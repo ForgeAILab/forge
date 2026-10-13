@@ -606,3 +606,14 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn task_latest_expected_workspace_head(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT h.head_sha FROM workspace_expected_head h JOIN workspace_placement p ON p.id=h.placement_id AND p.generation=h.generation WHERE p.task_id=? ORDER BY h.recorded_at DESC LIMIT 1")
+            .bind(task_id)
+            .fetch_optional(self.pool()).await?)
+    }
+}

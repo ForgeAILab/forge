@@ -7826,8 +7826,11 @@ Genesis and Project artifact commands, and chat/usage-index persistence use
 typed DB functions in the corresponding aggregate modules.
 Task lifecycle, role and lead reads, plan transport, workspace-root startup and
 migration, integration adapters, memory backfills, and environment, authorization
-and notification projections also use typed DB query helpers. Workspace-root
-path statements live in `sqlite/workspace_root.rs`; their rewrite transaction
+and notification projections also use typed DB query helpers.
+Task-step queue, conflict-hotspot episodes, periodic worker health and workflow
+transition/hook statements likewise live in their DB aggregate modules; queue
+and workflow services retain each statement's original connection and await order.
+Workspace-root path statements live in `sqlite/workspace_root.rs`; their rewrite transaction
 remains owned by the migration service, including its original deferred begin.
 The services retain policy and transaction ownership; queries participating in
 those transactions accept the caller's `SqliteConnection`. Read projections

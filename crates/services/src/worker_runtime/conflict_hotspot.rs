@@ -10,7 +10,7 @@ use chrono::{DateTime, Duration, Utc};
 use db::{new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEvent, DomainEventRepo, SqliteDb};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 
 use super::{consumer_error, Outcome, Subscription, Worker, WorkerError};
 
@@ -34,22 +34,6 @@ const UNSPLITTABLE_LOCKFILES: &[&str] = &[
     "Gemfile.lock",
     "composer.lock",
 ];
-
-// Existing Project and Task/state/time indexes bound the seek before parsing.
-// One query supplies every eligible path; UTC RFC3339 bounds match DB writers.
-const HANDOFF_QUERY: &str =
-    "SELECT tl.id, tl.task_id, tl.bridge_kind, tl.bridge_payload, tl.created_at
-    FROM task t JOIN transition_log tl ON tl.task_id = t.id
-    WHERE t.project_id = ? AND tl.from_state = 'merging' AND tl.to_state = 'merge_failed'
-      AND tl.triggered_by = ? AND tl.created_at > ? AND tl.created_at <= ?
-    ORDER BY tl.created_at DESC, tl.rowid DESC";
-const EPISODE_QUERY: &str = "SELECT resolved_after, open_since
-    FROM conflict_hotspot_boundary WHERE project_id = ? AND path = ?";
-const CLOSE_EPISODE: &str = "UPDATE conflict_hotspot_boundary
-    SET resolved_after = ?, open_since = NULL WHERE project_id = ? AND path = ?";
-const OPEN_EPISODE: &str = "INSERT INTO conflict_hotspot_boundary
-    (project_id, path, resolved_after, open_since) VALUES (?, ?, ?, ?)
-    ON CONFLICT(project_id, path) DO UPDATE SET open_since = excluded.open_since";
 
 /// Durable conflict observation shared by the server and Solo worker runtime.
 pub struct ConflictHotspotConsumer {
@@ -122,34 +106,27 @@ impl ConflictHotspotConsumer {
         }
         // Event prose is bounded. Read the authoritative typed kind, full paths
         // and timestamp; refuse a removed or mismatched source Task/log.
-        let source = sqlx::query(
-            "SELECT tl.id, tl.from_state, tl.to_state, tl.triggered_by, tl.bridge_kind, tl.bridge_payload, tl.created_at
-            FROM transition_log tl JOIN task t ON t.id = tl.task_id
-            WHERE tl.id = ? AND t.id = ? AND t.project_id = ?",
-        )
-        .bind(&payload.transition_log_id)
-        .bind(&event.entity_id)
-        .bind(&payload.project_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let source = self
+            .db
+            .conflict_handoff_source(
+                &payload.transition_log_id,
+                &event.entity_id,
+                &payload.project_id,
+            )
+            .await?;
         let Some(source) = source else {
             return Ok(None);
         };
-        if source.try_get::<String, _>("from_state")? != "merging"
-            || source.try_get::<String, _>("to_state")? != "merge_failed"
-            || source.try_get::<String, _>("triggered_by")?
-                != Actor::system(SystemComponent::Workflow).display()
+        if source.from_state()? != "merging"
+            || source.to_state()? != "merge_failed"
+            || source.triggered_by()? != Actor::system(SystemComponent::Workflow).display()
         {
             return Ok(None);
         }
         let Some(paths) = handoff_paths(
-            &source.try_get::<String, _>("id")?,
-            source
-                .try_get::<Option<String>, _>("bridge_kind")?
-                .as_deref(),
-            source
-                .try_get::<Option<String>, _>("bridge_payload")?
-                .as_deref(),
+            &source.id()?,
+            source.bridge_kind()?.as_deref(),
+            source.bridge_payload()?.as_deref(),
         )?
         else {
             return Ok(None);
@@ -157,7 +134,7 @@ impl ConflictHotspotConsumer {
         Ok((!paths.is_empty()).then(|| Handoff {
             project_id: payload.project_id,
             paths,
-            created_at: source.get("created_at"),
+            created_at: source.created_at(),
         }))
     }
 
@@ -170,19 +147,19 @@ impl ConflictHotspotConsumer {
         let now = now_rfc3339();
         let mut counts = BTreeMap::new();
         for path in &handoff.paths {
-            let state: Option<(Option<String>, Option<String>)> = sqlx::query_as(EPISODE_QUERY)
-                .bind(&handoff.project_id)
-                .bind(path)
-                .fetch_optional(&mut **tx)
+            let state: Option<(Option<String>, Option<String>)> = self
+                .db
+                .conflict_hotspot_episode_in_tx(tx, &handoff.project_id, path)
                 .await?;
             let (mut boundary, open_since) = state.unwrap_or_default();
             if let Some(open_since) = open_since {
-                let attention: Option<(String, Option<String>)> = sqlx::query_as(
-                    "SELECT status, resolved_at FROM attention_projection WHERE dedupe_key = ?",
-                )
-                .bind(incident_key(&handoff.project_id, path))
-                .fetch_optional(&mut **tx)
-                .await?;
+                let attention: Option<(String, Option<String>)> = self
+                    .db
+                    .conflict_hotspot_attention_resolution_in_tx(
+                        tx,
+                        incident_key(&handoff.project_id, path),
+                    )
+                    .await?;
                 let resolved = match attention {
                     Some((status, Some(at)))
                         if status == "resolved" && timestamp(&at)? >= timestamp(&open_since)? =>
@@ -195,11 +172,8 @@ impl ConflictHotspotConsumer {
                     continue;
                 };
                 boundary = Some(timestamp(&resolved)?.to_rfc3339());
-                sqlx::query(CLOSE_EPISODE)
-                    .bind(&boundary)
-                    .bind(&handoff.project_id)
-                    .bind(path)
-                    .execute(&mut **tx)
+                self.db
+                    .close_conflict_hotspot_episode_in_tx(tx, &boundary, &handoff.project_id, path)
                     .await?;
             }
             counts.insert(
@@ -216,12 +190,10 @@ impl ConflictHotspotConsumer {
         if counts.is_empty() {
             return Ok(());
         }
-        let cutover: String = sqlx::query_scalar(
-            "SELECT created_at FROM event_consumer_cutover WHERE consumer_name = ?",
-        )
-        .bind(CONSUMER_NAME)
-        .fetch_one(&mut **tx)
-        .await?;
+        let cutover: String = self
+            .db
+            .conflict_hotspot_consumer_cutover_in_tx(tx, CONSUMER_NAME)
+            .await?;
         let cutover = timestamp(&cutover)?;
         let end = timestamp(&handoff.created_at)?;
         let start = end - Duration::days(WINDOW_DAYS);
@@ -234,25 +206,27 @@ impl ConflictHotspotConsumer {
             .min()
             .unwrap_or(cutover);
         let lower = lower.max(cutover).max(start - Duration::nanoseconds(1));
-        let rows = sqlx::query(HANDOFF_QUERY)
-            .bind(&handoff.project_id)
-            .bind(Actor::system(SystemComponent::Workflow).display())
-            .bind(lower.to_rfc3339())
-            .bind(end.to_rfc3339())
-            .fetch_all(&mut **tx)
+        let rows = self
+            .db
+            .project_conflict_handoffs_in_tx(
+                tx,
+                &handoff.project_id,
+                Actor::system(SystemComponent::Workflow).display(),
+                lower.to_rfc3339(),
+                end.to_rfc3339(),
+            )
             .await?;
         for row in rows {
-            let at = timestamp(&row.try_get::<String, _>("created_at")?)?;
+            let at = timestamp(&row.created_at()?)?;
             let Some(paths) = handoff_paths(
-                &row.try_get::<String, _>("id")?,
-                row.try_get::<Option<String>, _>("bridge_kind")?.as_deref(),
-                row.try_get::<Option<String>, _>("bridge_payload")?
-                    .as_deref(),
+                &row.id()?,
+                row.bridge_kind()?.as_deref(),
+                row.bridge_payload()?.as_deref(),
             )?
             else {
                 continue;
             };
-            let task_id: String = row.try_get("task_id")?;
+            let task_id: String = row.task_id()?;
             for path in paths {
                 if let Some(count) = counts.get_mut(&path) {
                     if at >= start
@@ -273,12 +247,10 @@ impl ConflictHotspotConsumer {
             let key = incident_key(&handoff.project_id, &path);
             let detection_key = format!("{key}:detected:{}", event.id);
             // Explicit dead-letter replay also retains source/path identity.
-            let detected: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)",
-            )
-            .bind(&detection_key)
-            .fetch_one(&mut **tx)
-            .await?;
+            let detected: bool = self
+                .db
+                .conflict_hotspot_detection_exists_in_tx(tx, &detection_key)
+                .await?;
             if detected {
                 continue;
             }
@@ -306,12 +278,14 @@ impl ConflictHotspotConsumer {
                 created_at: now.clone(),
             };
             self.db.append_event_in_tx(tx, &detection).await?;
-            sqlx::query(OPEN_EPISODE)
-                .bind(&handoff.project_id)
-                .bind(&path)
-                .bind(count.boundary.map(|at| at.to_rfc3339()))
-                .bind(&now)
-                .execute(&mut **tx)
+            self.db
+                .open_conflict_hotspot_episode_in_tx(
+                    tx,
+                    &handoff.project_id,
+                    &path,
+                    count.boundary.map(|at| at.to_rfc3339()),
+                    &now,
+                )
                 .await?;
         }
         Ok(())

@@ -891,3 +891,33 @@ impl SqliteDb {
             .transpose()
     }
 }
+
+impl SqliteDb {
+    pub async fn conflict_hotspot_consumer_cutover_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        consumer_name: &str,
+    ) -> crate::Result<String> {
+        Ok(sqlx::query_scalar(
+            "SELECT created_at FROM event_consumer_cutover WHERE consumer_name = ?",
+        )
+        .bind(consumer_name)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn conflict_hotspot_detection_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM domain_event WHERE dedupe_key = ?)")
+                .bind(dedupe_key)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}

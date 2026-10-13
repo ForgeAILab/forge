@@ -1183,10 +1183,22 @@ impl WorkflowExecution<'_> {
                 .to_rfc3339();
                 let mut tx = db::begin_immediate(self.db.pool()).await?;
                 self.db.fence_hook_in_tx(&mut tx, step).await?;
-                sqlx::query("UPDATE workspace SET cleanup_after=COALESCE(cleanup_after,?),updated_at=? WHERE task_id=? AND status!='cleaned'")
-                        .bind(deadline).bind(now_rfc3339()).bind(&task.id).execute(&mut *tx).await?;
-                sqlx::query("UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?")
-                        .bind(serde_json::to_string(&HookResult::Ok).expect("outcome serializes")).bind(&step.id).bind(index).execute(&mut *tx).await?;
+                self.db
+                    .schedule_terminal_hook_workspace_cleanup_in_tx(
+                        &mut tx,
+                        deadline,
+                        now_rfc3339(),
+                        &task.id,
+                    )
+                    .await?;
+                self.db
+                    .record_terminal_cleanup_hook_result_in_tx(
+                        &mut tx,
+                        serde_json::to_string(&HookResult::Ok).expect("outcome serializes"),
+                        &step.id,
+                        index,
+                    )
+                    .await?;
                 tx.commit().await?;
             }
         }

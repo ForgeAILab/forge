@@ -87,9 +87,8 @@ impl PeriodicWorkers {
             .collect();
         let mut statuses = Vec::with_capacity(entries.len());
         for (worker_name, state) in entries {
-            let stored: Option<(Option<String>, Option<String>, i64)> = sqlx::query_as(
-                "SELECT last_error, last_error_at, restart_count FROM worker_health WHERE worker_name = ?")
-                .bind(&worker_name).fetch_optional(self.db.pool()).await?;
+            let stored: Option<(Option<String>, Option<String>, i64)> =
+                self.db.periodic_worker_error(&worker_name).await?;
             let (last_error, last_error_at, restart_count) = stored.unwrap_or_default();
             let state = state.lock().expect("periodic worker state");
             statuses.push(PeriodicWorkerStatus {

@@ -3,6 +3,7 @@ use crate::{worker_runtime::WorkerRuntime, AttentionService};
 use chrono::{Duration, Utc};
 use db::{create_sqlite_pool, run_migrations};
 use serde_json::Value;
+use sqlx::Row;
 
 async fn database() -> Arc<SqliteDb> {
     let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
@@ -547,17 +548,20 @@ async fn bulk_transitions(db: &SqliteDb, count: i64, same_project: bool, old: bo
 
 async fn query_plan(tx: &mut Transaction<'_, Sqlite>, project: &str, end: &str) -> Vec<String> {
     let end_time = super::timestamp(end).unwrap();
-    sqlx::query(&format!("EXPLAIN QUERY PLAN {HANDOFF_QUERY}"))
-        .bind(project)
-        .bind(Actor::system(SystemComponent::Workflow).display())
-        .bind((end_time - Duration::days(WINDOW_DAYS)).to_rfc3339())
-        .bind(end)
-        .fetch_all(&mut **tx)
-        .await
-        .unwrap()
-        .iter()
-        .map(|row| row.get("detail"))
-        .collect()
+    sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        db::CONFLICT_HANDOFF_QUERY
+    ))
+    .bind(project)
+    .bind(Actor::system(SystemComponent::Workflow).display())
+    .bind((end_time - Duration::days(WINDOW_DAYS)).to_rfc3339())
+    .bind(end)
+    .fetch_all(&mut **tx)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get("detail"))
+    .collect()
 }
 
 fn assert_indexed_plan(plan: &[String]) {

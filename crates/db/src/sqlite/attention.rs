@@ -996,3 +996,18 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn conflict_hotspot_attention_resolution_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: String,
+    ) -> crate::Result<Option<(String, Option<String>)>> {
+        Ok(sqlx::query_as(
+            "SELECT status, resolved_at FROM attention_projection WHERE dedupe_key = ?",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
