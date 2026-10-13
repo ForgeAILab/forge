@@ -290,7 +290,11 @@ impl crate::TaskService {
         }
         Box::pin(self.transition(
             task.id.clone(),
-            role_target(workflow, &task.status, crate::workflow::default_states::DONE),
+            role_target(
+                workflow,
+                &task.status,
+                crate::workflow::default_states::DONE,
+            ),
             crate::task_service::TransitionOptions {
                 bridge: Default::default(),
                 version: task.version,
