@@ -43,8 +43,9 @@ const DEFAULT_COLUMNS: ColumnGroup[] = [
   {
     primaryState: 'in_progress',
     columnName: 'In Progress',
-    states: ['in_progress'],
-    stateLabels: { in_progress: 'In Progress' },
+    states: ['in_progress', 'lead_check'],
+    stateLabels: { in_progress: 'In Progress', lead_check: 'Lead Check' },
+    inheritedStates: ['lead_check'],
     subStates: [],
     taskCount: 0,
     isTerminal: false,

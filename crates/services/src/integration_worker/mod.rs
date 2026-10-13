@@ -177,6 +177,12 @@ pub struct IntegrationQueueWorker {
     /// A Task step answered a head: its driver re-reads at once instead of
     /// at its next poll.
     answered: Notify,
+    /// A driver released its head: an admission that waits for the slot of
+    /// the Task's previous entry looks again at once instead of at its poll.
+    released: Notify,
+    /// How many heads this worker's drivers released.
+    #[cfg(test)]
+    releases: std::sync::atomic::AtomicU64,
     /// The supervised loop ([`Self::run`]) is live in this process.
     running: std::sync::atomic::AtomicBool,
     shared: Mutex<Shared>,
@@ -221,6 +227,9 @@ impl IntegrationQueueWorker {
             instance: format!("integration-worker:{}", db::new_uuid_v4()),
             wake: Notify::new(),
             answered: Notify::new(),
+            released: Notify::new(),
+            #[cfg(test)]
+            releases: std::sync::atomic::AtomicU64::new(0),
             running: std::sync::atomic::AtomicBool::new(false),
             shared: Mutex::new(Shared::default()),
             #[cfg(test)]
@@ -243,6 +252,24 @@ impl IntegrationQueueWorker {
     }
     pub(crate) async fn answered(&self) {
         self.answered.notified().await
+    }
+    /// A driver of this worker released its head (the attempt left the
+    /// slot). Only a wake: a waiter that misses it looks at its poll.
+    pub(crate) fn notify_released(&self) {
+        #[cfg(test)]
+        self.releases
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.released.notify_waiters();
+    }
+    /// The signal of the next release. Enable it before the look it guards,
+    /// so a release between the look and the wait is not missed.
+    pub(crate) fn released(&self) -> tokio::sync::futures::Notified<'_> {
+        self.released.notified()
+    }
+    /// Heads released by this worker's drivers so far.
+    #[cfg(test)]
+    pub(crate) fn releases(&self) -> u64 {
+        self.releases.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -447,6 +474,14 @@ impl IntegrationQueueWorker {
         self.sweep_due_parked().await?;
         if let Err(error) = self.sweep_dead_release_steps().await {
             tracing::warn!(target: "services::integration_worker", %error, "integration release-step sweep failed; the next sweep retries");
+        }
+        // A pre-queue `queued` row is claimable only once its import
+        // continuation settled; one whose settled step was pruned gets it
+        // again here instead of at the next start. One read of the current
+        // `queued` rows (`QUEUED_WITHOUT_CONTINUATION`), no write when there
+        // is nothing to do.
+        if let Err(error) = self.steps.continue_queued_imports().await {
+            tracing::warn!(target: "services::integration_worker", %error, "integration import continuations were not enqueued; the next sweep retries");
         }
         self.sweep_claims().await
     }

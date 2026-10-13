@@ -4704,8 +4704,8 @@ commit (a merge commit of before the queue) both are asked for.
 |---|---|---|---|
 | The target contains the commit | evidence, comment, `merging` → `done` | answers `done` | `applied` → `completed` |
 | The owner answers "not contained" (the target was rewound after the fast-forward, or the row was wrong) | stays in its merge state, `deferred` / `unresolved_result` with an interruption | answers `not_landed` and ends | the worker drops the recorded result and takes the attempt off the slot (`applied` → `parked`, `target_missing_commit`, kind `needs_fact`); the counted retry timer queues it again and validation merges it against the target as it is (after the counted retries: `owner_required` with the Retry offer) |
-| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, asks again at `result_park` (30 s); the worker re-arms it on every sweep | stays `applied` and keeps the slot |
-| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` | the import continuation asks again on the same timer | stays `applied` |
+| No answer (the owner is not connected, the checkout cannot be read) | stays, `deferred` / `unresolved_result` | stays pending, parked for `result_park` (600 s); the worker re-arms it on every sweep (`sweep_interval`, 30 s), so it asks about every 30 s | stays `applied` and keeps the slot |
+| An imported landed row (no worker holds a slot for it) is not proven | stays, `deferred` / `unresolved_result` while it asks; `deferred` / `owner_required` with an interruption (an Attention item) at the second "not contained" (`IMPORT_ABSENT_ASKS`, about 10 minutes) or after `IMPORT_PROOF_ASKS` (5, about 40 minutes) asks in a row that nobody answered and nobody will (the target's machine was removed, its default checkout is gone, a connected machine keeps failing the read). While the machine that holds the target's default checkout is known and only not connected, the row waits for it and is never parked (`proof::target_owner_away`) | the import continuation asks again at `result_park` (600 s; no worker re-arms it). Only asks are counted, on the step's retry reason (`[asked N, answered]` / `[asked N, no answer]`): a run of the step that asked nothing (it waited for the entry's hooks, it failed) or that waited for an offline machine starts the count again. At the bound the step ends `done` (`park_unproven_import`) | stays `applied` with its claim while it asks, then `parked` (`owner_required`, no deadline, `integrated_sha` cleared). The owner's Retry admits the Task again and the queue reads the target as it is: a Task whose own commit is on the target is reported once and nothing is merged again; Cancel ends it |
 
 **One writer per merge during an upgrade.** Three things could act on a merge
 that was in flight the old way: the old merge's own hooks step, the import
@@ -4727,9 +4727,17 @@ step started and then admits; a merge the old step had finished is admitted
 too, the head finds its commit in the target and the proven `result` step
 reports it (only if the candidate can no longer be named does the hook report
 it itself, after the same proof). The continuation waits for an earlier,
-suspended hooks step of the entry instead of admitting beside it. Residue: a
-`shadow:` row of a deleted Task gets no continuation and is never claimed; it
-holds no slot.
+suspended hooks step of the entry instead of admitting beside it. A `shadow:`
+row of a deleted Task gets no continuation and is never claimed; the start
+pass deletes it (`delete_orphan_shadow_attempts`) when it is the Task's
+*current* row, is at rest (`queued`, `path_wait`, `parked`, `quarantined`,
+`ejected`, `needs_review`), is not a queue's head and records no effect (no
+intent, no running or unknown operation). A history row (`current = 0`), a row
+that records a landed merge (`applied`) and a row in any state in which an
+owner may have been asked for an effect are kept. "Deleted" is
+`task.deleted_at` set or the Task row gone; nothing undeletes a Task. The
+delete walks the partial index of current rows and the index on
+`predecessor_attempt_id` (`V202610122352`), not the attempt history.
 
 **Unknown results from before the queue.** An imported merge whose old
 operation never reported is recorded `uncertain` against the machine that ran
@@ -4745,7 +4753,14 @@ passive shadow recording left) without a continuation gets one
 identity-fenced `integration/import_continue` step, keyed
 `integration-import:<attempt id>`. The step applies the continuation of the
 imported state under the Task's lease; running the start twice enqueues
-nothing new.
+nothing new. A `queued` pre-queue attempt whose settled continuation step was
+pruned (Task-step retention, 7 days) would not be claimable: the queue
+worker's sweep (`sweep_once`, `continue_queued_imports`) enqueues the
+continuation of every `queued` pre-queue attempt that has none, so it does not
+wait for the next start. The sweep's read seeks the current `queued` rows
+(`integration_attempt_retention`), not every pre-queue row; the step's key is
+unique per Task, so two sweeps, or a sweep beside the start pass, enqueue one
+step and count one.
 
 | Imported state | Continuation |
 |---|---|
@@ -4839,9 +4854,19 @@ an attempt that finished before the cutoff. Deny-by-default: the attempt is
 terminal and not current, has no effect intent, no pending / running /
 uncertain operation and no uncertain receipt, its Task has no current attempt,
 and its queue is neither quarantined nor names it as head. **No attempt row is
-deleted**: the row is the queue's history (states, commits, timings, lineage),
-and a Review's `execution.integration_checks` and a settled Task's
-`integration_lineage` witness name it by id; what a Review quotes of a head
+deleted, by decision**: the row is the queue's history (states, commits,
+timings, lineage), and a Review's `execution.integration_checks` and a settled
+Task's `integration_lineage` witness name it by id; no reader of those ids was
+audited for a missing row, and deletion is not built without that audit. The
+table therefore grows by one row per merge attempt: one per entry of a merge
+state, plus one for each re-admission (a re-entry after a repair or a
+re-review, an owner's Retry that replaces the attempt, a rebind). With its
+receipts and observations emptied by the rule above a finished row keeps its
+scalar columns and the small JSON documents (paths, checks, timings), on the
+order of a few kilobytes. The only rows ever deleted are those of a deleted
+queue (`ON DELETE CASCADE` from `integration_queue`), the rows of a deleted
+Project that have no queue, and the current, resting `shadow:` row of a
+deleted Task (above). What a Review quotes of a head
 check is stored in the Review itself. `integration_queues.finished_with_receipts`
 in operations status counts finished attempts that still hold receipts.
 Transfer cleanup and owner-journal acknowledgment run as before.
@@ -5509,7 +5534,9 @@ the transition graph. There is one current attempt per Task and one current
 reservation per queue sequence. Successors retain sequence, while eligible
 position is computed by the read surface. Nullable foreign keys preserve
 opaque Task/project/workspace/execution/location refs after cleanup. Task
-removal keeps history; repository/Project deletion cascades its owned rows.
+removal keeps history, except the Task's current, resting `shadow:` row, which
+the next start deletes (`delete_orphan_shadow_attempts`); repository/Project
+deletion cascades its owned rows.
 
 Attempts store candidate/original/target/integrated SHAs, predecessor lineage,
 full conflict/repair/guard paths, owner binding, effect intent/receipts,
@@ -5561,7 +5588,9 @@ snapshot survives hook-step pruning; cancellation does not erase the only
 possible-landed record.
 
 Current imported/shadow attempts receive an identity-fenced `import_continue`
-step once. Classification is committed before that step can execute. A queued
+step at start; a `queued` one that has lost its settled step to retention
+receives it again from the queue worker's sweep. Classification is committed
+before that step can execute. A queued
 pre-queue member is claimable only after continuation is acknowledged and no
 live legacy merge hook owns it. A suspended older hook completes its recorded
 rebase/read-only outcome and hands over through the same admission function.
@@ -5629,6 +5658,17 @@ pinning a quarantined queue.
 ### The active head pipeline
 
 The supervised sweep runs on admission/answer notifications and every 30 seconds.
+A Task that re-enters its merge state while the attempt of its previous entry
+is still the head is admitted as soon as that head is released: the admission
+flags the old attempt, wakes the worker and waits on the driver's release
+signal (`IntegrationQueueWorker::notify_released`, sent by `HeadDriver::pass`
+on `Pass::Released`), with a 100 ms poll for a worker of another process, for
+at most `RELEASE_WAIT` (20 s) before it returns the conflict to its step. The
+worker that signals is the one `TaskService::compose_integration` registers on
+the service when the runtime is built, before any worker starts; every
+admission is handed `TaskService::integration_worker()`. The admission
+subscribes before the admit that sets the cancel flag, and only that flag
+makes the driver release, so the signal cannot be missed.
 At most 16 queues have drivers; claims rotate for fairness. It cancels released
 members, makes due parks runnable, takes expired heads over, refreshes suspended
 targets and revisits quarantine. One slow head/check does not hold another
@@ -5732,7 +5772,10 @@ A result is never reported merged merely from `integrated_sha`. The target's
 current owner proves it contains the exact candidate before `done`, including
 imported landed rows and sibling target advances. Wrong-owner/generation receipts,
 a forged SHA, an unavailable owner or a rewound target produce a typed
-`unresolved_result`; a proven missing commit queues again. Git/RPC proof is
+`unresolved_result`; a proven missing commit queues again when a worker holds
+the row (`not_landed`), and parks an imported row for its owner at the second
+such answer (no worker holds a slot for it; see the bounds table of
+"`merging` is the integration queue"). Git/RPC proof is
 outside the write transaction; the transaction rechecks attempt and Task entry.
 
 ### Deletion, recovery and operational limits
@@ -6178,7 +6221,7 @@ role from its own rows, and no row is copied onto it.
 | Subtask state | Condition | Result | Mechanism | Budget |
 |---|---|---|---|---|
 | `in_progress` | the implementation run succeeded | `lead_check` | the state's Accept | — |
-| `lead_check` | the root has no lead | `done`, bridge `gate_skipped` | `auto_cascade_on_unassigned_role` on the entry, in the entry's own step: no execution, no person, no dispatcher decision | — |
+| `lead_check` | the root has no lead | `done`, bridge `gate_skipped`; no execution, no person, no park, no Attention item | `auto_cascade_on_unassigned_role`, an on-enter hook of the gate: the entry's hook step enqueues the skip as a `cascade` step of the same chain, so it runs as soon as the entry's hooks end and waits for no dispatcher pass and no sweep interval | — |
 | `lead_check` | the root has a lead | a `planner` execution on the subtask, under the lead's Agent, in the shared root workspace (prompt `planner.step_check.v1`) | `dispatch_role_agent` on the entry | — |
 | `lead_check` | the lead's result block says `pass` | `done` | the gate's Accept (`TaskService::settle_step_check`) | — |
 | `lead_check` | the result block says `fail` | `in_progress`, bridge `gate_rejected`, rejection; the same worker thread is resumed (`ResumeLatestTargetRoleThread`) with the lead's findings | the gate's Reject | charges `gate:lead_check` (limit: the gate's `max_rejections`, 2) |
@@ -6187,6 +6230,24 @@ role from its own rows, and no row is copied onto it.
 | `lead_check` | the run failed or timed out | the retry, deadline or failure any execution shows | execution retry | `execution` |
 | `lead_check`, nothing running | the root has no lead any more (removed after the entry; a restart between the entry and its skip) | `done`, bridge `gate_skipped` | `Step::SkipGate`, resolved from stored state by `next_step` (fact `gate_skip`); removing or changing the lead marks the subtasks that rest in the gate | — |
 | `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
+| `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
+| `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
+| `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
+
+"No dispatcher decision" in the no-lead row means the skip does not depend on
+one, not that the dispatcher never looks: the subtask is in `lead_check` for
+the time between two queue steps (the entry and its cascade), and a dispatcher
+pass that reads it in that window resolves the same skip from stored state
+(`Step::SkipGate`, the `gate_skip` fact, which is also the recovery when the
+process dies in that window). Both carry the Task version they read, so
+exactly one of them makes the transition (`gate_skipped`, once in the
+transition log) and the other is dropped as a version conflict; the subtask
+needs no further pass either way. What a client sees per finished subtask is
+two transitions and their events (`in_progress -> lead_check`,
+`lead_check -> done`), never a rest in `lead_check`.
+`without_a_lead_the_skip_rides_the_entry_s_own_chain` pins the hook path (the
+`cascade` step shares the chain of the entry's `hooks` step): removing the
+hook and keeping only the dispatcher's `SkipGate` fails it.
 
 The one loop this adds is `lead_check ↔ in_progress`. Its machine bound is the
 gate's `max_rejections`: two returns, then the third entry parks the subtask
@@ -6210,7 +6271,14 @@ none), so merge-queue returns of the root never spend this budget.
 
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
-next dispatcher pass. A verdict of a run that no longer owns the role attempt
+next dispatcher pass. Archiving the Agent that is the lead is the same lead
+change: the archive sweep (`on_agent_deleted_in_tx`) clears the row as a
+queued step of the root, and after its commit every caller (the archive
+route, `TaskService::on_agent_deleted`, the removed-machine settlement) runs
+`TaskService::lead_removed_from`, which waits for that clear and then calls
+the same hook. A paused lead is not a missing lead: the step is not passed
+unchecked. With no check running the subtask is parked on the Agent by name
+until it is resumed; a check that is already running finishes and settles. A verdict of a run that no longer owns the role attempt
 (lead removed or replaced, subtask held, cancelled or moved) is dropped
 without a transition (`execution_owns_current_role_attempt`). A replaced
 lead's running check is not stopped: the subtask waits for that run to end
@@ -6221,10 +6289,35 @@ the one Project slot it held during implementation (the check is that Task's
 run); a parked one holds none. The lead's Agent is admitted by the same Agent
 and machine limits as any run.
 
+The step-check prompt carries the step's diff as per-run input (the user
+part of `planner.step_check.v1`; the system part stays the stable doctrine and
+result contract). `workflow::dispatch::loader::load_step_diff` reads it where
+`AgentDispatchContext` is built, through the workspace backend's `diff`
+(embedded and daemon-owned workspaces alike; no protocol change): the shared
+root workspace, uncommitted leftovers included, against the commit the step
+started from. That commit is the head recorded when the last run of an
+earlier sibling ended (every step check records it, because the host runs it
+read-only; a native worker records it too) and the root workspace's branch
+point when none is recorded (the first step; or earlier steps run by a CLI
+worker under a root that had no lead then: the prompt says that changes of
+earlier steps are included). The diff is cut at 32 KiB (`STEP_DIFF_LIMIT`)
+with the cut marked; a diff that cannot be read is reported in the prompt in
+one line and never fails the dispatch.
+
+The step check is read-only by the host, not by its prompt: the runner marks
+every `planner` run read-only (`read_only_execution_role`), a native run gets
+the `TaskRead` scope (no write and no command tools), and for any executor the
+runner restores the worktree to the head it started from and fails the run
+(`read-only execution produced worktree changes`) when it wrote.
+
 The step-check role cannot be assigned on a subtask
-(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`); rows that predate the rule (for example
-from Project default role assignments, which still copy every default role
-onto new Tasks) hold nothing and are left out of the action snapshot.
+(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`), and Project default role assignments
+do not copy it onto one (`TaskService::project_default_role_assignments`
+leaves out every role `db::inherited_subtask::step_check_holder` gives to the
+root; the only path that gives a subtask default roles is the dispatcher's
+`Step::ApplyDefaults`). Rows that predate the rule hold nothing and are left
+out of the action snapshot; they are not migrated away (they can be removed
+by hand, and nothing reads them).
 
 The names the database needs of this workflow (its states, the step-check
 state and role) live in `db::inherited_subtask`; the services read them from
@@ -8485,7 +8578,11 @@ and agent-selected families retain their existing orchestration and check policy
 `Joined(run)` or `Scheduled(run)`. Selection and consumer insertion are one
 `BEGIN IMMEDIATE` transaction using the stage-A partial unique identity index.
 A repeated consumer key joins its original run, including a terminal failure;
-it never silently launches another attempt. A certified cacheable pass returns
+it never silently launches another attempt. One exception: an integration
+head's consumer that was withdrawn under it (a forced Project deletion that
+was then refused withdraws every consumer) waits again when the head asks
+again, on a certified result, a queued or running run or a fresh run
+(`revive_withdrawn_consumer_in_tx`); not on a run that is being stopped. A certified cacheable pass returns
 `Hit`. Uncacheable or failed idempotent evidence stays `Joined`, with the
 consumer's own `result_id`. New consumers never hit an uncacheable, unattested,
 failed, timed-out, uncertain or cleanup-failed result. Purpose belongs to the
@@ -8549,7 +8646,7 @@ This prevents a silent second execution of a certified key.
 
 | Run state | Automatic exit | Bound/policy |
 | --- | --- | --- |
-| `queued` | Admit to `running`; all consumers stale: `cancelled`; owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
+| `queued` | Admit to `running`; last consumer withdrawn: `cancelled` in the withdrawal's own transaction (`cancel_abandoned_check_consumer`, `cancel_project_check_consumers`: no slot has to free, no result row is written); all consumers stale by Task epoch (the Task was deleted or left the status entry that asked, and no writer withdrew them): `cancelled` at the worker's next admission look, before any slot (`admit_check_run` withdraws them and cancels the run in its transaction; no result row); owner removed or slot wait expired: infrastructure failure | Slot wait 1,800 seconds per attempt (with two automatic retries a consumer waits at most about 90 minutes before its Task is answered "no verdict"). Expiry settlement runs even when all 32 effect jobs are occupied. Queue time is excluded from wall time. |
 | `running` | Receipt to `cleaning`; lost reply or lost lease to `uncertain`; no consumers left: `cancelling`. A run taken over before its intent was stored launched nothing and settles as an infrastructure failure | Recorded wall limit (1–86,400 seconds) plus 65 seconds of settlement grace. Lease 60 seconds, renewed every 15; takeover within 60 seconds plus sweep delay. |
 | `cancelling` | Cancel reply with a receipt to `cleaning`; any other reply, or a lost lease, to `uncertain` | One cancel exchange, at most 61 seconds. |
 | `cleaning` | Immutable result to a terminal state; a lost lease to `uncertain`, which resumes from the retained receipt | One fenced transaction; takeover within 60 seconds plus sweep delay. |
@@ -9155,6 +9252,10 @@ finds its Task has left the entry:
 The check worker looks every second whether a running dispatch still has a
 live consumer (`CONSUMER_LIVENESS_INTERVAL`; the lease is renewed every 15 s)
 and cancels a run nobody waits for, so its machine slot is freed promptly.
+A `queued` run needs no worker for this: the write that withdraws its last
+consumer sets it `cancelled` in the same transaction, so a run waiting behind
+a full machine leaves `checks.by_state.queued` and `waiting_for_slot` at the
+withdrawal, not when a slot frees.
 An unreachable daemon keeps the run `uncertain` (slot and single-flight
 identity retained) until it confirms the stop, is removed, or passes the
 disconnected-owner bound. A Project is not deleted from under a live check

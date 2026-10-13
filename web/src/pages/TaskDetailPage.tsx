@@ -11,6 +11,7 @@ import {
   useReviewsQuery,
   useTaskDiffQuery,
   useTaskDetailQuery,
+  useTaskRelationsQuery,
   useTransitionTask,
   useUpdateTask,
 } from '@/api/hooks'
@@ -20,6 +21,7 @@ import { TaskCommentsPanel } from '@/components/task-detail/task-comments-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
+import { roleAssignmentErrorMessage } from '@/lib/root-lead'
 import { productTerm } from '@/lib/i18n'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
@@ -98,6 +100,11 @@ export function TaskDetailPage({
   const [expandedHistoryAttempts, setExpandedHistoryAttempts] = useState<Set<number>>(new Set())
 
   const task = taskDetailQuery.data?.task
+  const rootRelationsQuery = useTaskRelationsQuery(
+    taskId,
+    task?.project_id ?? '',
+    initialTab === 'overview' && Boolean(task) && task?.parent_task_id == null,
+  )
   const coderAssignment = task?.role_assignments.find(
     (assignment) => assignment.role_name === 'coder',
   )
@@ -141,6 +148,7 @@ export function TaskDetailPage({
   const transitions: Record<TaskStatus, TaskStatus[]> = {
     todo: ['in_progress', 'cancelled'],
     in_progress: ['review', 'cancelled'],
+    lead_check: ['done', 'in_progress', 'cancelled'],
     review: ['merging', 'cancelled'],
     merging: [],
     merge_failed: ['cancelled'],
@@ -183,6 +191,10 @@ export function TaskDetailPage({
     ...visibleRoles.filter((role) => role.name === coderRole),
     ...visibleRoles.filter((role) => role.name !== coderRole),
   ]
+  // A root Task with subtasks is a coordination root: its planning role is the lead.
+  const isCoordinationRoot =
+    task?.parent_task_id == null &&
+    ((rootRelationsQuery.data?.subtasks.length ?? 0) > 0 || task?.effective_lead?.source === 'own')
 
   // Handlers
 
@@ -276,7 +288,11 @@ export function TaskDetailPage({
       taskId: task.id,
       roleName,
       selection,
-      onError: (error) => toast.error(getTaskDetailApiErrorMessage(error, 'Assignment failed')),
+      onError: (error) =>
+        toast.error(
+          roleAssignmentErrorMessage(error) ??
+            getTaskDetailApiErrorMessage(error, 'Assignment failed'),
+        ),
     })
   }
 
@@ -395,6 +411,9 @@ export function TaskDetailPage({
               terminal={terminal}
               currentRole={currentRole}
               assignableRoles={assignableRoles}
+              coderRole={coderRole}
+              isCoordinationRoot={isCoordinationRoot}
+              workflow={effectiveWorkflow}
               agents={agentsQuery.data?.items ?? []}
               runSuffix={runSuffix}
               workflowRetryBudgets={workflowRetryBudgets}

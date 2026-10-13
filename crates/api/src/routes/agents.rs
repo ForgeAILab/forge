@@ -252,7 +252,11 @@ pub async fn archive_agent(
         .await?
         .ok_or_else(|| ApiError::not_found("agent", id.clone()))?;
     require_agent_manageable(&agent, &user, &id)?;
-    state.agent_service.archive(id).await?;
+    let lead_roots = state.agent_service.archive(id.clone()).await?;
+    state
+        .task_service
+        .lead_removed_from(&lead_roots, &id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

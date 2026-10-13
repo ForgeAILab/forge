@@ -48,4 +48,27 @@ describe('Placement diagnostics', () => {
     render(<TaskPlacementDiagnostics diagnostics={[]} />)
     expect(screen.queryByRole('status')).toBeNull()
   })
+  it('explains the refusal of a native lead on a daemon workspace with the two ways out', () => {
+    const refusal = { machine, filter_codes: ['native_backend_unsupported'], failing_checks: [] }
+    const { unmount } = render(<TaskPlacementDiagnostics diagnostics={[refusal]} hasLead />)
+    expect(screen.getByText('Mac mini: Daemon workspaces run CLI Agents only')).toBeTruthy()
+    const action = screen.getByTestId('lead-placement-refusal').textContent ?? ''
+    expect(action).toContain('Remove the lead')
+    expect(action).toContain('runs on the server')
+    unmount()
+
+    // Without a lead the refusal is about another role: no lead advice.
+    render(<TaskPlacementDiagnostics diagnostics={[refusal]} />)
+    expect(screen.getByText('Mac mini: Daemon workspaces run CLI Agents only')).toBeTruthy()
+    expect(screen.queryByTestId('lead-placement-refusal')).toBeNull()
+  })
+  it('gives no lead advice for another placement refusal on a root with a lead', () => {
+    render(
+      <TaskPlacementDiagnostics
+        diagnostics={[{ machine, filter_codes: ['machine_capacity'], failing_checks: [] }]}
+        hasLead
+      />,
+    )
+    expect(screen.queryByTestId('lead-placement-refusal')).toBeNull()
+  })
 })

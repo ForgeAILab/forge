@@ -20,7 +20,9 @@ import { stripRunSuffix } from './utils'
 
 const statusClassNames: Record<TaskStatus, string> = {
   todo: 'bg-slate-100 text-slate-800',
+  planning: 'bg-sky-100 text-sky-900',
   in_progress: 'bg-sky-100 text-sky-900',
+  lead_check: 'bg-sky-100 text-sky-900',
   review: 'bg-amber-100 text-amber-900',
   merging: 'bg-indigo-100 text-indigo-900',
   merge_failed: 'bg-red-100 text-red-900',
@@ -30,7 +32,13 @@ const statusClassNames: Record<TaskStatus, string> = {
 }
 
 function statusBadge(status: TaskStatus) {
-  return <Badge className={cn('border-transparent', statusClassNames[status])}>{status}</Badge>
+  return (
+    <Badge
+      className={cn('border-transparent', statusClassNames[status] ?? 'bg-zinc-100 text-zinc-700')}
+    >
+      {status.replace(/_/g, ' ')}
+    </Badge>
+  )
 }
 
 type ActiveTab = 'overview' | 'executions' | 'review' | 'diff' | 'terminal' | 'comments' | 'history'
@@ -131,7 +139,10 @@ export function TaskDetailSidebar({
       {task && (task.placement ?? task.workspace?.placement) ? (
         <div className="border-b p-4">
           <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
-          <TaskPlacementDiagnostics diagnostics={task.placement_diagnostics ?? []} />
+          <TaskPlacementDiagnostics
+                  diagnostics={task.placement_diagnostics ?? []}
+                  hasLead={task.effective_lead?.source === 'own'}
+                />
         </div>
       ) : null}
       <nav className="flex gap-0.5 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-visible">

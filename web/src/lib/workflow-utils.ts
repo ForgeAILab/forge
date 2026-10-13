@@ -15,6 +15,12 @@ export interface BoardColumn {
   columnName: string
   states: string[]
   stateLabels?: Record<string, string>
+  /**
+   * States of this column that the Project workflow does not define: the
+   * inherited subtask states (`lead_check`). A card in one always shows its
+   * state, and they do not make the column a multi-state column.
+   */
+  inheritedStates?: string[]
   isTerminal: boolean
   kind: StateKind | null
   dotColor: string
@@ -58,6 +64,16 @@ export function getTaskWorkflowWarning(
 ): { title: string; message: string } | null {
   const remaining = task.plan_progress?.remaining ?? 0
   const latest = task.execution_observability
+  // A coordination root in `in_progress` waits on its subtasks, not on a
+  // checklist: its lead's plan run completing is not a stalled Task.
+  if (
+    task.condition.kind === 'parked' &&
+    [task.condition.primary, ...task.condition.additional].some(
+      (reason) => reason.kind === 'children',
+    )
+  ) {
+    return null
+  }
   if (
     task.status !== 'in_progress' ||
     remaining <= 0 ||
@@ -124,6 +140,33 @@ const PARENT_WAIT_CAUSES: Record<string, string> = {
   not_coordinating: 'is not running subtasks yet',
 }
 
+const BUDGET_EXHAUSTED_NOTICES: Record<string, { title: string; message: string }> = {
+  replan: {
+    title: 'Re-plan budget spent',
+    message:
+      'The lead has re-planned this task as many times as one budget window allows, and its subtasks are held. Retry with a new budget to let the lead plan again, or settle the parked subtask yourself.',
+  },
+}
+
+/**
+ * A spent budget the web names itself. Other budget kinds are explained by
+ * the server's own blocked record; `null` for them.
+ */
+export function budgetExhaustedNotice(
+  task: Pick<TaskResponse, 'condition'>,
+): { title: string; message: string } | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
+  const first = condition.kind === 'parked' ? condition.primary : condition.failure
+  for (const reason of [first, ...condition.additional]) {
+    if (reason.kind === 'budget_exhausted' && reason.budget_kind) {
+      const notice = BUDGET_EXHAUSTED_NOTICES[reason.budget_kind]
+      if (notice) return notice
+    }
+  }
+  return null
+}
+
 const AGENT_WAIT_STATUSES: Record<string, string> = {
   paused: 'is paused',
   daemon_offline: 'is offline',
@@ -142,10 +185,28 @@ export function getTaskWaitNotice(
   const reason = [condition.primary, ...condition.additional].find(
     (candidate) =>
       candidate.kind === 'parent' ||
+      candidate.kind === 'children' ||
       candidate.kind === 'agent' ||
       (candidate.kind === 'dependencies' && !candidate.cancelled),
   )
   if (!reason) return null
+  if (reason.kind === 'parent' && reason.cause === 'planning') {
+    return {
+      title: "Waiting for the lead's plan",
+      message:
+        "The parent task's lead is planning. This subtask runs when the plan is done and the parent starts its subtasks.",
+    }
+  }
+  if (reason.kind === 'children') {
+    const count = reason.remaining.length
+    return {
+      title: 'Running subtasks',
+      message:
+        count === 1
+          ? 'One subtask is unfinished. This task goes to review when it is done.'
+          : `${count > 1 ? count : 'Some'} subtasks are unfinished. This task goes to review when they are done.`,
+    }
+  }
   if (reason.kind === 'parent') {
     const cause = PARENT_WAIT_CAUSES[reason.cause] ?? 'does not let it run yet'
     return {
@@ -236,6 +297,15 @@ export function patchTaskIntoStatus(
   return [...withoutTask.slice(0, beforeIndex), updatedTask, ...withoutTask.slice(beforeIndex)]
 }
 
+/** The step check of the inherited subtask workflow (`db::inherited_subtask`). */
+export const INHERITED_STEP_CHECK_STATE = 'lead_check'
+
+/** Whether a card in `status` shows its state on a column. */
+export function showsSubState(column: BoardColumn, status: string): boolean {
+  const inherited = column.inheritedStates ?? []
+  return inherited.includes(status) || column.states.length - inherited.length > 1
+}
+
 export function isInitialKind(kind: StateKind | null | undefined): boolean {
   return kind === 'initial'
 }
@@ -269,6 +339,20 @@ export function deriveColumns(workflow: WorkflowDefinition, tasks: Task[] = []):
     columnStates[state.column].push(state.name)
   }
 
+  // A subtask runs the inherited subtask workflow, which has one state the
+  // Project workflow does not: the step check. It belongs to the working
+  // column, or a subtask in it would be on no column at all.
+  const inherited: Record<string, string[]> = {}
+  if (!workflow.states.some((state) => state.name === INHERITED_STEP_CHECK_STATE)) {
+    const home =
+      workflow.states.find((state) => state.name === 'in_progress') ??
+      workflow.states.find((state) => state.kind === 'active')
+    if (home) {
+      columnStates[home.column].push(INHERITED_STEP_CHECK_STATE)
+      inherited[home.column] = [INHERITED_STEP_CHECK_STATE]
+    }
+  }
+
   return columnOrder.map((col) => {
     const states = columnStates[col]
     const columnTasks = tasks.filter((task) => states.includes(task.status))
@@ -293,6 +377,7 @@ export function deriveColumns(workflow: WorkflowDefinition, tasks: Task[] = []):
       columnName: col,
       states,
       stateLabels,
+      ...(inherited[col] ? { inheritedStates: inherited[col] } : {}),
       subStates: Array.from(new Set(columnTasks.map((task) => task.status))),
       taskCount: columnTasks.length,
       isTerminal,
@@ -339,7 +424,20 @@ export function outgoingWorkflowEdges(
   fromState: string,
 ): WorkflowEdge[] {
   const state = workflow.states.find((candidate) => candidate.name === fromState)
-  if (!state) return []
+  if (!state) {
+    // The step check is a state of the inherited subtask workflow. Read
+    // against a Project workflow (the board), it keeps the gate's own exits:
+    // accept to done, return to the worker, cancel.
+    if (fromState !== INHERITED_STEP_CHECK_STATE) return []
+    const exits: Array<[WorkflowTrigger, string]> = [
+      ['accept', 'done'],
+      ['reject', 'in_progress'],
+      ['fail', workflow.cancellation_state ?? 'cancelled'],
+    ]
+    return exits
+      .filter(([, to]) => workflow.states.some((candidate) => candidate.name === to))
+      .map(([trigger, to]) => ({ from: fromState, to, trigger }))
+  }
   const edges = Object.entries(state.triggers ?? {})
     .filter(
       (entry): entry is [WorkflowTrigger, NonNullable<(typeof state.triggers)[WorkflowTrigger]>] =>

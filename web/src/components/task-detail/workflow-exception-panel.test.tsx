@@ -155,4 +155,24 @@ describe('WorkflowExceptionPanel offers', () => {
       reason: 'Verified independently',
     })
   })
+  it('says what a spent re-plan budget means beside the offered Retry', () => {
+    const root = task([{ ...retry, label: 'Retry with a new budget' }])
+    root.condition = {
+      kind: 'parked',
+      primary: { kind: 'budget_exhausted', budget_kind: 'replan' },
+      additional: [],
+      resume: { kind: 'reconcile' },
+      since: null,
+      details: { ...root.condition.details, blocked: true },
+    } as Task['condition']
+    render(<WorkflowExceptionPanel task={root} />)
+    const notice = screen.getByTestId('budget-exhausted-notice').textContent ?? ''
+    expect(notice).toContain('Re-plan budget spent')
+    expect(notice).toContain('subtasks are held')
+    expect(screen.getByRole('button', { name: 'Retry with a new budget' })).toBeTruthy()
+  })
+  it('adds no budget note to another exception', () => {
+    render(<WorkflowExceptionPanel task={task([retry])} />)
+    expect(screen.queryByTestId('budget-exhausted-notice')).toBeNull()
+  })
 })

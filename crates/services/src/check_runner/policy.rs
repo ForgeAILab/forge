@@ -74,12 +74,14 @@ static TEST_GENERATIONS: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::n
 
 /// Installations whose login shell does not answer, for a test of the
 /// unavailable path. Scoped by installation like the generations above.
-#[cfg(test)]
+/// Under `test-support` too: an api test drives the owner's Retry of a
+/// review entry through REST with it.
+#[cfg(any(test, feature = "test-support"))]
 static TEST_UNANSWERED: Mutex<std::collections::BTreeSet<String>> =
     Mutex::new(std::collections::BTreeSet::new());
 
-#[cfg(test)]
-pub(crate) async fn silence_login_shell_for_test(db: &db::SqliteDb, silent: bool) -> Result<()> {
+#[cfg(any(test, feature = "test-support"))]
+pub async fn silence_login_shell_for_test(db: &db::SqliteDb, silent: bool) -> Result<()> {
     let installation = salt(db).await?;
     let mut unanswered = TEST_UNANSWERED.lock().unwrap_or_else(|p| p.into_inner());
     if silent {
@@ -177,7 +179,7 @@ pub async fn attest(
             .cloned()
             .unwrap_or(generation)
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let silent = {
         let installation = salt(db).await?;
         TEST_UNANSWERED
@@ -185,7 +187,7 @@ pub async fn attest(
             .unwrap_or_else(|p| p.into_inner())
             .contains(&installation)
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if silent {
         return attest_for_generation(db, project, &generation, || async {
             Err(check_executor::ProbeUnanswered::TimedOut)

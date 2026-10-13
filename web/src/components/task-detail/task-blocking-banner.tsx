@@ -2,6 +2,7 @@ import type { InterruptionMetadata, Task } from '@/types/generated'
 import {
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
+  budgetExhaustedNotice,
   checkWaitNotice,
   getTaskWaitNotice,
   getTaskWorkflowWarning,
@@ -57,6 +58,20 @@ export function TaskBlockingBanner({ task }: { task: Task }) {
   const staleAnnotation = getStaleBlockingAnnotation(task)
   const workflowWarning = getTaskWorkflowWarning(task)
   if (task.status === 'cancelled') return null
+
+  // A spent budget the web names itself (the lead's re-plans): the server's
+  // blocked record carries the mechanism, this says what it means and the way out.
+  const budgetNotice = budgetExhaustedNotice(task)
+  if (budgetNotice) {
+    return (
+      <section className="rounded-lg border border-amber-300 bg-amber-50 p-4 text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-200">
+        <div className="space-y-1.5">
+          <p className="text-sm font-semibold">{budgetNotice.title}</p>
+          <p className="text-sm">{budgetNotice.message}</p>
+        </div>
+      </section>
+    )
+  }
 
   if (task.condition.details.failed && task.condition.details.interruption) {
     return <InterruptionBanner title="Task Failed" metadata={task.condition.details.interruption} tone="failed" />

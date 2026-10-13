@@ -12,10 +12,10 @@ import {
 import { qk } from '@/api/query-keys'
 import {
   type AssigneeSelection,
-  AgentAssigneeDropdown,
   TaskStatusBadge,
   TaskStatusDropdown,
 } from '@/components/task-controls'
+import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-role-assignees'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
 import { TaskPlacementDiagnostics } from '@/components/task-detail/task-placement-diagnostics'
 import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
@@ -35,6 +35,7 @@ import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { roleAssignmentErrorMessage } from '@/lib/root-lead'
 import { TaskActionButtons } from './task-action-buttons'
 import { useEffect, useState, type ReactNode } from 'react'
 import type {
@@ -87,6 +88,16 @@ export function TaskDetailSidebar({
   const projectId = task?.project_id ?? ''
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
+  // A root Task with subtasks is a coordination root: its planning role is
+  // the lead. The subtasks panel reads the same relations, so this is cached.
+  const rootRelations = useTaskRelationsQuery(
+    task?.id ?? '',
+    projectId,
+    Boolean(task) && task?.parent_task_id == null,
+  )
+  const isCoordinationRoot =
+    task?.parent_task_id == null &&
+    ((rootRelations.data?.subtasks.length ?? 0) > 0 || task?.effective_lead?.source === 'own')
   const [pendingSelection, setPendingSelection] = useState<{
     roleName: string
     selection: AssigneeSelection
@@ -121,7 +132,11 @@ export function TaskDetailSidebar({
       selection,
       resetWorkspace: resetFlags?.resetWorkspace,
       resetWorktree: resetFlags?.resetWorktree,
-      onError: (error) => toast.error(getTaskDetailApiErrorMessage(error, 'Assignment failed')),
+      onError: (error) =>
+        toast.error(
+          roleAssignmentErrorMessage(error) ??
+            getTaskDetailApiErrorMessage(error, 'Assignment failed'),
+        ),
     })
   }
 
@@ -177,8 +192,13 @@ export function TaskDetailSidebar({
                   <TaskStatusBadge status={task.status} />
                 )}
               </span>
+              <span className="mt-2 block empty:hidden">
+                <TaskStepCheck task={task} workflow={effectiveWorkflow} agentName={agentName} />
+              </span>
             </SidebarField>
 
+            {/* Seam (stage 4): the `lead_input` human boundary (a lead's question
+                for the owner) gets its own label and answer control here. */}
             {task.condition.details.human_wait ? (
               <SidebarField label={task.status === 'planning' ? 'Plan' : 'Review'}>
                 <Badge className="border-transparent bg-violet-100 text-violet-900 dark:bg-violet-950 dark:text-violet-300 text-[11px]">
@@ -191,38 +211,24 @@ export function TaskDetailSidebar({
               const roles = effectiveWorkflow?.roles ?? [
                 { name: 'coder', display_name: 'Coder', description: '' },
               ]
-              const orderedRoles = [
-                ...roles.filter((r) => r.name === coderRole),
-                ...roles.filter((r) => r.name !== coderRole),
-              ]
               return (
                 <SidebarField label="Assignees">
                   <div
                     className="flex flex-wrap gap-1.5"
                     title={terminal ? 'task is terminal; cannot reassign' : undefined}
                   >
-                    {orderedRoles.map((role) => {
-                      const existing = task.role_assignments.find(
-                        (ra) => ra.role_name === role.name,
-                      )
-                      return (
-                        <span key={role.name}>
-                          <AgentAssigneeDropdown
-                            agents={projectAgentsData ?? []}
-                            members={membersData}
-                            disabled={terminal || rolePicker.isPending}
-                            fallbackName={assignmentAgentName(existing, agentName)}
-                            value={assignmentSelection(existing)}
-                            variant="chip"
-                            roleLabel={role.display_name || role.name}
-                            requiredNow={currentRole === role.name}
-                            onChange={(selection) =>
-                              handleRoleSelection(role.name, existing, selection)
-                            }
-                          />
-                        </span>
-                      )
-                    })}
+                    <TaskRoleAssignees
+                      task={task}
+                      roles={roles}
+                      coderRole={coderRole}
+                      currentRole={currentRole}
+                      isCoordinationRoot={isCoordinationRoot}
+                      agents={projectAgentsData ?? []}
+                      members={membersData}
+                      disabled={terminal || rolePicker.isPending}
+                      agentName={agentName}
+                      onSelect={handleRoleSelection}
+                    />
                   </div>
                 </SidebarField>
               )
@@ -265,7 +271,10 @@ export function TaskDetailSidebar({
             {(task.placement ?? task.workspace?.placement) ? (
               <div className="pb-4">
                 <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} pendingRemoteCancelCount={task.workspace?.pending_remote_cancel.length ?? 0} />
-                <TaskPlacementDiagnostics diagnostics={task.placement_diagnostics ?? []} />
+                <TaskPlacementDiagnostics
+                  diagnostics={task.placement_diagnostics ?? []}
+                  hasLead={task.effective_lead?.source === 'own'}
+                />
               </div>
             ) : null}
 
@@ -426,26 +435,6 @@ function SidebarField({
       {children}
     </div>
   )
-}
-
-function assignmentSelection(assignment?: TaskRoleAssignmentResponse): AssigneeSelection {
-  if (!assignment) return { type: 'unassigned' }
-  if (assignment.assignee_type === 'agent' && assignment.assignee_id) {
-    return { type: 'agent', agentId: assignment.assignee_id }
-  }
-  if (assignment.assignee_type === 'user') {
-    return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
-  }
-  return { type: 'unassigned' }
-}
-
-function assignmentAgentName(
-  assignment: TaskRoleAssignmentResponse | undefined,
-  agentName: (agentId?: string | null) => string | undefined | null,
-): string | undefined {
-  return assignment?.assignee_type === 'agent' && assignment.assignee_id
-    ? (agentName(assignment.assignee_id) ?? assignment.assignee_id)
-    : undefined
 }
 
 function sameSelection(

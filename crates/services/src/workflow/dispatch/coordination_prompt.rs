@@ -295,6 +295,49 @@ Step-check doctrine:
 - Read the step's own changes (the commits this subtask added to the shared branch) and the validation its worker recorded. Your tools are read-only: you cannot run commands or tests, so judge from the code and the recorded results. Do not review earlier steps again.
 - Must not modify code or files in the workspace, write a plan, or mark anything done.";
 
+/// The step's diff as per-run input (never part of the stable system text).
+fn step_diff_section(step_diff: &super::StepDiff) -> String {
+    match step_diff {
+        super::StepDiff::Loaded {
+            base_sha,
+            since_previous_step,
+            files_changed,
+            additions,
+            deletions,
+            diff,
+            truncated,
+        } => {
+            let base = base_sha.get(..12).unwrap_or(base_sha);
+            let since = if *since_previous_step {
+                "the end of the previous step"
+            } else {
+                "the root's branch point; no earlier step recorded where it ended, so changes of earlier steps are included"
+            };
+            if diff.trim().is_empty() {
+                return format!(
+                    "\nThe step's changes: the shared workspace has no difference against {base} ({since}).\n"
+                );
+            }
+            let mut section = format!(
+                "\nThe step's changes: git diff of the shared workspace against {base} ({since}); {files_changed} file(s), +{additions} -{deletions}:\n```diff\n{diff}"
+            );
+            if !section.ends_with('\n') {
+                section.push('\n');
+            }
+            section.push_str("```\n");
+            if *truncated {
+                section.push_str(
+                    "[diff truncated at 32 KiB: read the changed files in the workspace for the rest]\n",
+                );
+            }
+            section
+        }
+        super::StepDiff::Unavailable { reason } => format!(
+            "\nThe step's diff could not be loaded ({reason}). Read the step's changes in the workspace.\n"
+        ),
+    }
+}
+
 impl PromptBuilder for StepCheckPromptBuilder {
     fn id(&self) -> &'static str {
         BUILDER_ID_PLANNER_STEP_CHECK_V1
@@ -338,6 +381,9 @@ impl PromptBuilder for StepCheckPromptBuilder {
                 user.push_str(line);
             }
         }
+        if let Some(step_diff) = ctx.step_diff.as_ref() {
+            user.push_str(&step_diff_section(step_diff));
+        }
         user.push_str("\nDecide: pass or fail, with the result block.\n");
 
         AgentPrompt {
@@ -347,5 +393,37 @@ impl PromptBuilder for StepCheckPromptBuilder {
             user,
             tools: vec!["read_files".to_owned()],
         }
+    }
+}
+
+#[cfg(test)]
+mod step_diff_tests {
+    use super::*;
+
+    #[test]
+    fn the_step_diff_section_marks_its_base_its_cut_and_a_failed_load() {
+        let loaded = |since_previous_step, truncated| super::super::StepDiff::Loaded {
+            base_sha: "0123456789abcdef0123".to_owned(),
+            since_previous_step,
+            files_changed: 1,
+            additions: 2,
+            deletions: 0,
+            diff: "diff --git a/a.txt b/a.txt\n+one\n+two".to_owned(),
+            truncated,
+        };
+        let section = step_diff_section(&loaded(true, false));
+        assert!(section
+            .contains("against 0123456789ab (the end of the previous step); 1 file(s), +2 -0:"));
+        assert!(section.contains("```diff\ndiff --git a/a.txt b/a.txt\n+one\n+two\n```\n"));
+        assert!(!section.contains("[diff truncated"));
+        let section = step_diff_section(&loaded(false, true));
+        assert!(section.contains("the root's branch point"));
+        assert!(section.ends_with(
+            "[diff truncated at 32 KiB: read the changed files in the workspace for the rest]\n"
+        ));
+        let section = step_diff_section(&super::super::StepDiff::Unavailable {
+            reason: "workspace is not ready".to_owned(),
+        });
+        assert!(section.contains("could not be loaded (workspace is not ready)"));
     }
 }

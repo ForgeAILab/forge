@@ -1360,10 +1360,9 @@ export interface HookResultEntry {
   error: string | null
 }
 
-export type TransitionBridgeKind =
-  | 'review_refresh' | 'target_moved_rebase' | 'conflict_handoff'
-  | 'retry_window_reset' | 'recovery' | 'gate_skipped' | 'gate_approved'
-  | 'gate_rejected' | 'ci_only_review_passed' | 'review_carry'
+// The generated binding is the one definition (it carries `replan`).
+import type { TransitionBridgeKind } from './bindings/TransitionBridgeKind'
+export type { TransitionBridgeKind } from './bindings/TransitionBridgeKind'
 
 export interface TransitionLogEntry {
   bridge_kind: TransitionBridgeKind | null

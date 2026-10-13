@@ -149,15 +149,6 @@ export function assignmentSelection(
   return { type: 'unassigned' }
 }
 
-export function assignmentAgentName(
-  assignment: Task['role_assignments'][number] | undefined,
-  agentName: (agentId?: string | null) => string | undefined,
-): string | undefined {
-  return assignment?.assignee_type === 'agent' && assignment.assignee_id
-    ? (agentName(assignment.assignee_id) ?? assignment.assignee_id)
-    : undefined
-}
-
 export function splitDiffIntoFiles(rawDiff: string): ParsedDiffFile[] {
   if (!rawDiff.trim()) return []
   const chunks = rawDiff.split(/^diff --git /m)

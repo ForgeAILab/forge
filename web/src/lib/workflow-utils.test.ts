@@ -2,16 +2,22 @@ import { describe, expect, it } from 'vitest'
 
 import {
   blockedInterruption,
+  budgetExhaustedNotice,
   checkWait,
   checkWaitNotice,
   deriveColumns,
   getBlockingAnnotation,
   getStaleBlockingAnnotation,
   getTaskWaitNotice,
+  getStateColors,
+  getValidDropColumns,
   getTaskWorkflowWarning,
+  groupByColumns,
+  isActiveStatus,
   isTaskBlocked,
   matchesFilters,
   outgoingWorkflowEdges,
+  showsSubState,
   taskTypes,
   taskHasError,
   workflowTriggerTargets,
@@ -73,7 +79,92 @@ describe('deriveColumns', () => {
     const columns = deriveColumns(workflow)
 
     expect(columns.map((column) => column.primaryState)).toEqual(['todo', 'in_progress', 'review'])
-    expect(columns[1].states).toEqual(['planning', 'in_progress'])
+    expect(columns[1].states).toEqual(['planning', 'in_progress', 'lead_check'])
+  })
+
+  it('puts a subtask in lead_check on the working column of a workflow that has no such state', () => {
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      states: [
+        state('todo', 'initial', 'Todo', 'Todo'),
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('review', 'gate', 'Review', 'Review'),
+        state('done', 'terminal', 'Done', 'Done'),
+      ],
+      configuration: [],
+      cancellation_state: null,
+    }
+    const checking = taskListItem({ id: 'sub', parent_task_id: 'root', status: 'lead_check' })
+    const working = taskListItem({ id: 'other', status: 'in_progress' })
+    const columns = deriveColumns(workflow, [checking, working])
+    const column = columns.find((candidate) => candidate.primaryState === 'in_progress')!
+
+    expect(column.states).toEqual(['in_progress', 'lead_check'])
+    expect(column.inheritedStates).toEqual(['lead_check'])
+    expect(column.stateLabels?.lead_check).toBe('Lead Check')
+    expect(column.taskCount).toBe(2)
+    expect(column.isTerminal).toBe(false)
+    expect(groupByColumns([checking, working], columns).in_progress.map((task) => task.id)).toEqual([
+      'sub',
+      'other',
+    ])
+    // Only the card in the inherited state shows its state; the column stays single-state.
+    expect(showsSubState(column, 'lead_check')).toBe(true)
+    expect(showsSubState(column, 'in_progress')).toBe(false)
+    // The other columns are untouched.
+    expect(columns.filter((candidate) => candidate.inheritedStates).length).toBe(1)
+  })
+
+  it('gives a lead_check card on a Project workflow the exits of the gate', () => {
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      states: [
+        state('todo', 'initial', 'Todo', 'Todo'),
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('review', 'gate', 'Review', 'Review'),
+        state('done', 'terminal', 'Done', 'Done'),
+        state('cancelled', 'terminal', 'Cancelled', 'Cancelled'),
+      ],
+      configuration: [],
+      cancellation_state: 'cancelled',
+    }
+    expect(outgoingWorkflowEdges(workflow, 'lead_check')).toEqual([
+      { from: 'lead_check', to: 'done', trigger: 'accept' },
+      { from: 'lead_check', to: 'in_progress', trigger: 'reject' },
+      { from: 'lead_check', to: 'cancelled', trigger: 'fail' },
+    ])
+    expect(getValidDropColumns(workflow, 'lead_check')).toEqual(['done', 'in_progress', 'cancelled'])
+    // Never review: the step check is not a review.
+    expect(workflowTriggerTargets(workflow, 'lead_check')).not.toContain('review')
+    // A workflow without those states offers nothing it cannot reach, and any
+    // other unknown state still has no edges.
+    const bare = { ...workflow, states: [state('queued', 'initial', 'Queued', 'Queued')] }
+    expect(outgoingWorkflowEdges(bare, 'lead_check')).toEqual([])
+    expect(outgoingWorkflowEdges(workflow, 'some_unknown_state')).toEqual([])
+  })
+
+  it('keeps the state where the workflow itself defines lead_check', () => {
+    const workflow: WorkflowDefinition = {
+      roles: [],
+      states: [
+        state('todo', 'initial', 'Todo', 'Todo'),
+        state('in_progress', 'active', 'In Progress', 'In Progress'),
+        state('lead_check', 'gate', 'In Progress', 'Lead Check'),
+        state('done', 'terminal', 'Done', 'Done'),
+      ],
+      configuration: [],
+      cancellation_state: null,
+    }
+    const column = deriveColumns(workflow)[1]
+    expect(column.states).toEqual(['in_progress', 'lead_check'])
+    expect(column.inheritedStates).toBeUndefined()
+    expect(showsSubState(column, 'in_progress')).toBe(true)
+  })
+
+  it('colours lead_check as work in progress, never as an unknown state', () => {
+    expect(getStateColors('lead_check').dot).toBe('bg-orange-400')
+    expect(getStateColors('lead_check').bg).not.toContain('purple')
+    expect(isActiveStatus('lead_check')).toBe(true)
   })
 })
 
@@ -362,5 +453,62 @@ describe('integration conditions', () => {
     ).toBe('Waiting for dependencies')
     expect(getTaskWaitNotice(parked({ kind: 'dependencies', cancelled: true, dependency_ids: ['a'] }))).toBeNull()
     expect(getTaskWaitNotice(parked({ kind: 'held', actor: 'user' }))).toBeNull()
+  })
+
+  const details = { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false }
+  const parkedOn = (primary: Record<string, unknown>, overrides: Record<string, unknown> = {}) =>
+    taskListItem({
+      ...overrides,
+      condition: { kind: 'parked', primary, additional: [], resume: { kind: 'reconcile' }, since: null, details },
+    } as never)
+
+  it("says a subtask waits for the lead's plan while its root plans", () => {
+    expect(getTaskWaitNotice(parkedOn({ kind: 'parent', parent_id: 'root', cause: 'planning' }))).toEqual({
+      title: "Waiting for the lead's plan",
+      message:
+        "The parent task's lead is planning. This subtask runs when the plan is done and the parent starts its subtasks.",
+    })
+    // A cause this build does not know still reads as a wait on the parent.
+    expect(
+      getTaskWaitNotice(parkedOn({ kind: 'parent', parent_id: 'root', cause: 'some_new_cause' }))?.title,
+    ).toBe('Waiting for parent task')
+  })
+
+  it('shows a root that left todo for in_progress as running its subtasks, not as stalled', () => {
+    const root = parkedOn(
+      { kind: 'children', root_id: 'root', remaining: ['a', 'b'] },
+      { status: 'in_progress' },
+    )
+    expect(getTaskWaitNotice(root)).toEqual({
+      title: 'Running subtasks',
+      message: '2 subtasks are unfinished. This task goes to review when they are done.',
+    })
+    expect(
+      getTaskWaitNotice(parkedOn({ kind: 'children', root_id: 'root', remaining: ['a'] }))?.message,
+    ).toContain('One subtask is unfinished')
+    expect(isTaskBlocked(root)).toBe(false)
+    expect(taskHasError(root)).toBe(false)
+
+    // Its lead's plan run completed with checklist items open: that is not a stalled Task.
+    const withPlan = {
+      ...root,
+      plan_progress: { remaining: 3 },
+      execution_observability: { active_execution_id: null, latest_execution_status: 'completed' },
+    } as never
+    expect(getTaskWorkflowWarning(withPlan)).toBeNull()
+  })
+
+  it('names the spent re-plan budget and leaves other budgets to the server record', () => {
+    const replan = parkedOn({ kind: 'budget_exhausted', budget_kind: 'replan' })
+    expect(budgetExhaustedNotice(replan)?.title).toBe('Re-plan budget spent')
+    expect(budgetExhaustedNotice(replan)?.message).toContain('Retry with a new budget')
+    expect(budgetExhaustedNotice(parkedOn({ kind: 'budget_exhausted', budget_kind: 'review' }))).toBeNull()
+    expect(budgetExhaustedNotice(parkedOn({ kind: 'budget_exhausted', budget_kind: null }))).toBeNull()
+    expect(budgetExhaustedNotice(taskListItem({}))).toBeNull()
+    // As a secondary reason it is still named.
+    const secondary = parkedOn({ kind: 'held', actor: 'user' })
+    if (secondary.condition.kind !== 'parked') throw new Error('fixture')
+    secondary.condition.additional = [{ kind: 'budget_exhausted', budget_kind: 'replan' }]
+    expect(budgetExhaustedNotice(secondary)?.title).toBe('Re-plan budget spent')
   })
 })

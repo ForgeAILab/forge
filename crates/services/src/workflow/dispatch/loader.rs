@@ -8,7 +8,9 @@ use db::{
 use executors::{LogEntry, LogKind};
 use serde_json::Value;
 
-use crate::workflow::dispatch::{TaskDelivery, EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD};
+use crate::workflow::dispatch::{
+    StepDiff, TaskDelivery, EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD, STEP_DIFF_LIMIT,
+};
 use crate::{workflow::dispatch::AgentDispatchContext, Result, ServiceError};
 
 const REVIEW_FEEDBACK_LIMIT: usize = 12_000;
@@ -123,6 +125,16 @@ pub async fn load_agent_dispatch_context(
         task.task_state_config.as_deref(),
     );
 
+    let step_diff = match task.parent_task_id.as_deref() {
+        Some(root_id)
+            if role == db::inherited_subtask::STEP_CHECK_ROLE
+                && state_name == db::inherited_subtask::STEP_CHECK_STATE =>
+        {
+            load_step_diff(&db, router, &task, root_id).await?
+        }
+        _ => None,
+    };
+
     Ok(AgentDispatchContext {
         task,
         role: role.to_string(),
@@ -143,7 +155,86 @@ pub async fn load_agent_dispatch_context(
         read_only_task,
         delivery,
         review_ci_steps,
+        step_diff,
     })
+}
+
+/// The diff of a finished step for its step check: the shared root workspace
+/// (uncommitted leftovers included) against the commit the step started from.
+///
+/// That commit is the head recorded when the last run of an earlier sibling
+/// ended (a step check always records it: it is a read-only run; a native
+/// worker records it too), and the root workspace's branch point when no
+/// earlier run recorded one. It is read through the workspace backend, so an
+/// embedded and a daemon-owned workspace answer alike. A diff that cannot be
+/// read never fails the dispatch: the prompt says so and the lead reads the
+/// workspace.
+async fn load_step_diff(
+    db: &db::SqliteDb,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    task: &db::Task,
+    root_id: &str,
+) -> Result<Option<StepDiff>> {
+    let Some(workspace) = WorkspaceRepo::get_by_task_id(db, root_id).await? else {
+        return Ok(None);
+    };
+    let previous_step_head = sqlx::query_scalar::<_, String>(
+        "SELECT e.after_sha FROM execution e JOIN task sibling ON sibling.id = e.task_id
+         WHERE sibling.parent_task_id = ?1 AND sibling.id != ?2
+           AND e.after_sha IS NOT NULL AND e.after_sha != ''
+           AND e.created_at <= COALESCE(
+               (SELECT MIN(own.created_at) FROM execution own WHERE own.task_id = ?2),
+               e.created_at)
+         ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1",
+    )
+    .bind(root_id)
+    .bind(&task.id)
+    .fetch_optional(db.pool())
+    .await?;
+    let since_previous_step = previous_step_head.is_some();
+    let Some(base_sha) = previous_step_head.or_else(|| {
+        workspace
+            .before_sha
+            .clone()
+            .filter(|sha| !sha.trim().is_empty())
+    }) else {
+        return Ok(Some(StepDiff::Unavailable {
+            reason: "no commit is recorded as the start of this step".to_owned(),
+        }));
+    };
+    let loaded = async {
+        let resolved = router.resolve(db, &workspace).await?;
+        resolved
+            .backend
+            .diff(
+                &resolved.placement,
+                &crate::workspace_backend::DiffSpec {
+                    base_ref: base_sha.clone(),
+                    head_ref: None,
+                    max_bytes: STEP_DIFF_LIMIT,
+                },
+            )
+            .await
+    }
+    .await;
+    Ok(Some(match loaded {
+        Ok(diff) => StepDiff::Loaded {
+            base_sha,
+            since_previous_step,
+            files_changed: diff.response.stats.files_changed,
+            additions: diff.response.stats.total_additions,
+            deletions: diff.response.stats.total_deletions,
+            diff: diff.response.diff,
+            truncated: diff.truncated,
+        },
+        Err(error) => {
+            let reason = ServiceError::from(error).to_string();
+            tracing::warn!(task_id = %task.id, %reason, "step diff could not be loaded");
+            StepDiff::Unavailable {
+                reason: reason.chars().take(300).collect(),
+            }
+        }
+    }))
 }
 
 /// The delivery channel of the Agent assigned to `role`. An unassigned role

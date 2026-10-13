@@ -151,6 +151,33 @@ pub struct AgentDispatchContext {
     pub delivery: TaskDelivery,
     /// Checks Forge runs before review; see [`required_checks_section`].
     pub review_ci_steps: Vec<String>,
+    /// The step's own changes, loaded for a step check only.
+    pub step_diff: Option<StepDiff>,
+}
+
+/// Bound on the diff embedded in a step-check prompt.
+pub const STEP_DIFF_LIMIT: usize = 32 * 1024;
+
+/// The changes a finished subtask left in the shared workspace, for the
+/// lead's step check: the workspace against the commit the step started from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDiff {
+    Loaded {
+        /// The commit the diff starts from.
+        base_sha: String,
+        /// Whether that commit is the end of the previous step (a recorded
+        /// head) or, with none recorded, the root's branch point: then the
+        /// diff also holds the earlier steps.
+        since_previous_step: bool,
+        files_changed: u64,
+        additions: u64,
+        deletions: u64,
+        /// At most [`STEP_DIFF_LIMIT`] bytes.
+        diff: String,
+        truncated: bool,
+    },
+    /// The diff could not be read; the lead reads the workspace instead.
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

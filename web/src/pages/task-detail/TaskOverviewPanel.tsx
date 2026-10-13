@@ -5,16 +5,16 @@ import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
-import { visibleRemainingBudgets } from '@/lib/retry-budget-display'
+import { budgetLabel, visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
 import {
   type AssigneeSelection,
-  AgentAssigneeDropdown,
   TaskStatusDropdown,
 } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
 import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
+import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-role-assignees'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
@@ -31,9 +31,9 @@ import type {
   
   RoleDefinition,
   Task,
+  WorkflowDefinition,
 } from '@/types/generated'
 import {
-  assignmentAgentName,
   budgetValue,
   formatDate,
   readTaskStateConfig,
@@ -60,6 +60,10 @@ interface TaskOverviewPanelProps {
   terminal: boolean
   currentRole: string | null
   assignableRoles: RoleDefinition[]
+  coderRole: string
+  /** A root Task with subtasks: its planning role is the lead. */
+  isCoordinationRoot: boolean
+  workflow: Pick<WorkflowDefinition, 'states'> | undefined
   agents: Agent[]
   runSuffix: string
   workflowRetryBudgets: Record<string, unknown> | undefined
@@ -96,6 +100,9 @@ export function TaskOverviewPanel({
   terminal,
   currentRole,
   assignableRoles,
+  coderRole,
+  isCoordinationRoot,
+  workflow,
   runSuffix,
   workflowRetryBudgets,
   agentName,
@@ -426,31 +433,27 @@ export function TaskOverviewPanel({
                 className="flex flex-wrap gap-1.5"
                 title={terminal ? 'task is terminal; cannot reassign' : undefined}
               >
-                {assignableRoles.map((role) => {
-                  const assignment = task.role_assignments.find(
-                    (item) => item.role_name === role.name,
-                  )
-                  const roleDisabledReason = undefined
-                  return (
-                    <span key={role.name}>
-                      <AgentAssigneeDropdown
-                        agents={projectAgentsData ?? []}
-                        members={membersData}
-                        disabled={terminal || Boolean(roleDisabledReason) || rolePickerPending}
-                        fallbackName={assignmentAgentName(assignment, agentName)}
-                        requiredNow={currentRole === role.name}
-                        roleLabel={role.display_name || role.name}
-                        value={overviewAssignmentSelection(assignment)}
-                        variant="chip"
-                        onChange={(selection) => onAssigneeChange(role.name, selection)}
-                      />
-                    </span>
-                  )
-                })}
+                <TaskRoleAssignees
+                  task={task}
+                  roles={assignableRoles}
+                  coderRole={coderRole}
+                  currentRole={currentRole}
+                  isCoordinationRoot={isCoordinationRoot}
+                  agents={projectAgentsData ?? []}
+                  members={membersData}
+                  disabled={terminal || rolePickerPending}
+                  agentName={agentName}
+                  onSelect={(roleName, _current, selection) =>
+                    onAssigneeChange(roleName, selection)
+                  }
+                />
               </div>
               {rolePickerPending ? (
                 <p className="mt-1 text-xs text-muted-foreground">Updating assignee...</p>
               ) : null}
+              <div className="mt-2 empty:hidden">
+                <TaskStepCheck task={task} workflow={workflow} agentName={agentName} />
+              </div>
             </div>
 
             <div className="flex items-center gap-3">
@@ -492,7 +495,7 @@ export function TaskOverviewPanel({
                 <span className="font-medium uppercase tracking-wide">Remaining budget</span>
                 {remainingBudgets.map(([key, value]) => (
                   <span key={key}>
-                    {key.replace(/_/g, ' ')}:{' '}
+                    {budgetLabel(key)}:{' '}
                     <span className="font-mono text-foreground">{value}</span>
                   </span>
                 ))}
@@ -596,15 +599,3 @@ export function TaskOverviewPanel({
   )
 }
 
-function overviewAssignmentSelection(
-  assignment?: Task['role_assignments'][number],
-): AssigneeSelection {
-  if (!assignment) return { type: 'unassigned' }
-  if (assignment.assignee_type === 'agent' && assignment.assignee_id) {
-    return { type: 'agent', agentId: assignment.assignee_id }
-  }
-  if (assignment.assignee_type === 'user') {
-    return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
-  }
-  return { type: 'unassigned' }
-}
