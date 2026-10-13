@@ -104,8 +104,11 @@ impl ConditionStatement {
             ParkReason::EntryBlocked { .. }
             | ParkReason::PlacementDenied { .. }
             | ParkReason::DaemonUpgradeRequired { .. }
-            | ParkReason::ProjectPaused { .. }
             | ParkReason::PlanSettlementWait { .. } => true,
+            // A scheduler pause (no state) is an observer park. Restate it
+            // from the epoch-fenced schedule record instead of carrying it
+            // ahead of a check or retaining it after the Project resumes.
+            ParkReason::ProjectPaused { state } => state.is_some(),
             ParkReason::BudgetExhausted { source, .. } => source.field == Field::EntryBarrierJson,
             ParkReason::HumanDecision { source, .. } => source.field == Field::MetadataJson,
             ParkReason::UnknownCondition { source, .. } => {

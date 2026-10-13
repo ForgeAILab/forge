@@ -1019,6 +1019,40 @@ impl TaskService {
                     Ok(claimed.task)
                 }
                 "manually_held" | "role_retry" | "merge_fix_retry" => {
+                    // An accepted lead recovery is a new subtask window, even
+                    // when admission queued it as a role retry. Never validate
+                    // under the gate's spent window. The queue ID fences the
+                    // reset receipt; redelivery before admission sees zero
+                    // spending and cannot open another window.
+                    let task = if task.parent_task_id.is_some()
+                        && task.status == crate::workflow::default_states::LEAD_CHECK
+                        && matches!(&request.action, api_types::TaskAction::Retry { .. })
+                        && request
+                            .offer
+                            .authority
+                            .contains(&api_types::ActionAuthority::Lead)
+                        && db::budget::spent(
+                            self.db.pool(),
+                            &task.id,
+                            &db::budget::gate_key(&task.status),
+                        )
+                        .await?
+                            > 0
+                    {
+                        let mut marker = recovery_marker(
+                            &task.id,
+                            &task.status,
+                            "retry",
+                            &request.actor,
+                            "lead recovery opened a fresh step-check window",
+                        );
+                        marker.id = queued.id.clone();
+                        marker.bridge = api_types::TransitionBridge::recovery("retry", true);
+                        self.clear_retry_exhausted_blocking_metadata_with_marker(&task, marker)
+                            .await?
+                    } else {
+                        task
+                    };
                     let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                         .await?
                         .ok_or_else(|| {

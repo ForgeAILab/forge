@@ -641,7 +641,32 @@ impl TaskService {
         if role_name != crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE {
             return Ok(());
         }
-        for child in crate::task_hierarchy::ordered_children(&self.db, root_id).await? {
+        let children = crate::task_hierarchy::ordered_children(&self.db, root_id).await?;
+        if !children.is_empty() {
+            let root = TaskRepo::get_by_id(&*self.db, root_id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", root_id.to_owned()))?;
+            let workflow = self.workflow_for_task(&root).await?;
+            let policy = crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow);
+            let assignments = TaskRoleAssignmentRepo::list_by_task(&*self.db, root_id).await?;
+            let lead = policy.lead(root_id, &assignments);
+            for execution in ExecutionRepo::list_running_by_task(&*self.db, root_id).await? {
+                if policy.planning_state() == Some(root.status.as_str())
+                    && execution.role == role_name
+                    && lead.is_none_or(|assignment| assignment.assignee_id != execution.agent_id)
+                {
+                    self.cancel_active_execution(
+                        &execution,
+                        "the root's lead changed",
+                        db::StopReason::RoleReassigned,
+                        &api_types::Actor::user(api_types::UserActionSource::RoleReassignment),
+                        db::ResumePolicy::None,
+                    )
+                    .await?;
+                }
+            }
+        }
+        for child in children {
             if crate::task_hierarchy::step_check_root(&child, role_name).is_none()
                 || child.status != crate::workflow::default_states::LEAD_CHECK
             {

@@ -427,6 +427,11 @@ impl TaskDispatcher {
                     "not_coordinating"
                 };
                 f.parent_wait = Some((parent.id.clone(), cause.to_owned()));
+            } else if !f.child_ready {
+                // The root may be implementing while an earlier sibling
+                // waits for an owner. This child still needs a typed wait,
+                // independent of whether another execution holds a slot.
+                f.parent_wait = Some((parent.id.clone(), "sequence".to_owned()));
             }
         }
         if let Some(role) = role {

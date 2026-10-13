@@ -357,7 +357,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 6;
+pub const MAPPING_REVISION: i64 = 7;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -1568,8 +1568,9 @@ impl SqliteDb {
     /// with their mapping; integration is validated from its typed witness.
     /// A condition is refused unless those owners agree under the
     /// witnesses it states itself. Those witnesses are the producer's claim:
-    /// they are not re-read here (the invariant check does that), so stating a
-    /// condition costs no fact query.
+    /// they are not re-read here (the invariant check does that). The only
+    /// observer read is the epoch-fenced scheduler park, which the witnesses
+    /// do not own; it is checked in this same transaction.
     /// The shadow write bumps no version and emits no event or Attention.
     pub async fn set_condition(
         &self,
@@ -1657,12 +1658,25 @@ impl SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
+        // Scheduler parks are epoch-fenced observer facts, not owned
+        // witnesses. Compare the statement under the actual observer record,
+        // in this transaction, so a pause/parent/Agent wait cannot make an
+        // otherwise valid check or integration statement disagree with itself.
+        let owner_park: Option<String> = sqlx::query_scalar(
+            "SELECT reason_json FROM task_schedule_park WHERE task_id=? AND epoch=?",
+        )
+        .bind(task_id)
+        .bind(row.get::<i64, _>(8))
+        .fetch_optional(&mut **tx)
+        .await?;
+        let owner_park = owner_park.and_then(|raw| serde_json::from_str(&raw).ok());
         let stated = ConditionFacts::recover(condition)
             .filter(|facts| facts.task_id == task_id)
             .map(|mut facts| {
                 facts.version = expected_version;
                 facts.state = row.get(7);
                 facts.children_pending = facts::children_pending(bare.metadata_json.as_deref());
+                facts.owner_park = owner_park;
                 facts
             })
             .filter(|facts| facts.epoch == row.get::<i64, _>(8));

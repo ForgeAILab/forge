@@ -206,17 +206,32 @@ impl CrashRecovery {
                 "suspended stale native agent sessions from previous process"
             );
         }
-        let tasks = self.list_in_progress_tasks(None).await?;
+        let tasks = self.list_recoverable_tasks(None).await?;
         let mut recovered = 0;
 
         for task in tasks {
             // One live recovery command per Task and running-execution set:
             // repeated restarts before the queue drains do not stack copies.
-            let mut running = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
-                .await?
+            let executions = ExecutionRepo::list_running_by_task(&*self.db, &task.id).await?;
+            // The retired inline review owner has its own startup settlement
+            // below, which explains the stop and re-enters review. Do not let
+            // a generic gate recovery consume that owner's executions first.
+            if executions
+                .iter()
+                .any(crate::task_service::retired_review_rerun)
+            {
+                continue;
+            }
+            let mut running = executions
                 .into_iter()
                 .map(|execution| execution.id)
                 .collect::<Vec<_>>();
+            if running.is_empty() {
+                // A gate may own a suspended check entry, without an agent
+                // execution to recover. Do not put a recovery behind that
+                // entry: it could cancel the new role the entry later starts.
+                continue;
+            }
             running.sort();
             let key = format!("recover_task_after_restart:{}", running.join(","));
             let prefix = format!("{key}:");
@@ -322,8 +337,8 @@ impl CrashRecovery {
     }
 
     #[tracing::instrument(skip(self), fields(agent_id = agent_id.unwrap_or("any")))]
-    async fn list_in_progress_tasks(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
-        list_in_progress_tasks(&self.db, agent_id).await
+    async fn list_recoverable_tasks(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
+        list_recoverable_tasks(&self.db, agent_id).await
     }
 }
 
@@ -749,7 +764,7 @@ impl HeartbeatMonitor {
                 },
             });
 
-            for task in list_in_progress_tasks(&self.db, Some(&agent.id)).await? {
+            for task in list_recoverable_tasks(&self.db, Some(&agent.id)).await? {
                 let outcome = recover_task(
                     &self.db,
                     task,
@@ -1247,19 +1262,22 @@ pub(crate) struct RecoverTaskOutcome {
     pub settled_executions: usize,
 }
 
-async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
+async fn list_recoverable_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
     for project in list_projects(db).await? {
+        // Role executions also run in gates. Subtasks may use states absent
+        // from the Project workflow, notably the inherited step-check gate.
         let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
-        let statuses: Vec<String> = workflow
+        let inherited = WorkflowEngine::resolve_subtask_workflow();
+        let mut statuses: Vec<String> = workflow
             .states
             .iter()
-            .filter(|state| state.kind == api_types::StateKind::Active)
+            .chain(&inherited.states)
+            .filter(|state| state.kind != api_types::StateKind::Terminal)
             .map(|state| state.name.clone())
             .collect();
-        if statuses.is_empty() {
-            continue;
-        }
+        statuses.sort();
+        statuses.dedup();
         let mut cursor = None;
         loop {
             let page = TaskRepo::list(
@@ -1279,11 +1297,15 @@ async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result
                 },
             )
             .await?;
-            tasks.extend(
-                page.items
-                    .into_iter()
-                    .filter(|task| task.assignee_type.as_deref() != Some("user")),
-            );
+            tasks.extend(page.items.into_iter().filter(|task| {
+                let workflow = WorkflowEngine::resolve_workflow_for_task(
+                    task,
+                    &project.workflow_definition,
+                    &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
+                );
+                task.assignee_type.as_deref() != Some("user")
+                    && workflow.state_kind(&task.status) != Some(api_types::StateKind::Terminal)
+            }));
             cursor = page.next_cursor;
             if cursor.is_none() {
                 break;

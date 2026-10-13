@@ -751,88 +751,33 @@ async fn upgrade_states_that_held_subtasks_before_still_hold_and_release() {
     assert_eq!(executions(&lead.db, &child.id).await.len(), 1);
 }
 
-/// Removing the lead while its planner runs must not start a subtask beside
-/// the planner: a root and its subtasks have one running execution at most.
+/// Removing the lead stops its planning run before releasing the subtasks.
 #[tokio::test]
-async fn removing_the_lead_while_it_plans_never_runs_a_subtask_beside_the_planner() {
+async fn removing_the_lead_while_it_plans_stops_the_planner_and_starts_the_subtask() {
     let lead = lead_fixture(false).await;
     let (root, child) = root_with_child(&lead, true).await;
     passes(&lead, 3).await;
     assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
-    sqlx::query("DELETE FROM task_role_assignment WHERE task_id=? AND role_name='planner'")
-        .bind(&root.id)
-        .execute(lead.db.pool())
+    lead.dispatcher
+        .task_service
+        .remove_role(&root.id, "planner", false, false)
         .await
         .unwrap();
-    passes(&lead, 5).await;
-    let dump = state_dump(&lead.db).await;
-    eprintln!("REPORT lead removed while planning:\n{dump}");
-    let running = |runs: &[(String, String)]| {
-        runs.iter()
-            .filter(|(_, status)| status == "running")
-            .count()
-    };
-    // The run holds the root: nothing starts beside it, and both wait typed.
+    until(
+        &lead,
+        "the child runs without the removed lead",
+        async || !executions(&lead.db, &child.id).await.is_empty(),
+    )
+    .await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
     assert_eq!(
-        reload(&lead.db, &root.id).await.status,
-        "planning",
-        "{dump}"
+        executions(&lead.db, &root.id).await,
+        [("planner".to_owned(), "cancelled".to_owned())]
     );
-    assert_eq!(running(&executions(&lead.db, &root.id).await), 1, "{dump}");
-    assert_eq!(executions(&lead.db, &child.id).await, Vec::new(), "{dump}");
-    assert!(
-        park(&lead.db, &root.id).await.contains("InFlight"),
-        "{dump}"
-    );
-    assert!(
-        park(&lead.db, &child.id).await.contains("\"planning\""),
-        "{dump}"
-    );
-    let version = reload(&lead.db, &root.id).await.version;
-    passes(&lead, 3).await;
     assert_eq!(
-        reload(&lead.db, &root.id).await.version,
-        version,
-        "the hold writes nothing"
+        executions(&lead.db, &child.id).await,
+        [("coder".to_owned(), "running".to_owned())]
     );
-
-    // And it ends: the run stops, the root has no lead, so it implements and
-    // its subtask runs.
-    let execution: String = sqlx::query_scalar("SELECT id FROM execution WHERE task_id=?")
-        .bind(&root.id)
-        .fetch_one(lead.db.pool())
-        .await
-        .unwrap();
-    let service = &lead.dispatcher.task_service;
-    service
-        .stop_execution(execution, "stopped by its owner".to_owned())
-        .await
-        .expect("planner stops");
-    passes(&lead, 3).await;
-    let stopped = reload(&lead.db, &root.id).await;
-    let offers = service.test_action_values(&root.id).await.unwrap();
-    eprintln!(
-        "REPORT lead removed, run stopped: {} {offers:?}",
-        stopped.status
-    );
-    if stopped.status == "planning" {
-        service
-            .perform_task_action(
-                &root.id,
-                api_types::TaskAction::Release { reason: None },
-                stopped.version,
-            )
-            .await
-            .expect("the stopped root is released");
-        passes(&lead, 4).await;
-    }
-    let dump = state_dump(&lead.db).await;
-    assert_eq!(
-        reload(&lead.db, &root.id).await.status,
-        "in_progress",
-        "{dump}"
-    );
-    assert_eq!(running(&executions(&lead.db, &child.id).await), 1, "{dump}");
 }
 
 /// A planner that fails ends in a typed park on the root with a working
@@ -1225,7 +1170,7 @@ impl TaskExecutor for PausedPlanningExecutor {
 }
 
 #[tokio::test]
-async fn a_lead_paused_mid_planning_parks_typed_but_a_failed_run_needs_owner_retry() {
+async fn a_lead_paused_mid_planning_retries_a_failed_run_after_resume() {
     let (finish, wait) = tokio::sync::oneshot::channel();
     let mut lead = fixture_with(|db, sender| {
         Arc::new(PausedPlanningExecutor {
@@ -1301,36 +1246,19 @@ async fn a_lead_paused_mid_planning_parks_typed_but_a_failed_run_needs_owner_ret
     db::AgentRepo::set_paused(&*lead.db, &lead.planner, false)
         .await
         .unwrap();
-    passes(&lead, 5).await;
-    assert_eq!(
-        executions(&lead.db, &root.id).await.len(),
-        1,
-        "resuming the Agent does not retry an ordinary failed planner"
-    );
-    let task = reload(&lead.db, &root.id).await;
-    assert!(
-        matches!(task.condition, db::TaskCondition::Clear { .. }),
-        "current product finding: the failed planner has no typed manual-retry park"
-    );
-    let offered = lead
-        .dispatcher
-        .task_service
-        .test_action_values(&root.id)
-        .await
-        .unwrap();
-    let retry = offered
-        .into_iter()
-        .find(|action| matches!(action, api_types::TaskAction::Retry { .. }))
-        .expect("owner has Retry Planning");
-    lead.dispatcher
-        .task_service
-        .perform_task_action(&root.id, retry, task.version)
-        .await
-        .unwrap();
-    until(&lead, "the owner's retry resumes planning", async || {
-        executions(&lead.db, &root.id).await.len() == 2
-    })
+    until(
+        &lead,
+        "the recorded planner retry resumes after the Agent",
+        async || executions(&lead.db, &root.id).await.len() == 2,
+    )
     .await;
+    assert_eq!(
+        db::budget::spent(lead.db.pool(), &root.id, "execution")
+            .await
+            .unwrap(),
+        1,
+        "resuming repairs the existing retry without another charge"
+    );
     assert_eq!(
         executions(&lead.db, &root.id).await.last().unwrap(),
         &("planner".to_owned(), "running".to_owned())
@@ -1389,4 +1317,155 @@ async fn a_lead_paused_during_planning_admission_parks_typed_and_resumes_once() 
         ]
     );
     assert!(executions(&lead.db, &child.id).await.is_empty());
+}
+
+/// Startup recovers both a root's planning gate and its inherited step-check gate.
+#[tokio::test]
+async fn recovery_of_orphaned_planning_and_step_check_runs_redispatches_once() {
+    for state in ["planning", "lead_check"] {
+        let lead = lead_fixture(false).await;
+        let root = seed_task(
+            &lead.db,
+            &lead.project,
+            "root",
+            if state == "planning" {
+                "planning"
+            } else {
+                "in_progress"
+            },
+            1,
+        )
+        .await;
+        let child = seed_subtask(
+            &lead.db,
+            &root,
+            "child",
+            if state == "planning" {
+                "todo"
+            } else {
+                "lead_check"
+            },
+            0,
+        )
+        .await;
+        assign_role(&lead.db, &root.id, "coder", &lead.coder).await;
+        assign_role(&lead.db, &root.id, "planner", &lead.planner).await;
+        let task_id = if state == "planning" {
+            &root.id
+        } else {
+            &child.id
+        };
+        seed_running_execution(&lead.db, task_id, &lead.planner, "planner").await;
+        let orphan = ExecutionRepo::list_running_by_task(&*lead.db, task_id)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let recovery =
+            crate::recovery::CrashRecovery::new(Arc::clone(&lead.db), Arc::new(EventBus::new(32)));
+        recovery.run_recovery().await.unwrap();
+        recovery.run_recovery().await.unwrap();
+        lead.dispatcher.task_service.drain(task_id).await.unwrap();
+        let recovered = ExecutionRepo::get_by_id(&*lead.db, &orphan.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, ExecutionStatus::Cancelled, "{state}");
+        assert_eq!(recovered.resume_policy, Some(db::ResumePolicy::Auto));
+        until(&lead, "the recovered gate runs", async || {
+            ExecutionRepo::list_running_by_task(&*lead.db, task_id)
+                .await
+                .unwrap()
+                .len()
+                == 1
+        })
+        .await;
+        passes(&lead, 4).await;
+        assert_eq!(executions(&lead.db, task_id).await.len(), 2, "{state}");
+        assert_eq!(reload(&lead.db, task_id).await.status, state);
+    }
+}
+
+#[tokio::test]
+async fn a_project_pause_over_a_held_planning_root_parks_every_child_and_resume_restores_parent_wait(
+) {
+    let lead = lead_fixture(false).await;
+    let (root, child) = root_with_child(&lead, true).await;
+    passes(&lead, 3).await;
+    let root = reload(&lead.db, &root.id).await;
+    lead.dispatcher
+        .task_service
+        .perform_task_action(
+            &root.id,
+            api_types::TaskAction::Hold { reason: None },
+            root.version,
+        )
+        .await
+        .unwrap();
+    ProjectRepo::set_paused_at(&*lead.db, &lead.project, Some(now_rfc3339()))
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    let paused = reload(&lead.db, &child.id).await;
+    assert!(
+        paused
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, db::ParkReason::ProjectPaused { .. })),
+        "{:?}",
+        paused.condition
+    );
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+    ProjectRepo::set_paused_at(&*lead.db, &lead.project, None)
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    let resumed = reload(&lead.db, &child.id).await;
+    assert!(
+        resumed.condition.reasons().any(
+            |reason| matches!(reason, db::ParkReason::Parent { cause, .. } if cause == "held")
+        ),
+        "{:?}",
+        resumed.condition
+    );
+    assert!(executions(&lead.db, &child.id).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_later_subtask_names_its_sequence_wait_without_changing_the_no_lead_root() {
+    let lead = lead_fixture(false).await;
+    let (root, first, later) = super::root_replan::root_with_parked_child(&lead, false).await;
+    passes(&lead, 4).await;
+    let waiting = reload(&lead.db, &later.id).await;
+    assert!(waiting.condition.reasons().any(
+        |reason| matches!(reason, db::ParkReason::Parent { cause, .. } if cause == "sequence")
+    ));
+    assert!(!lead
+        .dispatcher
+        .task_service
+        .test_action_values(&later.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|action| matches!(action, api_types::TaskAction::Start)));
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert!(executions(&lead.db, &root.id).await.is_empty());
+    let first = reload(&lead.db, &first.id).await;
+    lead.dispatcher
+        .task_service
+        .perform_task_action(
+            &first.id,
+            api_types::TaskAction::Cancel { reason: None },
+            first.version,
+        )
+        .await
+        .unwrap();
+    until(
+        &lead,
+        "the next sibling runs after the first settles",
+        async || !executions(&lead.db, &later.id).await.is_empty(),
+    )
+    .await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert!(executions(&lead.db, &root.id).await.is_empty());
 }

@@ -2687,7 +2687,9 @@ impl World {
                AND c.status IN ('todo', 'in_progress')
                AND NOT (COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') = 'parent'
                         AND json_extract(c.condition_json, '$.primary.cause') IN ('planning', 'held', 'blocked'))
-               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure', 'budget_exhausted', 'agent_timeout')",
+               AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') NOT IN ('held', 'failure', 'budget_exhausted', 'agent_timeout')
+               AND NOT (EXISTS (SELECT 1 FROM project p WHERE p.id = c.project_id AND p.paused_at IS NOT NULL)
+                        AND COALESCE(json_extract(c.condition_json, '$.primary.kind'), '') = 'project_paused')",
         )
         .await?;
         if !unheld.is_empty() {
@@ -2820,6 +2822,22 @@ impl World {
                     return Ok(());
                 }
                 wedge("has no queued step, no live execution, no park and nothing it could be waiting for")
+            }
+            // Project pause owns no Task action: its exit is Resume Project.
+            // Require the live Project fact, so a stale pause park is a wedge.
+            (_, "project_paused") => {
+                let paused: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM project WHERE id=? AND paused_at IS NOT NULL)",
+                )
+                .bind(&self.project_id)
+                .fetch_one(&self.live().pool)
+                .await
+                .map_err(|error| error.to_string())?;
+                if paused {
+                    Ok(())
+                } else {
+                    wedge("the Project it waits for is not paused")
+                }
             }
             (_, "held") => {
                 if offered(&["release"]) {
@@ -3129,6 +3147,7 @@ impl World {
                 }
             }
             if open == 0 {
+                self.trace.push(format!("settled: {last}"));
                 return Ok(());
             }
             if deferred && self.move_deadlines(true).await? > 0 {
@@ -3336,13 +3355,41 @@ fn report(name: &str, sequence: &[Step], failure: &Failure) -> String {
 }
 
 fn digest(trace: &[String]) -> u64 {
-    // FNV-1a over the trace: equal digests mean equal histories.
+    // FNV-1a over action observations and the final settlement. Intermediate
+    // settlement rounds observe asynchronous slot/check timing, not model
+    // actions; retain them in the diagnostic trace without hashing them.
     trace
         .iter()
+        .filter(|line| !line.starts_with("settle "))
         .flat_map(|line| line.bytes().chain(*b"\n"))
         .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+}
+
+#[test]
+fn settlement_scheduling_does_not_change_the_action_trace_digest() {
+    let base = vec![
+        "0 Create -> task running".to_owned(),
+        "pauses lifted: task running".to_owned(),
+    ];
+    let mut isolated = base.clone();
+    isolated.extend(
+        [
+            "settle 0 []: task review/check",
+            "settle 1 []: task done",
+            "settled: task done",
+        ]
+        .map(str::to_owned),
+    );
+    let mut concurrent = base;
+    concurrent.extend(["settle 0 []: task done", "settled: task done"].map(str::to_owned));
+    assert_eq!(digest(&isolated), digest(&concurrent));
+    concurrent[0] = "0 Create -> task parked".to_owned();
+    assert_ne!(digest(&isolated), digest(&concurrent));
+    concurrent[0] = isolated[0].clone();
+    *concurrent.last_mut().unwrap() = "settled: task cancelled".to_owned();
+    assert_ne!(digest(&isolated), digest(&concurrent));
 }
 
 fn env_number(name: &str) -> Option<u64> {

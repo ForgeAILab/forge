@@ -8,6 +8,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Removing or replacing a coordination root's lead now cancels its live
+  planning execution. Removal advances through the no-lead path; replacement
+  starts the new lead once. Operations from the old execution are refused.
+- Failed planner executions now use the bounded Execution retry path that
+  coder failures use. Pausing the Agent holds a scheduled retry until resume;
+  exhausted retries leave a typed failure with an owner Retry action.
+- An unstarted subtask waiting behind an incomplete sibling now shows
+  `parent { cause: sequence }`, including when that sibling has no live run.
+  Start is not offered while the existing sequence guard would refuse it.
+  The root's state and execution policy are unchanged.
+- Project pause now exposes the existing `project_paused` typed condition on
+  children waiting for a planning root. Resume restores their parent wait.
+- Hold and Cancel are offered while a root waits for the owner's answer to
+  its lead's question, including after the asking execution has ended.
+  Release preserves the pending question and waits for the answer.
+
 - **A root's lead can change the breakdown, recover a parked subtask, leave
   hand-off notes and ask the owner a question.** The lead's planning run on
   the root (not its step check on a subtask, which returns a verdict and
@@ -3243,6 +3259,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- A planner failure while its Agent is paused no longer leaves the Task clear
+  without a run after resume; it retries within the Execution budget.
+- A queued lead recovery opens a fresh step-check budget window before
+  validation; a rejected recovered check stays within the two-return limit.
+  The root's two recoveries per subtask remain charged and bounded.
+
+- Startup recovery reclaims orphaned executions in planning, review and
+  inherited step-check gates as well as implementation states.
+- Project pause keeps a visible typed park on children waiting for a held
+  planning root; resume restores the parent wait when it still applies.
+  Owned check and integration results retain their authority under that
+  pause. Mapping revision 7 refreshes existing condition projections on upgrade.
 
 - Web coordination roots no longer offer refused interactive launches, withdrawn lead questions preserve typed drafts with copy and dismiss controls, board subtask exits use the server's effective workflow, and out-of-order Task events cannot overwrite newer cached state.
 - `409 integration_unresolved` names the machine that performs the outstanding effect. For a rebase run on another machine than the merge target's it used to name the target's machine, so its "reconnect or remove that machine" hint pointed at the wrong one.

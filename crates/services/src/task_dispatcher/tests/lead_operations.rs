@@ -21,6 +21,7 @@ const CODER: &str = crate::workflow::default_roles::CODER;
 #[derive(Clone)]
 enum Call {
     Fail,
+    Verdict(&'static str),
     Raw(&'static str, Value),
     /// The lead reads the subtask first and sends the version it was shown.
     AtVersion(&'static str, String, Value),
@@ -65,6 +66,13 @@ impl TaskExecutor for ScriptedLead {
         for (index, call) in calls.into_iter().enumerate() {
             let key = format!("{execution_id}:{index}");
             let (operation, payload) = match call {
+                Call::Verdict(verdict) => {
+                    return Ok(ExecutionResult {
+                        status: executors::ExecutionOutcome::Completed,
+                        summary: Some(verdict.to_owned()),
+                        ..Default::default()
+                    });
+                }
                 Call::Fail => {
                     return Ok(ExecutionResult {
                         status: executors::ExecutionOutcome::Failed,
@@ -1824,7 +1832,7 @@ async fn a_lead_removed_during_the_wait_leaves_an_answerable_question() {
     assert_eq!(question_items(lead, "open").await, 0);
     assert_eq!(
         executions(&lead.db, &root.id).await,
-        vec![(PLANNER.to_owned(), "completed".to_owned())],
+        vec![(PLANNER.to_owned(), "cancelled".to_owned())],
         "nobody plans a root that has no lead"
     );
 }
@@ -1869,11 +1877,9 @@ async fn assert_answer_runs_once(ops: &Ops, root: &str, child: &str, item: &str,
     assert_eq!(question_items(&ops.lead, "open").await, 0);
 }
 
-/// Current product finding: Hold is unavailable after the asking run ends.
-/// Keep the question/answer coverage and report the requested release path
-/// as NOT MET; changing offer eligibility belongs to protected task_actions.
+/// Hold and Release keep an ended asking run's question answerable.
 #[tokio::test]
-async fn a_hold_is_refused_during_the_leads_question_without_losing_the_wait() {
+async fn a_hold_during_the_leads_question_preserves_the_wait_after_release() {
     let ops = ops_fixture(true).await;
     let (root, child) = root_with_child(&ops.lead, true).await;
     ops.script(vec![
@@ -1885,19 +1891,28 @@ async fn a_hold_is_refused_during_the_leads_question_without_losing_the_wait() {
     ]);
     let (item, version) = waiting_question(&ops, &root.id).await;
     let waiting = reload(&ops.lead.db, &root.id).await;
-    let error = ops
-        .service
+    ops.service
         .perform_task_action(
             &root.id,
             api_types::TaskAction::Hold { reason: None },
             waiting.version,
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(error, crate::ServiceError::TaskActionUnavailable { .. }),
-        "{error:?}"
-    );
+        .unwrap();
+    passes(&ops.lead, 3).await;
+    let held = reload(&ops.lead.db, &root.id).await;
+    assert!(held
+        .condition
+        .reasons()
+        .any(|reason| matches!(reason, db::ParkReason::Held { .. })));
+    ops.service
+        .perform_task_action(
+            &root.id,
+            api_types::TaskAction::Release { reason: None },
+            held.version,
+        )
+        .await
+        .unwrap();
     passes(&ops.lead, 5).await;
     assert_eq!(executions(&ops.lead.db, &root.id).await.len(), 1);
     assert_eq!(question_items(&ops.lead, "open").await, 1);
@@ -2190,4 +2205,122 @@ async fn holding_a_live_asking_run_then_releasing_keeps_the_question_and_runs_on
     }
     assert_eq!(inputs.len(), 2);
     assert!(inputs[1].contains("Answer to the lead's question: B"));
+}
+
+/// The lead's recovery opens a new subtask gate window, without resetting
+/// the root's two-recovery bound. Its validation may reject in that window.
+#[tokio::test]
+async fn a_lead_recovery_of_a_spent_step_check_opens_a_new_gate_window() {
+    let ops = ops_fixture(true).await;
+    let lead = &ops.lead;
+    let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
+    let child = seed_subtask(&lead.db, &root, "child", "lead_check", 0).await;
+    assign_role(&lead.db, &root.id, CODER, &lead.coder).await;
+    assign_role(&lead.db, &root.id, PLANNER, &lead.planner).await;
+    let key = db::budget::gate_key("lead_check");
+    let mut tx = db::begin_immediate(lead.db.pool()).await.unwrap();
+    for n in 0..2 {
+        assert!(
+            db::budget::charge(&mut tx, &child.id, &key, 2, &format!("rejection:{n}"))
+                .await
+                .unwrap()
+                .charged
+        );
+    }
+    tx.commit().await.unwrap();
+    super::root_replan::park_child(lead, &child, "step-check budget spent").await;
+    ops.script(vec![
+        vec![Call::AtVersion(
+            "lead.recover",
+            child.id.clone(),
+            json!({"task_id": child.id, "action": {"verb": "retry"}}),
+        )],
+        vec![Call::Verdict(
+            r#"{"result":"fail","reason":"still fails validation"}"#,
+        )],
+    ]);
+    calls_succeeded(&ops, 1).await;
+    until(lead, "the recovered validation rejects", async || {
+        reload(&lead.db, &child.id).await.status == "in_progress"
+    })
+    .await;
+    assert_eq!(spent(lead, &child.id, &key).await, 1);
+    assert_eq!(
+        spent(lead, &root.id, &db::budget::lead_recover_key(&child.id)).await,
+        1
+    );
+    let resets: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transition_log WHERE task_id=? AND bridge_kind='retry_window_reset'",
+    )
+    .bind(&child.id)
+    .fetch_one(lead.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(resets, 1);
+}
+
+#[tokio::test]
+async fn replacing_a_live_planning_lead_stops_the_old_run_and_rejects_its_operations() {
+    let ops = ops_fixture(false).await;
+    let lead = &ops.lead;
+    let (root, child) = root_with_child(lead, true).await;
+    until(lead, "the old lead launches", async || {
+        running(lead, &root.id, PLANNER).await
+    })
+    .await;
+    let old = ExecutionRepo::list_running_by_task(&*lead.db, &root.id)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let replacement = crate::test_support::seed_native_agent(&lead.db).await;
+    ops.service
+        .reassign_role(
+            db::CreateTaskRoleAssignment {
+                id: db::new_uuid_v4(),
+                task_id: root.id.clone(),
+                role_name: PLANNER.to_owned(),
+                assignee_type: Some(db::AssigneeKind::Agent),
+                assignee_id: Some(replacement.clone()),
+                created_at: now_rfc3339(),
+                updated_at: now_rfc3339(),
+            },
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    until(lead, "the replacement leads the root", async || {
+        ExecutionRepo::list_running_by_task(&*lead.db, &root.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|run| run.agent_id.as_deref() == Some(replacement.as_str()))
+    })
+    .await;
+    assert_eq!(
+        ExecutionRepo::get_by_id(&*lead.db, &old.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        ExecutionStatus::Cancelled
+    );
+    let refused = ops
+        .call(
+            &root.id,
+            "lead.subtask",
+            json!({"action":"create", "title":"late work", "description":"old lead"}),
+            "after-replacement",
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        children(lead, &root.id).await.len(),
+        1,
+        "late operation was refused: {refused}"
+    );
+    passes(lead, 4).await;
+    assert_eq!(executions(&lead.db, &root.id).await.len(), 2);
+    assert!(executions(&lead.db, &child.id).await.is_empty());
 }

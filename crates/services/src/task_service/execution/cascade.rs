@@ -3060,7 +3060,10 @@ pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> b
     matches!(
         execution.role.as_str(),
         "interactive" | "executor" | crate::workflow::default_roles::CODER
-    )
+    ) || (execution.role == crate::workflow::default_roles::PLANNER
+        // Setup refusals keep dispatch's recovery semantics; only a planner
+        // that actually ran joins the ordinary execution-failure retry path.
+        && execution.stopped_by.as_deref() != Some("system:dispatch"))
 }
 
 fn execution_failure_reason(execution: &Execution) -> String {

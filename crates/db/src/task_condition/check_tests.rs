@@ -320,3 +320,48 @@ async fn a_check_wait_is_durable_across_a_restart() {
         .unwrap();
     assert!(db.task_condition_violations().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn scheduler_project_pause_does_not_override_or_outlive_a_check() {
+    let db = db().await;
+    let id = "check-project-pause";
+    task(&db, id).await;
+    let step = claim(&db, id).await;
+    crate::task_writer::in_task_step(step, async {
+        db.record_schedule_park(id, 0, &json!({"reason":"ProjectPaused"}).to_string())
+            .await
+            .unwrap();
+        state(&db, id, CheckWaitPhase::Slot, "consumer").await;
+        let parked = read(&db, id).await;
+        assert!(matches!(
+            parked.condition,
+            TaskCondition::Parked {
+                primary: ParkReason::Check { .. },
+                ..
+            }
+        ));
+        // Reconciliation may restate the same pause after the owned wait.
+        db.record_schedule_park(
+            id,
+            0,
+            &json!({"reason":"ProjectPaused", "owner":"User", "action":"ResumeProject"})
+                .to_string(),
+        )
+        .await
+        .unwrap();
+        state(&db, id, CheckWaitPhase::Result, "consumer").await;
+        assert_eq!(
+            read(&db, id).await.condition.check_wait(),
+            Some(&wait(CheckWaitPhase::Result, "consumer"))
+        );
+        assert!(db.clear_visible_schedule_park(id).await.unwrap());
+        clear(&db, id, "consumer").await;
+        let resumed = read(&db, id).await;
+        assert!(!resumed
+            .condition
+            .reasons()
+            .any(|reason| matches!(reason, ParkReason::ProjectPaused { .. })));
+        db.check_task_condition_invariant(&resumed).await.unwrap();
+    })
+    .await;
+}
