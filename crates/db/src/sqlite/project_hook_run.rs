@@ -371,3 +371,31 @@ impl SqliteDb {
         Ok(settled)
     }
 }
+
+#[derive(Debug)]
+pub struct ProjectHookCooldownRunRow {
+    pub id: String,
+    pub rule_id: String,
+    pub timestamp: Option<String>,
+    pub status: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ProjectHookCooldownRunRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            rule_id: row.try_get(1)?,
+            timestamp: row.try_get(2)?,
+            status: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_hook_cooldown_runs_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Vec<ProjectHookCooldownRunRow>> {
+        Ok(sqlx::query_as("SELECT id, rule_id, COALESCE(completed_at, updated_at), status FROM project_hook_run WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 100").bind(project_id).fetch_all(connection).await?)
+    }
+}

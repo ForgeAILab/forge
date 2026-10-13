@@ -145,3 +145,17 @@ fn map_oauth_refresh_token(row: SqliteRow) -> Result<OAuthRefreshToken> {
         created_at: row.get("created_at"),
     })
 }
+
+impl SqliteDb {
+    pub async fn oauth_refresh_family_oldest_created_at(
+        &self,
+        family_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MIN(created_at) FROM oauth_refresh_token WHERE family_id = ?",
+        )
+        .bind(family_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}

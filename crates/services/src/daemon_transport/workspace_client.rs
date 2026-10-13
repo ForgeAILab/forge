@@ -627,28 +627,18 @@ impl DaemonWorkspaceClient {
             .await
             .map_err(ServiceError::from)?
             .ok_or_else(|| ServiceError::not_found("workspace placement", placement_id))?;
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT intent.outcome_json FROM command_receipt intent
-             WHERE intent.scope_type = 'task' AND intent.scope_id = ? AND intent.operation = ?
-               AND json_extract(intent.outcome_json, '$.metadata.placement_id') = ?
-               AND json_extract(intent.outcome_json, '$.metadata.generation') = ?
-               AND NOT EXISTS (SELECT 1 FROM command_receipt result
-                   WHERE result.scope_type = intent.scope_type AND result.scope_id = intent.scope_id
-                     AND result.operation = ? AND result.correlation_id = intent.correlation_id)
-             ORDER BY intent.committed_at, intent.id",
-        )
-        .bind(&placement.task_id)
-        .bind(format!("daemon.{method}.intent"))
-        .bind(placement_id)
-        .bind(
-            params["generation"]
-                .as_i64()
-                .unwrap_or(placement.generation),
-        )
-        .bind(format!("daemon.{method}"))
-        .fetch_all(db.pool())
-        .await
-        .map_err(ServiceError::from)?;
+        let rows = db
+            .workspace_mutation_outstanding_intents(db::WorkspaceMutationOutstandingIntentInput {
+                task_id: &placement.task_id,
+                intent_operation: format!("daemon.{method}.intent"),
+                placement_id,
+                generation: params["generation"]
+                    .as_i64()
+                    .unwrap_or(placement.generation),
+                result_operation: format!("daemon.{method}"),
+            })
+            .await
+            .map_err(ServiceError::from)?;
         for row in rows {
             let saved: Value = serde_json::from_str(&row)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -785,13 +775,10 @@ impl DaemonWorkspaceClient {
         let mut transaction = db::begin_immediate(db.pool())
             .await
             .map_err(ServiceError::from)?;
-        let removed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",
-        )
-        .bind(daemon_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(ServiceError::from)?;
+        let removed: bool = db
+            .workspace_receipt_daemon_removed_in_tx(&mut transaction, daemon_id)
+            .await
+            .map_err(ServiceError::from)?;
         if removed {
             return Err(ServiceError::not_found("daemon", daemon_id).into());
         }
@@ -828,20 +815,30 @@ impl DaemonWorkspaceClient {
                     .ok_or_else(|| {
                         ServiceError::invalid_operation("merge evidence has no candidate SHA")
                     })?;
-                let execution_version = sqlx::query_scalar::<_, i64>(
-                    "SELECT execution_version FROM execution WHERE id = ? AND workspace_id = ?",
-                )
-                .bind(execution_id)
-                .bind(&placement.workspace_id)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(ServiceError::from)?
-                .ok_or_else(|| {
-                    ServiceError::conflict("merge execution no longer owns this workspace")
-                })?;
-                let updated = sqlx::query("UPDATE execution SET before_sha = ?, after_sha = ?, execution_version = execution_version + 1, updated_at = ? WHERE id = ? AND execution_version = ?")
-                    .bind(before_sha).bind(after_sha).bind(&now).bind(execution_id).bind(execution_version)
-                    .execute(&mut *transaction).await.map_err(ServiceError::from)?;
+                let execution_version = db
+                    .workspace_merge_execution_version_in_tx(
+                        &mut transaction,
+                        execution_id,
+                        &placement.workspace_id,
+                    )
+                    .await
+                    .map_err(ServiceError::from)?
+                    .ok_or_else(|| {
+                        ServiceError::conflict("merge execution no longer owns this workspace")
+                    })?;
+                let updated = db
+                    .record_workspace_merge_evidence_in_tx(
+                        &mut transaction,
+                        db::RecordWorkspaceMergeEvidenceInTxInput {
+                            before_sha,
+                            after_sha,
+                            updated_at: &now,
+                            execution_id,
+                            version: execution_version,
+                        },
+                    )
+                    .await
+                    .map_err(ServiceError::from)?;
                 if updated.rows_affected() != 1 {
                     return Err(ServiceError::from(db::DbError::VersionConflict).into());
                 }
@@ -911,19 +908,10 @@ impl DaemonWorkspaceClient {
     /// Reconnect sweeps call this even for placements already marked cleaned.
     pub async fn retry_acknowledgements(&self, daemon_id: &str) -> Result<()> {
         let Some(db) = &self.db else { return Ok(()) };
-        let results = sqlx::query_scalar::<_, String>(
-            "SELECT result.outcome_json FROM command_receipt result
-             JOIN workspace_placement p ON p.id = json_extract(result.outcome_json, '$.metadata.placement_id')
-             WHERE result.principal_id = 'workspace-backend'
-               AND json_extract(result.outcome_json, '$.metadata.daemon_id') = ?
-               AND json_extract(result.outcome_json, '$.metadata.status') IN ('result', 'error')
-               AND (result.operation <> 'daemon.workspace.cleanup' OR p.state = 'cleaned'
-                   OR json_extract(result.outcome_json, '$.metadata.status') = 'error')
-               AND NOT EXISTS (SELECT 1 FROM command_receipt ack WHERE ack.scope_type = result.scope_type
-                   AND ack.scope_id = result.scope_id AND ack.operation = result.operation || '.ack'
-                   AND ack.idempotency_key = result.idempotency_key)
-             ORDER BY result.committed_at, result.id LIMIT 128",
-        ).bind(daemon_id).fetch_all(db.pool()).await.map_err(ServiceError::from)?;
+        let results = db
+            .workspace_pending_acknowledgement_results(daemon_id)
+            .await
+            .map_err(ServiceError::from)?;
         for result in results {
             let result: Value = match serde_json::from_str(&result) {
                 Ok(result) => result,
@@ -970,18 +958,10 @@ impl DaemonWorkspaceClient {
             tracing::warn!(target: "services::daemon_transport", %daemon_id, %error, "integration attempt reconciliation failed on reconnect");
         }
         let Some(db) = &self.db else { return Ok(()) };
-        let intents = sqlx::query_scalar::<_, String>(
-            "SELECT intent.outcome_json FROM command_receipt intent
-             JOIN workspace_placement p ON p.id = json_extract(intent.outcome_json, '$.metadata.placement_id')
-             WHERE intent.operation IN ('daemon.workspace.run.intent', 'daemon.workspace.merge.intent')
-               AND json_extract(intent.outcome_json, '$.metadata.daemon_id') = ?
-               AND json_extract(intent.outcome_json, '$.metadata.generation') = p.generation
-               AND NOT EXISTS (SELECT 1 FROM command_receipt result
-                   WHERE result.scope_type = intent.scope_type AND result.scope_id = intent.scope_id
-                     AND result.operation = substr(intent.operation, 1, length(intent.operation) - 7)
-                     AND result.correlation_id = intent.correlation_id)
-             ORDER BY intent.committed_at, intent.id LIMIT 128",
-        ).bind(daemon_id).fetch_all(db.pool()).await.map_err(ServiceError::from)?;
+        let intents = db
+            .workspace_reconnect_unsettled_intents(daemon_id)
+            .await
+            .map_err(ServiceError::from)?;
         for intent in intents {
             let intent: Value = serde_json::from_str(&intent)
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -1057,17 +1037,10 @@ impl DaemonWorkspaceClient {
 
     async fn record_acknowledgement(&self, daemon_id: &str, entry_id: &str) -> Result<()> {
         let Some(db) = &self.db else { return Ok(()) };
-        let row = sqlx::query_as::<_, (String, String, String)>(
-            "SELECT scope_id, operation, input_digest FROM command_receipt
-             WHERE principal_id = 'workspace-backend' AND idempotency_key = ?
-               AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
-               AND json_extract(outcome_json, '$.metadata.status') IN ('result', 'error') LIMIT 1",
-        )
-        .bind(entry_id)
-        .bind(daemon_id)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(ServiceError::from)?;
+        let row = db
+            .workspace_acknowledgement_result_identity(entry_id, daemon_id)
+            .await
+            .map_err(ServiceError::from)?;
         let Some((task_id, operation, digest)) = row else {
             return Ok(());
         };

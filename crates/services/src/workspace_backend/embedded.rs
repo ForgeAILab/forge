@@ -107,15 +107,11 @@ impl EmbeddedWorkspaceBackend {
             }
         }
         let dedupe_key = crate::workspace_cleanup::cleanup_attention_key(&workspace.id);
-        let raised_at = sqlx::query_scalar::<_, String>(
-            "SELECT occurred_at FROM attention_projection
-             WHERE dedupe_key = ? AND status <> 'resolved'
-             ORDER BY occurred_at LIMIT 1",
-        )
-        .bind(&dedupe_key)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(ServiceError::from)?;
+        let raised_at = self
+            .db
+            .away_repository_cleanup_raised_at(&dedupe_key)
+            .await
+            .map_err(ServiceError::from)?;
         let Some(raised_at) = raised_at
             .as_deref()
             .and_then(|raised_at| chrono::DateTime::parse_from_rfc3339(raised_at).ok())
@@ -132,18 +128,10 @@ impl EmbeddedWorkspaceBackend {
              repository comes back, run `git worktree prune` in it",
             source.display()
         );
-        sqlx::query(
-            "UPDATE attention_projection
-             SET details_json = json_set(details_json, '$.settled', ?), updated_at = ?,
-                 version = version + 1
-             WHERE dedupe_key = ? AND status <> 'resolved'",
-        )
-        .bind(&evidence)
-        .bind(db::now_rfc3339())
-        .bind(&dedupe_key)
-        .execute(self.db.pool())
-        .await
-        .map_err(ServiceError::from)?;
+        self.db
+            .settle_away_repository_cleanup_attention(&evidence, db::now_rfc3339(), &dedupe_key)
+            .await
+            .map_err(ServiceError::from)?;
         Ok(Some(evidence))
     }
 
@@ -260,54 +248,47 @@ impl EmbeddedWorkspaceBackend {
             transaction.commit().await.map_err(ServiceError::from)?;
             return Ok(placement);
         }
-        let location_id = sqlx::query_scalar::<_, String>(
-            "SELECT id FROM repo_location WHERE repo_id = ? AND owner_kind = 'server'
-             AND daemon_id IS NULL AND runtime_id IS NULL AND path = ? AND kind = ?
-             ORDER BY created_at, id LIMIT 1",
-        )
-        .bind(&workspace.repo_id)
-        .bind(&source)
-        .bind(kind.to_string())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(ServiceError::from)?;
+        let location_id = db
+            .embedded_workspace_existing_repo_location_in_tx(
+                &mut transaction,
+                &workspace.repo_id,
+                &source,
+                kind.to_string(),
+            )
+            .await
+            .map_err(ServiceError::from)?;
         let now = db::now_rfc3339();
         let location_id = match location_id {
             Some(id) => id,
             None => {
                 let id = db::new_uuid_v4();
-                sqlx::query(
-                    "INSERT INTO repo_location (id, repo_id, owner_kind, path, kind,
-                     is_default, status, created_at, updated_at)
-                     VALUES (?, ?, 'server', ?, ?, ?, ?, ?, ?)",
+                db.insert_embedded_workspace_repo_location_in_tx(
+                    &mut transaction,
+                    db::InsertEmbeddedWorkspaceRepoLocationInTxInput {
+                        id: &id,
+                        repo_id: &workspace.repo_id,
+                        source: &source,
+                        kind: kind.to_string(),
+                        is_default: kind == RepoLocationKind::PrimaryCheckout,
+                        status: if kind == RepoLocationKind::PrimaryCheckout {
+                            "ready"
+                        } else {
+                            "unverified"
+                        },
+                        created_at: &now,
+                        updated_at: &now,
+                    },
                 )
-                .bind(&id)
-                .bind(&workspace.repo_id)
-                .bind(&source)
-                .bind(kind.to_string())
-                .bind(kind == RepoLocationKind::PrimaryCheckout)
-                .bind(if kind == RepoLocationKind::PrimaryCheckout {
-                    "ready"
-                } else {
-                    "unverified"
-                })
-                .bind(&now)
-                .bind(&now)
-                .execute(&mut *transaction)
                 .await
                 .map_err(ServiceError::from)?;
                 id
             }
         };
-        let agent_id = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT agent_id FROM execution WHERE workspace_id = ?
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&workspace.id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(ServiceError::from)?
-        .flatten();
+        let agent_id = db
+            .embedded_workspace_recent_agent_id_in_tx(&mut transaction, &workspace.id)
+            .await
+            .map_err(ServiceError::from)?
+            .flatten();
         let placement = WorkspacePlacementRepo::create_in_tx(
             db,
             &mut transaction,

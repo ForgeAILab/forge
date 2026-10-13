@@ -505,3 +505,42 @@ impl SqliteDb {
             .collect())
     }
 }
+
+pub struct TaskOutcomeActionOriginSourceRow {
+    pub result_json: crate::Result<String>,
+    pub id: crate::Result<String>,
+    pub actor_identity_id: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_action_origin_sources(
+        &self,
+    ) -> crate::Result<Vec<TaskOutcomeActionOriginSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id,
+                    e.result_json
+             FROM agent_action AS a
+             JOIN agent_action_execution AS e ON e.action_id = a.id
+             WHERE a.operation = 'task.propose'
+               AND e.status = 'succeeded'
+               AND e.result_json IS NOT NULL
+             ORDER BY a.id ASC, e.created_at ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TaskOutcomeActionOriginSourceRow {
+                result_json: row.try_get("result_json").map_err(crate::DbError::from),
+                id: row.try_get("id").map_err(crate::DbError::from),
+                actor_identity_id: row
+                    .try_get("actor_identity_id")
+                    .map_err(crate::DbError::from),
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}

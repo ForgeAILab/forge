@@ -570,3 +570,175 @@ impl SqliteDb {
         .await?)
     }
 }
+
+pub struct TaskProposalReceiptDigestInput<'a> {
+    pub principal_type: &'a str,
+    pub principal_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub operation: &'a str,
+    pub idempotency_key: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_existing_receipt_digest(
+        &self,
+        input: TaskProposalReceiptDigestInput<'_>,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT input_digest FROM command_receipt
+             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
+               AND scope_id = ? AND operation = ? AND idempotency_key = ? LIMIT 1",
+        )
+        .bind(input.principal_type)
+        .bind(input.principal_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.operation)
+        .bind(input.idempotency_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct WorkspaceMutationOutstandingIntentInput<'a> {
+    pub task_id: &'a str,
+    pub intent_operation: String,
+    pub placement_id: &'a str,
+    pub generation: i64,
+    pub result_operation: String,
+}
+
+impl SqliteDb {
+    pub async fn workspace_mutation_outstanding_intents(
+        &self,
+        input: WorkspaceMutationOutstandingIntentInput<'_>,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT intent.outcome_json FROM command_receipt intent
+             WHERE intent.scope_type = 'task' AND intent.scope_id = ? AND intent.operation = ?
+               AND json_extract(intent.outcome_json, '$.metadata.placement_id') = ?
+               AND json_extract(intent.outcome_json, '$.metadata.generation') = ?
+               AND NOT EXISTS (SELECT 1 FROM command_receipt result
+                   WHERE result.scope_type = intent.scope_type AND result.scope_id = intent.scope_id
+                     AND result.operation = ? AND result.correlation_id = intent.correlation_id)
+             ORDER BY intent.committed_at, intent.id",
+        )
+        .bind(input.task_id)
+        .bind(input.intent_operation)
+        .bind(input.placement_id)
+        .bind(input.generation)
+        .bind(input.result_operation)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_pending_acknowledgement_results(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT result.outcome_json FROM command_receipt result
+             JOIN workspace_placement p ON p.id = json_extract(result.outcome_json, '$.metadata.placement_id')
+             WHERE result.principal_id = 'workspace-backend'
+               AND json_extract(result.outcome_json, '$.metadata.daemon_id') = ?
+               AND json_extract(result.outcome_json, '$.metadata.status') IN ('result', 'error')
+               AND (result.operation <> 'daemon.workspace.cleanup' OR p.state = 'cleaned'
+                   OR json_extract(result.outcome_json, '$.metadata.status') = 'error')
+               AND NOT EXISTS (SELECT 1 FROM command_receipt ack WHERE ack.scope_type = result.scope_type
+                   AND ack.scope_id = result.scope_id AND ack.operation = result.operation || '.ack'
+                   AND ack.idempotency_key = result.idempotency_key)
+             ORDER BY result.committed_at, result.id LIMIT 128",
+        ).bind(daemon_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_reconnect_unsettled_intents(
+        &self,
+        daemon_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT intent.outcome_json FROM command_receipt intent
+             JOIN workspace_placement p ON p.id = json_extract(intent.outcome_json, '$.metadata.placement_id')
+             WHERE intent.operation IN ('daemon.workspace.run.intent', 'daemon.workspace.merge.intent')
+               AND json_extract(intent.outcome_json, '$.metadata.daemon_id') = ?
+               AND json_extract(intent.outcome_json, '$.metadata.generation') = p.generation
+               AND NOT EXISTS (SELECT 1 FROM command_receipt result
+                   WHERE result.scope_type = intent.scope_type AND result.scope_id = intent.scope_id
+                     AND result.operation = substr(intent.operation, 1, length(intent.operation) - 7)
+                     AND result.correlation_id = intent.correlation_id)
+             ORDER BY intent.committed_at, intent.id LIMIT 128",
+        ).bind(daemon_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_acknowledgement_result_identity(
+        &self,
+        entry_id: &str,
+        daemon_id: &str,
+    ) -> crate::Result<Option<(String, String, String)>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT scope_id, operation, input_digest FROM command_receipt
+             WHERE principal_id = 'workspace-backend' AND idempotency_key = ?
+               AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
+               AND json_extract(outcome_json, '$.metadata.status') IN ('result', 'error') LIMIT 1",
+        )
+        .bind(entry_id)
+        .bind(daemon_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_cleanup_replay_intent(
+        &self,
+        operation_id: &str,
+        placement_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM command_receipt WHERE principal_id = 'workspace-backend'
+                 AND operation = 'daemon.workspace.cleanup.intent' AND correlation_id = ?
+                 AND json_extract(outcome_json, '$.metadata.placement_id') = ?
+                 ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(operation_id)
+        .bind(placement_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn daemon_workspace_preparation_receipt(
+        &self,
+        task_id: &str,
+        placement_id: &str,
+        generation: i64,
+        daemon_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT outcome_json FROM command_receipt
+             WHERE principal_type = 'system' AND principal_id = 'workspace-backend'
+               AND scope_type = 'task' AND scope_id = ?
+               AND operation IN ('daemon.workspace.prepare', 'daemon.workspace.reset')
+               AND json_valid(outcome_json)
+               AND json_extract(outcome_json, '$.metadata.status') = 'result'
+               AND json_type(outcome_json, '$.owner_result.workspace_path') = 'text'
+               AND json_extract(outcome_json, '$.metadata.placement_id') = ?
+               AND json_extract(outcome_json, '$.metadata.generation') = ?
+               AND json_extract(outcome_json, '$.metadata.daemon_id') = ?
+             ORDER BY committed_at DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(placement_id)
+        .bind(generation)
+        .bind(daemon_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

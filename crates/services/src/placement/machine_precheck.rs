@@ -113,11 +113,9 @@ pub(crate) async fn task_blocked(
     {
         return Ok(None);
     }
-    let locations: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, status FROM repo_location WHERE repo_id = ?")
-            .bind(&prepared.repo.id)
-            .fetch_all(db.pool())
-            .await?;
+    let locations: Vec<(String, String)> = db
+        .machine_precheck_repository_location_statuses(&prepared.repo.id)
+        .await?;
     for (id, status) in &locations {
         if binding
             .as_ref()
@@ -174,14 +172,9 @@ async fn task_holds_run_slot(db: &db::SqliteDb, task_id: &str, role: &str) -> Re
     } else {
         role
     };
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND status = 'running' AND role IN (?, ?))",
-    )
-    .bind(task_id)
-    .bind(role)
-    .bind(executor)
-    .fetch_one(db.pool())
-    .await?)
+    Ok(db
+        .machine_precheck_task_holds_run_slot(task_id, role, executor)
+        .await?)
 }
 
 /// A known environment-failed machine is not an alternative to a full,

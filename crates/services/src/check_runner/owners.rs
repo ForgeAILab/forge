@@ -402,7 +402,10 @@ impl CheckOwnerPort for WorkspaceCheckOwners {
         let CheckDispatchTarget::Daemon { workspace } = &self.intent(record)?.target else {
             return Ok(false);
         };
-        let row: Option<(Option<String>,Option<String>,Option<String>)>=sqlx::query_as("SELECT d.removed_at,p.disconnected_at,d.last_report_at FROM daemon d LEFT JOIN workspace_placement p ON p.id=? WHERE d.id=?").bind(&workspace.placement_id).bind(&workspace.daemon_id).fetch_optional(self.db.pool()).await?;
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+            .db
+            .check_owner_disconnect_facts(&workspace.placement_id, &workspace.daemon_id)
+            .await?;
         let Some((removed, disconnected, reported)) = row else {
             return Ok(true);
         };

@@ -163,9 +163,8 @@ async fn retain_project_agent_workspace_if_current(
         repo_cache.as_deref(),
         authority.repository_identity.as_ref(),
     ) {
-        let repo_live = sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
-            .bind(&repository_identity.0)
-            .fetch_optional(&mut *transaction)
+        let repo_live = db
+            .project_agent_workspace_repo_live_in_tx(&mut transaction, &repository_identity.0)
             .await?
             .is_some();
         if repo_live {
@@ -211,27 +210,26 @@ pub(super) async fn cleanup_repo_cache_if_authority_gone(
             return;
         }
     };
-    let project_exists =
-        match sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ? LIMIT 1")
-            .bind(project_id)
-            .fetch_optional(&mut *transaction)
-            .await
-        {
-            Ok(row) => row.is_some(),
-            Err(error) => {
-                tracing::error!(
-                    project_id,
-                    repo_id,
-                    error = %error,
-                    "could not verify Project authority before repository-cache cleanup"
-                );
-                return;
-            }
-        };
-    let repo_exists = match sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
-        .bind(repo_id)
-        .fetch_optional(&mut *transaction)
+    let project_exists = match db
+        .project_agent_workspace_project_live_in_tx(&mut transaction, project_id)
         .await
+        .map_err(workspace_authority_query_error)
+    {
+        Ok(row) => row.is_some(),
+        Err(error) => {
+            tracing::error!(
+                project_id,
+                repo_id,
+                error = %error,
+                "could not verify Project authority before repository-cache cleanup"
+            );
+            return;
+        }
+    };
+    let repo_exists = match db
+        .project_agent_workspace_repo_live_in_tx(&mut transaction, repo_id)
+        .await
+        .map_err(workspace_authority_query_error)
     {
         Ok(row) => row.is_some(),
         Err(error) => {
@@ -412,16 +410,13 @@ impl ProjectAgentWorkspaceAuthority {
     }
 }
 
-type ProjectAgentWorkspaceAuthorityRow = (
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+// Background cache cleanup logs the original SQLx error text.
+fn workspace_authority_query_error(error: db::DbError) -> sqlx::Error {
+    match error {
+        db::DbError::Sqlx(error) => error,
+        error => sqlx::Error::Protocol(error.to_string()),
+    }
+}
 
 async fn query_project_agent_workspace_authority<'e, E>(
     executor: E,
@@ -430,49 +425,24 @@ async fn query_project_agent_workspace_authority<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
-    let row = sqlx::query_as::<_, ProjectAgentWorkspaceAuthorityRow>(
-        "SELECT p.id, p.created_at, p.primary_repo_id,
-                operation.id,
-                repo.id, CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END,
-                repo.local_path, repo.default_branch
-         FROM project p
-         LEFT JOIN project_provisioning_operation operation
-           ON operation.project_id = p.id
-         LEFT JOIN repo
-           ON repo.id = p.primary_repo_id AND repo.project_id = p.id
-         WHERE p.id = ?",
-    )
-    .bind(project_id)
-    .fetch_optional(executor)
-    .await?;
+    let row = db::project_agent_workspace_authority_source(executor, project_id).await?;
 
-    Ok(row.map(
-        |(
-            project_id,
-            project_created_at,
-            primary_repo_id,
-            provisioning_operation_id,
-            repository_id,
-            remote_url,
-            local_path,
-            default_branch,
-        )| ProjectAgentWorkspaceAuthority {
-            project_id,
-            project_created_at,
-            provisioning_operation_id,
-            primary_repo_id,
-            repository_identity: repository_id.zip(default_branch).map(
-                |(repository_id, default_branch)| {
-                    (
-                        repository_id,
-                        db::normalize_repo_remote_url(remote_url),
-                        local_path,
-                        default_branch,
-                    )
-                },
-            ),
-        },
-    ))
+    Ok(row.map(|row| ProjectAgentWorkspaceAuthority {
+        project_id: row.project_id,
+        project_created_at: row.project_created_at,
+        provisioning_operation_id: row.provisioning_operation_id,
+        primary_repo_id: row.primary_repo_id,
+        repository_identity: row.repository_id.zip(row.default_branch).map(
+            |(repository_id, default_branch)| {
+                (
+                    repository_id,
+                    db::normalize_repo_remote_url(row.remote_url),
+                    row.local_path,
+                    default_branch,
+                )
+            },
+        ),
+    }))
 }
 
 async fn capture_project_agent_workspace_authority(

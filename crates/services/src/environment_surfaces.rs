@@ -2,7 +2,6 @@
 use crate::{placement::environment, Result, ServiceError, TaskService};
 use api_types::{MachineEnvironmentRecheckResult, MachineIdentity, ProjectEnvironmentReadiness};
 use db::{EnvironmentMachine, ProjectMachineReadinessRepo, ProjectRepo, SqliteDb};
-use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Daemon names and legacy pause owners resolved in one bounded statement.
@@ -21,23 +20,20 @@ impl MachineCatalog {
         if daemon_ids.is_empty() && workspace_ids.is_empty() {
             return Ok(catalog);
         }
-        let rows = sqlx::query(
-            "WITH legacy AS (SELECT workspace_id,owner_kind,daemon_id,runtime_id FROM workspace_placement WHERE workspace_id IN (SELECT value FROM json_each(?)))
-             SELECT 'daemon' AS kind,id,hostname,NULL AS owner_kind,NULL AS daemon_id,NULL AS runtime_id FROM daemon
-               WHERE id IN (SELECT value FROM json_each(?)) OR id IN (SELECT daemon_id FROM legacy)
-             UNION ALL SELECT 'placement',workspace_id,NULL,owner_kind,daemon_id,runtime_id FROM legacy")
-            .bind(json_ids(workspace_ids)?).bind(json_ids(daemon_ids)?).fetch_all(db.pool()).await?;
+        let rows = db
+            .environment_machine_catalog_sources(json_ids(workspace_ids)?, json_ids(daemon_ids)?)
+            .await?;
         for row in rows {
-            let id: String = row.try_get("id")?;
-            if row.try_get::<String, _>("kind")? == "daemon" {
-                catalog.names.insert(id, row.try_get("hostname")?);
+            let id: String = row.id()?;
+            if row.kind()? == "daemon" {
+                catalog.names.insert(id, row.hostname()?);
             } else {
-                let machine = if row.try_get::<String, _>("owner_kind")? == "server" {
+                let machine = if row.owner_kind()? == "server" {
                     EnvironmentMachine::Server
                 } else {
                     EnvironmentMachine::Daemon {
-                        daemon_id: row.try_get("daemon_id")?,
-                        runtime_id: row.try_get("runtime_id")?,
+                        daemon_id: row.daemon_id()?,
+                        runtime_id: row.runtime_id()?,
                     }
                 };
                 catalog.legacy_owners.insert(id, machine);
@@ -148,45 +144,50 @@ pub async fn project_environments(
         return Ok(BTreeMap::new());
     }
     let ids: Vec<_> = projects.iter().map(|project| &project.id).collect();
-    let rows = sqlx::query("SELECT * FROM project_machine_readiness WHERE project_id IN (SELECT value FROM json_each(?)) ORDER BY project_id,owner_kind,daemon_id,runtime_id")
-        .bind(json_ids(&ids)?).fetch_all(db.pool()).await?;
+    let rows = db
+        .project_environment_readiness_sources(json_ids(&ids)?)
+        .await?;
     let mut records = Vec::new();
     let mut daemon_ids = BTreeSet::new();
     for row in rows {
-        let machine = if row.try_get::<String, _>("owner_kind")? == "server" {
+        let machine = if row.owner_kind()? == "server" {
             EnvironmentMachine::Server
         } else {
             EnvironmentMachine::Daemon {
-                daemon_id: row.try_get("daemon_id")?,
-                runtime_id: row.try_get("runtime_id")?,
+                daemon_id: row.daemon_id()?,
+                runtime_id: row.runtime_id()?,
             }
         };
         collect_daemon(&machine, &mut daemon_ids);
         // Decode the same persisted record as the repository's single-row read.
         let decode = |column| -> Result<serde_json::Value> {
-            serde_json::from_str(&row.try_get::<String, _>(column)?)
+            serde_json::from_str(&row.json_text(column)?)
                 .map_err(|error| db::DbError::Check(error.to_string()).into())
         };
         records.push(db::ProjectMachineReadiness {
-            project_id: row.try_get("project_id")?,
+            project_id: row.project_id()?,
             machine,
-            status: match row.try_get::<String, _>("status")?.as_str() {
+            status: match row.status()?.as_str() {
                 "ready" => db::EnvironmentReadinessStatus::Ready,
                 "not_ready" => db::EnvironmentReadinessStatus::NotReady,
                 _ => db::EnvironmentReadinessStatus::Unknown,
             },
-            checks_digest: row.try_get("checks_digest")?,
-            failing_checks: serde_json::from_value(decode("failing_checks_json")?)
-                .map_err(|error| db::DbError::Check(error.to_string()))?,
-            check_results: serde_json::from_value(decode("check_results_json")?)
-                .map_err(|error| db::DbError::Check(error.to_string()))?,
-            output_tail: row.try_get("output_tail")?,
-            scope_covered: row.try_get("scope_covered")?,
-            role: row.try_get("role")?,
-            workspace_id: row.try_get("workspace_id")?,
-            checked_at: row.try_get("checked_at")?,
-            next_check_at: row.try_get("next_check_at")?,
-            version: row.try_get("version")?,
+            checks_digest: row.checks_digest()?,
+            failing_checks: serde_json::from_value(decode(
+                db::EnvironmentReadinessJsonField::FailingChecks,
+            )?)
+            .map_err(|error| db::DbError::Check(error.to_string()))?,
+            check_results: serde_json::from_value(decode(
+                db::EnvironmentReadinessJsonField::CheckResults,
+            )?)
+            .map_err(|error| db::DbError::Check(error.to_string()))?,
+            output_tail: row.output_tail()?,
+            scope_covered: row.scope_covered()?,
+            role: row.role()?,
+            workspace_id: row.workspace_id()?,
+            checked_at: row.checked_at()?,
+            next_check_at: row.next_check_at()?,
+            version: row.version()?,
         });
     }
     let mut pauses = BTreeMap::new();
@@ -272,28 +273,28 @@ pub async fn runnable_on_for_agents(
     if agents.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let rows = sqlx::query("SELECT d.id,d.hostname,d.machine_id,d.owner_id,d.visibility,d.detected_clis_json,r.id AS runtime_id FROM daemon AS d LEFT JOIN runtime r ON r.daemon_id=d.id AND r.status='ready' WHERE d.status <> 'offline' AND (r.id IS NOT NULL OR d.machine_id=?) ORDER BY d.id,r.id")
-        .bind(db.server_run_cap.embedded_machine_id()).fetch_all(db.pool()).await?;
+    let rows = db
+        .agent_runnable_machine_sources(db.server_run_cap.embedded_machine_id())
+        .await?;
     let mut catalog = MachineCatalog::default();
     let mut embedded = None;
     let mut runtimes = Vec::new();
     let mut daemon_ids = BTreeSet::new();
     for row in rows {
-        let id: String = row.try_get("id")?;
-        catalog.names.insert(id.clone(), row.try_get("hostname")?);
+        let id: String = row.id()?;
+        catalog.names.insert(id.clone(), row.hostname()?);
         daemon_ids.insert(id.clone());
-        if row.try_get::<String, _>("machine_id")? == db.server_run_cap.embedded_machine_id() {
+        if row.machine_id()? == db.server_run_cap.embedded_machine_id() {
             embedded = Some(id);
             continue;
         }
         let detected: serde_json::Value =
-            serde_json::from_str(&row.try_get::<String, _>("detected_clis_json")?)
-                .unwrap_or_default();
+            serde_json::from_str(&row.detected_clis_json()?).unwrap_or_default();
         runtimes.push((
             id,
-            row.try_get::<String, _>("runtime_id")?,
-            row.try_get::<Option<String>, _>("owner_id")?,
-            row.try_get::<String, _>("visibility")?,
+            row.runtime_id()?,
+            row.owner_id()?,
+            row.visibility()?,
             detected,
         ));
     }
@@ -304,9 +305,13 @@ pub async fn runnable_on_for_agents(
         .collect();
     let mut healthy = BTreeSet::new();
     if !profiles.is_empty() {
-        for row in sqlx::query("SELECT profile_id,status FROM agent_connection_health WHERE profile_id IN (SELECT value FROM json_each(?))")
-            .bind(json_ids(&profiles)?).fetch_all(db.pool()).await? {
-            if row.try_get::<String,_>("status")? == "healthy" { healthy.insert(row.try_get::<String,_>("profile_id")?); }
+        for row in db
+            .agent_runnable_profile_health_sources(json_ids(&profiles)?)
+            .await?
+        {
+            if row.status()? == "healthy" {
+                healthy.insert(row.profile_id()?);
+            }
         }
     }
     let cli_types: BTreeSet<_> = agents
@@ -317,11 +322,19 @@ pub async fn runnable_on_for_agents(
     let mut policies = BTreeMap::new();
     let mut global_policies: BTreeMap<(String, String), bool> = BTreeMap::new();
     if !cli_types.is_empty() && !daemon_ids.is_empty() {
-        for row in sqlx::query("SELECT owner_user_id,daemon_id,executor_type,enabled FROM cli_runtime_policy WHERE daemon_id IN (SELECT value FROM json_each(?)) AND executor_type IN (SELECT value FROM json_each(?))")
-            .bind(json_ids(&daemon_ids)?).bind(json_ids(&cli_types)?).fetch_all(db.pool()).await? {
-            let owner: String = row.try_get("owner_user_id")?; let daemon: String = row.try_get("daemon_id")?; let executor: String = row.try_get("executor_type")?; let enabled: bool = row.try_get("enabled")?;
-            global_policies.entry((daemon.clone(),executor.clone())).and_modify(|old|*old &= enabled).or_insert(enabled);
-            policies.insert((owner,daemon,executor),enabled);
+        for row in db
+            .agent_runnable_cli_policy_sources(json_ids(&daemon_ids)?, json_ids(&cli_types)?)
+            .await?
+        {
+            let owner: String = row.owner_user_id()?;
+            let daemon: String = row.daemon_id()?;
+            let executor: String = row.executor_type()?;
+            let enabled: bool = row.enabled()?;
+            global_policies
+                .entry((daemon.clone(), executor.clone()))
+                .and_modify(|old| *old &= enabled)
+                .or_insert(enabled);
+            policies.insert((owner, daemon, executor), enabled);
         }
     }
     let enabled = |agent: &db::Agent, daemon: Option<&str>| {
@@ -437,9 +450,9 @@ pub async fn recheck(
             (row.machine.clone(), Some(row)),
         );
     }
-    let locations: Vec<(String,Option<String>,Option<String>)> = sqlx::query_as(
-        "SELECT l.owner_kind,l.daemon_id,l.runtime_id FROM repo_location l JOIN repo r ON r.id=l.repo_id WHERE r.project_id=? AND l.status='ready'")
-        .bind(project_id).fetch_all(db.pool()).await?;
+    let locations: Vec<(String, Option<String>, Option<String>)> = db
+        .project_environment_ready_location_owners(project_id)
+        .await?;
     for (kind, daemon, runtime) in locations {
         let machine = if kind == "server" {
             EnvironmentMachine::Server
@@ -455,11 +468,9 @@ pub async fn recheck(
     }
     // The primary host checkout is the legacy check target even without a location row.
     if project.primary_repo_id.is_some() {
-        let checkout: Option<Option<String>> =
-            sqlx::query_scalar("SELECT local_path FROM repo WHERE id=?")
-                .bind(&project.primary_repo_id)
-                .fetch_optional(db.pool())
-                .await?;
+        let checkout: Option<Option<String>> = db
+            .project_environment_primary_checkout(&project.primary_repo_id)
+            .await?;
         if checkout.flatten().is_some() {
             targets
                 .entry("server".into())

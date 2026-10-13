@@ -222,13 +222,10 @@ impl OwnerObjectTransfer {
     }
 
     async fn server_location(&self, location_id: &str) -> Result<Option<PathBuf>> {
-        let path: Option<String> = sqlx::query_scalar(
-            "SELECT path FROM repo_location WHERE id=? AND owner_kind='server' AND status='ready'",
-        )
-        .bind(location_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let path: Option<String> = self
+            .db
+            .integration_transfer_ready_server_location(location_id)
+            .await?;
         Ok(path.map(PathBuf::from))
     }
 
@@ -357,12 +354,10 @@ impl ObjectTransferPort for OwnerObjectTransfer {
     }
 
     async fn sweep_at_start(&self) -> Result<()> {
-        let locations: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id,path FROM repo_location WHERE owner_kind='server' AND status='ready' ORDER BY id",
-        )
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let locations: Vec<(String, String)> = self
+            .db
+            .integration_transfer_ready_server_locations()
+            .await?;
         for (location_id, path) in locations {
             let path = PathBuf::from(path);
             if !path.join(".git").exists() {
@@ -388,13 +383,10 @@ impl ObjectTransferPort for OwnerObjectTransfer {
             attempts.dedup();
             let mut released = 0;
             for attempt_id in attempts {
-                let holds_slot: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM integration_queue WHERE head_attempt_id=?)",
-                )
-                .bind(&attempt_id)
-                .fetch_one(self.db.pool())
-                .await
-                .map_err(db::DbError::from)?;
+                let holds_slot: bool = self
+                    .db
+                    .integration_transfer_attempt_holds_slot(&attempt_id)
+                    .await?;
                 if holds_slot {
                     continue;
                 }
@@ -417,24 +409,19 @@ impl ObjectTransferPort for OwnerObjectTransfer {
         // existing wire; it is idempotent and deletes nothing else.
         let since =
             (chrono::Utc::now() - chrono::Duration::days(OWED_RELEASE_WINDOW_DAYS)).to_rfc3339();
-        let owed: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT a.id,l.id,l.daemon_id,l.runtime_id FROM integration_attempt a \
-             JOIN integration_queue q ON q.id=a.queue_id \
-             JOIN repo_location l ON l.id IN (a.repo_location_id,q.target_location_id) \
-             WHERE l.owner_kind='daemon' AND l.daemon_id IS NOT NULL AND l.runtime_id IS NOT NULL \
-               AND a.repo_location_id IS NOT NULL AND q.target_location_id IS NOT NULL \
-               AND a.repo_location_id<>q.target_location_id \
-               AND (q.head_attempt_id IS NULL OR q.head_attempt_id<>a.id) \
-               AND a.started_at IS NOT NULL AND a.updated_at>=? ORDER BY a.updated_at DESC,a.id LIMIT ?",
-        )
-        .bind(&since)
-        .bind(OWED_RELEASE_MAX)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let owed = self
+            .db
+            .integration_transfer_owed_release_ends(&since, OWED_RELEASE_MAX)
+            .await?;
         *self.owed.lock().expect("owed releases") = owed
             .into_iter()
-            .map(|(attempt_id, repo_location_id, daemon_id, runtime_id)| {
+            .map(|row| {
+                let (attempt_id, repo_location_id, daemon_id, runtime_id) = (
+                    row.attempt_id,
+                    row.repo_location_id,
+                    row.daemon_id,
+                    row.runtime_id,
+                );
                 (
                     OwedEnd {
                         daemon_id,

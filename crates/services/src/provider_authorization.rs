@@ -235,14 +235,10 @@ impl ProviderAuthorizationService {
         request_origin: Option<String>,
     ) -> Result<ProviderAuthorizationOperation> {
         let since = (Utc::now() - ChronoDuration::minutes(1)).to_rfc3339();
-        let recent = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM provider_authorization_operation
-             WHERE owner_user_id = ? AND created_at >= ?",
-        )
-        .bind(&owner_user_id)
-        .bind(&since)
-        .fetch_one(self.db.pool())
-        .await?;
+        let recent = self
+            .db
+            .recent_provider_authorization_count(&owner_user_id, &since)
+            .await?;
         if recent >= 5 {
             return Err(ServiceError::RateLimited {
                 retry_after_seconds: 60,
@@ -356,13 +352,12 @@ impl ProviderAuthorizationService {
                 match self.start_device(request.provider).await {
                     Ok((authorization_url, user_code, interval, expires_in, secret)) => {
                         let expires_at = now + ChronoDuration::seconds(expires_in as i64);
-                        sqlx::query(
-                            "UPDATE provider_authorization_operation SET expires_at = ? WHERE id = ?",
-                        )
-                        .bind(expires_at.to_rfc3339())
-                        .bind(&id)
-                        .execute(self.db.pool())
-                        .await?;
+                        self.db
+                            .update_provider_device_authorization_expiry(
+                                expires_at.to_rfc3339(),
+                                &id,
+                            )
+                            .await?;
                         self.protected_store
                             .seal_provider_authorization_state(
                                 &id,

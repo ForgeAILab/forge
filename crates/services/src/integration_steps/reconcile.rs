@@ -305,11 +305,7 @@ impl crate::TaskService {
         if !merge_state(&workflow, &task.status) {
             return Ok(false);
         }
-        let owned: bool = sqlx::query_scalar(db::INTEGRATION_OWNED_SQL)
-            .bind(&task.id)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
+        let owned: bool = self.db.integration_reconcile_task_owned(&task.id).await?;
         // Rebind stale released owners through admission first. Healthy
         // attempts can repair their condition behind a real hold/block.
         let incomplete_import = self

@@ -671,16 +671,13 @@ async fn agent_usage_in_snapshot(
         return Ok(HashMap::new());
     }
     let ids_json = serde_json::to_string(identity_ids).map_err(|_| invalid_transition())?;
-    let source_rows = sqlx::query(
-        "SELECT agent_id, source_id FROM usage_invocation WHERE agent_id IN (SELECT value FROM json_each(?1))
-         UNION SELECT agent_id, source_id FROM usage_event WHERE agent_id IN (SELECT value FROM json_each(?1))
-         ORDER BY agent_id, source_id",
-    ).bind(&ids_json).fetch_all(&mut *connection).await?;
+    let source_rows =
+        db::SqliteDb::agent_usage_source_ids_on_connection(&mut *connection, &ids_json).await?;
     let mut sources_by_agent = HashMap::<String, HashSet<String>>::new();
     let mut all_sources = BTreeSet::<String>::new();
     for row in source_rows {
-        let agent_id: String = sqlx::Row::try_get(&row, "agent_id")?;
-        let source_id: String = sqlx::Row::try_get(&row, "source_id")?;
+        let agent_id: String = row.agent_id()?;
+        let source_id: String = row.source_id()?;
         all_sources.insert(source_id.clone());
         sources_by_agent
             .entry(agent_id)
@@ -694,14 +691,18 @@ async fn agent_usage_in_snapshot(
     .await?;
     let events = effective_usage_events_for_invocations(connection, &invocations).await?;
     let mut runs_by_agent = HashMap::<String, Vec<UsageDomainRun>>::new();
-    for row in sqlx::query("SELECT agent_id, id, status FROM execution WHERE agent_id IN (SELECT value FROM json_each(?))")
-        .bind(ids_json).fetch_all(&mut *connection).await? {
-        let agent_id: String = sqlx::Row::try_get(&row, "agent_id")?;
-        runs_by_agent.entry(agent_id).or_default().push(UsageDomainRun {
-            surface: DbUsageSurface::TaskExecution,
-            source_id: sqlx::Row::try_get(&row, "id")?,
-            pending: sqlx::Row::try_get::<String, _>(&row, "status")? == "running",
-        });
+    for row in
+        db::SqliteDb::agent_usage_domain_runs_on_connection(&mut *connection, ids_json).await?
+    {
+        let agent_id: String = row.agent_id()?;
+        runs_by_agent
+            .entry(agent_id)
+            .or_default()
+            .push(UsageDomainRun {
+                surface: DbUsageSurface::TaskExecution,
+                source_id: row.id()?,
+                pending: row.status()? == "running",
+            });
     }
     let mut aggregates = HashMap::new();
     for id in identity_ids {
@@ -741,19 +742,6 @@ async fn agent_usage_in_snapshot(
     Ok(aggregates)
 }
 
-/// Collect the execution attempts belonging to one Task.  Runtime rows are
-/// included as domain runs even when no invocation was admitted, preserving
-/// no-provider and active/pending coverage in Task observability.
-// Separate branches keep every predicate backed by its task/execution/source index.
-const TASK_USAGE_SOURCES_SQL: &str = "
-    SELECT source_id FROM usage_invocation WHERE task_id = ?
-    UNION SELECT source_id FROM usage_invocation WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-    UNION SELECT source_id FROM usage_invocation WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
-    UNION SELECT source_id FROM usage_event WHERE task_id = ?
-    UNION SELECT source_id FROM usage_event WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
-    UNION SELECT source_id FROM usage_event WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
-    ORDER BY source_id";
-
 async fn effective_usage_events_for_invocations(
     connection: &mut sqlx::SqliteConnection,
     invocations: &[UsageInvocation],
@@ -789,36 +777,11 @@ async fn effective_usage_events_for_invocations(
     }
     let mut metadata = HashMap::new();
     for chunk in effective.chunks(150) {
-        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "WITH requested(event_id, invocation_id, rate_id, catalog_id, revision_id) AS (",
-        );
-        query.push_values(chunk, |mut row, (event, revision)| {
-            row.push_bind(&event.id)
-                .push_bind(&event.invocation_id)
-                .push_bind(event.rate_revision_id.as_deref())
-                .push_bind(event.catalog_snapshot_id.as_deref())
-                .push_bind(revision.as_deref());
-        });
-        query.push(") SELECT requested.event_id,
-             ps.source_kind AS selection_source_kind,
-             ps.catalog_freshness AS selection_catalog_freshness,
-             ps.rate_revision_id AS selection_rate_revision_id,
-             ps.catalog_snapshot_id AS selection_catalog_snapshot_id,
-             r.source_kind AS rate_source_kind,
-             r.catalog_snapshot_id AS rate_catalog_snapshot_id,
-             r.effective_at AS rate_effective_at,
-             c.revision_digest AS catalog_digest,
-             c.fetched_at AS catalog_fetched_at,
-             ep.catalog_freshness AS estimate_catalog_freshness
-         FROM requested JOIN usage_invocation i ON i.id = requested.invocation_id
-         LEFT JOIN pricing_selection ps ON ps.id = i.pricing_selection_id
-         LEFT JOIN cost_estimate_revision er ON er.id = requested.revision_id
-         LEFT JOIN cost_estimation_run erun ON erun.id = er.run_id
-         LEFT JOIN cost_estimation_preview ep ON ep.id = erun.preview_id
-         LEFT JOIN pricing_rate_revision r ON r.id = COALESCE(requested.rate_id, ps.rate_revision_id)
-         LEFT JOIN pricing_catalog_snapshot c ON c.id = COALESCE(requested.catalog_id, r.catalog_snapshot_id, ps.catalog_snapshot_id)");
-        for row in query.build().fetch_all(&mut *connection).await? {
-            let id: String = sqlx::Row::try_get(&row, "event_id")?;
+        for row in
+            db::SqliteDb::effective_usage_event_metadata_on_connection(&mut *connection, chunk)
+                .await?
+        {
+            let id: String = row.event_id()?;
             metadata.insert(id, row);
         }
     }
@@ -839,15 +802,13 @@ async fn effective_usage_events_for_invocations(
 
 pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Result<UsageAggregate> {
     let mut connection = db.pool().acquire().await?;
-    let execution_rows = sqlx::query("SELECT id, status FROM execution WHERE task_id = ?")
-        .bind(task_id)
-        .fetch_all(&mut *connection)
-        .await?;
+    let execution_rows =
+        db::SqliteDb::task_usage_domain_runs_on_connection(&mut connection, task_id).await?;
     let mut execution_ids = BTreeSet::new();
     let mut domain_runs = Vec::with_capacity(execution_rows.len());
     for row in execution_rows {
-        let id: String = sqlx::Row::try_get(&row, "id")?;
-        let status: String = sqlx::Row::try_get(&row, "status")?;
+        let id: String = row.id()?;
+        let status: String = row.status()?;
         execution_ids.insert(id.clone());
         domain_runs.push(UsageDomainRun {
             surface: DbUsageSurface::TaskExecution,
@@ -856,18 +817,11 @@ pub async fn usage_aggregate_for_task(db: &db::SqliteDb, task_id: &str) -> Resul
         });
     }
 
-    let source_rows = sqlx::query(TASK_USAGE_SOURCES_SQL)
-        .bind(task_id)
-        .bind(task_id)
-        .bind(task_id)
-        .bind(task_id)
-        .bind(task_id)
-        .bind(task_id)
-        .fetch_all(&mut *connection)
-        .await?;
+    let source_rows =
+        db::SqliteDb::task_usage_source_ids_on_connection(&mut connection, task_id).await?;
     let source_ids = source_rows
         .iter()
-        .map(|row| sqlx::Row::try_get(row, "source_id"))
+        .map(|row| row.source_id())
         .collect::<std::result::Result<Vec<String>, _>>()?;
     let candidates =
         db::SqliteDb::usage_invocations_for_sources(&mut connection, &source_ids).await?;
@@ -913,16 +867,11 @@ pub async fn usage_aggregate_for_operations(db: &db::SqliteDb) -> Result<UsageAg
 async fn operations_usage_in_snapshot(
     connection: &mut sqlx::SqliteConnection,
 ) -> Result<UsageAggregate> {
-    let source_rows = sqlx::query(
-        "SELECT DISTINCT source_id FROM usage_invocation
-         UNION SELECT DISTINCT source_id FROM usage_event
-         ORDER BY source_id ASC",
-    )
-    .fetch_all(&mut *connection)
-    .await?;
+    let source_rows =
+        db::SqliteDb::operations_usage_source_ids_on_connection(&mut *connection).await?;
     let source_ids = source_rows
         .iter()
-        .map(|row| sqlx::Row::try_get(row, "source_id"))
+        .map(|row| row.source_id())
         .collect::<std::result::Result<Vec<String>, _>>()?;
     // Operations is polled: read the ledger in id batches (the Task path's
     // readers) instead of four statements per invocation.
@@ -946,12 +895,11 @@ async fn operations_usage_in_snapshot(
             pending: false,
         })
         .collect::<Vec<_>>();
-    let execution_rows = sqlx::query("SELECT id, status FROM execution")
-        .fetch_all(&mut *connection)
-        .await?;
+    let execution_rows =
+        db::SqliteDb::operations_usage_domain_runs_on_connection(&mut *connection).await?;
     for row in execution_rows {
-        let source_id: String = sqlx::Row::try_get(&row, "id")?;
-        let status: String = sqlx::Row::try_get(&row, "status")?;
+        let source_id: String = row.id()?;
+        let status: String = row.status()?;
         domain_runs.push(UsageDomainRun {
             surface: DbUsageSurface::TaskExecution,
             source_id,
@@ -1825,16 +1773,19 @@ mod task_read_tests {
                 serde_json::to_value(aggregate).unwrap()
             );
         }
-        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {TASK_USAGE_SOURCES_SQL}"))
-            .bind("task-0")
-            .bind("task-0")
-            .bind("task-0")
-            .bind("task-0")
-            .bind("task-0")
-            .bind("task-0")
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
+        let rows = sqlx::query(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            db::TASK_USAGE_SOURCES_SQL
+        ))
+        .bind("task-0")
+        .bind("task-0")
+        .bind("task-0")
+        .bind("task-0")
+        .bind("task-0")
+        .bind("task-0")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
         let plans = rows
             .iter()
             .map(|r| sqlx::Row::get::<String, _>(r, "detail"))

@@ -615,34 +615,26 @@ impl DaemonExecutionEventHandler for ServerExecutionEventSink {
         if let Some(registry) = registry {
             // Retain the replayed result too: the original request may have
             // lost its response, and its journal ACK can be interrupted.
-            let placement_id = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM workspace_placement WHERE owner_kind = 'daemon' AND daemon_id = ?
-                 AND workspace_handle = ? AND generation = ? AND state = 'cleaned'",
-            )
-            .bind(daemon_id)
-            .bind(&notification.workspace_handle)
-            .bind(
-                i64::try_from(notification.generation)
-                    .map_err(|_| ServiceError::invalid_operation("invalid cleanup generation"))?,
-            )
-            .fetch_optional(self.db.pool())
-            .await?;
+            let placement_id = self
+                .db
+                .daemon_cleanup_replay_placement_id(
+                    daemon_id,
+                    &notification.workspace_handle,
+                    i64::try_from(notification.generation).map_err(|_| {
+                        ServiceError::invalid_operation("invalid cleanup generation")
+                    })?,
+                )
+                .await?;
             let Some(placement_id) = placement_id else {
                 return Ok(DaemonTerminalDisposition::Ignore);
             };
             let placement = WorkspacePlacementRepo::get_by_id(&*self.db, &placement_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("placement", &placement_id))?;
-            let intent = sqlx::query_scalar::<_, String>(
-                "SELECT outcome_json FROM command_receipt WHERE principal_id = 'workspace-backend'
-                 AND operation = 'daemon.workspace.cleanup.intent' AND correlation_id = ?
-                 AND json_extract(outcome_json, '$.metadata.placement_id') = ?
-                 ORDER BY committed_at DESC, id DESC LIMIT 1",
-            )
-            .bind(&notification.operation_id)
-            .bind(&placement.id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let intent = self
+                .db
+                .daemon_cleanup_replay_intent(&notification.operation_id, &placement.id)
+                .await?;
             let request = match intent {
                 Some(intent) => {
                     let intent: serde_json::Value =

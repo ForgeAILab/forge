@@ -108,3 +108,71 @@ impl RuntimeRepo for SqliteDb {
         page_from_items(items, &query.page, offset, total)
     }
 }
+
+pub struct PlacementProvisionRuntimeSourceRow {
+    row: SqliteRow,
+}
+impl PlacementProvisionRuntimeSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn retry_runtime(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("retry_runtime")?)
+    }
+    pub fn retry_location(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("retry_location")?)
+    }
+    pub fn retry_attempts(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("retry_attempts")?)
+    }
+    pub fn retry_digest(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("retry_digest")?)
+    }
+    pub fn retry_connection(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("retry_connection")?)
+    }
+    pub fn workspace_root(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("workspace_root")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_provision_runtime_sources_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        embedded_machine_id: String,
+    ) -> crate::Result<Vec<PlacementProvisionRuntimeSourceRow>> {
+        let rows = sqlx::query("SELECT r.*, j.runtime_id AS retry_runtime, j.location_id AS retry_location, j.attempts AS retry_attempts, j.checks_digest AS retry_digest, j.connection_id AS retry_connection FROM runtime r JOIN daemon d ON d.id = r.daemon_id LEFT JOIN repo_provision_retry j ON j.runtime_id = r.id AND j.repo_id = ? WHERE d.removed_at IS NULL AND d.machine_id <> ? ORDER BY d.created_at, d.id, r.id").bind(repo_id).bind(embedded_machine_id).fetch_all(connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PlacementProvisionRuntimeSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_runtime_ready_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        runtime_id: &str,
+        daemon_id: &str,
+    ) -> crate::Result<Option<bool>> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT status = 'ready' FROM runtime WHERE id = ? AND daemon_id = ?",
+        )
+        .bind(runtime_id)
+        .bind(daemon_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}

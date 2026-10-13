@@ -331,3 +331,76 @@ impl SqliteDb {
 .fetch_one(connection).await?)
     }
 }
+
+pub struct ProjectEnvironmentReadinessSourceRow {
+    row: SqliteRow,
+}
+impl ProjectEnvironmentReadinessSourceRow {
+    pub fn owner_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("owner_kind")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn runtime_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("runtime_id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn checks_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("checks_digest")?)
+    }
+    pub fn output_tail(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("output_tail")?)
+    }
+    pub fn scope_covered(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("scope_covered")?)
+    }
+    pub fn role(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("role")?)
+    }
+    pub fn workspace_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("workspace_id")?)
+    }
+    pub fn checked_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("checked_at")?)
+    }
+    pub fn next_check_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("next_check_at")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_environment_readiness_sources(
+        &self,
+        project_ids_json: String,
+    ) -> crate::Result<Vec<ProjectEnvironmentReadinessSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM project_machine_readiness WHERE project_id IN (SELECT value FROM json_each(?)) ORDER BY project_id,owner_kind,daemon_id,runtime_id").bind(project_ids_json).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectEnvironmentReadinessSourceRow { row })
+            .collect())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum EnvironmentReadinessJsonField {
+    FailingChecks,
+    CheckResults,
+}
+impl ProjectEnvironmentReadinessSourceRow {
+    pub fn json_text(&self, field: EnvironmentReadinessJsonField) -> crate::Result<String> {
+        let column = match field {
+            EnvironmentReadinessJsonField::FailingChecks => "failing_checks_json",
+            EnvironmentReadinessJsonField::CheckResults => "check_results_json",
+        };
+        Ok(self.row.try_get(column)?)
+    }
+}

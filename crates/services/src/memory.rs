@@ -11,7 +11,6 @@ use db::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{Result, ServiceError};
@@ -870,32 +869,24 @@ impl MemoryBackfillRepository for SqliteDb {
 }
 
 async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, e.id, e.task_id, e.agent_id, e.role, e.status, e.summary, e.error \
-         FROM execution e JOIN task t ON t.id = e.task_id \
-         WHERE e.status IN ('completed', 'failed') \
-           AND (TRIM(COALESCE(e.summary, '')) <> '' OR TRIM(COALESCE(e.error, '')) <> '') \
-         ORDER BY e.created_at ASC, e.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_execution_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
-            let summary: Option<String> = row.try_get("summary")?;
-            let error: Option<String> = row.try_get("error")?;
+            let status: String = row.status()?;
+            let summary: Option<String> = row.summary()?;
+            let error: Option<String> = row.error()?;
             let body = summary
                 .clone()
                 .or(error.clone())
                 .unwrap_or_else(|| status.clone());
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
-                execution_id: Some(row.try_get("id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
+                execution_id: Some(row.id()?),
                 source_type: MemorySourceType::Execution,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::ExecutionSummary,
-                title: format!("Execution {status}: {}", row.try_get::<String, _>("role")?),
+                title: format!("Execution {status}: {}", row.role()?),
                 summary: snippet(&body),
                 body,
                 confidence: Some(if status == "completed" {
@@ -903,38 +894,26 @@ async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSourc
                 } else {
                     MemoryConfidence::Partial
                 }),
-                creator: row
-                    .try_get::<Option<String>, _>("agent_id")?
-                    .map(agent_creator),
+                creator: row.agent_id()?.map(agent_creator),
             })
         })
         .collect()
 }
 
 async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, r.id, r.task_id, r.execution_id, r.attempt_number, r.status, r.step_results_json \
-         FROM review r JOIN task t ON t.id = r.task_id \
-         WHERE r.status != 'running' \
-         ORDER BY r.created_at ASC, r.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_review_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
-            let body: String = row.try_get("step_results_json")?;
+            let status: String = row.status()?;
+            let body: String = row.step_results_json()?;
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
-                execution_id: Some(row.try_get("execution_id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
+                execution_id: Some(row.execution_id()?),
                 source_type: MemorySourceType::Review,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::ReviewResult,
-                title: format!(
-                    "Review {status} attempt {}",
-                    row.try_get::<i64, _>("attempt_number")?
-                ),
+                title: format!("Review {status} attempt {}", row.attempt_number()?),
                 summary: review_summary_from_json(&body, &status),
                 body,
                 confidence: Some(if status == "passed" || status == "failed" {
@@ -949,25 +928,19 @@ async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>>
 }
 
 async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, c.id, c.task_id, c.author_type, c.author_id, c.author_name, c.content \
-         FROM task_comment c JOIN task t ON t.id = c.task_id \
-         ORDER BY c.created_at ASC, c.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_comment_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let author_type: String = row.try_get("author_type")?;
-            let author_id: Option<String> = row.try_get("author_id")?;
-            let content: String = row.try_get("content")?;
-            let author_name: String = row.try_get("author_name")?;
+            let author_type: String = row.author_type()?;
+            let author_id: Option<String> = row.author_id()?;
+            let content: String = row.content()?;
+            let author_name: String = row.author_name()?;
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
                 execution_id: None,
                 source_type: MemorySourceType::Comment,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::Comment,
                 title: format!("Comment by {author_name}"),
                 summary: snippet(&content),
@@ -985,32 +958,25 @@ async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>
 }
 
 async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, tl.id, tl.task_id, tl.from_state, tl.to_state, tl.trigger_name, tl.triggered_by, \
-                tl.bridge_kind, tl.bridge_payload, tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
-         FROM transition_log tl JOIN task t ON t.id = tl.task_id \
-         ORDER BY tl.created_at ASC, tl.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_transition_sources().await?;
     let mut sources = Vec::new();
     for row in rows {
         let transition = TransitionLog {
-            id: row.try_get("id")?,
-            task_id: row.try_get("task_id")?,
-            from_state: row.try_get("from_state")?,
-            to_state: row.try_get("to_state")?,
-            trigger_name: row.try_get("trigger_name")?,
-            triggered_by: row.try_get("triggered_by")?,
+            id: row.id()?,
+            task_id: row.task_id()?,
+            from_state: row.from_state()?,
+            to_state: row.to_state()?,
+            trigger_name: row.trigger_name()?,
+            triggered_by: row.triggered_by()?,
             bridge: db::decode_transition_bridge(
-                row.try_get::<&str, _>("id")?,
-                row.try_get::<Option<&str>, _>("bridge_kind")?,
-                row.try_get::<Option<&str>, _>("bridge_payload")?,
+                row.id_ref()?,
+                row.bridge_kind()?,
+                row.bridge_payload()?,
             )?,
-            trigger_reason: row.try_get("trigger_reason")?,
-            hook_results_json: row.try_get("hook_results_json")?,
-            rejection: row.try_get::<i64, _>("rejection")? != 0,
-            created_at: row.try_get("created_at")?,
+            trigger_reason: row.trigger_reason()?,
+            hook_results_json: row.hook_results_json()?,
+            rejection: row.rejection()? != 0,
+            created_at: row.created_at()?,
         };
         // History keeps only the row's own typed evidence: the Task's
         // annotation and Review verdict at that moment were not recorded.
@@ -1025,7 +991,7 @@ async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSour
         }
         let body = transition_body(&transition, None);
         sources.push(MemoryBackfillSource {
-            project_id: row.try_get("project_id")?,
+            project_id: row.project_id()?,
             task_id: Some(transition.task_id.clone()),
             execution_id: None,
             source_type: MemorySourceType::Transition,

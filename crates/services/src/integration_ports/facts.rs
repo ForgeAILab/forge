@@ -93,13 +93,14 @@ impl WorkspaceHeadFacts {
     /// the queue to do, the Task's own flow continues and its next entry of
     /// the merge state is admitted. Only imported attempts are read twice.
     async fn entry_live(&self, attempt: &IntegrationAttempt) -> Result<bool> {
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
+        let live: bool = self
+            .db
+            .integration_task_entry_matches(
+                &attempt.task_ref,
+                &attempt.expected_status,
+                attempt.expected_epoch,
+            )
+            .await?;
         if !live || attempt.import_source_json.is_none() {
             return Ok(live);
         }
@@ -175,13 +176,11 @@ impl IntegrationFactsPort for WorkspaceHeadFacts {
         // The default checkout: a path on this host, or a daemon's.
         let target_row: Option<(String, String, Option<String>, Option<String>)> =
             match queue.target_location_id.as_deref() {
-                Some(location_id) => sqlx::query_as(
-                    "SELECT path,owner_kind,daemon_id,runtime_id FROM repo_location WHERE id=?",
-                )
-                .bind(location_id)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db::DbError::from)?,
+                Some(location_id) => self
+                    .db
+                    .integration_target_location(location_id)
+                    .await?
+                    .map(|row| (row.path, row.owner_kind, row.daemon_id, row.runtime_id)),
                 None => None,
             };
         let target_path: Option<PathBuf> = target_row

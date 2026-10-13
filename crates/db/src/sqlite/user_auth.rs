@@ -214,3 +214,25 @@ impl SqliteDb {
         Ok(result.rows_affected())
     }
 }
+
+pub async fn execution_admission_account_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    owner_id: String,
+) -> crate::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
+            .bind(owner_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+pub async fn execution_admission_default_account_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+) -> crate::Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT id FROM user ORDER BY is_admin DESC, created_at, id LIMIT 1",
+    )
+    .fetch_optional(connection)
+    .await?)
+}

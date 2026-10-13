@@ -442,12 +442,14 @@ impl OAuthService {
         }
 
         let family_cutoff = format_rfc3339(now_dt - Duration::days(REFRESH_TOKEN_FAMILY_TTL_DAYS));
-        let oldest_created_at = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT MIN(created_at) FROM oauth_refresh_token WHERE family_id = ?",
-        )
-        .bind(&stored.family_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let oldest_created_at = self
+            .db
+            .oauth_refresh_family_oldest_created_at(&stored.family_id)
+            .await
+            .map_err(|error| match error {
+                db::DbError::Sqlx(error) => OAuthError::from(error),
+                error => OAuthError::from(error),
+            })?;
         if let Some(oldest_created_at) = oldest_created_at {
             if oldest_created_at < family_cutoff {
                 OAuthRefreshTokenRepo::revoke_refresh_token_family(

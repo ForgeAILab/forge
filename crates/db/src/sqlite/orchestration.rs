@@ -14960,3 +14960,414 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn charter_command_revision_version(&self, charter_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT version FROM project_charter WHERE id = ? LIMIT 1")
+                .bind(charter_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn published_handoff_charter_approval_id(
+        &self,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(source_revisions_json, '$.approval_id')
+         FROM agent_handoff WHERE dedupe_key = ? LIMIT 1",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct ProjectCreationOperatingSkillRow {
+    row: SqliteRow,
+}
+impl ProjectCreationOperatingSkillRow {
+    pub fn skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("skill_key")?)
+    }
+    pub fn operating_skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("operating_skill_key")?)
+    }
+    pub fn current_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_creation_operating_skill_source(
+        &self,
+        skill_revision_id: &str,
+    ) -> crate::Result<Option<ProjectCreationOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT sr.skill_key, os.skill_key AS operating_skill_key, os.current_revision_id
+         FROM operating_skill_revision sr
+         JOIN operating_skill os ON os.id = sr.operating_skill_id
+           AND os.skill_key = sr.skill_key
+         WHERE sr.id = ? AND os.lifecycle = 'active'
+         LIMIT 1",
+        )
+        .bind(skill_revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectCreationOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_governed_milestone_ids(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT g.milestone_id FROM project_task_governance g
+                 WHERE g.task_id = ? AND g.project_id = ? AND g.milestone_id IS NOT NULL",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+pub struct DeliveryFollowupMilestoneRow {
+    row: SqliteRow,
+}
+impl DeliveryFollowupMilestoneRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn milestone_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_key")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn definition_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("definition_revision_id")?)
+    }
+    pub fn task_selection_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_selection_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_milestone_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<DeliveryFollowupMilestoneRow>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.milestone_key, m.version,
+                    m.current_definition_revision_id AS definition_revision_id,
+                    r.task_selection_json
+             FROM project_milestone m
+             JOIN project_milestone_revision r
+               ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
+             WHERE m.project_id = ?
+               AND m.lifecycle IN ('planned', 'active', 'ready_for_release')
+             ORDER BY m.milestone_sequence ASC, m.id ASC",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DeliveryFollowupMilestoneRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_open_task_count(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        task_selection_json: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task t
+                 WHERE t.project_id = ?
+                   AND t.deleted_at IS NULL AND t.archived_at IS NULL
+                   AND t.status NOT IN ('done', 'cancelled')
+                   AND (
+                        t.id IN (SELECT g.task_id FROM project_task_governance g
+                                 WHERE g.milestone_id = ? AND g.project_id = ?)
+                     OR t.id IN (SELECT value FROM json_each(?))
+                   )",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(task_selection_json)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct DeliveryFollowupCheckRow {
+    row: SqliteRow,
+}
+impl DeliveryFollowupCheckRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn source_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_kind")?)
+    }
+    pub fn outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("outcome")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_outstanding_check_sources(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        definition_revision_id: &str,
+    ) -> crate::Result<Vec<DeliveryFollowupCheckRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.source_kind, COALESCE(r.outcome, 'missing') AS outcome
+                 FROM project_milestone_check c
+                 LEFT JOIN project_milestone_check_result r
+                   ON r.id = c.current_result_id
+                  AND r.definition_revision_id = c.definition_revision_id
+                 WHERE c.project_id = ? AND c.milestone_id = ?
+                   AND c.definition_revision_id = ? AND c.required = 1
+                   AND COALESCE(r.outcome, 'missing') NOT IN ('passed', 'waived')
+                 ORDER BY c.check_key ASC
+                 LIMIT 64",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(definition_revision_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DeliveryFollowupCheckRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_has_active_product_genesis(&self, chat_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                     SELECT 1 FROM product_genesis_session
+                     WHERE main_chat_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                 )",
+        )
+        .bind(chat_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn admission_current_operating_skill_revision(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT revision.id
+         FROM operating_skill AS skill
+         JOIN operating_skill_revision AS revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+         WHERE skill.skill_key = ? AND skill.lifecycle = 'active'
+         LIMIT 1",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_agent_active_operating_skill_revision(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revision.id
+         FROM operating_skill AS skill
+         JOIN operating_skill_revision AS revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+          AND revision.skill_key = skill.skill_key
+         WHERE skill.skill_key = ?
+           AND skill.lifecycle = 'active'
+           AND skill.current_revision_id IS NOT NULL
+         LIMIT 1",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct ExecutionSetupReconciliationConflictRow {
+    row: SqliteRow,
+}
+impl ExecutionSetupReconciliationConflictRow {
+    pub fn reconciliation_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("reconciliation_id")?)
+    }
+    pub fn conflict_code(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflict_code")?)
+    }
+    pub fn description(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("description")?)
+    }
+    pub fn record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_type")?)
+    }
+    pub fn record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_id")?)
+    }
+    pub fn governing_record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_type")?)
+    }
+    pub fn governing_record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_id")?)
+    }
+    pub fn affected_paths_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("affected_paths_json")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_setup_reconciliation_conflict_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<ExecutionSetupReconciliationConflictRow>> {
+        let rows = sqlx::query(
+            "SELECT r.id AS reconciliation_id, c.conflict_code, c.description,
+                r.record_type, r.record_id,
+                r.governing_record_type, r.governing_record_id,
+                c.affected_paths_json, r.updated_at
+         FROM project_reconciliation_record r
+         JOIN project_canonical_conflict c ON c.id = r.conflict_id
+         WHERE r.project_id = ? AND r.state = 'required'
+         ORDER BY r.updated_at DESC, r.id DESC",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ExecutionSetupReconciliationConflictRow { row })
+            .collect())
+    }
+}
+
+pub struct MainCharterReadSourceRow {
+    row: SqliteRow,
+}
+impl MainCharterReadSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn genesis_session_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("genesis_session_id")?)
+    }
+    pub fn current_draft_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_draft_revision_id")?)
+    }
+    pub fn current_approved_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_approved_revision_id")?)
+    }
+    pub fn project_mode(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_mode")?)
+    }
+    pub fn maturity(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("maturity")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_unowned_charter_read_sources(
+        &self,
+        account_id: String,
+        charter_id: &Option<String>,
+        genesis_session_id: &Option<String>,
+        revision_id: &Option<String>,
+        limit: i64,
+    ) -> crate::Result<Vec<MainCharterReadSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, genesis_session_id, current_draft_revision_id,
+                    current_approved_revision_id, project_mode, maturity,
+                    lifecycle, version, updated_at
+             FROM project_charter
+             WHERE account_id = ? AND project_id IS NULL
+               AND (? IS NULL OR id = ?)
+               AND (? IS NULL OR genesis_session_id = ?)
+               AND (? IS NULL OR current_draft_revision_id = ?
+                    OR current_approved_revision_id = ?)
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(charter_id)
+        .bind(charter_id)
+        .bind(genesis_session_id)
+        .bind(genesis_session_id)
+        .bind(revision_id)
+        .bind(revision_id)
+        .bind(revision_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MainCharterReadSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_active_genesis_session_id(
+        &self,
+        account_id: &str,
+        charter_id: Option<&str>,
+    ) -> crate::Result<Option<String>> {
+        let query = if charter_id.is_some() {
+            "SELECT id FROM product_genesis_session
+                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                     ORDER BY CASE WHEN charter_id = ? THEN 0
+                                   WHEN charter_id IS NULL THEN 1
+                                   ELSE 2 END,
+                              updated_at DESC, id DESC LIMIT 1"
+        } else {
+            "SELECT id FROM product_genesis_session
+                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                     ORDER BY updated_at DESC, id DESC LIMIT 1"
+        };
+        let mut request = sqlx::query_scalar::<_, String>(query).bind(account_id);
+        if let Some(charter_id) = charter_id {
+            request = request.bind(charter_id);
+        }
+        Ok(request.fetch_optional(self.pool()).await?)
+    }
+}

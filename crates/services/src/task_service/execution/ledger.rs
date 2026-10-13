@@ -424,30 +424,20 @@ async fn admission_account_in_tx(
     project_id: &str,
     agent: &db::Agent,
 ) -> Result<Option<String>> {
-    let project_owner: Option<String> =
-        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
-            .bind(project_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .flatten();
+    let project_owner: Option<String> = db::execution_admission_project_owner_in_tx(tx, project_id)
+        .await?
+        .flatten();
     for owner in [project_owner, agent.owner_id.clone()]
         .into_iter()
         .flatten()
         .filter(|owner| !owner.trim().is_empty())
     {
-        let account = sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
-            .bind(owner)
-            .fetch_optional(&mut **tx)
-            .await?;
+        let account = db::execution_admission_account_in_tx(tx, owner).await?;
         if account.is_some() {
             return Ok(account);
         }
     }
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT id FROM user ORDER BY is_admin DESC, created_at, id LIMIT 1",
-    )
-    .fetch_optional(&mut **tx)
-    .await?)
+    Ok(db::execution_admission_default_account_in_tx(tx).await?)
 }
 
 /// Same admission operation with the concrete DB handle required by the
@@ -468,14 +458,7 @@ pub(crate) async fn admit_task_execution_in_tx_with_db(
     let Some(owner_user_id) = admission_account_in_tx(tx, &task.project_id, agent).await? else {
         return Ok(());
     };
-    if sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pricing_selection WHERE source_id = ? AND domain_kind = 'execution'",
-    )
-    .bind(&execution.id)
-    .fetch_one(&mut **tx)
-    .await?
-        > 0
-    {
+    if db::execution_pricing_selection_count_in_tx(tx, &execution.id).await? > 0 {
         return Ok(());
     }
     let mut placement_snapshot = snapshot.clone();
@@ -586,13 +569,7 @@ pub(crate) async fn ensure_task_execution_admission(
     };
     let mut tx = db::begin_immediate(db.pool()).await?;
     admit_task_execution_in_tx_with_db(db, &mut tx, task, execution, &agent, snapshot).await?;
-    let admitted = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pricing_selection WHERE source_id = ? AND domain_kind = 'execution'",
-    )
-    .bind(&execution.id)
-    .fetch_one(&mut *tx)
-    .await?
-        > 0;
+    let admitted = db::execution_pricing_selection_count_in_tx(&mut tx, &execution.id).await? > 0;
     tx.commit().await?;
     Ok(admitted)
 }

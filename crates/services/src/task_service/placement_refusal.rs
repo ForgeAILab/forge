@@ -4,37 +4,60 @@ use sha2::{Digest, Sha256};
 impl TaskService {
     async fn placement_eligibility_key(&self, task: &Task) -> Result<String> {
         let project_id = &task.project_id;
-        let assignments:Vec<(String,Option<String>,Option<String>,String)>=sqlx::query_as("SELECT role_name,assignee_type,assignee_id,updated_at FROM task_role_assignment WHERE task_id=? OR task_id=? ORDER BY task_id,role_name")
-            .bind(&task.id).bind(task.parent_task_id.as_deref().unwrap_or(&task.id)).fetch_all(self.db.pool()).await?;
+        let assignments: Vec<(String, Option<String>, Option<String>, String)> = self
+            .db
+            .placement_eligibility_assignments(
+                &task.id,
+                task.parent_task_id.as_deref().unwrap_or(&task.id),
+            )
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.role_name,
+                    row.assignee_type,
+                    row.assignee_id,
+                    row.updated_at,
+                )
+            })
+            .collect();
         // Heartbeat timestamps are intentionally excluded: only eligibility
         // facts can wake a deterministic refusal.
-        let locations: Vec<(String, i64, String, String)> = sqlx::query_as("SELECT l.id,l.version,l.status,COALESCE(r.status,'') FROM repo_location l JOIN repo ON repo.id=l.repo_id LEFT JOIN runtime r ON r.id=l.runtime_id WHERE repo.project_id=? ORDER BY l.id")
-            .bind(project_id).fetch_all(self.db.pool()).await?;
-        let retries:Vec<(String,i64,String,i64)>=sqlx::query_as("SELECT j.runtime_id,j.attempts,j.checks_digest,j.connection_id FROM repo_provision_retry j JOIN repo r ON r.id=j.repo_id WHERE r.project_id=? ORDER BY j.repo_id,j.runtime_id")
-            .bind(project_id).fetch_all(self.db.pool()).await?;
+        let locations: Vec<(String, i64, String, String)> = self
+            .db
+            .placement_eligibility_locations(project_id)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.version, row.status, row.runtime_status))
+            .collect();
+        let retries: Vec<(String, i64, String, i64)> = self
+            .db
+            .placement_eligibility_provision_retries(project_id)
+            .await?
+            .into_iter()
+            .map(|row| {
+                (
+                    row.runtime_id,
+                    row.attempts,
+                    row.checks_digest,
+                    row.connection_id,
+                )
+            })
+            .collect();
         let machines: Vec<(String, String, String)> =
-            sqlx::query_as("SELECT id, status, detected_clis_json FROM daemon ORDER BY id")
-                .fetch_all(self.db.pool())
-                .await?;
-        let profiles: Vec<(String, i64, String)> = sqlx::query_as(
-            "SELECT id,version,COALESCE(selected_profile_id,'') FROM agent_identity ORDER BY id",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+            self.db.placement_eligibility_machines().await?;
+        let profiles: Vec<(String, i64, String)> =
+            self.db.placement_eligibility_selected_profiles().await?;
         let profile_versions: Vec<(String, i64)> =
-            sqlx::query_as("SELECT id,version FROM agent_profile ORDER BY id")
-                .fetch_all(self.db.pool())
-                .await?;
+            self.db.placement_eligibility_profile_versions().await?;
         let credentials: Vec<(String, String, bool)> =
-            sqlx::query_as("SELECT id,updated_at,enabled FROM credential_handle ORDER BY id")
-                .fetch_all(self.db.pool())
-                .await?;
-        let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
-            .bind(project_id)
-            .fetch_one(self.db.pool())
+            self.db.placement_eligibility_credentials().await?;
+        let project_version: i64 = self
+            .db
+            .placement_eligibility_project_version(project_id)
             .await?;
-        let policies: Vec<(String,String,bool)> = sqlx::query_as("SELECT daemon_id,executor_type,enabled FROM cli_runtime_policy ORDER BY daemon_id,executor_type")
-            .fetch_all(self.db.pool()).await?;
+        let policies: Vec<(String, String, bool)> =
+            self.db.placement_eligibility_cli_policies().await?;
         let mut handshakes: Vec<_> = self
             .daemon_connections
             .as_ref()
@@ -85,11 +108,7 @@ impl TaskService {
         let mut capabilities = Vec::new();
         for candidate in &refusal.rejected_candidates {
             if let Some(id) = &candidate.daemon_id {
-                let machine: Option<String> =
-                    sqlx::query_scalar("SELECT hostname FROM daemon WHERE id=?")
-                        .bind(id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let machine: Option<String> = self.db.placement_refusal_machine_name(id).await?;
                 machines.push(serde_json::json!({"daemon_id":id,"runtime_id":candidate.runtime_id,"machine":machine.unwrap_or_else(|| id.clone()),"filter_codes":candidate.filter_codes}));
                 if candidate
                     .filter_codes
@@ -130,12 +149,11 @@ impl TaskService {
         });
         let mut failures = Vec::new();
         if failed {
-            let remote: Option<String> =
-                sqlx::query_scalar("SELECT remote_url FROM repo WHERE id=?")
-                    .bind(&refusal.repo_id)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .flatten();
+            let remote: Option<String> = self
+                .db
+                .placement_refusal_repo_remote_url(&refusal.repo_id)
+                .await?
+                .flatten();
             for machine in &mut machines {
                 if machine["filter_codes"]
                     .as_array()
@@ -149,8 +167,11 @@ impl TaskService {
                                 && candidate.runtime_id.as_deref() == machine["runtime_id"].as_str()
                         })
                         .expect("failed machine");
-                    let error:Option<String>=sqlx::query_scalar("SELECT COALESCE(l.last_error,j.last_error) FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id=j.location_id WHERE j.repo_id=? AND j.runtime_id=?")
-                        .bind(&refusal.repo_id).bind(&candidate.runtime_id).fetch_optional(self.db.pool()).await?.flatten();
+                    let error: Option<String> = self
+                        .db
+                        .placement_refusal_provision_error(&refusal.repo_id, &candidate.runtime_id)
+                        .await?
+                        .flatten();
                     let error = crate::project_environment::bounded_output_tail(
                         &git::redact_remote_credentials(
                             error
@@ -208,9 +229,19 @@ impl TaskService {
         };
         let wait=refusal.rejected_candidates.iter().find(|candidate|candidate.filter_codes.contains(&wait_code))
             .map(|candidate|serde_json::json!({"kind":if failed {"provision_failed"} else {"environment_unverified"},"machine":{"owner_kind":"daemon","daemon_id":candidate.daemon_id,"runtime_id":candidate.runtime_id},"checks":[]}));
-        let result=db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
-            metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?")
-            .bind(annotation.to_string()).bind(unverified || failed).bind(marker.to_string()).bind(serde_json::to_string(&wait).expect("wait")).bind(marker.to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).execute(self.db.pool()).await?;
+        let result = self
+            .db
+            .record_placement_dispatch_refusal(db::RecordPlacementDispatchRefusalInput {
+                annotation: annotation.to_string(),
+                environment_wait: unverified || failed,
+                marker: marker.to_string(),
+                wait_json: serde_json::to_string(&wait).expect("wait"),
+                marker_copy: marker.to_string(),
+                updated_at: now_rfc3339(),
+                task_id: &task.id,
+                version: task.version,
+            })
+            .await?;
         if result != 1 {
             return Err(DbError::VersionConflict.into());
         }
@@ -253,8 +284,12 @@ impl TaskService {
                 },
             )
             .await?;
-            sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1")
-                .bind(new_uuid_v4()).bind(&task.project_id).bind(event.id).bind(&message).bind(serde_json::json!({"task":{"id":task.id,"title":task.title},"machines":machines,"cause":wait_kind}).to_string()).bind(format!("task-{}:{}",if failed {"provision-failed"} else {"environment-unverified"},task.id)).bind(&now).bind(&now).execute(&mut *tx).await?;
+            self.db.upsert_placement_refusal_attention_in_tx(&mut tx, db::UpsertPlacementRefusalAttentionInTxInput {
+                id: new_uuid_v4(), project_id: &task.project_id, event_id: event.id, summary: &message,
+                details_json: serde_json::json!({"task":{"id":task.id,"title":task.title},"machines":machines,"cause":wait_kind}).to_string(),
+                dedupe_key: format!("task-{}:{}",if failed {"provision-failed"} else {"environment-unverified"},task.id),
+                occurred_at: &now, updated_at: &now,
+            }).await?;
             tx.commit().await?;
         }
         Ok(true)
@@ -314,10 +349,23 @@ impl TaskService {
         {
             return Ok(task);
         }
-        sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE dedupe_key IN (?,?) AND status<>'resolved'").bind(now_rfc3339()).bind(now_rfc3339()).bind(format!("task-environment-unverified:{}",task.id)).bind(format!("task-provision-failed:{}",task.id)).execute(self.db.pool()).await?;
-        db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
-            metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind') IN ('environment_unverified','provision_failed') THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?")
-            .bind(marker["annotation"].to_string()).bind(now_rfc3339()).bind(&task.id).bind(task.version).bind(&task.metadata_json).execute(self.db.pool()).await?;
+        self.db
+            .resolve_placement_refusal_attention(
+                now_rfc3339(),
+                now_rfc3339(),
+                format!("task-environment-unverified:{}", task.id),
+                format!("task-provision-failed:{}", task.id),
+            )
+            .await?;
+        self.db
+            .clear_placement_dispatch_refusal(db::ClearPlacementDispatchRefusalInput {
+                annotation: marker["annotation"].to_string(),
+                updated_at: now_rfc3339(),
+                task_id: &task.id,
+                version: task.version,
+                metadata_json: &task.metadata_json,
+            })
+            .await?;
         TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", &task.id))

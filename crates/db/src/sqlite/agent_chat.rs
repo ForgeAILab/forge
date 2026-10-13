@@ -4154,3 +4154,210 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn task_outcome_project_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT project_id FROM agent_chat
+                 WHERE id = ? AND kind = 'project'",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct TaskProposalChatScopeRow {
+    pub kind: String,
+    pub project_id: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<TaskProposalChatScopeRow>> {
+        let row = sqlx::query("SELECT kind, project_id FROM agent_chat WHERE id = ? LIMIT 1")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.map(|row| {
+            Ok(TaskProposalChatScopeRow {
+                kind: row.try_get("kind")?,
+                project_id: row.try_get("project_id")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn charter_command_project_chat_id(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn orchestration_main_chat_account_target(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT account_id FROM agent_chat WHERE id = ? AND kind = 'account_main'",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn orchestration_direct_chat_project_target(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT project_id
+                     FROM agent_chat
+                     WHERE id = ? AND kind = 'project'
+                     LIMIT 1",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct OrchestrationMainChatScopeRow {
+    row: SqliteRow,
+}
+impl OrchestrationMainChatScopeRow {
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn account_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("account_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn orchestration_main_chat_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<OrchestrationMainChatScopeRow>> {
+        let rows = sqlx::query("SELECT kind, account_id FROM agent_chat WHERE id = ? LIMIT 1")
+            .bind(chat_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| OrchestrationMainChatScopeRow { row }))
+    }
+}
+
+pub struct OrchestrationBoundProjectChatScopeRow {
+    row: SqliteRow,
+}
+impl OrchestrationBoundProjectChatScopeRow {
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn project_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("project_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn orchestration_bound_project_chat_scope(
+        &self,
+        identity_id: &str,
+        chat_id: &str,
+    ) -> crate::Result<Option<OrchestrationBoundProjectChatScopeRow>> {
+        let rows = sqlx::query(
+            "SELECT chat.kind, chat.project_id, binding.identity_id
+                     FROM agent_chat AS chat
+                     JOIN project_agent_binding AS binding
+                       ON binding.project_id = chat.project_id
+                      AND binding.identity_id = ?
+                      AND binding.state = 'active'
+                     WHERE chat.id = ? AND chat.kind = 'project'
+                     LIMIT 1",
+        )
+        .bind(identity_id)
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| OrchestrationBoundProjectChatScopeRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_creation_genesis_source_turn(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> crate::Result<Option<(String, String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, responder_identity_id, profile_id
+             FROM agent_chat_turn_job
+             WHERE chat_id = ? AND triggering_message_id = ?
+               AND responder_identity_id IS NOT NULL AND profile_id IS NOT NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(chat_id)
+        .bind(message_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_creation_genesis_instruction_revision(
+        &self,
+        chat_id: &str,
+        genesis_id: &str,
+    ) -> crate::Result<Option<(String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT id, revision FROM agent_chat_instruction_revision
+             WHERE chat_id = ? AND source_type = 'native' AND source_id = ?
+             ORDER BY revision DESC, id DESC LIMIT 1",
+        )
+        .bind(chat_id)
+        .bind(genesis_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct MainActionChatAccountRow {
+    row: SqliteRow,
+}
+impl MainActionChatAccountRow {
+    pub fn account_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("account_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_action_chat_account_scope(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<MainActionChatAccountRow>> {
+        let rows = sqlx::query(
+            "SELECT kind, account_id FROM agent_chat WHERE id = ? AND kind = 'account_main'",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MainActionChatAccountRow { row }))
+    }
+}

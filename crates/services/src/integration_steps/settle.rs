@@ -270,11 +270,13 @@ impl IntegrationSteps {
             IntegrationStepPosition::Due => {}
         }
         let task = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await?;
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
+        let live: bool = self
+            .db
+            .integration_task_entry_matches(
+                &attempt.task_ref,
+                &attempt.expected_status,
+                attempt.expected_epoch,
+            )
             .await?;
         let Some(task) = task.filter(|_| live) else {
             return self
@@ -580,11 +582,13 @@ impl IntegrationSteps {
             IntegrationStepPosition::Due => {}
         }
         let task = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await?;
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
+        let live: bool = self
+            .db
+            .integration_task_entry_matches(
+                &attempt.task_ref,
+                &attempt.expected_status,
+                attempt.expected_epoch,
+            )
             .await?;
         let Some(task) = task.filter(|_| live) else {
             return self.answer_task_left(step, request, states).await;
@@ -664,8 +668,10 @@ impl IntegrationSteps {
                 let own = step
                     .map(|step| step.id.clone())
                     .or_else(db::task_writer::current_step_id);
-                let preempting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND priority>=1 AND status IN ('pending','claimed') AND (? IS NULL OR id<>?))")
-                    .bind(&task.id).bind(&own).bind(&own).fetch_one(&mut *tx).await?;
+                let preempting: bool = self
+                    .db
+                    .integration_preempting_owner_command_in_tx(&mut tx, &task.id, &own)
+                    .await?;
                 if preempting {
                     return Ok(StepOutcome::Retry(
                         "an owner command is ahead of the permit".into(),
@@ -924,22 +930,13 @@ impl IntegrationSteps {
         // under exactly this identity (commit, target, commands, policy,
         // environment, workspace). The consumer's key is rebuilt with the
         // function review entry asks with, so the two cannot drift apart.
-        let reviews: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM review WHERE task_id=? AND status='passed' ORDER BY attempt_number DESC,id DESC LIMIT 16",
-        )
-        .bind(&task.id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let reviews: Vec<String> = self.db.integration_passed_review_ids(&task.id).await?;
         let mut prior = None;
         for review in reviews {
-            let row: Option<(String, i64)> = sqlx::query_as(
-                "SELECT c.id,c.status_epoch FROM check_consumer c JOIN check_result r ON r.id=c.result_id JOIN check_run run ON run.id=c.run_id WHERE c.task_id=?1 AND c.origin='entry' AND c.identity_key=?2 AND c.cancelled_at IS NULL AND r.outcome='pass' AND r.identity_key=?2 AND run.identity_key=?2 AND run.state='succeeded' AND substr(c.request_key,length(c.request_key)-length(?3))='|'||?3 ORDER BY c.created_at DESC,c.id DESC LIMIT 1",
-            )
-            .bind(&task.id)
-            .bind(&key)
-            .bind(&review)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let row: Option<(String, i64)> = self
+                .db
+                .integration_passed_review_entry_consumer(&task.id, &key, &review)
+                .await?;
             let Some((consumer_id, epoch)) = row else {
                 continue;
             };
@@ -1052,8 +1049,10 @@ impl IntegrationSteps {
         ) {
             return Ok(());
         }
-        let row: Option<(String,String)> = sqlx::query_as("SELECT id,step_results_json FROM review WHERE task_id=? ORDER BY attempt_number DESC,id DESC LIMIT 1")
-            .bind(&attempt.task_ref).fetch_optional(&mut **tx).await?;
+        let row: Option<(String, String)> = self
+            .db
+            .integration_latest_review_details_in_tx(tx, &attempt.task_ref)
+            .await?;
         let (id, mut details) = match row {
             Some((id, raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(details) => (id, details),
@@ -1100,17 +1099,14 @@ impl IntegrationSteps {
         // result is not a certified reusable one); `executed` is a run that
         // was scheduled for this consumer (it is the run's first consumer);
         // anything else is a consumer recorded on a run that already existed.
-        let origin: Option<String> =
-            sqlx::query_scalar("SELECT origin FROM check_consumer WHERE id=?")
-                .bind(&application.consumer_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        let first: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM check_consumer WHERE run_id=? ORDER BY created_at,rowid LIMIT 1",
-        )
-        .bind(&application.run.id)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let origin: Option<String> = self
+            .db
+            .integration_check_consumer_origin_in_tx(tx, &application.consumer_id)
+            .await?;
+        let first: Option<String> = self
+            .db
+            .integration_first_check_consumer_in_tx(tx, &application.run.id)
+            .await?;
         let source = if origin.as_deref() == Some("entry") {
             "review_authority"
         } else if first.as_deref() == Some(application.consumer_id.as_str()) {
@@ -1136,11 +1132,13 @@ impl IntegrationSteps {
         if records.len() > 64 {
             records.drain(..records.len() - 64);
         }
-        sqlx::query("UPDATE review SET step_results_json=?,updated_at=? WHERE id=?")
-            .bind(details.to_string())
-            .bind(db::now_rfc3339())
-            .bind(id)
-            .execute(&mut **tx)
+        self.db
+            .annotate_integration_review_details_in_tx(
+                tx,
+                details.to_string(),
+                db::now_rfc3339(),
+                id,
+            )
             .await?;
         self.db
             .produce_condition_in_tx(tx, &attempt.task_ref, db::ConditionChange::Human)

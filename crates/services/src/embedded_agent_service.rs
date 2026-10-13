@@ -29,7 +29,6 @@ use forge_agent_host::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{
     agent_chat_policy::guard_runtime_content,
@@ -1019,12 +1018,10 @@ impl EmbeddedAgentService {
             input.reasoning_effort.as_deref(),
         )?;
         let system_prompt = validate_public_runtime_text(input.system_prompt.as_deref())?;
-        let account_permission_ceiling = sqlx::query_scalar::<_, String>(
-            "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
-        )
-        .bind(&identity.id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let account_permission_ceiling = self
+            .db
+            .embedded_identity_account_permission_ceiling(&identity.id)
+            .await?;
         let account_permission_ceiling =
             serde_json::from_str(&account_permission_ceiling).unwrap_or(Value::Null);
         validate_public_runtime_json(&account_permission_ceiling)?;
@@ -1158,15 +1155,10 @@ impl EmbeddedAgentService {
     /// Best-effort persistence of the resolved base URL in entry metadata so
     /// later agent creation does not need to re-derive it.
     async fn record_entry_base_url(&self, credential_id: &str, base_url: &str) {
-        let _ = sqlx::query(
-            "UPDATE credential_handle
-             SET metadata_json = json_set(metadata_json, '$.base_url', ?)
-             WHERE id = ?",
-        )
-        .bind(base_url.trim_end_matches('/'))
-        .bind(credential_id)
-        .execute(self.db.pool())
-        .await;
+        let _ = self
+            .db
+            .record_embedded_credential_base_url(base_url.trim_end_matches('/'), credential_id)
+            .await;
     }
 
     pub async fn create_or_resume_session(
@@ -1397,16 +1389,12 @@ impl EmbeddedAgentService {
                     binding.version,
                     input.binding_version,
                 )?;
-                let policy_row = sqlx::query(
-                    "SELECT policy_revision, policy_digest
-                     FROM project_agent_binding WHERE id = ? AND project_id = ?",
-                )
-                .bind(&input.binding_id)
-                .bind(&project_id)
-                .fetch_one(self.db.pool())
-                .await?;
-                let policy_revision: String = policy_row.try_get("policy_revision")?;
-                let stored_policy_digest: String = policy_row.try_get("policy_digest")?;
+                let policy_row = self
+                    .db
+                    .frozen_project_agent_binding_policy(&input.binding_id, &project_id)
+                    .await?;
+                let policy_revision: String = policy_row.policy_revision()?;
+                let stored_policy_digest: String = policy_row.policy_digest()?;
                 if policy_revision != input.policy_revision
                     || stored_policy_digest != input.policy_digest
                 {
@@ -1612,27 +1600,14 @@ impl EmbeddedAgentService {
         context_scope_id: &str,
         profile_id: &str,
     ) -> Result<Option<AgentSession>> {
-        let dormant: Option<String> = sqlx::query_scalar(
-            "SELECT s.id FROM agent_session s
-             WHERE s.identity_id = ? AND s.context_scope_id = ? AND s.profile_id = ?
-               AND s.backend_kind = 'native' AND s.status = 'suspended'
-               AND s.replaced_by_session_id IS NULL
-             ORDER BY s.created_at DESC LIMIT 1",
-        )
-        .bind(identity_id)
-        .bind(context_scope_id)
-        .bind(profile_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let dormant: Option<String> = self
+            .db
+            .dormant_native_chat_session_id(identity_id, context_scope_id, profile_id)
+            .await?;
         let Some(id) = dormant else {
             return Ok(None);
         };
-        let pending_successor: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)",
-        )
-        .bind(&id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let pending_successor: bool = self.db.native_chat_session_pending_successor(&id).await?;
         if pending_successor {
             return Ok(None);
         }
@@ -1838,12 +1813,10 @@ impl EmbeddedAgentService {
         let allowed = if canonical.scope_type == CanonicalScopeType::Task {
             // A preview for an identity, not a session: Task authority itself
             // also needs the running execution, which no preview has.
-            let account_json: String = sqlx::query_scalar(
-                "SELECT account_permission_ceiling FROM agent_identity WHERE id = ?",
-            )
-            .bind(identity_id)
-            .fetch_one(self.db.pool())
-            .await?;
+            let account_json: String = self
+                .db
+                .embedded_identity_account_permission_ceiling(identity_id)
+                .await?;
             intersect_non_empty_layers(&[
                 permission_set(&account_json),
                 permission_set(&profile.tool_policy_json),

@@ -899,3 +899,345 @@ impl SqliteDb {
         .await?)
     }
 }
+
+#[derive(Debug)]
+pub struct PlacementEligibilityLocationRow {
+    pub id: String,
+    pub version: i64,
+    pub status: String,
+    pub runtime_status: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for PlacementEligibilityLocationRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            version: row.try_get(1)?,
+            status: row.try_get(2)?,
+            runtime_status: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_eligibility_locations(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<PlacementEligibilityLocationRow>> {
+        Ok(sqlx::query_as("SELECT l.id,l.version,l.status,COALESCE(r.status,'') FROM repo_location l JOIN repo ON repo.id=l.repo_id LEFT JOIN runtime r ON r.id=l.runtime_id WHERE repo.project_id=? ORDER BY l.id").bind(project_id).fetch_all(self.pool()).await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct PlacementEligibilityProvisionRetryRow {
+    pub runtime_id: String,
+    pub attempts: i64,
+    pub checks_digest: String,
+    pub connection_id: i64,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for PlacementEligibilityProvisionRetryRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            runtime_id: row.try_get(0)?,
+            attempts: row.try_get(1)?,
+            checks_digest: row.try_get(2)?,
+            connection_id: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_eligibility_provision_retries(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<PlacementEligibilityProvisionRetryRow>> {
+        Ok(sqlx::query_as("SELECT j.runtime_id,j.attempts,j.checks_digest,j.connection_id FROM repo_provision_retry j JOIN repo r ON r.id=j.repo_id WHERE r.project_id=? ORDER BY j.repo_id,j.runtime_id").bind(project_id).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_refusal_provision_error(
+        &self,
+        repo_id: &str,
+        runtime_id: &Option<String>,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar("SELECT COALESCE(l.last_error,j.last_error) FROM repo_provision_retry j LEFT JOIN repo_location l ON l.id=j.location_id WHERE j.repo_id=? AND j.runtime_id=?").bind(repo_id).bind(runtime_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_server_clone_paths(&self) -> crate::Result<Vec<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT path FROM repo_location WHERE owner_kind = 'server'")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_environment_ready_location_owners(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<(String, Option<String>, Option<String>)>> {
+        Ok(sqlx::query_as(
+        "SELECT l.owner_kind,l.daemon_id,l.runtime_id FROM repo_location l JOIN repo r ON r.id=l.repo_id WHERE r.project_id=? AND l.status='ready'").bind(project_id).fetch_all(self.pool()).await?)
+    }
+}
+
+pub struct PlacementRepoLocationSourceRow {
+    row: SqliteRow,
+}
+impl PlacementRepoLocationSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn repo_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("repo_id")?)
+    }
+    pub fn owner_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("owner_kind")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn runtime_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("runtime_id")?)
+    }
+    pub fn path(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("path")?)
+    }
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn is_default(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("is_default")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn last_verified_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("last_verified_at")?)
+    }
+    pub fn last_error(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("last_error")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_repository_location_sources_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+    ) -> crate::Result<Vec<PlacementRepoLocationSourceRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM repo_location WHERE repo_id = ? ORDER BY created_at, id")
+                .bind(repo_id)
+                .fetch_all(connection)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PlacementRepoLocationSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn embedded_workspace_existing_repo_location_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+        source: &str,
+        kind: String,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM repo_location WHERE repo_id = ? AND owner_kind = 'server'
+             AND daemon_id IS NULL AND runtime_id IS NULL AND path = ? AND kind = ?
+             ORDER BY created_at, id LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(source)
+        .bind(kind)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+pub struct InsertEmbeddedWorkspaceRepoLocationInTxInput<'a> {
+    pub id: &'a str,
+    pub repo_id: &'a str,
+    pub source: &'a str,
+    pub kind: String,
+    pub is_default: bool,
+    pub status: &'a str,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_embedded_workspace_repo_location_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertEmbeddedWorkspaceRepoLocationInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO repo_location (id, repo_id, owner_kind, path, kind,
+                     is_default, status, created_at, updated_at)
+                     VALUES (?, ?, 'server', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.repo_id)
+        .bind(input.source)
+        .bind(input.kind)
+        .bind(input.is_default)
+        .bind(input.status)
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_transfer_ready_server_location(
+        &self,
+        location_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT path FROM repo_location WHERE id=? AND owner_kind='server' AND status='ready'",
+        )
+        .bind(location_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_transfer_ready_server_locations(
+        &self,
+    ) -> crate::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT id,path FROM repo_location WHERE owner_kind='server' AND status='ready' ORDER BY id",
+        ).fetch_all(self.pool()).await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct IntegrationTransferOwedReleaseRow {
+    pub attempt_id: String,
+    pub repo_location_id: String,
+    pub daemon_id: String,
+    pub runtime_id: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for IntegrationTransferOwedReleaseRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            attempt_id: row.try_get(0)?,
+            repo_location_id: row.try_get(1)?,
+            daemon_id: row.try_get(2)?,
+            runtime_id: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_transfer_owed_release_ends(
+        &self,
+        since: &str,
+        limit: u32,
+    ) -> crate::Result<Vec<IntegrationTransferOwedReleaseRow>> {
+        Ok(sqlx::query_as(
+            "SELECT a.id,l.id,l.daemon_id,l.runtime_id FROM integration_attempt a \
+             JOIN integration_queue q ON q.id=a.queue_id \
+             JOIN repo_location l ON l.id IN (a.repo_location_id,q.target_location_id) \
+             WHERE l.owner_kind='daemon' AND l.daemon_id IS NOT NULL AND l.runtime_id IS NOT NULL \
+               AND a.repo_location_id IS NOT NULL AND q.target_location_id IS NOT NULL \
+               AND a.repo_location_id<>q.target_location_id \
+               AND (q.head_attempt_id IS NULL OR q.head_attempt_id<>a.id) \
+               AND a.started_at IS NOT NULL AND a.updated_at>=? ORDER BY a.updated_at DESC,a.id LIMIT ?",
+        ).bind(since).bind(limit).fetch_all(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_owner_server_checkout_path(
+        &self,
+        location_id: Option<&str>,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT path FROM repo_location WHERE id=? AND owner_kind='server'")
+                .bind(location_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct IntegrationTargetLocationRow {
+    pub path: String,
+    pub owner_kind: String,
+    pub daemon_id: Option<String>,
+    pub runtime_id: Option<String>,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for IntegrationTargetLocationRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            path: row.try_get(0)?,
+            owner_kind: row.try_get(1)?,
+            daemon_id: row.try_get(2)?,
+            runtime_id: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_target_location(
+        &self,
+        location_id: &str,
+    ) -> crate::Result<Option<IntegrationTargetLocationRow>> {
+        Ok(sqlx::query_as(
+            "SELECT path,owner_kind,daemon_id,runtime_id FROM repo_location WHERE id=?",
+        )
+        .bind(location_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_target_disconnected_daemon_id(
+        &self,
+        location_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar(
+            "SELECT l.daemon_id FROM repo_location l JOIN daemon d ON d.id=l.daemon_id \
+         WHERE l.id=? AND l.owner_kind='daemon' AND d.removed_at IS NULL",
+        )
+        .bind(location_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn machine_precheck_repository_location_statuses(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<Vec<(String, String)>> {
+        Ok(
+            sqlx::query_as("SELECT id, status FROM repo_location WHERE repo_id = ?")
+                .bind(repo_id)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}

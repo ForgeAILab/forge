@@ -284,14 +284,9 @@ impl TaskService {
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
         let workspace = WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?;
         let running_execution_id = if let Some(workspace) = workspace {
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM execution
-                 WHERE workspace_id = ? AND status = 'running'
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            )
-            .bind(&workspace.id)
-            .fetch_optional(self.db.pool())
-            .await?
+            self.db
+                .repository_running_execution_id(&workspace.id)
+                .await?
         } else {
             None
         };

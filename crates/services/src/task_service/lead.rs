@@ -70,12 +70,9 @@ fn clip(text: &str, chars: usize) -> (String, bool) {
 /// workflow calls its implementation role (and an owner's interactive
 /// session too: it had the workspace).
 pub(crate) async fn subtask_started(db: &SqliteDb, task_id: &str) -> Result<bool> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution WHERE task_id = ? AND role <> ?)")
-        .bind(task_id)
-        .bind(db::inherited_subtask::STEP_CHECK_ROLE)
-        .fetch_one(db.pool())
+    db.lead_subtask_implementation_started(task_id, db::inherited_subtask::STEP_CHECK_ROLE)
         .await
-        .map_err(|error| db::DbError::from(error).into())
+        .map_err(ServiceError::from)
 }
 
 /// End the wait a lead's question put on `task`, whichever way it ends: the
@@ -127,16 +124,8 @@ pub(crate) async fn clear_lead_input_wait(
     )
     .await?;
     let now = now_rfc3339();
-    sqlx::query(
-        "UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1
-         WHERE dedupe_key=? AND status!='resolved'",
-    )
-    .bind(&now)
-    .bind(&now)
-    .bind(lead_input_dedupe_key(&task.id, current))
-    .execute(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    db.resolve_lead_input_attention(&now, lead_input_dedupe_key(&task.id, current))
+        .await?;
     Ok(updated)
 }
 
@@ -370,15 +359,10 @@ impl TaskService {
                 fresh = true;
                 continue;
             }
-            let recorded: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM task_budget_charge c JOIN task_budget b USING(task_id,kind) WHERE c.task_id=? AND c.kind=? AND c.window_id=b.window_id AND c.step_id=?)",
-            )
-            .bind(&root.id)
-            .bind(budget)
-            .bind(key)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db::DbError::from)?;
+            let recorded: bool = self
+                .db
+                .lead_budget_charge_recorded_in_tx(&mut tx, &root.id, budget, key)
+                .await?;
             if !recorded {
                 // Dropping the transaction takes back the charges made above.
                 return Err(refused(
@@ -389,7 +373,7 @@ impl TaskService {
                 ));
             }
         }
-        tx.commit().await.map_err(db::DbError::from)?;
+        tx.commit().await?;
         Ok(fresh)
     }
 
@@ -404,14 +388,10 @@ impl TaskService {
         for child in children.iter().take(READ_CHILDREN) {
             let (description, clipped) =
                 clip(child.description.as_deref().unwrap_or_default(), 400);
-            let notes: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM task_comment WHERE task_id=? AND worklog_kind=?",
-            )
-            .bind(&child.id)
-            .bind(db::COMMENT_KIND_HANDOFF)
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
+            let notes: i64 = self
+                .db
+                .lead_subtask_handoff_note_count(&child.id, db::COMMENT_KIND_HANDOFF)
+                .await?;
             let row = json!({
                 "task_id": child.id,
                 "version": child.version,
@@ -443,20 +423,8 @@ impl TaskService {
                 task.description.as_deref().unwrap_or_default(),
                 READ_TEXT_CHARS * 8,
             );
-            let executions: Vec<(String, String, Option<String>, String)> = sqlx::query_as(
-                "SELECT role, status, error, created_at FROM execution WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 5",
-            )
-            .bind(&task.id)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
-            let comments: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
-                "SELECT author_name, worklog_kind, content, created_at FROM task_comment WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 10",
-            )
-            .bind(&task.id)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
+            let executions = self.db.lead_subtask_recent_executions(&task.id).await?;
+            let comments = self.db.lead_subtask_recent_comments(&task.id).await?;
             let offers = self
                 .task_action_offers(&task.id, &Actor::agent(&run.identity_id))
                 .await?;
@@ -468,8 +436,8 @@ impl TaskService {
                 "description_truncated": clipped,
                 "condition": task.condition.public(),
                 "recovery_actions": offers.available_actions.iter().map(|offer| json!({"action": offer.action, "reason": offer.reason})).collect::<Vec<_>>(),
-                "executions": executions.into_iter().map(|(role, status, error, at)| json!({"role": role, "status": status, "error": error.map(|error| clip(&error, 500).0), "created_at": at})).collect::<Vec<_>>(),
-                "comments": comments.into_iter().map(|(author, kind, content, at)| json!({"author": author, "kind": kind, "content": clip(&content, READ_TEXT_CHARS).0, "created_at": at})).collect::<Vec<_>>(),
+                "executions": executions.into_iter().map(|row| json!({"role": row.role, "status": row.status, "error": row.error.map(|error| clip(&error, 500).0), "created_at": row.created_at})).collect::<Vec<_>>(),
+                "comments": comments.into_iter().map(|row| json!({"author": row.author_name, "kind": row.worklog_kind, "content": clip(&row.content, READ_TEXT_CHARS).0, "created_at": row.created_at})).collect::<Vec<_>>(),
             });
         }
         Ok(out)
@@ -854,15 +822,14 @@ impl TaskService {
                 operation_registry::task_lead::MAX_NOTE_CHARS
             )));
         }
-        let (existing, replay): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(SUM(idempotency_key = ?), 0) FROM task_comment WHERE task_id=? AND worklog_kind=?",
-        )
-        .bind(format!("lead:{}:{key}", db::COMMENT_KIND_HANDOFF))
-        .bind(&task.id)
-        .bind(db::COMMENT_KIND_HANDOFF)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let (existing, replay): (i64, i64) = self
+            .db
+            .lead_handoff_note_replay_counts(
+                format!("lead:{}:{key}", db::COMMENT_KIND_HANDOFF),
+                &task.id,
+                db::COMMENT_KIND_HANDOFF,
+            )
+            .await?;
         if replay == 0 && existing >= MAX_HANDOFF_NOTES_PER_SUBTASK {
             return Err(refused(
                 LeadRefusal::LimitReached,
@@ -932,12 +899,10 @@ impl TaskService {
             return Err(db::DbError::IdempotencyConflict.into());
         }
         let dedupe = lead_input_dedupe_key(&root.id, &comment.id);
-        let asked: Option<String> =
-            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key=?")
-                .bind(&dedupe)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db::DbError::from)?;
+        let asked: Option<String> = self
+            .db
+            .lead_input_attention_status_in_tx(&mut tx, &dedupe)
+            .await?;
         let waiting = json!({
             "operation": "lead.request_input", "task_id": root.id, "comment_id": comment.id,
             "waiting": true,

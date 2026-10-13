@@ -2074,3 +2074,122 @@ pub use agent_chat::DirectProjectChatScopeRow;
 pub use repo_location::SetRepositoryLocationDefaultInTxInput;
 
 pub use repo_location::{RepoLocationPageSort, VisibleRepositoryLocationPageInput};
+
+pub use attention::UpsertPlacementRefusalAttentionInTxInput;
+pub use repo_location::PlacementEligibilityLocationRow;
+pub use repo_location::PlacementEligibilityProvisionRetryRow;
+pub use task::ClearPlacementDispatchRefusalInput;
+pub use task::PlacementEligibilityAssignmentRow;
+pub use task::RecordPlacementDispatchRefusalInput;
+
+mod workspace_root;
+pub use system_setting::record_workspace_root_setting;
+pub use workspace_root::WorkspaceRootEntity;
+pub use workspace_root::WorkspaceRootPathRemaining;
+pub use workspace_root::WorkspaceRootPathRewrite;
+pub use workspace_root::WorkspaceRootStoredPath;
+pub use workspace_root::WorkspaceRootTextPredicate;
+pub use workspace_root::WORKSPACE_ROOT_STORED_PATHS;
+
+pub use execution::RecordExecutionPlanTransportRetryInTxInput;
+pub use execution::RememberExecutionPlanSeedInput;
+pub use task::RecordExecutionPlanTaskWaitInTxInput;
+
+pub use action::TaskOutcomeActionOriginSourceRow;
+
+pub use execution::ExecutionTerminalAuthorityRow;
+
+pub use execution::LeadSubtaskExecutionRow;
+pub use task_comment::LeadSubtaskCommentRow;
+
+pub use agent_chat::TaskProposalChatScopeRow;
+pub use command_receipt::TaskProposalReceiptDigestInput;
+
+pub use command_receipt::WorkspaceMutationOutstandingIntentInput;
+pub use execution::RecordWorkspaceMergeEvidenceInTxInput;
+
+pub use agent::CharterSelectedAgentEligibilityRow;
+
+pub use task::TaskRoleAssignmentSourceRow;
+
+pub use agent::AgentRunnableProfileHealthRow;
+pub use daemon::AgentRunnableCliPolicyRow;
+pub use daemon::AgentRunnableMachineSourceRow;
+pub use environment_readiness::EnvironmentReadinessJsonField;
+pub use environment_readiness::ProjectEnvironmentReadinessSourceRow;
+pub use workspace_placement::EnvironmentMachineCatalogRow;
+
+pub use project::FrozenProjectBindingPolicyRow;
+
+pub use agent_chat::OrchestrationBoundProjectChatScopeRow;
+pub use agent_chat::OrchestrationMainChatScopeRow;
+
+pub use attention::RecordWorkspaceWaitAttentionInTxInput;
+pub use attention::ResolveWorkspaceAdmissionAttentionInTxInput;
+pub use workspace_placement::expired_workspace_reservations_in_tx;
+pub use workspace_placement::fail_expired_workspace_reservation_in_tx;
+pub use workspace_placement::ExpiredWorkspaceReservationRow;
+
+pub use daemon::PlacementExecutionDaemonSourceRow;
+pub use repo_location::PlacementRepoLocationSourceRow;
+pub use runtime::PlacementProvisionRuntimeSourceRow;
+
+pub use task::InsertInitialExplicitTaskRoleInTxInput;
+pub use task::TaskCreationParentRoleRow;
+
+pub use execution::AgentUsageDomainRunRow;
+pub use execution::OperationsUsageDomainRunRow;
+pub use execution::TaskUsageDomainRunRow;
+pub use pricing::AgentUsageSourceRow;
+pub use pricing::EffectiveUsageEventMetadataRow;
+pub use pricing::OperationsUsageSourceRow;
+pub use pricing::TaskUsageSourceRow;
+pub use pricing::TASK_USAGE_SOURCES_SQL;
+
+pub use orchestration::ProjectCreationOperatingSkillRow;
+
+pub use pricing::execution_pricing_selection_count_in_tx;
+pub use project::execution_admission_project_owner_in_tx;
+pub use user_auth::execution_admission_account_in_tx;
+pub use user_auth::execution_admission_default_account_in_tx;
+
+pub use repo_location::InsertEmbeddedWorkspaceRepoLocationInTxInput;
+
+pub use memory::MemoryBackfillCommentRow;
+pub use memory::MemoryBackfillExecutionRow;
+pub use memory::MemoryBackfillReviewRow;
+pub use memory::MemoryBackfillTransitionRow;
+
+pub use repo_location::IntegrationTransferOwedReleaseRow;
+
+pub use orchestration::DeliveryFollowupCheckRow;
+pub use orchestration::DeliveryFollowupMilestoneRow;
+
+pub use project::project_agent_workspace_authority_source;
+pub use project::ProjectAgentWorkspaceAuthoritySourceRow;
+
+pub use execution::ExecutionSetupTaskEvidenceRow;
+pub use orchestration::ExecutionSetupReconciliationConflictRow;
+
+pub use repo_location::IntegrationTargetLocationRow;
+
+pub use agent_chat::MainActionChatAccountRow;
+
+pub use orchestration::MainCharterReadSourceRow;
+
+pub use project_hook_run::ProjectHookCooldownRunRow;
+
+pub use task::project_work_completion_sources_in_tx;
+pub use task::ProjectWorkCompletionSourceRow;
+
+pub use execution::ShutdownExecutionSourceRow;
+pub use task::ShutdownTaskSourceRow;
+
+pub use agent::WakeBlockerProjectResponderRow;
+pub use agent_wake::WakeBlockerTurnSourceRow;
+
+pub use task::coordination_root_visible_children_in_connection;
+
+pub use task::TaskRepositoryAuthoritySourceRow;
+
+pub use task::LatestTaskStateEntrySourceRow;

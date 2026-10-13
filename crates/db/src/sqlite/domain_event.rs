@@ -797,3 +797,97 @@ impl SqliteDb {
             .collect())
     }
 }
+
+impl SqliteDb {
+    pub async fn execution_terminal_previous_owner(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(execution_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_receipt_previous_owner(
+        &self,
+        event_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+             FROM domain_event
+             WHERE id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_report_previous_owner_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(payload_json, '$.previous_lease_owner')
+                     FROM domain_event
+                     WHERE entity_type = 'task'
+                       AND entity_id = ?
+                       AND event_type IN (
+                           'execution.completed', 'execution.failed',
+                           'execution.cancelled', 'execution.terminal_report.received'
+                       )
+                       AND json_extract(payload_json, '$.execution_id') = ?
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(execution_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_terminal_owner_event_id(
+        &self,
+        task_id: &str,
+        lease_owner: &str,
+        execution_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT id
+             FROM domain_event
+             WHERE entity_type = 'task'
+               AND entity_id = ?
+               AND event_type IN ('execution.completed', 'execution.failed', 'execution.cancelled')
+               AND json_extract(payload_json, '$.previous_lease_owner') = ?
+               AND json_extract(payload_json, '$.execution_id') = ?
+             ORDER BY sequence DESC
+             LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(lease_owner)
+        .bind(execution_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| row.try_get("id").map_err(crate::DbError::from))
+            .transpose()
+    }
+}

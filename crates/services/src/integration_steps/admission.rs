@@ -87,11 +87,7 @@ pub(crate) async fn admit(
     replace_released: bool,
 ) -> Result<IntegrationAttempt> {
     let facts = merge_service.integration_admission_facts(task).await?;
-    let epoch: i64 = sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=?")
-        .bind(&task.id)
-        .fetch_one(db.pool())
-        .await
-        .map_err(DbError::from)?;
+    let epoch: i64 = db.integration_admission_task_status_epoch(&task.id).await?;
     let queue = db
         .create_or_get_integration_queue(&facts.workspace.repo_id, &facts.target_branch)
         .await?;
@@ -358,18 +354,9 @@ async fn reviewed_before_rebase(
     if authority.as_deref() == Some(candidate_sha) {
         return Ok(None);
     }
-    let rebased_by_queue: Option<String> = sqlx::query_scalar(
-        "SELECT original_candidate_sha FROM integration_attempt \
-         WHERE task_ref=? AND candidate_sha=? AND original_candidate_sha IS NOT NULL \
-           AND original_candidate_sha<>? AND integrated_sha IS NULL \
-         ORDER BY created_at DESC,id DESC LIMIT 1",
-    )
-    .bind(&task.id)
-    .bind(candidate_sha)
-    .bind(candidate_sha)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(DbError::from)?;
+    let rebased_by_queue: Option<String> = db
+        .integration_queue_rebased_original_candidate(&task.id, candidate_sha)
+        .await?;
     if rebased_by_queue.is_some() {
         return Ok(rebased_by_queue);
     }

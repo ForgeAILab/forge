@@ -318,9 +318,10 @@ impl<'a> ProjectHookEngine<'a> {
         tx: &mut Transaction<'_, Sqlite>,
         prepared: &PreparedHook,
     ) -> Result<bool> {
-        let version: Option<i64> = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(&prepared.project.id)
-            .fetch_optional(&mut **tx)
+        let version: Option<i64> = self
+            .service
+            .db
+            .project_hook_current_version_in_tx(tx, &prepared.project.id)
             .await?;
         if version != Some(prepared.project.version) {
             return Err(db::DbError::VersionConflict.into());
@@ -593,8 +594,13 @@ impl<'a> ProjectHookEngine<'a> {
             return Ok(None);
         };
         // Preserve the old 100-recent-runs bound and completed/dispatched/skipped policy.
-        let runs: Vec<(String, String, Option<String>, String)> = sqlx::query_as("SELECT id, rule_id, COALESCE(completed_at, updated_at), status FROM project_hook_run WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 100").bind(project_id).fetch_all(&mut **tx).await?;
-        for (id, rule_id, timestamp, status) in runs {
+        let runs = self
+            .service
+            .db
+            .project_hook_cooldown_runs_in_tx(tx, project_id)
+            .await?;
+        for row in runs {
+            let (id, rule_id, timestamp, status) = (row.id, row.rule_id, row.timestamp, row.status);
             if rule_id != rule.id
                 || !matches!(status.as_str(), "completed" | "dispatched" | "skipped")
             {

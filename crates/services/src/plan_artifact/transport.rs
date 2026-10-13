@@ -15,16 +15,12 @@ pub(crate) async fn remember_seed(
     env: &BTreeMap<String, String>,
 ) -> Result<()> {
     let seed = seed.map(|text| executors::environment::redact_environment_values(text, env));
-    sqlx::query(
-        "INSERT INTO execution_plan_transport (execution_id, seed_digest, seed_size, updated_at)
-        SELECT id, ?, ?, ? FROM execution WHERE id=? AND status='running'
-        ON CONFLICT(execution_id) DO NOTHING",
-    )
-    .bind(seed.as_deref().map(digest))
-    .bind(seed.as_ref().map(|text| text.len() as i64))
-    .bind(db::now_rfc3339())
-    .bind(execution_id)
-    .execute(db.pool())
+    db.remember_execution_plan_seed(db::RememberExecutionPlanSeedInput {
+        seed_digest: seed.as_deref().map(digest),
+        seed_size: seed.as_ref().map(|text| text.len() as i64),
+        updated_at: db::now_rfc3339(),
+        execution_id,
+    })
     .await?;
     Ok(())
 }
@@ -49,13 +45,10 @@ pub(crate) async fn candidate(
         } else if !executors::plan_has_checklist(text) {
             error = Some("this execution's plan candidate has no checklist items".into());
         } else {
-            let seed: Option<String> = sqlx::query_scalar(
-                "SELECT seed_digest FROM execution_plan_transport WHERE execution_id=?",
-            )
-            .bind(&execution.id)
-            .fetch_optional(db.pool())
-            .await?
-            .flatten();
+            let seed: Option<String> = db
+                .execution_plan_seed_digest(&execution.id)
+                .await?
+                .flatten();
             if seed.as_deref() == Some(&digest(text)) {
                 error = Some(
                     "this execution did not write a plan: its candidate is identical to the seed"
@@ -78,13 +71,10 @@ pub(crate) async fn stored(
     db: &db::SqliteDb,
     execution_id: &str,
 ) -> Result<(Option<String>, Option<String>)> {
-    Ok(sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT candidate_text, candidate_error FROM execution_plan_transport WHERE execution_id=?",
-    )
-    .bind(execution_id)
-    .fetch_optional(db.pool())
-    .await?
-    .unwrap_or_default())
+    Ok(db
+        .stored_execution_plan_candidate(execution_id)
+        .await?
+        .unwrap_or_default())
 }
 
 pub(crate) async fn retry_due(
@@ -92,14 +82,10 @@ pub(crate) async fn retry_due(
     execution_id: &str,
     operation: &str,
 ) -> Result<()> {
-    let retry: Option<String> = sqlx::query_scalar(
-        "SELECT retry_at FROM execution_plan_transport WHERE execution_id=? AND retry_operation=?",
-    )
-    .bind(execution_id)
-    .bind(operation)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let retry: Option<String> = db
+        .execution_plan_retry_at(execution_id, operation)
+        .await?
+        .flatten();
     if let Some(at) = retry.filter(|at| at.as_str() > db::now_rfc3339().as_str()) {
         return Err(ServiceError::invalid_operation(format!(
             "execution plan settlement is waiting until {at}"
@@ -115,10 +101,7 @@ pub(crate) async fn record_retry(
     daemon_id: &str,
     error: &crate::workspace_backend::WorkspaceBackendError,
 ) -> Result<()> {
-    let task_id: Option<String> = sqlx::query_scalar("SELECT task_id FROM execution WHERE id=?")
-        .bind(execution_id)
-        .fetch_optional(db.pool())
-        .await?;
+    let task_id: Option<String> = db.execution_plan_task_id(execution_id).await?;
     let Some(task_id) = task_id else {
         return Ok(());
     };
@@ -127,17 +110,25 @@ pub(crate) async fn record_retry(
     };
     let now = chrono::Utc::now();
     let mut tx = db::begin_immediate(db.pool()).await?;
-    let attempts: Option<i64> = sqlx::query_scalar("SELECT retry_count FROM execution_plan_transport WHERE execution_id=? AND retry_operation=?")
-        .bind(execution_id).bind(operation).fetch_optional(&mut *tx).await?;
+    let attempts: Option<i64> = db
+        .execution_plan_retry_count_in_tx(&mut tx, execution_id, operation)
+        .await?;
     let attempts = attempts.unwrap_or(0).saturating_add(1);
     let delay = (5_i64 * (1_i64 << (attempts - 1).min(6))).min(300);
     let retry_at = (now + chrono::Duration::seconds(delay)).to_rfc3339();
     let message = format!("Waiting to {operation} execution plan on daemon {daemon_id}: {error}");
-    sqlx::query("INSERT INTO execution_plan_transport (execution_id, retry_operation, retry_count, retry_at, retry_error, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(execution_id) DO UPDATE SET retry_operation=excluded.retry_operation,
-        retry_count=excluded.retry_count, retry_at=excluded.retry_at, retry_error=excluded.retry_error, updated_at=excluded.updated_at")
-        .bind(execution_id).bind(operation).bind(attempts).bind(&retry_at).bind(&message).bind(now.to_rfc3339())
-        .execute(&mut *tx).await?;
+    db.record_execution_plan_transport_retry_in_tx(
+        &mut tx,
+        db::RecordExecutionPlanTransportRetryInTxInput {
+            execution_id,
+            operation,
+            attempts,
+            retry_at: &retry_at,
+            message: &message,
+            updated_at: now.to_rfc3339(),
+        },
+    )
+    .await?;
     let offline = matches!(
         error,
         crate::workspace_backend::WorkspaceBackendError::OwnerUnreachable { .. }
@@ -146,12 +137,7 @@ pub(crate) async fn record_retry(
             if matches!(error.as_ref(), ServiceError::DaemonUnavailable { .. } | ServiceError::DaemonTimeout { .. }));
     let marker = serde_json::json!({"execution_id":execution_id,"operation":operation,"daemon_id":daemon_id,"message":message,"retry_at":retry_at});
     let annotation = serde_json::json!({"type":"plan_settlement_wait","code":if offline {"runtime_offline"} else {"plan_owner_error"}, "message":message,"daemon_id":daemon_id,"execution_id":execution_id,"retry_at":retry_at});
-    let changed = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(COALESCE(metadata_json, '{}'), '$.plan_settlement_wait', json(?), '$.deferred_dispatch', json(?)),
-        error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation, '$.type')='plan_settlement_wait' THEN ? ELSE error_annotation END,
-        version=version+1, updated_at=? WHERE id=? AND version=?")
-        .bind(marker.to_string()).bind(serde_json::json!({"target_state":task.status,"reason":message,"not_before":retry_at}).to_string())
-        .bind(annotation.to_string()).bind(now.to_rfc3339()).bind(&task.id).bind(task.version)
-        .identity_fenced().execute_in_tx(&mut tx).await?;
+    let changed = db.record_execution_plan_task_wait_in_tx(&mut tx, db::RecordExecutionPlanTaskWaitInTxInput { task_id: &task.id, marker: marker.to_string(), disposition: serde_json::json!({"target_state":task.status,"reason":message,"not_before":retry_at}).to_string(), annotation: annotation.to_string(), updated_at: now.to_rfc3339(), version: task.version }).await?;
     // A blocking wait must never be lost: outside the Task lease it is
     // queued identity-fenced, so it applies even after a status change and
     // the attention recorded below stays truthful.
@@ -169,9 +155,7 @@ pub(crate) async fn record_retry(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| now.to_rfc3339());
-        let _queued_or_applied = db::task_writer::TaskQuery::new(db,&task.id,"UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?")
-            .bind(serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).bind(&task.id)
-            .identity_fenced().execute_in_tx(&mut tx).await?;
+        let _queued_or_applied = db.record_execution_plan_owner_wait_in_tx(&mut tx, &task.id, serde_json::json!({"daemon_id":daemon_id,"started_at":started_at,"plan_execution_id":execution_id}).to_string()).await?;
     }
     crate::placement::admission::record_wait_attention_in_tx(
         db,
@@ -191,22 +175,18 @@ pub(crate) async fn record_retry(
 }
 
 pub(crate) async fn clear_retry(db: &db::SqliteDb, execution_id: &str) -> Result<()> {
-    let task_id: String = sqlx::query_scalar("SELECT task_id FROM execution WHERE id=?")
-        .bind(execution_id)
-        .fetch_one(db.pool())
+    let task_id: String = db.execution_plan_required_task_id(execution_id).await?;
+    db.clear_execution_plan_transport_retry(execution_id)
         .await?;
-    sqlx::query("UPDATE execution_plan_transport SET retry_operation=NULL,retry_count=0,retry_at=NULL,retry_error=NULL WHERE execution_id=?")
-        .bind(execution_id).execute(db.pool()).await?;
-    let task_version: Option<i64> = sqlx::query_scalar("SELECT version FROM task WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=?")
-        .bind(execution_id).fetch_optional(db.pool()).await?;
-    db::task_writer::TaskQuery::new(db,&task_id,"UPDATE task SET error_annotation=CASE WHEN json_extract(error_annotation, '$.type')='plan_settlement_wait' AND json_extract(error_annotation, '$.execution_id')=? THEN NULL ELSE error_annotation END,
-        metadata_json=CASE WHEN json_extract(metadata_json, '$.owner_wait.plan_execution_id')=?
-          THEN json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch', '$.owner_wait')
-          ELSE json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch') END,
-        version=version+1,updated_at=? WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=? AND version=?")
-        .bind(execution_id).bind(execution_id).bind(db::now_rfc3339()).bind(execution_id).bind(task_version).execute(db.pool()).await?;
-    sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=? WHERE dedupe_key=? AND status<>'resolved'")
-        .bind(db::now_rfc3339()).bind(db::now_rfc3339()).bind(format!("task-plan-wait:{execution_id}")).execute(db.pool()).await?;
+    let task_version: Option<i64> = db.execution_plan_wait_task_version(execution_id).await?;
+    db.clear_execution_plan_task_wait(&task_id, execution_id, db::now_rfc3339(), task_version)
+        .await?;
+    db.resolve_execution_plan_wait_attention(
+        db::now_rfc3339(),
+        db::now_rfc3339(),
+        format!("task-plan-wait:{execution_id}"),
+    )
+    .await?;
     Ok(())
 }
 

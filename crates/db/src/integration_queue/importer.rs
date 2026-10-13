@@ -1429,3 +1429,33 @@ async fn load_snapshot(
         incomplete,
     })
 }
+
+const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
+    WHERE (a.current=1 OR (@IMPORT_PARK@)) AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
+      AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
+      AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
+                     AND s.causation_key='integration-import:'||a.id) \
+    ORDER BY a.id";
+
+impl SqliteDb {
+    pub async fn integration_imports_without_continuation(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            &UNCONTINUED.replace("@IMPORT_PARK@", super::UNOWNED_QUARANTINED_IMPORT),
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_reported_applied_import_ids(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT a.id FROM integration_attempt a WHERE a.current=1 AND a.state='applied' \
+           AND a.import_source_json IS NOT NULL AND a.acknowledged_at IS NOT NULL \
+           AND json_extract(a.effect_ack_json,'$.action')='result' \
+           AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=a.id)",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}

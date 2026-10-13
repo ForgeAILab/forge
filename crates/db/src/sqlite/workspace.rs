@@ -1,3 +1,4 @@
+use super::workspace_root::under_sql;
 use super::*;
 
 #[async_trait]
@@ -788,6 +789,78 @@ impl SqliteDb {
         .bind(bytes)
         .bind(measured_at)
         .bind(workspace_id)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_server_worktrees(&self) -> crate::Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT w.worktree_path, w.task_id FROM workspace w
+         LEFT JOIN workspace_placement p ON p.workspace_id = w.id
+         WHERE w.status != 'cleaned' AND COALESCE(p.owner_kind, 'server') = 'server'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_live_workspace_count(&self, spelling: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM workspace WHERE status != 'cleaned' AND {}",
+            under_sql("worktree_path")
+        ))
+        .bind(spelling)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delete_unacquired_task_workspace_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        workspace_id: &str,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "DELETE FROM workspace
+                     WHERE id = ? AND task_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM execution
+                           WHERE execution.workspace_id = workspace.id
+                       )",
+        )
+        .bind(workspace_id)
+        .bind(task_id)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_review_rebase_expected_head(
+        &self,
+        head_sha: String,
+        recorded_at: String,
+        placement_id: &str,
+        generation: i64,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO workspace_expected_head (placement_id, generation, head_sha, recorded_at)
+             SELECT id, generation, ?, ? FROM workspace_placement
+             WHERE id = ? AND generation = ? AND version = ?
+             ON CONFLICT(placement_id) DO UPDATE SET generation = excluded.generation,
+                 head_sha = excluded.head_sha, recorded_at = excluded.recorded_at",
+        )
+        .bind(head_sha)
+        .bind(recorded_at)
+        .bind(placement_id)
+        .bind(generation)
+        .bind(version)
         .execute(self.pool())
         .await?)
     }

@@ -58,13 +58,7 @@ pub(crate) async fn task_gate(db: &SqliteDb, task_id: &str) -> Result<Option<Gat
     if let Some(cause) = task_row_gate(&task) {
         return Ok(Some(cause));
     }
-    let project_paused: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM project WHERE id=? AND paused_at IS NOT NULL)",
-    )
-    .bind(&task.project_id)
-    .fetch_one(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    let project_paused: bool = db.integration_gate_project_paused(&task.project_id).await?;
     if project_paused {
         return Ok(Some(GateCause::ProjectPaused));
     }

@@ -485,3 +485,124 @@ impl SqliteDb {
         .await?)
     }
 }
+
+pub struct EnvironmentMachineCatalogRow {
+    row: SqliteRow,
+}
+impl EnvironmentMachineCatalogRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn hostname(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("hostname")?)
+    }
+    pub fn owner_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("owner_kind")?)
+    }
+    pub fn daemon_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("daemon_id")?)
+    }
+    pub fn runtime_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("runtime_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_machine_catalog_sources(
+        &self,
+        workspace_ids_json: String,
+        daemon_ids_json: String,
+    ) -> crate::Result<Vec<EnvironmentMachineCatalogRow>> {
+        let rows = sqlx::query(
+            "WITH legacy AS (SELECT workspace_id,owner_kind,daemon_id,runtime_id FROM workspace_placement WHERE workspace_id IN (SELECT value FROM json_each(?)))
+             SELECT 'daemon' AS kind,id,hostname,NULL AS owner_kind,NULL AS daemon_id,NULL AS runtime_id FROM daemon
+               WHERE id IN (SELECT value FROM json_each(?)) OR id IN (SELECT daemon_id FROM legacy)
+             UNION ALL SELECT 'placement',workspace_id,NULL,owner_kind,daemon_id,runtime_id FROM legacy").bind(workspace_ids_json).bind(daemon_ids_json).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EnvironmentMachineCatalogRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_latest_task_placement(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<(String, String, Option<String>)>> {
+        Ok(sqlx::query_as(
+            "SELECT workspace_id,state,daemon_id FROM workspace_placement WHERE task_id=? \
+             ORDER BY generation DESC,updated_at DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_reservations_expired(&self, now: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspace_placement WHERE state IN ('reserved', 'preparing') AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?))").bind(now).fetch_one(self.pool()).await?)
+    }
+}
+
+pub struct ExpiredWorkspaceReservationRow {
+    row: SqliteRow,
+}
+impl ExpiredWorkspaceReservationRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+}
+pub async fn expired_workspace_reservations_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    now: &str,
+) -> crate::Result<Vec<ExpiredWorkspaceReservationRow>> {
+    let rows = sqlx::query(
+        "SELECT id, version FROM workspace_placement
+         WHERE state IN ('reserved', 'preparing')
+           AND julianday(COALESCE(reserved_until, datetime(updated_at, '+10 minutes'))) <= julianday(?)",
+    ).bind(now).fetch_all(connection).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| ExpiredWorkspaceReservationRow { row })
+        .collect())
+}
+
+pub async fn fail_expired_workspace_reservation_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    now: &str,
+    id: String,
+    version: i64,
+) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+    Ok(sqlx::query(
+            "UPDATE workspace_placement SET state = 'failed', failure_cause = 'prepare_failed',
+                 reserved_until = NULL, workspace_handle = NULL, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND state IN ('reserved', 'preparing')",
+        ).bind(now).bind(id).bind(version).execute(connection).await?)
+}
+
+impl SqliteDb {
+    pub async fn daemon_cleanup_replay_placement_id(
+        &self,
+        daemon_id: &str,
+        workspace_handle: &str,
+        generation: i64,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM workspace_placement WHERE owner_kind = 'daemon' AND daemon_id = ?
+                 AND workspace_handle = ? AND generation = ? AND state = 'cleaned'",
+        )
+        .bind(daemon_id)
+        .bind(workspace_handle)
+        .bind(generation)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}

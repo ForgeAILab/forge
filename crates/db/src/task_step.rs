@@ -980,6 +980,111 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn integration_task_entry_matches(
+        &self,
+        task_id: &str,
+        status: &str,
+        epoch: i64,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(crate::STEP_FENCE)
+            .bind(task_id)
+            .bind(status)
+            .bind(epoch)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_preempting_owner_command_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        own_step_id: &Option<String>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND priority>=1 AND status IN ('pending','claimed') AND (? IS NULL OR id<>?))").bind(task_id).bind(own_step_id).bind(own_step_id).fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_continuation_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        causation_key: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND causation_key=?)",
+        )
+        .bind(task_id)
+        .bind(causation_key)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_suspended_prior_entry_hooks(
+        &self,
+        task_id: &str,
+        sequence: i64,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task_step h JOIN task t ON t.id=h.task_id \
+             WHERE h.task_id=? AND h.kind='hooks' AND h.status='suspended' AND h.seq<? \
+               AND h.expected_status=t.status AND h.expected_epoch=t.status_epoch)",
+        )
+        .bind(task_id)
+        .bind(sequence)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+pub async fn integration_task_entry_matches_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    task_id: &str,
+    status: &str,
+    epoch: i64,
+) -> crate::Result<bool> {
+    Ok(sqlx::query_scalar(crate::STEP_FENCE)
+        .bind(task_id)
+        .bind(status)
+        .bind(epoch)
+        .fetch_one(connection)
+        .await?)
+}
+
+impl SqliteDb {
+    pub async fn prioritize_applied_integration_cascade_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        step_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE task_step SET priority=2 WHERE id=?")
+            .bind(step_id)
+            .execute(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_step_causation_status(
+        &self,
+        task_id: &str,
+        causation_key: String,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT status FROM task_step WHERE task_id=? AND causation_key=?")
+                .bind(task_id)
+                .bind(causation_key)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

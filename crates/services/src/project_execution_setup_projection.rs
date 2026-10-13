@@ -60,34 +60,24 @@ pub(crate) async fn required_reconciliation_conflicts(
     db: &SqliteDb,
     project_id: &str,
 ) -> Result<Vec<ReconciliationConflictRow>> {
-    let rows = sqlx::query(
-        "SELECT r.id AS reconciliation_id, c.conflict_code, c.description,
-                r.record_type, r.record_id,
-                r.governing_record_type, r.governing_record_id,
-                c.affected_paths_json, r.updated_at
-         FROM project_reconciliation_record r
-         JOIN project_canonical_conflict c ON c.id = r.conflict_id
-         WHERE r.project_id = ? AND r.state = 'required'
-         ORDER BY r.updated_at DESC, r.id DESC",
-    )
-    .bind(project_id)
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db
+        .execution_setup_reconciliation_conflict_sources(project_id)
+        .await?;
     rows.into_iter()
         .map(|row| {
-            let affected_paths_json: String = sqlx::Row::try_get(&row, "affected_paths_json")?;
+            let affected_paths_json: String = row.affected_paths_json()?;
             let affected_paths: Vec<String> =
                 serde_json::from_str(&affected_paths_json).unwrap_or_default();
             Ok(ReconciliationConflictRow {
-                reconciliation_id: sqlx::Row::try_get(&row, "reconciliation_id")?,
-                conflict_code: sqlx::Row::try_get(&row, "conflict_code")?,
-                description: sqlx::Row::try_get(&row, "description")?,
-                record_type: sqlx::Row::try_get(&row, "record_type")?,
-                record_id: sqlx::Row::try_get(&row, "record_id")?,
-                governing_record_type: sqlx::Row::try_get(&row, "governing_record_type")?,
-                governing_record_id: sqlx::Row::try_get(&row, "governing_record_id")?,
+                reconciliation_id: row.reconciliation_id()?,
+                conflict_code: row.conflict_code()?,
+                description: row.description()?,
+                record_type: row.record_type()?,
+                record_id: row.record_id()?,
+                governing_record_type: row.governing_record_type()?,
+                governing_record_id: row.governing_record_id()?,
                 affected_paths,
-                updated_at: sqlx::Row::try_get(&row, "updated_at")?,
+                updated_at: row.updated_at()?,
             })
         })
         .collect::<std::result::Result<Vec<_>, ServiceError>>()
@@ -722,26 +712,10 @@ fn compute_blocker_digest(
 /// change. Count implementation evidence only when a non-review execution
 /// actually advanced that SHA.
 async fn task_execution_evidence(db: &SqliteDb, task_id: &str) -> Result<ExecutionEvidenceSummary> {
-    let row = sqlx::query(
-        "SELECT
-             COUNT(*) AS execution_count,
-             SUM(CASE WHEN role != 'reviewer' THEN 1 ELSE 0 END) AS attempt_count,
-             (SELECT after_sha FROM execution
-                WHERE task_id = ?
-                  AND role != 'reviewer'
-                  AND after_sha IS NOT NULL
-                  AND COALESCE(before_sha, '') != after_sha
-                ORDER BY created_at DESC, id DESC LIMIT 1) AS latest_commit_sha
-         FROM execution WHERE task_id = ?",
-    )
-    .bind(task_id)
-    .bind(task_id)
-    .fetch_one(db.pool())
-    .await?;
-    let execution_count: i64 = sqlx::Row::try_get(&row, "execution_count")?;
-    let attempt_count: i64 =
-        sqlx::Row::try_get::<Option<i64>, _>(&row, "attempt_count")?.unwrap_or(0);
-    let latest_commit_sha: Option<String> = sqlx::Row::try_get(&row, "latest_commit_sha")?;
+    let row = db.execution_setup_task_evidence_counts(task_id).await?;
+    let execution_count: i64 = row.execution_count()?;
+    let attempt_count: i64 = row.attempt_count()?.unwrap_or(0);
+    let latest_commit_sha: Option<String> = row.latest_commit_sha()?;
     Ok(ExecutionEvidenceSummary::from_counts(
         attempt_count,
         execution_count,
@@ -786,15 +760,10 @@ pub async fn load_task_execution_blocker(
         return Ok((evidence, None));
     }
 
-    let capability_class = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT capability_class FROM project_task_governance
-         WHERE task_id = ? AND project_id = ?",
-    )
-    .bind(&task.id)
-    .bind(&task.project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let capability_class = db
+        .execution_setup_task_capability_class(&task.id, &task.project_id)
+        .await?
+        .flatten();
     let execution_class = classify_task_execution(&task.task_type, capability_class.as_deref())
         .unwrap_or(TaskExecutionClass::Implementation);
     if execution_class == TaskExecutionClass::ReadOnlyPlanning {

@@ -270,32 +270,19 @@ impl DaemonService {
         validate_required("retained_machine_id", retained_machine_id)?;
         validate_required("reason", reason)?;
 
-        let daemon_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id
-             FROM daemon
-             WHERE status = 'online'
-               AND machine_id != ?",
-        )
-        .bind(retained_machine_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let daemon_ids = self
+            .db
+            .external_online_daemon_ids(retained_machine_id)
+            .await?;
         if daemon_ids.is_empty() {
             return Ok(0);
         }
 
         let now = now_rfc3339();
-        let result = sqlx::query(
-            "UPDATE daemon
-             SET status = 'offline',
-                 updated_at = ?,
-                 version = version + 1
-             WHERE status = 'online'
-               AND machine_id != ?",
-        )
-        .bind(&now)
-        .bind(retained_machine_id)
-        .execute(self.db.pool())
-        .await?;
+        let result = self
+            .db
+            .mark_external_online_daemons_offline(&now, retained_machine_id)
+            .await?;
 
         for daemon_id in daemon_ids {
             self.publish(ForgeEvent {
@@ -389,21 +376,10 @@ impl DaemonService {
         executor_type: &str,
         owner_id: &str,
     ) -> Result<bool> {
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM agent_current
-                WHERE daemon_id = ?
-                  AND executor_type = ?
-                  AND owner_id = ?
-                LIMIT 1
-            )",
-        )
-        .bind(daemon_id)
-        .bind(executor_type)
-        .bind(owner_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let exists = self
+            .db
+            .daemon_owned_executor_agent_exists(daemon_id, executor_type, owner_id)
+            .await?;
 
         Ok(exists != 0)
     }

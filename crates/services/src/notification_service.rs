@@ -70,11 +70,10 @@ impl NotificationService {
             })?;
             // Preserve the old missing-Task skip after a source is removed;
             // a deleted Project likewise has no inbox to receive this request.
-            let project_exists: bool =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ?)")
-                    .bind(&request.project_id)
-                    .fetch_one(self.db.pool())
-                    .await?;
+            let project_exists: bool = self
+                .db
+                .notification_project_exists(&request.project_id)
+                .await?;
             if !project_exists {
                 return Ok(None);
             }

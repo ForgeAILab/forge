@@ -619,3 +619,37 @@ impl SqliteDb {
             .collect())
     }
 }
+
+impl SqliteDb {
+    pub async fn task_outcome_commitment_ids(&self, task_id: &str) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_commitment
+             WHERE originating_task_id = ? ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_delivery_evidence_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        commitment_id: &str,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_evidence WHERE commitment_id = ? AND evidence_type = 'task_delivery' AND evidence_id = ?").bind(commitment_id).bind(task_id).fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_commitment_lifecycle_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        commitment_id: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?").bind(commitment_id).bind(dedupe_key).fetch_one(connection).await?)
+    }
+}

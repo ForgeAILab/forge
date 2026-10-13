@@ -302,3 +302,107 @@ pub use sqlite::DirectProjectChatScopeRow;
 pub use sqlite::SetRepositoryLocationDefaultInTxInput;
 
 pub use sqlite::{RepoLocationPageSort, VisibleRepositoryLocationPageInput};
+
+pub use sqlite::{
+    ClearPlacementDispatchRefusalInput, PlacementEligibilityAssignmentRow,
+    PlacementEligibilityLocationRow, PlacementEligibilityProvisionRetryRow,
+    RecordPlacementDispatchRefusalInput, UpsertPlacementRefusalAttentionInTxInput,
+};
+
+pub use sqlite::{
+    record_workspace_root_setting, WorkspaceRootEntity, WorkspaceRootPathRemaining,
+    WorkspaceRootPathRewrite, WorkspaceRootStoredPath, WorkspaceRootTextPredicate,
+    WORKSPACE_ROOT_STORED_PATHS,
+};
+
+pub use sqlite::{
+    RecordExecutionPlanTaskWaitInTxInput, RecordExecutionPlanTransportRetryInTxInput,
+    RememberExecutionPlanSeedInput,
+};
+
+pub use sqlite::TaskOutcomeActionOriginSourceRow;
+
+pub use sqlite::ExecutionTerminalAuthorityRow;
+
+pub use sqlite::{LeadSubtaskCommentRow, LeadSubtaskExecutionRow};
+
+pub use sqlite::{TaskProposalChatScopeRow, TaskProposalReceiptDigestInput};
+
+pub use sqlite::{RecordWorkspaceMergeEvidenceInTxInput, WorkspaceMutationOutstandingIntentInput};
+
+pub use sqlite::CharterSelectedAgentEligibilityRow;
+
+pub use sqlite::TaskRoleAssignmentSourceRow;
+
+pub use sqlite::{
+    AgentRunnableCliPolicyRow, AgentRunnableMachineSourceRow, AgentRunnableProfileHealthRow,
+    EnvironmentMachineCatalogRow, EnvironmentReadinessJsonField,
+    ProjectEnvironmentReadinessSourceRow,
+};
+
+pub use sqlite::FrozenProjectBindingPolicyRow;
+
+pub use sqlite::{OrchestrationBoundProjectChatScopeRow, OrchestrationMainChatScopeRow};
+
+pub use sqlite::{
+    expired_workspace_reservations_in_tx, fail_expired_workspace_reservation_in_tx,
+    ExpiredWorkspaceReservationRow, RecordWorkspaceWaitAttentionInTxInput,
+    ResolveWorkspaceAdmissionAttentionInTxInput,
+};
+
+pub use sqlite::{
+    PlacementExecutionDaemonSourceRow, PlacementProvisionRuntimeSourceRow,
+    PlacementRepoLocationSourceRow,
+};
+
+pub use sqlite::{InsertInitialExplicitTaskRoleInTxInput, TaskCreationParentRoleRow};
+
+pub use sqlite::{
+    AgentUsageDomainRunRow, AgentUsageSourceRow, EffectiveUsageEventMetadataRow,
+    OperationsUsageDomainRunRow, OperationsUsageSourceRow, TaskUsageDomainRunRow,
+    TaskUsageSourceRow, TASK_USAGE_SOURCES_SQL,
+};
+
+pub use sqlite::ProjectCreationOperatingSkillRow;
+
+pub use sqlite::{
+    execution_admission_account_in_tx, execution_admission_default_account_in_tx,
+    execution_admission_project_owner_in_tx, execution_pricing_selection_count_in_tx,
+};
+
+pub use sqlite::InsertEmbeddedWorkspaceRepoLocationInTxInput;
+
+pub use sqlite::{
+    MemoryBackfillCommentRow, MemoryBackfillExecutionRow, MemoryBackfillReviewRow,
+    MemoryBackfillTransitionRow,
+};
+
+pub use sqlite::IntegrationTransferOwedReleaseRow;
+
+pub use sqlite::{DeliveryFollowupCheckRow, DeliveryFollowupMilestoneRow};
+
+pub use sqlite::{
+    project_agent_workspace_authority_source, ProjectAgentWorkspaceAuthoritySourceRow,
+};
+
+pub use sqlite::{ExecutionSetupReconciliationConflictRow, ExecutionSetupTaskEvidenceRow};
+
+pub use sqlite::IntegrationTargetLocationRow;
+
+pub use sqlite::MainActionChatAccountRow;
+
+pub use sqlite::MainCharterReadSourceRow;
+
+pub use sqlite::ProjectHookCooldownRunRow;
+
+pub use sqlite::{project_work_completion_sources_in_tx, ProjectWorkCompletionSourceRow};
+
+pub use sqlite::{ShutdownExecutionSourceRow, ShutdownTaskSourceRow};
+
+pub use sqlite::{WakeBlockerProjectResponderRow, WakeBlockerTurnSourceRow};
+
+pub use sqlite::coordination_root_visible_children_in_connection;
+
+pub use sqlite::TaskRepositoryAuthoritySourceRow;
+
+pub use sqlite::LatestTaskStateEntrySourceRow;

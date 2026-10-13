@@ -774,3 +774,17 @@ const NATIVE_RESPONDER_SQL: &str = "SELECT EXISTS (
          WHERE b.project_id = c.project_id AND b.state = 'active'))
     JOIN agent_profile p ON p.id = i.selected_profile_id
     WHERE c.id = ? AND p.backend_kind = 'native')";
+
+impl SqliteDb {
+    pub async fn native_chat_session_pending_successor(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE successor_session_id = ?)",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}

@@ -164,18 +164,8 @@ pub(crate) fn retired_auditor_notice_key(task_id: &str) -> String {
 /// them all. Notices of Tasks that no longer name one, or are closed, are
 /// resolved. Returns how many notices were opened.
 pub(crate) async fn state_retired_auditor_notices(db: &db::SqliteDb) -> Result<usize> {
-    let named: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM task WHERE deleted_at IS NULL AND status NOT IN ('done','cancelled') AND task_state_config IS NOT NULL AND json_valid(task_state_config) AND COALESCE(json_extract(task_state_config,'$.review.auditor_agent_id'), json_extract(task_state_config,'$.auditor_agent_id')) IS NOT NULL ORDER BY id",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
-    let open: Vec<String> = sqlx::query_scalar(
-        "SELECT dedupe_key FROM attention_projection WHERE status <> 'resolved' AND dedupe_key LIKE 'retired-auditor:%'",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    let named: Vec<String> = db.tasks_naming_retired_auditor().await?;
+    let open: Vec<String> = db.open_retired_auditor_notice_keys().await?;
     let mut opened = 0;
     for task_id in &named {
         let key = retired_auditor_notice_key(task_id);
@@ -201,12 +191,9 @@ pub(crate) async fn state_retired_auditor_notices(db: &db::SqliteDb) -> Result<u
         // blocker budget per Task, with the instruction to recover a Task
         // that needs no recovery). `acknowledged` items are listed to the
         // owner like open ones and are no wake source.
-        sqlx::query("UPDATE attention_projection SET status = 'acknowledged', acknowledged_at = updated_at WHERE dedupe_key = ? AND status = 'open'")
-            .bind(&key)
-            .execute(&mut *tx)
-            .await
-            .map_err(db::DbError::from)?;
-        tx.commit().await.map_err(db::DbError::from)?;
+        db.acknowledge_retired_auditor_notice_in_tx(&mut tx, &key)
+            .await?;
+        tx.commit().await?;
         opened += 1;
     }
     for key in open {
@@ -226,13 +213,7 @@ async fn resolve_retired_auditor_notice(db: &db::SqliteDb, task_id: &str) -> Res
 
 async fn resolve_attention(db: &db::SqliteDb, dedupe_key: &str) -> Result<()> {
     let now = now_rfc3339();
-    sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key = ?")
-        .bind(&now)
-        .bind(&now)
-        .bind(dedupe_key)
-        .execute(db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+    db.resolve_retired_auditor_notice(&now, dedupe_key).await?;
     Ok(())
 }
 

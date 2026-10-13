@@ -73,11 +73,10 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
                 "integration step request names another Task",
             ));
         }
-        let version: Option<i64> =
-            sqlx::query_scalar("SELECT version FROM task WHERE id=? AND deleted_at IS NULL")
-                .bind(&request.task_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+        let version: Option<i64> = self
+            .db
+            .integration_step_live_task_version(&request.task_id)
+            .await?;
         let Some(version) = version else {
             // A deleted Task has no step queue; its attempt ends without one.
             return Ok(());
@@ -130,24 +129,20 @@ impl IntegrationStepPort for TaskStepIntegrationPort {
     }
 
     async fn step_state(&self, request: &IntegrationStepRequest) -> Result<IntegrationStepState> {
-        let status: Option<String> =
-            sqlx::query_scalar("SELECT status FROM task_step WHERE task_id=? AND causation_key=?")
-                .bind(&request.task_id)
-                .bind(request.causation_key())
-                .fetch_optional(self.db.pool())
-                .await?;
+        let status: Option<String> = self
+            .db
+            .integration_step_causation_status(&request.task_id, request.causation_key())
+            .await?;
         Ok(match status.as_deref() {
             None => IntegrationStepState::Missing,
             // `suspended` waits for a check and is as live as a queued step.
             Some("pending" | "claimed" | "suspended" | "parked") => IntegrationStepState::Live,
             Some("done") => IntegrationStepState::Done,
             Some(_) => {
-                let left: bool = sqlx::query_scalar(
-                    "SELECT NOT EXISTS(SELECT 1 FROM integration_attempt a JOIN task t ON t.id=a.task_ref WHERE a.id=? AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch AND t.deleted_at IS NULL)",
-                )
-                .bind(&request.attempt_id)
-                .fetch_one(self.db.pool())
-                .await?;
+                let left: bool = self
+                    .db
+                    .integration_step_task_left_entry(&request.attempt_id)
+                    .await?;
                 if left {
                     IntegrationStepState::TaskLeft
                 } else {

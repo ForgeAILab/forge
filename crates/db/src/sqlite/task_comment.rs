@@ -267,3 +267,61 @@ impl SqliteDb {
             .collect())
     }
 }
+
+impl SqliteDb {
+    pub async fn lead_subtask_handoff_note_count(
+        &self,
+        task_id: &str,
+        worklog_kind: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_comment WHERE task_id=? AND worklog_kind=?",
+        )
+        .bind(task_id)
+        .bind(worklog_kind)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn lead_handoff_note_replay_counts(
+        &self,
+        idempotency_key: String,
+        task_id: &str,
+        worklog_kind: &str,
+    ) -> crate::Result<(i64, i64)> {
+        Ok(sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(idempotency_key = ?), 0) FROM task_comment WHERE task_id=? AND worklog_kind=?",
+        ).bind(idempotency_key).bind(task_id).bind(worklog_kind).fetch_one(self.pool()).await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct LeadSubtaskCommentRow {
+    pub author_name: String,
+    pub worklog_kind: Option<String>,
+    pub content: String,
+    pub created_at: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for LeadSubtaskCommentRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            author_name: row.try_get(0)?,
+            worklog_kind: row.try_get(1)?,
+            content: row.try_get(2)?,
+            created_at: row.try_get(3)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn lead_subtask_recent_comments(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Vec<LeadSubtaskCommentRow>> {
+        Ok(sqlx::query_as(
+                "SELECT author_name, worklog_kind, content, created_at FROM task_comment WHERE task_id=? ORDER BY created_at DESC, id DESC LIMIT 10",
+            ).bind(task_id).fetch_all(self.pool()).await?)
+    }
+}

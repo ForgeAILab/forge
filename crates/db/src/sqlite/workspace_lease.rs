@@ -622,3 +622,14 @@ impl SqliteDb {
         Ok(map_issued_workspace_lease_row(row))
     }
 }
+
+impl SqliteDb {
+    pub async fn workspace_root_active_lease_count(&self, now: String) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workspace_lease WHERE status = 'active' AND expires_at > ?",
+        )
+        .bind(now)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}

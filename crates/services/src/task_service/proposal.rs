@@ -22,7 +22,6 @@ use db::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 use std::collections::HashSet;
 use std::str::FromStr;
 
@@ -696,19 +695,17 @@ impl TaskService {
         if existing.is_some() {
             return Ok(existing);
         }
-        let existing_digest: Option<String> = sqlx::query_scalar(
-            "SELECT input_digest FROM command_receipt
-             WHERE principal_type = ? AND principal_id = ? AND scope_type = ?
-               AND scope_id = ? AND operation = ? AND idempotency_key = ? LIMIT 1",
-        )
-        .bind(context.principal().principal_type())
-        .bind(context.principal().principal_id())
-        .bind(context.canonical_scope().scope_type().as_str())
-        .bind(context.canonical_scope().scope_id())
-        .bind(context.operation())
-        .bind(context.idempotency_key())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let existing_digest: Option<String> = self
+            .db
+            .task_proposal_existing_receipt_digest(db::TaskProposalReceiptDigestInput {
+                principal_type: context.principal().principal_type(),
+                principal_id: context.principal().principal_id(),
+                scope_type: context.canonical_scope().scope_type().as_str(),
+                scope_id: context.canonical_scope().scope_id(),
+                operation: context.operation(),
+                idempotency_key: context.idempotency_key(),
+            })
+            .await?;
         if existing_digest.is_some() {
             return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
         }
@@ -732,16 +729,15 @@ impl TaskService {
         match action.scope_type.as_str() {
             "project" if action.scope_id == project_id => {}
             "agent_chat" => {
-                let row =
-                    sqlx::query("SELECT kind, project_id FROM agent_chat WHERE id = ? LIMIT 1")
-                        .bind(&action.scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?
-                        .ok_or_else(|| {
-                            ServiceError::not_found("agent_chat", action.scope_id.clone())
-                        })?;
-                let kind: String = row.try_get("kind")?;
-                let chat_project_id: Option<String> = row.try_get("project_id")?;
+                let row = self
+                    .db
+                    .task_proposal_chat_scope(&action.scope_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServiceError::not_found("agent_chat", action.scope_id.clone())
+                    })?;
+                let kind: String = row.kind;
+                let chat_project_id: Option<String> = row.project_id;
                 if kind != "project" || chat_project_id.as_deref() != Some(project_id) {
                     return Err(ServiceError::invalid_operation(
                         "task proposal scope must match its owning Project Agent Chat",
@@ -754,14 +750,10 @@ impl TaskService {
                 ));
             }
         }
-        let permissions: Option<String> = sqlx::query_scalar(
-            "SELECT permission_ceiling_json FROM project_agent_binding
-             WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(&action.actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let permissions: Option<String> = self
+            .db
+            .task_proposal_actor_permission_ceiling(project_id, &action.actor_identity_id)
+            .await?;
         if !permissions.as_deref().is_some_and(|permissions| {
             operation_registry::authority::permission_set(permissions).contains("propose_task")
         }) {
@@ -776,11 +768,10 @@ impl TaskService {
                         message: "agent executor must be the source Project Agent".to_owned(),
                     });
                 }
-                let exists: Option<i64> =
-                    sqlx::query_scalar("SELECT 1 FROM agent_identity WHERE id = ? LIMIT 1")
-                        .bind(executed_by_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let exists: Option<i64> = self
+                    .db
+                    .task_proposal_executor_identity(executed_by_id)
+                    .await?;
                 if exists.is_none() {
                     return Err(ServiceError::AuthorizationDenied {
                         message: "agent executor identity does not exist".to_owned(),
@@ -788,19 +779,11 @@ impl TaskService {
                 }
             }
             "user" => {
-                let owner: Option<String> =
-                    sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ? LIMIT 1")
-                        .bind(project_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
-                let member: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM project_member
-                     WHERE project_id = ? AND user_id = ? LIMIT 1",
-                )
-                .bind(project_id)
-                .bind(executed_by_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+                let owner: Option<String> = self.db.task_proposal_project_owner(project_id).await?;
+                let member: Option<i64> = self
+                    .db
+                    .task_proposal_project_member(project_id, executed_by_id)
+                    .await?;
                 if owner.as_deref() != Some(executed_by_id) && member.is_none() {
                     return Err(ServiceError::AuthorizationDenied {
                         message: "user executor is not a Project owner or member".to_owned(),
@@ -836,24 +819,19 @@ impl TaskService {
         if !execution_class.is_implementation() && !has_governance_shorthand {
             return Ok(None);
         }
-        let charter_revision_id: Option<String> = sqlx::query_scalar(
-            "SELECT current_charter_revision_id FROM project
-             WHERE id = ? AND charter_status = 'charter_backed'
-               AND charter_setup_required = 0 LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .flatten();
+        let charter_revision_id: Option<String> = self
+            .db
+            .task_proposal_current_charter_revision(project_id)
+            .await?
+            .flatten();
         let Some(charter_revision_id) = charter_revision_id else {
             return Ok(None);
         };
         // The Project's own primary milestone pointer is the traceability
         // default; there is no separate approved artifact to read it from.
         let primary_milestone_id: Option<String> = if requests_milestone_traceability {
-            sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
+            self.db
+                .task_proposal_primary_milestone(project_id)
                 .await?
                 .flatten()
         } else {

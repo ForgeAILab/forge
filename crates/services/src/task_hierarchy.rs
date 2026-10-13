@@ -658,21 +658,7 @@ pub(crate) async fn is_coordination_root_tx(
     connection: &mut SqliteConnection,
     task_id: &str,
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, i64>(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM task AS root
-             JOIN task AS child ON child.parent_task_id = root.id
-             WHERE root.id = ?
-               AND root.parent_task_id IS NULL
-               AND root.deleted_at IS NULL
-               AND child.deleted_at IS NULL
-         )",
-    )
-    .bind(task_id)
-    .fetch_one(connection)
-    .await?
-        != 0)
+    Ok(db::coordination_root_visible_children_in_connection(connection, task_id).await? != 0)
 }
 
 /// Return whether a child is currently first in the runnable ordered sequence.

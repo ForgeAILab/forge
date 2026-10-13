@@ -4122,3 +4122,195 @@ impl UsageEventSourceMetadataRead for UsageIndexEffectiveEventRow {
         self.catalog_fetched_at()
     }
 }
+
+pub struct AgentUsageSourceRow {
+    row: SqliteRow,
+}
+impl AgentUsageSourceRow {
+    pub fn agent_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("agent_id")?)
+    }
+    pub fn source_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn agent_usage_source_ids_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+        ids_json: &str,
+    ) -> crate::Result<Vec<AgentUsageSourceRow>> {
+        let rows = sqlx::query(
+        "SELECT agent_id, source_id FROM usage_invocation WHERE agent_id IN (SELECT value FROM json_each(?1))
+         UNION SELECT agent_id, source_id FROM usage_event WHERE agent_id IN (SELECT value FROM json_each(?1))
+         ORDER BY agent_id, source_id",
+    ).bind(ids_json).fetch_all(connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AgentUsageSourceRow { row })
+            .collect())
+    }
+}
+
+pub struct TaskUsageSourceRow {
+    row: SqliteRow,
+}
+impl TaskUsageSourceRow {
+    pub fn source_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_usage_source_ids_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+    ) -> crate::Result<Vec<TaskUsageSourceRow>> {
+        let rows = sqlx::query(TASK_USAGE_SOURCES_SQL)
+            .bind(task_id)
+            .bind(task_id)
+            .bind(task_id)
+            .bind(task_id)
+            .bind(task_id)
+            .bind(task_id)
+            .fetch_all(connection)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TaskUsageSourceRow { row })
+            .collect())
+    }
+}
+
+pub struct OperationsUsageSourceRow {
+    row: SqliteRow,
+}
+impl OperationsUsageSourceRow {
+    pub fn source_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn operations_usage_source_ids_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> crate::Result<Vec<OperationsUsageSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT source_id FROM usage_invocation
+         UNION SELECT DISTINCT source_id FROM usage_event
+         ORDER BY source_id ASC",
+        )
+        .fetch_all(connection)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| OperationsUsageSourceRow { row })
+            .collect())
+    }
+}
+
+/// Collect the execution attempts belonging to one Task.  Runtime rows are
+/// included as domain runs even when no invocation was admitted, preserving
+/// no-provider and active/pending coverage in Task observability.
+// Separate branches keep every predicate backed by its task/execution/source index.
+pub const TASK_USAGE_SOURCES_SQL: &str = "
+    SELECT source_id FROM usage_invocation WHERE task_id = ?
+    UNION SELECT source_id FROM usage_invocation WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_invocation WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_event WHERE task_id = ?
+    UNION SELECT source_id FROM usage_event WHERE execution_id IN (SELECT id FROM execution WHERE task_id = ?)
+    UNION SELECT source_id FROM usage_event WHERE source_id IN (SELECT id FROM execution WHERE task_id = ?)
+    ORDER BY source_id";
+
+pub struct EffectiveUsageEventMetadataRow {
+    row: SqliteRow,
+}
+impl EffectiveUsageEventMetadataRow {
+    pub fn event_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("event_id")?)
+    }
+}
+impl UsageEventSourceMetadataRead for EffectiveUsageEventMetadataRow {
+    fn rate_source_kind(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::rate_source_kind(&self.row)
+    }
+    fn selection_source_kind(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::selection_source_kind(&self.row)
+    }
+    fn selection_catalog_freshness(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::selection_catalog_freshness(&self.row)
+    }
+    fn estimate_catalog_freshness(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::estimate_catalog_freshness(&self.row)
+    }
+    fn selection_rate_revision_id(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::selection_rate_revision_id(&self.row)
+    }
+    fn selection_catalog_snapshot_id(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::selection_catalog_snapshot_id(&self.row)
+    }
+    fn rate_catalog_snapshot_id(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::rate_catalog_snapshot_id(&self.row)
+    }
+    fn catalog_digest(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::catalog_digest(&self.row)
+    }
+    fn rate_effective_at(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::rate_effective_at(&self.row)
+    }
+    fn catalog_fetched_at(&self) -> crate::Result<Option<String>> {
+        UsageEventSourceMetadataRead::catalog_fetched_at(&self.row)
+    }
+}
+impl SqliteDb {
+    pub async fn effective_usage_event_metadata_on_connection(
+        connection: &mut sqlx::SqliteConnection,
+        chunk: &[(crate::UsageEvent, Option<String>)],
+    ) -> crate::Result<Vec<EffectiveUsageEventMetadataRow>> {
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "WITH requested(event_id, invocation_id, rate_id, catalog_id, revision_id) AS (",
+        );
+        query.push_values(chunk, |mut row, (event, revision)| {
+            row.push_bind(&event.id)
+                .push_bind(&event.invocation_id)
+                .push_bind(event.rate_revision_id.as_deref())
+                .push_bind(event.catalog_snapshot_id.as_deref())
+                .push_bind(revision.as_deref());
+        });
+        query.push(") SELECT requested.event_id,
+             ps.source_kind AS selection_source_kind,
+             ps.catalog_freshness AS selection_catalog_freshness,
+             ps.rate_revision_id AS selection_rate_revision_id,
+             ps.catalog_snapshot_id AS selection_catalog_snapshot_id,
+             r.source_kind AS rate_source_kind,
+             r.catalog_snapshot_id AS rate_catalog_snapshot_id,
+             r.effective_at AS rate_effective_at,
+             c.revision_digest AS catalog_digest,
+             c.fetched_at AS catalog_fetched_at,
+             ep.catalog_freshness AS estimate_catalog_freshness
+         FROM requested JOIN usage_invocation i ON i.id = requested.invocation_id
+         LEFT JOIN pricing_selection ps ON ps.id = i.pricing_selection_id
+         LEFT JOIN cost_estimate_revision er ON er.id = requested.revision_id
+         LEFT JOIN cost_estimation_run erun ON erun.id = er.run_id
+         LEFT JOIN cost_estimation_preview ep ON ep.id = erun.preview_id
+         LEFT JOIN pricing_rate_revision r ON r.id = COALESCE(requested.rate_id, ps.rate_revision_id)
+         LEFT JOIN pricing_catalog_snapshot c ON c.id = COALESCE(requested.catalog_id, r.catalog_snapshot_id, ps.catalog_snapshot_id)");
+        let rows = query.build().fetch_all(&mut *connection).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveUsageEventMetadataRow { row })
+            .collect())
+    }
+}
+
+pub async fn execution_pricing_selection_count_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    execution_id: &str,
+) -> crate::Result<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM pricing_selection WHERE source_id = ? AND domain_kind = 'execution'",
+    )
+    .bind(execution_id)
+    .fetch_one(connection)
+    .await?)
+}

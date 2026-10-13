@@ -1,5 +1,4 @@
 use db::ExecutionRepo;
-use sqlx::Row;
 
 fn role_matches(role: &str, execution_role: &str) -> bool {
     role == execution_role
@@ -25,18 +24,12 @@ pub async fn latest_state_entry_authority(
     task_id: &str,
     to_state: &str,
 ) -> crate::Result<Option<LatestStateEntryAuthority>> {
-    let row = sqlx::query(
-        "SELECT id, created_at FROM transition_log WHERE task_id = ? AND to_state = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
-    )
-    .bind(task_id)
-    .bind(to_state)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db.latest_task_state_entry_source(task_id, to_state).await?;
 
     row.map(|row| {
         Ok(LatestStateEntryAuthority {
-            id: row.try_get("id")?,
-            created_at: row.try_get("created_at")?,
+            id: row.id()?,
+            created_at: row.created_at()?,
         })
     })
     .transpose()
@@ -58,121 +51,14 @@ pub async fn list_execution_action_authority(
     current_role: Option<&str>,
     blocked_execution_id: Option<&str>,
 ) -> crate::Result<Vec<db::Execution>> {
-    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT DISTINCT id FROM (");
-    let mut first = true;
-
-    macro_rules! candidate_static {
-        ($predicate:expr) => {{
-            if !first {
-                query.push(" UNION ALL ");
-            }
-            first = false;
-            query
-                .push("SELECT id FROM (SELECT id FROM execution WHERE task_id = ")
-                .push_bind(task_id)
-                .push(" AND ")
-                .push($predicate)
-                .push(" ORDER BY created_at DESC, id DESC LIMIT 1)");
-        }};
-    }
-
-    macro_rules! candidate_role {
-        ($predicate:expr, $role:expr) => {{
-            if !first {
-                query.push(" UNION ALL ");
-            }
-            first = false;
-            query
-                .push("SELECT id FROM (SELECT id FROM execution WHERE task_id = ")
-                .push_bind(task_id)
-                .push(" AND ")
-                .push($predicate)
-                .push_bind($role)
-                .push(" ORDER BY created_at DESC, id DESC LIMIT 1)");
-        }};
-    }
-
-    macro_rules! candidate_coder_roles {
-        ($predicate:expr, $role:expr) => {{
-            if !first {
-                query.push(" UNION ALL ");
-            }
-            first = false;
-            query
-                .push("SELECT id FROM (SELECT id FROM execution WHERE task_id = ")
-                .push_bind(task_id)
-                .push(" AND ")
-                .push($predicate)
-                .push_bind($role)
-                .push(", 'executor') ORDER BY created_at DESC, id DESC LIMIT 1)");
-        }};
-    }
-
-    macro_rules! candidate_id {
-        ($execution_id:expr) => {{
-            if !first {
-                query.push(" UNION ALL ");
-            }
-            query
-                .push("SELECT id FROM (SELECT id FROM execution WHERE task_id = ")
-                .push_bind(task_id)
-                .push(" AND id = ")
-                .push_bind($execution_id)
-                .push(" ORDER BY created_at DESC, id DESC LIMIT 1)");
-        }};
-    }
-
-    candidate_static!("status != 'running'");
-    candidate_static!("status != 'running' AND agent_session_id IS NOT NULL");
-    // `action_agent_id` can fall back to the newest execution with an agent
-    // identity when there is no role assignment. It includes running rows;
-    // preserve that authority class in the bounded projection as well.
-    // `action_agent_id` falls back to the newest agent-backed execution even
-    // when that row is still running. Keep that exact authority source in the
-    // bounded projection so the `/actions` fingerprint observes the same row
-    // the resolver can use.
-    candidate_static!("agent_id IS NOT NULL");
-    candidate_static!("status = 'running'");
-    candidate_static!("status = 'running' AND role = 'interactive'");
-    if let Some(role) = current_role {
-        if role == crate::workflow::default_roles::CODER {
-            candidate_coder_roles!("status != 'running' AND role IN (", role);
-            candidate_coder_roles!(
-                "status != 'running' AND agent_session_id IS NOT NULL AND role IN (",
-                role
-            );
-            candidate_coder_roles!(
-                "status != 'running' AND agent_id IS NOT NULL AND role IN (",
-                role
-            );
-            candidate_coder_roles!("status = 'running' AND role IN (", role);
-        } else {
-            candidate_role!("status != 'running' AND role = ", role);
-            candidate_role!(
-                "status != 'running' AND agent_session_id IS NOT NULL AND role = ",
-                role
-            );
-            candidate_role!(
-                "status != 'running' AND agent_id IS NOT NULL AND role = ",
-                role
-            );
-            candidate_role!("status = 'running' AND role = ", role);
-        }
-    }
-    if let Some(execution_id) = blocked_execution_id {
-        candidate_id!(execution_id);
-    }
-
-    // The resolver consumes this as a set, but the `/actions` coherence
-    // fingerprint compares the projected rows directly. Make the projection
-    // order deterministic so an unchanged authority snapshot cannot look
-    // different merely because SQLite chose another UNION scan order.
-    query.push(") candidates ORDER BY id");
-    let rows = query.build().fetch_all(db.pool()).await?;
-    let execution_ids = rows
-        .iter()
-        .map(|row| row.try_get::<String, _>("id"))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let execution_ids = db
+        .execution_action_authority_ids(
+            task_id,
+            current_role,
+            blocked_execution_id,
+            crate::workflow::default_roles::CODER,
+        )
+        .await?;
     let execution_ids = execution_ids.iter().map(String::as_str).collect::<Vec<_>>();
     Ok(ExecutionRepo::get_by_ids(db, &execution_ids).await?)
 }

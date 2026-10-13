@@ -63,13 +63,6 @@ pub struct ImportReport {
 
 /// Uncontinued current pre-queue rows and missing-source non-current imports
 /// with no successor, of Tasks that still exist in the imported entry.
-const UNCONTINUED: &str = "SELECT a.id FROM integration_attempt a \
-    WHERE (a.current=1 OR (@IMPORT_PARK@)) AND (a.import_source_json IS NOT NULL OR a.admission_key LIKE 'shadow:%') \
-      AND EXISTS(SELECT 1 FROM task t WHERE t.id=a.task_ref AND t.deleted_at IS NULL) \
-      AND NOT EXISTS(SELECT 1 FROM task_step s WHERE s.task_id=a.task_ref \
-                     AND s.causation_key='integration-import:'||a.id) \
-    ORDER BY a.id";
-
 use super::reconcile::merge_state;
 
 /// The machine a pre-queue owner wait named (`metadata.owner_wait.daemon_id`).
@@ -149,13 +142,7 @@ pub(crate) async fn enqueue_missing_continuations(
     let ids: Vec<String> = if queued_only {
         db.queued_imports_without_continuation().await?
     } else {
-        sqlx::query_scalar(&UNCONTINUED.replace(
-            "@IMPORT_PARK@",
-            db::integration_queue::UNOWNED_QUARANTINED_IMPORT,
-        ))
-        .fetch_all(db.pool())
-        .await
-        .map_err(db::DbError::from)?
+        db.integration_imports_without_continuation().await?
     };
     let mut enqueued = 0;
     for id in ids {
@@ -199,14 +186,9 @@ async fn enqueue_continuation(db: &Arc<SqliteDb>, attempt_id: &str) -> Result<bo
     // One continuation per attempt, whoever asks (two sweeps, a sweep beside
     // the start): the step's key is unique per Task and a second enqueue
     // inserts nothing. Only the insert is counted.
-    let existed: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND causation_key=?)",
-    )
-    .bind(&input.task_id)
-    .bind(&input.causation_key)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(db::DbError::from)?;
+    let existed: bool = db
+        .integration_continuation_exists_in_tx(&mut tx, &input.task_id, &input.causation_key)
+        .await?;
     if existed {
         return Ok(false);
     }
@@ -280,11 +262,13 @@ impl IntegrationSteps {
         if attempt.state.terminal() {
             return Ok(StepOutcome::Skip("the attempt is history".into()));
         }
-        let live: bool = sqlx::query_scalar(db::STEP_FENCE)
-            .bind(&attempt.task_ref)
-            .bind(&attempt.expected_status)
-            .bind(attempt.expected_epoch)
-            .fetch_one(self.db.pool())
+        let live: bool = self
+            .db
+            .integration_task_entry_matches(
+                &attempt.task_ref,
+                &attempt.expected_status,
+                attempt.expected_epoch,
+            )
             .await?;
         let task = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await?;
         let Some(task) = task.filter(|_| live) else {
@@ -313,15 +297,10 @@ impl IntegrationSteps {
         // claimable): it waits. Only an earlier, suspended step is waited
         // for: a pending one runs before this step anyway, and a later one
         // could not run until this step is settled.
-        let suspended_entry_hooks: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM task_step h JOIN task t ON t.id=h.task_id \
-             WHERE h.task_id=? AND h.kind='hooks' AND h.status='suspended' AND h.seq<? \
-               AND h.expected_status=t.status AND h.expected_epoch=t.status_epoch)",
-        )
-        .bind(&task.id)
-        .bind(step.seq)
-        .fetch_one(self.db.pool())
-        .await?;
+        let suspended_entry_hooks: bool = self
+            .db
+            .integration_suspended_prior_entry_hooks(&task.id, step.seq)
+            .await?;
         if in_merge_state && suspended_entry_hooks {
             return Ok(StepOutcome::RetryAt(
                 "the entry's own hooks step continues this merge first".into(),
@@ -462,14 +441,8 @@ impl IntegrationSteps {
         if metadata.get("daemon_upgrade_refusal").is_some() {
             return Ok(false);
         }
-        let placement: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT workspace_id,state,daemon_id FROM workspace_placement WHERE task_id=? \
-             ORDER BY generation DESC,updated_at DESC LIMIT 1",
-        )
-        .bind(&task.id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db::DbError::from)?;
+        let placement: Option<(String, String, Option<String>)> =
+            self.db.integration_latest_task_placement(&task.id).await?;
         let Some((workspace_id, state, daemon_id)) = placement else {
             return Ok(false);
         };
@@ -663,15 +636,7 @@ async fn complete_applied(db: &Arc<SqliteDb>, attempt_id: &str) {
 /// `applied` (the process stopped between the two writes). No queue holds
 /// them as its head, so nothing else would complete them.
 pub async fn complete_reported(db: &Arc<SqliteDb>) -> Result<()> {
-    let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT a.id FROM integration_attempt a WHERE a.current=1 AND a.state='applied' \
-           AND a.import_source_json IS NOT NULL AND a.acknowledged_at IS NOT NULL \
-           AND json_extract(a.effect_ack_json,'$.action')='result' \
-           AND NOT EXISTS(SELECT 1 FROM integration_queue q WHERE q.head_attempt_id=a.id)",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(db::DbError::from)?;
+    let ids: Vec<String> = db.integration_reported_applied_import_ids().await?;
     for id in ids {
         complete_applied(db, &id).await;
     }
