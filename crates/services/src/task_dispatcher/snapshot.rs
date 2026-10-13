@@ -427,6 +427,11 @@ impl TaskDispatcher {
                     "not_coordinating"
                 };
                 f.parent_wait = Some((parent.id.clone(), cause.to_owned()));
+            } else if !f.child_ready {
+                // The root may be implementing while an earlier sibling
+                // waits for an owner. This child still needs a typed wait,
+                // independent of whether another execution holds a slot.
+                f.parent_wait = Some((parent.id.clone(), "sequence".to_owned()));
             }
         }
         if let Some(role) = role {
@@ -506,7 +511,11 @@ impl TaskDispatcher {
                         f.human_wait = true;
                     }
                 }
+                // Asking runs, including failed ones, are finished with
+                // the question. After the answer the next planning run owns
+                // the work; the asking run is not a manual-stop wait.
                 f.stopped_execution = !no_exact_review
+                    && metadata["lead_input_execution_id"] != e.id
                     && matches!(
                         e.status,
                         ExecutionStatus::Failed | ExecutionStatus::Cancelled

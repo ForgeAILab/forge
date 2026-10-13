@@ -228,9 +228,10 @@ pub enum ParkReason {
     /// A subtask its parent does not let run yet. `cause` is `held` (the
     /// owner holds the parent), `blocked` (the parent is parked on a
     /// failure or a blocked entry), `planning` (the parent is in its
-    /// planning state: its lead runs or is about to) or `not_coordinating`
-    /// (the parent is in another state that runs no subtasks). The exit is
-    /// on the parent.
+    /// planning state: its lead runs or is about to), `not_coordinating`
+    /// (the parent is in another state that runs no subtasks) or `sequence`
+    /// (the parent runs its subtasks and an earlier sibling is unfinished).
+    /// The exit is on the parent, or on that sibling.
     Parent {
         parent_id: String,
         cause: String,
@@ -357,7 +358,7 @@ pub const LEGACY_BLOCKING_ANNOTATION_KINDS: &[&str] = &[
 /// Revision of the mapping and of the stored encoding. A database whose
 /// recorded revision differs is recomputed once in the background, off the
 /// startup path. Bump it with every change to either.
-pub const MAPPING_REVISION: i64 = 6;
+pub const MAPPING_REVISION: i64 = 7;
 /// Protected `system_setting` key recording the revision last backfilled.
 pub const MAPPING_REVISION_KEY: &str = "task_condition_mapping_revision";
 
@@ -1568,8 +1569,9 @@ impl SqliteDb {
     /// with their mapping; integration is validated from its typed witness.
     /// A condition is refused unless those owners agree under the
     /// witnesses it states itself. Those witnesses are the producer's claim:
-    /// they are not re-read here (the invariant check does that), so stating a
-    /// condition costs no fact query.
+    /// they are not re-read here (the invariant check does that). The only
+    /// observer read is the epoch-fenced scheduler park, which the witnesses
+    /// do not own; it is checked in this same transaction.
     /// The shadow write bumps no version and emits no event or Attention.
     pub async fn set_condition(
         &self,
@@ -1657,12 +1659,27 @@ impl SqliteDb {
         {
             return Err(DbError::VersionConflict);
         }
+        // Scheduler parks are epoch-fenced observer facts, not owned
+        // witnesses. Compare the statement under the actual observer record,
+        // in this transaction, so a pause/parent/Agent wait cannot make an
+        // otherwise valid check or integration statement disagree with itself.
+        let owner_park: Option<String> = sqlx::query_scalar(
+            // The pause record counts only while the Project is paused: the
+            // same rule as the snapshot the producer reads (`Families::sql`).
+            "SELECT reason_json FROM task_schedule_park WHERE task_id=?1 AND epoch=?2 AND NOT (json_valid(reason_json) AND json_extract(reason_json,'$.reason')='ProjectPaused' AND (SELECT p.paused_at FROM project p JOIN task t ON t.project_id=p.id WHERE t.id=?1) IS NULL)",
+        )
+        .bind(task_id)
+        .bind(row.get::<i64, _>(8))
+        .fetch_optional(&mut **tx)
+        .await?;
+        let owner_park = owner_park.and_then(|raw| serde_json::from_str(&raw).ok());
         let stated = ConditionFacts::recover(condition)
             .filter(|facts| facts.task_id == task_id)
             .map(|mut facts| {
                 facts.version = expected_version;
                 facts.state = row.get(7);
                 facts.children_pending = facts::children_pending(bare.metadata_json.as_deref());
+                facts.owner_park = owner_park;
                 facts
             })
             .filter(|facts| facts.epoch == row.get::<i64, _>(8));

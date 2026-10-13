@@ -206,14 +206,25 @@ impl CrashRecovery {
                 "suspended stale native agent sessions from previous process"
             );
         }
-        let tasks = self.list_in_progress_tasks(None).await?;
+        // Driven by the running executions, not by the Tasks: a start with
+        // nothing to recover reads one empty list and writes nothing,
+        // however many Tasks the database holds.
+        let tasks = tasks_with_running_executions(&self.db).await?;
         let mut recovered = 0;
 
-        for task in tasks {
+        for (task, executions) in tasks {
             // One live recovery command per Task and running-execution set:
             // repeated restarts before the queue drains do not stack copies.
-            let mut running = ExecutionRepo::list_running_by_task(&*self.db, &task.id)
-                .await?
+            // The retired inline review owner has its own startup settlement
+            // below, which explains the stop and re-enters review. Do not let
+            // a generic gate recovery consume that owner's executions first.
+            if executions
+                .iter()
+                .any(crate::task_service::retired_review_rerun)
+            {
+                continue;
+            }
+            let mut running = executions
                 .into_iter()
                 .map(|execution| execution.id)
                 .collect::<Vec<_>>();
@@ -322,11 +333,6 @@ impl CrashRecovery {
 
         tracing::info!(recovered_tasks = recovered, "crash recovery completed");
         Ok(recovered)
-    }
-
-    #[tracing::instrument(skip(self), fields(agent_id = agent_id.unwrap_or("any")))]
-    async fn list_in_progress_tasks(&self, agent_id: Option<&str>) -> Result<Vec<Task>> {
-        list_in_progress_tasks(&self.db, agent_id).await
     }
 }
 
@@ -1250,6 +1256,55 @@ pub(crate) struct RecoverTaskOutcome {
     pub settled_executions: usize,
 }
 
+/// Every non-terminal Task that has a running execution, with those
+/// executions: implementation states and the gates a role runs in (the
+/// planning gate, review, a subtask's inherited step check, a custom
+/// workflow's gate roles). One query for the executions and one Task read per
+/// Task that has one; Tasks without a running execution are never read.
+async fn tasks_with_running_executions(db: &SqliteDb) -> Result<Vec<(Task, Vec<Execution>)>> {
+    let mut by_task = std::collections::BTreeMap::<String, Vec<Execution>>::new();
+    for execution in ExecutionRepo::list_running(db).await? {
+        by_task
+            .entry(execution.task_id.clone())
+            .or_default()
+            .push(execution);
+    }
+    let mut projects = HashMap::<String, Option<Project>>::new();
+    let mut tasks = Vec::new();
+    for (task_id, executions) in by_task {
+        let Some(task) = TaskRepo::get_by_id(db, &task_id, false).await? else {
+            continue;
+        };
+        if task.archived_at.is_some() || task.assignee_type.as_deref() == Some("user") {
+            continue;
+        }
+        if !projects.contains_key(&task.project_id) {
+            let project = ProjectRepo::get_by_id(db, &task.project_id).await?;
+            projects.insert(task.project_id.clone(), project);
+        }
+        let Some(Some(project)) = projects.get(&task.project_id) else {
+            continue;
+        };
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            &task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::CrashRecovery),
+        );
+        // A state the effective workflow does not define has no recovery
+        // (`recover_task` refuses it); a settled Task is not re-driven.
+        if matches!(
+            workflow.state_kind(&task.status),
+            None | Some(api_types::StateKind::Terminal)
+        ) {
+            continue;
+        }
+        tasks.push((task, executions));
+    }
+    Ok(tasks)
+}
+
+/// The Tasks an Agent's heartbeat timeout stops: implementation states only,
+/// where the running execution is the Task's own Agent's.
 async fn list_in_progress_tasks(db: &SqliteDb, agent_id: Option<&str>) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
     for project in list_projects(db).await? {

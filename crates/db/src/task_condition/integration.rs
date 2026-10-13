@@ -224,6 +224,9 @@ pub(super) fn overlay(
     reason: &IntegrationReason,
     handoff_ready: bool,
 ) -> TaskCondition {
+    // The queue owns its typed wait even while the Project blocks new work.
+    // A scheduler pause is restated separately and must not mask this owner.
+    condition = super::readers::without_scheduler_pause(condition);
     // A settled Task keeps the attempt identity alone: paths, phase and cause
     // are the attempt record's, and nothing is waiting any more.
     if matches!(condition, TaskCondition::Settled { .. }) {

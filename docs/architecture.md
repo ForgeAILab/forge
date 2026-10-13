@@ -5981,14 +5981,39 @@ is held, parked on a failure or a blocked entry, or not in an implementation
 (`task_dispatcher/next_step.rs`), which is one of the visible schedule parks
 (`db::task_condition::readers::owner_park`), so the subtask's stored condition
 is `parked` with the typed reason `parent { parent_id, cause }` (`held`,
-`blocked`, `planning`, `not_coordinating`). It is a wait without a diagnostic or failure
+`blocked`, `planning`, `not_coordinating`, `sequence`). `sequence` names an
+unstarted child's wait for an earlier incomplete sibling, including one that
+is parked with no live execution. The root's state and execution policy are
+unchanged; the child's already-refused Start is no longer offered meanwhile.
+Project pause has scheduler priority:
+while the Project is paused, a child waiting on its parent shows
+`project_paused` instead. Resume restores the parent wait if it still applies.
+Every non-terminal child retains a typed park through either change. A
+`project_paused` scheduler park has `state: null` and its exit is Resume Project,
+only while that Project is actually paused: the condition reader ignores a
+pause record whose Project has no `paused_at` (`Families::sql`,
+`set_condition`), so a record a resumed Project left behind states nothing
+and the invariant check repairs a condition that still shows it. A resume
+removes the pause records of the Project's Tasks and restates their
+conditions in its own commit (`wake_dispatch_for_project_in_tx`), one
+condition write per Task that showed the pause, so the stored condition never
+disagrees with the Project row. A Task whose
+run or state entry is live keeps `running` / `entering` under a pause
+(`ConditionFacts::apply`); the pause becomes its park when the run ends. It is restated from the scheduler
+record, never carried by a check or integration statement. The condition write
+compares against that record under the current Task epoch in the same
+transaction; observer waits never invalidate an owned result. Thus: a check wait still owns its result
+and a Project resume cannot retain the old pause park. It is a wait without a diagnostic or failure
 kind, `start` is not offered on the subtask meanwhile, and the park is cleared
 on the pass that finds the root coordinating again (a change of the root's
 condition or status marks its children for the scheduler). A Task whose Agent cannot
 take work is shown the same way: `Reason::AgentWait` is a visible schedule
 park and the stored condition is `parked` on `agent { agent_id, status }`
 (the Agent's effective status), cleared on the pass that finds the Agent
-available. A Task past its initial state whose Agent is at its run limit
+available. A retry (queued action or deadline) keeps its continuation while
+it shows the Project or Agent park, and a queued action while it shows the
+parent park; removing that park never loses the accepted retry. A retry
+deadline under a parent or capacity wait stays `deferred`. A Task past its initial state whose Agent is at its run limit
 resolves `Reason::AgentCapacity`, also a visible schedule park: its stored
 condition is `parked` on `capacity { scope: agent }` and it is woken by the
 Agent's wait record when a run ends. A Task still waiting for its first run
@@ -6168,8 +6193,8 @@ Authority is decided in two places and nowhere else.
    the same evaluator, so an ordinary planner, worker or reviewer session is
    never offered a `lead.*` operation and pays nothing for them in its tool
    prefix. Within a turn the fact can be lost and never gained
-   (`EffectiveAuthority::narrowed`): a lead removed mid-run loses the lead
-   operations at its next call and keeps its Task records.
+   (`EffectiveAuthority::narrowed`): a lead removed or replaced mid-run loses its execution and all Task-run
+   operations at its next call.
 2. *Is the target in the subtree* is one predicate at one boundary.
    `TaskService::bind_lead` is called first by every lead command: it repeats
    the workflow's side of the lead rule (`RootRolePolicy::lead`, the run on
@@ -6230,6 +6255,14 @@ A refused call spends nothing. A charge and the command it guards are not one
 transaction: a crash between them spends a unit and creates nothing, and the
 retry of the same key is not charged again.
 
+A lead's Retry opens a fresh budget window on the subtask, including
+`gate:lead_check`; the root's `lead_recover:<subtask>` charge stays in the
+root's window. A queued role Retry that still carries gate spending records
+one `retry_window_reset` before validation, identified by its queue ID, and
+only when the actor that accepted it is the root's lead (the offer names the
+lead for every caller, so the offer alone does not say who accepted it).
+Redelivery sees that reset and never opens another window.
+
 A recovery the lead accepts while its root plans is not replayed against the
 order check: the subtask keeps the typed wait `parent { cause: planning }`
 until the root is back in its implementation state, and the accepted action
@@ -6257,9 +6290,10 @@ nothing. An item whose root was deleted is closed by resolving it.
 
 | Root | Condition | Result | Mechanism |
 |---|---|---|---|
-| `planning`, the lead's run asked | the run ends | stays in `planning`; the run is not the gate's Accept and is not settled again | `maybe_cascade_executor_completion` (`lead_asked_input`); the snapshot leaves that run out of `terminal_execution` |
+| `planning`, the lead's run asked | the run ends, successfully, failed or cancelled | stays in `planning`; the run is not the gate's Accept and is not settled again or treated as a manual stop after the answer | `maybe_cascade_executor_completion` (`lead_asked_input`); the snapshot leaves that run out of `terminal_execution` |
 | `planning`, waiting | every pass, a restart | parked `human_decision { lead_input }`, owner the user; no lead run; subtasks `parent { cause: planning }` | `next_step` `human_wait` |
 | `planning`, waiting | the owner resolves the item with an answer (`POST …/attention/{id}/resolve` with `answer`) | the answer is a user comment on the root, the wait is cleared, the item resolved, the root woken; the lead runs again with its questions and the owner's answers in its input | `AttentionService::resolve_with_answer` → `lead::answer_lead_input`, then `Step::Role` |
+| `planning`, waiting, asking run live or ended | the owner holds the root, then releases it | a live asking run stops; release clears the hold and keeps the question wait. The lead runs once after the answer, not at release | the Release action uses `release_to_dispatch_queue` for a pending lead-input wait |
 | any | the root leaves `planning` another way (Approve, move, cancel) | the wait is cleared and the item resolved | `lead::clear_lead_input_wait` in the transition |
 
 An answer is no transition, so it charges no re-plan. The loop "ask, answer,
@@ -6315,8 +6349,8 @@ Edges of the root lifecycle, each a typed wait with an exit:
 | Situation | Root | Its subtasks | Exit |
 |---|---|---|---|
 | The root has an unfinished dependency | stays where it is, parked `dispatch_refusal { capability: coordination_root_advance }` | `parent { cause: not_coordinating }` | the dependency's completion wakes the root (`wake_dependents_of_completed_task`), which starts on the next pass; a cancelled dependency blocks it as it blocks any Task |
-| The lead is removed while its planner runs | rests in `planning` (`in_flight`) until the run ends: `RootRolePolicy::planning_run_live` keeps the root advance (fact and walk) off | `parent { cause: planning }` | the run's settlement moves the root to `in_progress`; a stopped run leaves a held root whose release starts nothing and lets the advance move it on |
-| The planner fails, is stopped, or its Agent is paused | `planning`, with the retry deadline, the failure, the hold or the Agent wait any Task shows | `parent { cause: planning }`, or `blocked` / `held` once the root records it | the root's own retry, release or the Agent's resume |
+| The lead is removed or replaced while its planner runs | the old planning run is cancelled (`role_reassigned`); the removed lead's later calls lose authority | `parent { cause: planning }` until planning ends | removal takes the no-lead advance to `in_progress`; replacement starts the new lead once in the same planning state |
+| The planner fails, is stopped, or its Agent is paused | `planning`, with the retry deadline, the failure, the hold or the Agent wait any Task shows | `parent { cause: planning }`, or `blocked` / `held` once the root records it | failed planners use the same Execution retry budget as coders; a paused Agent holds the retry until resume; exhausted retries require the owner's Retry; a manual stop requires Release |
 | The planning gate requires a person's approval and the root has a lead | `planning`, `human_decision { boundary: plan_review }` after the planner succeeded | `parent { cause: planning }` | Approve (or Send back) on the root |
 | The same gate, no lead | never stops there: the walk passes the gate under the system actor | run | — |
 
@@ -7460,13 +7494,17 @@ the terminal CAS for embedded owner-lease expiry or a reached hard deadline.
 A separate semantic-progress scan emits warnings without terminalizing a live
 owner. Hard deadlines are recovered distinctly from ordinary owner-lease expiry.
 
-Startup enqueues a Task recovery command only when that Task has a running
-execution to recover. An unchanged restart with no interrupted execution adds
-no recovery steps or Task scheduler dirty generations.
-
-Startup crash recovery marks every interrupted implementation execution whose
-terminal CAS it wins with `resume_policy = auto`, regardless of its active
-workflow state or whether the attempt has a reusable runtime session. It leaves
+Startup crash recovery starts from the running executions (one query, then
+one read per Task that has one; `recovery::tasks_with_running_executions`),
+so its cost follows the number of interrupted runs, not the number of Tasks,
+and a start with nothing to recover writes nothing. It covers every
+non-terminal state of the Task's effective workflow, including the planning
+gate, review gates and the inherited `lead_check` gate (which need not be in
+the Project workflow). An Agent heartbeat timeout is narrower: it stops the
+runs of that Agent's Tasks in implementation states only. Startup recovery marks every
+interrupted execution whose terminal CAS it wins with `resume_policy = auto`,
+regardless of its workflow state or whether the attempt has a reusable runtime
+session. It leaves
 the Task in its current state without a manual `recovery_required` annotation so
 the normal dispatcher can resume or freshly re-execute it. Heartbeat/owner-timeout
 recovery remains a live failure decision and may publish the manual recovery

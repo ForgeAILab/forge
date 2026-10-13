@@ -319,6 +319,26 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     .await?;
     // Open Tasks with nothing stored to clear are reconsidered too: the
     // Project fact they were held on changed without touching their rows.
+    // A resumed Project: the pause records of its Tasks state nothing any
+    // more (the condition reader ignores them once `paused_at` is null), so
+    // remove them and restate those conditions in this commit. No Task shows
+    // `project_paused` after the resume commits, and the stored condition
+    // never disagrees with the Project row. The scheduler's pass over the
+    // Tasks marked below then gives each its real next step or park.
+    let resumed: Vec<String> = sqlx::query_scalar(
+        "SELECT s.task_id FROM task_schedule_park s JOIN task t ON t.id=s.task_id JOIN project p ON p.id=t.project_id WHERE t.project_id=? AND p.paused_at IS NULL AND json_valid(s.reason_json) AND json_extract(s.reason_json,'$.reason')='ProjectPaused'",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for task_id in &resumed {
+        sqlx::query("DELETE FROM task_schedule_park WHERE task_id=?")
+            .bind(task_id)
+            .execute(&mut **transaction)
+            .await?;
+        crate::task_condition::produce(transaction, task_id, crate::ConditionChange::Legacy)
+            .await?;
+    }
     sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
         .bind(project_id)
         .execute(&mut **transaction)

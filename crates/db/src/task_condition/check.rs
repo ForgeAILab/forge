@@ -106,7 +106,10 @@ pub(super) fn without_reason(mut condition: TaskCondition) -> TaskCondition {
     condition
 }
 
-pub(super) fn overlay(mut condition: TaskCondition, wait: &CheckWait) -> TaskCondition {
+pub(super) fn overlay(condition: TaskCondition, wait: &CheckWait) -> TaskCondition {
+    // A Project pause holds future dispatch, not a check already asked for.
+    // Its scheduler park must not mask that check's current result authority.
+    let mut condition = super::readers::without_scheduler_pause(condition);
     // Nothing waits once the Task is settled, and a live execution is shown
     // as running: the witness stays on the evidence and parks again when the
     // run ends inside the same status entry.

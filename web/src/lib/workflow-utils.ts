@@ -187,6 +187,7 @@ export function getTaskWaitNotice(
       candidate.kind === 'parent' ||
       candidate.kind === 'children' ||
       candidate.kind === 'agent' ||
+      (candidate.kind === 'project_paused' && candidate.state === null) ||
       (candidate.kind === 'dependencies' && !candidate.cancelled),
   )
   if (!reason) return null
@@ -195,6 +196,20 @@ export function getTaskWaitNotice(
       title: "Waiting for the lead's plan",
       message:
         "The parent task's lead is planning. This subtask runs when the plan is done and the parent starts its subtasks.",
+    }
+  }
+  if (reason.kind === 'parent' && reason.cause === 'sequence') {
+    return {
+      title: 'Waiting for an earlier subtask',
+      message:
+        'Subtasks run in order. This subtask runs when the ones before it are done or cancelled.',
+    }
+  }
+  if (reason.kind === 'project_paused') {
+    return {
+      title: 'Project paused',
+      message:
+        'This task waits for its Project to resume. Resume the Project in its settings; nothing on the task needs repair.',
     }
   }
   if (reason.kind === 'children') {

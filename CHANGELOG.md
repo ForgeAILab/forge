@@ -8,6 +8,45 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Removing or replacing a coordination root's lead now cancels its live
+  planning execution. Removal advances through the no-lead path; replacement
+  starts the new lead once. Operations from the old execution are refused.
+- **A failed planner run is retried automatically, on every Task.** A
+  planner run that fails (any Task with a planning step, with or without a
+  lead) used to leave the Task in `planning` with no run and a clear
+  condition until the owner pressed Retry Planning. It is now retried like a
+  failed coder run: at most 3 automatic retries per Task (the Task's one
+  Execution retry budget, shared with its coder runs, 10 s / 20 s / 40 s
+  apart), then the Task is blocked on `executor_failed` with a Retry action
+  and an Attention item. After the upgrade a Task that is resting on a failed
+  planner run starts its retries by itself. A run that could not be launched
+  (setup or dispatch refusal) and a run stopped by a person are not retried,
+  as before. A usage-limit failure waits for the provider's reset time as
+  before; a retry that falls due while the Agent is paused waits for the
+  Agent and shows `agent` instead of a past-due `deferred`.
+- **A subtask waiting for an earlier sibling says so, under every parent.**
+  A subtask that has not started because an earlier subtask of the same
+  parent is not done used to read `clear` and offered a Start the server
+  refused. It now reads `parked` on `parent { cause: "sequence" }` and does
+  not offer Start. `sequence` is a new value of the open string `cause`
+  (`docs/api.md`, Task condition); the web app labels it "Waiting for an
+  earlier subtask". Which subtask runs when is unchanged.
+- **Every waiting Task of a paused Project shows `project_paused`.** While a
+  Project is paused, a non-terminal Task with no run and no reason of its own
+  (it read `clear`, `deferred`, or parked on its parent or its Agent) now
+  reads `parked` on `project_paused` with `state: null`; the web app shows
+  "Project paused". A Task whose run is live stays `running`, and a Task that
+  is held, failed, blocked, waiting for a person, for its checks or in the
+  merge queue keeps its own primary reason. Resuming the Project removes the
+  reason from every Task in the resume itself, and after the scheduler's next
+  pass every Task shows what it showed before. The reason is never shown for a
+  Project that is not paused. Existing
+  databases are refreshed once in the background after the upgrade (condition
+  mapping revision 7), in slices, without blocking startup.
+- Hold and Cancel are offered while a root waits for the owner's answer to
+  its lead's question, including after the asking execution has ended.
+  Release preserves the pending question and waits for the answer.
+
 - **A root's lead can change the breakdown, recover a parked subtask, leave
   hand-off notes and ask the owner a question.** The lead's planning run on
   the root (not its step check on a subtask, which returns a verdict and
@@ -3246,6 +3285,24 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Interrupted review-refresh recovery now uses one entry-keyed durable cascade and honors existing failure parks. An unrecoverable `merge_failed` Task raises Attention with Restart/Cancel instead of appending two failed recovery commands on every dispatcher pass; transient recovery uses the Task-step worker's bounded retries. A Task whose machine is away waits for the machine instead; if the park is lifted while the Task stays in `merge_failed`, one new recovery attempt runs (it used to be swallowed by the ended one, leaving the Task with no step and no park).
 - Paused-integration resume, unchanged merge-admission refusals, and accepted role retries waiting for machine capacity no longer append recovery/admission commands on every dispatcher pass. Accepted retries keep their intent and proceed when capacity is released.
+- A planner failure while its Agent is paused no longer leaves the Task clear
+  without a run after resume; it retries within the Execution budget.
+- A queued lead recovery opens a fresh step-check budget window before
+  validation; a rejected recovered check stays within the two-return limit.
+  The root's two recoveries per subtask remain charged and bounded.
+
+- Startup recovery reclaims orphaned executions in planning, review and
+  inherited step-check gates as well as implementation states. It reads the
+  running executions instead of every open Task, so a start with nothing to
+  recover costs one query and writes nothing. An Agent heartbeat timeout
+  still stops the runs of Tasks in implementation states only.
+- A Task whose run is live no longer loses its `running` condition when its
+  Project is paused.
+- Project pause keeps a visible typed park on children waiting for a held
+  planning root; resume restores the parent wait when it still applies.
+  Owned check and integration results retain their authority under that
+  pause. Mapping revision 7 refreshes existing condition projections on upgrade.
+
 - Legacy merge imports missing their execution or pinned workspace now park their Tasks as `deferred/owner_required`, with the retained cause, Attention, an integration summary, Retry and Cancel. This also repairs quarantines from an earlier start. Retry admits the Task's present branch through normal admission and performs a full head check; it never merges the import's old candidate blindly.
 - After the owner's Retry of a quarantined import, a later admission of the same merge entry (its placement was verified again) no longer blocks the Task with `integration_admission_failed` for the execution it never had, and the attempt that replaces the retried one still runs the head check.
 - A Task parked for a quarantined import adds no Task-step row and no scheduler generation on later dispatcher passes or starts (the sweep used to ask for its admission at every pass).

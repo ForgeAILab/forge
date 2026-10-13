@@ -551,6 +551,17 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     if !held
         && !running_live
         && (queued
+            || (condition_read.explicit_human_wait
+                && !snapshot.entry_hooks_running
+                && task.condition.reasons().any(|reason| {
+                    matches!(
+                        reason,
+                        db::ParkReason::HumanDecision {
+                            boundary: db::HumanBoundary::LeadInput,
+                            ..
+                        }
+                    )
+                }))
             || (snapshot.wait_cause.is_some()
                 && condition.is_none()
                 && !condition_read.hard_failure

@@ -531,6 +531,15 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
             park_diagnostic("workflow_invalid", &message),
         ));
     }
+    if r.as_str() == Some("ProjectPaused") {
+        return Some((
+            ParkReason::ProjectPaused { state: None },
+            park_diagnostic(
+                "project_paused",
+                "This Task waits for its Project to resume.",
+            ),
+        ));
+    }
     if let Some(v) = r.get("ParentWait") {
         let parent_id = v["parent_id"].as_str()?.to_owned();
         let cause = v["cause"].as_str()?.to_owned();
@@ -575,7 +584,49 @@ pub(crate) fn owner_park(raw: &Value) -> Option<(ParkReason, TaskBlockingAnnotat
     ))
 }
 
-pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>) -> TaskCondition {
+/// Whether a schedule park record is the Project pause.
+pub(super) fn is_scheduler_pause(raw: &Value) -> bool {
+    matches!(
+        owner_park(raw),
+        Some((ParkReason::ProjectPaused { state: None }, _))
+    )
+}
+
+/// Scheduler pause is an observer, restated from its record on every write.
+/// Never let an owned check statement retain it after that record is cleared.
+pub(super) fn without_scheduler_pause(mut condition: TaskCondition) -> TaskCondition {
+    if let TaskCondition::Parked {
+        primary,
+        additional,
+        ..
+    } = &mut condition
+    {
+        additional.retain(|reason| !matches!(reason, ParkReason::ProjectPaused { state: None }));
+        if matches!(primary, ParkReason::ProjectPaused { state: None }) {
+            if let Some(read) = &mut condition.evidence_mut().presentation {
+                read.owner = None;
+                read.recovery = None;
+            }
+            if let TaskCondition::Parked {
+                primary,
+                additional,
+                ..
+            } = &mut condition
+            {
+                if additional.is_empty() {
+                    return TaskCondition::Clear {
+                        evidence: std::mem::take(condition.evidence_mut()),
+                    };
+                }
+                *primary = additional.remove(0);
+            }
+        }
+    }
+    condition
+}
+
+pub(super) fn apply_owner_park(condition: TaskCondition, raw: Option<&Value>) -> TaskCondition {
+    let mut condition = without_scheduler_pause(condition);
     let Some((reason, mut diagnostic)) = raw.and_then(owner_park) else {
         return condition;
     };
@@ -596,7 +647,8 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
     }
     if matches!(
         reason,
-        ParkReason::Parent { .. }
+        ParkReason::ProjectPaused { .. }
+            | ParkReason::Parent { .. }
             | ParkReason::Agent { .. }
             | ParkReason::Capacity {
                 scope: ConditionCapacityScope::Agent
@@ -617,12 +669,18 @@ pub(super) fn apply_owner_park(mut condition: TaskCondition, raw: Option<&Value>
                 resume,
                 mut evidence,
                 ..
-            } if matches!(&reason, ParkReason::Parent { .. })
-                && matches!(&resume, ConditionContinuation::ResumeQueuedCommand { .. }) =>
+            } if matches!(
+                &reason,
+                ParkReason::ProjectPaused { .. } | ParkReason::Agent { .. }
+            ) || (matches!(&reason, ParkReason::Parent { .. })
+                && matches!(&resume, ConditionContinuation::ResumeQueuedCommand { .. })) =>
             {
                 // An accepted role action remains queued while the root
-                // plans or an earlier sibling runs. State that hierarchy
-                // wait without losing the accepted command's continuation.
+                // plans or an earlier sibling runs, and a retry (queued or
+                // by deadline) is held while the Project is paused or the
+                // Agent cannot take work. State that typed wait without
+                // losing the continuation. A retry deadline under a parent
+                // or capacity wait stays the Task's own timer.
                 evidence
                     .presentation
                     .get_or_insert_with(Default::default)

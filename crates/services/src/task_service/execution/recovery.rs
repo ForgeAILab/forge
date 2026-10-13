@@ -1019,6 +1019,54 @@ impl TaskService {
                     Ok(claimed.task)
                 }
                 "manually_held" | "role_retry" | "merge_fix_retry" => {
+                    // An accepted lead recovery is a new subtask window, even
+                    // when admission queued it as a role retry. Never validate
+                    // under the gate's spent window. The queue ID fences the
+                    // reset receipt; redelivery before admission sees zero
+                    // spending and cannot open another window.
+                    // The offer names the lead for every caller, so its
+                    // authority list does not say who accepted it: only the
+                    // root's lead itself opens the window. The owner's or the
+                    // Project Agent's ordinary Retry keeps the spent window.
+                    let accepted_by_lead = match &request.actor {
+                        api_types::Actor::Agent { agent_id, .. }
+                            if task.parent_task_id.is_some()
+                                && task.status == crate::workflow::default_states::LEAD_CHECK =>
+                        {
+                            crate::task_hierarchy::lead_verbs(&self.db, &task)
+                                .await?
+                                .is_some_and(|(lead, _)| lead == *agent_id)
+                        }
+                        _ => false,
+                    };
+                    let task = if accepted_by_lead
+                        && matches!(&request.action, api_types::TaskAction::Retry { .. })
+                        && request
+                            .offer
+                            .authority
+                            .contains(&api_types::ActionAuthority::Lead)
+                        && db::budget::spent(
+                            self.db.pool(),
+                            &task.id,
+                            &db::budget::gate_key(&task.status),
+                        )
+                        .await?
+                            > 0
+                    {
+                        let mut marker = recovery_marker(
+                            &task.id,
+                            &task.status,
+                            "retry",
+                            &request.actor,
+                            "lead recovery opened a fresh step-check window",
+                        );
+                        marker.id = queued.id.clone();
+                        marker.bridge = api_types::TransitionBridge::recovery("retry", true);
+                        self.clear_retry_exhausted_blocking_metadata_with_marker(&task, marker)
+                            .await?
+                    } else {
+                        task
+                    };
                     let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                         .await?
                         .ok_or_else(|| {
