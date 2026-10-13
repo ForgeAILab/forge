@@ -942,7 +942,11 @@ fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
     match name {
         "backlog" => Some(CanonicalPhase::Backlog),
         "todo" => Some(CanonicalPhase::Ready),
-        "planning" | "in_progress" => Some(CanonicalPhase::Working),
+        // `lead_check` is a state of the inherited subtask workflow only: a
+        // reader that resolves a subtask's status against the Project
+        // workflow finds no such state there and lands here. The step check
+        // is part of the work, never a review.
+        "planning" | "in_progress" | "lead_check" => Some(CanonicalPhase::Working),
         "review" | "merging" | "merge_failed" => Some(CanonicalPhase::Review),
         "done" | "cancelled" => Some(CanonicalPhase::Done),
         _ => None,
@@ -1112,6 +1116,21 @@ mod tests {
         assert_eq!(
             workflow.canonical_phase_for_state("code_review"),
             CanonicalPhase::Review
+        );
+    }
+
+    /// A subtask's `lead_check` resolved against a Project workflow (which
+    /// has no such state) is working, by name and not by the unknown-state
+    /// default.
+    #[test]
+    fn the_step_check_state_is_working_under_a_workflow_that_does_not_define_it() {
+        assert_eq!(
+            super::canonical_phase_for_legacy_state_name("lead_check"),
+            Some(CanonicalPhase::Working)
+        );
+        assert_eq!(
+            workflow(Vec::new()).canonical_phase_for_state("lead_check"),
+            CanonicalPhase::Working
         );
     }
 

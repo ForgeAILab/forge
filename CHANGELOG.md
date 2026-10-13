@@ -56,7 +56,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   root **with** a lead, the lead runs a read-only `planner` execution on each
   finished subtask (prompt `planner.step_check.v1`) and ends it with a result
   block: `pass` moves the subtask to `done`; `fail` returns it to
-  `in_progress` and resumes the same worker thread with the findings. The
+  `in_progress` and resumes the same worker thread with the findings. The check's
+  prompt carries the step's diff (the shared workspace against the end of the
+  previous step, at most 32 KiB, the cut marked). The
   next subtask starts only after the step is accepted. Returns are limited by
   the gate's `max_rejections` (2): the entry after the second return parks
   the subtask as `retry_exhausted` with an Attention item, and the owner's
@@ -65,10 +67,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   of a subtask in `todo`, `in_progress`, `lead_check`, `done` or `cancelled`
   is the root's lead and nothing else. Assigning `planner` on such a subtask
   is now refused with `422 STEP_CHECK_ROLE_HELD_BY_ROOT` (it was accepted and
-  never used); rows that already exist, including the ones Project default
-  role assignments copy onto every new Task, hold nothing as before and can
-  still be removed. Removing the root's lead stops a step check that is still
-  running and the subtask passes the gate. `retry` on a subtask parked in
+  never used); Project default role assignments no longer copy a `planner` row onto
+  a subtask; rows that already exist hold nothing as before and can still be
+  removed. Removing the root's lead, or archiving the Agent that is
+  the lead, stops a step check that is still running and the subtask passes
+  the gate at once. Pausing that Agent does not pass the step: with no check
+  running the subtask is parked on the Agent (`agent`, naming it) until the
+  Agent is resumed, and a check that already runs finishes and settles. `retry` on a subtask parked in
   `lead_check` starts the lead's check of the existing rework, not another
   rework. No migration.
 

@@ -123,6 +123,7 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         read_only_task: false,
         delivery: TaskDelivery::NativeTools,
         review_ci_steps: Vec::new(),
+        step_diff: None,
     }
 }
 

@@ -594,8 +594,20 @@ impl TaskService {
         task: &Task,
         covered_roles: HashSet<String>,
     ) -> Result<Vec<CreateTaskRoleAssignment>> {
-        self.project_default_role_assignments_for_ids(&task.id, &task.project_id, covered_roles)
-            .await
+        let mut assignments = self
+            .project_default_role_assignments_for_ids(&task.id, &task.project_id, covered_roles)
+            .await?;
+        // A role the Task's root holds for it (a subtask's step check) is
+        // never a row of the Task: no default is copied onto it.
+        assignments.retain(|assignment| {
+            db::inherited_subtask::step_check_holder(
+                task.parent_task_id.as_deref(),
+                &task.status,
+                &assignment.role_name,
+            )
+            .is_none()
+        });
+        Ok(assignments)
     }
 
     async fn project_default_role_assignments_for_ids(

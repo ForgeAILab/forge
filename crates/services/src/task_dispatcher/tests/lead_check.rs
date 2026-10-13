@@ -18,6 +18,23 @@ struct StepExecutor {
     /// A scripted reply that starts with `@hold:` is given only after this
     /// gets a permit (a step check that is still running).
     release: Arc<tokio::sync::Semaphore>,
+    /// Bytes every implementation run commits to the shared workspace, in a
+    /// file named after its Task (0: it commits nothing).
+    commit_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn git_in(worktree: &str, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.name=step", "-c", "user.email=step@example.com"])
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?} in {worktree}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[async_trait]
@@ -48,6 +65,18 @@ impl TaskExecutor for StepExecutor {
             if self.hold_coder == Some(task.title.as_str()) {
                 pending::<()>().await;
             }
+            let bytes = self.commit_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            if bytes > 0 {
+                let file = format!("{}.txt", task.title);
+                let line = format!("work of {}\n", task.title);
+                std::fs::write(
+                    Path::new(&ctx.worktree_path).join(&file),
+                    line.repeat(bytes / line.len() + 1),
+                )
+                .expect("the step writes its file");
+                git_in(&ctx.worktree_path, &["add", "-A"]);
+                git_in(&ctx.worktree_path, &["commit", "-m", &file]);
+            }
             return completed(None);
         }
         if task.parent_task_id.is_none() {
@@ -55,13 +84,32 @@ impl TaskExecutor for StepExecutor {
         }
         let reply = self.replies.lock().unwrap().pop_front();
         match reply {
-            Some(reply) => match reply.strip_prefix("@hold:") {
-                Some(held) => {
+            Some(reply) => {
+                if let Some(held) = reply.strip_prefix("@hold:") {
                     self.release.acquire().await.unwrap().forget();
-                    completed(Some(held.to_owned()))
+                    return completed(Some(held.to_owned()));
                 }
-                None => completed(Some(reply)),
-            },
+                // The run ends with a session the host can ask again.
+                if let Some(said) = reply.strip_prefix("@session:") {
+                    return Ok(ExecutionResult {
+                        status: executors::ExecutionOutcome::Completed,
+                        summary: Some(said.to_owned()),
+                        agent_session_id: Some("lead-session".to_owned()),
+                        ..Default::default()
+                    });
+                }
+                // A lead that edits the workspace although it may only read.
+                if let Some(said) = reply.strip_prefix("@write:") {
+                    std::fs::write(
+                        Path::new(&ctx.worktree_path).join("lead-was-here.txt"),
+                        "the lead wrote this\n",
+                    )
+                    .expect("the lead writes a file");
+                    git_in(&ctx.worktree_path, &["add", "-A"]);
+                    return completed(Some(said.to_owned()));
+                }
+                completed(Some(reply))
+            }
             None => {
                 pending::<()>().await;
                 unreachable!()
@@ -81,6 +129,9 @@ struct Steps {
     planner: String,
     dispatcher: TaskDispatcher,
     release: Arc<tokio::sync::Semaphore>,
+    commit_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// The scripted replies no step check has taken yet.
+    replies: Arc<std::sync::Mutex<VecDeque<String>>>,
     _dirs: (TempDir, TempDir),
 }
 
@@ -96,12 +147,18 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
     let planner = crate::test_support::seed_native_agent(&db).await;
     let event_bus = Arc::new(EventBus::new(64));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let commit_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let replies = Arc::new(std::sync::Mutex::new(
+        replies
+            .iter()
+            .map(|reply| (*reply).to_owned())
+            .collect::<VecDeque<_>>(),
+    ));
     let task_executor: Arc<dyn TaskExecutor> = Arc::new(StepExecutor {
+        commit_bytes: Arc::clone(&commit_bytes),
         release: Arc::clone(&release),
         db: Arc::clone(&db),
-        replies: Arc::new(std::sync::Mutex::new(
-            replies.iter().map(|reply| (*reply).to_owned()).collect(),
-        )),
+        replies: Arc::clone(&replies),
         hold_coder,
     });
     let task_service = Arc::new(
@@ -123,6 +180,8 @@ async fn steps(replies: &[&str], hold_coder: Option<&'static str>) -> Steps {
         planner,
         dispatcher,
         release,
+        commit_bytes,
+        replies,
         _dirs: (repo, workspace),
     }
 }
@@ -1316,4 +1375,496 @@ async fn a_lead_assigned_while_a_step_rests_in_the_gate_checks_it() {
         log(&steps.db, &child.id).await,
         vec![hop("lead_check", "done", None, false)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 follow-ups.
+// ---------------------------------------------------------------------------
+
+const HELD_PASS: &str = "@hold:Checked.\n{\"result\":\"pass\",\"reason\":\"verified\"}";
+
+/// The lead's Agent is archived while its check runs. The assignment row is
+/// cleared by the archive sweep; that is a lead change like any other: the
+/// run is stopped and the subtask passes the gate now, not when the run ends.
+#[tokio::test]
+async fn archiving_the_lead_s_agent_while_its_check_runs_stops_the_check_and_passes_the_step() {
+    let steps = steps(&[HELD_FAIL], Some("second")).await;
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await
+    })
+    .await;
+    steps
+        .dispatcher
+        .task_service
+        .on_agent_deleted(&steps.planner)
+        .await
+        .expect("the lead's Agent is swept");
+    assert!(
+        !running_check(&steps.db, &first.id).await,
+        "the archived lead's run is stopped by the sweep itself: {}",
+        dump(&steps.db).await
+    );
+    // Without the run ever answering.
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    steps.release.add_permits(8);
+    passes(&steps, 4).await;
+    let hops = log(&steps.db, &first.id).await;
+    assert_eq!(
+        hops.last(),
+        Some(&hop("lead_check", "done", Some("gate_skipped"), false)),
+        "{hops:?}"
+    );
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0);
+    until(&steps, "the next step runs", async || {
+        !executions(&steps.db, &second.id).await.is_empty()
+    })
+    .await;
+}
+
+/// The archive sweep wakes a subtask that rests in the gate with no run (here
+/// behind a Project pause): it is marked for the dispatcher at once.
+#[tokio::test]
+async fn archiving_the_lead_s_agent_wakes_a_step_that_waits_in_the_gate() {
+    let steps = steps(&[], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    ProjectRepo::set_paused_at(&*steps.db, &steps.project, Some(now_rfc3339()))
+        .await
+        .unwrap();
+    passes(&steps, 2).await;
+    assert_eq!(executions(&steps.db, &child.id).await, Vec::new());
+    sqlx::query("UPDATE task_schedule_dirty SET dirty=0 WHERE task_id=?")
+        .bind(&child.id)
+        .execute(steps.db.pool())
+        .await
+        .unwrap();
+    steps
+        .dispatcher
+        .task_service
+        .on_agent_deleted(&steps.planner)
+        .await
+        .expect("the lead's Agent is swept");
+    let dirty: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM task_schedule_dirty WHERE task_id=? AND dirty=1)",
+    )
+    .bind(&child.id)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap();
+    assert!(dirty, "the sweep marks the waiting step");
+    ProjectRepo::set_paused_at(&*steps.db, &steps.project, None)
+        .await
+        .unwrap();
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &child.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(executions(&steps.db, &child.id).await, Vec::new());
+}
+
+/// The lead's Agent is paused and no check runs: the subtask does not pass
+/// (a pause is temporary, and nobody validated the step) and does not rest
+/// silently: it is parked on that Agent by name, as a planning root is on its
+/// paused planner. Resuming the Agent starts the check.
+#[tokio::test]
+async fn a_paused_lead_agent_parks_the_step_on_that_agent_until_it_resumes() {
+    let steps = steps(&[PASS], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    db::AgentRepo::set_paused(&*steps.db, &steps.planner, true)
+        .await
+        .unwrap();
+    passes(&steps, 4).await;
+    let parked = reload(&steps.db, &child.id).await;
+    assert_eq!(parked.status, "lead_check", "{}", dump(&steps.db).await);
+    assert_eq!(executions(&steps.db, &child.id).await, Vec::new());
+    let stored = condition(&steps.db, &child.id).await;
+    let stored: serde_json::Value = serde_json::from_str(&stored).expect("a condition is stored");
+    assert_eq!(stored["kind"], "parked", "{stored}");
+    assert_eq!(stored["primary"]["kind"], "agent", "{stored}");
+    assert_eq!(
+        stored["primary"]["agent_id"],
+        steps.planner.as_str(),
+        "the park names the paused lead: {stored}"
+    );
+    assert_eq!(stored["primary"]["status"], "paused", "{stored}");
+
+    db::AgentRepo::set_paused(&*steps.db, &steps.planner, false)
+        .await
+        .unwrap();
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &child.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(
+        log(&steps.db, &child.id).await,
+        vec![hop("lead_check", "done", None, false)],
+        "the lead's own pass, not a skip"
+    );
+}
+
+/// The lead's Agent is paused while its check runs: a pause starts nothing
+/// new and stops nothing, as for every other run. The check finishes and its
+/// verdict settles the step.
+#[tokio::test]
+async fn pausing_the_lead_s_agent_lets_its_running_check_finish_and_settle() {
+    let steps = steps(&[HELD_PASS], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    // The run is past its launch: the executor holds its reply.
+    until(&steps, "the step check runs", async || {
+        running_check(&steps.db, &first.id).await && steps.replies.lock().unwrap().is_empty()
+    })
+    .await;
+    db::AgentRepo::set_paused(&*steps.db, &steps.planner, true)
+        .await
+        .unwrap();
+    passes(&steps, 3).await;
+    assert!(
+        running_check(&steps.db, &first.id).await,
+        "{}",
+        dump(&steps.db).await
+    );
+    steps.release.add_permits(1);
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    assert_eq!(
+        log(&steps.db, &first.id).await.last(),
+        Some(&hop("lead_check", "done", None, false))
+    );
+}
+
+/// Project default role assignments are given to a subtask the dispatcher
+/// releases (`Step::ApplyDefaults`). The step-check role is not among them:
+/// on a subtask it is the root's lead and nothing else, and no row is copied.
+#[tokio::test]
+async fn project_defaults_do_not_copy_the_step_check_role_onto_a_subtask() {
+    let steps = steps(&[], None).await;
+    let settings = serde_json::json!({"default_role_assignments": [
+        {"role_name": "planner", "assignee_type": "agent", "assignee_id": steps.planner},
+        {"role_name": "coder", "assignee_type": "agent", "assignee_id": steps.coder},
+    ]});
+    sqlx::query("UPDATE project SET settings=? WHERE id=?")
+        .bind(settings.to_string())
+        .bind(&steps.project)
+        .execute(steps.db.pool())
+        .await
+        .unwrap();
+    let root = seed_task(&steps.db, &steps.project, "root", "in_progress", 1).await;
+    let child = seed_subtask(&steps.db, &root, "first", "todo", 0).await;
+    steps
+        .dispatcher
+        .task_service
+        .assign_project_default_roles(&child)
+        .await
+        .expect("defaults are applied");
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role_name FROM task_role_assignment WHERE task_id=? ORDER BY role_name",
+    )
+    .bind(&child.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["coder".to_owned()]);
+    // A root still gets every default role.
+    let other = seed_task(&steps.db, &steps.project, "single", "todo", 1).await;
+    steps
+        .dispatcher
+        .task_service
+        .assign_project_default_roles(&other)
+        .await
+        .expect("defaults are applied");
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT role_name FROM task_role_assignment WHERE task_id=? ORDER BY role_name",
+    )
+    .bind(&other.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(roles, vec!["coder".to_owned(), "planner".to_owned()]);
+}
+
+async fn check_prompt(db: &db::SqliteDb, task: &str) -> String {
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT prompt FROM execution WHERE task_id=? AND role='planner' ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .bind(task)
+    .fetch_one(db.pool())
+    .await
+    .unwrap()
+    .unwrap_or_default()
+}
+
+/// The step-check prompt carries the step's own diff: the shared workspace
+/// against the end of the previous step (the root's branch point for the
+/// first step), bounded at 32 KiB with the cut marked.
+#[tokio::test]
+async fn the_step_check_prompt_carries_the_step_s_own_diff() {
+    let steps = steps(&[PASS], None).await;
+    steps
+        .commit_bytes
+        .store(64, std::sync::atomic::Ordering::SeqCst);
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the first step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    let prompt = check_prompt(&steps.db, &first.id).await;
+    assert!(
+        prompt.contains("+++ b/first.txt") && prompt.contains("+work of first"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("the root's branch point"), "{prompt}");
+    assert!(!prompt.contains("[diff truncated"), "{prompt}");
+    // The diff is per-run input, after the stable role contract.
+    let (contract, input) = prompt
+        .split_once("Execution request:")
+        .expect("the prompt has both parts");
+    assert!(!contract.contains("first.txt") && input.contains("first.txt"));
+
+    // The second step is large: its diff is cut at the bound, and it does not
+    // repeat the first step's changes.
+    steps
+        .commit_bytes
+        .store(48 * 1024, std::sync::atomic::Ordering::SeqCst);
+    until(&steps, "the second step check runs", async || {
+        running_check(&steps.db, &second.id).await
+    })
+    .await;
+    let prompt = check_prompt(&steps.db, &second.id).await;
+    assert!(prompt.contains("+++ b/second.txt"), "{prompt}");
+    assert!(
+        !prompt.contains("first.txt"),
+        "the previous step is not shown again"
+    );
+    assert!(prompt.contains("the end of the previous step"));
+    assert!(prompt.contains("[diff truncated at 32 KiB"));
+    assert!(prompt.len() < 32 * 1024 + 16 * 1024, "{}", prompt.len());
+}
+
+async fn seed_finished_check(steps: &Steps, task: &Task, reply: &str) -> String {
+    let project_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+        .bind(&steps.project)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+    let now = now_rfc3339();
+    let id = new_uuid_v4();
+    ExecutionRepo::create(
+        &*steps.db,
+        db::CreateExecution {
+            id: id.clone(),
+            task_id: task.id.clone(),
+            agent_id: Some(steps.planner.clone()),
+            role: crate::workflow::default_roles::PLANNER.to_owned(),
+            status: ExecutionStatus::Completed,
+            stop_reason: None,
+            stopped_by: Some("system:executor".to_owned()),
+            resume_policy: None,
+            stopped_at: Some(now.clone()),
+            parent_execution_id: None,
+            agent_session_id: None,
+            agent_message_id: None,
+            last_activity_at: None,
+            summary: Some(reply.to_owned()),
+            logs_path: None,
+            before_sha: None,
+            after_sha: None,
+            error: None,
+            executor_config_snapshot_json: Some(
+                serde_json::json!({
+                    "executor_type": "shell",
+                    "config": {},
+                    "project_version": project_version,
+                })
+                .to_string(),
+            ),
+            workspace_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("the finished check is stored");
+    id
+}
+
+async fn verdict_comments(db: &db::SqliteDb, task: &str) -> i64 {
+    count(
+        db,
+        "SELECT COUNT(*) FROM task_comment WHERE task_id=? AND idempotency_key LIKE 'step-check:%'",
+        task,
+    )
+    .await
+}
+
+/// A crash between a check that completed and its settlement leaves a
+/// finished planner run on a subtask that still rests in the gate. The
+/// dispatcher settles it from what is stored: the verdict is applied once and
+/// no second check is started.
+#[tokio::test]
+async fn a_check_that_finished_before_a_crash_is_settled_from_stored_state() {
+    let steps = steps(&[], None).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    seed_finished_check(&steps, &child, FAIL).await;
+    until(&steps, "the step is returned", async || {
+        reload(&steps.db, &child.id).await.status != "lead_check"
+    })
+    .await;
+    passes(&steps, 3).await;
+    let hops = log(&steps.db, &child.id).await;
+    assert_eq!(
+        hops.first(),
+        Some(&hop(
+            "lead_check",
+            "in_progress",
+            Some("gate_rejected"),
+            true
+        )),
+        "{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(
+        hops.iter()
+            .filter(|hop| hop.0 == "lead_check" && hop.3)
+            .count(),
+        1,
+        "{hops:?}"
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 1);
+    assert_eq!(verdict_comments(&steps.db, &child.id).await, 1);
+}
+
+/// Settling the same finished check twice (a replayed step, two passes that
+/// race) applies its verdict once: one transition, one comment, one charge.
+#[tokio::test]
+async fn settling_a_finished_check_twice_applies_its_verdict_once() {
+    let steps = steps(&[], Some("first")).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    seed_finished_check(&steps, &child, FAIL).await;
+    let version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+        .bind(&steps.project)
+        .fetch_one(steps.db.pool())
+        .await
+        .unwrap();
+    let stale = reload(&steps.db, &child.id).await;
+    let dispatcher = &steps.dispatcher;
+    for _ in 0..2 {
+        // Both calls hold the Task as it was before the first settlement.
+        dispatcher
+            .reconcile_terminal_role_execution(
+                &stale,
+                crate::workflow::default_roles::PLANNER,
+                version,
+            )
+            .await
+            .expect("settlement does not fail");
+    }
+    passes(&steps, 2).await;
+    let hops = log(&steps.db, &child.id).await;
+    assert_eq!(
+        hops.iter().filter(|hop| hop.0 == "lead_check").count(),
+        1,
+        "{hops:?}\n{}",
+        dump(&steps.db).await
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 1);
+    assert_eq!(verdict_comments(&steps.db, &child.id).await, 1);
+}
+
+/// A check that ends without a verdict while its session is still there is
+/// asked again in that session (not a new check, not a return), and the
+/// answer settles the step.
+#[tokio::test]
+async fn a_check_without_a_verdict_is_asked_again_in_its_live_session() {
+    let steps = steps(&["@session:Looks fine to me.", PASS], Some("second")).await;
+    let (_root, first, _second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step is done", async || {
+        reload(&steps.db, &first.id).await.status == "done"
+    })
+    .await;
+    let runs: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, parent_execution_id, prompt FROM execution
+         WHERE task_id=? AND role='planner' ORDER BY created_at, id",
+    )
+    .bind(&first.id)
+    .fetch_all(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(runs.len(), 2, "{}", dump(&steps.db).await);
+    assert!(
+        runs[1].1.is_some(),
+        "the second run continues the first: {runs:?}"
+    );
+    assert!(
+        runs[1]
+            .2
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no usable result block"),
+        "{:?}",
+        runs[1].2
+    );
+    assert_eq!(gate_spent(&steps.db, &first.id).await, 0, "not a return");
+    assert_eq!(
+        log(&steps.db, &first.id).await.last(),
+        Some(&hop("lead_check", "done", None, false))
+    );
+    assert!(
+        !reload(&steps.db, &first.id)
+            .await
+            .condition
+            .read()
+            .interruption_present
+    );
+}
+
+/// The step check is a read-only run, enforced by the host and not by the
+/// prompt: what a lead writes to the shared workspace is discarded, the run
+/// fails loudly, and its verdict passes nothing.
+#[tokio::test]
+async fn a_step_check_that_writes_the_workspace_is_discarded_and_fails() {
+    let steps = steps(&[&format!("@write:{PASS}")], Some("second")).await;
+    steps
+        .commit_bytes
+        .store(64, std::sync::atomic::Ordering::SeqCst);
+    let (_root, first, second) = root_with_two_steps(&steps, true).await;
+    until(&steps, "the step check ended", async || {
+        executions(&steps.db, &first.id)
+            .await
+            .iter()
+            .any(|run| run.0 == "planner" && run.1 != "running")
+    })
+    .await;
+    let (status, error, worktree): (String, Option<String>, String) = sqlx::query_as(
+        "SELECT e.status, e.error, w.worktree_path FROM execution e
+         JOIN workspace w ON w.id = e.workspace_id
+         WHERE e.task_id=? AND e.role='planner' ORDER BY e.created_at, e.id LIMIT 1",
+    )
+    .bind(&first.id)
+    .fetch_one(steps.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "failed", "{}", dump(&steps.db).await);
+    assert!(
+        error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("read-only execution produced worktree changes"),
+        "{error:?}"
+    );
+    assert!(
+        !Path::new(&worktree).join("lead-was-here.txt").exists(),
+        "the lead's write is discarded"
+    );
+    assert!(
+        Path::new(&worktree).join("first.txt").exists(),
+        "the step's own work stays"
+    );
+    let moved = reload(&steps.db, &first.id).await;
+    assert_ne!(moved.status, "done", "a failed check passes nothing");
+    assert_eq!(executions(&steps.db, &second.id).await, Vec::new());
 }

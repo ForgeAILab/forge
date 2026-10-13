@@ -166,7 +166,7 @@ impl TaskService {
                         &facts,
                     )
                     .await?;
-                    TaskService::publish_role_sweep_events(&self.event_bus, settlement.role_events);
+                    self.settle_role_sweep(settlement.role_events).await?;
                     let mut task = self.command_task(&task_id).await?;
                     if before.version != task.version {
                         self.publish(events::ForgeEvent {

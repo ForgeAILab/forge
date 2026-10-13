@@ -128,6 +128,8 @@ enum Action {
     ResumeProject,
     /// Save the Project unchanged: any edit moves its version.
     EditProject,
+    /// Make the scripted lead the planner of the Task (a coordination root).
+    AssignLead(usize),
     /// Pause and resume the coder Agent.
     PauseAgent,
     ResumeAgent,
@@ -329,6 +331,304 @@ impl ScriptedAdapter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Scripted lead (plan 3.10): `Action::AssignLead` and the planner runs of a
+// root's lead. The lead must be an Agent with a native profile; the model's
+// one is native by `backend_kind` and runs through the scripted adapter (its
+// profile names the adapter's executor type), so no provider is needed.
+// ---------------------------------------------------------------------------
+
+/// System text of the step-check prompt (`planner.step_check.v1`).
+const STEP_CHECK_PROMPT_MARK: &str = "Step-check doctrine:";
+/// System text of the lead's prompt on its root (`planner.coordination.v1`).
+const LEAD_PROMPT_MARK: &str = "You are the lead of this Forge coordination root";
+const LEAD_AGENT_ID: &str = "model-lead";
+
+impl ScriptedAdapter {
+    /// The lead's step check of a subtask: a result block with the verdict
+    /// the model scripted for that subtask (`Action::Verdict`; pass when
+    /// nothing is scripted).
+    async fn step_check(&self, ctx: &ExecutionContext) -> Result<(), ExecutorError> {
+        let pass = self
+            .0
+            .shared
+            .verdicts
+            .lock()
+            .unwrap()
+            .get(&ctx.task_id)
+            .copied()
+            .unwrap_or(true);
+        let text = if pass {
+            "The step leaves its deliverable.\n{\"result\":\"pass\",\"reason\":\"the model scripted a pass\"}"
+        } else {
+            "The step is not accepted.\n{\"result\":\"fail\",\"reason\":\"the model scripted a return\"}"
+        };
+        if let Some(parent) = Path::new(&ctx.logs_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        LogWriter::new(&ctx.logs_path, ctx.execution_id.clone(), 1024 * 1024)
+            .write(LogKind::Assistant, LogStream::Main, json!({ "text": text }))
+            .await?;
+        Ok(())
+    }
+}
+
+impl World {
+    /// The scripted lead, created on first use.
+    async fn lead_agent(&self) -> Result<String, String> {
+        let db = &*self.live().state.db;
+        let err = |error: db::DbError| error.to_string();
+        if db::AgentRepo::get_by_id(db, LEAD_AGENT_ID)
+            .await
+            .map_err(err)?
+            .is_some()
+        {
+            return Ok(LEAD_AGENT_ID.to_owned());
+        }
+        let daemon_id: Option<String> = sqlx::query_scalar(
+            "SELECT p.daemon_id FROM agent_profile p JOIN agent_identity i ON i.selected_profile_id = p.id WHERE i.id = ?",
+        )
+        .bind(&self.coder_id)
+        .fetch_one(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let now = db::now_rfc3339();
+        let agent = db::AgentRepo::create_identity_with_profile(
+            db,
+            db::CreateAgentIdentity {
+                id: LEAD_AGENT_ID.to_owned(),
+                name: "model-lead".to_owned(),
+                description: None,
+                max_concurrent_tasks: 2,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: Some(now.clone()),
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                account_permission_ceiling: "{}".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            db::CreateAgentProfile {
+                id: db::new_uuid_v4(),
+                identity_id: LEAD_AGENT_ID.to_owned(),
+                backend_kind: "native".to_owned(),
+                executor_type: "codex".to_owned(),
+                provider: None,
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".to_owned(),
+                tool_policy_json: "{}".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .map_err(err)?;
+        db::AgentConnectionHealthRepo::upsert_connection_health(
+            db,
+            db::UpsertAgentConnectionHealth {
+                profile_id: agent.profile_id.clone(),
+                status: "healthy".to_owned(),
+                capability_status_json: "{}".to_owned(),
+                checked_at: Some(now.clone()),
+                error_code: None,
+                updated_at: now,
+            },
+        )
+        .await
+        .map_err(err)?;
+        Ok(LEAD_AGENT_ID.to_owned())
+    }
+
+    /// `Action::AssignLead`: the lead becomes the planner of the Task. A
+    /// refusal (the Task is a subtask, or cannot have a lead) is an answer.
+    async fn assign_lead(&mut self, index: usize) -> Result<String, String> {
+        let lead = self.lead_agent().await?;
+        let (status, body) = self
+            .request(
+                Method::PUT,
+                &format!("/api/v1/tasks/{}/roles/planner", self.tasks[index]),
+                Some(json!({ "assignee_type": "agent", "assignee_id": lead })),
+            )
+            .await?;
+        Ok(if status.is_success() {
+            "lead assigned".to_owned()
+        } else {
+            format!("refused {status} {}", body["code"])
+        })
+    }
+
+    /// One model step outside `run`: the action, then every invariant of a
+    /// committed and of a quiescent state.
+    async fn lead_step(&mut self, action: Action) -> Result<String, String> {
+        let applied = self.apply(&action).await?;
+        self.check_committed().await?;
+        self.quiesce().await?;
+        let state = self.check_quiescent().await?;
+        self.trace.push(format!("{action:?} -> {applied}: {state}"));
+        Ok(applied)
+    }
+
+    async fn lead_count(&self, sql: &str) -> Result<i64, String> {
+        sqlx::query_scalar(sql)
+            .fetch_one(&self.live().pool)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// A coordination root with a lead, end to end on the real stack: the lead
+/// plans (the root rests in `planning` with its run live, its subtasks parked
+/// on it), then checks every finished step; one step is returned once and
+/// then accepted. Every invariant runs after every action, so (i), (j) of
+/// stage 1 and (m), (n) of stage 3 are checked on states that have a lead, a
+/// planning root, running step checks and a charged `gate:lead_check`.
+async fn root_with_a_lead() -> Result<(), String> {
+    let mut world = World::new().await;
+    world.create(None).await?;
+    for _ in 0..2 {
+        let child = world.create(Some(0)).await?;
+        if child.starts_with("refused") {
+            return Err(format!("the subtask was {child}"));
+        }
+    }
+    let assigned = world.lead_step(Action::AssignLead(0)).await?;
+    if assigned != "lead assigned" {
+        return Err(format!("the lead was {assigned}"));
+    }
+    // The lead plans: its run is live on the root, nothing else runs.
+    let root = world.task(0).await?;
+    let planning = root["status"] == "planning";
+    if planning {
+        if !world.waiting(0) {
+            return Err(format!(
+                "the root plans and its lead does not run: {}",
+                root["condition"]
+            ));
+        }
+        let parked = world
+            .lead_count(
+                "SELECT COUNT(*) FROM task c WHERE c.parent_task_id IS NOT NULL
+                   AND json_extract(c.condition_json, '$.primary.kind') = 'parent'
+                   AND json_extract(c.condition_json, '$.primary.cause') = 'planning'",
+            )
+            .await?;
+        if parked != 2 {
+            return Err(format!(
+                "(j) {parked} of 2 subtasks are parked on the planning root"
+            ));
+        }
+        world.lead_step(Action::Finish(0, Outcome::Success)).await?;
+    }
+    // The first step is returned once, then accepted.
+    world.lead_step(Action::Verdict(1, false)).await?;
+    if !world.waiting(1) {
+        return Err(format!(
+            "the first subtask does not run: {:#?}",
+            world.trace
+        ));
+    }
+    world.lead_step(Action::Finish(1, Outcome::Success)).await?;
+    // The step rests in the gate with the lead's check live: (m), (h).
+    if world.task(1).await?["status"] != "lead_check" || !world.waiting(1) {
+        return Err(format!(
+            "(m) the finished step is not in the gate with its check running: {}; trace {:#?}",
+            world.task(1).await?,
+            world.trace
+        ));
+    }
+    let live = world
+        .lead_count(
+            "SELECT COUNT(*) FROM execution e JOIN task c ON c.id = e.task_id
+             WHERE c.status = 'lead_check' AND e.role = 'planner' AND e.status = 'running'
+               AND e.agent_id = 'model-lead'",
+        )
+        .await?;
+    if live != 1 {
+        return Err(format!(
+            "(m) {live} step checks run under the lead, 1 expected"
+        ));
+    }
+    world.lead_step(Action::Finish(1, Outcome::Success)).await?;
+    let returned = world
+        .lead_count(
+            "SELECT COALESCE(MAX(spent), 0) FROM task_budget WHERE kind = 'gate:lead_check'",
+        )
+        .await?;
+    if returned != 1 || world.task(1).await?["status"] != "in_progress" {
+        return Err(format!(
+            "(n) the lead's `fail` did not return the step once: spent {returned}, task {}; trace {:#?}",
+            world.task(1).await?,
+            world.trace
+        ));
+    }
+    world.lead_step(Action::Verdict(1, true)).await?;
+    world.lead_step(Action::Finish(1, Outcome::Success)).await?;
+    world.lead_step(Action::Finish(1, Outcome::Success)).await?;
+    if world.task(1).await?["status"] != "done" {
+        return Err(format!(
+            "the lead's `pass` did not finish the step: {}; trace {:#?}",
+            world.task(1).await?,
+            world.trace
+        ));
+    }
+    // The second step and the root's review and merge: every waiting run
+    // (the worker, the lead's check) is finished by the settlement drive.
+    world.drive_to_settlement().await?;
+    for index in 0..world.tasks.len() {
+        let task = world.task(index).await?;
+        if task["status"] != "done" {
+            return Err(format!(
+                "task {index} ended {}: {}; trace {:#?}",
+                task["status"], task["condition"], world.trace
+            ));
+        }
+    }
+    let checks = world
+        .lead_count(
+            "SELECT COUNT(*) FROM execution e JOIN task c ON c.id = e.task_id
+             WHERE c.parent_task_id IS NOT NULL AND e.role = 'planner' AND e.status = 'completed'",
+        )
+        .await?;
+    if checks != 3 {
+        return Err(format!(
+            "(m) 3 step checks were expected (fail, pass, pass), {checks} ran"
+        ));
+    }
+    let skipped = world
+        .lead_count("SELECT COUNT(*) FROM transition_log WHERE from_state = 'lead_check' AND bridge_kind = 'gate_skipped'")
+        .await?;
+    if skipped != 0 {
+        return Err(format!(
+            "{skipped} step(s) passed the gate unchecked under a lead"
+        ));
+    }
+    if !planning {
+        return Err(format!(
+            "(i), (j) the root never rested in planning under its lead; trace {:#?}",
+            world.trace
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_root_with_a_lead_plans_and_has_every_step_checked() {
+    log_to_stderr();
+    if let Err(error) = root_with_a_lead().await {
+        panic!("{error}");
+    }
+}
+
 fn result(status: ExecutionOutcome, error: Option<&str>) -> ExecutionResult {
     ExecutionResult {
         status,
@@ -368,6 +668,10 @@ impl CodingExecutorAdapter for ScriptedAdapter {
             self.review(&ctx).await?;
             return Ok(result(ExecutionOutcome::Completed, None));
         }
+        // A run of the scripted lead waits for a model action like any other
+        // run, so the model sees the states in which it is live.
+        let step_check = ctx.description.contains(STEP_CHECK_PROMPT_MARK);
+        let lead_run = step_check || ctx.description.contains(LEAD_PROMPT_MARK);
         let (gate, opened) = tokio::sync::oneshot::channel();
         self.0
             .waiting
@@ -389,6 +693,14 @@ impl CodingExecutorAdapter for ScriptedAdapter {
                 retry_after: Some(Duration::from_millis(1)),
                 usage_reports: Vec::new(),
             }),
+            // The lead's runs are read-only: on its root it reports, on a
+            // subtask it ends with the scripted verdict; it writes nothing.
+            Ok(_) if lead_run => {
+                if step_check {
+                    self.step_check(&ctx).await?;
+                }
+                Ok(result(ExecutionOutcome::Completed, None))
+            }
             Ok(outcome) => {
                 self.commit(&ctx, outcome)?;
                 Ok(result(ExecutionOutcome::Completed, None))
@@ -1402,6 +1714,10 @@ impl World {
                 self.agent_paused = pause;
                 Ok(verb.to_owned())
             }
+            Action::AssignLead(task) => match pick(*task) {
+                Some(task) => self.assign_lead(task).await,
+                None => Ok("skipped".to_owned()),
+            },
             Action::AdvanceClock => Ok(format!(
                 "{} deadline(s) passed",
                 self.move_deadlines(true).await?
@@ -1634,12 +1950,12 @@ impl World {
     /// mutated back to "the first implementation state" this fails on the
     /// first finished subtask.
     ///
-    /// VACUOUS here: (m) and (n). The model still has no native-runtime stub
-    /// (`Action::AssignLead` and a scripted native planner were not built in
-    /// stage 3), so no root has a lead, no step check ever runs and
-    /// `gate:lead_check` is never charged. Both are stated so that they bind
-    /// the day a lead exists in the model; until then the lead cases are
-    /// proven at the dispatcher level, in
+    /// (m) and (n) bind where a root has a lead: `Action::AssignLead` and
+    /// the scripted lead exist, and `a_root_with_a_lead_plans_and_has_every_
+    /// step_checked` runs every invariant on states with a live step check, a
+    /// returned step and a charged `gate:lead_check`. No random sequence
+    /// assigns a lead yet (as none creates a subtask), so in those they stay
+    /// vacuous; the lead cases are also proven at the dispatcher level, in
     /// `services::task_dispatcher::tests::lead_check`.
     async fn check_step_checks(&self, quiescent: bool) -> Result<(), String> {
         let pool = &self.live().pool;
@@ -1821,11 +2137,12 @@ impl World {
     /// mutated back to the old rule (a subtask of a `todo` root dispatches
     /// and the root is not kicked off) `a_coordination_root_merges_through_
     /// the_queue` fails on it. The no-lead halves of (h) and (k) are real for
-    /// the same roots. (i), (j) and the lead halves of (h) and (k) are
-    /// VACUOUS: the model has no native-runtime stub, so no root in it ever
-    /// has a lead or a planner execution. They need `Action::AssignLead` and
-    /// a scripted native planner (stage 3/4). Until then the lead cases are
-    /// proven at the dispatcher level, in
+    /// the same roots. (i), (j) and the lead halves of (h) and (k) bind where
+    /// a root has a lead: `a_root_with_a_lead_plans_and_has_every_step_
+    /// checked` (`Action::AssignLead`, the scripted lead) checks them on a
+    /// root that rests in `planning` with its lead's run live. No random
+    /// sequence assigns a lead yet, so there they stay vacuous; the lead
+    /// cases are also proven at the dispatcher level, in
     /// `services::task_dispatcher::tests::root_lead` (the upgrade matrix and
     /// the lead-removed-while-planning case, which checks (g) and (h) with a
     /// running planner).

@@ -6108,7 +6108,7 @@ role from its own rows, and no row is copied onto it.
 | Subtask state | Condition | Result | Mechanism | Budget |
 |---|---|---|---|---|
 | `in_progress` | the implementation run succeeded | `lead_check` | the state's Accept | — |
-| `lead_check` | the root has no lead | `done`, bridge `gate_skipped` | `auto_cascade_on_unassigned_role` on the entry, in the entry's own step: no execution, no person, no dispatcher decision | — |
+| `lead_check` | the root has no lead | `done`, bridge `gate_skipped`; no execution, no person, no park, no Attention item | `auto_cascade_on_unassigned_role`, an on-enter hook of the gate: the entry's hook step enqueues the skip as a `cascade` step of the same chain, so it runs as soon as the entry's hooks end and waits for no dispatcher pass and no sweep interval | — |
 | `lead_check` | the root has a lead | a `planner` execution on the subtask, under the lead's Agent, in the shared root workspace (prompt `planner.step_check.v1`) | `dispatch_role_agent` on the entry | — |
 | `lead_check` | the lead's result block says `pass` | `done` | the gate's Accept (`TaskService::settle_step_check`) | — |
 | `lead_check` | the result block says `fail` | `in_progress`, bridge `gate_rejected`, rejection; the same worker thread is resumed (`ResumeLatestTargetRoleThread`) with the lead's findings | the gate's Reject | charges `gate:lead_check` (limit: the gate's `max_rejections`, 2) |
@@ -6117,6 +6117,24 @@ role from its own rows, and no row is copied onto it.
 | `lead_check` | the run failed or timed out | the retry, deadline or failure any execution shows | execution retry | `execution` |
 | `lead_check`, nothing running | the root has no lead any more (removed after the entry; a restart between the entry and its skip) | `done`, bridge `gate_skipped` | `Step::SkipGate`, resolved from stored state by `next_step` (fact `gate_skip`); removing or changing the lead marks the subtasks that rest in the gate | — |
 | `lead_check`, nothing running | the root has a lead (a restart between the entry and the run) | the step check | `Step::Role` | — |
+| `lead_check`, a check running | the lead is removed, or the Agent that is the lead is archived | the run is stopped; then `done`, bridge `gate_skipped`, in the next dispatcher pass | `TaskService::wake_step_checks_of` (from role removal and, for an archived Agent, `TaskService::lead_removed_from` after the archive sweep), then `Step::SkipGate` | — |
+| `lead_check`, nothing running | the lead's Agent is paused (or cannot be reached) | stays; `parked` with `agent { agent_id, status }` naming the lead's Agent; the check starts when the Agent is resumed | `next_step` (`Reason::AgentWait`), as for a planning root whose planner is paused | — |
+| `lead_check`, a check running | the lead's Agent is paused | the run goes on and its verdict settles the step (a pause starts nothing and stops nothing) | — | — |
+
+"No dispatcher decision" in the no-lead row means the skip does not depend on
+one, not that the dispatcher never looks: the subtask is in `lead_check` for
+the time between two queue steps (the entry and its cascade), and a dispatcher
+pass that reads it in that window resolves the same skip from stored state
+(`Step::SkipGate`, the `gate_skip` fact, which is also the recovery when the
+process dies in that window). Both carry the Task version they read, so
+exactly one of them makes the transition (`gate_skipped`, once in the
+transition log) and the other is dropped as a version conflict; the subtask
+needs no further pass either way. What a client sees per finished subtask is
+two transitions and their events (`in_progress -> lead_check`,
+`lead_check -> done`), never a rest in `lead_check`.
+`without_a_lead_the_skip_rides_the_entry_s_own_chain` pins the hook path (the
+`cascade` step shares the chain of the entry's `hooks` step): removing the
+hook and keeping only the dispatcher's `SkipGate` fails it.
 
 The one loop this adds is `lead_check ↔ in_progress`. Its machine bound is the
 gate's `max_rejections`: two returns, then the third entry parks the subtask
@@ -6140,7 +6158,14 @@ none), so merge-queue returns of the root never spend this budget.
 
 Removing the root's lead stops a step check that is still running
 (`TaskService::wake_step_checks_of`) and the subtask passes the gate in the
-next dispatcher pass. A verdict of a run that no longer owns the role attempt
+next dispatcher pass. Archiving the Agent that is the lead is the same lead
+change: the archive sweep (`on_agent_deleted_in_tx`) clears the row as a
+queued step of the root, and after its commit every caller (the archive
+route, `TaskService::on_agent_deleted`, the removed-machine settlement) runs
+`TaskService::lead_removed_from`, which waits for that clear and then calls
+the same hook. A paused lead is not a missing lead: the step is not passed
+unchecked. With no check running the subtask is parked on the Agent by name
+until it is resumed; a check that is already running finishes and settles. A verdict of a run that no longer owns the role attempt
 (lead removed or replaced, subtask held, cancelled or moved) is dropped
 without a transition (`execution_owns_current_role_attempt`). A replaced
 lead's running check is not stopped: the subtask waits for that run to end
@@ -6151,10 +6176,35 @@ the one Project slot it held during implementation (the check is that Task's
 run); a parked one holds none. The lead's Agent is admitted by the same Agent
 and machine limits as any run.
 
+The step-check prompt carries the step's diff as per-run input (the user
+part of `planner.step_check.v1`; the system part stays the stable doctrine and
+result contract). `workflow::dispatch::loader::load_step_diff` reads it where
+`AgentDispatchContext` is built, through the workspace backend's `diff`
+(embedded and daemon-owned workspaces alike; no protocol change): the shared
+root workspace, uncommitted leftovers included, against the commit the step
+started from. That commit is the head recorded when the last run of an
+earlier sibling ended (every step check records it, because the host runs it
+read-only; a native worker records it too) and the root workspace's branch
+point when none is recorded (the first step; or earlier steps run by a CLI
+worker under a root that had no lead then: the prompt says that changes of
+earlier steps are included). The diff is cut at 32 KiB (`STEP_DIFF_LIMIT`)
+with the cut marked; a diff that cannot be read is reported in the prompt in
+one line and never fails the dispatch.
+
+The step check is read-only by the host, not by its prompt: the runner marks
+every `planner` run read-only (`read_only_execution_role`), a native run gets
+the `TaskRead` scope (no write and no command tools), and for any executor the
+runner restores the worktree to the head it started from and fails the run
+(`read-only execution produced worktree changes`) when it wrote.
+
 The step-check role cannot be assigned on a subtask
-(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`); rows that predate the rule (for example
-from Project default role assignments, which still copy every default role
-onto new Tasks) hold nothing and are left out of the action snapshot.
+(`422 STEP_CHECK_ROLE_HELD_BY_ROOT`), and Project default role assignments
+do not copy it onto one (`TaskService::project_default_role_assignments`
+leaves out every role `db::inherited_subtask::step_check_holder` gives to the
+root; the only path that gives a subtask default roles is the dispatcher's
+`Step::ApplyDefaults`). Rows that predate the rule hold nothing and are left
+out of the action snapshot; they are not migrated away (they can be removed
+by hand, and nothing reads them).
 
 The names the database needs of this workflow (its states, the step-check
 state and role) live in `db::inherited_subtask`; the services read them from
