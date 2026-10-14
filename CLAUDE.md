@@ -110,7 +110,8 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 The full version lives in [docs/architecture.md](docs/architecture.md). Quick orientation:
 
 ```
-forge-cli → api / mcp-server / services-agents / services
+forge-cli → api / services-agents / services
+api → mcp-server
 api / mcp-server / forge-solo → services-agents → services → db
 api / mcp-server / forge-solo → services
 services-agents / services → events / agent-host / executors / workspace → git

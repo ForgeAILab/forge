@@ -41,7 +41,8 @@ crates/
 ### Dependency flow
 
 ```
-forge-cli → api / mcp-server / services-agents / services
+forge-cli → api / services-agents / services
+api → mcp-server
 api / mcp-server / forge-solo → services-agents → services → db
 api / mcp-server / forge-solo → services
 services-agents / services → events / agent-host / executors / workspace → git
@@ -7950,7 +7951,9 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   `ForgeRuntimeBuilder` composition graph and `RuntimeSupervisor`; inquiry and
   Main Chat topic services, prompt previews, provider authorization, and the
   embedded Task executor. Depends on `services`; the core does not depend back.
-  Cross-service acceptance suites and runtime lifetime coverage live here.
+  The Agent Chat turn-worker and Main Chat topic acceptance suites and the
+  runtime-lifetime recovery test live here; the other acceptance suites stay in
+  `services`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
   asks the durable check runner for the configured checks before ordinary
   reviewer dispatch; its hooks step waits `suspended` for the result. An
