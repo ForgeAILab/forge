@@ -788,7 +788,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         }),
         typed::<AddTaskDependencyParams>(
             "forge_add_task_dependency",
-            "Add a prerequisite gate without sharing a workspace.",
+            "Add a prerequisite gate without sharing a workspace. Refused with cycle_detected when the Tasks would wait on each other, counting sibling order and parentage.",
             RequiredRole::Project,
             ResourceRule::DependencyMutation,
             McpInput::AddTaskDependency,
@@ -835,7 +835,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         ),
         typed::<ReorderSubTasksParams>(
             "forge_reorder_sub_tasks",
-            "Reorder direct children; preserve the terminal prefix and active child.",
+            "Reorder direct children; preserve the terminal prefix and active child. Refused with cycle_detected when the order reverses a prerequisite.",
             RequiredRole::Project,
             ResourceRule::ReorderSubTasks,
             McpInput::ReorderSubTasks,

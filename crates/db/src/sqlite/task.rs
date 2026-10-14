@@ -1442,12 +1442,9 @@ impl TaskRepo for SqliteDb {
         // A new order cannot make an earlier child depend (even transitively)
         // on one that the same order requires to wait for it. Roll back the
         // whole order if the implicit waits close a prerequisite cycle.
-        for task_id in ordered_ids {
-            if super::task_dependency::dependency_cycle_in_tx(&mut transaction, task_id, None)
-                .await?
-            {
-                return Err(DbError::CycleDetected);
-            }
+        let ids: Vec<&str> = ordered_ids.iter().map(String::as_str).collect();
+        if super::task_dependency::dependency_cycle_any_in_tx(&mut transaction, &ids, None).await? {
+            return Err(DbError::CycleDetected);
         }
         // Child witnesses follow the sequence order.
         crate::task_condition::produce_children(&mut transaction, parent_task_id).await?;

@@ -8,6 +8,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Dependency links and subtask reorders that make Tasks wait on each
+  other are refused.** `POST /api/v1/tasks/{id}/dependencies` (MCP
+  `forge_add_task_dependency`, the lead's `lead.subtask create` links) and
+  `POST /api/v1/tasks/{id}/subtasks/reorder` (MCP `forge_reorder_sub_tasks`,
+  `lead.subtask reorder`) now count sibling order and parentage, not only
+  explicit links: an earlier subtask depending, directly or through another
+  Task, on a later sibling, a root depending on its own unfinished subtask,
+  and an order that moves a prerequisite after its dependent answer
+  `422 cycle_detected` (MCP `-32602`) where they were accepted before and
+  wedged both Tasks. Existing links are kept: a subtask waiting on such a
+  link shows `dependency cycle: ... cannot finish before this Task` with the
+  repair (remove the link, which wakes it, or cancel one of the Tasks)
+  instead of waiting silently.
+
 - Removing or replacing a coordination root's lead now cancels its live
   planning execution. Removal advances through the no-lead path; replacement
   starts the new lead once. Operations from the old execution are refused.
@@ -3305,10 +3319,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - A subtask that cannot leave its merge state stops automatic reconciliation
   after eight failed Task-step attempts in that entry and shows the existing
   integration-admission failure park with owner recovery actions.
-
-- Dependency admission and subtask reordering now check implicit sibling-order
-  and parent-completion waits as well as explicit prerequisites, preventing
-  an earlier subtask from waiting on a later one that cannot start.
 
 - Execution retry admission now commits its automatic resume policy with the
   durable deadline. Startup also repairs a retry committed by an older build

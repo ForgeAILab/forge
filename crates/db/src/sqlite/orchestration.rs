@@ -1662,6 +1662,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .await
             .map_err(orchestration_write_error)?;
         }
+        if !input.depends_on_task_ids.is_empty()
+            && super::task_dependency::dependency_cycle_in_tx(&mut transaction, &task.id, None)
+                .await?
+        {
+            return Err(DbError::CycleDetected);
+        }
         for assignment in &input.role_assignments {
             sqlx::query(
                 "INSERT INTO task_role_assignment

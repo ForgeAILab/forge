@@ -334,6 +334,13 @@ pub(super) async fn apply_adaptive_task_command(
                 .execute(&mut *tx)
                 .await?;
             }
+            // A new order cannot make an earlier child wait (even
+            // transitively) on one that the same order makes wait for it.
+            // This is the writer behind REST, MCP and `lead.subtask reorder`.
+            let ids: Vec<&str> = ordered_task_ids.iter().map(String::as_str).collect();
+            if super::task_dependency::dependency_cycle_any_in_tx(&mut tx, &ids, None).await? {
+                return Err(DbError::CycleDetected);
+            }
             // Child witnesses follow the sequence order.
             crate::task_condition::produce_children(&mut tx, &source.id).await?;
             // `subtask_order` is part of the Task board's sibling ordering but

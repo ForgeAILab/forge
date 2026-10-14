@@ -128,9 +128,9 @@ database for historical provenance.
 | POST   | `/api/v1/tasks/{id}/archive` | Archive task (hidden from default lists) |
 | POST   | `/api/v1/tasks/{id}/transition` | Commit the requested transition; return `{task, review, pending_steps}` before queued cascades |
 | POST   | `/api/v1/tasks/{id}/move` | Atomically move/reorder a board task with task and board concurrency checks |
-| POST   | `/api/v1/tasks/{id}/subtasks/reorder` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move |
+| POST   | `/api/v1/tasks/{id}/subtasks/reorder` | Reorder a root's direct children; the terminal/current-child prefix stays fixed and only the untouched `todo` suffix may move; `422 cycle_detected` when the order reverses a prerequisite |
 | GET    | `/api/v1/tasks/{id}/dependencies` | List prerequisite dependency edges |
-| POST   | `/api/v1/tasks/{id}/dependencies` | Add one prerequisite dependency edge |
+| POST   | `/api/v1/tasks/{id}/dependencies` | Add one prerequisite dependency edge; `422 cycle_detected` when the Tasks would wait on each other (dependencies, sibling order, parentage) |
 | DELETE | `/api/v1/tasks/{id}/dependencies/{dep_id}` | Remove one prerequisite dependency edge |
 | GET    | `/api/v1/tasks/{id}/dependents` | List Tasks that depend on this prerequisite |
 | GET    | `/api/v1/tasks/{id}/diff` | Get task workspace diff |
@@ -3138,9 +3138,17 @@ each named prerequisite reaches `done`; they do not create parent/child
 hierarchy and never imply workspace sharing. Dependency edges are same-Project
 and acyclic, including the implicit completion waits imposed by parentage and
 sibling order. An earlier subtask cannot depend, directly or through another
-Task, on a later sibling that must wait for it. Reordering is refused with the
-existing cycle error if the resulting order closes such a cycle; no links or
-partial order changes are committed. Forge rejects a child that lists its coordination parent as a
+Task, on a later sibling that must wait for it. Both refusals answer
+`422 cycle_detected` (MCP `-32602`, `data.code: "cycle_detected"`): adding
+such a link, and a reorder (REST, `forge_reorder_sub_tasks`, the lead's
+`lead.subtask reorder`, all one writer) whose order reverses a prerequisite.
+No links or partial order changes are committed. The check reads the Task's
+Project once and runs in memory. A link an older release admitted, or a cycle
+a re-opened Task closes, is not deleted: the waiting subtask's `dependencies`
+park (shown after its accepted Retry) reads `dependency cycle: <ids> cannot
+finish before this Task ...` and names the repair, removing the link with
+`DELETE /api/v1/tasks/{id}/dependencies/{dep_id}` (which wakes the Task) or
+cancelling one of the Tasks. Forge rejects a child that lists its coordination parent as a
 dependency. A dependency edge between independent roots or between siblings
 does not merge their workspaces, and changing subtask order does not rewrite
 dependency edges. Cancelling a prerequisite projects a durable blocker onto

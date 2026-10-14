@@ -1,33 +1,143 @@
 use super::*;
 
 /// Explicit prerequisites and the hierarchy's completion/order waits form
-/// one graph. The writer transaction also fences a concurrent reorder.
+/// one graph of `(Task, phase)` nodes: a Task's start waits on each
+/// prerequisite's completion; its completion waits on its own start; a child
+/// starts after its parent started; a parent completes after its children;
+/// a later sibling starts after the preceding unfinished sibling completed.
+/// Settled Tasks contribute no waits. Dependencies and parentage never cross
+/// a Project, so one indexed read loads the Task's Project and the search
+/// runs in memory, linear in that graph: a reorder checks every child
+/// against one load. The writer transaction also fences a concurrent write.
+struct WaitGraph {
+    index: std::collections::HashMap<(String, bool), usize>,
+    edges: Vec<Vec<usize>>,
+}
+
+const START: bool = false;
+const DONE: bool = true;
+
+impl WaitGraph {
+    async fn load(tx: &mut Transaction<'_, Sqlite>, project_of: &str) -> Result<Self> {
+        let rows: Vec<(String, bool, String, bool)> = sqlx::query_as(
+            "WITH live AS (
+                SELECT id,parent_task_id,subtask_order,created_at FROM task
+                WHERE project_id=(SELECT project_id FROM task WHERE id=?1)
+                  AND deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'
+             ), ordered AS (
+                SELECT *,ROW_NUMBER() OVER(PARTITION BY parent_task_id ORDER BY subtask_order,created_at,id) AS position
+                FROM live WHERE parent_task_id IS NOT NULL
+             )
+             SELECT d.task_id,0,d.depends_on_id,1 FROM task_dependency d
+               JOIN live t ON t.id=d.task_id JOIN live p ON p.id=d.depends_on_id
+             UNION ALL SELECT child.id,0,parent.id,0 FROM live parent JOIN live child ON child.parent_task_id=parent.id
+             UNION ALL SELECT parent.id,1,child.id,1 FROM live parent JOIN live child ON child.parent_task_id=parent.id
+             UNION ALL SELECT later.id,0,earlier.id,1 FROM ordered later JOIN ordered earlier
+               ON later.parent_task_id=earlier.parent_task_id AND later.position=earlier.position+1",
+        )
+        .bind(project_of)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut graph = Self {
+            index: Default::default(),
+            edges: Vec::new(),
+        };
+        for (from, from_phase, to, to_phase) in rows {
+            let from = graph.node(from, from_phase);
+            let to = graph.node(to, to_phase);
+            graph.edges[from].push(to);
+        }
+        Ok(graph)
+    }
+
+    /// A Task's completion waits on its own start: every completion node
+    /// gets that edge with its start node.
+    fn node(&mut self, id: String, phase: bool) -> usize {
+        if let Some(&node) = self.index.get(&(id.clone(), phase)) {
+            return node;
+        }
+        let node = self.edges.len();
+        self.index.insert((id.clone(), phase), node);
+        self.edges.push(Vec::new());
+        if phase == DONE {
+            let start = self.node(id, START);
+            self.edges[node].push(start);
+        }
+        node
+    }
+
+    /// Whether `task_id`'s start waits on itself, with `extra` (a candidate
+    /// prerequisite's completion) added to its start's waits.
+    fn waits_on_itself(&self, task_id: &str, extra: Option<usize>) -> bool {
+        let Some(&origin) = self.index.get(&(task_id.to_owned(), START)) else {
+            return false;
+        };
+        let mut seen = vec![false; self.edges.len()];
+        let mut stack: Vec<usize> = self.edges[origin].iter().copied().chain(extra).collect();
+        while let Some(node) = stack.pop() {
+            if node == origin {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[node], true) {
+                stack.extend(self.edges[node].iter().copied());
+            }
+        }
+        false
+    }
+}
+
+/// Whether `task_id` waits on itself, with `candidate` added as one more of
+/// its prerequisites (an admission) or as is (a reorder, or a read).
 pub(super) async fn dependency_cycle_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     task_id: &str,
     candidate: Option<&str>,
 ) -> Result<bool> {
-    Ok(sqlx::query_scalar::<_, bool>(
-        "WITH RECURSIVE live AS (
-            SELECT id,parent_task_id,subtask_order,created_at FROM task
-            WHERE deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'
-         ), ordered AS (
-            SELECT *,ROW_NUMBER() OVER(PARTITION BY parent_task_id ORDER BY subtask_order,created_at,id) AS position
-            FROM live WHERE parent_task_id IS NOT NULL
-         ), edges(from_id,from_phase,to_id,to_phase) AS (
-            SELECT d.task_id,'start',d.depends_on_id,'done' FROM task_dependency d
-            JOIN live t ON t.id=d.task_id JOIN live p ON p.id=d.depends_on_id
-            UNION SELECT id,'done',id,'start' FROM live
-            UNION SELECT child.id,'start',parent.id,'start' FROM live parent JOIN live child ON child.parent_task_id=parent.id
-            UNION SELECT parent.id,'done',child.id,'done' FROM live parent JOIN live child ON child.parent_task_id=parent.id
-            UNION SELECT later.id,'start',earlier.id,'done' FROM ordered later JOIN ordered earlier
-              ON later.parent_task_id=earlier.parent_task_id AND later.position=earlier.position+1
-         ), reachable(id,phase) AS (
-            SELECT to_id,to_phase FROM edges WHERE from_id=?1 AND from_phase='start'
-            UNION SELECT id,'done' FROM live WHERE id=?2
-            UNION SELECT e.to_id,e.to_phase FROM edges e JOIN reachable r ON e.from_id=r.id AND e.from_phase=r.phase
-         ) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?1 AND phase='start')"
-    ).bind(task_id).bind(candidate).fetch_one(&mut **tx).await?)
+    dependency_cycle_any_in_tx(tx, &[task_id], candidate).await
+}
+
+/// Whether any of `task_ids` (one Project) waits on itself; `candidate`
+/// applies to the first of them.
+pub(super) async fn dependency_cycle_any_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_ids: &[&str],
+    candidate: Option<&str>,
+) -> Result<bool> {
+    let Some(first) = task_ids.first() else {
+        return Ok(false);
+    };
+    let mut graph = WaitGraph::load(tx, first).await?;
+    let extra = match candidate {
+        Some(candidate) => {
+            let live: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND deleted_at IS NULL
+                   AND json_extract(condition_json,'$.kind') != 'settled')",
+            )
+            .bind(candidate)
+            .fetch_one(&mut **tx)
+            .await?;
+            live.then(|| graph.node(candidate.to_owned(), DONE))
+        }
+        None => None,
+    };
+    Ok(task_ids
+        .iter()
+        .enumerate()
+        .any(|(position, id)| graph.waits_on_itself(id, extra.filter(|_| position == 0))))
+}
+
+impl SqliteDb {
+    /// Whether `task_id` waits on itself through explicit dependencies,
+    /// sibling order and parentage: a wait no completion can end. Admission
+    /// refuses such a graph, but a database written before it did, or a
+    /// terminal Task that re-opened, can still hold one; the dependency
+    /// gate reads this to name the cycle instead of waiting in silence.
+    pub async fn dependency_wait_is_cycle(&self, task_id: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let cycle = dependency_cycle_in_tx(&mut tx, task_id, None).await?;
+        tx.rollback().await?;
+        Ok(cycle)
+    }
 }
 
 #[async_trait]

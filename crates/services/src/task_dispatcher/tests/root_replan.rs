@@ -742,9 +742,11 @@ async fn removing_the_lead_ends_an_in_flight_replan_and_nothing_replans_without_
         .remove_role(&root.id, PLANNER, false, false)
         .await
         .expect("the owner removes the lead of a re-planning root");
-    until(&lead, "the root leaves planning without a lead", async || {
-        reload(&lead.db, &root.id).await.status == "in_progress"
-    })
+    until(
+        &lead,
+        "the root leaves planning without a lead",
+        async || reload(&lead.db, &root.id).await.status == "in_progress",
+    )
     .await;
     passes(&lead, 4).await;
 

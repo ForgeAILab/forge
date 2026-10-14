@@ -723,7 +723,10 @@ impl From<DbError> for McpToolError {
             DbError::DependencyGate => Self::new(-32029, "dependency gate").with_data(json!({
                 "code": "setup_required"
             })),
-            DbError::CycleDetected => Self::new(-32602, "dependency cycle detected")
+            DbError::CycleDetected => Self::new(
+                -32602,
+                "dependency cycle detected: the Tasks would wait on each other through their dependencies, sibling order or parentage",
+            )
                 .with_data(json!({ "code": "cycle_detected" })),
             _ => Self::new(-32603, "internal error"),
         };
