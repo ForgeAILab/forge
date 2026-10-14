@@ -2959,6 +2959,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- **A public demo deployment and a pull-request suite check.** `deploy/demo/`
+  holds a Compose application for Dokploy and a demo image for a throwaway
+  public instance: seeded demo data, no agent daemon, no MCP endpoint, no
+  provider credentials, and a memory-backed data directory that is empty at
+  every container start. The image's entrypoint creates the administrator and
+  a test account while Forge listens on loopback only, then starts Forge on
+  the public address. The new `Demo TestSprite` workflow builds each
+  same-repository pull request to `main` or `next/v0.14` that is not a
+  draft, has Dokploy deploy that build, waits until the public URL serves it
+  and runs the TestSprite suite against it. It needs repository secrets and variables and does
+  nothing for forks. See [docs/demo-instance.md](docs/demo-instance.md).
+
 - Web support for answering root-lead questions in Mission Control, linked from Task detail, with distinct handoff/question comments, lead offer audiences, readable operation refusals, and named lead activity.
 
 - Task comments return an optional `kind` (`progress`, `decision`,
@@ -3289,6 +3301,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- **`forge --demo` starts again after the first user has registered.** The
+  first registered user takes ownership of the seeded demo daemon, and the
+  next `--demo` start then tried to register that daemon again without an
+  owner, was refused (`machine owned by another user`) and exited with
+  `demo install failed`. The demo install now keeps the owner and visibility
+  an existing demo daemon has.
 
 - Startup reconciliation retires obsolete machine/Project capacity waits when
   the assigned Agent is unavailable, including a paused Agent whose last run

@@ -30,6 +30,7 @@ forge.db*
 
 .env
 .env.*
+deploy/demo/demo.env
 *.pem
 *.key
 *.secret

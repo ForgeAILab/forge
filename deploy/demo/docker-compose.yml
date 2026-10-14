@@ -1,0 +1,74 @@
+# Public demo instance of Forge, as a Dokploy "Docker Compose" application.
+# See docs/demo-instance.md.
+#
+# This is NOT the self-host file (that is /docker-compose.yml). It runs a
+# throwaway instance: seeded demo data, no agent daemon, no MCP endpoint, no
+# provider credentials, and a data directory that is empty at every start.
+#
+# Dokploy owns the routing: attach the domain to the `forge` service, port
+# 8080, in the Domains tab. Dokploy then adds the Traefik labels and its
+# `dokploy-network` to the service by itself, so neither is declared here,
+# and no port is published on the host.
+#
+# The variables come from the Environment tab of the Dokploy application.
+
+services:
+  forge:
+    # A fixed, moving tag (…-demo:live). The pull-request check moves it to
+    # the build under test and then asks Dokploy to deploy.
+    image: ${FORGE_DEMO_IMAGE:?set FORGE_DEMO_IMAGE to the demo image, e.g. ghcr.io/<owner>/<repo>-demo:live}
+    pull_policy: always
+    # The image's entrypoint creates the two accounts while Forge listens on
+    # loopback only, and only then starts Forge on 0.0.0.0:8080.
+    environment:
+      FORGE_PUBLIC_BASE_URL: ${FORGE_PUBLIC_BASE_URL:?set FORGE_PUBLIC_BASE_URL to the public URL, e.g. https://demo.example.org}
+      DEMO_ADMIN_EMAIL: ${DEMO_ADMIN_EMAIL:?set DEMO_ADMIN_EMAIL}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:?set DEMO_ADMIN_PASSWORD}
+      DEMO_TEST_EMAIL: ${DEMO_TEST_EMAIL:?set DEMO_TEST_EMAIL}
+      DEMO_TEST_PASSWORD: ${DEMO_TEST_PASSWORD:?set DEMO_TEST_PASSWORD}
+      DEMO_ADMIN_NAME: ${DEMO_ADMIN_NAME:-Demo Admin}
+      DEMO_TEST_NAME: ${DEMO_TEST_NAME:-Demo Tester}
+      DEMO_TEST_PROJECT_ROLE: ${DEMO_TEST_PROJECT_ROLE-member}
+      DEMO_SEED_TIMEOUT_SECONDS: ${DEMO_SEED_TIMEOUT_SECONDS:-180}
+      # Empty keeps Forge's own default log filter.
+      DEMO_RUST_LOG: ${DEMO_RUST_LOG:-}
+    expose:
+      - "8080"
+    # No volume, and a read-only root filesystem: the only writable places
+    # are the memory-backed filesystems below, each with a hard size cap that
+    # counts against mem_limit (plus Docker's own 64 MB /dev/shm).
+    #   /data       database, worktrees, media, sessions. The entrypoint
+    #               empties it at every start, so every deploy, restart and
+    #               crash recovery is a new seeded instance.
+    #   /data/logs  Forge always writes a daily log file here next to stderr,
+    #               without a size limit of its own. A separate cap keeps a
+    #               full log from taking the database's space; once it is
+    #               full the file stops growing and stderr carries on.
+    #   /tmp        temp files, HOME, the "seeded" marker of the health check.
+    # `mode=0700` relies on the image running as root.
+    read_only: true
+    tmpfs:
+      - /data:size=${DEMO_DATA_SIZE:-512m},mode=0700
+      - /data/logs:size=${DEMO_LOG_SIZE:-64m},mode=0700
+      - /tmp:size=${DEMO_TMP_SIZE:-128m},mode=1777
+    # Reaps the orphans that hook, git and shell children leave behind.
+    init: true
+    # Healthy = the accounts exist (marker file) AND /healthz answers 200.
+    healthcheck:
+      test:
+        - CMD
+        - forge-demo-healthcheck
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 240s
+    restart: unless-stopped
+    # Containment for a server that strangers can register on. The container
+    # is on Dokploy's shared proxy network and CAN open outbound connections.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${DEMO_FORGE_PIDS_LIMIT:-512}
+    mem_limit: ${DEMO_FORGE_MEMORY:-2g}
+    cpus: ${DEMO_FORGE_CPUS:-2}
