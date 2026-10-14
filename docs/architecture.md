@@ -945,9 +945,12 @@ the execution's stale WorkspaceLease atomically. Replacement retries at most 32
 times, reloading the Task, execution and active grant between attempts, with
 exponential backoff capped at 50 ms. A changed precondition stops launch with its
 specific reason. Exhausted version contention is an auto-resumable pre-dispatch
-infrastructure refusal: no executor starts, no executor-failure Task blocker is
-created, and no execution retry budget is charged. Normal dispatcher recovery
-admits the next launch under current authority.
+infrastructure refusal: no executor starts, no execution retry budget is
+charged, and the dispatcher's next scan launches the role again under current
+authority. Re-dispatch is bounded too: the third refusal in a row for lease
+contention of the same Task role parks the Task behind the dispatch-failure
+blocker (`executor_failed`, recovered by the owner's Retry), still without
+charging the execution retry budget.
 The start of every run, embedded or daemon-placed, checks the grant first
 (`start_execution`). When the only change since the claim is that the Task's
 version moved past the run's own grant (a manual Launch or a session follow-up

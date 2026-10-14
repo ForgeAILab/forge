@@ -8,6 +8,10 @@ pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk b
 pub(crate) const AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX: &str = "Agent paused before launch: ";
 pub(in crate::task_service) const WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX: &str =
     "WorkspaceLease launch contention: ";
+/// Launches of one Task role refused in a row for lease contention before
+/// the Task parks behind the dispatch-failure blocker (no retry budget).
+/// Each launch already retried its reissue; this bounds the re-dispatches.
+const MAX_LAUNCH_CONTENTION_REFUSALS: usize = 3;
 
 /// Like environment/disk/Agent waits, contention before the executor starts
 /// is an infrastructure refusal, not a failed attempt by the worker.
@@ -514,6 +518,26 @@ impl TaskService {
         true
     }
 
+    /// Whether this refusal and the ones just before it, of the same Task
+    /// role, are all lease-contention refusals up to the bound.
+    async fn launch_contention_bound_spent(&self, execution: &db::Execution) -> Result<bool> {
+        let recent = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            &execution.task_id,
+            &execution.role,
+            db::PageRequest {
+                cursor: None,
+                limit: MAX_LAUNCH_CONTENTION_REFUSALS as i64,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await?;
+        Ok(recent.items.len() == MAX_LAUNCH_CONTENTION_REFUSALS
+            && recent.items.iter().all(is_workspace_lease_pre_dispatch_failure))
+    }
+
     pub(super) async fn fail_execution_before_dispatch_without_task_block(
         &self,
         execution_id: &str,
@@ -626,7 +650,19 @@ impl TaskService {
         match outcome {
             ExecutionTerminalOutcome::Committed { execution, .. } => {
                 super::publish_terminal_execution_event(self, &execution);
-                if block_task && should_block_task_for_failed_execution(&execution) {
+                let contention_bound_spent = block_task
+                    && is_workspace_lease_pre_dispatch_failure(&execution)
+                    && self
+                        .launch_contention_bound_spent(&execution)
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(execution_id = %execution.id, %error, "failed to count launch contention refusals");
+                            false
+                        });
+                if block_task
+                    && (should_block_task_for_failed_execution(&execution)
+                        || contention_bound_spent)
+                {
                     if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
                         tracing::warn!(
                             execution_id = %execution.id,

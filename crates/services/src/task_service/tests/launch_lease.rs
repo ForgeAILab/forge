@@ -534,3 +534,63 @@ async fn a_task_write_between_claim_and_start_does_not_fail_the_run() {
         .unwrap();
     assert!(fresh.blocked_json.is_none(), "{:?}", fresh.blocked_json);
 }
+
+/// A Task that is written through every launch is not launched forever:
+/// each refused launch is re-dispatched by the scheduler, a bounded number
+/// of times, and then the Task parks. No execution retry is spent.
+#[tokio::test]
+async fn launch_contention_on_every_dispatch_parks_after_a_bound_without_budget() {
+    let (db, service, task, execution, _repo) = fixture().await;
+    let (writer_db, id) = (Arc::clone(&db), task.id.clone());
+    let _registered = register(
+        &task.id,
+        Arc::clone(&db),
+        Arc::new(move |_| {
+            let (db, id) = (Arc::clone(&writer_db), id.clone());
+            Box::pin(async move {
+                bump(&db, &id).await;
+            })
+        }),
+    );
+    let executor = Arc::new(CountingExecutor(AtomicUsize::new(0)));
+    let service = Arc::new(service.with_task_executor(executor.clone()));
+    service
+        .run_execution(execution.id.clone(), executor.as_ref())
+        .await
+        .unwrap_err();
+    let dispatcher = crate::task_dispatcher::TaskDispatcher::new(
+        Arc::clone(&db),
+        Arc::new(EventBus::new(64)),
+        Arc::clone(&service),
+    );
+    for _ in 0..8 {
+        dispatcher.check_once().await.unwrap();
+        service.drain(&task.id).await.unwrap();
+        settled(&db, &task.id).await;
+    }
+    let refused: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution WHERE task_id = ? AND status = 'failed' AND error LIKE '%WorkspaceLease launch contention%'",
+    )
+    .bind(&task.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let fresh = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    eprintln!(
+        "contention refusals={refused}; blocked={:?}; condition={:?}",
+        fresh.blocked_json, fresh.condition
+    );
+    assert!(refused >= 2, "the refused launch is re-dispatched: {refused}");
+    assert!(refused <= 3, "launches under contention are bounded: {refused}");
+    assert!(fresh.blocked_json.is_some(), "the Task parks after the bound");
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .unwrap(),
+        0
+    );
+}

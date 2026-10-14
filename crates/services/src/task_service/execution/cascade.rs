@@ -1364,7 +1364,9 @@ impl TaskService {
         execution: &Execution,
         allow_retry: bool,
     ) -> Result<()> {
-        if super::guards::is_workspace_lease_pre_dispatch_failure(execution) {
+        // Lease contention never spends the execution retry budget; only the
+        // dispatch path parks it, once its re-dispatch bound is spent.
+        if allow_retry && super::guards::is_workspace_lease_pre_dispatch_failure(execution) {
             return Ok(());
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
