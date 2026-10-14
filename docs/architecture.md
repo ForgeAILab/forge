@@ -1381,6 +1381,14 @@ variant, never by matching refusal text, because that text belongs to the
 blocker projection and keeps changing. Potentially transient failures record no
 disposition and retry on the next scan.
 
+Execution-failure retry admission commits its deadline, failure receipt, budget
+charge and automatic execution resume policy in one transaction. Startup
+recognizes the older crash prefix (the receipt and deadline committed before
+that policy write) and settles the failed execution to restore automatic
+resume under the current execution, assignment and Project authority. The
+scheduler records the deadline in its durable wait row; expiry and startup
+reconciliation resume the Task without an in-memory timer owner.
+
 Metadata writes do not bump a Task's `version`, so a disposition stays keyed to
 the state it observed. Assignment, source availability, reconciliation
 resolution, and authorized retry changes call `services::wake_task_dispatch`,
@@ -6029,6 +6037,15 @@ turn retry scope across REST, MCP, and native tools.
 
 ### Root Tasks and ordered subtasks
 
+A subtask resting in a merge state leaves through that state's landed-merge
+target. If that transition remains refused, reconciliation counts the durable
+failed admission-command attempts in the same status epoch, including the
+current attempt, and stops at the Task-step limit (eight). It uses the existing
+`integration_admission_failed` / workspace-error park and owner recovery actions,
+as root admission does. A restart preserves that count; a successful later
+attempt finishes normally without a park. No merge attempt is created for a
+subtask.
+
 A root Task is a Task with no `parent_task_id`. Setting `parent_task_id` makes a
 Task a direct child of that root and selects the root's shared workspace; it is
 the hierarchy/workspace relationship, not a prerequisite edge. A root Task
@@ -6623,7 +6640,19 @@ lock serializes access, and the dispatcher admits only the first incomplete
 sibling, so ordered children execute one at a time even when different Agents
 are assigned. Execution admission repeats both assignment resolution and the
 single-run check transactionally against the shared workspace, so remote daemon
-workers cannot bypass serialization. Reordering is transactional as well: the
+workers cannot bypass serialization. Dependency cycle admission includes the implicit waits of the hierarchy:
+later siblings wait for earlier incomplete siblings, children need their parent
+to start coordinating, and a parent completes only after its children. The
+validator distinguishes starting from completing so the hierarchy itself is
+acyclic while a parent prerequisite on its own unfinished child is refused. A prerequisite that closes that combined graph is
+refused with the existing cycle error, including a path through an unrelated
+Task. Reordering validates the resulting graph in the same writer transaction
+and rolls the entire order back if it creates a cycle. Terminal Tasks contribute
+no waits. For a cyclic link stored by an older build, removing the prerequisite
+through the dependency command preserves the Tasks and wakes the accepted retry;
+the parent order remains authoritative.
+
+Reordering is transactional as well: the
 terminal prefix and current first incomplete child remain fixed, and only the
 untouched `todo` suffix may be permuted.
 

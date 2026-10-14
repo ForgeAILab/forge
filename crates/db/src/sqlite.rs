@@ -159,7 +159,7 @@ pub use task::{
 };
 mod task_adaptive;
 mod task_comment;
-mod task_dependency;
+pub(crate) mod task_dependency;
 mod task_list_read;
 mod task_media;
 mod task_move;

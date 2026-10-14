@@ -819,14 +819,39 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     // The per-run bound: one was created above, seven more fit, the next is
     // refused, typed, and creates nothing.
     for index in 0..7 {
-        ops.call(
-            &root.id,
-            "lead.subtask",
-            json!({"action": "create", "title": format!("extra {index}")}),
-            &format!("extra-{index}"),
-        )
-        .await
-        .unwrap();
+        let result = ops
+            .call(
+                &root.id,
+                "lead.subtask",
+                json!({"action": "create", "title": format!("extra {index}")}),
+                &format!("extra-{index}"),
+            )
+            .await;
+        if let Err(error) = &result {
+            let task = reload(&lead.db, &root.id).await;
+            let runs = ExecutionRepo::list_running_by_task(&*lead.db, &root.id)
+                .await
+                .unwrap();
+            let all = ExecutionRepo::list_by_task_and_role(
+                &*lead.db,
+                &root.id,
+                PLANNER,
+                PageRequest {
+                    cursor: None,
+                    limit: 20,
+                    include_total: false,
+                    sort_by: SortBy::CreatedAt,
+                    sort_order: SortOrder::Desc,
+                },
+            )
+            .await
+            .unwrap();
+            let agent = AgentRepo::get_by_id(&*lead.db, &lead.planner)
+                .await
+                .unwrap();
+            panic!("extra-{index}: {error}\nroot: {task:#?}\nrunning: {runs:#?}\nplanner history: {all:#?}\nAgent: {agent:#?}");
+        }
+        result.unwrap();
     }
     let before = children(lead, &root.id).await.len();
     let refused = ops
