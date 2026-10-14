@@ -994,6 +994,8 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             && ((role.is_some() && (snapshot.has_agent && !snapshot.project_paused))
                 // A merge fix launches the coder: without an Agent the
                 // handler refuses it ("accepted role action lost its Agent").
+                // A Project pause only delays it.
+                || (reason == "merge_fix_retry" && snapshot.has_agent)
                 || !matches!(reason, "role_retry" | "initial_retry" | "merge_fix_retry")
                 || (state.kind == StateKind::Initial
                     && (snapshot.has_agent && !snapshot.project_paused)

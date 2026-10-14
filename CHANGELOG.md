@@ -20,8 +20,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Agent answered `400 validation_error: accepted role action lost its Agent`.
   Retry now appears once a coder (or the state's role) is assigned; the park
   names the missing assignment ("Assign a coder Agent before retrying, or
-  Cancel.") and Cancel stays offered. The same rule holds while the Project is
-  paused for `merge_fix_retry`, as it already did for a role retry.
+  Cancel.") and Cancel stays offered. A Project pause still does not hide a
+  merge fix Retry whose Agent is assigned: the accepted retry waits for the
+  pause to end, as before.
 
 - **Dependency links and subtask reorders that make Tasks wait on each
   other are refused.** `POST /api/v1/tasks/{id}/dependencies` (MCP

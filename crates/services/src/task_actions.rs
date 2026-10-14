@@ -1198,6 +1198,8 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             )
             && (!snapshot.coordination_root || state.kind == StateKind::Gate)
             && ((role.is_some() && (snapshot.has_agent && !snapshot.project_paused))
+                // A merge fix needs its Agent; a Project pause only delays it.
+                || (reason == "merge_fix_retry" && snapshot.has_agent)
                 || !matches!(reason, "role_retry" | "initial_retry" | "merge_fix_retry")
                 || (state.kind == StateKind::Initial
                     && (snapshot.has_agent && !snapshot.project_paused)
@@ -2163,6 +2165,19 @@ pub(crate) mod tests {
             );
             assert!(offers.iter().any(|offer| offer.action.verb() == "cancel"));
         }
+    }
+
+    /// A merge fix with an Agent is offered while the Project is paused: the
+    /// accepted retry waits for the pause to end, as it did before.
+    #[test]
+    fn open_items_fix_merge_fix_retry_with_an_agent_stays_offered_during_a_pause() {
+        let mut s = snapshot("merge_failed", Some(FailureKind::MergeConflict));
+        s.project_paused = true;
+        let offers = projected_actions(&s);
+        assert!(
+            offers.iter().any(|offer| offer.reason == "merge_fix_retry"),
+            "{offers:?}"
+        );
     }
 
     pub(crate) fn integration_conditions() -> Vec<db::TaskCondition> {
