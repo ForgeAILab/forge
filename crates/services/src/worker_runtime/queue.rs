@@ -16,7 +16,48 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+pub(crate) mod command_reply;
+
 pub const CHAIN_LIMIT: i64 = 64;
+
+/// One-shot per-Task command faults for deterministic transport regressions.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_hooks {
+    use crate::ServiceError;
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+
+    type CommandFaults = Mutex<HashMap<(usize, String), (ServiceError, bool)>>;
+    fn faults() -> &'static CommandFaults {
+        static FAULTS: OnceLock<CommandFaults> = OnceLock::new();
+        FAULTS.get_or_init(Default::default)
+    }
+    pub fn inject_command_error(
+        service: &crate::TaskService,
+        task_id: &str,
+        error: ServiceError,
+        durable_reply: bool,
+    ) {
+        faults().lock().unwrap().insert(
+            (
+                std::sync::Arc::as_ptr(&service.task_step_replies) as usize,
+                task_id.to_owned(),
+            ),
+            (error, durable_reply),
+        );
+    }
+    pub(super) fn take(
+        service: &crate::TaskService,
+        task_id: &str,
+    ) -> Option<(ServiceError, bool)> {
+        faults().lock().unwrap().remove(&(
+            std::sync::Arc::as_ptr(&service.task_step_replies) as usize,
+            task_id.to_owned(),
+        ))
+    }
+}
 // Long steps (merge, CI review checks) can wait on one repository's lock for
 // the whole hook. They get their own four slots so the eight fast slots keep
 // every other Project's cascades moving. Per-repository head-of-line inside
@@ -330,8 +371,8 @@ impl TaskStepWorker {
             if matches!(own.status.as_str(), "done" | "failed") && lease.is_none() {
                 // A live claimer releases the step and then sends its typed
                 // reply. A waiter that reads the row between the two waits
-                // for that reply, briefly: the stored answer keeps an error's
-                // message but not its type.
+                // for that reply, briefly. The durable answer carries the
+                // same error kind and fields if the channel was lost.
                 if own.claimed_by.is_none() {
                     if let Ok(Ok(reply)) =
                         tokio::time::timeout(LAPSED_CLAIM_POLL, &mut received).await
@@ -345,9 +386,9 @@ impl TaskStepWorker {
                 // or reply. Its durable answer is safe once the lease lapses;
                 // executing the command again would repeat its effect.
                 if let Some(reply) = &own.result_json {
-                    let reply: db::task_writer::TaskMutationReply = serde_json::from_str(reply)
+                    let reply: command_reply::CommandReply = serde_json::from_str(reply)
                         .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-                    return reply.decode().map_err(ServiceError::from);
+                    return reply.decode();
                 }
                 return Err(ServiceError::invalid_operation(
                     own.last_error
@@ -973,7 +1014,7 @@ impl TaskStepWorker {
             return Ok(false);
         }
         if !self.db.step_entry_matches(step).await? {
-            self.settle(step, "superseded", Some(&error.to_string()), false)
+            self.settle(step, "superseded", Some(&error.to_string()), false, None)
                 .await?;
         } else if step.attempts < MAX_STEP_ATTEMPTS
             && (database_busy(error)
@@ -981,7 +1022,7 @@ impl TaskStepWorker {
                     error,
                     ServiceError::Review(::review::ReviewError::CheckEnvironmentUnavailable)
                 )
-                || (step.kind != "hooks" && retryable(error)))
+                || retryable(error))
         {
             // A hook that found the database busy wrote nothing in that
             // statement: it runs again from its checkpoints, as it does
@@ -994,8 +1035,14 @@ impl TaskStepWorker {
             self.fail_committed_hook_phase(step, &error.to_string())
                 .await?;
         } else {
-            self.settle(step, "failed", Some(&error.to_string()), true)
-                .await?;
+            self.settle(
+                step,
+                "failed",
+                Some(&error.to_string()),
+                true,
+                (step.kind == "command").then_some(error),
+            )
+            .await?;
         }
         Ok(false)
     }
@@ -1019,6 +1066,7 @@ impl TaskStepWorker {
                 "preempted by owner command"
             }),
             false,
+            None,
         )
         .await?;
         if let Some(reply) = self
@@ -1100,6 +1148,7 @@ impl TaskStepWorker {
                     "superseded",
                     Some("Task left the command's accepted status entry"),
                     false,
+                    None,
                 )
                 .await?;
                 if let Some(reply) = self
@@ -1159,67 +1208,83 @@ impl TaskStepWorker {
                         .await?;
                 }
             }
-            let result = if command.operation == "engine_transition" {
-                #[derive(Deserialize)]
-                struct Input {
-                    #[serde(flatten)]
-                    pub bridge: api_types::TransitionBridge,
-                    task_id: String,
-                    target_state: String,
-                    workflow: api_types::WorkflowDefinition,
-                    actor: Actor,
-                    reason: String,
-                    rejection: bool,
-                    skip_before_exit: bool,
-                    defer_dispatch_until: Option<String>,
-                    board_move: Option<crate::workflow::engine::BoardMoveRequest>,
-                    authority: Option<WorkflowAuthority>,
-                    entry_retry: bool,
+            #[cfg(any(test, feature = "test-support"))]
+            let fault = test_hooks::take(&self.task_service, &step.task_id);
+            #[cfg(any(test, feature = "test-support"))]
+            let durable_reply = fault.as_ref().is_some_and(|(_, durable)| *durable);
+            let result = async {
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some((error, _)) = fault {
+                    return Err(error);
                 }
-                let input: Input = serde_json::from_value(command.arguments.clone())
-                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
-                let current = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
-                    .await?
-                    .ok_or(db::DbError::NotFound)?;
-                self.engine
-                    .bind(&self.task_service)
-                    .transition_inner(
-                        input.task_id,
-                        input.target_state,
-                        current.version,
-                        &input.workflow,
-                        input.actor,
-                        input.reason,
-                        input.rejection,
-                        input.skip_before_exit,
-                        input.defer_dispatch_until,
-                        input.board_move,
-                        None,
-                        input.authority,
-                        input.entry_retry,
-                        input.bridge,
+                if command.operation == "engine_transition" {
+                    #[derive(Deserialize)]
+                    struct Input {
+                        #[serde(flatten)]
+                        pub bridge: api_types::TransitionBridge,
+                        task_id: String,
+                        target_state: String,
+                        workflow: api_types::WorkflowDefinition,
+                        actor: Actor,
+                        reason: String,
+                        rejection: bool,
+                        skip_before_exit: bool,
+                        defer_dispatch_until: Option<String>,
+                        board_move: Option<crate::workflow::engine::BoardMoveRequest>,
+                        authority: Option<WorkflowAuthority>,
+                        entry_retry: bool,
+                    }
+                    let input: Input = serde_json::from_value(command.arguments.clone())
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let current = TaskRepo::get_by_id(&*self.db, &input.task_id, false)
+                        .await?
+                        .ok_or(db::DbError::NotFound)?;
+                    self.engine
+                        .bind(&self.task_service)
+                        .transition_inner(
+                            input.task_id,
+                            input.target_state,
+                            current.version,
+                            &input.workflow,
+                            input.actor,
+                            input.reason,
+                            input.rejection,
+                            input.skip_before_exit,
+                            input.defer_dispatch_until,
+                            input.board_move,
+                            None,
+                            input.authority,
+                            input.entry_retry,
+                            input.bridge,
+                        )
+                        .await
+                        .and_then(|value| {
+                            serde_json::to_value(value)
+                                .map_err(|e| ServiceError::invalid_operation(e.to_string()))
+                        })
+                } else {
+                    crate::TaskService::with_recovery_command_context(
+                        &step.payload_json,
+                        self.task_service.execute_task_command(&command),
                     )
                     .await
-                    .and_then(|value| {
-                        serde_json::to_value(value)
-                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))
-                    })
-            } else {
-                crate::TaskService::with_recovery_command_context(
-                    &step.payload_json,
-                    self.task_service.execute_task_command(&command),
-                )
-                .await
-            };
+                }
+            }
+            .await;
+            // This command only reads candidate facts and makes idempotent
+            // queue writes. A reconnect failure goes through the normal step
+            // retry bound; deterministic/exhausted failures park for the owner.
+            if command.operation == "retry_integration" && result.is_err() {
+                return result.map(|_| ());
+            }
             let error = result.as_ref().err().map(ToString::to_string);
-            let stored = serde_json::json!({"result":result.as_ref().ok(),"error":error.as_ref().map(|message|serde_json::json!({"code":"check","message":message}))});
+            let stored = command_reply::CommandReply::encode(&result)?;
             // The command has run. A busy database here must not send the
             // step back through `retry_step`: the next attempt would run the
             // command a second time. Wait the lock out; if it never clears,
             // the caller still gets the command's own answer and the step
             // is failed, not re-queued.
             let status = if result.is_ok() { "done" } else { "failed" };
-            let stored = stored.to_string();
             let settled = wait_out_busy(|| async {
                 #[cfg(test)]
                 if let Some(gate) = &self.command_test_gate {
@@ -1290,6 +1355,14 @@ impl TaskStepWorker {
             if let Some(gate) = &self.command_test_gate {
                 gate.inject(step, tests::CommandPoint::BeforeSend).await;
             }
+            #[cfg(any(test, feature = "test-support"))]
+            if durable_reply {
+                self.task_service
+                    .task_step_replies
+                    .lock()
+                    .expect("Task step replies")
+                    .remove(&step.id);
+            }
             if let Some(reply) = self
                 .task_service
                 .task_step_replies
@@ -1315,6 +1388,7 @@ impl TaskStepWorker {
                 "superseded",
                 Some("Task left the producing status entry"),
                 false,
+                None,
             )
             .await?;
             // A step that left its entry while it waited for a check never
@@ -1498,6 +1572,7 @@ impl TaskStepWorker {
                         "superseded",
                         Some("Cascade edge is no longer allowed by the current workflow"),
                         false,
+                        None,
                     )
                     .await;
             }
@@ -1524,6 +1599,7 @@ impl TaskStepWorker {
                         "superseded",
                         Some("Cascade requires approval in the current workflow"),
                         false,
+                        None,
                     )
                     .await;
             }
@@ -1544,7 +1620,8 @@ impl TaskStepWorker {
             });
         if repeated || step.chain_position > CHAIN_LIMIT {
             let reason = format!("Automatic workflow loop detected: {} → {}; chain {}, step {} (limit {CHAIN_LIMIT})", step.expected_status, payload.to, step.chain_id, step.chain_position);
-            self.settle(step, "parked", Some(&reason), true).await?;
+            self.settle(step, "parked", Some(&reason), true, None)
+                .await?;
             return Ok(());
         }
         let result = self
@@ -1585,6 +1662,7 @@ impl TaskStepWorker {
         status: &str,
         error: Option<&str>,
         annotate: bool,
+        reply_error: Option<&ServiceError>,
     ) -> Result<()> {
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let mut task = self
@@ -1607,6 +1685,16 @@ impl TaskStepWorker {
         self.db
             .finish_step_in_tx(&mut tx, step, status, error)
             .await?;
+        if let Some(error) = reply_error {
+            self.db
+                .store_task_step_command_result_in_tx(
+                    &mut tx,
+                    &command_reply::CommandReply::encode_error(error)?,
+                    &step.id,
+                    &step.claimed_by,
+                )
+                .await?;
+        }
         if status == "superseded" {
             let mut event = db::CreateDomainEvent::task_interruption_changed(&task);
             event.id = db::new_uuid_v4();
@@ -1755,7 +1843,8 @@ impl TaskStepWorker {
 
     async fn fail_committed_hook_phase(&self, step: &TaskStep, error: &str) -> Result<()> {
         let message = format!("Transition committed; hook failed: {error}");
-        self.settle(step, "failed", Some(&message), true).await
+        self.settle(step, "failed", Some(&message), true, None)
+            .await
     }
 }
 fn log_job(result: Option<std::result::Result<Result<()>, tokio::task::JoinError>>) {
@@ -1816,8 +1905,12 @@ where
 }
 
 pub(crate) fn retryable(error: &ServiceError) -> bool {
-    matches!(error, ServiceError::Db(db::DbError::VersionConflict))
-        || consumer_error_kind(error) == WorkerErrorKind::Transient
+    matches!(
+        error,
+        ServiceError::Db(db::DbError::VersionConflict)
+            | ServiceError::Git(git::GitError::Io(_))
+            | ServiceError::Review(::review::ReviewError::Io(_))
+    ) || consumer_error_kind(error) == WorkerErrorKind::Transient
 }
 
 // The step uses the same actor as the former recursive hop.

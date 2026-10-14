@@ -1372,7 +1372,7 @@ impl WorkflowExecution<'_> {
                         &actor,
                     );
             let started = Instant::now();
-            let result = action.execute(&exit_ctx).await;
+            let result = crate::workflow::evaluate_hook(action.as_ref(), &exit_ctx).await?;
             self.refresh_task_after_hook(&mut task, &current_status, None)
                 .await?;
             let duration_ms = elapsed_ms(started);

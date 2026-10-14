@@ -66,6 +66,36 @@ pub enum HookResult {
     },
 }
 
+tokio::task_local! {
+    static HOOK_READ_ERROR: std::cell::RefCell<Option<crate::ServiceError>>;
+}
+
+/// Keep a transient failure typed until the step worker can account for it.
+/// The hook's string result remains its deterministic refusal/evidence format.
+pub(crate) fn hook_error_reason(error: impl Into<crate::ServiceError>) -> String {
+    let error = error.into();
+    let reason = error.to_string();
+    if crate::worker_runtime::queue::retryable(&error) {
+        let _ = HOOK_READ_ERROR.try_with(|slot| *slot.borrow_mut() = Some(error));
+    }
+    reason
+}
+
+pub(crate) async fn evaluate_hook(
+    action: &dyn HookAction,
+    ctx: &HookContext,
+) -> crate::Result<HookResult> {
+    HOOK_READ_ERROR
+        .scope(std::cell::RefCell::new(None), async {
+            let result = action.execute(ctx).await;
+            match HOOK_READ_ERROR.with(|slot| slot.borrow_mut().take()) {
+                Some(error) => Err(error),
+                None => Ok(result),
+            }
+        })
+        .await
+}
+
 pub mod actions;
 pub mod default_autonomous_workflow;
 pub mod default_roles;
@@ -142,6 +172,10 @@ pub(crate) async fn review_refresh_transition_pending(
     task_id: &str,
     current_state: &str,
 ) -> db::Result<bool> {
+    #[cfg(test)]
+    if let Some(error) = refresh_read_faults::take() {
+        return Err(error);
+    }
     let latest = db.latest_workflow_transition_source(task_id).await?;
     let Some(db::LatestWorkflowTransitionSourceRow {
         id,
@@ -159,6 +193,27 @@ pub(crate) async fn review_refresh_transition_pending(
         && to_state == current_state
         && bridge.is_review_refresh()
         && triggered_by == api_types::Actor::system(api_types::SystemComponent::Workflow).display())
+}
+
+#[cfg(test)]
+pub(crate) mod refresh_read_faults {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    fn faults() -> &'static Mutex<HashMap<String, db::DbError>> {
+        static FAULTS: OnceLock<Mutex<HashMap<String, db::DbError>>> = OnceLock::new();
+        FAULTS.get_or_init(Default::default)
+    }
+    pub(crate) fn inject(step_id: &str, error: db::DbError) {
+        faults().lock().unwrap().insert(step_id.to_owned(), error);
+    }
+    pub(super) fn take() -> Option<db::DbError> {
+        faults()
+            .lock()
+            .unwrap()
+            .remove(&db::task_writer::current_step_id()?)
+    }
 }
 
 pub(crate) fn review_refresh_target(

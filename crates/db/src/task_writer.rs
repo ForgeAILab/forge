@@ -85,6 +85,48 @@ pub struct TaskMutationReply {
     pub result: Option<Value>,
     pub error: Option<Value>,
 }
+
+#[derive(Debug)]
+struct StoredDatabaseError {
+    display: String,
+    message: String,
+    code: Option<String>,
+    kind: sqlx::error::ErrorKind,
+}
+impl std::fmt::Display for StoredDatabaseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display)
+    }
+}
+impl std::error::Error for StoredDatabaseError {}
+impl sqlx::error::DatabaseError for StoredDatabaseError {
+    fn message(&self) -> &str {
+        &self.message
+    }
+    fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.code.as_deref().map(Into::into)
+    }
+    fn kind(&self) -> sqlx::error::ErrorKind {
+        match &self.kind {
+            sqlx::error::ErrorKind::UniqueViolation => sqlx::error::ErrorKind::UniqueViolation,
+            sqlx::error::ErrorKind::ForeignKeyViolation => {
+                sqlx::error::ErrorKind::ForeignKeyViolation
+            }
+            sqlx::error::ErrorKind::NotNullViolation => sqlx::error::ErrorKind::NotNullViolation,
+            sqlx::error::ErrorKind::CheckViolation => sqlx::error::ErrorKind::CheckViolation,
+            _ => sqlx::error::ErrorKind::Other,
+        }
+    }
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+        self
+    }
+    fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+        self
+    }
+}
 impl TaskMutationReply {
     fn from_result(result: &Result<Value>) -> Self {
         match result {
@@ -94,100 +136,154 @@ impl TaskMutationReply {
             },
             Err(error) => Self {
                 result: None,
-                error: Some(match error {
-                    DbError::TaskBusy {
-                        pending_steps,
-                        retry_after_ms,
-                    } => {
-                        serde_json::json!({"code":"task_busy","pending_steps":pending_steps,"retry_after_ms":retry_after_ms})
-                    }
-                    DbError::BoardRevisionConflict { expected, actual } => {
-                        serde_json::json!({"code":"board_revision_conflict","expected":expected,"actual":actual})
-                    }
-                    DbError::MoveOperationConflict { operation_id } => {
-                        serde_json::json!({"code":"move_operation_conflict","operation_id":operation_id})
-                    }
-                    DbError::MoveOperationIncomplete { operation_id } => {
-                        serde_json::json!({"code":"move_operation_incomplete","operation_id":operation_id})
-                    }
-                    DbError::InvalidTaskMove(message) => {
-                        serde_json::json!({"code":"invalid_task_move","message":message})
-                    }
-                    DbError::InvalidSoftDelete => serde_json::json!({"code":"invalid_soft_delete"}),
-                    DbError::ReviewDetailsCorrupt { review_id, reason } => {
-                        serde_json::json!({"code":"review_details_corrupt","review_id":review_id,"reason":reason})
-                    }
-                    DbError::TransitionBridgeCorrupt {
-                        transition_log_id,
-                        reason,
-                    } => {
-                        serde_json::json!({"code":"transition_bridge_corrupt","transition_log_id":transition_log_id,"reason":reason})
-                    }
-                    DbError::RepoInUse { repo_id } => {
-                        serde_json::json!({"code":"repo_in_use","repo_id":repo_id})
-                    }
-                    DbError::ResourceInUse { resource, reason } => {
-                        serde_json::json!({"code":"resource_in_use","resource":resource,"reason":reason})
-                    }
-                    DbError::ProjectInUse {
-                        project_id,
-                        running_executions,
-                        active_leases,
-                        live_check_runs,
-                    } => {
-                        serde_json::json!({"code":"project_in_use","project_id":project_id,"running_executions":running_executions,"active_leases":active_leases,"live_check_runs":live_check_runs})
-                    }
-                    DbError::TurnNotRetryable => serde_json::json!({"code":"turn_not_retryable"}),
-                    DbError::ChatTurnLive => serde_json::json!({"code":"chat_turn_live"}),
-                    DbError::DeadLetterNotReplayable => {
-                        serde_json::json!({"code":"dead_letter_not_replayable"})
-                    }
-                    DbError::InvalidCursor => serde_json::json!({"code":"invalid_cursor"}),
-                    DbError::Sqlx(source) => {
-                        serde_json::json!({"code":"database_error","message":source.to_string(),"transient":error.is_transient()})
-                    }
-                    DbError::VersionConflict => serde_json::json!({"code":"version_conflict"}),
-                    DbError::NotFound => serde_json::json!({"code":"not_found"}),
-                    DbError::TaskVersionConflict { expected, actual } => {
-                        serde_json::json!({"code":"task_version_conflict","expected":expected,"actual":actual})
-                    }
-                    DbError::AgentPaused { agent_id } => {
-                        serde_json::json!({"code":"agent_paused","agent_id":agent_id})
-                    }
-                    DbError::ProjectPaused { project_id } => {
-                        serde_json::json!({"code":"project_paused","project_id":project_id})
-                    }
-                    DbError::InvalidTransition => serde_json::json!({"code":"invalid_transition"}),
-                    DbError::IdempotencyConflict => {
-                        serde_json::json!({"code":"idempotency_conflict"})
-                    }
-                    DbError::DependencyGate => serde_json::json!({"code":"dependency_gate"}),
-                    DbError::CycleDetected => serde_json::json!({"code":"cycle_detected"}),
-                    DbError::Check(message) => {
-                        serde_json::json!({"code":"check","message":message})
-                    }
-                    DbError::TaskConditionQuarantined { task_id } => {
-                        serde_json::json!({"code":"task_condition_quarantined","task_id":task_id})
-                    }
-                    DbError::AgentAtCapacity => serde_json::json!({"code":"agent_at_capacity"}),
-                    DbError::MachineAtCapacity => serde_json::json!({"code":"machine_at_capacity"}),
-                    DbError::ExecutionAlreadyRunning {
-                        scope,
-                        execution_id,
-                    } => {
-                        serde_json::json!({"code":"execution_already_running","scope":scope,"execution_id":execution_id})
-                    }
-                    _ => {
-                        serde_json::json!({"code":"database_error","message":error.to_string(),"transient":false})
-                    }
-                }),
+                error: Some(Self::error_json(error)),
             },
         }
     }
+    /// The same typed error envelope used by DB mutations and service commands.
+    pub fn error_json(error: &DbError) -> Value {
+        match error {
+            DbError::PermissionDocument(error) => serde_json::json!({"code":error.code()}),
+            DbError::IntegrationUnresolved { task_id, machine } => {
+                serde_json::json!({"code":"integration_unresolved","task_id":task_id,"machine":machine})
+            }
+            DbError::MachineConnected => serde_json::json!({"code":"machine_connected"}),
+            DbError::LocalMachine => serde_json::json!({"code":"local_machine"}),
+            DbError::MachineOwnedByAnotherUser => serde_json::json!({"code":"machine_owned"}),
+            DbError::TaskBusy {
+                pending_steps,
+                retry_after_ms,
+            } => {
+                serde_json::json!({"code":"task_busy","pending_steps":pending_steps,"retry_after_ms":retry_after_ms})
+            }
+            DbError::BoardRevisionConflict { expected, actual } => {
+                serde_json::json!({"code":"board_revision_conflict","expected":expected,"actual":actual})
+            }
+            DbError::MoveOperationConflict { operation_id } => {
+                serde_json::json!({"code":"move_operation_conflict","operation_id":operation_id})
+            }
+            DbError::MoveOperationIncomplete { operation_id } => {
+                serde_json::json!({"code":"move_operation_incomplete","operation_id":operation_id})
+            }
+            DbError::InvalidTaskMove(message) => {
+                serde_json::json!({"code":"invalid_task_move","message":message})
+            }
+            DbError::InvalidSoftDelete => serde_json::json!({"code":"invalid_soft_delete"}),
+            DbError::ReviewDetailsCorrupt { review_id, reason } => {
+                serde_json::json!({"code":"review_details_corrupt","review_id":review_id,"reason":reason})
+            }
+            DbError::TransitionBridgeCorrupt {
+                transition_log_id,
+                reason,
+            } => {
+                serde_json::json!({"code":"transition_bridge_corrupt","transition_log_id":transition_log_id,"reason":reason})
+            }
+            DbError::RepoInUse { repo_id } => {
+                serde_json::json!({"code":"repo_in_use","repo_id":repo_id})
+            }
+            DbError::ResourceInUse { resource, reason } => {
+                serde_json::json!({"code":"resource_in_use","resource":resource,"reason":reason})
+            }
+            DbError::ProjectInUse {
+                project_id,
+                running_executions,
+                active_leases,
+                live_check_runs,
+            } => {
+                serde_json::json!({"code":"project_in_use","project_id":project_id,"running_executions":running_executions,"active_leases":active_leases,"live_check_runs":live_check_runs})
+            }
+            DbError::TurnNotRetryable => serde_json::json!({"code":"turn_not_retryable"}),
+            DbError::ChatTurnLive => serde_json::json!({"code":"chat_turn_live"}),
+            DbError::DeadLetterNotReplayable => {
+                serde_json::json!({"code":"dead_letter_not_replayable"})
+            }
+            DbError::InvalidCursor => serde_json::json!({"code":"invalid_cursor"}),
+            DbError::Sqlx(source) => {
+                let mut stored = serde_json::json!({"code":"database_error","message":source.to_string(),"transient":error.is_transient()});
+                stored["sqlx_kind"] = match source {
+                    sqlx::Error::PoolTimedOut => "pool_timed_out",
+                    sqlx::Error::PoolClosed => "pool_closed",
+                    sqlx::Error::WorkerCrashed => "worker_crashed",
+                    sqlx::Error::RowNotFound => "row_not_found",
+                    sqlx::Error::Io(io) => {
+                        stored["io_message"] = io.to_string().into();
+                        "io"
+                    }
+                    sqlx::Error::Protocol(message) => {
+                        stored["protocol_message"] = message.clone().into();
+                        "protocol"
+                    }
+                    sqlx::Error::Database(database) => {
+                        stored["database_message"] = database.message().into();
+                        stored["database_code"] = serde_json::json!(database.code().as_deref());
+                        stored["database_kind"] = serde_json::json!(match database.kind() {
+                            sqlx::error::ErrorKind::UniqueViolation => "unique",
+                            sqlx::error::ErrorKind::ForeignKeyViolation => "foreign_key",
+                            sqlx::error::ErrorKind::NotNullViolation => "not_null",
+                            sqlx::error::ErrorKind::CheckViolation => "check",
+                            _ => "other",
+                        });
+                        "database"
+                    }
+                    _ => "other",
+                }
+                .into();
+                stored
+            }
+            DbError::VersionConflict => serde_json::json!({"code":"version_conflict"}),
+            DbError::NotFound => serde_json::json!({"code":"not_found"}),
+            DbError::TaskVersionConflict { expected, actual } => {
+                serde_json::json!({"code":"task_version_conflict","expected":expected,"actual":actual})
+            }
+            DbError::AgentPaused { agent_id } => {
+                serde_json::json!({"code":"agent_paused","agent_id":agent_id})
+            }
+            DbError::ProjectPaused { project_id } => {
+                serde_json::json!({"code":"project_paused","project_id":project_id})
+            }
+            DbError::InvalidTransition => serde_json::json!({"code":"invalid_transition"}),
+            DbError::IdempotencyConflict => {
+                serde_json::json!({"code":"idempotency_conflict"})
+            }
+            DbError::DependencyGate => serde_json::json!({"code":"dependency_gate"}),
+            DbError::CycleDetected => serde_json::json!({"code":"cycle_detected"}),
+            DbError::Check(message) => {
+                serde_json::json!({"code":"check","message":message})
+            }
+            DbError::TaskConditionQuarantined { task_id } => {
+                serde_json::json!({"code":"task_condition_quarantined","task_id":task_id})
+            }
+            DbError::AgentAtCapacity => serde_json::json!({"code":"agent_at_capacity"}),
+            DbError::MachineAtCapacity => serde_json::json!({"code":"machine_at_capacity"}),
+            DbError::ExecutionAlreadyRunning {
+                scope,
+                execution_id,
+            } => {
+                serde_json::json!({"code":"execution_already_running","scope":scope,"execution_id":execution_id})
+            }
+            _ => {
+                serde_json::json!({"code":"database_error","message":error.to_string(),"transient":false})
+            }
+        }
+    }
+
     pub fn decode<T: DeserializeOwned>(self) -> Result<T> {
         if let Some(error) = self.error {
             let value = |key: &str| error[key].as_str().unwrap_or_default().to_owned();
             return Err(match error["code"].as_str() {
+                Some("invalid_permission_document") => DbError::PermissionDocument(
+                    operation_registry::authority::PermissionDocumentError::Invalid,
+                ),
+                Some("conflicting_permission_document") => DbError::PermissionDocument(
+                    operation_registry::authority::PermissionDocumentError::Conflicting,
+                ),
+                Some("integration_unresolved") => DbError::IntegrationUnresolved {
+                    task_id: value("task_id"),
+                    machine: value("machine"),
+                },
+                Some("machine_connected") => DbError::MachineConnected,
+                Some("local_machine") => DbError::LocalMachine,
+                Some("machine_owned") => DbError::MachineOwnedByAnotherUser,
                 Some("task_busy") => DbError::TaskBusy {
                     pending_steps: error["pending_steps"].as_i64().unwrap_or_default(),
                     retry_after_ms: error["retry_after_ms"].as_u64().unwrap_or_default(),
@@ -232,10 +328,29 @@ impl TaskMutationReply {
                 Some("chat_turn_live") => DbError::ChatTurnLive,
                 Some("dead_letter_not_replayable") => DbError::DeadLetterNotReplayable,
                 Some("invalid_cursor") => DbError::InvalidCursor,
-                Some("database_error") => DbError::Sqlx(if error["transient"] == true {
-                    sqlx::Error::Io(std::io::Error::other(value("message")))
-                } else {
-                    sqlx::Error::Protocol(value("message"))
+                Some("database_error") => DbError::Sqlx(match error["sqlx_kind"].as_str() {
+                    Some("pool_timed_out") => sqlx::Error::PoolTimedOut,
+                    Some("pool_closed") => sqlx::Error::PoolClosed,
+                    Some("worker_crashed") => sqlx::Error::WorkerCrashed,
+                    Some("row_not_found") => sqlx::Error::RowNotFound,
+                    Some("io") => sqlx::Error::Io(std::io::Error::other(value("io_message"))),
+                    Some("protocol") => sqlx::Error::Protocol(value("protocol_message")),
+                    Some("database") => sqlx::Error::Database(Box::new(StoredDatabaseError {
+                        display: value("message"),
+                        message: value("database_message"),
+                        code: error["database_code"].as_str().map(str::to_owned),
+                        kind: match error["database_kind"].as_str() {
+                            Some("unique") => sqlx::error::ErrorKind::UniqueViolation,
+                            Some("foreign_key") => sqlx::error::ErrorKind::ForeignKeyViolation,
+                            Some("not_null") => sqlx::error::ErrorKind::NotNullViolation,
+                            Some("check") => sqlx::error::ErrorKind::CheckViolation,
+                            _ => sqlx::error::ErrorKind::Other,
+                        },
+                    })),
+                    _ if error["transient"] == true => {
+                        sqlx::Error::Io(std::io::Error::other(value("message")))
+                    }
+                    _ => sqlx::Error::Protocol(value("message")),
                 }),
                 Some("version_conflict") => DbError::VersionConflict,
                 Some("not_found") => DbError::NotFound,

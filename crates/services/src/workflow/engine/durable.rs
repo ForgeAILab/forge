@@ -253,7 +253,12 @@ impl WorkflowExecution<'_> {
             transient: transient.clone(),
             suspend: suspend.clone(),
         };
-        let result = HOOK_ATTEMPT.scope(attempt, action.execute(ctx)).await;
+        let result = HOOK_ATTEMPT
+            .scope(
+                attempt,
+                crate::workflow::evaluate_hook(action.as_ref(), ctx),
+            )
+            .await?;
         if let Some(suspension) = suspend.lock().unwrap_or_else(|p| p.into_inner()).take() {
             // Leave the checkpoint open: the woken step runs this hook
             // again and it settles from the delivered result.

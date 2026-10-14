@@ -378,7 +378,7 @@ impl MergeService {
         let incomplete_import = match task.condition.integration_wait() {
             Some(api_types::IntegrationReason::Deferred {
                 attempt_id,
-                cause: api_types::IntegrationDeferralCause::OwnerRequired,
+                cause: api_types::IntegrationDeferralCause::OwnerRequired | api_types::IntegrationDeferralCause::OwnerOffline,
                 ..
             }) => self
                 .db

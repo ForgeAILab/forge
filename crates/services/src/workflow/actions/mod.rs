@@ -19,6 +19,8 @@ pub use lifecycle::{
     ScheduleWorkspaceCleanup,
 };
 #[cfg(test)]
+pub(crate) use merge::guard_test_faults;
+#[cfg(test)]
 pub(crate) use merge::test_faults as merge_test_faults;
 pub(crate) use merge::{conflict_handoff_result, merge_failure_result, record_integration_failure};
 pub use merge::{CheckMergeFixBudget, RequireConflictMarkersResolved, RunMerge};

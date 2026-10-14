@@ -79,7 +79,7 @@ impl HookAction for DispatchRoleAgent {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         };
@@ -115,7 +115,7 @@ impl HookAction for DispatchRoleAgent {
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }
@@ -610,7 +610,7 @@ impl HookAction for NotifyRoleHolder {
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }

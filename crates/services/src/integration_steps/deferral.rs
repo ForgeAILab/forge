@@ -21,6 +21,8 @@ pub(crate) struct ImportFacts {
     pub deadline: bool,
     /// The machine a pre-queue owner wait named (row P15).
     pub waited_owner: Option<String>,
+    /// Retry was accepted and waits for this machine to supply the candidate.
+    pub retry_owner: Option<String>,
 }
 
 /// The facts of a `parked` or `quarantined` attempt (or of the suspended
@@ -41,6 +43,13 @@ pub(crate) struct DeferralFacts<'a> {
 
 /// The cause and the machine waited for.
 pub(crate) fn deferral(facts: &DeferralFacts<'_>) -> (C, Option<String>) {
+    if let Some(owner) = facts
+        .import
+        .as_ref()
+        .and_then(|import| import.retry_owner.clone())
+    {
+        return (C::OwnerOffline, Some(owner));
+    }
     if facts.quarantined {
         // An imported row quarantined with no operation to ask about has no
         // result that could still arrive: its owner decides.
@@ -113,6 +122,7 @@ pub(crate) fn import_facts(
         operation: attempt.current_operation_state.is_some() || attempt.operation_id.is_some(),
         deadline: attempt.available_at.is_some(),
         waited_owner,
+        retry_owner: source["retry_owner"].as_str().map(str::to_owned),
     })
 }
 
@@ -129,6 +139,7 @@ pub(crate) fn snapshot_import_facts(snapshot: &serde_json::Value) -> Option<Impo
         operation: snapshot["operation"] == true,
         deadline: snapshot["deadline"] == true,
         waited_owner: snapshot["waited_owner"].as_str().map(str::to_owned),
+        retry_owner: snapshot["retry_owner"].as_str().map(str::to_owned),
     })
 }
 
@@ -207,6 +218,7 @@ mod tests {
             operation,
             deadline,
             waited_owner: (priority == 15).then(|| "old".to_owned()),
+            retry_owner: None,
         };
         let with = |quarantined, import| DeferralFacts {
             import: Some(import),

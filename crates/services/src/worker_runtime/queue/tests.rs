@@ -149,6 +149,91 @@ fn transition_command() -> crate::task_service::commands::TaskCommand {
 }
 
 #[tokio::test]
+async fn open_item_4_durable_command_errors_preserve_inline_kinds_and_fields() {
+    let errors: Vec<Box<dyn Fn() -> ServiceError>> = vec![
+        Box::new(|| db::DbError::VersionConflict.into()),
+        Box::new(|| {
+            db::DbError::TaskVersionConflict {
+                expected: 2,
+                actual: 3,
+            }
+            .into()
+        }),
+        Box::new(|| ServiceError::not_found("execution", "missing")),
+        Box::new(|| ServiceError::invalid_operation("deterministic refusal")),
+        Box::new(|| ServiceError::AuthorizationDenied {
+            message: "policy refused the command".into(),
+        }),
+        Box::new(|| ServiceError::GuardRejection {
+            guard: "dependency_gate".into(),
+            reason: "unfinished dependency".into(),
+        }),
+        Box::new(|| ServiceError::TaskBusy {
+            pending_steps: 3,
+            retry_after_ms: 250,
+        }),
+    ];
+    for make_error in errors {
+        let mut answers = Vec::new();
+        for durable in [false, true] {
+            let (db, worker) = fixture().await;
+            test_hooks::inject_command_error(&worker.task_service, "t", make_error(), durable);
+            let result = Arc::new(worker)
+                .request_command::<serde_json::Value>("t", transition_command())
+                .await;
+            answers.push(format!("{:?}", result.unwrap_err()));
+            let rows = db.task_steps("t").await.unwrap();
+            assert_eq!(rows[0].status, "failed");
+            assert_eq!(rows[0].attempts, 1, "a completed command is never repeated");
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "durable reply changed the error category or fields"
+        );
+    }
+}
+
+#[tokio::test]
+async fn open_item_4_a_command_failure_before_its_handler_has_a_typed_durable_reply() {
+    let (db, worker) = fixture().await;
+    let mut input = step("done");
+    input.kind = "command".into();
+    input.payload_json = transition_command().payload_json().unwrap();
+    db.enqueue_step(&input).await.unwrap();
+    let mut claimed = db
+        .claim_step("before-handler", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    claimed.attempts = MAX_STEP_ATTEMPTS;
+    sqlx::query("UPDATE task_step SET attempts=? WHERE id=?")
+        .bind(MAX_STEP_ATTEMPTS)
+        .bind(&claimed.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let error = ServiceError::Db(db::DbError::VersionConflict);
+    assert!(!db::task_writer::in_task_step(
+        claimed.clone(),
+        worker.settle_failed_attempt(&claimed, &error)
+    )
+    .await
+    .unwrap());
+    let stored = db.task_steps("t").await.unwrap().remove(0);
+    assert_eq!(stored.status, "failed");
+    let reply: command_reply::CommandReply = serde_json::from_str(
+        &stored
+            .result_json
+            .expect("terminal command errors have a durable reply"),
+    )
+    .unwrap();
+    assert!(matches!(
+        reply.decode::<serde_json::Value>(),
+        Err(ServiceError::Db(db::DbError::VersionConflict))
+    ));
+}
+
+#[tokio::test]
 async fn command_waiter_reclaims_a_claimer_that_panics_after_claim() {
     let (db, mut worker) = fixture().await;
     let gate = CommandGate::new(CommandPoint::AfterClaim, CommandFault::Panic);
@@ -655,6 +740,158 @@ async fn fixture() -> (Arc<db::SqliteDb>, TaskStepWorker) {
     .unwrap();
     let worker = TaskStepWorker::new(service.clone());
     (db, worker)
+}
+
+#[tokio::test]
+async fn open_item_1_transient_repair_guard_uses_the_step_attempt_bound() {
+    let (db, worker) = fixture().await;
+    let service =
+        worker
+            .task_service
+            .clone()
+            .with_merge_service(Arc::new(crate::MergeService::new(
+                db.clone(),
+                std::path::PathBuf::from("unused"),
+            )));
+    let worker = TaskStepWorker::new(service);
+    let mut definition = workflow();
+    definition.states[0].name = "merge_failed".into();
+    definition.states[0]
+        .triggers
+        .get_mut(&WorkflowTrigger::Accept)
+        .unwrap()
+        .to = "review".into();
+    definition.states[0]
+        .hooks
+        .before_exit
+        .push(api_types::HookSpec {
+            action: "require_conflict_markers_resolved".into(),
+            params: serde_json::json!({}),
+            on_failure: api_types::FailurePolicy::Block,
+            applies_to: api_types::HookAudience::All,
+        });
+    definition.states[1].name = "review".into();
+    sqlx::query("UPDATE task SET status='merge_failed' WHERE id='t'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_step_workflow SET definition_json=? WHERE id='fixture'")
+        .bind(serde_json::to_string(&definition).unwrap())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let mut input = step("review");
+    input.expected_status = "merge_failed".into();
+    db.enqueue_step(&input).await.unwrap();
+    for attempt in 1..=MAX_STEP_ATTEMPTS {
+        db.ready_step(&input.id).await.unwrap();
+        let claimed = db
+            .claim_step("guard-test", Some("t"), &lease_deadline())
+            .await
+            .unwrap()
+            .unwrap();
+        let error = match attempt % 4 {
+            0 => busy(),
+            1 => ServiceError::Db(db::DbError::VersionConflict),
+            2 => ServiceError::Git(git::GitError::Io(std::io::Error::other(
+                "checkout read interrupted",
+            ))),
+            _ => ServiceError::Db(db::DbError::Sqlx(sqlx::Error::Io(std::io::Error::other(
+                "checkout read interrupted",
+            )))),
+        };
+        crate::workflow::actions::guard_test_faults::inject(&input.id, error);
+        worker.execute(claimed).await.unwrap();
+        let stored = db.task_steps("t").await.unwrap().remove(0);
+        assert_eq!(stored.attempts, attempt);
+        let task = TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap();
+        if attempt < MAX_STEP_ATTEMPTS {
+            assert_eq!(
+                stored.status, "pending",
+                "a transient guard error must retry"
+            );
+            assert!(task.error_annotation.is_none(), "no park before the bound");
+        } else {
+            assert_eq!(stored.status, "failed");
+            assert_eq!(
+                task.condition.read().failure_kind,
+                Some(api_types::FailureKind::CascadeFailed)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn open_item_1_refresh_precondition_retries_without_checkpointing_the_failure() {
+    let (db, worker) = fixture().await;
+    let mut definition = workflow();
+    definition.states[1].name = "merge_failed".into();
+    definition.states[1].kind = StateKind::Active;
+    definition.states[1]
+        .hooks
+        .on_enter
+        .push(api_types::HookSpec {
+            action: "dispatch_role_agent".into(),
+            params: serde_json::json!({}),
+            on_failure: api_types::FailurePolicy::Log,
+            applies_to: api_types::HookAudience::All,
+        });
+    definition.states[0]
+        .triggers
+        .get_mut(&WorkflowTrigger::Accept)
+        .unwrap()
+        .to = "merge_failed".into();
+    let mut command = transition_command();
+    command.arguments["workflow"] = serde_json::json!(definition);
+    command.arguments["target_state"] = serde_json::json!("merge_failed");
+    let worker = Arc::new(worker);
+    let entered = worker
+        .request_command::<crate::workflow::engine::TransitionResult>("t", command)
+        .await
+        .unwrap();
+    let id = entered.queued_step_id.unwrap();
+    crate::workflow::refresh_read_faults::inject(&id, db::DbError::VersionConflict);
+    let claimed = db
+        .claim_step("refresh-test", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, id);
+    worker.execute(claimed).await.unwrap();
+    let failed_read = db
+        .task_steps("t")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert_eq!(failed_read.status, "pending");
+    assert_eq!(failed_read.attempts, 1);
+    assert!(TaskRepo::get_by_id(&*db, "t", false)
+        .await
+        .unwrap()
+        .unwrap()
+        .error_annotation
+        .is_none());
+    db.ready_step(&id).await.unwrap();
+    let claimed = db
+        .claim_step("refresh-test", Some("t"), &lease_deadline())
+        .await
+        .unwrap()
+        .unwrap();
+    worker.execute(claimed).await.unwrap();
+    let retried = db
+        .task_steps("t")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap();
+    assert_eq!(retried.status, "done");
+    assert_eq!(retried.attempts, 2);
 }
 fn workflow() -> WorkflowDefinition {
     let mut from = StateDefinition {

@@ -997,6 +997,8 @@ impl RuntimeSupervisor {
             return Ok(0);
         }
 
+        self.runtime.db.release_orphaned_task_step_claims().await?;
+
         let recovered = match self.runtime.crash_recovery.run().await {
             Ok(recovered) => recovered,
             Err(error) if self.mode == RuntimeAssemblyMode::Solo => return Err(error),
@@ -1357,6 +1359,73 @@ mod tests {
         assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
         assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
         assert_eq!(COMMON_WORKERS[18], RuntimeWorker::IntegrationQueue);
+    }
+
+    #[tokio::test]
+    async fn open_item_3_startup_releases_a_crash_orphaned_task_claim_before_the_first_write() {
+        use db::{TaskRepo, TaskStepRepo};
+        let (_data_dir, runtime) = runtime().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('restart-project','restart',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('restart-task','restart-project','old','backlog',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        let mut tx = db::begin_immediate(runtime.db.pool()).await.unwrap();
+        runtime
+            .db
+            .enqueue_task_mutation_in_tx(
+                &mut tx,
+                "restart-task",
+                db::TaskMutation::Sql {
+                    task_id: "restart-task".into(),
+                    query: "UPDATE task SET title='recovered' WHERE id='restart-task'".into(),
+                    arguments: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let orphan = runtime
+            .db
+            .claim_step(
+                "previous-process",
+                Some("restart-task"),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphan.status, "claimed");
+        runtime
+            .db
+            .set_claimed_task_step_wait(Duration::from_millis(250));
+        let mut supervisor = RuntimeSupervisor::new(runtime.clone(), RuntimeAssemblyMode::Solo);
+        supervisor.start().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            db::task_writer::TaskQuery::new(
+                &runtime.db,
+                "restart-task",
+                "UPDATE task SET title='first write' WHERE id='restart-task'",
+            )
+            .execute(runtime.db.pool()),
+        )
+        .await;
+        supervisor.shutdown().await.unwrap();
+        assert_eq!(
+            result
+                .expect("first write must not wait for the orphan's lease")
+                .expect("first write applies"),
+            1
+        );
+        assert_eq!(
+            TaskRepo::get_by_id(&*runtime.db, "restart-task", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
+            "first write"
+        );
     }
 
     #[tokio::test]

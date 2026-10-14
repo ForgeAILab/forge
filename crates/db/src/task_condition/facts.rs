@@ -145,6 +145,7 @@ pub(super) struct Terminals {
 #[derive(Clone)]
 struct HumanState {
     role: Option<String>,
+    active: bool,
     gate: bool,
     requires: bool,
     optional: bool,
@@ -175,6 +176,7 @@ impl Terminals {
                     .entry(name.to_owned())
                     .or_insert_with(|| HumanState {
                         role: state["role"].as_str().map(str::to_owned),
+                        active: state["kind"] == "active",
                         gate: state["kind"] == "gate",
                         requires: state["gate_config"]["requires_user_approval"] == true,
                         optional: state["gate_config"]["optional_when_unassigned"] == true,
@@ -257,6 +259,7 @@ pub struct ConditionFacts {
     /// The attempt a settled Task was integrated by, once its reason is gone.
     pub integration_lineage: Option<IntegrationAttemptId>,
     pub human_wait: bool,
+    pub missing_recovery_role: Option<String>,
     pub review_wait: bool,
     pub review_failure: bool,
     pub owner_park: Option<Value>,
@@ -559,6 +562,7 @@ impl Snapshot {
                 }
             }
         }
+        facts.missing_recovery_role = self.missing_recovery_role(c).await?;
         Ok(())
     }
 }
@@ -871,6 +875,23 @@ impl ConditionFacts {
                     || (self.hooks.is_none() && (read.explicit_human_wait || self.human_wait));
                 read.review_wait = self.review_wait;
                 read.review_failure = self.review_failure;
+                if let Some(role) = &self.missing_recovery_role {
+                    let article = if role == "implementation" { "an" } else { "a" };
+                    let guidance =
+                        format!("Assign {article} {role} Agent before retrying, or Cancel.");
+                    if let Some(diagnostic) = &mut read.diagnostic {
+                        let message = diagnostic
+                            .message
+                            .get_or_insert_with(|| diagnostic.blocking_reason.clone());
+                        if !message.contains(&guidance) {
+                            *message = format!("{guidance} {message}");
+                        }
+                    } else if let Some(interruption) = &mut read.interruption {
+                        if !interruption.reason.contains(&guidance) {
+                            interruption.reason = format!("{guidance} {}", interruption.reason);
+                        }
+                    }
+                }
             }
             if self.children_pending && !children {
                 // Legacy dispatches a flagged root without visible children as
@@ -984,6 +1005,66 @@ impl ConditionFacts {
 }
 
 impl Snapshot {
+    /// Failure recovery launches the assigned implementation role. Human work
+    /// without a failure keeps its ordinary presentation and incurs no read.
+    async fn missing_recovery_role(&self, c: &mut SqliteConnection) -> Result<Option<String>> {
+        let mapped = map_view(&self.input.view());
+        if !matches!(
+            mapped,
+            TaskCondition::Parked {
+                primary: ParkReason::Failure { .. },
+                ..
+            } | TaskCondition::Failed {
+                failure: ParkReason::Failure { .. },
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        let workflow: String = if self.families.entry {
+            self.row.try_get("workflow")?
+        } else {
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id=?")
+                .bind(&self.project)
+                .fetch_one(&mut *c)
+                .await?
+        };
+        let classes = Terminals::of(&workflow);
+        let role = if self.parent.is_some()
+            && matches!(self.state.as_str(), "in_progress" | "merge_failed")
+        {
+            Some("coder".to_owned())
+        } else if classes.has_states {
+            classes.human_states.get(&self.state).and_then(|state| {
+                state
+                    .role
+                    .clone()
+                    .or_else(|| state.active.then(|| "assignee".to_owned()))
+            })
+        } else if matches!(self.state.as_str(), "in_progress" | "merge_failed") {
+            Some("coder".to_owned())
+        } else {
+            None
+        };
+        let Some(role) = role
+            .filter(|role| matches!(role.as_str(), "coder" | "worker" | "executor" | "assignee"))
+        else {
+            return Ok(None);
+        };
+        let canonical = if role == "executor" { "coder" } else { &role };
+        let assignment = sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT assignee_type,assignee_id FROM task_role_assignment WHERE role_name=?1 AND (task_id=?2 OR (?1='coder' AND task_id=?3)) ORDER BY CASE WHEN task_id=?2 THEN 0 ELSE 1 END LIMIT 1")
+            .bind(canonical).bind(&self.id).bind(&self.parent).fetch_optional(&mut *c).await?;
+        Ok(
+            (!assignment
+                .is_some_and(|(kind, id)| kind.as_deref() == Some("agent") && id.is_some()))
+            .then_some(if role == "assignee" {
+                "implementation".to_owned()
+            } else {
+                role
+            }),
+        )
+    }
+
     /// One read of the canonical human-work facts, captured by the producer.
     /// No public reader reconstructs them or reads migrated metadata.
     async fn human_wait(
@@ -1033,12 +1114,14 @@ impl Snapshot {
             match self.state.as_str() {
                 "planning" => Some(HumanState {
                     role: Some("planner".into()),
+                    active: false,
                     gate: true,
                     requires: false,
                     optional: true,
                 }),
                 "review" => Some(HumanState {
                     role: Some("reviewer".into()),
+                    active: false,
                     gate: true,
                     requires: false,
                     optional: false,

@@ -142,6 +142,9 @@ impl crate::TaskService {
         if super::gate::task_gate(&self.db, task_id).await?.is_some() {
             return Ok(());
         }
+        if self.resume_import_retry(task_id).await? {
+            return Ok(());
+        }
         if self
             .db
             .expedite_parked_integration_attempt(task_id, &db::now_rfc3339(), false)
@@ -161,6 +164,9 @@ impl crate::TaskService {
     /// the worker cannot drive it) is admitted here, as the reconciler's
     /// sweep would admit it at its next pass. No owner action is involved.
     pub async fn integration_owner_ready(&self, task_id: &str) -> Result<()> {
+        if self.resume_import_retry(task_id).await? {
+            return Ok(());
+        }
         let Some(current) = self.db.current_integration_attempt(task_id).await? else {
             return Ok(());
         };
@@ -204,7 +210,20 @@ impl crate::TaskService {
     /// counted retries started again; one that left the queue for good, or a
     /// Task with no attempt at all, is admitted again.
     pub(crate) async fn retry_integration(&self, task: &db::Task) -> Result<db::Task> {
-        let current = self.db.current_integration_attempt(&task.id).await?;
+        if !db::task_writer::owns_task(&task.id) {
+            return self
+                .request_task_command(
+                    &task.id,
+                    "retry_integration",
+                    serde_json::json!([task.id]),
+                    false,
+                )
+                .await;
+        }
+        let current = match self.db.current_integration_attempt(&task.id).await? {
+            Some(attempt) => Some(attempt),
+            None => self.db.unowned_quarantined_import(&task.id).await?,
+        };
         let unsettled = |attempt: &db::IntegrationAttempt| {
             attempt.effect_intent_json.is_some()
                 || matches!(
@@ -236,6 +255,51 @@ impl crate::TaskService {
             }
             other => other,
         };
+        if let Some(imported) = current.as_ref().filter(|attempt| {
+            attempt.state == S::Quarantined
+                && attempt.import_source_json.is_some()
+                && !unsettled(attempt)
+        }) {
+            if let Some(placement) =
+                db::WorkspacePlacementRepo::get_for_task(&*self.db, &task.id).await?
+            {
+                if let Some(daemon_id) = placement
+                    .daemon_id
+                    .as_deref()
+                    .filter(|_| placement.owner_kind == db::PlacementOwnerKind::Daemon)
+                {
+                    let online = self
+                        .daemon_connections
+                        .as_ref()
+                        .is_some_and(|registry| registry.get(daemon_id).is_some());
+                    if !online || placement.state == db::PlacementState::Disconnected {
+                        if imported
+                            .import_source_json
+                            .as_ref()
+                            .is_none_or(|source| source["retry_owner"].as_str() != Some(daemon_id))
+                        {
+                            let mut tx = db::begin_immediate(self.db.pool()).await?;
+                            self.db
+                                .wait_quarantined_import_retry_in_tx(&mut tx, imported, daemon_id)
+                                .await?;
+                            self.db.state_integration_condition_in_tx(&mut tx, &task.id, &db::ConditionStatement::Integration {
+                                reason: api_types::IntegrationReason::Deferred {
+                                    attempt_id: api_types::IntegrationAttemptId::new(&imported.id),
+                                    cause: api_types::IntegrationDeferralCause::OwnerOffline,
+                                    owner_id: Some(daemon_id.to_owned()),
+                                    message: format!("Retry accepted; waiting for checkout machine {daemon_id}"),
+                                },
+                            }).await?;
+                            tx.commit().await?;
+                            self.db.domain_event_notify().notify_waiters();
+                        }
+                        return TaskRepo::get_by_id(&*self.db, &task.id, false)
+                            .await?
+                            .ok_or(db::DbError::NotFound.into());
+                    }
+                }
+            }
+        }
         match current {
             Some(attempt) if unsettled(&attempt) => {
                 return Err(ServiceError::invalid_operation(
@@ -270,6 +334,59 @@ impl crate::TaskService {
         TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))
+    }
+
+    /// Reconnect and the admission sweep both deliver the accepted retry.
+    /// Offline time is a typed machine wait, never an attempt or a poll loop.
+    async fn resume_import_retry(&self, task_id: &str) -> Result<bool> {
+        let Some(attempt) = self.db.pending_quarantined_import_retry(task_id).await? else {
+            return Ok(false);
+        };
+        let Some(placement) = db::WorkspacePlacementRepo::get_for_task(&*self.db, task_id).await?
+        else {
+            return Ok(false);
+        };
+        if placement.state != db::PlacementState::Ready
+            || !placement.daemon_id.as_deref().is_some_and(|daemon| {
+                self.daemon_connections
+                    .as_ref()
+                    .is_some_and(|registry| registry.get(daemon).is_some())
+            })
+            || super::gate::task_gate(&self.db, task_id).await?.is_some()
+        {
+            return Ok(false);
+        }
+        let Some(task) = TaskRepo::get_by_id(&*self.db, &attempt.task_ref, false).await? else {
+            return Ok(false);
+        };
+        if !matches!(
+            &task.condition,
+            db::TaskCondition::Parked {
+                primary: db::ParkReason::Integration {
+                    reason: api_types::IntegrationReason::Deferred {
+                        cause: api_types::IntegrationDeferralCause::OwnerOffline,
+                        ..
+                    }
+                },
+                ..
+            }
+        ) {
+            return Ok(false);
+        }
+        if !self
+            .db
+            .task_command_pending(task_id, "retry_integration")
+            .await?
+        {
+            self.enqueue_task_command(
+                task_id,
+                "retry_integration",
+                serde_json::json!([task_id]),
+                false,
+            )
+            .await?;
+        }
+        Ok(true)
     }
 
     /// A subtask resting in a merge state (its entry answered before the
@@ -333,6 +450,9 @@ impl crate::TaskService {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &task.id, false).await? else {
             return Ok(false);
         };
+        if self.resume_import_retry(&task.id).await? {
+            return Ok(true);
+        }
         if task.archived_at.is_some() {
             return Ok(false);
         }

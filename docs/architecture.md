@@ -5894,6 +5894,14 @@ its receipt. Imported operations with no fenced intent can be explicitly closed
 by Retry. Approve on a held Task in its merge state is labelled **Mark done
 without merging**: it ends the Task and cancels its attempt without changing Git.
 
+Retry of a quarantined import whose checkout owner is offline is accepted,
+as Retry of an ordinary bound offline attempt is. The import retains a durable
+retry-owner marker and the Task states `owner_offline` with that machine's ID.
+No candidate read or attempt is charged while the machine is away. Reconnect,
+or the admission sweep after readiness, enqueues the accepted continuation;
+transient read failures then use the Task-step attempt bound and deterministic
+or exhausted failures park typed. Hold, Cancel and Project pause still gate it.
+
 Public queue/member reads, Task integration summaries, operations status and
 `integration.updated` are live; see [api.md](api.md) and [cli.md](cli.md).
 `pending_steps` counts `pending` or `claimed` Task-step rows, excluding the
@@ -5960,6 +5968,12 @@ a child's own coder, else its parent's coder; the step-check lead is the
 root's assignment. Hold retains the offered Task-version check and the exact
 assignment/state-entry fences; an inherited assignment does not manufacture
 a version conflict after the execution has already been stopped.
+
+A role retry, including merge repair, requires its current implementation Agent
+assignment. A previous execution's Agent or an available default cannot stand
+in for a removed assignment. A parked implementation failure names the missing
+coder/worker assignment; assignment remains the ordinary role API and Cancel
+remains available. Retry is offered again when an assigned Agent can take it.
 
 Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
 
@@ -6949,7 +6963,9 @@ in the compact Task list's existing `workflow_health` projection.
 `WorkflowEngine::transition` lifecycle for `A → B`:
 
 1. Validate the Task version, applicable workflow authority and graph edge.
-2. Run filtered `A.before_exit` guards. Blocking failures reject before commit.
+2. Run filtered `A.before_exit` guards. Deterministic blocking failures reject before commit. Transient database,
+   version-race and checkout I/O failures stay typed and return to the step
+   queue, which retries at most eight attempts before an owner park.
 3. In one writer transaction, update status/version/epoch, write transition_log
    and task.transitioned, and insert a `hooks` task_step keyed by the log ID.
    A leased cascade's done acknowledgment shares this same transaction.
@@ -6990,7 +7006,9 @@ are fast. Repository/workspace integration locks remain; a per-target integratio
 queue is refactor 3.2. Unique owner tokens and renewable 60-second leases fence
 checkpoint/effect writes. A 250 ms poll backs up commit notifications. Shutdown
 drains for eight seconds within the supervisor's ten-second grace; otherwise
-unfinished leases expire and restart resumes their checkpoints.
+startup clears claims and releases leases left by the previous process before
+any recovery or worker starts. Pending work resumes from its retained checkpoints
+and attempt count; settled replies are released without repeating their effects.
 
 Hooks use a shared immutable definition of their committed order/config and
 Project authority, rather than repeating complete workflow definitions in rows.
@@ -7093,6 +7111,13 @@ settlement (its claimer stopped between claim and release), the waiter takes
 the step over through the normal claim, which excludes live local owners.
 A settled step whose release or reply was lost answers from its durable
 result when its lease lapses, without repeating the command's effect.
+The durable command reply stores the service error variant and its fields.
+Reading it after a lost channel preserves the same service/HTTP category,
+resource identity, policy refusal, version details and task-busy retry details
+as the inline reply. Historical string-only errors cannot recover a missing
+kind: `V202610140530` preserves their prior generic check error and every reply
+row while normalizing the encoding.
+
 A command or mutation that stays claimed under a live
 owner for 90 seconds (one 60-second lease plus SQLite's 30-second lock
 timeout) returns `task_busy` and remains queued: no caller waits without a

@@ -4176,6 +4176,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   under the Project owner, else the Agent owner, else the instance's first
   administrator.
 
+- Transient workflow guard and review-refresh precondition failures now use the
+  Task step queue's eight-attempt retry bound before parking for the owner.
+- Retry on an imported quarantined merge accepts an offline checkout owner,
+  names the machine it waits for, and continues when that owner reconnects.
+- Startup releases Task-step claims left by the previous process before workers
+  start, so an orphan's 60-second lease no longer blocks the first Task write.
+- Durable Task command replies preserve error kinds and public fields, including
+  version conflicts, missing resources, policy refusals and task-busy details.
+- A failure without its assigned implementation Agent no longer offers a Retry
+  that cannot run; the park names the missing assignment and retains Cancel.
+
 ### Known issues
 
 - A damaged worktree on a daemon owner is not repaired; the Task needs

@@ -417,6 +417,21 @@ impl Drop for TaskStepActivity {
 use crate::check_run::CANCEL_UNWATCHED_QUEUED_RUNS;
 
 impl SqliteDb {
+    pub async fn task_command_pending(&self, task_id: &str, operation: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND json_extract(payload_json,'$.operation')=?)")
+            .bind(task_id).bind(operation).fetch_one(self.pool()).await?)
+    }
+    /// Startup only, before any Task worker runs. No claim from the previous
+    /// process can still own local work. Keep checkpoints, attempts and replies;
+    /// unfinished steps become immediately claimable and settled replies unlock.
+    pub async fn release_orphaned_task_step_claims(&self) -> Result<u64> {
+        let now = now_rfc3339();
+        let changed = sqlx::query("UPDATE task_step SET status=CASE WHEN status='claimed' THEN 'pending' ELSE status END,claimed_by=NULL,lease_until=NULL,available_at=CASE WHEN status='claimed' THEN ? ELSE available_at END,updated_at=? WHERE claimed_by IS NOT NULL OR lease_until IS NOT NULL")
+            .bind(&now).bind(&now).execute(self.pool()).await?.rows_affected();
+        self.domain_event_notify().notify_waiters();
+        Ok(changed)
+    }
+
     /// Check lease ownership and the producing status entry in the writer
     /// transaction that records a hook effect or checkpoint.
     pub async fn fence_hook_in_tx(

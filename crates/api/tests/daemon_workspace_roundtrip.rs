@@ -7793,6 +7793,119 @@ async fn a_pre_queue_merge_waiting_for_its_disconnected_daemon_merges_on_reconne
     let _ = service;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn open_item_2_retry_of_a_quarantined_import_waits_for_its_offline_daemon() {
+    let mut fixture = Fixture::file_backed("forge-quarantine-offline-retry").await;
+    let candidate = fixture.candidate().await;
+    let database = fixture.harness.state.db.clone();
+    let service = fixture.harness.state.task_service.clone();
+    let task_id = fixture.resolved.placement.task_id.clone();
+    let placement_id = fixture.resolved.placement.id.clone();
+    fixture.link.take();
+    common::fake_daemon::wait_until_disconnected(&fixture.harness.state, &fixture.daemon_id).await;
+    sqlx::query("UPDATE task SET status='merging' WHERE id=?")
+        .bind(&task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM execution WHERE task_id=?")
+        .bind(&task_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace_placement SET state='disconnected' WHERE id=?")
+        .bind(&placement_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let report = services::integration_steps::import::import_at_start(&database)
+        .await
+        .unwrap();
+    assert_eq!(report.quarantined, 1);
+    service.drain(&task_id).await.unwrap();
+    let parked = TaskRepo::get_by_id(&*database, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let actor = Actor::user(UserActionSource::Api);
+    let offers = service.task_action_offers(&task_id, &actor).await.unwrap();
+    assert!(
+        offers
+            .available_actions
+            .iter()
+            .any(|offer| offer.reason == "integration_retry"),
+        "{offers:?}"
+    );
+    let accepted = service
+        .perform_task_action_as(&task_id, TaskAction::retry(), parked.version, actor)
+        .await
+        .expect("an offered Retry is accepted while the checkout owner is offline");
+    let reason = json!(accepted.task.condition.integration_reason());
+    assert_eq!(reason["cause"], "owner_offline", "{reason}");
+    assert_eq!(reason["owner_id"], fixture.daemon_id);
+    assert_ne!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        candidate
+    );
+    // This successor has no pinned legacy execution, so it owes a fresh
+    // head check. The test app started before drain composed that runtime.
+    let periodic = services::worker_runtime::PeriodicWorkers::new(database.clone());
+    let (stop_checks, checks_stopped) = tokio::sync::watch::channel(false);
+    let checks = service
+        .compose_checks(
+            fixture.harness.state.daemon_connections.clone(),
+            Duration::from_secs(60),
+            &services::integration_worker::IntegrationWorkerConfig::default(),
+        )
+        .worker
+        .start(&periodic, checks_stopped);
+    let (stop, running) = run_queue_worker(&fixture, Duration::from_secs(60));
+    fixture.link = Some(
+        DaemonLink::connect(
+            &fixture.server,
+            &fixture.daemon_id,
+            &fixture.token,
+            fixture.runtime.clone(),
+        )
+        .await,
+    );
+    fixture.reconcile_reconnected_placement(&placement_id).await;
+    service.integration_owner_ready(&task_id).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if TaskRepo::get_by_id(&*database, &task_id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                == "done"
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let _ = stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let _ = stop_checks.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), checks).await;
+    if result.is_err() {
+        use db::{IntegrationQueueRepo, TaskStepRepo};
+        let task = TaskRepo::get_by_id(&*database, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        panic!("the accepted Retry did not continue: status {}, condition {}, attempt {:?}, steps {:?}", task.status,
+            json!(task.condition.public()), database.current_integration_attempt(&task_id).await.unwrap().map(|a| (a.state, a.failure_message)),
+            database.task_steps(&task_id).await.unwrap().into_iter().map(|s| (s.kind, s.status, s.last_error)).collect::<Vec<_>>());
+    }
+    assert_eq!(
+        git_sync(&fixture.checkout, &["rev-parse", "refs/heads/main"]),
+        candidate
+    );
+}
+
 /// A head that was admitted before its daemon came back under another
 /// runtime id (or with another placement generation) and was never parked:
 /// the queue worker claims it with the binding it has. Through the real
