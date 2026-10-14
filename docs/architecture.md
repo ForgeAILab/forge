@@ -943,8 +943,10 @@ Before local launch, a Task version change that preserves its state entry,
 current execution, assignment and repository authority is recovered by replacing
 the execution's stale WorkspaceLease atomically. Replacement retries at most 32
 times, reloading the Task, execution and active grant between attempts, with
-exponential backoff capped at 50 ms. A changed precondition stops launch with its
-specific reason. Exhausted version contention is an auto-resumable pre-dispatch
+exponential backoff capped at 50 ms. A replacement that commits is the run's
+grant: a Task write after it is not re-checked for version (as after a strict
+verify), only for the run's preconditions. A changed precondition stops launch
+with its specific reason. Exhausted version contention is an auto-resumable pre-dispatch
 infrastructure refusal: no executor starts, no execution retry budget is
 charged, and the dispatcher's next scan launches the role again under current
 authority. Re-dispatch is bounded too: the third refusal in a row for lease

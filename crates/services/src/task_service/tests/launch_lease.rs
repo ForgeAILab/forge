@@ -59,6 +59,35 @@ pub(crate) async fn before_reissue(task: &str) {
     }
 }
 
+fn after_probes() -> &'static StdMutex<HashMap<String, Writer>> {
+    static AFTER: OnceLock<StdMutex<HashMap<String, Writer>>> = OnceLock::new();
+    AFTER.get_or_init(StdMutex::default)
+}
+
+struct RegisteredAfter(String);
+
+impl Drop for RegisteredAfter {
+    fn drop(&mut self) {
+        after_probes().lock().unwrap().remove(&self.0);
+    }
+}
+
+fn register_after(task: &str, writer: Writer) -> RegisteredAfter {
+    after_probes()
+        .lock()
+        .unwrap()
+        .insert(task.to_owned(), writer);
+    RegisteredAfter(task.to_owned())
+}
+
+/// Right after a lease replacement committed.
+pub(crate) async fn after_reissue(task: &str) {
+    let writer = after_probes().lock().unwrap().get(task).cloned();
+    if let Some(writer) = writer {
+        writer(0).await;
+    }
+}
+
 async fn bump(db: &SqliteDb, task: &str) {
     let fresh = TaskRepo::get_by_id(db, task, false).await.unwrap().unwrap();
     TaskRepo::mutate_metadata_and_bump_version(
@@ -593,4 +622,37 @@ async fn launch_contention_on_every_dispatch_parks_after_a_bound_without_budget(
             .unwrap(),
         0
     );
+}
+
+/// A replacement that committed is the run's grant, verified exactly. A Task
+/// write right after it is like a write right after a strict verify, which
+/// the launch does not re-check: it must not send the reissue round again.
+#[tokio::test]
+async fn a_task_write_after_a_committed_reissue_does_not_retry_the_launch() {
+    let (db, service, task, execution, _repo) = fixture().await;
+    let _registered = register(
+        &task.id,
+        Arc::clone(&db),
+        Arc::new(|_| Box::pin(async {})),
+    );
+    let (writer_db, id) = (Arc::clone(&db), task.id.clone());
+    let _after = register_after(
+        &task.id,
+        Arc::new(move |_| {
+            let (db, id) = (Arc::clone(&writer_db), id.clone());
+            Box::pin(async move {
+                bump(&db, &id).await;
+            })
+        }),
+    );
+    let executor = CountingExecutor(AtomicUsize::new(0));
+    let result = service.run_execution(execution.id.clone(), &executor).await;
+    assert_eq!(
+        result
+            .expect("a write after the committed replacement must not fail launch")
+            .status,
+        ExecutionStatus::Completed
+    );
+    assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+    assert_eq!(probe(&task.id).unwrap().attempts.load(Ordering::SeqCst), 1);
 }

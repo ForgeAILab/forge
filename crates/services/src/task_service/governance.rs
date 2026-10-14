@@ -1380,19 +1380,22 @@ impl TaskService {
                 .await;
             match replacement {
                 Ok(Some(_lease)) => {
+                    #[cfg(test)]
+                    super::tests::launch_lease::after_reissue(&task.id).await;
+                    // The replacement verified the exact grant. A later write
+                    // is like one after a strict verify: its version is not
+                    // re-checked, but a changed precondition still stops.
                     let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    if current.version == fresh_task.version {
-                        self.ensure_execution_launch_preconditions(
-                            &current,
-                            &task,
-                            role,
-                            execution_id,
-                        )
-                        .await?;
-                        return Ok(current);
-                    }
+                    self.ensure_execution_launch_preconditions(
+                        &current,
+                        &task,
+                        role,
+                        execution_id,
+                    )
+                    .await?;
+                    return Ok(current);
                 }
                 Ok(None) => {
                     let error = ServiceError::invalid_operation(
