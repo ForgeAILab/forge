@@ -230,7 +230,7 @@ impl EmbeddedTaskExecutor {
             &workspace_root,
             task_service
                 .as_ref()
-                .and_then(|service| service.repo_cache_locks.clone()),
+                .and_then(|service| service.repo_cache_locks()),
             &self.workspace_backend_router,
         )
         .waiting_for_disk()

@@ -468,7 +468,7 @@ pub struct TaskService {
     pub(crate) daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub(crate) workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     pub(crate) terminal_activity: Option<Arc<TerminalActivityTracker>>,
-    pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub(crate) repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     pub(crate) workspace_backend_router: Arc<WorkspaceBackendRouter>,
     test_workspace_backend: bool,
     pub(crate) workspace_root: PathBuf,
@@ -807,6 +807,10 @@ impl TaskService {
 
     pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
         Arc::clone(&self.workspace_backend_router)
+    }
+
+    pub fn repo_cache_locks(&self) -> Option<Arc<RepoCacheLockManager>> {
+        self.repo_cache_locks.clone()
     }
 
     fn configure_workspace_backend(&mut self) {
