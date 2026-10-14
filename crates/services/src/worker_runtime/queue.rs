@@ -1355,13 +1355,12 @@ impl TaskStepWorker {
             if let Some(gate) = &self.command_test_gate {
                 gate.inject(step, tests::CommandPoint::BeforeSend).await;
             }
+            // A lost live reply stays registered and unsent, as it does when
+            // a claimer stops before its send: the waiter answers from the
+            // durable row. Production never drops a sender without sending.
             #[cfg(any(test, feature = "test-support"))]
             if durable_reply {
-                self.task_service
-                    .task_step_replies
-                    .lock()
-                    .expect("Task step replies")
-                    .remove(&step.id);
+                return Ok(());
             }
             if let Some(reply) = self
                 .task_service
