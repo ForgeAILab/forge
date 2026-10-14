@@ -4223,6 +4223,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   names the machine it waits for, and continues when that owner reconnects.
 - Startup releases Task-step claims left by the previous process before workers
   start, so an orphan's 60-second lease no longer blocks the first Task write.
+  A claim the starting process already holds (an inline Task write made before
+  the workers start) keeps its owner and is not run twice.
 - Durable Task command replies preserve error kinds and public fields, including
   version conflicts, missing resources, policy refusals and task-busy details.
 

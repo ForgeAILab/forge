@@ -1173,6 +1173,51 @@ mod tests {
             .iter()
             .all(|step| step.kind == "mutation" && step.status == "done"));
     }
+    /// The startup release frees what a previous process left claimed. A
+    /// claim this process holds (an inline Task writer that ran before the
+    /// workers started) is live work: releasing it would run it twice.
+    #[tokio::test]
+    async fn open_items_fix_startup_release_keeps_a_claim_this_process_holds() {
+        let db = fixture().await;
+        let now = crate::now_rfc3339();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('orphan','p','o','todo',?,?)").bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        for (id, task) in [("live-step", "t"), ("orphan-step", "orphan")] {
+            db.enqueue_step(&EnqueueTaskStep {
+                id: id.into(),
+                task_id: task.into(),
+                kind: "cascade".into(),
+                payload_json: "{}".into(),
+                causation_step_id: None,
+                causation_key: id.into(),
+                chain_id: id.into(),
+                chain_position: 1,
+                expected_status: "todo".into(),
+                expected_version: 1,
+                expected_epoch: None,
+                lane: "fast".into(),
+                available_at: crate::now_rfc3339(),
+            })
+            .await
+            .unwrap();
+        }
+        let live = db
+            .claim_step("this-process", Some("t"), &lease_deadline())
+            .await
+            .unwrap()
+            .unwrap();
+        let _activity = db.hold_task_step(&live);
+        db.claim_step("previous-process", Some("orphan"), &lease_deadline())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db.release_orphaned_task_step_claims().await.unwrap(), 1);
+        let live = db.task_steps("t").await.unwrap().remove(0);
+        assert_eq!(live.status, "claimed");
+        assert_eq!(live.claimed_by.as_deref(), Some("this-process"));
+        let orphan = db.task_steps("orphan").await.unwrap().remove(0);
+        assert_eq!(orphan.status, "pending");
+        assert_eq!(orphan.claimed_by, None);
+    }
     #[tokio::test]
     async fn busy_wait_retains_the_accepted_mutation() {
         let db = fixture().await;

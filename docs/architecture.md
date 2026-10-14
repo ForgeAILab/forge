@@ -7036,7 +7036,9 @@ queue is refactor 3.2. Unique owner tokens and renewable 60-second leases fence
 checkpoint/effect writes. A 250 ms poll backs up commit notifications. Shutdown
 drains for eight seconds within the supervisor's ten-second grace; otherwise
 startup clears claims and releases leases left by the previous process before
-any recovery or worker starts. Pending work resumes from its retained checkpoints
+any recovery or worker starts. A claim held by the starting process itself (its
+process-local step activity) is kept; a second process on the same database is
+excluded by the data root's `runtime.lock`. Pending work resumes from its retained checkpoints
 and attempt count; settled replies are released without repeating their effects.
 
 Hooks use a shared immutable definition of their committed order/config and
