@@ -939,6 +939,20 @@ worker, and task-worker aliases to persisted `worker`, while reviewers remain
 `reviewer`. No route, MCP tool, chat context, filesystem path, handle, or bearer
 token exposes the row.
 
+Before local launch, a Task version change that preserves its state entry,
+current execution, assignment and repository authority is recovered by replacing
+the execution's stale WorkspaceLease atomically. Replacement retries at most 32
+times, reloading the Task, execution and active grant between attempts, with
+exponential backoff capped at 50 ms. A changed precondition stops launch with its
+specific reason. Exhausted version contention is an auto-resumable pre-dispatch
+infrastructure refusal: no executor starts, no executor-failure Task blocker is
+created, and no execution retry budget is charged. Normal dispatcher recovery
+admits the next launch under current authority.
+The runner fences status and state-entry epoch against the Task captured before
+launch preparation. Already admitted checks may finish during a Project pause;
+explicit interactive recovery may inspect a Task held at admission. A new hold
+during launch still stops the run.
+
 ### Project readiness and execution setup
 
 Project coordination, repository setup, and Charter-backed execution are

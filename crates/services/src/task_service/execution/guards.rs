@@ -6,6 +6,30 @@ pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk b
 /// Error prefix of a run that was admitted and then not launched because its
 /// Agent was paused in between. The Task's Agent wait is its recovery.
 pub(crate) const AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX: &str = "Agent paused before launch: ";
+pub(in crate::task_service) const WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX: &str =
+    "WorkspaceLease launch contention: ";
+
+/// Like environment/disk/Agent waits, contention before the executor starts
+/// is an infrastructure refusal, not a failed attempt by the worker.
+pub(super) fn is_workspace_lease_pre_dispatch_failure(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Failed
+        && execution.stopped_by.as_deref() == Some("system:dispatch")
+        && execution.error.as_deref().is_some_and(|error| {
+            error.contains(WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX)
+                || error.contains("version conflict")
+        })
+}
+
+fn launch_state_epoch(task: &Task) -> Option<i64> {
+    task.condition
+        .evidence()
+        .witnesses
+        .iter()
+        .find_map(|witness| match witness {
+            db::ConditionWitness::Entry { epoch, .. } => Some(*epoch),
+            _ => None,
+        })
+}
 
 /// A run ended by [`TaskService::defer_launch_for_paused_agent`]. It is not
 /// an execution failure of the Task: it takes no retry and no block.
@@ -18,6 +42,67 @@ pub(crate) fn is_agent_paused_pre_dispatch_failure(execution: &db::Execution) ->
 }
 
 impl TaskService {
+    pub(in crate::task_service) async fn ensure_execution_launch_preconditions(
+        &self,
+        task: &Task,
+        admitted_task: &Task,
+        role: &str,
+        execution_id: &str,
+    ) -> Result<()> {
+        // An explicitly admitted interactive recovery session may inspect an
+        // already held Task. A new hold during launch still stops that session.
+        let admitted_hold = role == "interactive"
+            && admitted_task
+                .condition
+                .reasons()
+                .chain(admitted_task.condition.evidence().observations.iter())
+                .any(|reason| matches!(reason, db::ParkReason::Held { .. }));
+        if !admitted_hold
+            && task
+                .condition
+                .reasons()
+                .chain(task.condition.evidence().observations.iter())
+                .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Err(ServiceError::conflict(format!(
+                "Task '{}' is held; execution launch stopped",
+                task.id
+            )));
+        }
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        if execution.status != ExecutionStatus::Running {
+            return Err(ServiceError::conflict(format!(
+                "execution '{}' is {}; it is no longer running",
+                execution_id, execution.status
+            )));
+        }
+        if task.status != admitted_task.status
+            || launch_state_epoch(task)
+                .zip(launch_state_epoch(admitted_task))
+                .is_some_and(|(current, admitted)| current != admitted)
+        {
+            return Err(ServiceError::conflict(format!(
+                "Task '{}' changed state or state entry to '{}'; execution launch stopped",
+                task.id, task.status
+            )));
+        }
+        let roles: &[&str] = match role {
+            "coder" | "executor" | "worker" => &["coder", "executor", "worker"],
+            "reviewer" | "auditor" => &["reviewer", "auditor"],
+            _ => &[role],
+        };
+        if ExecutionRepo::latest_execution_by_task_and_roles(&*self.db, &task.id, roles)
+            .await?
+            .is_none_or(|latest| latest.id != execution_id)
+        {
+            return Err(ServiceError::conflict(format!(
+                "execution '{execution_id}' was superseded by a newer Task run"
+            )));
+        }
+        Ok(())
+    }
     /// Refuse paused Projects before placement or launch side effects. The
     /// execution INSERT still rechecks admission atomically for concurrent pauses.
     pub(in crate::task_service) async fn ensure_project_not_paused(

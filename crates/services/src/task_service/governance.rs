@@ -761,6 +761,10 @@ impl TaskService {
             created_at: issued_at.clone(),
             updated_at: issued_at,
         };
+        #[cfg(test)]
+        if replacing_lease.is_some() {
+            super::tests::launch_lease::before_reissue(&task.id).await;
+        }
         let issue_result = if let Some((
             expected_version,
             expected_workflow_definition,
@@ -1233,21 +1237,11 @@ impl TaskService {
         .map(Some)
     }
 
-    /// Verify a running execution's active WorkspaceLease and, when the
-    /// exact-match verification fails, recover once through the normal
-    /// issuance path instead of hard-failing the dispatch.
-    ///
-    /// Any Task-row mutation between lease issuance and this re-verify — a
-    /// role handoff, a retry-metadata clear, a concurrent transition — bumps
-    /// `task.version` and makes the stale lease fail the exact match even
-    /// though the execution's authority is otherwise intact. Recovery stays
-    /// fail-closed: only a lease held by this execution is revoked, the
-    /// reissue runs the full issuance validation (assignment authority is
-    /// re-resolved fresh, and issuance verifies the new lease), and exactly
-    /// one reissue attempt is made.
-    ///
-    /// Returns the fresh Task row the successful verification was performed
-    /// against, so callers do not keep using a stale snapshot.
+    /// Recover a stale Task-version grant without spending an execution retry.
+    /// Each replacement is atomic with retirement of the previous grant, and
+    /// each conflict rebuilds admission from current Task/execution/authority
+    /// facts. A changed precondition fails closed with its own reason.
+    /// Returns the fresh Task snapshot used by the successful verification.
     pub(super) async fn verify_or_reissue_active_workspace_lease(
         &self,
         task: db::Task,
@@ -1260,7 +1254,11 @@ impl TaskService {
             .verify_active_workspace_lease(&task, workspace, role, principal_id, execution_id)
             .await
         {
-            Ok(_lease) => return Ok(task),
+            Ok(_lease) => {
+                self.ensure_execution_launch_preconditions(&task, &task, role, execution_id)
+                    .await?;
+                return Ok(task);
+            }
             Err(error) => error,
         };
         let Some(stale) = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id).await?
@@ -1270,7 +1268,9 @@ impl TaskService {
         if stale.execution_id != execution_id {
             // Another execution owns the Task's active authority; this
             // attempt genuinely lost the race and must fail closed.
-            return Err(verify_error);
+            return Err(ServiceError::conflict(
+                "WorkspaceLease is owned by another execution",
+            ));
         }
         tracing::info!(
             task_id = %task.id,
@@ -1279,18 +1279,56 @@ impl TaskService {
             %verify_error,
             "reissuing this execution's WorkspaceLease after the Task row moved during dispatch"
         );
-        let mut fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-        // Rebuild the admission from the fresh Task/Project/workflow
-        // snapshot before reviving authority. In particular, do not let a
-        // stale execution role survive a state handoff merely because the
-        // same role exists in another workflow state. The first replacement
-        // attempt is atomic with retirement of `stale`; a Project/Task write
-        // racing that attempt rolls the retirement back, so one retry can
-        // rebuild against the newer snapshot without stranding the running
-        // execution.
-        for attempt in 0..2 {
+        const MAX_REISSUE_ATTEMPTS: u32 = 32;
+        // Keep the original grant's immutable authority; a benign version
+        // movement may refresh it but must never widen or rebind it.
+        let original = stale;
+        let original_capabilities =
+            serde_json::from_str::<Vec<String>>(&original.capabilities_json).map_err(|error| {
+                ServiceError::invalid_operation(format!(
+                    "invalid WorkspaceLease capability set: {error}"
+                ))
+            })?;
+        for attempt in 0..=MAX_REISSUE_ATTEMPTS {
+            let fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+            let stale = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::conflict("WorkspaceLease was revoked during launch")
+                })?;
+            if stale.execution_id != execution_id {
+                return Err(ServiceError::conflict(
+                    "WorkspaceLease is owned by another execution",
+                ));
+            }
+            let admission = async {
+                self.ensure_execution_launch_preconditions(&fresh_task, &task, role, execution_id)
+                    .await?;
+                let principal = self
+                    .validate_workspace_assignment(&fresh_task, role, principal_id)
+                    .await?;
+                let (repo, capability, base_ref) =
+                    self.workspace_lease_inputs(&fresh_task, workspace).await?;
+                if repo.id != original.repository_binding_id
+                    || base_ref != original.base_ref
+                    || original_capabilities != vec![capability.clone()]
+                    || original.assigned_principal_id != principal
+                    || original.capability_profile_revision != CAPABILITY_PROFILE_REVISION
+                    || capability_profile_digest(&capability) != original.capability_profile_digest
+                {
+                    return Err(ServiceError::conflict(
+                        "WorkspaceLease repository or capability authority changed during launch",
+                    ));
+                }
+                if workspace_lease_expired(&stale) {
+                    return Err(ServiceError::conflict(
+                        "WorkspaceLease expired during launch",
+                    ));
+                }
+                Ok(())
+            };
             let expected_effective_role = match self
                 .canonical_execution_role_for_task(&fresh_task, role)
                 .await
@@ -1304,6 +1342,21 @@ impl TaskService {
                     return Err(error);
                 }
             };
+            if let Err(error) = admission.await {
+                self.revoke_workspace_lease(&stale).await;
+                return Err(error);
+            }
+            // The last conflict may itself have changed a precondition. Read
+            // and validate that snapshot above before reporting contention.
+            if attempt == MAX_REISSUE_ATTEMPTS {
+                self.revoke_workspace_lease(&stale).await;
+                return Err(ServiceError::conflict(format!(
+                    "{}Task '{}' kept changing during {} lease replacement attempts",
+                    super::execution::WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX,
+                    task.id,
+                    MAX_REISSUE_ATTEMPTS,
+                )));
+            }
             let project = ProjectRepo::get_by_id(&*self.db, &fresh_task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", fresh_task.project_id.clone()))?;
@@ -1324,7 +1377,21 @@ impl TaskService {
                 )
                 .await;
             match replacement {
-                Ok(Some(_lease)) => return Ok(fresh_task),
+                Ok(Some(_lease)) => {
+                    let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
+                    if current.version == fresh_task.version {
+                        self.ensure_execution_launch_preconditions(
+                            &current,
+                            &task,
+                            role,
+                            execution_id,
+                        )
+                        .await?;
+                        return Ok(current);
+                    }
+                }
                 Ok(None) => {
                     let error = ServiceError::invalid_operation(
                         "WorkspaceLease reissue did not produce an active lease",
@@ -1332,37 +1399,46 @@ impl TaskService {
                     self.revoke_workspace_lease(&stale).await;
                     return Err(error);
                 }
-                Err(error)
-                    if attempt == 0
-                        && matches!(&error, ServiceError::Db(db::DbError::VersionConflict)) =>
-                {
-                    fresh_task = TaskRepo::get_by_id(&*self.db, &task.id, false)
-                        .await?
-                        .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                }
+                Err(ServiceError::Db(db::DbError::VersionConflict)) => {}
                 Err(error) => {
                     // The replacement transaction leaves `stale` active on
-                    // every failure. Compensate explicitly after the final
-                    // rebuilt admission attempt so a terminalized execution
+                    // every failure. Compensate after a genuine admission
+                    // refusal so a terminalized execution
                     // cannot retain an occupied Task slot.
                     self.revoke_workspace_lease(&stale).await;
                     return Err(error);
                 }
             }
+            tokio::time::sleep(std::time::Duration::from_millis(
+                (5_u64 << attempt.min(4)).min(50),
+            ))
+            .await;
         }
         unreachable!("WorkspaceLease reissue attempts are bounded")
     }
 
-    /// `verify_execution_workspace_authority` with the one-shot stale-lease
+    /// `verify_execution_workspace_authority` with bounded stale-lease
     /// reissue above. Used by `run_execution`'s in-flight re-verifications;
     /// the initial `start_execution` admission keeps the strict verify.
     pub(super) async fn verify_or_reissue_execution_workspace_authority(
         &self,
         execution: &db::Execution,
+        admitted_task: &db::Task,
     ) -> Result<db::Task> {
+        #[cfg(test)]
+        super::tests::launch_lease::before_launch(&execution.task_id).await;
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        self.canonical_execution_role_for_task(&task, &execution.role)
+            .await?;
+        self.ensure_execution_launch_preconditions(
+            &task,
+            admitted_task,
+            &execution.role,
+            &execution.id,
+        )
+        .await?;
         let Some(workspace_id) = execution.workspace_id.as_deref() else {
             return Err(ServiceError::invalid_operation(
                 "repository execution requires a scheduler WorkspaceLease-backed workspace",

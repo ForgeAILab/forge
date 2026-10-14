@@ -242,6 +242,7 @@ mod guards;
 pub(crate) use guards::is_agent_paused_pre_dispatch_failure;
 #[cfg(test)]
 pub(crate) use guards::DISK_PRE_DISPATCH_ERROR_PREFIX;
+pub(super) use guards::WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX;
 mod hooks;
 mod launch;
 pub(crate) mod ledger;

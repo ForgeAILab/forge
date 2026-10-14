@@ -3348,6 +3348,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Task launch now retries WorkspaceLease replacement across repeated harmless
+  Task writes with bounded backoff. Cancellation, holds, reassignment and changed
+  authority still stop launch; exhausted launch contention stays outside the
+  executor failure path and consumes no Task execution retry budget.
+
 - A subtask that cannot leave its merge state stops automatic reconciliation
   after eight failed Task-step attempts in that entry and shows the existing
   integration-admission failure park with owner recovery actions.

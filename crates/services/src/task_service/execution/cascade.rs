@@ -1364,9 +1364,20 @@ impl TaskService {
         execution: &Execution,
         allow_retry: bool,
     ) -> Result<()> {
+        if super::guards::is_workspace_lease_pre_dispatch_failure(execution) {
+            return Ok(());
+        }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        if execution.stopped_by.as_deref() == Some("system:dispatch")
+            && task
+                .condition
+                .reasons()
+                .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Ok(());
+        }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -3057,6 +3068,9 @@ fn executor_unavailable_dispatch_time(
 }
 
 pub(crate) fn should_block_task_for_failed_execution(execution: &Execution) -> bool {
+    if super::guards::is_workspace_lease_pre_dispatch_failure(execution) {
+        return false;
+    }
     matches!(
         execution.role.as_str(),
         "interactive" | "executor" | crate::workflow::default_roles::CODER

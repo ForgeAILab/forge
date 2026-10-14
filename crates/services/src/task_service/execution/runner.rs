@@ -519,7 +519,7 @@ impl TaskService {
         let worktree_path = worktree_path.as_path();
         // A Task-row mutation since lease issuance (role handoff, metadata
         // clear, concurrent transition) fails the exact-match verify; recover
-        // once through the normal issuance path instead of hard-failing, and
+        // with bounded retries through the normal issuance path, and
         // keep working against the fresh Task row.
         let task = match self
             .verify_or_reissue_active_workspace_lease(
@@ -673,9 +673,9 @@ impl TaskService {
         // a lease or a baseline supersession.  Re-read the execution/task
         // bindings and acknowledge the lease immediately before handing
         // control to an executor.  A stale lease left behind by a Task-row
-        // mutation is reissued once through the normal issuance path.
+        // mutation is reissued with bounded retries through the issuance path.
         let task = match self
-            .verify_or_reissue_execution_workspace_authority(&execution_before_launch)
+            .verify_or_reissue_execution_workspace_authority(&execution_before_launch, &task)
             .await
         {
             Ok(task) => task,
