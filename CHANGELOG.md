@@ -8,6 +8,22 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Retry is no longer offered on a Task whose implementation role has no
+  assigned Agent.** `available_actions` (REST Task detail and
+  `GET /api/v1/tasks/{id}/actions`, MCP, web) used to offer Retry on an
+  implementation state (`in_progress`, `merge_failed`, a custom workflow's
+  active state) when no coder/assignee role assignment existed, because a
+  previous run's Agent, the legacy `assignee_id` or a default Agent stood in
+  for it. Applying it never ran: `role_retry` was accepted (200) and then
+  parked `recovery_required: task ... has no assignment for workflow role
+  coder` with Retry offered again; `merge_fix_retry` without any available
+  Agent answered `400 validation_error: accepted role action lost its Agent`.
+  Retry now appears once a coder (or the state's role) is assigned; the park
+  names the missing assignment ("Assign a coder Agent before retrying, or
+  Cancel.") and Cancel stays offered. A Project pause still does not hide a
+  merge fix Retry whose Agent is assigned: the accepted retry waits for the
+  pause to end, as before.
+
 - **Dependency links and subtask reorders that make Tasks wait on each
   other are refused.** `POST /api/v1/tasks/{id}/dependencies` (MCP
   `forge_add_task_dependency`, the lead's `lead.subtask create` links) and
@@ -4213,6 +4229,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   never reached the ledger. It is admitted at the models.dev catalogue price
   under the Project owner, else the Agent owner, else the instance's first
   administrator.
+
+- Transient workflow guard and review-refresh precondition failures now use the
+  Task step queue's eight-attempt retry bound before parking for the owner.
+  Transient means a busy or locked database, a version conflict from a
+  concurrent write, or a checkout read that can clear by itself (interrupted,
+  would block, timed out, resource busy). A missing checkout path or a refused
+  permission is deterministic and parks at once.
+- Retry on an imported quarantined merge accepts an offline checkout owner,
+  names the machine it waits for, and continues when that owner reconnects.
+- Startup releases Task-step claims left by the previous process before workers
+  start, so an orphan's 60-second lease no longer blocks the first Task write.
+  A claim the starting process already holds (an inline Task write made before
+  the workers start) keeps its owner and is not run twice.
+- Durable Task command replies preserve error kinds and public fields, including
+  version conflicts, missing resources, policy refusals and task-busy details.
 
 ### Known issues
 

@@ -22,7 +22,7 @@ pub(super) async fn get_role_assignment(
     crate::task_hierarchy::effective_role_assignment(&ctx.db, &task, role)
         .await
         .map(|resolved| resolved.map(|resolved| resolved.assignment))
-        .map_err(|error| error.to_string())
+        .map_err(crate::workflow::hook_error_reason)
 }
 
 pub(super) fn execution_guard_roles(role: &str) -> Vec<&str> {
@@ -39,7 +39,7 @@ pub(super) async fn has_running_execution_for_roles(
 ) -> Result<bool, String> {
     let executions = ExecutionRepo::list_running_by_task(&*ctx.db, &ctx.task_id)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(crate::workflow::hook_error_reason)?;
     Ok(executions
         .iter()
         .any(|execution| roles.iter().any(|role| execution.role == *role)))
@@ -48,7 +48,7 @@ pub(super) async fn has_running_execution_for_roles(
 pub(super) async fn task(ctx: &HookContext) -> Result<db::Task, String> {
     TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(crate::workflow::hook_error_reason)?
         .ok_or_else(|| format!("task not found: {}", ctx.task_id))
 }
 
@@ -63,14 +63,11 @@ pub(crate) async fn task_is_read_only(db: &db::SqliteDb, task: &db::Task) -> Res
     let capability_class = db
         .task_governance_capability_class(&task.id)
         .await
-        .map_err(|error| match error {
-            db::DbError::Sqlx(error) => error.to_string(),
-            error => error.to_string(),
-        })?
+        .map_err(crate::workflow::hook_error_reason)?
         .flatten();
     crate::execution_setup::classify_task_execution(&task.task_type, capability_class.as_deref())
         .map(|class| class.is_read_only())
-        .map_err(|error| error.to_string())
+        .map_err(crate::workflow::hook_error_reason)
 }
 
 pub(super) async fn latest_executor_execution(ctx: &HookContext) -> Option<Execution> {

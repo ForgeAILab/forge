@@ -22,6 +22,98 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn open_item_4_durable_task_command_error_keeps_its_rest_status_and_fields() {
+    let directory = common::TestDir::new("durable-command-error");
+    let harness = common::test_app(directory.path(), "durable-command-error").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Durable errors"}),
+        StatusCode::OK,
+    )
+    .await;
+    let task: TaskResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"error transport"}),
+        StatusCode::OK,
+    )
+    .await;
+    let errors: Vec<(StatusCode, Box<dyn Fn() -> services::ServiceError>)> = vec![
+        (
+            StatusCode::CONFLICT,
+            Box::new(|| db::DbError::VersionConflict.into()),
+        ),
+        (
+            StatusCode::CONFLICT,
+            Box::new(|| {
+                db::DbError::TaskVersionConflict {
+                    expected: 2,
+                    actual: 3,
+                }
+                .into()
+            }),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            Box::new(|| services::ServiceError::not_found("execution", "missing")),
+        ),
+        (
+            StatusCode::BAD_REQUEST,
+            Box::new(|| services::ServiceError::invalid_operation("deterministic refusal")),
+        ),
+        (
+            StatusCode::FORBIDDEN,
+            Box::new(|| services::ServiceError::AuthorizationDenied {
+                message: "policy refusal".into(),
+            }),
+        ),
+        (
+            StatusCode::PRECONDITION_FAILED,
+            Box::new(|| services::ServiceError::GuardRejection {
+                guard: "dependency_gate".into(),
+                reason: "unfinished dependency".into(),
+            }),
+        ),
+        (
+            StatusCode::CONFLICT,
+            Box::new(|| services::ServiceError::TaskBusy {
+                pending_steps: 3,
+                retry_after_ms: 250,
+            }),
+        ),
+    ];
+    for (status, make_error) in errors {
+        let mut replies = Vec::new();
+        for durable in [false, true] {
+            services::worker_runtime::queue::test_hooks::inject_command_error(
+                &harness.state.task_service,
+                &task.id,
+                make_error(),
+                durable,
+            );
+            let response = common::raw_json_request(
+                &harness.app,
+                Method::POST,
+                &format!("/api/v1/tasks/{}/actions", task.id),
+                json!({"version":task.version,"action":{"verb":"hold"}}),
+            )
+            .await;
+            assert_eq!(response.status(), status, "durable={durable}");
+            let mut body: Value = common::parse_response(response, status).await;
+            body.as_object_mut().unwrap().remove("request_id");
+            replies.push(body);
+        }
+        assert_eq!(
+            replies[0], replies[1],
+            "durable replies preserve status, code, message and public fields"
+        );
+    }
+}
+
+#[tokio::test]
 async fn forge_happy_path_end_to_end() {
     let repo_dir = common::TestDir::new("forge-happy-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;

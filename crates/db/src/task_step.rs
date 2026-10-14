@@ -417,6 +417,32 @@ impl Drop for TaskStepActivity {
 use crate::check_run::CANCEL_UNWATCHED_QUEUED_RUNS;
 
 impl SqliteDb {
+    pub async fn task_command_pending(&self, task_id: &str, operation: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND kind='command' AND status IN ('pending','claimed') AND json_extract(payload_json,'$.operation')=?)")
+            .bind(task_id).bind(operation).fetch_one(self.pool()).await?)
+    }
+    /// Startup only, before any Task worker runs. No claim from the previous
+    /// process can still own local work. Keep checkpoints, attempts and replies;
+    /// unfinished steps become immediately claimable and settled replies unlock.
+    /// A claim this process holds (an inline Task writer that ran before the
+    /// workers started) is live work and keeps its owner. A second process on
+    /// the same database is excluded by the data root's `runtime.lock`.
+    pub async fn release_orphaned_task_step_claims(&self) -> Result<u64> {
+        let now = now_rfc3339();
+        let live: Vec<String> = self
+            .task_step_activity
+            .lock()
+            .expect("step activity")
+            .values()
+            .map(|(_, owner)| owner.clone())
+            .collect();
+        let live = serde_json::to_string(&live).map_err(|e| DbError::Check(e.to_string()))?;
+        let changed = sqlx::query("UPDATE task_step SET status=CASE WHEN status='claimed' THEN 'pending' ELSE status END,claimed_by=NULL,lease_until=NULL,available_at=CASE WHEN status='claimed' THEN ? ELSE available_at END,updated_at=? WHERE CASE WHEN claimed_by IS NULL THEN lease_until IS NOT NULL ELSE claimed_by NOT IN (SELECT value FROM json_each(?)) END")
+            .bind(&now).bind(&now).bind(&live).execute(self.pool()).await?.rows_affected();
+        self.domain_event_notify().notify_waiters();
+        Ok(changed)
+    }
+
     /// Check lease ownership and the producing status entry in the writer
     /// transaction that records a hook effect or checkpoint.
     pub async fn fence_hook_in_tx(

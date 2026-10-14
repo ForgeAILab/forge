@@ -91,7 +91,7 @@ impl HookAction for CheckRetryBudget {
                 Ok(budget) => budget,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     };
                 }
             };
@@ -105,7 +105,7 @@ impl HookAction for CheckRetryBudget {
                 Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     }
                 }
             };
@@ -130,7 +130,7 @@ impl HookAction for CheckRetryBudget {
                 Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     }
                 }
             };
@@ -144,7 +144,7 @@ impl HookAction for CheckRetryBudget {
                 Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     }
                 }
             };
@@ -180,7 +180,7 @@ impl HookAction for CheckRetryBudget {
             .await
             {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
             return HookResult::Ok;
@@ -211,7 +211,7 @@ impl HookAction for RequirePlanChecklistComplete {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         };
@@ -225,7 +225,7 @@ impl HookAction for RequirePlanChecklistComplete {
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }
@@ -243,7 +243,10 @@ impl HookAction for RequirePlanChecklistComplete {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("workspace unavailable: {error}"),
+                    reason: format!(
+                        "workspace unavailable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
@@ -252,7 +255,10 @@ impl HookAction for RequirePlanChecklistComplete {
             Ok(resolved) => resolved,
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("plan checklist unreadable: {error}"),
+                    reason: format!(
+                        "plan checklist unreadable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
@@ -270,7 +276,10 @@ impl HookAction for RequirePlanChecklistComplete {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("plan checklist unreadable: {error}"),
+                    reason: format!(
+                        "plan checklist unreadable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
@@ -343,7 +352,10 @@ impl HookAction for DependencyGate {
                 Ok(deps) => deps,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("dependency check failed: {error}"),
+                        reason: format!(
+                            "dependency check failed: {}",
+                            crate::workflow::hook_error_reason(error)
+                        ),
                     };
                 }
             };
@@ -364,7 +376,10 @@ impl HookAction for DependencyGate {
                 Ok(_) => {}
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("dependency check failed: {error}"),
+                        reason: format!(
+                            "dependency check failed: {}",
+                            crate::workflow::hook_error_reason(error)
+                        ),
                     };
                 }
             }
@@ -386,7 +401,7 @@ impl HookAction for DependencyGate {
                 .await
                 {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     };
                 }
             }
@@ -418,7 +433,10 @@ impl HookAction for RequireUpstreamRolesCompleted {
             Ok(logs) => logs,
             Err(error) => {
                 return HookResult::Skipped {
-                    reason: format!("transition log unavailable: {error}"),
+                    reason: format!(
+                        "transition log unavailable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };

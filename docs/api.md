@@ -6241,6 +6241,19 @@ conflict rather than applying twice. The web shows "Queued; it will apply after 
 current step" for `task_busy`, and `forge-ctl` prints the pending step count and the
 retry hint. MCP exposes the same code and details as a tool error.
 
+A durable reply read after a lost live reply has the same HTTP status, code,
+message and details as the inline result (including version conflict 409,
+missing resource 404, policy refusal 403 and task-busy 409). Invalid operations
+retain the existing 400 `validation_error` mapping. Startup releases orphaned
+Task-step claims before workers start; a previous process's claim does not
+add a 60-second task-busy delay.
+
+An imported quarantined merge may accept Retry while its checkout machine is
+offline. Its Task condition states integration `deferred`, cause
+`owner_offline`, and `owner_id`; reconnect continues the accepted retry. A
+failed Task without its implementation Agent assignment offers no role Retry:
+its diagnostic names the missing assignment and Cancel remains available.
+
 Running the command's own step does not count as waiting, and most own steps are
 short. These are bounded only by their own work: `claim`/start with Project
 environment checks (each check at most 300 seconds) and Cancel/Hold of remote

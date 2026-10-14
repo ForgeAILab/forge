@@ -11,6 +11,32 @@ use super::*;
 pub const UNOWNED_QUARANTINED_IMPORT: &str = "a.current=0 AND a.state='quarantined' AND a.failure_kind='corrupt_import' AND json_extract(a.import_source_json,'$.decision.reason')='missing execution or pinned workspace' AND a.effect_intent_json IS NULL AND a.operation_id IS NULL AND a.current_operation_state IS NULL AND NOT EXISTS(SELECT 1 FROM integration_attempt successor WHERE successor.task_ref=a.task_ref AND successor.id<>a.id) AND EXISTS(SELECT 1 FROM task entry WHERE entry.id=a.task_ref AND entry.status=a.expected_status AND entry.status_epoch=a.expected_epoch AND entry.deleted_at IS NULL)";
 
 impl SqliteDb {
+    /// An owner accepted Retry, but its imported candidate cannot be read
+    /// until this checkout owner reconnects. Keep the import and its evidence.
+    pub async fn wait_quarantined_import_retry_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt: &IntegrationAttempt,
+        daemon_id: &str,
+    ) -> Result<()> {
+        self.fence_current_step_in_tx(tx).await?;
+        let changed = sqlx::query("UPDATE integration_attempt SET import_source_json=json_set(import_source_json,'$.retry_owner',?),revision=revision+1,updated_at=? WHERE id=? AND revision=? AND state='quarantined' AND import_source_json IS NOT NULL AND effect_intent_json IS NULL AND COALESCE(current_operation_state,'') NOT IN ('running','uncertain')")
+            .bind(daemon_id).bind(now_rfc3339()).bind(&attempt.id).bind(attempt.revision)
+            .execute(&mut **tx).await?.rows_affected();
+        if changed != 1 {
+            return Err(DbError::VersionConflict);
+        }
+        Ok(())
+    }
+
+    pub async fn pending_quarantined_import_retry(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<IntegrationAttempt>> {
+        sqlx::query("SELECT a.* FROM integration_attempt a JOIN task t ON t.id=a.task_ref AND t.status=a.expected_status AND t.status_epoch=a.expected_epoch WHERE a.task_ref=? AND a.state='quarantined' AND json_type(a.import_source_json,'$.retry_owner')='text' AND t.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM integration_attempt s WHERE s.predecessor_attempt_id=a.id)")
+            .bind(task_id).fetch_optional(self.pool()).await?.map(map_attempt).transpose()
+    }
+
     pub async fn unowned_quarantined_import(
         &self,
         task_id: &str,

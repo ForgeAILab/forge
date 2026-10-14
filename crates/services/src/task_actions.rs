@@ -173,6 +173,19 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         execution.status == ExecutionStatus::Running && execution.role != "interactive"
     });
     let role = crate::workflow::effective_role(state);
+    let retry_role = crate::workflow::action_role(workflow, &task.status);
+    let retry_role_assigned = retry_role.is_some_and(|role| {
+        let role = if role == "executor" { "coder" } else { role };
+        snapshot
+            .role_assignments
+            .iter()
+            .find(|assignment| assignment.role_name == role)
+            .map(|assignment| {
+                assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                    && assignment.assignee_id.is_some()
+            })
+            .unwrap_or(task.assignee_type.as_deref() == Some("agent") && task.assignee_id.is_some())
+    });
     let current_executions: Vec<_> = snapshot
         .executions
         .iter()
@@ -1172,6 +1185,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             }
         };
         if state.kind != StateKind::Backlog
+            && (!matches!(reason, "role_retry" | "merge_fix_retry") || retry_role_assigned)
             && !matches!(
                 condition,
                 Some(
@@ -1184,7 +1198,9 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             )
             && (!snapshot.coordination_root || state.kind == StateKind::Gate)
             && ((role.is_some() && (snapshot.has_agent && !snapshot.project_paused))
-                || (reason != "role_retry" && reason != "initial_retry")
+                // A merge fix needs its Agent; a Project pause only delays it.
+                || (reason == "merge_fix_retry" && snapshot.has_agent)
+                || !matches!(reason, "role_retry" | "initial_retry" | "merge_fix_retry")
                 || (state.kind == StateKind::Initial
                     && (snapshot.has_agent && !snapshot.project_paused)
                     && task.status != "backlog"))
@@ -1665,7 +1681,27 @@ pub async fn load_snapshot(
         .is_empty();
     let selected_role = crate::workflow::action_role(&workflow, &task.status);
     let action_agent_id = select_action_agent(db, &task, selected_role, connections).await?;
-    let has_agent = action_agent_id.is_some();
+    let retry_needs_assignment = workflow
+        .states
+        .iter()
+        .find(|state| state.name == task.status)
+        .is_some_and(|state| state.kind == StateKind::Active)
+        || (task.status == "merging"
+            && task_condition(&task).is_some_and(FailureKind::is_merge_recoverable));
+    let assigned_agent = if retry_needs_assignment {
+        match selected_role {
+            Some(role) => crate::task_hierarchy::effective_role_assignment(db, &task, role)
+                .await?
+                .is_some_and(|resolved| {
+                    resolved.assignment.assignee_type == Some(db::AssigneeKind::Agent)
+                        && resolved.assignment.assignee_id.is_some()
+                }),
+            None => false,
+        }
+    } else {
+        true
+    };
+    let has_agent = action_agent_id.is_some() && assigned_agent;
     let project = db::ProjectRepo::get_by_id(db, &task.project_id).await?;
     let recovery_budget_limit = project
         .as_ref()
@@ -2114,6 +2150,35 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub(crate) use super::test_support::snapshot;
+
+    #[test]
+    fn open_item_5_failure_without_a_coder_does_not_offer_an_inapplicable_repair_retry() {
+        for state in ["in_progress", "merge_failed"] {
+            let mut s = snapshot(state, Some(FailureKind::ExecutorFailed));
+            s.task.assignee_id = None;
+            s.task.assignee_type = None;
+            s.has_agent = false;
+            let offers = projected_actions(&s);
+            assert!(
+                !offers.iter().any(|offer| offer.action.verb() == "retry"),
+                "{state}: {offers:?}"
+            );
+            assert!(offers.iter().any(|offer| offer.action.verb() == "cancel"));
+        }
+    }
+
+    /// A merge fix with an Agent is offered while the Project is paused: the
+    /// accepted retry waits for the pause to end, as it did before.
+    #[test]
+    fn open_items_fix_merge_fix_retry_with_an_agent_stays_offered_during_a_pause() {
+        let mut s = snapshot("merge_failed", Some(FailureKind::MergeConflict));
+        s.project_paused = true;
+        let offers = projected_actions(&s);
+        assert!(
+            offers.iter().any(|offer| offer.reason == "merge_fix_retry"),
+            "{offers:?}"
+        );
+    }
 
     pub(crate) fn integration_conditions() -> Vec<db::TaskCondition> {
         use api_types::{

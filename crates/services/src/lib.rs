@@ -338,7 +338,7 @@ pub use workspace_execution_lock::WorkspaceExecutionLockManager;
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
 /// Why a lead operation was refused. The value is the public reason code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LeadRefusal {
     /// The target is not this root or one of its subtasks.
     OutsideSubtree,
@@ -372,7 +372,7 @@ impl LeadRefusal {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, serde::Serialize)]
 pub enum ServiceError {
     #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
     TaskBusy {
@@ -402,13 +402,15 @@ pub enum ServiceError {
     },
 
     #[error(transparent)]
-    Db(db::DbError),
+    Db(#[serde(with = "worker_runtime::queue::command_reply::database")] db::DbError),
 
     #[error(transparent)]
-    Git(git::GitError),
+    Git(#[serde(with = "worker_runtime::queue::command_reply::git_error")] git::GitError),
 
     #[error(transparent)]
-    Review(review::ReviewError),
+    Review(
+        #[serde(with = "worker_runtime::queue::command_reply::review_error")] review::ReviewError,
+    ),
 
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: String },

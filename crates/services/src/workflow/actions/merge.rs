@@ -799,6 +799,25 @@ impl HookAction for CheckMergeFixBudget {
 /// safety net.
 pub struct RequireConflictMarkersResolved;
 
+#[cfg(test)]
+pub(crate) mod guard_test_faults {
+    use crate::ServiceError;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn faults() -> &'static Mutex<HashMap<String, ServiceError>> {
+        static FAULTS: OnceLock<Mutex<HashMap<String, ServiceError>>> = OnceLock::new();
+        FAULTS.get_or_init(Default::default)
+    }
+    pub(crate) fn inject(step_id: &str, error: ServiceError) {
+        faults().lock().unwrap().insert(step_id.to_owned(), error);
+    }
+    pub(super) fn take() -> Option<ServiceError> {
+        let id = db::task_writer::current_step_id()?;
+        faults().lock().unwrap().remove(&id)
+    }
+}
+
 #[async_trait]
 impl HookAction for RequireConflictMarkersResolved {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
@@ -819,7 +838,15 @@ impl HookAction for RequireConflictMarkersResolved {
                 reason: "merge service unavailable".to_string(),
             };
         };
-        match merge_service.unresolved_handoff_markers(&ctx.task_id).await {
+        let checked = async {
+            #[cfg(test)]
+            if let Some(error) = guard_test_faults::take() {
+                return Err(error);
+            }
+            merge_service.unresolved_handoff_markers(&ctx.task_id).await
+        }
+        .await;
+        match checked {
             Ok(paths) if paths.is_empty() => HookResult::Ok,
             Ok(paths) => HookResult::Failed {
                 reason: format!(
@@ -828,7 +855,7 @@ impl HookAction for RequireConflictMarkersResolved {
                 ),
             },
             Err(error) => HookResult::Failed {
-                reason: format!("conflict marker check failed: {error}"),
+                reason: format!("conflict marker check failed: {}", crate::workflow::hook_error_reason(error)),
             },
         }
     }

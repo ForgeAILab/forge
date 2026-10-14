@@ -892,6 +892,16 @@ impl RuntimeSupervisor {
             return Ok(0);
         }
 
+        // As crash recovery: a failure stops Solo, and the server keeps
+        // serving with its workers; the orphan's lease lapses on its own.
+        match self.runtime.db.release_orphaned_task_step_claims().await {
+            Ok(_) => {}
+            Err(error) if self.mode == RuntimeAssemblyMode::Solo => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(%error, "releasing the previous process's Task-step claims failed")
+            }
+        }
+
         let recovered = match self.runtime.crash_recovery.run().await {
             Ok(recovered) => recovered,
             Err(error) if self.mode == RuntimeAssemblyMode::Solo => return Err(error),
@@ -1254,6 +1264,133 @@ mod tests {
         assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
         assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
         assert_eq!(COMMON_WORKERS[18], RuntimeWorker::IntegrationQueue);
+    }
+
+    #[tokio::test]
+    async fn open_item_3_startup_releases_a_crash_orphaned_task_claim_before_the_first_write() {
+        use db::{TaskRepo, TaskStepRepo};
+        let (_data_dir, runtime) = runtime().await;
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('restart-project','restart',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('restart-task','restart-project','old','backlog',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        let mut tx = db::begin_immediate(runtime.db.pool()).await.unwrap();
+        runtime
+            .db
+            .enqueue_task_mutation_in_tx(
+                &mut tx,
+                "restart-task",
+                db::TaskMutation::Sql {
+                    task_id: "restart-task".into(),
+                    query: "UPDATE task SET title='recovered' WHERE id='restart-task'".into(),
+                    arguments: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let orphan = runtime
+            .db
+            .claim_step(
+                "previous-process",
+                Some("restart-task"),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(orphan.status, "claimed");
+        runtime
+            .db
+            .set_claimed_task_step_wait(Duration::from_millis(250));
+        let mut supervisor = RuntimeSupervisor::new(runtime.clone(), RuntimeAssemblyMode::Solo);
+        supervisor.start().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            db::task_writer::TaskQuery::new(
+                &runtime.db,
+                "restart-task",
+                "UPDATE task SET title='first write' WHERE id='restart-task'",
+            )
+            .execute(runtime.db.pool()),
+        )
+        .await;
+        supervisor.shutdown().await.unwrap();
+        assert_eq!(
+            result
+                .expect("first write must not wait for the orphan's lease")
+                .expect("first write applies"),
+            1
+        );
+        assert_eq!(
+            TaskRepo::get_by_id(&*runtime.db, "restart-task", false)
+                .await
+                .unwrap()
+                .unwrap()
+                .title,
+            "first write"
+        );
+    }
+
+    /// A failed release of the previous process's claims is not a reason to
+    /// serve without workers: the server continues, as it does after a failed
+    /// crash recovery, and the orphan's lease lapses on its own.
+    #[tokio::test]
+    async fn open_items_fix_server_starts_its_workers_when_the_claim_release_fails() {
+        use db::TaskStepRepo;
+        let (_data_dir, runtime) = runtime().await;
+        let now = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO project(id,name,created_at,updated_at) VALUES('poison-project','p',?,?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(runtime.db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('poison-task','poison-project','p','backlog',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        runtime
+            .db
+            .enqueue_step(&db::EnqueueTaskStep {
+                id: "poison-step".into(),
+                task_id: "poison-task".into(),
+                kind: "cascade".into(),
+                payload_json: "{}".into(),
+                causation_step_id: None,
+                causation_key: "poison".into(),
+                chain_id: "poison".into(),
+                chain_position: 1,
+                expected_status: "backlog".into(),
+                expected_version: 1,
+                expected_epoch: None,
+                lane: "fast".into(),
+                available_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .db
+            .claim_step(
+                "previous-process",
+                Some("poison-task"),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("CREATE TRIGGER poison_release BEFORE UPDATE ON task_step WHEN OLD.claimed_by='previous-process' BEGIN SELECT RAISE(ABORT,'injected release failure'); END")
+            .execute(runtime.db.pool())
+            .await
+            .unwrap();
+        let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
+        supervisor
+            .start()
+            .await
+            .expect("a failed claim release does not stop the server's runtime");
+        assert!(supervisor.worker_handle_count() > 0);
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]

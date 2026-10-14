@@ -295,6 +295,12 @@ impl TaskService {
                     let task = self.command_task(&id).await?;
                     encode(Box::pin(self.reconcile_integration_admission(&task)).await?)
                 }
+                "retry_integration" => {
+                    let (id,): (String,) = serde_json::from_value(command.arguments.clone())
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
+                    let task = self.command_task(&id).await?;
+                    encode(Box::pin(self.retry_integration(&task)).await?)
+                }
                 "dispatch_queued_recovery" => {
                     let (id,): (String,) = serde_json::from_value(command.arguments.clone())
                         .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;

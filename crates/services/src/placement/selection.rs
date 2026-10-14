@@ -178,7 +178,7 @@ pub struct PlacementSelection {
     pub selection_reason: SelectionReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 #[error("no compatible workspace placement for task {task_id}{hint}", hint = self.upgrade_hint())]
 pub struct PlacementUnavailable {
     pub task_id: String,

@@ -22,6 +22,76 @@ async fn fixture(
         .unwrap()
 }
 
+#[tokio::test]
+async fn open_item_5_removed_coder_names_the_assignment_and_cancel_applies() {
+    let db = Arc::new(sqlite_db().await);
+    let (project, _, _) = seed_project_repo(&db).await;
+    let agent = seed_agent(&db).await;
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::new(64)));
+    for state in ["in_progress", "merge_failed", "working"] {
+        if state == "working" {
+            let mut workflow =
+                crate::workflow::default_autonomous_workflow::default_autonomous_workflow();
+            workflow
+                .states
+                .iter_mut()
+                .find(|state| state.name == "working")
+                .unwrap()
+                .role = None;
+            sqlx::query("UPDATE project SET workflow_definition=?,version=version+1 WHERE id=?")
+                .bind(serde_json::to_string(&workflow).unwrap())
+                .bind(&project)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let task = fixture(
+            &db,
+            &project,
+            &agent,
+            state,
+            Some(FailureKind::CascadeFailed),
+        )
+        .await;
+        service
+            .remove_role(&task.id, "coder", false, false)
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let offers = service
+            .task_action_offers(
+                &task.id,
+                &api_types::Actor::user(api_types::UserActionSource::Test),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !offers
+                .available_actions
+                .iter()
+                .any(|offer| offer.action.verb() == "retry"),
+            "{state}: {offers:?}"
+        );
+        let message = task.condition.read().message().unwrap();
+        assert!(
+            message.contains(if state == "working" {
+                "Assign an implementation Agent"
+            } else {
+                "Assign a coder Agent"
+            }),
+            "{state}: {message}"
+        );
+        service
+            .perform_task_action(&task.id, TaskAction::Cancel { reason: None }, task.version)
+            .await
+            .unwrap();
+        assert_eq!(service.drain(&task.id).await.unwrap().status, "cancelled");
+    }
+}
+
 /// One state's slice of what was a single serial test over every state and
 /// failure kind on one database.
 async fn every_offer_applies_in(state: &str) {
