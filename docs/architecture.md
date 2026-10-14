@@ -3214,6 +3214,16 @@ disposition and decision-incident resolution commit together. Consumer
 `after_commit` hooks hold no durable effect; Attention only emits its budget-stall
 bus notification for the zero configured-budget branch, using the budget scope.
 
+Setup-required decisions retain each Attention item's canonical incident digest,
+including when the startup sweep finds several blockers in the same Project.
+Only a prepared turn uses a batch admission digest. The latest-decision row is
+updated only when its digest, disposition, reason or responder identity changes;
+an unchanged startup sweep writes no wake audit, disposition, latest-decision
+timestamp or consumer checkpoint. Event projection commits its decision and
+disposition with the source checkpoint in the worker's one transaction. The
+sweep reads open Attention level state, so its historical causation event does
+not imply a replay of the event-consumer cursor.
+
 Mission Control and Agent detail are bounded read models over authoritative
 Task/identity/session/commitment/event state. They show needs-attention,
 review-ready and active work, embedded-agent health/current scope/focus,

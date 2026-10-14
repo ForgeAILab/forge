@@ -1180,7 +1180,11 @@ impl SqliteDb {
                  SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM attention_projection WHERE id=?)
                  ON CONFLICT(attention_id) DO UPDATE SET incident_digest=excluded.incident_digest,
                     disposition=excluded.disposition, reason=excluded.reason,
-                    identity_id=excluded.identity_id, updated_at=excluded.updated_at")
+                    identity_id=excluded.identity_id, updated_at=excluded.updated_at
+                 WHERE agent_wake_attention_latest.incident_digest IS NOT excluded.incident_digest
+                    OR agent_wake_attention_latest.disposition IS NOT excluded.disposition
+                    OR agent_wake_attention_latest.reason IS NOT excluded.reason
+                    OR agent_wake_attention_latest.identity_id IS NOT excluded.identity_id")
 .bind(input.attention_id)
 .bind(input.incident_digest)
 .bind(input.disposition)

@@ -3348,6 +3348,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An unchanged restart no longer creates another setup-required wake decision
+  when a Project has several open blockers, or refreshes unchanged Attention
+  wake timestamps. Setup decisions keep each incident's canonical digest;
+  real setup changes still admit one blocker wake for the Project batch.
+
 - Task launch now retries WorkspaceLease replacement across repeated harmless
   Task writes with bounded backoff. Cancellation, holds, reassignment and changed
   authority still stop launch; exhausted launch contention stays outside the

@@ -3253,3 +3253,470 @@ async fn incident_stored_by_the_deployed_build_survives_this_builds_first_pass()
         "at most one wake for one change"
     );
 }
+
+// Exercise the seven event consumers with fresh runtime objects, including the
+// startup Attention tick, then flush the ignored tail before stopping.
+async fn restart_wake_cycle(db: &Arc<SqliteDb>, service: Arc<AttentionService>) {
+    use services::worker_runtime::{conflict_hotspot::ConflictHotspotConsumer, WorkerRuntime};
+    let bus = Arc::new(events::EventBus::new(32));
+    let notifications = Arc::new(services::NotificationService::new(db.clone(), bus.clone()));
+    let tasks = Arc::new(services::TaskService::new_for_test(db.clone(), bus.clone()));
+    let attention = WorkerRuntime::new(db.clone(), service);
+    let wake = WorkerRuntime::new(
+        db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(db.clone())),
+    );
+    let coordination = WorkerRuntime::new(
+        db.clone(),
+        Arc::new(services::CoordinationOutcomeConsumer::new(db.clone())),
+    );
+    let memory = WorkerRuntime::new(
+        db.clone(),
+        Arc::new(services::AgentChatMemoryConsumer::new(db.clone())),
+    );
+    let hooks = WorkerRuntime::new(
+        db.clone(),
+        Arc::new(services::ProjectHookService::new(
+            db.clone(),
+            bus,
+            tasks,
+            notifications.clone(),
+        )),
+    );
+    let notifications = WorkerRuntime::new(db.clone(), notifications);
+    let conflicts = WorkerRuntime::new(
+        db.clone(),
+        Arc::new(ConflictHotspotConsumer::new(db.clone())),
+    );
+    for _ in 0..3 {
+        attention.run_once(100).await.unwrap();
+        wake.run_once(100).await.unwrap();
+        coordination.run_once(100).await.unwrap();
+        memory.run_once(100).await.unwrap();
+        hooks.run_once(100).await.unwrap();
+        notifications.run_once(100).await.unwrap();
+        conflicts.run_once(100).await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        tokio::time::resume();
+    }
+}
+
+const RESTART_WAKE_TABLES: &[&str] = &[
+    "domain_event",
+    "agent_wake_disposition",
+    "agent_wake_disposition_current",
+    "event_consumer_cursor",
+    "agent_wake_attention_latest",
+];
+
+async fn restart_wake_snapshot(db: &SqliteDb) -> Vec<String> {
+    use sqlx::Row;
+    let mut result = Vec::new();
+    for table in RESTART_WAKE_TABLES {
+        let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        let fields = columns
+            .iter()
+            .map(|c| format!("'{c}',\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        result.push(
+            sqlx::query_scalar(&format!(
+            "SELECT json_group_array(json_object({fields})) FROM (SELECT * FROM {table} ORDER BY 1)"
+        ))
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        );
+    }
+    result
+}
+
+async fn restart_wake_observe_writes(db: &SqliteDb) {
+    sqlx::query("CREATE TABLE restart_wake_writes (table_name TEXT, operation TEXT)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for table in RESTART_WAKE_TABLES {
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            sqlx::raw_sql(&format!(
+                "CREATE TRIGGER observe_{table}_{operation} AFTER {operation} ON {table} BEGIN INSERT INTO restart_wake_writes VALUES ('{table}', '{operation}'); END;"
+            )).execute(db.pool()).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn restart_wake_imported_merges_are_write_free_and_a_real_change_wakes_once() {
+    let db = database().await;
+    let project_id = "restart-merge-project".to_owned();
+    let at = "2026-01-01T00:00:00Z";
+    let owner = "restart-owner";
+    db::UserRepo::create_user(
+        &*db,
+        &db::User {
+            id: owner.into(),
+            email: "restart@example.test".into(),
+            password_hash: "test".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: at.into(),
+            updated_at: at.into(),
+        },
+    )
+    .await
+    .unwrap();
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            owner_id: Some(owner.into()),
+            name: "Imported merges".into(),
+            primary_repo_id: None,
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut task_ids = Vec::new();
+    for (index, title) in ["merge_held", "merge_paused"].into_iter().enumerate() {
+        let task = project_task(&db, &project_id, title).await;
+        let attempt = format!("imported-{title}");
+        sqlx::query("INSERT INTO integration_attempt (id,task_id,task_ref,project_ref,queue_seq,current,admission_key,expected_status,expected_epoch,observed_task_version,enqueued_at,state,failure_kind,failure_message,import_source_json,created_at,updated_at) VALUES (?,?,?,?,1,0,?,'merging',0,1,?,'quarantined','owner_required','missing execution or pinned workspace','{}',?,?)")
+            .bind(&attempt).bind(&task.id).bind(&task.id).bind(&project_id).bind(&attempt)
+            .bind(at).bind(at).bind(at).execute(db.pool()).await.unwrap();
+        let interruption = serde_json::json!({"source":"integration", "cause":"owner_required", "kind":"review_needs_owner", "owner_id":null, "reason":"missing execution or pinned workspace"});
+        let reason = serde_json::json!({"kind":"deferred", "attempt_id":attempt, "cause":"owner_required", "owner_id":null, "message":"missing execution or pinned workspace"});
+        let mut evidence =
+            serde_json::to_value(db::task_condition::ConditionEvidence::default()).unwrap();
+        evidence["material"] =
+            serde_json::json!({"requires_intervention":true,"interruption":interruption});
+        evidence["witnesses"] = serde_json::json!([{"kind":"integration", "reason":reason}]);
+        let condition = serde_json::json!({"kind":"parked", "primary":{"kind":"integration", "reason":reason}, "additional":[], "resume":{"kind":"integration", "attempt_id":attempt}, "since":null, "evidence":evidence});
+        db::task_condition::decode(&condition.to_string()).unwrap();
+        sqlx::query("UPDATE task SET status='merging', condition_json=? WHERE id=?")
+            .bind(condition.to_string())
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        append_attention_event_at(
+            &db,
+            "task.interruption_changed",
+            &task.id,
+            &project_id,
+            serde_json::json!({"requires_intervention":true, "interruption":interruption}),
+            &format!("2026-01-01T00:00:0{index}Z"),
+        )
+        .await;
+        task_ids.push(task.id);
+    }
+    let new_service = || {
+        Arc::new(AttentionService::new(
+            db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(db.clone())),
+        ))
+    };
+    restart_wake_cycle(&db, new_service()).await;
+    let decisions: Vec<(String, String)> = sqlx::query_as("SELECT attention_id,incident_digest FROM agent_wake_disposition ORDER BY source_event_sequence")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(decisions.len(), 2);
+    for (id, digest) in &decisions {
+        assert_eq!(
+            *digest,
+            services::wake_attention_incident_digest(&db.get_attention(id).await.unwrap().unwrap())
+        );
+    }
+    let cursors: Vec<i64> = sqlx::query_scalar("SELECT last_sequence FROM event_consumer_cursor")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    let head: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM domain_event")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(cursors, vec![head; 7]);
+    let before = restart_wake_snapshot(&db).await;
+    restart_wake_observe_writes(&db).await;
+    // Reconstruct twice: neither a second nor a third start may write anything.
+    for _ in 0..2 {
+        restart_wake_cycle(&db, new_service()).await;
+        let events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.setup_required'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            events, 2,
+            "an unchanged startup must not add a batch-shaped setup decision"
+        );
+        assert_eq!(
+            before,
+            restart_wake_snapshot(&db).await,
+            "all columns, including timestamps and cursor versions"
+        );
+        let writes: Vec<(String, String)> = sqlx::query_as("SELECT * FROM restart_wake_writes")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            writes.is_empty(),
+            "even same-value writes are forbidden: {writes:?}"
+        );
+    }
+    // Real setup changes after restart admit the outstanding blocker batch once.
+    let responder = "restart-responder";
+    identity(&db, responder).await;
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(owner)
+        .bind(responder)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar("SELECT version FROM project_agent_binding WHERE project_id=? AND state='agent_setup_required'")
+        .bind(&project_id).fetch_one(db.pool()).await.unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner.into(),
+            project_id: project_id.clone(),
+            identity_id: Some(responder.into()),
+            state: "active".into(),
+            autonomy_policy_json: "{}".into(),
+            permission_ceiling_json: "{}".into(),
+            subscriptions_json: "[]".into(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
+    restart_wake_cycle(&db, new_service()).await;
+    restart_wake_cycle(&db, new_service()).await;
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.admitted'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        (admitted, turns),
+        (1, 1),
+        "a real setup change wakes the two blockers exactly once"
+    );
+    // A completed turn consumes the old digest. Resolve the other batch member
+    // so a material change to this Task must be the source of the next wake.
+    sqlx::query("UPDATE agent_chat_turn_job SET status='succeeded',version=version+1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let other: String = sqlx::query_scalar(
+        "SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=?",
+    )
+    .bind(&task_ids[1])
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let other = db.get_attention(&other).await.unwrap().unwrap();
+    db.update_attention_lifecycle(UpdateAttentionLifecycle {
+        id: other.id,
+        expected_version: other.version,
+        status: "resolved".into(),
+        acknowledged_at: None,
+        snoozed_until: None,
+        resolved_at: Some(Some(now_rfc3339())),
+        updated_by_user_id: None,
+        updated_at: now_rfc3339(),
+    })
+    .await
+    .unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task_ids[0], false)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut condition = serde_json::to_value(&task.condition).unwrap();
+    let message = "the imported merge now requires a different owner repair";
+    condition["primary"]["reason"]["message"] = serde_json::json!(message);
+    condition["evidence"]["witnesses"][0]["reason"]["message"] = serde_json::json!(message);
+    condition["evidence"]["material"]["interruption"]["reason"] = serde_json::json!(message);
+    db::task_condition::decode(&condition.to_string()).unwrap();
+    sqlx::query("UPDATE task SET condition_json=?,version=version+1 WHERE id=?")
+        .bind(condition.to_string())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let changed = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    db.append_event(CreateDomainEvent::task_interruption_changed(&changed))
+        .await
+        .unwrap();
+    let service = new_service();
+    // Project first, then advance admission time beyond the existing cooldown.
+    services::worker_runtime::WorkerRuntime::new(db.clone(), service.clone())
+        .run_once(100)
+        .await
+        .unwrap();
+    assert_eq!(
+        service.sweep_once_at("2030-01-01T00:00:00Z").await.unwrap(),
+        1
+    );
+    restart_wake_cycle(&db, new_service()).await;
+    restart_wake_cycle(&db, new_service()).await;
+    let admitted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.admitted'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        (admitted, turns),
+        (2, 2),
+        "a material blocker change after restart adds exactly one wake and turn"
+    );
+}
+
+#[tokio::test]
+async fn restart_wake_latest_upsert_changes_only_material_values() {
+    let db = database().await;
+    append_attention_event(
+        &db,
+        "validation.failed",
+        "latest-task",
+        "latest-project",
+        serde_json::json!({}),
+    )
+    .await;
+    let service = AttentionService::new(
+        db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(db.clone())),
+    );
+    service.project_once(100).await.unwrap();
+    let id: String = sqlx::query_scalar("SELECT id FROM attention_projection")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    // Equal NULL identities must be compared as equal. Timestamps are not material.
+    for (index, (digest, disposition, reason, identity, expected)) in [
+        ("digest", "setup_required", "missing", None, 1),
+        ("digest", "setup_required", "missing", None, 0),
+        ("changed", "setup_required", "missing", None, 1),
+        ("changed", "deferred", "missing", None, 1),
+        ("changed", "deferred", "cooldown", None, 1),
+        ("changed", "deferred", "cooldown", Some("identity"), 1),
+        ("changed", "deferred", "cooldown", Some("identity"), 0),
+        ("changed", "deferred", "cooldown", None, 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let timestamp = format!("2030-01-01T00:00:0{index}Z");
+        let before: String = sqlx::query_scalar(
+            "SELECT updated_at FROM agent_wake_attention_latest WHERE attention_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(
+            db.record_latest_attention_wake_in_tx(
+                &mut tx,
+                db::RecordLatestAttentionWakeInTxInput {
+                    attention_id: &id,
+                    existing_attention_id: &id,
+                    incident_digest: digest,
+                    disposition,
+                    reason,
+                    identity_id: identity,
+                    updated_at: &timestamp,
+                }
+            )
+            .await
+            .unwrap(),
+            expected
+        );
+        let after: String = sqlx::query_scalar(
+            "SELECT updated_at FROM agent_wake_attention_latest WHERE attention_id=?",
+        )
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(after, if expected == 0 { before } else { timestamp });
+    }
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_wake_checkpoint_failure_rolls_back_decision_and_disposition() {
+    use services::worker_runtime::WorkerRuntime;
+    let db = database().await;
+    let service = Arc::new(AttentionService::new(
+        db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(db.clone())),
+    ));
+    let runtime = WorkerRuntime::new(db.clone(), service);
+    runtime.run_once(100).await.unwrap(); // initialize the checkpoint before fault injection
+    append_attention_event(
+        &db,
+        "validation.failed",
+        "atomic-task",
+        "atomic-project",
+        serde_json::json!({}),
+    )
+    .await;
+    let before = restart_wake_snapshot(&db).await;
+    sqlx::raw_sql("CREATE TRIGGER fail_wake_checkpoint BEFORE UPDATE ON event_consumer_cursor WHEN NEW.consumer_name='attention_projection' BEGIN SELECT RAISE(ABORT, 'checkpoint fault'); END;")
+        .execute(db.pool()).await.unwrap();
+    assert!(runtime.run_once(100).await.is_err());
+    assert_eq!(
+        before,
+        restart_wake_snapshot(&db).await,
+        "the audit event, both disposition rows and latest decision roll back with the cursor"
+    );
+    let incidents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(incidents, 0);
+    sqlx::query("DROP TRIGGER fail_wake_checkpoint")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runtime.run_once(100).await.unwrap(), 1);
+    let counts: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.setup_required'), (SELECT COUNT(*) FROM agent_wake_disposition), (SELECT COUNT(*) FROM agent_wake_disposition_current), (SELECT COUNT(*) FROM agent_wake_attention_latest)")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(counts, (1, 1, 1, 1));
+    let source: i64 = sqlx::query_scalar(
+        "SELECT sequence FROM domain_event WHERE event_type='validation.failed'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let cursor = db
+        .get_consumer_cursor("attention_projection")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cursor.last_sequence, source);
+}

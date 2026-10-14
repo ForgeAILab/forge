@@ -494,6 +494,21 @@ impl AttentionService {
             )
             .await?
             .map(Arc::new);
+        if context.turn.is_none() {
+            // Setup is an incident decision, not a turn admission. The event
+            // projection records each member's canonical digest; retain that
+            // identity when the startup sweep finds several unconfigured
+            // blockers together. A batch digest would create another decision
+            // for the first member even though no incident or setup changed.
+            for attention in &batch {
+                let request = self.request_for_attention(attention, now).await?;
+                let context = self.wake_decision_context_for_incident(&request).await?;
+                let mut tx = db::begin_immediate(self.db.pool()).await?;
+                self.admit_wake_in_tx(&mut tx, &request, &context).await?;
+                tx.commit().await?;
+            }
+            return Ok(false);
+        }
         context.batch = batch;
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let outcome = self.admit_wake_in_tx(&mut tx, &request, &context).await?;
