@@ -278,13 +278,14 @@ async fn legacy_landed_proof(
 ) -> std::result::Result<(), String> {
     use crate::integration_steps::{TargetOwnerProof, TargetProof, TargetProofSource};
     use db::IntegrationQueueRepo;
-    let repo_id: Option<String> = sqlx::query_scalar(
-        "SELECT repo_id FROM workspace WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
-    )
-    .bind(&ctx.task_id)
-    .fetch_optional(ctx.db.pool())
-    .await
-    .map_err(|error| error.to_string())?;
+    let repo_id: Option<String> = ctx
+        .db
+        .latest_task_workspace_repo_id(&ctx.task_id)
+        .await
+        .map_err(|error| match error {
+            db::DbError::Sqlx(error) => error.to_string(),
+            error => error.to_string(),
+        })?;
     let repo_id = repo_id.ok_or("the Task has no workspace row")?;
     let queue = ctx
         .db

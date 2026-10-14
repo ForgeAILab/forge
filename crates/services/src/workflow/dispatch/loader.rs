@@ -105,13 +105,10 @@ pub async fn load_agent_dispatch_context(
     } else {
         task.plan.clone()
     };
-    let capability_class = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
-    )
-    .bind(&task.id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let capability_class = db
+        .task_governance_capability_class(&task.id)
+        .await?
+        .flatten();
     let read_only_task = crate::execution_setup::classify_task_execution(
         &task.task_type,
         capability_class.as_deref(),
@@ -178,19 +175,9 @@ async fn load_step_diff(
     let Some(workspace) = WorkspaceRepo::get_by_task_id(db, root_id).await? else {
         return Ok(None);
     };
-    let previous_step_head = sqlx::query_scalar::<_, String>(
-        "SELECT e.after_sha FROM execution e JOIN task sibling ON sibling.id = e.task_id
-         WHERE sibling.parent_task_id = ?1 AND sibling.id != ?2
-           AND e.after_sha IS NOT NULL AND e.after_sha != ''
-           AND e.created_at <= COALESCE(
-               (SELECT MIN(own.created_at) FROM execution own WHERE own.task_id = ?2),
-               e.created_at)
-         ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1",
-    )
-    .bind(root_id)
-    .bind(&task.id)
-    .fetch_optional(db.pool())
-    .await?;
+    let previous_step_head = db
+        .previous_sibling_execution_head(root_id, &task.id)
+        .await?;
     let since_previous_step = previous_step_head.is_some();
     let Some(base_sha) = previous_step_head.or_else(|| {
         workspace
@@ -240,19 +227,7 @@ async fn load_step_diff(
 /// The delivery channel of the Agent assigned to `role`. An unassigned role
 /// keeps the native contract; whoever picks it up is resolved at launch.
 async fn role_delivery(db: &db::SqliteDb, task_id: &str, role: &str) -> Result<TaskDelivery> {
-    let backend_kind = sqlx::query_scalar::<_, String>(
-        "SELECT profile.backend_kind
-         FROM task_role_assignment assignment
-         JOIN agent_identity identity ON identity.id = assignment.assignee_id
-         JOIN agent_profile profile ON profile.id = identity.selected_profile_id
-         WHERE assignment.task_id = ? AND assignment.role_name = ?
-           AND assignment.assignee_type = 'agent'
-         LIMIT 1",
-    )
-    .bind(task_id)
-    .bind(role)
-    .fetch_optional(db.pool())
-    .await?;
+    let backend_kind = db.task_role_selected_backend_kind(task_id, role).await?;
     Ok(backend_kind
         .as_deref()
         .map_or(TaskDelivery::NativeTools, TaskDelivery::for_backend_kind))

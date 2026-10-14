@@ -2200,3 +2200,9 @@ pub use task::coordination_root_visible_children_in_connection;
 pub use task::TaskRepositoryAuthoritySourceRow;
 
 pub use task::LatestTaskStateEntrySourceRow;
+
+pub use workflow::LatestWorkflowTransitionSourceRow;
+
+pub use task::RecordReviewCiFailureInTxInput;
+
+pub use task::ClearDaemonUpgradeDispatchRefusalInput;

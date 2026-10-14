@@ -60,14 +60,14 @@ pub(super) async fn task_execution_is_read_only(
 }
 
 pub(crate) async fn task_is_read_only(db: &db::SqliteDb, task: &db::Task) -> Result<bool, String> {
-    let capability_class = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
-    )
-    .bind(&task.id)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(|error| error.to_string())?
-    .flatten();
+    let capability_class = db
+        .task_governance_capability_class(&task.id)
+        .await
+        .map_err(|error| match error {
+            db::DbError::Sqlx(error) => error.to_string(),
+            error => error.to_string(),
+        })?
+        .flatten();
     crate::execution_setup::classify_task_execution(&task.task_type, capability_class.as_deref())
         .map(|class| class.is_read_only())
         .map_err(|error| error.to_string())

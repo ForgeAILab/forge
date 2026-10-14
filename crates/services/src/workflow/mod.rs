@@ -142,27 +142,16 @@ pub(crate) async fn review_refresh_transition_pending(
     task_id: &str,
     current_state: &str,
 ) -> db::Result<bool> {
-    let latest = sqlx::query_as::<
-        _,
-        (
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        ),
-    >(
-        "SELECT id, from_state, to_state, bridge_kind, bridge_payload, triggered_by
-         FROM transition_log
-         WHERE task_id = ?
-         ORDER BY created_at DESC, rowid DESC
-         LIMIT 1",
-    )
-    .bind(task_id)
-    .fetch_optional(db.pool())
-    .await?;
-    let Some((id, from_state, to_state, kind, payload, triggered_by)) = latest else {
+    let latest = db.latest_workflow_transition_source(task_id).await?;
+    let Some(db::LatestWorkflowTransitionSourceRow {
+        id,
+        from_state,
+        to_state,
+        bridge_kind: kind,
+        bridge_payload: payload,
+        triggered_by,
+    }) = latest
+    else {
         return Ok(false);
     };
     let bridge = db::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref())?;

@@ -682,3 +682,85 @@ pub(super) async fn transitions_for_tasks(
     let rows = query.build().fetch_all(&mut *connection).await?;
     rows.into_iter().map(map_transition_log_row).collect()
 }
+
+#[derive(Debug)]
+pub struct LatestWorkflowTransitionSourceRow {
+    pub id: String,
+    pub from_state: String,
+    pub to_state: String,
+    pub bridge_kind: Option<String>,
+    pub bridge_payload: Option<String>,
+    pub triggered_by: String,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for LatestWorkflowTransitionSourceRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            from_state: row.try_get(1)?,
+            to_state: row.try_get(2)?,
+            bridge_kind: row.try_get(3)?,
+            bridge_payload: row.try_get(4)?,
+            triggered_by: row.try_get(5)?,
+        })
+    }
+}
+
+impl SqliteDb {
+    pub async fn latest_workflow_transition_source(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<LatestWorkflowTransitionSourceRow>> {
+        Ok(sqlx::query_as::<_, LatestWorkflowTransitionSourceRow>(
+            "SELECT id, from_state, to_state, bridge_kind, bridge_payload, triggered_by
+         FROM transition_log
+         WHERE task_id = ?
+         ORDER BY created_at DESC, rowid DESC
+         LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_role_selected_backend_kind(
+        &self,
+        task_id: &str,
+        role: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT profile.backend_kind
+         FROM task_role_assignment assignment
+         JOIN agent_identity identity ON identity.id = assignment.assignee_id
+         JOIN agent_profile profile ON profile.id = identity.selected_profile_id
+         WHERE assignment.task_id = ? AND assignment.role_name = ?
+           AND assignment.assignee_type = 'agent'
+         LIMIT 1",
+        )
+        .bind(task_id)
+        .bind(role)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn prune_coordination_root_role_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        role_name: String,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(
+            self,
+            task_id,
+            "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+        )
+        .bind(task_id)
+        .bind(role_name)
+        .identity_fenced()
+        .execute_in_tx(transaction)
+        .await
+    }
+}

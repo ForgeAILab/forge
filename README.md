@@ -82,6 +82,8 @@ Working in one checkout from a terminal? Open the Kanban-first [Forge Solo](docs
 
 Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 
+Running a public demo instance, and the pull-request check that tests it → [docs/demo-instance.md](docs/demo-instance.md).
+
 ## Core concepts
 
 <picture>

@@ -2434,17 +2434,16 @@ impl TaskService {
             let follow_up = self
                 .insert_created_task_in_tx(&mut transaction, follow_up, follow_up_governance)
                 .await?;
-            let linked = db::task_writer::TaskQuery::new(
-                &self.db,
-                &task.id,
-                "UPDATE task SET metadata_json = ?, version = version + 1
-                 WHERE id = ? AND version = ?",
-            )
-            .bind(json!({ "follow_up_of": task.id }).to_string())
-            .bind(&follow_up.id)
-            .bind(follow_up.version)
-            .execute_in_tx(&mut transaction)
-            .await?;
+            let linked = self
+                .db
+                .link_manual_review_follow_up_in_tx(
+                    &mut transaction,
+                    &task.id,
+                    json!({ "follow_up_of": task.id }).to_string(),
+                    &follow_up.id,
+                    follow_up.version,
+                )
+                .await?;
             if linked.require_applied()? != 1 {
                 return Err(db::DbError::VersionConflict.into());
             }
@@ -2454,17 +2453,15 @@ impl TaskService {
                 manual_pass,
             )
             .await?;
-            let cleared = db::task_writer::TaskQuery::new(
-                &self.db,
-                &task.id,
-                "UPDATE task SET error_annotation = NULL, blocked_json = NULL,
-                 updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
-            )
-            .bind(&finished_at)
-            .bind(&task.id)
-            .bind(task.version)
-            .execute_in_tx(&mut transaction)
-            .await?;
+            let cleared = self
+                .db
+                .clear_manual_review_failure_in_tx(
+                    &mut transaction,
+                    &finished_at,
+                    &task.id,
+                    task.version,
+                )
+                .await?;
             if cleared.require_applied()? != 1 {
                 return Err(db::DbError::VersionConflict.into());
             }

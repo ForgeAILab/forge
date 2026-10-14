@@ -411,3 +411,9 @@ pub use sqlite::{
     ConflictHandoffHistoryRow, ConflictHandoffSourceRow, InsertWorkflowTransitionLogInput,
     WorkflowProjectAuthorityRow, WriteWorkflowTransitionStateInput, CONFLICT_HANDOFF_QUERY,
 };
+
+pub use sqlite::LatestWorkflowTransitionSourceRow;
+
+pub use sqlite::RecordReviewCiFailureInTxInput;
+
+pub use sqlite::ClearDaemonUpgradeDispatchRefusalInput;

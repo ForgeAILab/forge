@@ -406,23 +406,17 @@ async fn clear_upgrade_dispatch_refusal(db: &db::SqliteDb, task: &db::Task) -> c
     }
     let clear_annotation = annotation["type"] == DISPATCH_FAILED_ANNOTATION
         && annotation["code"] == api_types::DAEMON_UPGRADE_REQUIRED;
-    let result = db::task_writer::TaskQuery::new(db,&task.id,
-        "UPDATE task SET
-            error_annotation = CASE WHEN ? THEN NULL ELSE error_annotation END,
-            metadata_json = NULLIF(json_remove(metadata_json, '$.daemon_upgrade_refusal', '$.dispatch_disposition', '$.deferred_dispatch'), '{}'),
-            version = version + 1, updated_at = ?
-         WHERE id = ? AND deleted_at IS NULL AND version = ?
-            AND metadata_json IS ? AND error_annotation IS ?
-            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?"
-    )
-    .bind(clear_annotation)
-    .bind(now_rfc3339())
-    .bind(&task.id)
-    .bind(task.version)
-    .bind(&task.metadata_json)
-    .bind(&task.error_annotation)
-    .bind(api_types::DAEMON_UPGRADE_REQUIRED)
-    .execute(db.pool()).await?;
+    let result = db
+        .clear_daemon_upgrade_dispatch_refusal(db::ClearDaemonUpgradeDispatchRefusalInput {
+            clear_annotation,
+            updated_at: now_rfc3339(),
+            task_id: &task.id,
+            version: task.version,
+            metadata_json: &task.metadata_json,
+            error_annotation: &task.error_annotation,
+            refusal_code: api_types::DAEMON_UPGRADE_REQUIRED,
+        })
+        .await?;
     let changed = result != 0;
     if changed {
         tracing::info!(task_id = %task.id, "task dispatch woken after daemon upgrade");

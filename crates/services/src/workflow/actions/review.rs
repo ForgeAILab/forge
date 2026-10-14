@@ -1095,12 +1095,16 @@ pub async fn run_ci_steps_in_step(
     use crate::check_runner::consumer::CheckVerdict;
     let db = Arc::clone(&ctx.db);
     let id = db::new_uuid_v4();
-    let entered: Option<(String, i64)> =
-        sqlx::query_as("SELECT status,version FROM task WHERE id=?")
-            .bind(&ctx.task_id)
-            .fetch_optional(db.pool())
-            .await
-            .expect("Task reads");
+    let entered: Option<(String, i64)> = db
+        .review_hook_task_status_version(&ctx.task_id)
+        .await
+        .map_err(|error| -> Box<dyn std::fmt::Debug> {
+            match error {
+                db::DbError::Sqlx(error) => Box::new(error),
+                error => Box::new(error),
+            }
+        })
+        .expect("Task reads");
     let (status, version) = entered.unwrap_or_else(|| (ctx.to_state.clone(), 1));
     db::TaskStepRepo::enqueue_step(
         &*db,
@@ -1122,14 +1126,15 @@ pub async fn run_ci_steps_in_step(
     )
     .await
     .expect("hooks step enqueues");
-    sqlx::query(
-        "UPDATE task_step SET status='claimed',claimed_by='run-ci-steps',lease_until=? WHERE id=?",
-    )
-    .bind(db::task_writer::lease_deadline())
-    .bind(&id)
-    .execute(db.pool())
-    .await
-    .expect("hooks step claims");
+    db.claim_run_ci_helper_step(db::task_writer::lease_deadline(), &id)
+        .await
+        .map_err(|error| -> Box<dyn std::fmt::Debug> {
+            match error {
+                db::DbError::Sqlx(error) => Box::new(error),
+                error => Box::new(error),
+            }
+        })
+        .expect("hooks step claims");
     let step = db::TaskStepRepo::task_steps(&*db, &ctx.task_id)
         .await
         .expect("steps list")
@@ -1175,11 +1180,14 @@ pub async fn run_ci_steps_in_step(
         }
     };
     let result = db::task_writer::in_task_step(step.clone(), run).await;
-    sqlx::query("DELETE FROM task_step WHERE task_id=? AND (id=? OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('apply_check_result','apply_check_progress')))")
-        .bind(&ctx.task_id)
-        .bind(&id)
-        .execute(db.pool())
+    db.remove_run_ci_helper_steps(&ctx.task_id, &id)
         .await
+        .map_err(|error| -> Box<dyn std::fmt::Debug> {
+            match error {
+                db::DbError::Sqlx(error) => Box::new(error),
+                error => Box::new(error),
+            }
+        })
         .expect("helper steps are removed");
     result
 }

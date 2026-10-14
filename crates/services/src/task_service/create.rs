@@ -344,16 +344,14 @@ impl TaskService {
                 ) {
                     // Effects on an existing parent are its own queued
                     // steps, identity-fenced so they are never dropped.
-                    let _queued_or_applied = db::task_writer::TaskQuery::new(
-                        &self.db,
-                        parent_task_id,
-                        "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-                    )
-                    .bind(parent_task_id)
-                    .bind(role_name)
-                    .identity_fenced()
-                    .execute_in_tx(&mut transaction)
-                    .await?;
+                    let _queued_or_applied = self
+                        .db
+                        .prune_coordination_root_role_in_tx(
+                            &mut transaction,
+                            parent_task_id,
+                            role_name,
+                        )
+                        .await?;
                     removed_parent_role = true;
                 }
             }
@@ -361,32 +359,14 @@ impl TaskService {
                 // Converting a Task into a coordination root changes its
                 // authority surface. Invalidate review authority and wake
                 // parked dispatch in the same transaction as role pruning.
-                let _queued_or_applied = db::task_writer::TaskQuery::new(&self.db,parent_task_id,
-                    "UPDATE task
-                     SET review_passed_at = NULL,
-                         version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
-                         metadata_json = CASE
-                             WHEN json_valid(COALESCE(metadata_json, '{}'))
-                             THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
-                             ELSE metadata_json
-                         END,
-                         updated_at = CASE
-                             WHEN review_passed_at IS NOT NULL
-                                  OR (json_valid(COALESCE(metadata_json, '{}'))
-                                      AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                           OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
-                             THEN ? ELSE updated_at END
-                     WHERE id = ? AND deleted_at IS NULL
-                       AND (review_passed_at IS NOT NULL
-                            OR (json_valid(COALESCE(metadata_json, '{}'))
-                                AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))",
-                )
-                .bind(&now)
-                .bind(parent_task_id)
-                .identity_fenced()
-                .execute_in_tx(&mut transaction)
-                .await?;
+                let _queued_or_applied = self
+                    .db
+                    .clear_coordination_root_review_dispatch_in_tx(
+                        &mut transaction,
+                        &now,
+                        parent_task_id,
+                    )
+                    .await?;
             }
         }
         for dependency_id in &dependency_ids {
