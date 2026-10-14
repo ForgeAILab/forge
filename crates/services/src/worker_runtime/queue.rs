@@ -372,8 +372,9 @@ impl TaskStepWorker {
                 // A live claimer releases the step and then sends its typed
                 // reply. A waiter that reads the row between the two waits
                 // for that reply, briefly. The durable answer carries the
-                // same error kind and fields if the channel was lost.
-                if own.claimed_by.is_none() {
+                // same error kind and fields if the channel was lost. A
+                // spent (closed) receiver has no reply left; never poll it.
+                if own.claimed_by.is_none() && !closed {
                     if let Ok(Ok(reply)) =
                         tokio::time::timeout(LAPSED_CLAIM_POLL, &mut received).await
                     {
@@ -1354,6 +1355,13 @@ impl TaskStepWorker {
             #[cfg(test)]
             if let Some(gate) = &self.command_test_gate {
                 gate.inject(step, tests::CommandPoint::BeforeSend).await;
+                if gate.drops_reply() {
+                    self.task_service
+                        .task_step_replies
+                        .lock()
+                        .expect("Task step replies")
+                        .remove(&step.id);
+                }
             }
             // A lost live reply stays registered and unsent, as it does when
             // a claimer stops before its send: the waiter answers from the

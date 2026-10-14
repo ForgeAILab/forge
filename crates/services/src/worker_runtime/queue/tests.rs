@@ -24,6 +24,8 @@ enum CommandFault {
     Busy,
     /// The claimer is slow at the point.
     Delay,
+    /// Pauses like `Pause`, then drops the live reply sender unsent.
+    DropReply,
 }
 
 /// A real SQLITE_BUSY as the worker classifies it.
@@ -129,6 +131,9 @@ impl CommandGate {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.fault == CommandFault::Busy
+    }
+    pub(super) fn drops_reply(&self) -> bool {
+        self.fault == CommandFault::DropReply
     }
     async fn wait(&self) {
         tokio::time::timeout(Duration::from_secs(3), self.arrived.notified())
@@ -272,6 +277,57 @@ async fn lost_live_reply_while_the_waiter_is_parked_is_answered_from_the_durable
     let rows = db.task_steps("t").await.unwrap();
     assert_eq!(rows[0].status, "failed");
     assert_eq!(rows[0].attempts, 1, "a completed command is never repeated");
+    assert!(worker
+        .task_service
+        .task_step_replies
+        .lock()
+        .unwrap()
+        .is_empty());
+}
+
+/// Forced order: the claimer releases the settled step and drops the live
+/// reply sender unsent while the waiter is parked in its select. The spent
+/// receiver is never polled again; the waiter answers from the durable row.
+#[tokio::test]
+async fn sender_dropped_unsent_while_the_waiter_is_parked_is_answered_from_the_durable_row() {
+    let (db, mut worker) = fixture().await;
+    let gate = CommandGate::new(CommandPoint::BeforeReply, CommandFault::DropReply);
+    worker.command_test_gate = Some(gate.clone());
+    let worker = Arc::new(worker);
+    let waiter = tokio::spawn({
+        let worker = worker.clone();
+        async move {
+            worker
+                .request_command::<crate::workflow::engine::TransitionResult>(
+                    "t",
+                    transition_command(),
+                )
+                .await
+        }
+    });
+    // The claimer has settled the step and holds it, before its release.
+    gate.wait().await;
+    // The waiter reads the settled, still-leased row and parks in its select.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.resume.notify_one();
+    let answer = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .expect("the waiter answers")
+        .expect("the waiter does not panic on a dropped reply sender")
+        .expect("the durable reply is the command's result");
+    assert_eq!(answer.task.status, "done");
+    let rows = db.task_steps("t").await.unwrap();
+    let command = rows.iter().find(|step| step.kind == "command").unwrap();
+    assert_eq!(command.status, "done");
+    assert_eq!(command.attempts, 1, "a completed command is never repeated");
+    assert!(command.result_json.is_some());
+    assert_eq!(
+        db::TransitionLogRepo::list_by_task(&*db, "t")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(worker
         .task_service
         .task_step_replies
