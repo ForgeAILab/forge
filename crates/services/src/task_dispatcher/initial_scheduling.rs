@@ -369,7 +369,7 @@ impl TaskDispatcher {
         let (queued_agent, queued_all) = self.db.queued_admissions(&agent.id, &task.id).await?;
         let running_agent: i64 = self
             .db
-            .dispatch_running_agent_execution_count(&agent.id)
+            .agent_capacity_running_execution_count(&agent.id)
             .await?;
         if queued_agent > 0 && queued_agent + running_agent >= agent.max_concurrent_tasks {
             return Ok(false);
