@@ -1,4 +1,9 @@
 //! Owner escalation for admitted blocker digests. This module never mutates Tasks.
+/// Autonomous wake turns carry the admitted wake dedupe key.
+pub fn is_autonomous_wake_turn(job: &db::AgentChatTurnJob) -> bool {
+    job.dedupe_key.starts_with("agent-wake-admitted:")
+}
+
 use crate::{
     attention_service::wake_attention_incident_digest,
     wake_blocker::{blocker_turn_state, is_deterministic_failure, BlockerTurnState},
@@ -563,7 +568,7 @@ impl ProjectEscalationService {
         match job.status {
             db::AgentChatTurnState::Succeeded => self.escalate_silent_turn(turn_id).await,
             db::AgentChatTurnState::Failed
-                if crate::agent_chat_turn_policy::is_autonomous_wake_turn(&job)
+                if crate::project_escalation::is_autonomous_wake_turn(&job)
                     && is_deterministic_failure(job.error_code.as_deref()) =>
             {
                 self.raise_cannot_run_notice(&job).await

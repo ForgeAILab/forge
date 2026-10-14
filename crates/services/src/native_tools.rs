@@ -6,6 +6,7 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
+use crate::task_service::execution::{ExecutionOutboxInput, ExecutionOutboxReport};
 #[cfg(test)]
 use forge_agent_host::PROJECT_CURRENT_STATE_OPERATION;
 mod project_proposals;
@@ -4627,27 +4628,6 @@ struct StoredEvidence {
     asset_id: String,
     checksum: String,
     byte_size: i64,
-}
-
-/// The execution whose outbox is ingested. Provenance comes from here, never
-/// from the files the harness wrote.
-#[derive(Debug, Clone, Copy)]
-pub struct ExecutionOutboxInput<'a> {
-    pub task_id: &'a str,
-    pub execution_id: &'a str,
-    pub agent_id: &'a str,
-    pub role: Option<&'a str>,
-    pub worktree_path: &'a str,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ExecutionOutboxReport {
-    pub worklog_entries: usize,
-    pub evidence_items: usize,
-    /// One human-readable reason per entry that was not ingested.
-    pub rejected: Vec<String>,
-    pub(crate) plan_candidate: bool,
-    pub(crate) plan_rejected: bool,
 }
 
 /// At most this many bytes of one outbox file are read.

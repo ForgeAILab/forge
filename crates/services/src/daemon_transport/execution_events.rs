@@ -894,7 +894,7 @@ impl ServerExecutionEventSink {
                     })?;
                     let report = task_service
                         .ingest_execution_outbox_entries(
-                            &crate::native_tools::ExecutionOutboxInput {
+                            &crate::task_service::execution::ExecutionOutboxInput {
                                 task_id: &execution.task_id,
                                 execution_id: &execution.id,
                                 agent_id,

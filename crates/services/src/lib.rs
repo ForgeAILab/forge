@@ -13,6 +13,7 @@ pub mod agent_service;
 pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
+pub mod chat_notices;
 pub(crate) mod chat_usage;
 pub mod check_runner;
 pub mod command_boundary;
@@ -82,6 +83,7 @@ pub mod project_runtime;
 pub mod project_settings;
 pub mod prompt_preview;
 pub mod provider_authorization;
+pub mod provider_credentials;
 pub mod provider_health;
 pub mod queue_invalidation;
 pub mod recovery;
@@ -103,6 +105,7 @@ pub mod types;
 pub mod usage_projection;
 pub(crate) mod wake_blocker;
 pub mod wake_turn_consumer;
+pub mod wake_turns;
 pub mod worker_runtime;
 pub mod workflow;
 pub mod workspace_backend;
@@ -128,10 +131,9 @@ pub use adaptive_task_operations::{
 pub use agent_chat_memory_consumer::{memory_consumer_name, AgentChatMemoryConsumer};
 pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
 pub use agent_chat_service::{
-    append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,
-    AgentChatService, CancelAgentChatTurnInput, CommittedAgentChatResponse,
-    CreateAgentHandoffInput, RetryAgentChatTurnInput, SendAgentChatMessageInput,
-    SetMainAgentBindingInput, SetProjectAgentBindingInput,
+    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
+    CommittedAgentChatResponse, CreateAgentHandoffInput, RetryAgentChatTurnInput,
+    SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
 };
 pub use agent_chat_turn_policy::{
     bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,

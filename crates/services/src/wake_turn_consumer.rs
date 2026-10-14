@@ -4,6 +4,7 @@ use crate::{
         content_digest, AgentTurnAdmissionService, AgentTurnPrepareInput, AgentTurnReadiness,
         AgentTurnTrigger, PreparedAgentTurnAdmission,
     },
+    wake_turns::{PreparedWakeTurn, WakeTurns},
     worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result,
 };
@@ -162,14 +163,6 @@ pub struct WakeTurnRun {
     pub last_sequence: i64,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PreparedWakeTurn {
-    pub chat: AgentChat,
-    pub content: String,
-    pub prepared: PreparedAgentTurnAdmission,
-    pub attention: db::AttentionProjection,
-    pub delivery: Option<DeliveryFollowupState>,
-}
 #[derive(Clone)]
 pub struct WakeTurnConsumer {
     db: Arc<SqliteDb>,
@@ -196,82 +189,6 @@ impl WakeTurnConsumer {
             processed_events,
             last_sequence,
         })
-    }
-    pub(crate) async fn prepare_attention(
-        &self,
-        attention: &db::AttentionProjection,
-        dedupe_key: &str,
-        causation_id: Option<&str>,
-        depth: i64,
-        batch: &[db::AttentionProjection],
-    ) -> Result<Option<PreparedWakeTurn>> {
-        let chat = match attention.scope_type.as_str() {
-            "project" => AgentChatRepo::get_project_chat(&*self.db, &attention.scope_id).await?,
-            "account" => AgentChatRepo::get_main_chat(&*self.db, &attention.scope_id).await?,
-            _ => None,
-        };
-        let Some(chat) = chat else {
-            return Ok(None);
-        };
-        let service = AgentTurnAdmissionService::new(Arc::clone(&self.db));
-        if service.resolve(&chat).await?.readiness != AgentTurnReadiness::Ready {
-            return Ok(None);
-        }
-        let delivery = if attention.attention_type == "delivery_followup" {
-            Some(
-                self.delivery_followup_state(
-                    &attention.scope_id,
-                    delivery_followup_task_id(attention).as_deref(),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
-        let mut content = wake_content(attention, delivery.as_ref());
-        if batch.len() > 1 {
-            // One existing directive for the whole batch; other incidents are data only.
-            let details = batch.iter().map(|a| json!({"incident": a.dedupe_key, "summary": a.summary, "details": serde_json::from_str::<Value>(&a.details_json).unwrap_or(Value::Null)})).collect::<Vec<_>>();
-            let first_line = content.lines().next().unwrap_or_default().to_owned();
-            let directive = DEFAULT_WAKE_DIRECTIVE;
-            content = format!(
-                "{first_line}\n\nDetails: {}\n\n{directive}",
-                Value::Array(details)
-            );
-        }
-        let digest = content_digest(&content)?;
-        let prepared = service
-            .prepare(AgentTurnPrepareInput {
-                chat: &chat,
-                trigger: AgentTurnTrigger::AutonomousWake,
-                dedupe_key,
-                content_digest: &digest,
-                causation_id,
-                causation_depth: depth.saturating_add(1).min(8),
-                source_responder: None,
-            })
-            .await?;
-        Ok(Some(PreparedWakeTurn {
-            chat,
-            content,
-            prepared,
-            attention: attention.clone(),
-            delivery,
-        }))
-    }
-    pub(crate) fn build_prepared_turn(
-        &self,
-        event: &DomainEvent,
-        input: &PreparedWakeTurn,
-    ) -> Result<AdmitAgentChatTurn> {
-        self.build_turn_admission(
-            event,
-            input.chat.clone(),
-            input.content.clone(),
-            input.prepared.clone(),
-            Some(&input.attention),
-            input.delivery.as_ref(),
-        )
     }
     async fn delivery_followup_state(
         &self,
@@ -457,6 +374,91 @@ impl WakeTurnConsumer {
             created_at: now,
         };
         Ok(AdmitAgentChatTurn { message, turn })
+    }
+}
+#[async_trait]
+impl WakeTurns for WakeTurnConsumer {
+    async fn prepare_attention(
+        &self,
+        attention: &db::AttentionProjection,
+        dedupe_key: &str,
+        causation_id: Option<&str>,
+        depth: i64,
+        batch: &[db::AttentionProjection],
+    ) -> Result<Option<PreparedWakeTurn>> {
+        let chat = match attention.scope_type.as_str() {
+            "project" => AgentChatRepo::get_project_chat(&*self.db, &attention.scope_id).await?,
+            "account" => AgentChatRepo::get_main_chat(&*self.db, &attention.scope_id).await?,
+            _ => None,
+        };
+        let Some(chat) = chat else {
+            return Ok(None);
+        };
+        let service = AgentTurnAdmissionService::new(Arc::clone(&self.db));
+        if service.resolve(&chat).await?.readiness != AgentTurnReadiness::Ready {
+            return Ok(None);
+        }
+        let delivery = if attention.attention_type == "delivery_followup" {
+            Some(
+                self.delivery_followup_state(
+                    &attention.scope_id,
+                    delivery_followup_task_id(attention).as_deref(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let mut content = wake_content(attention, delivery.as_ref());
+        if batch.len() > 1 {
+            // One existing directive for the whole batch; other incidents are data only.
+            let details = batch.iter().map(|a| json!({"incident": a.dedupe_key, "summary": a.summary, "details": serde_json::from_str::<Value>(&a.details_json).unwrap_or(Value::Null)})).collect::<Vec<_>>();
+            let first_line = content.lines().next().unwrap_or_default().to_owned();
+            let directive = DEFAULT_WAKE_DIRECTIVE;
+            content = format!(
+                "{first_line}\n\nDetails: {}\n\n{directive}",
+                Value::Array(details)
+            );
+        }
+        let digest = content_digest(&content)?;
+        let prepared = service
+            .prepare(AgentTurnPrepareInput {
+                chat: &chat,
+                trigger: AgentTurnTrigger::AutonomousWake,
+                dedupe_key,
+                content_digest: &digest,
+                causation_id,
+                causation_depth: depth.saturating_add(1).min(8),
+                source_responder: None,
+            })
+            .await?;
+        let consumer = self.clone();
+        Ok(Some(PreparedWakeTurn::new(
+            prepared.responder.binding_id.clone(),
+            prepared.responder.binding_version,
+            prepared.dedupe_key.clone(),
+            move |event, attention| {
+                consumer.build_turn_admission(
+                    event,
+                    chat.clone(),
+                    content.clone(),
+                    prepared.clone(),
+                    Some(attention),
+                    delivery.as_ref(),
+                )
+            },
+        )))
+    }
+    fn build_prepared_turn(
+        &self,
+        event: &DomainEvent,
+        input: &PreparedWakeTurn,
+        attention: &db::AttentionProjection,
+    ) -> Result<AdmitAgentChatTurn> {
+        input.build_admission(event, attention)
+    }
+    fn consumer_name(&self) -> &'static str {
+        CONSUMER_NAME
     }
 }
 #[async_trait]

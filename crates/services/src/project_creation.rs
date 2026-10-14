@@ -832,8 +832,13 @@ async fn create_project_from_charter_approval_attempt(
             created.project.name, identity.name
         ),
     );
-    if let Err(error) =
-        crate::append_system_chat_message(&db, &genesis.main_chat_id, &message_id, &content).await
+    if let Err(error) = crate::chat_notices::append_system_chat_message(
+        &db,
+        &genesis.main_chat_id,
+        &message_id,
+        &content,
+    )
+    .await
     {
         tracing::warn!(%error, project_id = %created.project.id, "Project-created chat anchor failed");
     }

@@ -7,10 +7,12 @@
 //! adapter only translates one admitted Task execution into a native runtime
 //! turn and returns the normal executor result.
 
+use crate::task_service::execution::embedded_task_executor::is_read_only_task_role;
+use crate::task_service::execution::{execution_lease_for, UNCOMMITTED_WORKTREE_FAILURE};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use async_trait::async_trait;
@@ -27,7 +29,7 @@ use forge_agent_host::{
     RuntimeContextManifestLink, WorkspaceAccess,
 };
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -40,192 +42,6 @@ mod review_correction;
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
 const TASK_ROLE_MARKER: &str = executors::TASK_ROLE_CONFIG_KEY;
-pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
-
-/// Shared state for the server-owned execution lease.
-///
-/// The embedded adapter receives this through a short-lived registry rather
-/// than through `ExecutionContext`: the latter is also constructed by all CLI
-/// adapters and is deliberately transport-neutral.  The runner registers the
-/// handle immediately before dispatch and removes it after the future exits.
-/// Both heartbeat and semantic-progress calls serialize on the same mutex so
-/// every successful CAS advances one authoritative execution version.
-pub(crate) struct EmbeddedExecutionLease {
-    db: Arc<SqliteDb>,
-    execution_id: String,
-    owner: String,
-    state: Mutex<EmbeddedExecutionLeaseState>,
-}
-
-#[derive(Debug, Clone)]
-struct EmbeddedExecutionLeaseState {
-    execution_version: i64,
-}
-
-/// Turn events are semantic progress only.  They never renew the execution
-/// owner lease: the server-controlled runner heartbeat does that
-/// independently, so a quiet provider request or long-running tool remains
-/// live while its owner is healthy.
-#[async_trait]
-impl TurnProgressObserver for EmbeddedExecutionLease {
-    async fn record_progress(&self) {
-        let progress_at = db::now_rfc3339();
-        if let Err(error) = self.record_progress(progress_at, db::now_rfc3339()).await {
-            tracing::debug!(
-                execution_id = %self.execution_id,
-                %error,
-                "failed to record native execution semantic progress"
-            );
-        }
-    }
-}
-
-impl std::fmt::Debug for EmbeddedExecutionLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("EmbeddedExecutionLease")
-            .field("execution_id", &self.execution_id)
-            .field("owner", &self.owner)
-            .finish_non_exhaustive()
-    }
-}
-
-impl EmbeddedExecutionLease {
-    pub(crate) fn new(
-        db: Arc<SqliteDb>,
-        execution_id: impl Into<String>,
-        owner: impl Into<String>,
-        execution_version: i64,
-    ) -> Self {
-        Self {
-            db,
-            execution_id: execution_id.into(),
-            owner: owner.into(),
-            state: Mutex::new(EmbeddedExecutionLeaseState { execution_version }),
-        }
-    }
-
-    pub(crate) async fn renew(
-        &self,
-        lease_expires_at: String,
-        now: String,
-    ) -> db::Result<db::ExecutionLeaseMutation> {
-        let mut state = self.state.lock().await;
-        for attempt in 0..2 {
-            let outcome = ExecutionRepo::renew_lease(
-                &*self.db,
-                db::RenewExecutionLease {
-                    execution_id: self.execution_id.clone(),
-                    expected_version: state.execution_version,
-                    owner: self.owner.clone(),
-                    lease_expires_at: lease_expires_at.clone(),
-                    now: now.clone(),
-                },
-            )
-            .await?;
-            match outcome {
-                db::ExecutionLeaseMutation::Updated(execution) => {
-                    state.execution_version = execution.execution_version;
-                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
-                }
-                db::ExecutionLeaseMutation::Concurrent {
-                    current: Some(current),
-                } if attempt == 0
-                    && current.status == ExecutionStatus::Running
-                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
-                {
-                    // A semantic-progress or adjacent same-owner CAS may
-                    // have advanced the version between the heartbeat read
-                    // and renewal. Refresh once; only a different owner or
-                    // terminal row means this runner has truly lost liveness.
-                    state.execution_version = current.execution_version;
-                }
-                other => return Ok(other),
-            }
-        }
-        unreachable!("bounded heartbeat renewal retry always returns")
-    }
-
-    pub(crate) async fn record_progress(
-        &self,
-        progress_at: String,
-        now: String,
-    ) -> db::Result<db::ExecutionLeaseMutation> {
-        let mut state = self.state.lock().await;
-        for attempt in 0..2 {
-            let outcome = ExecutionRepo::record_progress(
-                &*self.db,
-                db::RecordExecutionProgress {
-                    execution_id: self.execution_id.clone(),
-                    expected_version: state.execution_version,
-                    owner: self.owner.clone(),
-                    progress_at: progress_at.clone(),
-                    now: now.clone(),
-                },
-            )
-            .await?;
-            match outcome {
-                db::ExecutionLeaseMutation::Updated(execution) => {
-                    state.execution_version = execution.execution_version;
-                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
-                }
-                db::ExecutionLeaseMutation::Concurrent {
-                    current: Some(current),
-                } if attempt == 0
-                    && current.status == ExecutionStatus::Running
-                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
-                {
-                    state.execution_version = current.execution_version;
-                }
-                other => return Ok(other),
-            }
-        }
-        unreachable!("bounded semantic-progress retry always returns")
-    }
-
-    pub(crate) async fn owner_and_version(&self) -> (String, i64) {
-        let state = self.state.lock().await;
-        (self.owner.clone(), state.execution_version)
-    }
-}
-
-type EmbeddedExecutionLeaseRegistry = StdMutex<HashMap<String, Arc<EmbeddedExecutionLease>>>;
-
-fn embedded_execution_leases() -> &'static EmbeddedExecutionLeaseRegistry {
-    static REGISTRY: OnceLock<EmbeddedExecutionLeaseRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-pub(crate) fn register_execution_lease(
-    execution_id: impl Into<String>,
-    lease: Arc<EmbeddedExecutionLease>,
-) {
-    if let Ok(mut leases) = embedded_execution_leases().lock() {
-        leases.insert(execution_id.into(), lease);
-    }
-}
-
-pub(crate) fn unregister_execution_lease(
-    execution_id: &str,
-    expected: &Arc<EmbeddedExecutionLease>,
-) {
-    if let Ok(mut leases) = embedded_execution_leases().lock() {
-        if leases
-            .get(execution_id)
-            .is_some_and(|current| Arc::ptr_eq(current, expected))
-        {
-            leases.remove(execution_id);
-        }
-    }
-}
-
-fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
-    embedded_execution_leases()
-        .lock()
-        .ok()
-        .and_then(|leases| leases.get(execution_id).cloned())
-}
-
 /// The native Task adapter used by the existing Task execution supervisor.
 #[derive(Clone)]
 pub struct EmbeddedTaskExecutor {
@@ -1398,15 +1214,6 @@ fn canonical_task_role(role: &str) -> Result<&'static str> {
             "embedded Task execution is not admitted for role `{other}`"
         ))),
     }
-}
-
-/// Roles whose executions and native Task sessions never receive worktree
-/// write access. Planners author plans through Task metadata/native tools.
-pub(crate) fn is_read_only_task_role(role: &str) -> bool {
-    matches!(
-        role,
-        crate::workflow::default_roles::REVIEWER | crate::workflow::default_roles::PLANNER
-    )
 }
 
 /// Refuse to report delivery when a native worker authored files but did not

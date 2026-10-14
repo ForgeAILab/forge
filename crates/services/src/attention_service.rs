@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     wake_blocker::BlockerTurnState,
+    wake_turns::{PreparedWakeTurn, WakeTurns},
     worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result, ServiceError,
 };
@@ -155,7 +156,7 @@ struct WakeDecisionContext {
     task_id: Option<String>,
     requires_current_task_intervention: bool,
     orphan_execution_id: Option<String>,
-    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
+    turn: Option<Arc<PreparedWakeTurn>>,
     batch: Vec<AttentionProjection>,
 }
 
@@ -1103,8 +1104,8 @@ impl AttentionService {
                         correlation_id: request.correlation_id.clone(), causation_id: request.causation_id.clone(),
                         causation_depth: request.reaction_depth,
                         dedupe_key: Some(format!("autonomy-stalled:{}:{}:{}:{}", budget_scope_type, budget_scope_id,
-                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_id.as_deref()).unwrap_or_default(),
-                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_version).unwrap_or_default())),
+                            context.turn.as_ref().and_then(|p|p.binding_id.as_deref()).unwrap_or_default(),
+                            context.turn.as_ref().and_then(|p|p.binding_version).unwrap_or_default())),
                         payload_json: json!({
                             "project_id": budget_scope_id, "task_id": null,
                             "event_type": "project.autonomy_stalled",
@@ -1416,7 +1417,7 @@ impl AttentionService {
         let payload_json = json!({
             "decision": decision_code,
             "turn_job_id": (event_type == "agent.wake.admitted").then(|| context.turn.as_ref().map(|p|
-                Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}:turn", p.prepared.dedupe_key).as_bytes()).to_string())).flatten(),
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}:turn", p.dedupe_key).as_bytes()).to_string())).flatten(),
             "reason": reason_code,
             "admission_phase": admission_phase,
             "identity_id": identity_id,
@@ -1480,7 +1481,6 @@ impl AttentionService {
                     .turn
                     .as_ref()
                     .ok_or_else(|| ServiceError::invalid_operation("wake has no prepared turn"))?;
-                let mut input = (**prepared).clone();
                 let id = context
                     .attention_id
                     .as_deref()
@@ -1490,9 +1490,8 @@ impl AttentionService {
                     .get_attention_in_tx(transaction, id)
                     .await?
                     .ok_or(db::DbError::NotFound)?;
-                input.attention = actual.clone();
                 let admitted = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
-                    .build_prepared_turn(&event, &input)?;
+                    .build_prepared_turn(&event, prepared, &actual)?;
                 (
                     db::AgentWakeDispositionKind::TurnAdmitted,
                     Some(admitted),
@@ -3912,7 +3911,7 @@ pub struct PreparedAttention {
 }
 struct PreparedAttentionIncident {
     projection: CreateAttentionProjection,
-    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
+    turn: Option<Arc<PreparedWakeTurn>>,
     request: WakeAdmissionRequest,
     decision: PreparedWakeDecision,
     failed_turn: Option<db::AgentChatTurnJob>,

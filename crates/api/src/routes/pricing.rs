@@ -46,7 +46,7 @@ use pricing::{
     RetrospectiveRepositoryError, RetrospectiveUsageEvent,
 };
 use serde_json::{json, Value};
-use services::embedded_agent_service::provider_entry_endpoint;
+use services::provider_credentials::provider_entry_endpoint;
 
 use crate::{
     errors::{ApiError, ApiResult},

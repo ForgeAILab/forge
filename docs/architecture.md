@@ -180,6 +180,17 @@ worker handles and one shutdown signal. The server's `AppState` and Solo's
 session facade consume this graph rather than maintaining parallel persistence,
 workflow, retry, or recovery implementations.
 
+Inside `services`, shared execution outbox contracts and the embedded execution
+lease registry belong to `task_service::execution`. Its `ExecutionSupport`
+interface supplies provider credential injection and outbox ingestion; the
+runtime builder injects `EmbeddedAgentService` through that interface. Provider
+endpoint defaults and URL-shape validation live in `provider_credentials`, and
+plain system chat notices in `chat_notices`. The core `wake_turns` module owns
+`WakeTurns` and `PreparedWakeTurn`; the agents-side callback builds the admission
+at the original transaction boundary using the current Attention row. Attention
+still constructs `WakeTurnConsumer` directly pending constructor injection, so
+this preparatory refactor has not completed the agents/core dependency cut.
+
 The graph shares one `WorkspaceBackendRouter` across Task execution, workflow
 hooks, lifecycle hooks, merge, cleanup, terminals, and operator status. Consumers
 resolve the persisted placement before workspace I/O; the legacy
