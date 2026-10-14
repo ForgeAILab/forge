@@ -984,7 +984,7 @@ async fn imported_owner_waits_are_admitted_by_the_sweep_once_their_block_is_lift
         ),
     ];
     for (priority, seed, lift) in rows {
-        let world = World::new().await;
+        let mut world = World::new().await;
         world.legacy_task("t", "t.txt", "merging").await;
         world.seed_execution("t", "executor", None).await;
         sqlx::query(seed).execute(world.db.pool()).await.unwrap();
@@ -1067,7 +1067,7 @@ async fn imported_lost_owner_and_accepted_command_rows_state_owner_required_and_
         ),
     ];
     for (priority, seed) in rows {
-        let world = World::new().await;
+        let mut world = World::new().await;
         world.legacy_task("t", "t.txt", "merging").await;
         world.seed_execution("t", "executor", None).await;
         sqlx::query(seed).execute(world.db.pool()).await.unwrap();
@@ -1575,13 +1575,16 @@ async fn a_custom_workflow_with_renamed_states_merges_through_the_queue() {
 /// a renamed merge state before the queue is imported (row P18) and merges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn the_importer_takes_a_task_in_a_renamed_merge_state() {
-    let world = World::new().await;
+    let mut world = World::new().await;
     world.rename_merge_states().await;
     world.legacy_task("t", "t.txt", "landing").await;
     world.seed_execution("t", "executor", None).await;
     // A Task of a default-workflow name in this Project is not a merge.
     world.legacy_task("other", "other.txt", "merging").await;
     world.touch("t").await;
+    // The importer runs before any worker, as at a start: the continuation
+    // admits this row again, so the read below must come before it.
+    world.stop_steps().await;
     let report = super::super::import::import_at_start(&world.db)
         .await
         .unwrap();
@@ -1596,6 +1599,7 @@ async fn the_importer_takes_a_task_in_a_renamed_merge_state() {
         imported.import_source_json.as_ref().unwrap()["priority"],
         18
     );
+    world.start_steps();
     let production = Production::new(&world);
     merged_as(&world, "t", "done", &production).await;
     assert_eq!(world.merges("t").await, 1);
@@ -1680,7 +1684,7 @@ async fn a_stopped_rebase_found_by_the_head_is_finished_and_its_conflict_handed_
 /// Project is resumed, with nothing but the worker's sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_imported_paused_integration_merges_when_the_project_is_resumed() {
-    let world = World::new().await;
+    let mut world = World::new().await;
     world.legacy_task("t", "t.txt", "merging").await;
     world.seed_execution("t", "executor", None).await;
     crate::deferred_dispatch::defer_integration_for_pause(&world.db, &world.task("t").await)
