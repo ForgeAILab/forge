@@ -997,7 +997,15 @@ impl RuntimeSupervisor {
             return Ok(0);
         }
 
-        self.runtime.db.release_orphaned_task_step_claims().await?;
+        // As crash recovery: a failure stops Solo, and the server keeps
+        // serving with its workers; the orphan's lease lapses on its own.
+        match self.runtime.db.release_orphaned_task_step_claims().await {
+            Ok(_) => {}
+            Err(error) if self.mode == RuntimeAssemblyMode::Solo => return Err(error.into()),
+            Err(error) => {
+                tracing::warn!(%error, "releasing the previous process's Task-step claims failed")
+            }
+        }
 
         let recovered = match self.runtime.crash_recovery.run().await {
             Ok(recovered) => recovered,
@@ -1426,6 +1434,66 @@ mod tests {
                 .title,
             "first write"
         );
+    }
+
+    /// A failed release of the previous process's claims is not a reason to
+    /// serve without workers: the server continues, as it does after a failed
+    /// crash recovery, and the orphan's lease lapses on its own.
+    #[tokio::test]
+    async fn open_items_fix_server_starts_its_workers_when_the_claim_release_fails() {
+        use db::TaskStepRepo;
+        let (_data_dir, runtime) = runtime().await;
+        let now = db::now_rfc3339();
+        sqlx::query(
+            "INSERT INTO project(id,name,created_at,updated_at) VALUES('poison-project','p',?,?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(runtime.db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('poison-task','poison-project','p','backlog',?,?)")
+            .bind(&now).bind(&now).execute(runtime.db.pool()).await.unwrap();
+        runtime
+            .db
+            .enqueue_step(&db::EnqueueTaskStep {
+                id: "poison-step".into(),
+                task_id: "poison-task".into(),
+                kind: "cascade".into(),
+                payload_json: "{}".into(),
+                causation_step_id: None,
+                causation_key: "poison".into(),
+                chain_id: "poison".into(),
+                chain_position: 1,
+                expected_status: "backlog".into(),
+                expected_version: 1,
+                expected_epoch: None,
+                lane: "fast".into(),
+                available_at: now.clone(),
+            })
+            .await
+            .unwrap();
+        runtime
+            .db
+            .claim_step(
+                "previous-process",
+                Some("poison-task"),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("CREATE TRIGGER poison_release BEFORE UPDATE ON task_step WHEN OLD.claimed_by='previous-process' BEGIN SELECT RAISE(ABORT,'injected release failure'); END")
+            .execute(runtime.db.pool())
+            .await
+            .unwrap();
+        let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
+        supervisor
+            .start()
+            .await
+            .expect("a failed claim release does not stop the server's runtime");
+        assert!(supervisor.worker_handle_count() > 0);
+        supervisor.shutdown().await.unwrap();
     }
 
     #[tokio::test]
