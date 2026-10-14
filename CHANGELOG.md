@@ -1679,7 +1679,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Split internal runtime composition and selected agent services into `services-agents`, above the `services` task core; no behaviour change.
+- **The runtime composition root and five agents modules moved to the new
+  `services-agents` crate (developer-only).** `ForgeRuntime`,
+  `ForgeRuntimeBuilder`, `RuntimeSupervisor`, `RuntimeAssemblyMode` and
+  `RuntimeTaskHandle`, and the `agent_inquiry_service`, `main_chat_topic`,
+  `prompt_preview`, `provider_authorization` and `embedded_task_executor`
+  modules, live in `services-agents`, above `services`; `services` re-exports
+  none of them. `ShutdownSignal`, `RuntimeWorker` and `COMMON_WORKERS` stay in
+  `services::worker_runtime::assembly`, and `DeadLetterService::for_runtime` is
+  now `ForgeRuntime::dead_letter_service`. The unused `RuntimeMode` alias and
+  the `runtime::builder` / `runtime::supervisor` re-export modules are gone.
+  No REST, MCP, CLI, event or stored-data change. Log lines from the moved
+  modules carry `services_agents::…` targets instead of `services::…`: the
+  default `services=info` filter still matches them (a filter target matches
+  by prefix), but a `RUST_LOG` directive that names a moved module, such as
+  `services::runtime=debug`, needs the new path.
 
 - **Pricing and the Solo services left the `services` crate (developer-only).**
   Provider pricing is the new `pricing` crate (`services → pricing → db`), and
