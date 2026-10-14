@@ -960,9 +960,14 @@ starts in a later Task step than its claim), the start takes the same bounded
 reissue, fenced to the run's state entry. A daemon-placed run has no later
 server-side lease check.
 The runner fences status and state-entry epoch against the Task captured before
-launch preparation. Already admitted checks may finish during a Project pause;
-explicit interactive recovery may inspect a Task held at admission. A new hold
-during launch still stops the run.
+launch preparation. A Project pause does not stop a run already admitted (a
+pause refuses new admissions; running runs finish). An Agent paused during the
+reissue ends the run as the Agent wait. Explicit interactive recovery may
+inspect a Task held at admission; a new hold during launch still stops the run.
+The workspace placement is not re-checked: no write moves a placement to
+another owner after admission, and a workspace admits one running repository
+execution. Across the backoff the launch holds only the in-process workspace
+execution lock (final check); each try is its own short transaction.
 
 ### Project readiness and execution setup
 
