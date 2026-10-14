@@ -19,6 +19,7 @@ events = { path = "../events" }
 fs2 = "0.4"
 review = { path = "../review" }
 services = { path = "../services" }
+services-agents = { path = "../services-agents" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }

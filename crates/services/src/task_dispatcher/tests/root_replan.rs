@@ -514,7 +514,10 @@ async fn a_spent_replan_budget_parks_the_root_with_a_typed_park_and_an_exit() {
     assert_eq!(reload(&lead.db, &root.id).await.version, blocked.version);
 
     // The owner is told: the park is an open Attention item of the root.
-    let attention = crate::AttentionService::new(Arc::clone(&lead.db));
+    let attention = crate::AttentionService::new(
+        Arc::clone(&lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+    );
     while attention.project_once(100).await.unwrap().processed_events > 0 {}
     let items: Vec<(String, String)> = sqlx::query_as(
         "SELECT attention_type, recommended_action FROM attention_projection WHERE status = 'open'

@@ -23,7 +23,8 @@ crates/
 ├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
 ├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
-├── services/      # Business logic (task state machine, workflow engine)
+├── services/      # Task core, workflow engine, shared domain services
+├── services-agents/ # Shared composition root, inquiry/topic services, provider authorization, embedded executor
 ├── pricing/       # models.dev catalog, price resolution at admission, cost estimation
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
@@ -40,19 +41,17 @@ crates/
 ### Dependency flow
 
 ```
-forge-cli → api → services → db
-                → events      ↑
-                → agent-host → agent-runtime
-          → mcp-server -------┘
-          → executors (log schema, shell executor)
-          → workspace → git
-          → config
-          → api-types (shared request/response types, zero internal deps)
+forge-cli → api / services-agents / services
+api → mcp-server
+api / mcp-server / forge-solo → services-agents → services → db
+api / mcp-server / forge-solo → services
+services-agents / services → events / agent-host / executors / workspace → git
+agent-host → agent-runtime
+forge-cli / forge-solo → config
+forge-solo → api-types / review / cli-adapters / operation-registry
+api-types (shared request/response types, zero internal deps)
 
-forge-solo → services → db / events / agent-host / executors / workspace → git
-           → config / api-types / review / cli-adapters / operation-registry
-
-api / services → pricing → db / api-types
+api / services-agents / services → pricing → db / api-types
 
 services / review / forge-client → check-executor → process-supervisor
                                                   → git → process-supervisor
@@ -161,7 +160,7 @@ builds. The recovery-to-re-execution future is boxed so it is stored on the
 heap rather than inline in the coordination-tool recovery future.
 
 `forge-cli/main.rs` resolves configuration, builds one transport-neutral
-`services::ForgeRuntime` through `ForgeRuntimeBuilder`, starts its
+`services_agents::ForgeRuntime` through `ForgeRuntimeBuilder`, starts its
 `RuntimeSupervisor` in server mode, and then constructs `AppState` as the Axum
 adapter over that graph. `AppState` retains `Arc` references to the Task,
 identity/profile, Main/Project Agent Chat, embedded-session, memory,
@@ -171,14 +170,38 @@ the background worker lifecycle. `AppState` is `Clone` (shared fields are
 
 ### Shared runtime composition and Forge Solo
 
-`services::ForgeRuntimeBuilder` is the composition boundary shared by the
-server and `forge-solo`. It resolves the effective configuration and injects
-one database, event bus, adapter registry, Agent Runtime host, credential and
+`services_agents::ForgeRuntimeBuilder` is the composition boundary shared by the
+server and `forge-solo`, in `services-agents`. API and MCP adapters also depend
+on that upper crate; `services` has no dependency back to it. It resolves the
+effective configuration and injects one database, event bus, adapter registry, Agent Runtime host, credential and
 log roots, workflow, review/merge, workspace, and cleanup graph. The builder
 constructs each domain service once; `RuntimeSupervisor` owns the background
 worker handles and one shutdown signal. The server's `AppState` and Solo's
 session facade consume this graph rather than maintaining parallel persistence,
 workflow, retry, or recovery implementations.
+
+Inside `services`, shared execution outbox contracts and the embedded execution
+lease registry belong to `task_service::execution`. Its `ExecutionSupport`
+interface supplies provider credential injection and outbox ingestion; the
+runtime builder injects `EmbeddedAgentService` through that interface. Provider
+endpoint defaults and URL-shape validation live in `provider_credentials`, and
+plain system chat notices in `chat_notices`. The core `wake_turns` module owns
+`WakeTurns` and `PreparedWakeTurn`; the agents-side callback builds the admission
+at the original transaction boundary using the current Attention row.
+`AttentionService::new` takes the `WakeTurns` implementation as an
+`Arc<dyn WakeTurns>`: the runtime builder passes the `WakeTurnConsumer` it
+starts as a worker, and Mission Control routes pass one built on the same
+database. Shared shutdown and worker identity contracts live in core
+`worker_runtime::assembly`; graph-dependent dead-letter registration lives in
+`ForgeRuntime::dead_letter_service` in `services-agents`.
+
+The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
+`prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with
+their tests. The remaining chat/admission/native-tool modules still live in
+`services`, where core unit-test fixtures and worker monitoring reference them.
+The core retains the agent registry, capacity, memory, operating skills, turn
+log sink, provider credentials/health, OAuth, daemon and orchestration services.
+Shared recovery fixtures are exposed only with core `test-support`.
 
 The graph shares one `WorkspaceBackendRouter` across Task execution, workflow
 hooks, lifecycle hooks, merge, cleanup, terminals, and operator status. Consumers
@@ -7948,7 +7971,16 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
   execution recovery and stale-annotation sweep), `HeartbeatMonitor` (owner
   lease/deadline expiry plus separate semantic-progress warnings),
   `DaemonMonitor`, Agent Chat turn workers, durable event consumers, Attention
-  projection, and `WorkspaceCleanupScheduler`.
+  projection, and `WorkspaceCleanupScheduler`. Shared worker identity and
+  shutdown contracts remain here, alongside the chat/admission/native-tool
+  modules still used by core unit-test fixtures and monitoring.
+- **services-agents** — The transport-neutral `ForgeRuntime` /
+  `ForgeRuntimeBuilder` composition graph and `RuntimeSupervisor`; inquiry and
+  Main Chat topic services, prompt previews, provider authorization, and the
+  embedded Task executor. Depends on `services`; the core does not depend back.
+  The Agent Chat turn-worker and Main Chat topic acceptance suites and the
+  runtime-lifetime recovery test live here; the other acceptance suites stay in
+  `services`.
 - **review** — the workflow's `run_ci_steps` hook prepares the Workspace and
   asks the durable check runner for the configured checks before ordinary
   reviewer dispatch; its hooks step waits `suspended` for the result. An

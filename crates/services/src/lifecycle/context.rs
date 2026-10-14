@@ -18,7 +18,7 @@ pub struct LifecycleHookContext {
     pub env: std::collections::BTreeMap<String, String>,
 }
 
-pub(crate) fn embedded_workspace_router_for_test(
+pub fn embedded_workspace_router_for_test(
     db: std::sync::Arc<db::SqliteDb>,
     root: PathBuf,
     locks: Option<std::sync::Arc<workspace::RepoCacheLockManager>>,

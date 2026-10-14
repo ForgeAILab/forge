@@ -364,7 +364,7 @@ async fn create_chat_invocation(
             },
             Some(agent.id.as_str()),
             runtime_model,
-            crate::embedded_agent_service::provider_entry_endpoint,
+            crate::provider_credentials::provider_entry_endpoint,
             &admitted_at,
         )
         .await?;

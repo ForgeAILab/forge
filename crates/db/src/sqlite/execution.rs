@@ -3417,20 +3417,6 @@ impl SqliteDb {
 }
 
 impl SqliteDb {
-    pub async fn dispatch_running_agent_execution_count(
-        &self,
-        agent_id: &str,
-    ) -> crate::Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COUNT(*) FROM execution WHERE agent_id=? AND status='running'",
-        )
-        .bind(agent_id)
-        .fetch_one(self.pool())
-        .await?)
-    }
-}
-
-impl SqliteDb {
     pub async fn retired_review_settlement_execution_ids(
         &self,
         task_id: &str,

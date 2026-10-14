@@ -1479,7 +1479,7 @@ async fn uncommitted_native_worker_failure_prompts_a_retry_and_preserves_the_dif
         .expect("execution failure is persisted");
 
     let expected_error = ExecutorError::Other(
-        crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
+        crate::task_service::execution::UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
     )
     .to_string();
     assert_eq!(updated.status, ExecutionStatus::Failed);

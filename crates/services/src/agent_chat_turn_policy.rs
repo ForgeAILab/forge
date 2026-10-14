@@ -218,11 +218,6 @@ pub fn recover_expired(
     })
 }
 
-/// Autonomous wake turns carry the admitted wake dedupe key.
-pub fn is_autonomous_wake_turn(job: &db::AgentChatTurnJob) -> bool {
-    job.dedupe_key.starts_with("agent-wake-admitted:")
-}
-
 pub fn bounded_error(error: &str) -> String {
     error
         .chars()

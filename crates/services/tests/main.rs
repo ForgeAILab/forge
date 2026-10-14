@@ -2,8 +2,6 @@
 // Env-mutating provisioning and shared-root Project-create tests stay isolated.
 // Keep the original target name as the module for focused test filters.
 
-#[path = "suite/agent_chat_turn_worker.rs"]
-mod agent_chat_turn_worker;
 #[path = "suite/attention_service.rs"]
 mod attention_service;
 #[path = "suite/attention_workflow_semantics.rs"]
@@ -24,8 +22,6 @@ mod domain_event_latency;
 mod embedded_agent_authorization;
 #[path = "suite/execution_liveness_characterization.rs"]
 mod execution_liveness_characterization;
-#[path = "suite/main_chat_topic.rs"]
-mod main_chat_topic;
 #[path = "suite/main_orchestration_queries.rs"]
 mod main_orchestration_queries;
 #[path = "suite/memory_service.rs"]

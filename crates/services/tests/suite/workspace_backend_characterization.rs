@@ -578,7 +578,7 @@ async fn owner_harvested_outbox_ingests_bytes_without_owner_paths_and_replays_on
     use api_types::{
         ExecutionOutboxArtifact, ExecutionOutboxEvidenceKind, ExecutionOutboxWorklogKind,
     };
-    use services::{native_tools::ExecutionOutboxInput, CoordinationToolProvider};
+    use services::{task_service::execution::ExecutionOutboxInput, CoordinationToolProvider};
 
     let fixture = fixture().await;
     let db = seed(&fixture, None).await;

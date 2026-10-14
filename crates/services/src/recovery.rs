@@ -3551,9 +3551,15 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     (era * 146_097 + doe - 719_468).into()
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::recovery::test_support::{
+        seed_project_repo, seed_task, seed_task_with_assignee, sqlite_db,
+    };
     use crate::{
         daemon_service::{DaemonReportInput, DaemonService, DetectedCliInput},
         daemon_transport::DaemonConnectionRegistry,
@@ -3561,12 +3567,11 @@ pub(crate) mod tests {
         TaskService,
     };
     use db::{
-        create_sqlite_pool, new_uuid_v4, run_migrations, AgentContextScopeRepo, AgentProfileRepo,
-        AgentSession, CreateAgent, CreateAgentContextScope, CreateAgentProfile, CreateAgentSession,
-        CreateExecution, CreateProject, CreateRepo, CreateReview, CreateTask,
-        CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo, DaemonStatus,
-        DomainEventRepo, RepoRepo, ReviewRepo, ReviewStatus, TaskRoleAssignmentRepo, TaskStatus,
-        UpdateProject, UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
+        new_uuid_v4, AgentContextScopeRepo, AgentProfileRepo, AgentSession, CreateAgent,
+        CreateAgentContextScope, CreateAgentProfile, CreateAgentSession, CreateExecution,
+        CreateReview, CreateTaskRoleAssignment, CreateWorkspace, CreateWorkspaceLease, DaemonRepo,
+        DaemonStatus, DomainEventRepo, ReviewRepo, ReviewStatus, TaskRoleAssignmentRepo,
+        UpsertDaemon, WorkspaceRepo, WorkspaceStatus,
     };
     use executors::{ExecutionContext, ExecutionOutcome, ExecutionResult, ExecutorError};
     use serde_json::Value;
@@ -3600,70 +3605,6 @@ pub(crate) mod tests {
                 .push(execution_id.to_owned());
             Ok(())
         }
-    }
-
-    async fn sqlite_db() -> SqliteDb {
-        let pool = create_sqlite_pool("sqlite::memory:")
-            .await
-            .expect("pool creates");
-        run_migrations(&pool).await.expect("migrations run");
-        SqliteDb::new(pool)
-    }
-
-    async fn seed_project_repo(db: &SqliteDb) -> (String, String) {
-        let now = now_rfc3339();
-        let project_id = new_uuid_v4();
-        let repo_id = new_uuid_v4();
-        ProjectRepo::create(
-            db,
-            CreateProject {
-                id: project_id.clone(),
-                name: "Forge".to_owned(),
-                settings: "{}".to_owned(),
-                workflow_definition: "{}".to_owned(),
-                primary_repo_id: None,
-                owner_id: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("project creates");
-        RepoRepo::create(
-            db,
-            CreateRepo {
-                id: repo_id.clone(),
-                project_id: project_id.clone(),
-                name: "forge".to_owned(),
-                remote_url: Some("https://example.com/forge.git".to_owned()),
-                local_path: None,
-                default_branch: "main".to_owned(),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("repo creates");
-        ProjectRepo::update_at_version(
-            db,
-            UpdateProject {
-                id: project_id.clone(),
-                name: None,
-                settings: None,
-                primary_repo_id: Some(Some(repo_id.clone())),
-                paused_at: None,
-                updated_at: now_rfc3339(),
-            },
-            ProjectRepo::get_by_id(db, &project_id)
-                .await
-                .expect("fixture Project lookup")
-                .expect("fixture Project exists")
-                .version,
-            None,
-        )
-        .await
-        .expect("project primary repo updates");
-        (project_id, repo_id)
     }
 
     async fn seed_agent(
@@ -3725,68 +3666,6 @@ pub(crate) mod tests {
         )
         .await
         .expect("agent creates")
-    }
-
-    async fn seed_task(
-        db: &SqliteDb,
-        project_id: String,
-        status: TaskStatus,
-        agent_id: Option<String>,
-    ) -> Task {
-        seed_task_with_assignee(db, project_id, status, "agent", agent_id).await
-    }
-
-    async fn seed_task_with_assignee(
-        db: &SqliteDb,
-        project_id: String,
-        status: TaskStatus,
-        assignee_type: &str,
-        assignee_id: Option<String>,
-    ) -> Task {
-        let now = now_rfc3339();
-        let task = TaskRepo::create(
-            db,
-            CreateTask {
-                id: new_uuid_v4(),
-                project_id,
-                parent_task_id: None,
-                subtask_order: None,
-                assignee_type: assignee_id.as_ref().map(|_| assignee_type.to_owned()),
-                assignee_id: assignee_id.clone(),
-                title: "Recover me".to_owned(),
-                description: None,
-                task_type: "task".to_owned(),
-                status,
-                is_automation: false,
-                priority: 0,
-                task_state_config: None,
-                merge_config: None,
-                plan: None,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            },
-        )
-        .await
-        .expect("task creates");
-        if assignee_type == "agent" {
-            if let Some(agent_id) = assignee_id {
-                TaskRoleAssignmentRepo::assign(
-                    db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name: default_roles::CODER.to_owned(),
-                        assignee_type: Some(db::AssigneeKind::Agent),
-                        assignee_id: Some(agent_id),
-                        created_at: now.clone(),
-                        updated_at: now,
-                    },
-                )
-                .await
-                .expect("role assignment creates");
-            }
-        }
-        task
     }
 
     async fn seed_running_execution(
@@ -5100,79 +4979,6 @@ pub(crate) mod tests {
         match &recovered[0].context {
             EventContext::TaskRecovered { reason, .. } => assert_eq!(reason, "crash_recovery"),
             other => panic!("unexpected task.recovered context: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn unchanged_starts_without_live_executions_write_no_recovery_steps_or_dirty_generations()
-    {
-        let db = Arc::new(sqlite_db().await);
-        let (project, _) = seed_project_repo(&db).await;
-        for state in ["in_progress", "merge_failed"] {
-            seed_task(&db, project.clone(), state.to_owned(), None).await;
-        }
-        let snapshot = || async {
-            let steps: Vec<(String, String)> =
-                sqlx::query_as("SELECT id,status FROM task_step ORDER BY id")
-                    .fetch_all(db.pool())
-                    .await
-                    .unwrap();
-            let dirty: Vec<(String, i64, i64, i64)> = sqlx::query_as("SELECT task_id,generation,dirty,external FROM task_schedule_dirty ORDER BY task_id")
-                .fetch_all(db.pool()).await.unwrap();
-            (steps, dirty)
-        };
-        let before = snapshot().await;
-        for _ in 0..2 {
-            let runtime_db = Arc::new(SqliteDb::new(db.pool().clone()));
-            CrashRecovery::new(runtime_db, Arc::new(EventBus::new(16)))
-                .run_recovery()
-                .await
-                .unwrap();
-            assert_eq!(snapshot().await, before);
-        }
-        // Exercise two complete runtime lifetimes on that same database.
-        // A paused Project keeps ordinary dispatch quiet during the starts.
-        sqlx::query("UPDATE project SET paused_at=? WHERE id=?")
-            .bind(now_rfc3339())
-            .bind(&project)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let mut previous_start = None;
-        let data_dir = tempfile::tempdir().unwrap();
-        let config = config::ForgeConfig::with_data_dir(data_dir.path().to_path_buf());
-        for _ in 0..2 {
-            let runtime_db = Arc::new(SqliteDb::new(db.pool().clone()));
-            let runtime = Arc::new(
-                crate::runtime::ForgeRuntimeBuilder::from_config(
-                    runtime_db,
-                    Arc::new(EventBus::new(64)),
-                    config.clone(),
-                )
-                .build(),
-            );
-            let mut supervisor = crate::runtime::RuntimeSupervisor::new(
-                runtime.clone(),
-                crate::runtime::RuntimeAssemblyMode::Solo,
-            );
-            supervisor.start().await.unwrap();
-            // Finish legitimate first-start import/scheduler work before
-            // comparing the next unchanged runtime lifetime.
-            runtime.task_dispatcher.reconcile_all().await.unwrap();
-            let ids: Vec<String> = sqlx::query_scalar("SELECT id FROM task ORDER BY id")
-                .fetch_all(db.pool())
-                .await
-                .unwrap();
-            for id in ids {
-                runtime.task_service.drain(&id).await.unwrap();
-            }
-            runtime.task_dispatcher.reconcile_all().await.unwrap();
-            supervisor.shutdown().await.unwrap();
-            let after = snapshot().await;
-            if let Some(previous) = previous_start.as_ref() {
-                assert_eq!(&after, previous);
-            }
-            previous_start = Some(after);
         }
     }
 

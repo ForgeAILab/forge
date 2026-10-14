@@ -8,9 +8,10 @@ use services::{
     AgentActionService, AgentChatTurnLogRoot, AgentChatTurnWorker, AgentInboxService, AgentService,
     AuthService, CommitmentService, DaemonService, EmbeddedAgentService, MemoryService,
     MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
-    ProjectHookService, ProviderAuthorizationService, TaskService, TerminalService,
-    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
+    ProjectHookService, TaskService, TerminalService, WorkspaceCleanupScheduler,
+    WorkspaceExecutionLockManager,
 };
+use services_agents::ProviderAuthorizationService;
 use uuid::Uuid;
 use workspace::RepoCacheLockManager;
 
@@ -38,8 +39,9 @@ pub struct AppState {
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
     pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
-    pub main_chat_topic_service: Arc<services::MainChatTopicService<SqliteDb>>,
-    pub agent_inquiry_service: Arc<services::agent_inquiry_service::AgentInquiryService<SqliteDb>>,
+    pub main_chat_topic_service: Arc<services_agents::MainChatTopicService<SqliteDb>>,
+    pub agent_inquiry_service:
+        Arc<services_agents::agent_inquiry_service::AgentInquiryService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
     /// Where each Agent Chat turn's durable activity log (tool calls,
     /// reasoning, reply deltas) lives; shared by the turn worker that writes
@@ -79,7 +81,7 @@ pub struct AppState {
     pub run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
     /// Keeps compatibility notification startup abortable when no runtime
     /// supervisor is present (for example in API-only test harnesses).
-    _notification_worker: Arc<services::RuntimeTaskHandle>,
+    _notification_worker: Arc<services_agents::RuntimeTaskHandle>,
     /// Owns the isolated data root used by the convenience/test constructors.
     _test_data_dir: Option<Arc<tempfile::TempDir>>,
 }
@@ -154,16 +156,17 @@ impl AppState {
         let data_dir = Arc::new(tempfile::tempdir().expect("test data directory creates"));
         let mut effective_config = ForgeConfig::with_data_dir(data_dir.path().to_path_buf());
         effective_config.workspace.root = workspace_root;
-        let runtime = services::ForgeRuntimeBuilder::from_config(db, event_bus, effective_config)
-            .with_adapter_registry(adapter_registry)
-            .with_cleanup_scheduler(cleanup_scheduler)
-            .with_merge_service(merge_service)
-            .with_shutdown_signal(shutdown_signal)
-            .with_workflows_dir(workflows_dir)
-            .with_jwt_secret(jwt_secret)
-            .with_bcrypt_cost(bcrypt_cost)
-            .start_notification_service()
-            .build();
+        let runtime =
+            services_agents::ForgeRuntimeBuilder::from_config(db, event_bus, effective_config)
+                .with_adapter_registry(adapter_registry)
+                .with_cleanup_scheduler(cleanup_scheduler)
+                .with_merge_service(merge_service)
+                .with_shutdown_signal(shutdown_signal)
+                .with_workflows_dir(workflows_dir)
+                .with_jwt_secret(jwt_secret)
+                .with_bcrypt_cost(bcrypt_cost)
+                .start_notification_service()
+                .build();
         let mut state = Self::from_runtime(runtime, mcp_enabled);
         state._test_data_dir = Some(data_dir);
         state
@@ -173,11 +176,14 @@ impl AppState {
     ///
     /// The dispatcher belongs to the shared runtime graph, so API state and
     /// every local presentation observe the same dispatcher identity.
-    pub fn from_runtime(runtime: services::ForgeRuntime, mcp_enabled: bool) -> Self {
+    pub fn from_runtime(runtime: services_agents::ForgeRuntime, mcp_enabled: bool) -> Self {
         Self::from_runtime_arc(Arc::new(runtime), mcp_enabled)
     }
 
-    pub fn from_runtime_arc(runtime: Arc<services::ForgeRuntime>, mcp_enabled: bool) -> Self {
+    pub fn from_runtime_arc(
+        runtime: Arc<services_agents::ForgeRuntime>,
+        mcp_enabled: bool,
+    ) -> Self {
         runtime
             .operator_status_service
             .usage_ledger_index()
@@ -215,9 +221,7 @@ impl AppState {
             notification_service: Arc::clone(&runtime.notification_service),
             project_hook_service: Arc::clone(&runtime.project_hook_service),
             terminal_service: Arc::clone(&runtime.terminal_service),
-            dead_letter_service: Arc::new(
-                services::dead_letter_service::DeadLetterService::for_runtime(&runtime),
-            ),
+            dead_letter_service: Arc::new(runtime.dead_letter_service()),
             operator_status_service: Arc::clone(&runtime.operator_status_service),
             operator_status_emitter: Arc::clone(&runtime.operator_status_emitter),
             cleanup_scheduler: Arc::clone(&runtime.cleanup_scheduler),

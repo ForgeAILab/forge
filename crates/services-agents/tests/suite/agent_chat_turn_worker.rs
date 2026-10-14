@@ -825,7 +825,10 @@ async fn manual_retry_admits_current_profile_is_versioned_idempotent_and_resolve
         let failed = current_turn(&db, &job.id).await;
         assert_eq!(failed.status, AgentChatTurnState::Failed);
         assert!(failed.retry_action().is_some());
-        let attention = services::AttentionService::new(db.clone());
+        let attention = services::AttentionService::new(
+            db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(db.clone())),
+        );
         attention.project_once(100).await.unwrap();
         attention.project_once(100).await.unwrap();
         let items: Vec<(String, String, String)> = sqlx::query_as("SELECT summary, recommended_action, details_json FROM attention_projection WHERE source_event_id IN (SELECT id FROM domain_event WHERE entity_id = ? AND event_type = 'agent_chat.turn.failed')")
@@ -953,7 +956,10 @@ async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
             failure_runner(api_types::TurnFailure::Configuration, false),
         );
         worker.run_once().await.unwrap();
-        let attention = services::AttentionService::new(db.clone());
+        let attention = services::AttentionService::new(
+            db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(db.clone())),
+        );
         attention.project_once(100).await.unwrap();
         attention.project_once(100).await.unwrap();
         sqlx::query(
@@ -963,12 +969,12 @@ async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
     .await
     .unwrap();
         if topic_divider {
-            services::MainChatTopicService::new(
+            services_agents::MainChatTopicService::new(
                 db.clone(),
                 Arc::new(AgentChatService::new(db.clone())),
                 services::ProductGenesisService::for_sqlite(db.clone()),
             )
-            .start_topic(services::StartMainChatTopicInput {
+            .start_topic(services_agents::StartMainChatTopicInput {
                 actor_user_id: ACCOUNT_ID.into(),
                 chat_id: job.chat_id.clone(),
                 label: Some("new topic".into()),

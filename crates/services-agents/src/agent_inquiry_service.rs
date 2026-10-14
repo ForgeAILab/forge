@@ -1,6 +1,6 @@
 //! Read and cancel surface for Main Agent inquiries.
 //!
-//! Dispatching one lives in [`crate::agent_inquiry_runner`]; this service is
+//! Dispatching one lives in [`services::agent_inquiry_runner`]; this service is
 //! only what the REST layer needs to show a run and stop it.
 //!
 //! Authorization reuses [`AgentChatService::get_authorized_chat`] rather than
@@ -19,7 +19,7 @@ use db::{
     AgentRepo, Page, ProjectAgentBindingRepo, ProjectMemberRepo,
 };
 
-use crate::{
+use services::{
     agent_chat_service::AgentChatService, agent_inquiry_runner::InquiryRunner,
     agent_turn_admission::AgentResponderStore, Result, ServiceError,
 };

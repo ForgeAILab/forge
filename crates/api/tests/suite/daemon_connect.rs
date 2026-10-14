@@ -239,7 +239,7 @@ async fn reconnect_cannot_be_left_offline_by_delayed_disconnect() {
     db::run_migrations(&pool).await.unwrap();
     // AppState::new starts a notification worker that also acquires from the
     // pool. Build without it so only the socket can consume the armed gate.
-    let runtime = services::ForgeRuntimeBuilder::from_config(
+    let runtime = services_agents::ForgeRuntimeBuilder::from_config(
         Arc::new(db::SqliteDb::new(pool)),
         Arc::new(events::EventBus::new(64)),
         config::ForgeConfig::with_data_dir(root.path().to_path_buf()),

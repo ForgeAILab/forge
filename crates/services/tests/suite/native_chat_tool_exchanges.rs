@@ -1632,7 +1632,10 @@ async fn native_provider_availability_failures_are_configuration_before_provider
                 .await
                 .unwrap();
         assert_eq!(invocations, 0, "{condition}");
-        let attention = services::AttentionService::new(fixture.db.clone());
+        let attention = services::AttentionService::new(
+            fixture.db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(fixture.db.clone())),
+        );
         attention.project_once(100).await.unwrap();
         attention.project_once(100).await.unwrap();
         let incidents: i64 = sqlx::query_scalar(

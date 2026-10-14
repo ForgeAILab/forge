@@ -1,5 +1,5 @@
 use super::*;
-use crate::embedded_task_executor::is_read_only_task_role;
+use crate::task_service::execution::embedded_task_executor::is_read_only_task_role;
 use crate::workspace_backend::ResolvedWorkspace;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio::sync::mpsc;
@@ -136,7 +136,7 @@ fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
 }
 
 async fn embedded_execution_heartbeat(
-    lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+    lease: Arc<crate::task_service::execution::EmbeddedExecutionLease>,
     hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
@@ -152,7 +152,7 @@ async fn embedded_execution_heartbeat(
 }
 
 async fn embedded_execution_heartbeat_with_clock(
-    lease: Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+    lease: Arc<crate::task_service::execution::EmbeddedExecutionLease>,
     hard_deadline_at: Option<String>,
     stop: CancellationToken,
     signal_tx: mpsc::UnboundedSender<EmbeddedLeaseSignal>,
@@ -818,13 +818,13 @@ impl TaskService {
             .lease_owner
             .clone()
             .ok_or_else(|| ServiceError::invalid_operation("execution lease has no owner"))?;
-        let lease = Arc::new(crate::embedded_task_executor::EmbeddedExecutionLease::new(
+        let lease = Arc::new(crate::task_service::execution::EmbeddedExecutionLease::new(
             Arc::clone(&self.db),
             lease_execution.id.clone(),
             lease_owner,
             lease_execution.execution_version,
         ));
-        crate::embedded_task_executor::register_execution_lease(
+        crate::task_service::execution::register_execution_lease(
             execution_before_launch.id.clone(),
             Arc::clone(&lease),
         );
@@ -977,7 +977,7 @@ impl TaskService {
             match git::get_current_sha(worktree_path).await {
                 Ok(head) => Some(head),
                 Err(error) => {
-                    crate::embedded_task_executor::unregister_execution_lease(
+                    crate::task_service::execution::unregister_execution_lease(
                         &execution_id,
                         &lease,
                     );
@@ -1106,7 +1106,7 @@ impl TaskService {
         {
             hard_deadline_exceeded = true;
         }
-        crate::embedded_task_executor::unregister_execution_lease(&execution_id, &lease);
+        crate::task_service::execution::unregister_execution_lease(&execution_id, &lease);
         // Drain semantic events before the terminal CAS.  The forwarding task
         // owns the only progress writer, so joining it ensures no late event
         // can race the final owner/version read.
@@ -1244,7 +1244,7 @@ impl TaskService {
         }
         let uncommitted_worktree_failure = result.status == ExecutionOutcome::Failed
             && result.error.as_deref().is_some_and(|error| {
-                error.ends_with(crate::embedded_task_executor::UNCOMMITTED_WORKTREE_FAILURE)
+                error.ends_with(crate::task_service::execution::UNCOMMITTED_WORKTREE_FAILURE)
             });
         // A write-capable implementation execution that "completes" while
         // leaving the repository untouched and firing no workflow transition
@@ -1522,13 +1522,15 @@ impl TaskService {
                     (self.credential_env.as_ref(), updated.agent_id.as_deref())
                 {
                     let report = embedded
-                        .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
-                            task_id: &task.id,
-                            execution_id: &execution_id,
-                            agent_id,
-                            role: Some(updated.role.as_str()),
-                            worktree_path: &workspace_path,
-                        })
+                        .ingest_execution_outbox(
+                            &crate::task_service::execution::ExecutionOutboxInput {
+                                task_id: &task.id,
+                                execution_id: &execution_id,
+                                agent_id,
+                                role: Some(updated.role.as_str()),
+                                worktree_path: &workspace_path,
+                            },
+                        )
                         .await;
                     if report.worklog_entries > 0 || report.evidence_items > 0 {
                         tracing::info!(
@@ -1886,7 +1888,7 @@ mod tests {
     async fn heartbeat_fixture() -> (
         Arc<db::SqliteDb>,
         String,
-        Arc<crate::embedded_task_executor::EmbeddedExecutionLease>,
+        Arc<crate::task_service::execution::EmbeddedExecutionLease>,
     ) {
         let pool = db::create_sqlite_pool("sqlite::memory:")
             .await
@@ -2028,7 +2030,7 @@ mod tests {
             db::ExecutionLeaseMutation::Updated(execution) => execution,
             other => panic!("claim must succeed, got {other:?}"),
         };
-        let lease = Arc::new(crate::embedded_task_executor::EmbeddedExecutionLease::new(
+        let lease = Arc::new(crate::task_service::execution::EmbeddedExecutionLease::new(
             Arc::clone(&db),
             execution_id.clone(),
             claimed.lease_owner.expect("owner persisted"),
@@ -2248,16 +2250,16 @@ impl TaskService {
     /// their backend; daemon turns supply the terminal report's entries.
     pub(crate) async fn ingest_execution_outbox_entries(
         &self,
-        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
         entries: Vec<api_types::ExecutionOutboxEntry>,
-    ) -> crate::native_tools::ExecutionOutboxReport {
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
         match self.credential_env.as_ref() {
             Some(embedded) => {
                 embedded
                     .ingest_execution_outbox_entries(input, entries)
                     .await
             }
-            None => crate::native_tools::ExecutionOutboxReport::default(),
+            None => crate::task_service::execution::ExecutionOutboxReport::default(),
         }
     }
 

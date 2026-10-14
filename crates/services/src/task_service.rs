@@ -57,7 +57,7 @@ mod create;
 pub(crate) use create::PreparedProjectHookTask;
 mod create_subtasks;
 mod dependencies;
-pub(crate) mod execution;
+pub mod execution;
 mod governance;
 mod lifecycle_test;
 pub(crate) mod logs;
@@ -478,7 +478,7 @@ pub struct TaskService {
     /// Shared with manual checks: a Project has at most one host re-check.
     environment_rechecks: Arc<std::sync::Mutex<HashSet<String>>>,
     dispatch_notify: Arc<tokio::sync::Notify>,
-    credential_env: Option<Arc<crate::embedded_agent_service::EmbeddedAgentService>>,
+    credential_env: Option<Arc<dyn execution::ExecutionSupport>>,
     pub(crate) dispatch_wake: Arc<tokio::sync::Notify>,
     /// The runtime's dispatcher instance, for commands it queued.
     dispatcher: Arc<std::sync::Mutex<std::sync::Weak<crate::task_dispatcher::DispatcherInstance>>>,
@@ -801,12 +801,16 @@ impl TaskService {
         self
     }
 
-    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+    pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
     }
 
     pub fn workspace_backend_router(&self) -> Arc<WorkspaceBackendRouter> {
         Arc::clone(&self.workspace_backend_router)
+    }
+
+    pub fn repo_cache_locks(&self) -> Option<Arc<RepoCacheLockManager>> {
+        self.repo_cache_locks.clone()
     }
 
     fn configure_workspace_backend(&mut self) {
@@ -940,7 +944,7 @@ impl TaskService {
     /// into their in-memory executor environment.
     pub fn with_provider_credential_env(
         mut self,
-        embedded: Arc<crate::embedded_agent_service::EmbeddedAgentService>,
+        embedded: Arc<dyn execution::ExecutionSupport>,
     ) -> Self {
         self.credential_env = Some(embedded);
         self.task_step_driver = Arc::default();

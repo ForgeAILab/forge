@@ -15,7 +15,7 @@ pub async fn prompt_preview(
         return Err(ApiError::bad_request("role must not be empty"));
     }
 
-    let prompt = services::preview_effective_prompt(
+    let prompt = services_agents::preview_effective_prompt(
         std::sync::Arc::clone(&state.db),
         &state.task_service.workspace_backend_router(),
         &id,

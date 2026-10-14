@@ -25,7 +25,8 @@ use crate::session::{
 use db::DbError;
 use events::ForgeEvent;
 use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
-use services::{EmbeddedDaemon, RuntimeSupervisor, ServiceError};
+use services::{EmbeddedDaemon, ServiceError};
+use services_agents::RuntimeSupervisor;
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
 use crate::backend::{

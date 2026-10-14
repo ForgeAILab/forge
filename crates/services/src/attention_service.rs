@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     wake_blocker::BlockerTurnState,
+    wake_turns::{PreparedWakeTurn, WakeTurns},
     worker_runtime::{Outcome, Subscription, Worker, WorkerError, WorkerRuntime},
     Result, ServiceError,
 };
@@ -155,7 +156,7 @@ struct WakeDecisionContext {
     task_id: Option<String>,
     requires_current_task_intervention: bool,
     orphan_execution_id: Option<String>,
-    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
+    turn: Option<Arc<PreparedWakeTurn>>,
     batch: Vec<AttentionProjection>,
 }
 
@@ -172,15 +173,17 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    wake_turns: Arc<dyn WakeTurns>,
     action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
     last_sweep: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AttentionService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
+    pub fn new(db: Arc<SqliteDb>, wake_turns: Arc<dyn WakeTurns>) -> Self {
         Self {
             db,
+            wake_turns,
             event_bus: None,
             action_connections: None,
             last_sweep: Arc::default(),
@@ -257,7 +260,8 @@ impl AttentionService {
         if let Some(id) = context.attention_id.as_deref() {
             if let Some(attention) = self.db.get_attention(id).await? {
                 let dedupe = wake_admitted_dedupe_key(&request, &context);
-                context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                context.turn = self
+                    .wake_turns
                     .prepare_attention(
                         &attention,
                         &dedupe,
@@ -479,7 +483,8 @@ impl AttentionService {
         }
         let combined = parts.join(":");
         context.incident_digest = Some(wake_incident_digest(&combined, None));
-        context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+        context.turn = self
+            .wake_turns
             .prepare_attention(
                 &first,
                 &wake_admitted_dedupe_key(&request, &context),
@@ -1103,8 +1108,8 @@ impl AttentionService {
                         correlation_id: request.correlation_id.clone(), causation_id: request.causation_id.clone(),
                         causation_depth: request.reaction_depth,
                         dedupe_key: Some(format!("autonomy-stalled:{}:{}:{}:{}", budget_scope_type, budget_scope_id,
-                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_id.as_deref()).unwrap_or_default(),
-                            context.turn.as_ref().and_then(|p|p.prepared.responder.binding_version).unwrap_or_default())),
+                            context.turn.as_ref().and_then(|p|p.binding_id.as_deref()).unwrap_or_default(),
+                            context.turn.as_ref().and_then(|p|p.binding_version).unwrap_or_default())),
                         payload_json: json!({
                             "project_id": budget_scope_id, "task_id": null,
                             "event_type": "project.autonomy_stalled",
@@ -1416,7 +1421,7 @@ impl AttentionService {
         let payload_json = json!({
             "decision": decision_code,
             "turn_job_id": (event_type == "agent.wake.admitted").then(|| context.turn.as_ref().map(|p|
-                Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}:turn", p.prepared.dedupe_key).as_bytes()).to_string())).flatten(),
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{}:turn", p.dedupe_key).as_bytes()).to_string())).flatten(),
             "reason": reason_code,
             "admission_phase": admission_phase,
             "identity_id": identity_id,
@@ -1480,7 +1485,6 @@ impl AttentionService {
                     .turn
                     .as_ref()
                     .ok_or_else(|| ServiceError::invalid_operation("wake has no prepared turn"))?;
-                let mut input = (**prepared).clone();
                 let id = context
                     .attention_id
                     .as_deref()
@@ -1490,9 +1494,9 @@ impl AttentionService {
                     .get_attention_in_tx(transaction, id)
                     .await?
                     .ok_or(db::DbError::NotFound)?;
-                input.attention = actual.clone();
-                let admitted = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
-                    .build_prepared_turn(&event, &input)?;
+                let admitted = self
+                    .wake_turns
+                    .build_prepared_turn(&event, prepared, &actual)?;
                 (
                     db::AgentWakeDispositionKind::TurnAdmitted,
                     Some(admitted),
@@ -1550,7 +1554,7 @@ impl AttentionService {
             .db
             .get_agent_wake_disposition_in_tx(
                 transaction,
-                crate::wake_turn_consumer_name(),
+                self.wake_turns.consumer_name(),
                 &event.id,
             )
             .await?
@@ -1565,7 +1569,7 @@ impl AttentionService {
                 format!("wake-disposition:{}", event.id).as_bytes(),
             )
             .to_string(),
-            consumer_name: crate::wake_turn_consumer_name().to_owned(),
+            consumer_name: self.wake_turns.consumer_name().to_owned(),
             source_event_id: event.id.clone(),
             source_event_sequence: event.sequence,
             attempt_number: 1,
@@ -2620,7 +2624,7 @@ impl AttentionService {
                     incident_digest: Some(wake_attention_incident_digest(&candidate)),
                     ..Default::default()
                 };
-                crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                self.wake_turns
                     .prepare_attention(
                         &candidate,
                         &wake_admitted_dedupe_key(&request, &context),
@@ -3912,7 +3916,7 @@ pub struct PreparedAttention {
 }
 struct PreparedAttentionIncident {
     projection: CreateAttentionProjection,
-    turn: Option<Arc<crate::wake_turn_consumer::PreparedWakeTurn>>,
+    turn: Option<Arc<PreparedWakeTurn>>,
     request: WakeAdmissionRequest,
     decision: PreparedWakeDecision,
     failed_turn: Option<db::AgentChatTurnJob>,
@@ -4242,7 +4246,8 @@ mod tests {
     async fn health_service() -> AttentionService {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
-        AttentionService::new(Arc::new(SqliteDb::new(pool)))
+        let db = Arc::new(SqliteDb::new(pool));
+        AttentionService::new(Arc::clone(&db), Arc::new(crate::WakeTurnConsumer::new(db)))
     }
 
     async fn append_projection_event(

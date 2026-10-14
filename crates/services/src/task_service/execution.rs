@@ -1,10 +1,239 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
+use crate::turn_log_sink::TurnProgressObserver;
 use crate::workflow::dispatch::{
     build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
     loader::load_agent_dispatch_context,
 };
+use async_trait::async_trait;
 use db::{UpdateTask, UpdateTaskStatus};
+use std::sync::{Mutex as StdMutex, OnceLock};
+
+pub mod embedded_task_executor;
+
+/// The execution whose outbox is ingested. Provenance comes from here, never
+/// from the files the harness wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionOutboxInput<'a> {
+    pub task_id: &'a str,
+    pub execution_id: &'a str,
+    pub agent_id: &'a str,
+    pub role: Option<&'a str>,
+    pub worktree_path: &'a str,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecutionOutboxReport {
+    pub worklog_entries: usize,
+    pub evidence_items: usize,
+    /// One human-readable reason per entry that was not ingested.
+    pub rejected: Vec<String>,
+    pub(crate) plan_candidate: bool,
+    pub(crate) plan_rejected: bool,
+}
+
+/// Provider credentials and owner outboxes used by Task execution.
+/// The composition root supplies the agents adapter; the Task core owns the
+/// input and result contracts and retains its execution ordering.
+#[async_trait]
+pub trait ExecutionSupport: Send + Sync {
+    async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()>;
+    async fn ingest_execution_outbox(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+    ) -> ExecutionOutboxReport;
+    async fn ingest_execution_outbox_entries(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> ExecutionOutboxReport;
+}
+
+pub const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
+
+/// Shared state for the server-owned execution lease.
+///
+/// The embedded adapter receives this through a short-lived registry rather
+/// than through `ExecutionContext`: the latter is also constructed by all CLI
+/// adapters and is deliberately transport-neutral.  The runner registers the
+/// handle immediately before dispatch and removes it after the future exits.
+/// Both heartbeat and semantic-progress calls serialize on the same mutex so
+/// every successful CAS advances one authoritative execution version.
+pub struct EmbeddedExecutionLease {
+    db: Arc<SqliteDb>,
+    execution_id: String,
+    owner: String,
+    state: Mutex<EmbeddedExecutionLeaseState>,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddedExecutionLeaseState {
+    execution_version: i64,
+}
+
+/// Turn events are semantic progress only.  They never renew the execution
+/// owner lease: the server-controlled runner heartbeat does that
+/// independently, so a quiet provider request or long-running tool remains
+/// live while its owner is healthy.
+#[async_trait]
+impl TurnProgressObserver for EmbeddedExecutionLease {
+    async fn record_progress(&self) {
+        let progress_at = db::now_rfc3339();
+        if let Err(error) = self.record_progress(progress_at, db::now_rfc3339()).await {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                %error,
+                "failed to record native execution semantic progress"
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for EmbeddedExecutionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedExecutionLease")
+            .field("execution_id", &self.execution_id)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddedExecutionLease {
+    pub(crate) fn new(
+        db: Arc<SqliteDb>,
+        execution_id: impl Into<String>,
+        owner: impl Into<String>,
+        execution_version: i64,
+    ) -> Self {
+        Self {
+            db,
+            execution_id: execution_id.into(),
+            owner: owner.into(),
+            state: Mutex::new(EmbeddedExecutionLeaseState { execution_version }),
+        }
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        lease_expires_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::renew_lease(
+                &*self.db,
+                db::RenewExecutionLease {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    lease_expires_at: lease_expires_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    // A semantic-progress or adjacent same-owner CAS may
+                    // have advanced the version between the heartbeat read
+                    // and renewal. Refresh once; only a different owner or
+                    // terminal row means this runner has truly lost liveness.
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded heartbeat renewal retry always returns")
+    }
+
+    pub(crate) async fn record_progress(
+        &self,
+        progress_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::record_progress(
+                &*self.db,
+                db::RecordExecutionProgress {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    progress_at: progress_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded semantic-progress retry always returns")
+    }
+
+    pub(crate) async fn owner_and_version(&self) -> (String, i64) {
+        let state = self.state.lock().await;
+        (self.owner.clone(), state.execution_version)
+    }
+}
+
+type EmbeddedExecutionLeaseRegistry = StdMutex<HashMap<String, Arc<EmbeddedExecutionLease>>>;
+
+fn embedded_execution_leases() -> &'static EmbeddedExecutionLeaseRegistry {
+    static REGISTRY: OnceLock<EmbeddedExecutionLeaseRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_execution_lease(
+    execution_id: impl Into<String>,
+    lease: Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        leases.insert(execution_id.into(), lease);
+    }
+}
+
+pub(crate) fn unregister_execution_lease(
+    execution_id: &str,
+    expected: &Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        if leases
+            .get(execution_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            leases.remove(execution_id);
+        }
+    }
+}
+
+pub fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
+    embedded_execution_leases()
+        .lock()
+        .ok()
+        .and_then(|leases| leases.get(execution_id).cloned())
+}
 
 mod cascade;
 mod environment;
@@ -744,7 +973,7 @@ impl TaskService {
         &self,
         task: &Task,
         execution: &Execution,
-    ) -> Result<crate::native_tools::ExecutionOutboxReport> {
+    ) -> Result<crate::task_service::execution::ExecutionOutboxReport> {
         let workspace = match execution.workspace_id.as_deref() {
             Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
             None => {
@@ -757,7 +986,7 @@ impl TaskService {
             execution.agent_id.as_deref(),
             workspace,
         ) else {
-            return Ok(crate::native_tools::ExecutionOutboxReport::default());
+            return Ok(crate::task_service::execution::ExecutionOutboxReport::default());
         };
         let resolved = self
             .workspace_backend_router
@@ -766,12 +995,12 @@ impl TaskService {
         // Daemon-owned outboxes are carried in the retained terminal report;
         // their handles do not name files on the Forge host.
         if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
-            return Ok(crate::native_tools::ExecutionOutboxReport::default());
+            return Ok(crate::task_service::execution::ExecutionOutboxReport::default());
         }
         // The outbox sits in the Task root, beside the worktree.
         let path = crate::workspace_manager::task_root_anchor(&resolved)?;
         let report = embedded
-            .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
+            .ingest_execution_outbox(&crate::task_service::execution::ExecutionOutboxInput {
                 task_id: &task.id,
                 execution_id: &execution.id,
                 agent_id,

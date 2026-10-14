@@ -1,3 +1,6 @@
+use crate::provider_credentials::{
+    default_api_key_base_url, entry_base_url, restricted_provider_ip, validate_provider_url_shape,
+};
 use operation_registry::authority::permission_set;
 use std::{
     collections::BTreeSet,
@@ -344,7 +347,7 @@ impl EmbeddedAgentService {
     /// Apply the server's optional public-search configuration to the shared
     /// provider used by all subsequently composed native sessions.
     /// The Task service the server wired in, when there is one.
-    pub(crate) fn task_service_handle(&self) -> Option<Arc<crate::TaskService>> {
+    pub fn task_service_handle(&self) -> Option<Arc<crate::TaskService>> {
         self.tool_provider.task_service_handle()
     }
 
@@ -426,16 +429,16 @@ impl EmbeddedAgentService {
     /// outbox; see [`CoordinationToolProvider::ingest_execution_outbox`].
     pub async fn ingest_execution_outbox(
         &self,
-        input: &crate::native_tools::ExecutionOutboxInput<'_>,
-    ) -> crate::native_tools::ExecutionOutboxReport {
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
         self.tool_provider.ingest_execution_outbox(input).await
     }
 
     pub async fn ingest_execution_outbox_entries(
         &self,
-        input: &crate::native_tools::ExecutionOutboxInput<'_>,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
         entries: Vec<api_types::ExecutionOutboxEntry>,
-    ) -> crate::native_tools::ExecutionOutboxReport {
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
         self.tool_provider
             .ingest_execution_outbox_entries(input, entries)
             .await
@@ -2333,24 +2336,6 @@ fn provider_env_variable(provider: &str) -> Option<&'static str> {
     }
 }
 
-/// Default API endpoint for API-key entries. `openai_compatible` has no
-/// default and requires an explicit base URL.
-pub fn default_api_key_base_url(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some("https://api.openai.com/v1"),
-        "xai" => Some("https://api.x.ai/v1"),
-        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
-        "openrouter" => Some("https://openrouter.ai/api/v1"),
-        _ => None,
-    }
-}
-
-/// [`entry_base_url`] as the pricing crate asks for it: the endpoint, or `None`
-/// when the entry has no usable one.
-pub fn provider_entry_endpoint(entry: &CredentialHandle) -> Option<String> {
-    entry_base_url(entry).ok()
-}
-
 /// Whether a base URL points at the ChatGPT Codex backend, which speaks the
 /// Responses API only and has no OpenAI-compatible `GET /models` route.
 fn is_codex_backend(base_url: &str) -> bool {
@@ -2383,43 +2368,6 @@ fn validate_native_reasoning_effort(
         )));
     }
     Ok(Some(reasoning_effort.to_owned()))
-}
-
-fn default_oauth_base_url(provider: &str) -> Option<&'static str> {
-    match provider {
-        "openai" => Some("https://chatgpt.com/backend-api/codex"),
-        "xai" => Some("https://api.x.ai/v1"),
-        "gemini" => Some("https://generativelanguage.googleapis.com/v1beta"),
-        _ => None,
-    }
-}
-
-/// The API endpoint an agent built on this entry talks to: stored entry
-/// metadata first, then the provider/method default.
-pub fn entry_base_url(entry: &CredentialHandle) -> Result<String> {
-    let stored = serde_json::from_str::<Value>(&entry.metadata_json)
-        .ok()
-        .and_then(|metadata| {
-            metadata
-                .get("base_url")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-    if let Some(base_url) = stored {
-        let base_url = base_url.trim();
-        validate_provider_url_shape(base_url).map_err(ServiceError::invalid_operation)?;
-        return Ok(base_url.to_owned());
-    }
-    let fallback = if entry.credential_method == "oauth_bundle" {
-        default_oauth_base_url(&entry.provider)
-    } else {
-        default_api_key_base_url(&entry.provider)
-    };
-    let fallback = fallback.ok_or_else(|| {
-        ServiceError::invalid_operation("provider entry has no usable API endpoint")
-    })?;
-    validate_provider_url_shape(fallback).map_err(ServiceError::invalid_operation)?;
-    Ok(fallback.to_owned())
 }
 
 /// The provider-side account id recorded on an entry during OAuth login.
@@ -2537,82 +2485,6 @@ async fn provider_url_addresses(
     Ok((parsed, addresses))
 }
 
-/// Validate the URL properties that do not require DNS resolution. This is
-/// shared by metadata/profile persistence and the full async provider probe,
-/// so a legacy or tampered metadata value cannot bypass the endpoint policy
-/// simply because it was read from storage instead of submitted by a caller.
-fn validate_provider_url_shape(base_url: &str) -> std::result::Result<url::Url, &'static str> {
-    let parsed = url::Url::parse(base_url).map_err(|_| "base_url must be an absolute URL")?;
-    if parsed.username() != ""
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err("base_url must not contain userinfo, a query, or a fragment");
-    }
-    if parsed.scheme() != "https" {
-        return Err("base_url must use https");
-    }
-    let host = parsed.host().ok_or("base_url must include a host")?;
-    let _port = parsed
-        .port_or_known_default()
-        .ok_or("base_url has no known port")?;
-    match host {
-        url::Host::Ipv4(address) if restricted_provider_ip(IpAddr::V4(address)) => {
-            return Err("base_url must not target a private or local address");
-        }
-        url::Host::Ipv6(address) if restricted_provider_ip(IpAddr::V6(address)) => {
-            return Err("base_url must not target a private or local address");
-        }
-        url::Host::Domain(domain) if restricted_provider_hostname(domain) => {
-            return Err("base_url must not target a local or private hostname");
-        }
-        _ => {}
-    }
-    Ok(parsed)
-}
-
-fn restricted_provider_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
-}
-
-fn restricted_provider_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] & 0xfe00) == 0xfc00
-                || segments[0] >= 0xff00
-                || address
-                    .to_ipv4()
-                    .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
-        }
-    }
-}
-
 fn validate_public_runtime_text(value: Option<&str>) -> Result<Option<String>> {
     value
         .map(|text| guard_runtime_content(text).map(|guarded| guarded.content))
@@ -2701,7 +2573,7 @@ fn native_model_limits(provider: &str) -> (u32, u32, u32) {
 /// the old generic triple baked into their config. That exact triple can only
 /// be a baked default — never a deliberate user choice of all three values —
 /// so it resolves to the provider defaults instead of capping the model.
-pub(crate) fn effective_native_limits(
+pub fn effective_native_limits(
     provider: &str,
     context_tokens: u32,
     max_input_tokens: u32,
@@ -2998,6 +2870,28 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
             Some(default_roles::WORKER | default_roles::CODER)
         ),
         _ => false,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::task_service::execution::ExecutionSupport for EmbeddedAgentService {
+    async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()> {
+        EmbeddedAgentService::inject_provider_env(self, agent_config).await
+    }
+
+    async fn ingest_execution_outbox(
+        &self,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
+        EmbeddedAgentService::ingest_execution_outbox(self, input).await
+    }
+
+    async fn ingest_execution_outbox_entries(
+        &self,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
+        EmbeddedAgentService::ingest_execution_outbox_entries(self, input, entries).await
     }
 }
 

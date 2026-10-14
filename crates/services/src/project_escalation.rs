@@ -17,6 +17,11 @@ use serde_json::{json, Value};
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 use std::sync::Arc;
 
+/// Autonomous wake turns carry the admitted wake dedupe key.
+pub fn is_autonomous_wake_turn(job: &db::AgentChatTurnJob) -> bool {
+    job.dedupe_key.starts_with("agent-wake-admitted:")
+}
+
 pub const ESCALATE_DESCRIPTION: &str = "Ask the Project owner for the exact need blocking named Tasks; creates one Notification and Attention item.";
 /// The answer recorded when the owner resolves an escalation without text.
 pub const RESOLVED_BY_OWNER_ANSWER: &str = "Resolved by the owner.";
@@ -563,7 +568,7 @@ impl ProjectEscalationService {
         match job.status {
             db::AgentChatTurnState::Succeeded => self.escalate_silent_turn(turn_id).await,
             db::AgentChatTurnState::Failed
-                if crate::agent_chat_turn_policy::is_autonomous_wake_turn(&job)
+                if is_autonomous_wake_turn(&job)
                     && is_deterministic_failure(job.error_code.as_deref()) =>
             {
                 self.raise_cannot_run_notice(&job).await

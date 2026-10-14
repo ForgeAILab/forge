@@ -4256,7 +4256,7 @@ impl AgentChatTurnWorker {
                             .as_deref()
                             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
                             .map(|at| at.with_timezone(&Utc)),
-                        fail_fast: crate::agent_chat_turn_policy::is_autonomous_wake_turn(&job),
+                        fail_fast: crate::project_escalation::is_autonomous_wake_turn(&job),
                     },
                     Utc::now(),
                     "",

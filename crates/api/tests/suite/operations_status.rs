@@ -284,7 +284,7 @@ async fn operations_status_uses_startup_budget_and_effective_config() {
     let harness = common::test_app(workspace.path(), "usage-budget-startup").await;
     let mut config = (*harness.state.effective_config).clone();
     config.server.usage_index_budget_mb = Some(0);
-    let runtime = services::ForgeRuntimeBuilder::from_config(
+    let runtime = services_agents::ForgeRuntimeBuilder::from_config(
         harness.state.db.clone(),
         harness.state.event_bus.clone(),
         config.clone(),

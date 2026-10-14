@@ -1818,7 +1818,7 @@ impl MainGenesisCommandService {
         .ok_or_else(|| {
             ServiceError::Conflict("Main Charter command receipt was not committed".to_owned())
         })?;
-        if let Err(error) = crate::append_system_chat_message(
+        if let Err(error) = crate::chat_notices::append_system_chat_message(
             &self.db,
             &session.main_chat_id,
             &format!("charter-proposal:{}", revision.id),

@@ -39,7 +39,7 @@ async fn test_app(root: &std::path::Path) -> Harness {
     let mut config = config::ForgeConfig::with_data_dir(data.path().to_path_buf());
     config.workspace.root = root.to_path_buf();
     // Route tests own explicit delivery; no notification worker races their fixtures.
-    let runtime = services::ForgeRuntimeBuilder::from_config(
+    let runtime = services_agents::ForgeRuntimeBuilder::from_config(
         db,
         std::sync::Arc::new(events::EventBus::new(64)),
         config,

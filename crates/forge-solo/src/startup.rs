@@ -21,10 +21,8 @@ use crate::session::{SoloSessionDependencies, SoloSessionScope, SoloSessionServi
 use config::{ConfigOverrides, ForgeConfig};
 use db::{Daemon, DaemonRepo, DaemonStatus, SqliteDb};
 use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
-use services::{
-    EmbeddedDaemon, ForgeRuntime, ForgeRuntimeBuilder, RuntimeAssemblyMode, RuntimeSupervisor,
-    ServiceError,
-};
+use services::{EmbeddedDaemon, ServiceError};
+use services_agents::{ForgeRuntime, ForgeRuntimeBuilder, RuntimeAssemblyMode, RuntimeSupervisor};
 use tokio::{sync::Mutex, time::sleep};
 
 use crate::{

@@ -1229,7 +1229,10 @@ async fn a_lead_question_parks_the_root_until_the_owner_answers() {
     assert!(executions(&lead.db, &child.id).await.is_empty());
 
     // The item is a question: it is resolved with an answer and not without.
-    let attention = crate::attention_service::AttentionService::new(Arc::clone(&lead.db));
+    let attention = crate::attention_service::AttentionService::new(
+        Arc::clone(&lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+    );
     assert!(attention.resolve("owner", &item, version).await.is_err());
     assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
     let resolved = attention
@@ -1643,7 +1646,10 @@ async fn a_question_of_a_deleted_root_is_resolved_without_an_answer_target() {
         .execute(lead.db.pool())
         .await
         .unwrap();
-    let attention = crate::attention_service::AttentionService::new(Arc::clone(&lead.db));
+    let attention = crate::attention_service::AttentionService::new(
+        Arc::clone(&lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+    );
     let resolved = attention
         .resolve_with_answer(&owner, &item, version, Some("B"))
         .await
@@ -1845,10 +1851,13 @@ async fn a_lead_removed_during_the_wait_leaves_an_answerable_question() {
     .await
     .expect("the question is still open while the root still waits");
     assert_eq!(waiting.status, "planning");
-    crate::attention_service::AttentionService::new(Arc::clone(&lead.db))
-        .resolve_with_answer("owner", &item, version, Some("B"))
-        .await
-        .expect("the answer is taken");
+    crate::attention_service::AttentionService::new(
+        Arc::clone(&lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+    )
+    .resolve_with_answer("owner", &item, version, Some("B"))
+    .await
+    .expect("the answer is taken");
     until(lead, "the root implements without a lead", async || {
         reload(&lead.db, &root.id).await.status == "in_progress"
             && running(lead, &child.id, CODER).await
@@ -1878,10 +1887,13 @@ async fn waiting_question(ops: &Ops, root: &str) -> (String, i64) {
 
 async fn assert_answer_runs_once(ops: &Ops, root: &str, child: &str, item: &str, version: i64) {
     let before = executions(&ops.lead.db, root).await.len();
-    crate::attention_service::AttentionService::new(Arc::clone(&ops.lead.db))
-        .resolve_with_answer("owner", item, version, Some("B"))
-        .await
-        .expect("the preserved question is answerable");
+    crate::attention_service::AttentionService::new(
+        Arc::clone(&ops.lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&ops.lead.db))),
+    )
+    .resolve_with_answer("owner", item, version, Some("B"))
+    .await
+    .expect("the preserved question is answerable");
     until(
         &ops.lead,
         "one lead run after the answer releases the child",
@@ -2200,10 +2212,13 @@ async fn holding_a_live_asking_run_then_releasing_keeps_the_question_and_runs_on
     );
     assert!(park(&ops.lead.db, &root.id).await.contains("HumanWork"));
     assert!(executions(&ops.lead.db, &child.id).await.is_empty());
-    crate::attention_service::AttentionService::new(Arc::clone(&ops.lead.db))
-        .resolve_with_answer("owner", &item, version, Some("B"))
-        .await
-        .expect("the held question is still answerable");
+    crate::attention_service::AttentionService::new(
+        Arc::clone(&ops.lead.db),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&ops.lead.db))),
+    )
+    .resolve_with_answer("owner", &item, version, Some("B"))
+    .await
+    .expect("the held question is still answerable");
     until(&ops.lead, "the answered lead runs again", async || {
         running(&ops.lead, &root.id, PLANNER).await
     })

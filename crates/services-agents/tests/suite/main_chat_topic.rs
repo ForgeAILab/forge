@@ -12,9 +12,10 @@ use db::{
     AgentRepo, AgentStatus, CreateAgentIdentity, CreateAgentProfile, SqliteDb, User, UserRepo,
 };
 use services::{
-    AgentChatService, MainChatTopicService, ProductGenesisService, SendAgentChatMessageInput,
-    ServiceError, SetMainAgentBindingInput, StartMainChatTopicInput,
+    AgentChatService, ProductGenesisService, SendAgentChatMessageInput, ServiceError,
+    SetMainAgentBindingInput,
 };
+use services_agents::{MainChatTopicService, StartMainChatTopicInput};
 
 const ACCOUNT_ID: &str = "topic-service-account";
 const OTHER_ACCOUNT_ID: &str = "topic-service-other-account";

@@ -62,7 +62,7 @@ pub struct DispatcherInstance {
     reconcile_lock: tokio::sync::Mutex<()>,
     /// One slice of the sweep at a time.
     sweep_lock: tokio::sync::Mutex<()>,
-    observer_shutdown: crate::runtime::ShutdownSignal,
+    observer_shutdown: crate::worker_runtime::assembly::ShutdownSignal,
     #[cfg(test)]
     fixture_worker: std::sync::OnceLock<tests::FixtureWorker>,
 }
@@ -100,7 +100,7 @@ impl TaskDispatcher {
             schedule_state: Mutex::default(),
             reconcile_lock: tokio::sync::Mutex::default(),
             sweep_lock: tokio::sync::Mutex::default(),
-            observer_shutdown: crate::runtime::ShutdownSignal::new(),
+            observer_shutdown: crate::worker_runtime::assembly::ShutdownSignal::new(),
             #[cfg(test)]
             fixture_worker: std::sync::OnceLock::new(),
         });

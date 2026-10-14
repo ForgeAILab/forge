@@ -44,7 +44,7 @@ pub async fn register_agent(
             .embedded_agent_service
             .require_owned_entry(&user.user_id, credential_id)
             .await?;
-        services::provider_authorization::runtime_supported(
+        services_agents::provider_authorization::runtime_supported(
             &entry.provider,
             &entry.credential_method,
             &request.executor_type,
