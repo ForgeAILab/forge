@@ -26,14 +26,61 @@ async fn seed_second_agent(db: &db::SqliteDb, max: i64) -> String {
     seed_agent_with_executor(db, max, DaemonStatus::Online, AgentStatus::Idle, "shell").await
 }
 
+/// `RecordingExecutor` with a test-only knob: the context is sent only
+/// after `delay`, as when load delays the first poll of the spawned
+/// execution future past the dispatcher's own passes.
+struct DelayedRecordingExecutor {
+    sender: mpsc::UnboundedSender<ExecutionContext>,
+    delay: Duration,
+}
+
+#[async_trait]
+impl TaskExecutor for DelayedRecordingExecutor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        tokio::time::sleep(self.delay).await;
+        let _ = self.sender.send(ctx);
+        pending::<()>().await;
+        unreachable!()
+    }
+
+    async fn cancel(&self, _execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
 async fn ctx(prime: bool) -> Ctx {
+    ctx_with(prime, Duration::ZERO).await
+}
+
+async fn ctx_with(prime: bool, delay: Duration) -> Ctx {
     let db = Arc::new(sqlite_db().await);
     let repo = TempDir::new().unwrap();
     let ws = TempDir::new().unwrap();
     let (pid, _) = seed_project_repo(&db, repo.path()).await;
     let a1 = seed_agent(&db, 3, DaemonStatus::Online, AgentStatus::Idle).await;
     let a2 = seed_second_agent(&db, 3).await;
-    let (dispatcher, rx) = build_dispatcher(Arc::clone(&db), ws.path()).await;
+    let (dispatcher, rx) = if delay.is_zero() {
+        build_dispatcher(Arc::clone(&db), ws.path()).await
+    } else {
+        let event_bus = Arc::new(EventBus::new(64));
+        let (sender, rx) = mpsc::unbounded_channel();
+        let task_service = Arc::new(
+            TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
+                .with_task_executor(Arc::new(DelayedRecordingExecutor { sender, delay }))
+                .with_repo_cache_locks(Arc::new(RepoCacheLockManager::default()))
+                .with_workspace_root(ws.path().to_path_buf()),
+        );
+        let dispatcher = TaskDispatcher::with_check_interval(
+            Arc::clone(&db),
+            event_bus,
+            task_service,
+            Duration::from_millis(10),
+        );
+        (dispatcher, rx)
+    };
     let events = dispatcher.event_bus.subscribe();
     if prime {
         let _ = dispatcher.check_once_and_drain().await;
@@ -1075,21 +1122,72 @@ async fn tick(d: &TaskDispatcher, seconds: u64) -> String {
     }
 }
 
+/// How a shape counts the executions it spawned.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Observe {
+    /// The old sampling: whatever reached the executor by the end of the
+    /// ticks. Load can delay the first poll of a spawned execution future
+    /// past that point, so a started run reads as `spawned=0`.
+    Immediate,
+    /// Wait (bounded) until every running execution the dispatcher started
+    /// in this shape has reached the executor, then count.
+    UntilStarted,
+}
+
+async fn running_executions(db: &db::SqliteDb) -> std::collections::HashSet<String> {
+    sqlx::query_scalar::<_, String>("SELECT id FROM execution WHERE status='running'")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+async fn count_spawned(
+    c: &mut Ctx,
+    observe: Observe,
+    before: &std::collections::HashSet<String>,
+) -> usize {
+    let mut spawned = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        while c.rx.try_recv().is_ok() {
+            spawned += 1;
+        }
+        if observe == Observe::Immediate {
+            return spawned;
+        }
+        let started = running_executions(&c.db).await.difference(before).count();
+        if spawned >= started || tokio::time::Instant::now() >= deadline {
+            return spawned;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn run_shape(mode: &str, name: &'static str, prime: bool) -> Vec<String> {
-    let mut c = ctx(prime).await;
+    run_shape_observed(mode, name, prime, Duration::ZERO, Observe::UntilStarted).await
+}
+
+async fn run_shape_observed(
+    mode: &str,
+    name: &'static str,
+    prime: bool,
+    delay: Duration,
+    observe: Observe,
+) -> Vec<String> {
+    let mut c = ctx_with(prime, delay).await;
     Box::pin(apply(name, &c)).await;
     let agents = agent_labels(&c).await;
     let before = snapshot(&c.db, &c.pid, &agents).await;
+    let running_before = running_executions(&c.db).await;
     while c.events.try_recv().is_ok() {}
     let mut ticks = Vec::new();
     for _ in 0..3 {
         ticks.push(tick(&c.dispatcher, 20).await);
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
-    let mut spawned = 0;
-    while c.rx.try_recv().is_ok() {
-        spawned += 1;
-    }
+    let spawned = count_spawned(&mut c, observe, &running_before).await;
     let mut published: std::collections::BTreeMap<String, u32> = Default::default();
     loop {
         match c.events.try_recv() {
@@ -1601,6 +1699,46 @@ async fn shapes(mode: &'static str, prime: bool, case: usize) {
         return;
     }
     settle_shapes(mode, Some(&names), lines);
+}
+
+/// The spawn count waits for the started run to reach the executor. With
+/// the first poll of the execution future delayed past the three ticks
+/// (load did this twice on 2026-10-13: `deferred_future_todo` and
+/// `publication_claim_orphan` read `spawned=0` with every persisted line
+/// equal), the old sampling misses the run and the new one sees it.
+#[tokio::test]
+async fn shape_spawn_count_waits_for_a_delayed_executor_poll() {
+    let delay = Duration::from_millis(600);
+    let pass = |lines: &[String]| {
+        lines
+            .iter()
+            .find(|line| line.contains("(pass)"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let old = run_shape_observed(
+        "steady",
+        "deferred_future_todo",
+        true,
+        delay,
+        Observe::Immediate,
+    )
+    .await;
+    assert!(pass(&old).contains("spawned=0"), "{}", pass(&old));
+    let new = run_shape_observed(
+        "steady",
+        "deferred_future_todo",
+        true,
+        delay,
+        Observe::UntilStarted,
+    )
+    .await;
+    assert!(pass(&new).contains("spawned=1"), "{}", pass(&new));
+    let expected = FIXTURE
+        .lines()
+        .find(|line| line.starts_with("steady deferred_future_todo (pass)"))
+        .unwrap();
+    assert_eq!(pass(&new), expected);
 }
 
 /// The cases run every shape once, and together they expect every recorded

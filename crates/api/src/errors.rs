@@ -646,7 +646,7 @@ impl From<DbError> for ApiError {
             DbError::CycleDetected => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 code: "cycle_detected",
-                message: "dependency cycle detected".to_owned(),
+                message: "dependency cycle detected: the Tasks would wait on each other through their dependencies, sibling order or parentage".to_owned(),
                 details: None,
             },
             DbError::InvalidCursor => Self {

@@ -405,7 +405,7 @@ impl crate::TaskService {
         {
             return Ok(false);
         }
-        Box::pin(self.transition(
+        let result = Box::pin(self.transition(
             task.id.clone(),
             role_target(
                 workflow,
@@ -421,8 +421,73 @@ impl crate::TaskService {
                 defer_dispatch_seconds: None,
             },
         ))
+        .await;
+        let Err(error) = result else {
+            return Ok(true);
+        };
+        let Some(current_step) = db::task_writer::current_task_step() else {
+            return Err(error);
+        };
+        // A busy database or a concurrent write is retried by the step
+        // runtime like any transient failure: it never parks a subtask
+        // whose transition would apply once the other writer committed.
+        if !counts_toward_merge_sweep_bound(&error) {
+            return Err(error);
+        }
+        // Dispatcher passes create distinct commands. Count their durable
+        // failed attempts in this entry, including the current claimed one,
+        // rather than resetting a counter on every pass or restart.
+        let attempts = db::TaskStepRepo::task_steps(&*self.db, &task.id)
+            .await?
+            .iter()
+            .filter(|step| {
+                step.kind == "command"
+                    && step.expected_epoch == current_step.expected_epoch
+                    && (step.status == "failed" || step.id == current_step.id)
+                    && serde_json::from_str::<serde_json::Value>(&step.payload_json)
+                        .is_ok_and(|p| p["operation"] == "reconcile_integration_admission")
+            })
+            .fold(0_i64, |total, step| total.saturating_add(step.attempts));
+        if attempts < crate::worker_runtime::queue::MAX_STEP_ATTEMPTS {
+            return Err(error);
+        }
+        // The root admission's existing park and owner actions also own a
+        // subtask whose landed-merge transition cannot be applied.
+        let reason = "integration_admission_failed";
+        let message = format!(
+            "the subtask cannot leave its merge state after {attempts} Task-step attempts: {error}"
+        );
+        TaskRepo::update(
+            &*self.db,
+            db::UpdateTask {
+                id: task.id.clone(),
+                expected_version: task.version,
+                title: None,
+                description: None,
+                priority: None,
+                merge_config: None,
+                plan: None,
+                error_annotation: Some(Some(
+                    serde_json::json!({
+                        "type": api_types::FailureKind::WorkspaceError,
+                        "blocking_reason": reason, "message": message,
+                    })
+                    .to_string(),
+                )),
+                blocked_json: Some(Some(
+                    serde_json::json!({
+                        "kind": reason, "reason": message, "created_at": db::now_rfc3339(),
+                    })
+                    .to_string(),
+                )),
+                failed_json: None,
+                task_state_config: None,
+                parent_task_id: None,
+                updated_at: db::now_rfc3339(),
+            },
+        )
         .await?;
-        Ok(true)
+        Ok(false)
     }
 
     /// The reconciler's step for one Task (`Step::AdmitIntegration`): admit a
@@ -769,4 +834,11 @@ impl crate::TaskService {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+/// Whether a failed landed-merge transition of a subtask counts toward the
+/// sweep's bound: a refusal does, a transient database failure (busy, a
+/// version conflict from a concurrent write) does not.
+pub(crate) fn counts_toward_merge_sweep_bound(error: &crate::ServiceError) -> bool {
+    !matches!(error, crate::ServiceError::Db(db_error) if db_error.is_transient())
 }

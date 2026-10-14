@@ -1860,7 +1860,7 @@ fn lease_deadline() -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(LEASE_SECONDS)).to_rfc3339()
 }
 /// Attempts (including the first) a step gets for retryable failures.
-const MAX_STEP_ATTEMPTS: i64 = 8;
+pub(crate) const MAX_STEP_ATTEMPTS: i64 = 8;
 /// Attempts (including the first) a review entry asks the owner's login
 /// shell for its environment before the Task shows the interruption: about
 /// seven seconds of back-off on top of each probe's own bound.

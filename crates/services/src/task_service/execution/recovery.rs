@@ -557,11 +557,11 @@ impl TaskService {
                 // into an untyped `recovery_required: "dependency gate"`
                 // that offered the refused action again.
                 let dependency_ids = unsatisfied.clone();
-                crate::deferred_dispatch::record_dispatch_disposition_naming(
-                    &self.db,
-                    &current,
-                    crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
-                    &format!(
+                // A cycle is not a wait: name it and its repair.
+                let message = if self.db.dependency_wait_is_cycle(&current.id).await? {
+                    dependency_cycle_reason(&dependency_ids)
+                } else {
+                    format!(
                         "waiting for unfinished dependenc{}: {}",
                         if dependency_ids.len() == 1 {
                             "y"
@@ -569,7 +569,13 @@ impl TaskService {
                             "ies"
                         },
                         dependency_ids.join(", ")
-                    ),
+                    )
+                };
+                crate::deferred_dispatch::record_dispatch_disposition_naming(
+                    &self.db,
+                    &current,
+                    crate::deferred_dispatch::DEPENDENCY_WAIT_CAPABILITY,
+                    &message,
                     &dependency_ids,
                 )
                 .await?;
@@ -3155,4 +3161,18 @@ fn blocked_metadata_kind(raw_metadata: &str) -> Option<api_types::FailureKind> {
 fn is_retry_exhausted_blocked_metadata(raw_metadata: &str) -> bool {
     blocked_metadata_kind(raw_metadata)
         .is_some_and(api_types::FailureKind::is_retry_exhausted_metadata)
+}
+
+/// The text of a dependency wait that is a cycle: the Tasks waited for
+/// cannot finish before this one (sibling order or parentage makes them wait
+/// for it). Admission refuses such a graph, but a database written before it
+/// did, or a terminal Task that re-opened, can still hold one. Removing the
+/// dependency link (which wakes the Task) or cancelling one of the Tasks
+/// ends it.
+fn dependency_cycle_reason(dependency_ids: &[String]) -> String {
+    format!(
+        "dependency cycle: {} cannot finish before this Task (sibling order or parentage makes {} wait for it); remove the dependency (DELETE /api/v1/tasks/{{id}}/dependencies/{{depends_on_id}}) or cancel one of the Tasks",
+        dependency_ids.join(", "),
+        if dependency_ids.len() == 1 { "it" } else { "them" },
+    )
 }

@@ -1711,3 +1711,112 @@ async fn a_later_subtask_names_its_sequence_wait_without_changing_the_no_lead_ro
     assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
     assert!(executions(&lead.db, &root.id).await.is_empty());
 }
+
+/// A database written before cycle admission can hold an earlier subtask
+/// that depends on a later sibling (the later one waits for it by order).
+/// After the upgrade the dispatcher names the cycle and its repair on the
+/// earlier subtask instead of waiting in silence; the owner's existing
+/// remove-dependency command wakes it and it runs. The public reorder (the
+/// adaptive sequence writer behind REST, MCP and `lead.subtask reorder`)
+/// refuses an order that would close the same cycle and changes nothing.
+#[tokio::test]
+async fn a_pre_upgrade_dependency_cycle_is_named_and_the_remove_command_repairs_it() {
+    let lead = lead_fixture(false).await;
+    let root = seed_task(&lead.db, &lead.project, "root", "in_progress", 1).await;
+    let first = seed_subtask(&lead.db, &root, "first", "todo", 0).await;
+    let later = seed_subtask(&lead.db, &root, "later", "todo", 1).await;
+    assign_role(
+        &lead.db,
+        &root.id,
+        crate::workflow::default_roles::CODER,
+        &lead.coder,
+    )
+    .await;
+    // The public reorder (it keeps the first unfinished subtask in place
+    // and reorders the unstarted rest): a legal prerequisite (c on b), then
+    // an order that reverses it: refused, typed, and the order stays.
+    let other = seed_task(&lead.db, &lead.project, "other root", "todo", 1).await;
+    let a = seed_subtask(&lead.db, &other, "a", "todo", 0).await;
+    let b = seed_subtask(&lead.db, &other, "b", "todo", 1).await;
+    let c = seed_subtask(&lead.db, &other, "c", "todo", 2).await;
+    let service = &lead.dispatcher.task_service;
+    service.add_task_dependency(&c.id, &b.id).await.unwrap();
+    let refused = service
+        .reorder_subtasks(
+            other.id.clone(),
+            vec![a.id.clone(), c.id.clone(), b.id.clone()],
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(ServiceError::Db(db::DbError::CycleDetected))),
+        "{refused:?}"
+    );
+    let order: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM task WHERE parent_task_id=? ORDER BY subtask_order")
+            .bind(&other.id)
+            .fetch_all(lead.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(order, vec![a.id.clone(), b.id.clone(), c.id.clone()]);
+    // The row an older build admitted.
+    sqlx::query("INSERT INTO task_dependency(task_id,depends_on_id,created_at) VALUES(?,?,?)")
+        .bind(&first.id)
+        .bind(&later.id)
+        .bind(now_rfc3339())
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    assert!(executions(&lead.db, &first.id).await.is_empty());
+    assert!(executions(&lead.db, &later.id).await.is_empty());
+    assert!(
+        park(&lead.db, &later.id).await.contains("sequence"),
+        "the later subtask waits for the earlier one by order: {}",
+        park(&lead.db, &later.id).await
+    );
+    // The owner retries the refused start (the action the dependency gate's
+    // refusal offers). Behind the dependency the accepted action waits, and
+    // that wait names the cycle and its repair.
+    let offers = service
+        .task_action_offers(&first.id, &Actor::user(api_types::UserActionSource::Api))
+        .await
+        .unwrap();
+    let retry = offers
+        .available_actions
+        .iter()
+        .find(|offer| offer.action.verb() == "retry")
+        .unwrap_or_else(|| panic!("the refused start offers a retry: {offers:?}"));
+    service
+        .perform_task_action(&first.id, retry.action.clone(), offers.version)
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    assert!(executions(&lead.db, &first.id).await.is_empty());
+    let parked = reload(&lead.db, &first.id).await;
+    let visible = format!(
+        "{} {} {}",
+        park(&lead.db, &first.id).await,
+        parked.metadata_json.as_deref().unwrap_or_default(),
+        parked.error_annotation.as_deref().unwrap_or_default(),
+    );
+    assert!(
+        visible.contains("dependency cycle") && visible.contains(&later.id),
+        "the earlier subtask's wait names the cycle and the Task it waits for: {visible}"
+    );
+
+    service
+        .remove_task_dependency(&first.id, &later.id)
+        .await
+        .expect("the owner's repair applies");
+    until(
+        &lead,
+        "the earlier subtask runs once the link is gone",
+        async || {
+            !ExecutionRepo::list_running_by_task(&*lead.db, &first.id)
+                .await
+                .unwrap()
+                .is_empty()
+        },
+    )
+    .await;
+}

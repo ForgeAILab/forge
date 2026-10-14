@@ -1479,6 +1479,118 @@ const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
 const TERMINAL: [&str; 2] = ["done", "cancelled"];
 
+// Model-only observations for invariant (l). Whether a Task is a
+// lead-managed root is read inside the transaction that writes each `replan`
+// charge and each planning entry over the `replan` bridge, so a later change
+// of the assignment cannot rewrite what was true when the re-plan was decided.
+//
+// The product decides a re-plan once, at its charge (`charge_replan`), and
+// the entry that carries the same receipt is that decision's second half:
+// the owner's removal of the lead may land between the two commands, and the
+// product keeps the bridge on purpose (services test
+// `a_rejection_decided_as_a_replan_keeps_its_bridge_when_the_lead_is_removed`).
+// So an entry is authorized by a lead at its own commit, or by the charge of
+// its own receipt having been written under a lead. Every other charge or
+// entry on a Task that is not a lead-managed root is a violation, and stays
+// one after the lead is assigned again.
+const MODEL_LEAD_ROOT: &str = "t.parent_task_id IS NULL AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = t.id AND c.deleted_at IS NULL) AND EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = t.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
+
+async fn install_replan_audit(pool: &sqlx::SqlitePool) {
+    sqlx::query("CREATE TABLE IF NOT EXISTS model_replan_authority (task_id TEXT NOT NULL, kind TEXT NOT NULL, receipt TEXT NOT NULL, eligible INTEGER NOT NULL)")
+        .execute(pool).await.unwrap();
+    let lead_root_now =
+        format!("COALESCE((SELECT ({MODEL_LEAD_ROOT}) FROM task t WHERE t.id=NEW.task_id),0)");
+    let charged_under_a_lead = "EXISTS(SELECT 1 FROM model_replan_authority a WHERE a.task_id=NEW.task_id AND a.kind='charge' AND a.eligible=1 AND a.receipt=json_extract(NEW.bridge_payload,'$.receipt'))";
+    for (kind, table, filter, receipt, eligible) in [
+        (
+            "charge",
+            "task_budget_charge",
+            "NEW.kind = 'replan'",
+            "NEW.step_id",
+            lead_root_now.clone(),
+        ),
+        (
+            "entry",
+            "transition_log",
+            "NEW.bridge_kind = 'replan'",
+            "COALESCE(json_extract(NEW.bridge_payload,'$.receipt'), NEW.id)",
+            format!("({lead_root_now} OR {charged_under_a_lead})"),
+        ),
+    ] {
+        sqlx::raw_sql(&format!(
+            "CREATE TRIGGER IF NOT EXISTS model_replan_{kind} AFTER INSERT ON {table}
+             WHEN {filter} BEGIN INSERT INTO model_replan_authority(task_id,kind,receipt,eligible)
+             VALUES(NEW.task_id, '{kind}', {receipt}, {eligible}); END"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// The audit of (l) on rows written directly: what a product that re-plans
+/// a root with no lead would write is caught as a charge alone, as an entry
+/// alone, and as both; the history of an authorized re-plan is not.
+#[tokio::test]
+async fn replan_authority_audit_retains_history_and_catches_later_illegal_effects() {
+    let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+    db::run_migrations(&pool).await.unwrap();
+    install_replan_audit(&pool).await;
+    let entry = |id: &str, receipt: &str| {
+        format!("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload) VALUES('{id}','root','in_progress','planning','system:workflow','model','now','replan','{{\"receipt\":\"{receipt}\"}}');")
+    };
+    let charge = |receipt: &str| {
+        format!("INSERT INTO task_budget_charge(task_id,kind,window_id,step_id) VALUES('root','replan','w','{receipt}');")
+    };
+    let flagged = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT kind || ' ' || receipt FROM model_replan_authority WHERE eligible=0 ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    sqlx::raw_sql(&format!("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','now','now');
+        INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('root','p','root','planning','now','now');
+        INSERT INTO task(id,project_id,parent_task_id,title,status,created_at,updated_at) VALUES('child','p','root','child','todo','now','now');
+        INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('a','root','planner','agent','lead','now','now');
+        INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES('root','replan','w',2);
+        {} {} {}
+        DELETE FROM task_role_assignment WHERE id='a';
+        {}",
+        charge("with-lead"), entry("e1", "with-lead"), charge("decided-with-lead"),
+        // The designed race: decided and charged under the lead, entered
+        // after the owner removed it.
+        entry("e2", "decided-with-lead")))
+        .execute(&pool).await.unwrap();
+    assert_eq!(
+        flagged().await,
+        Vec::<String>::new(),
+        "an authorized re-plan stays authorized after the lead is removed"
+    );
+    // A product that re-plans a root with no lead: the charge alone, the
+    // entry alone (no charge, and a receipt charged without a lead), both.
+    sqlx::raw_sql(&format!(
+        "{} {} {}",
+        charge("no-lead"),
+        entry("e3", "never-charged"),
+        entry("e4", "no-lead")
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        flagged().await,
+        ["charge no-lead", "entry never-charged", "entry no-lead"],
+        "every effect decided without a lead is a violation"
+    );
+    // Assigning a lead again does not launder them.
+    sqlx::raw_sql("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('b','root','planner','agent','lead','now','now');")
+        .execute(&pool).await.unwrap();
+    assert_eq!(flagged().await.len(), 3);
+    pool.close().await;
+}
+
 impl World {
     async fn boot(dir: &Path, shared: &Arc<Shared>, probe: &Arc<Probe>) -> Live {
         *probe.database.lock().unwrap() = Some(dir.join("forge.db"));
@@ -1494,6 +1606,7 @@ impl World {
         let url = format!("sqlite:{}?mode=rwc", dir.join("forge.db").display());
         let pool = db::create_sqlite_pool(&url).await.expect("pool creates");
         db::run_migrations(&pool).await.expect("migrations run");
+        install_replan_audit(&pool).await;
         // A fresh `SqliteDb` per boot: its in-memory schedule generation and
         // step-executor reference die with the process, as in a real crash.
         let db = Arc::new(db::SqliteDb::new(pool.clone()));
@@ -2317,6 +2430,7 @@ impl World {
             if round >= QUIESCENCE_BOUND && started.elapsed() >= QUIESCENCE_PATIENCE {
                 break;
             }
+            self.adopt_unindexed_children().await?;
             self.sync_lead_tasks();
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
@@ -2360,6 +2474,38 @@ impl World {
             "(d) livelock: no quiescence after {QUIESCENCE_BOUND} rounds; last states {:#?}",
             &history[tail..]
         ))
+    }
+
+    /// A child the lead created is indexed by the scripted adapter after
+    /// its `lead.subtask create` returns. A run cancelled in that window
+    /// (the root's Cancel stops the planner) drops the future after the
+    /// create committed, and the model would never drive the child's Task
+    /// steps (the root's cancel cascade enqueues one), then report the
+    /// child it stranded itself under (o). The product's step worker runs
+    /// every pending step; the model indexes every child of a Task it
+    /// knows from the database.
+    async fn adopt_unindexed_children(&mut self) -> Result<(), String> {
+        let known: Vec<String> = self.shared.index.lock().unwrap().keys().cloned().collect();
+        let known = serde_json::to_string(&known).map_err(|error| error.to_string())?;
+        let found: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, parent_task_id FROM task
+             WHERE parent_task_id IN (SELECT value FROM json_each(?1))
+               AND id NOT IN (SELECT value FROM json_each(?1))
+             ORDER BY created_at, id",
+        )
+        .bind(&known)
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut index = self.shared.index.lock().unwrap();
+        let mut parents = self.shared.parents.lock().unwrap();
+        for (id, parent) in found {
+            let next = index.len();
+            let root = index[&parent];
+            let child = *index.entry(id).or_insert(next);
+            parents.insert(child, root);
+        }
+        Ok(())
     }
 
     fn sync_lead_tasks(&mut self) {
@@ -2541,19 +2687,22 @@ impl World {
                 .await
                 .map_err(|error| error.to_string())
         };
-        const LEAD_ROOT: &str = "t.parent_task_id IS NULL AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = t.id AND c.deleted_at IS NULL) AND EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = t.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
-        let strangers: Vec<String> = sqlx::query_scalar(&format!(
-            "SELECT t.id FROM task t WHERE NOT ({LEAD_ROOT})
-               AND (EXISTS (SELECT 1 FROM task_budget b WHERE b.task_id = t.id AND b.kind = 'replan' AND b.spent > 0)
-                    OR EXISTS (SELECT 1 FROM transition_log l WHERE l.task_id = t.id AND l.bridge_kind = 'replan'
-                               AND NOT EXISTS (SELECT 1 FROM task_budget_charge c WHERE c.task_id = t.id AND c.kind = 'replan')))"
-        ))
-        .fetch_all(pool)
-        .await
-        .map_err(|error| error.to_string())?;
+        let strangers = rows(
+            "SELECT task_id || ' ' || kind || ' ' || receipt FROM model_replan_authority WHERE eligible=0"
+        ).await?;
         if !strangers.is_empty() {
             return Err(format!(
                 "(l) Tasks that are not lead-managed roots re-planned: {strangers:?}"
+            ));
+        }
+        let uncharged = rows(
+            "SELECT l.task_id || ' ' || l.id FROM transition_log l WHERE l.bridge_kind='replan'
+             AND NOT EXISTS(SELECT 1 FROM task_budget_charge c WHERE c.task_id=l.task_id AND c.kind='replan'
+                            AND c.step_id=json_extract(l.bridge_payload,'$.receipt'))"
+        ).await?;
+        if !uncharged.is_empty() {
+            return Err(format!(
+                "(l) re-plan entries lack their charge: {uncharged:?}"
             ));
         }
         let overspent = rows(
@@ -2595,8 +2744,20 @@ impl World {
         )
         .await?;
         if !open.is_empty() {
+            // What happened to the subtask left behind: its Task steps and
+            // transitions, so a failing seed names the writer that skipped it.
+            let history = rows(
+                "SELECT c.id || ' created ' || c.created_at || ' root-cancelled ' || COALESCE((SELECT MAX(l.created_at) FROM transition_log l WHERE l.task_id=r.id AND l.to_state='cancelled'),'-')
+                   || ' now ' || strftime('%Y-%m-%dT%H:%M:%f','now') || ' steps ' || COALESCE((SELECT group_concat(s.seq || ':' || s.kind || ':' || s.status || ':' || s.attempts || ':' || s.priority || ':' || COALESCE(s.lane,'') || ':avail=' || COALESCE(s.available_at,'') || ':lease=' || COALESCE(s.lease_until,'') || ':' || COALESCE(json_extract(s.payload_json,'$.operation'),'') || ':' || COALESCE(s.last_error,''), ' | ') FROM task_step s WHERE s.task_id=c.id),'none')
+                   || ' log ' || COALESCE((SELECT group_concat(l.from_state || '->' || l.to_state || ' ' || l.trigger_reason, ' | ') FROM transition_log l WHERE l.task_id=c.id),'none')
+                 FROM task r JOIN task c ON c.parent_task_id = r.id
+                 WHERE r.parent_task_id IS NULL AND r.status IN ('review','merging','done','cancelled') AND c.status NOT IN ('done','cancelled')",
+            )
+            .await
+            .unwrap_or_default();
             return Err(format!(
-                "(o) roots past implementation with a subtask left to run: {open:?}"
+                "(o) roots past implementation with a subtask left to run: {open:?}\n  {}",
+                history.join("\n  ")
             ));
         }
         Ok(())
@@ -3480,9 +3641,9 @@ async fn run_all(mut cases: Vec<(String, Vec<Step>)>, avoid: bool) {
 }
 
 /// Seeds every run covers, so a regression in one of them is a stable failure.
-const FIXED_SEEDS: [u64; 14] = [
+const FIXED_SEEDS: [u64; 17] = [
     1, 2, 3, 5, 8, 909358760, 213412165, 974622785, 637240885, 277839211, 580812352, 610875980,
-    207044633, 749274245,
+    207044633, 749274245, 263753536, 625967944, 931180934,
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
