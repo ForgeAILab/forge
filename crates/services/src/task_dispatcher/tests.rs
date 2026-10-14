@@ -6434,6 +6434,25 @@ async fn retry_metadata_commits_automatic_resume_policy_atomically() {
     assert_eq!(execution.resume_policy, Some(ResumePolicy::Auto));
 }
 
+/// Eight busy passes must not park a healthy subtask: only a refusal of the
+/// landed-merge transition counts toward the sweep's bound.
+#[test]
+fn only_a_refused_merge_transition_counts_toward_the_sweep_bound() {
+    use crate::integration_steps::reconcile::counts_toward_merge_sweep_bound;
+    assert!(!counts_toward_merge_sweep_bound(&ServiceError::Db(
+        db::DbError::VersionConflict
+    )));
+    assert!(!counts_toward_merge_sweep_bound(&ServiceError::Db(
+        db::DbError::Sqlx(sqlx::Error::PoolTimedOut)
+    )));
+    assert!(counts_toward_merge_sweep_bound(&ServiceError::Db(
+        db::DbError::InvalidTransition
+    )));
+    assert!(counts_toward_merge_sweep_bound(
+        &ServiceError::invalid_operation("no landed-merge edge")
+    ));
+}
+
 async fn refuse_subtask_merge_target(db: &db::SqliteDb, project_id: &str) {
     let mut workflow = WorkflowEngine::resolve_workflow("{}");
     let index = workflow

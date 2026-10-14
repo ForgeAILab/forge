@@ -311,6 +311,12 @@ impl crate::TaskService {
         let Some(current_step) = db::task_writer::current_task_step() else {
             return Err(error);
         };
+        // A busy database or a concurrent write is retried by the step
+        // runtime like any transient failure: it never parks a subtask
+        // whose transition would apply once the other writer committed.
+        if !counts_toward_merge_sweep_bound(&error) {
+            return Err(error);
+        }
         // Dispatcher passes create distinct commands. Count their durable
         // failed attempts in this entry, including the current claimed one,
         // rather than resetting a counter on every pass or restart.
@@ -708,4 +714,11 @@ impl crate::TaskService {
         tx.commit().await?;
         Ok(true)
     }
+}
+
+/// Whether a failed landed-merge transition of a subtask counts toward the
+/// sweep's bound: a refusal does, a transient database failure (busy, a
+/// version conflict from a concurrent write) does not.
+pub(crate) fn counts_toward_merge_sweep_bound(error: &crate::ServiceError) -> bool {
+    !matches!(error, crate::ServiceError::Db(db_error) if db_error.is_transient())
 }
