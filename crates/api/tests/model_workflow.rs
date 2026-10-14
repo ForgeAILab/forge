@@ -1479,72 +1479,115 @@ const SETTLE_ROUNDS: usize = 20;
 const INITIAL: [&str; 2] = ["backlog", "todo"];
 const TERMINAL: [&str; 2] = ["done", "cancelled"];
 
-// Model-only observations: eligibility is captured inside each charge/entry
-// transaction. A later assignment change cannot rewrite that historical fact.
+// Model-only observations for invariant (l). Whether a Task is a
+// lead-managed root is read inside the transaction that writes each `replan`
+// charge and each planning entry over the `replan` bridge, so a later change
+// of the assignment cannot rewrite what was true when the re-plan was decided.
+//
+// The product decides a re-plan once, at its charge (`charge_replan`), and
+// the entry that carries the same receipt is that decision's second half:
+// the owner's removal of the lead may land between the two commands, and the
+// product keeps the bridge on purpose (services test
+// `a_rejection_decided_as_a_replan_keeps_its_bridge_when_the_lead_is_removed`).
+// So an entry is authorized by a lead at its own commit, or by the charge of
+// its own receipt having been written under a lead. Every other charge or
+// entry on a Task that is not a lead-managed root is a violation, and stays
+// one after the lead is assigned again.
 const MODEL_LEAD_ROOT: &str = "t.parent_task_id IS NULL AND EXISTS (SELECT 1 FROM task c WHERE c.parent_task_id = t.id AND c.deleted_at IS NULL) AND EXISTS (SELECT 1 FROM task_role_assignment a WHERE a.task_id = t.id AND a.role_name = 'planner' AND a.assignee_type = 'agent' AND a.assignee_id IS NOT NULL)";
 
 async fn install_replan_audit(pool: &sqlx::SqlitePool) {
     sqlx::query("CREATE TABLE IF NOT EXISTS model_replan_authority (task_id TEXT NOT NULL, kind TEXT NOT NULL, receipt TEXT NOT NULL, eligible INTEGER NOT NULL)")
         .execute(pool).await.unwrap();
-    for (kind, table, filter, receipt) in [
+    let lead_root_now =
+        format!("COALESCE((SELECT ({MODEL_LEAD_ROOT}) FROM task t WHERE t.id=NEW.task_id),0)");
+    let charged_under_a_lead = "EXISTS(SELECT 1 FROM model_replan_authority a WHERE a.task_id=NEW.task_id AND a.kind='charge' AND a.eligible=1 AND a.receipt=json_extract(NEW.bridge_payload,'$.receipt'))";
+    for (kind, table, filter, receipt, eligible) in [
         (
             "charge",
             "task_budget_charge",
             "NEW.kind = 'replan'",
-            "NEW.window_id || ':' || NEW.step_id",
+            "NEW.step_id",
+            lead_root_now.clone(),
         ),
         (
             "entry",
             "transition_log",
             "NEW.bridge_kind = 'replan'",
-            "NEW.id",
+            "COALESCE(json_extract(NEW.bridge_payload,'$.receipt'), NEW.id)",
+            format!("({lead_root_now} OR {charged_under_a_lead})"),
         ),
     ] {
         sqlx::raw_sql(&format!(
             "CREATE TRIGGER IF NOT EXISTS model_replan_{kind} AFTER INSERT ON {table}
              WHEN {filter} BEGIN INSERT INTO model_replan_authority(task_id,kind,receipt,eligible)
-             VALUES(NEW.task_id, '{kind}', {receipt},
-                    COALESCE((SELECT ({MODEL_LEAD_ROOT}) FROM task t WHERE t.id=NEW.task_id),0)); END"
-        )).execute(pool).await.unwrap();
+             VALUES(NEW.task_id, '{kind}', {receipt}, {eligible}); END"
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 }
 
+/// The audit of (l) on rows written directly: what a product that re-plans
+/// a root with no lead would write is caught as a charge alone, as an entry
+/// alone, and as both; the history of an authorized re-plan is not.
 #[tokio::test]
 async fn replan_authority_audit_retains_history_and_catches_later_illegal_effects() {
     let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     install_replan_audit(&pool).await;
-    sqlx::raw_sql("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','now','now');
+    let entry = |id: &str, receipt: &str| {
+        format!("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload) VALUES('{id}','root','in_progress','planning','system:workflow','model','now','replan','{{\"receipt\":\"{receipt}\"}}');")
+    };
+    let charge = |receipt: &str| {
+        format!("INSERT INTO task_budget_charge(task_id,kind,window_id,step_id) VALUES('root','replan','w','{receipt}');")
+    };
+    let flagged = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT kind || ' ' || receipt FROM model_replan_authority WHERE eligible=0 ORDER BY rowid",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    sqlx::raw_sql(&format!("INSERT INTO project(id,name,created_at,updated_at) VALUES('p','p','now','now');
         INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('root','p','root','planning','now','now');
         INSERT INTO task(id,project_id,parent_task_id,title,status,created_at,updated_at) VALUES('child','p','root','child','todo','now','now');
         INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('a','root','planner','agent','lead','now','now');
-        INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES('root','replan','w',1);
-        INSERT INTO task_budget_charge(task_id,kind,window_id,step_id) VALUES('root','replan','w','valid');
-        DELETE FROM task_role_assignment WHERE id='a';")
+        INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES('root','replan','w',2);
+        {} {} {}
+        DELETE FROM task_role_assignment WHERE id='a';
+        {}",
+        charge("with-lead"), entry("e1", "with-lead"), charge("decided-with-lead"),
+        // The designed race: decided and charged under the lead, entered
+        // after the owner removed it.
+        entry("e2", "decided-with-lead")))
         .execute(&pool).await.unwrap();
-    let valid: i64 =
-        sqlx::query_scalar("SELECT eligible FROM model_replan_authority WHERE kind='charge'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     assert_eq!(
-        valid, 1,
-        "removal retains the authority of the earlier charge"
+        flagged().await,
+        Vec::<String>::new(),
+        "an authorized re-plan stays authorized after the lead is removed"
     );
-    sqlx::raw_sql("INSERT INTO task_budget_charge(task_id,kind,window_id,step_id) VALUES('root','replan','w','invalid');
-        INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload) VALUES('illegal-entry','root','in_progress','planning','system:workflow','invalid','now','replan','{\"receipt\":\"valid\"}');")
-        .execute(&pool).await.unwrap();
-    let invalid: Vec<String> = sqlx::query_scalar(
-        "SELECT kind FROM model_replan_authority WHERE eligible=0 ORDER BY kind",
-    )
-    .fetch_all(&pool)
+    // A product that re-plans a root with no lead: the charge alone, the
+    // entry alone (no charge, and a receipt charged without a lead), both.
+    sqlx::raw_sql(&format!(
+        "{} {} {}",
+        charge("no-lead"),
+        entry("e3", "never-charged"),
+        entry("e4", "no-lead")
+    ))
+    .execute(&pool)
     .await
     .unwrap();
     assert_eq!(
-        invalid,
-        ["charge", "entry"],
-        "both effects after removal are still violations"
+        flagged().await,
+        ["charge no-lead", "entry never-charged", "entry no-lead"],
+        "every effect decided without a lead is a violation"
     );
+    // Assigning a lead again does not launder them.
+    sqlx::raw_sql("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('b','root','planner','agent','lead','now','now');")
+        .execute(&pool).await.unwrap();
+    assert_eq!(flagged().await.len(), 3);
     pool.close().await;
 }
 

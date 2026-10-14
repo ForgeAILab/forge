@@ -717,6 +717,136 @@ async fn a_replanning_root_that_lost_its_lead_returns_to_implementation() {
     assert_eq!(log(&lead, &root.id).await.len(), settled);
 }
 
+/// The lead is removed (through the owner's command) from a root that is in
+/// planning because of a real re-plan whose planner run is live. The run is
+/// cancelled, the root leaves planning by the no-lead path, the charge and
+/// its one planning entry stay as the history of an authorized re-plan, and
+/// no later pass charges or enters planning again while there is no lead:
+/// not for the park that is still there, and not for a rejected aggregate
+/// review.
+#[tokio::test]
+async fn removing_the_lead_ends_an_in_flight_replan_and_nothing_replans_without_a_lead() {
+    let lead = lead_fixture(false).await;
+    let (root, child, later) = root_with_parked_child(&lead, true).await;
+    let receipt = child_receipt(&lead, &child).await;
+    passes(&lead, 3).await;
+    assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
+    assert_eq!(
+        executions(&lead.db, &root.id).await,
+        vec![(PLANNER.to_owned(), "running".to_owned())]
+    );
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+
+    let service = &lead.dispatcher.task_service;
+    service
+        .remove_role(&root.id, PLANNER, false, false)
+        .await
+        .expect("the owner removes the lead of a re-planning root");
+    until(&lead, "the root leaves planning without a lead", async || {
+        reload(&lead.db, &root.id).await.status == "in_progress"
+    })
+    .await;
+    passes(&lead, 4).await;
+
+    let entries = log(&lead, &root.id).await;
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "in_progress".to_owned(),
+                "planning".to_owned(),
+                Some("replan".to_owned())
+            ),
+            ("planning".to_owned(), "in_progress".to_owned(), None),
+        ],
+        "one re-plan entry, then the no-lead advance"
+    );
+    assert_eq!(
+        executions(&lead.db, &root.id).await,
+        vec![(PLANNER.to_owned(), "cancelled".to_owned())],
+        "the removed lead's run is cancelled and nothing replaces it"
+    );
+    // The budget entry is the history of the authorized re-plan: one charge,
+    // under the receipt of the one entry.
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    let charges: Vec<String> = sqlx::query_scalar(
+        "SELECT step_id FROM task_budget_charge WHERE task_id=? AND kind='replan'",
+    )
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(charges, vec![receipt.clone()]);
+    let bridged: Vec<String> = sqlx::query_scalar(
+        "SELECT json_extract(bridge_payload,'$.receipt') FROM transition_log WHERE task_id=? AND bridge_kind='replan'",
+    )
+    .bind(&root.id)
+    .fetch_all(lead.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(bridged, vec![receipt]);
+    // The park is the Project Agent's now, the root waits on its subtasks,
+    // and the later subtask is still held by the sequence.
+    assert!(
+        !crate::task_hierarchy::lead_handles_subtask_park(&lead.db, &child.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        park(&lead.db, &root.id).await.contains("Children"),
+        "{}",
+        park(&lead.db, &root.id).await
+    );
+    assert_eq!(reload(&lead.db, &later.id).await.status, "todo");
+
+    // A new park of the same subtask (a fresh trigger, a fresh receipt) does
+    // not re-plan a root with no lead, and the command refuses it directly.
+    let parked_again = park_child(&lead, &child, "it failed again after the lead left").await;
+    let park_id = crate::task_hierarchy::subtask_decision_park(&parked_again).expect("parked");
+    passes(&lead, 4).await;
+    assert!(!service
+        .replan_coordination_root(&root.id, &child.id, &park_id)
+        .await
+        .unwrap());
+    assert_eq!(reload(&lead.db, &root.id).await.status, "in_progress");
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert_eq!(log(&lead, &root.id).await, entries);
+    assert_eq!(executions(&lead.db, &root.id).await.len(), 1);
+}
+
+/// A rejected aggregate review of a root whose lead was removed after an
+/// earlier, charged re-plan goes to the configured target: the old charge
+/// authorizes nothing more.
+#[tokio::test]
+async fn a_rejection_after_the_lead_was_removed_spends_no_replan() {
+    let lead = lead_fixture(false).await;
+    let root = root_with_failed_review(&lead, true).await;
+    spend_replans(&lead, &root.id, 1).await;
+    let service = &lead.dispatcher.task_service;
+    service
+        .remove_role(&root.id, PLANNER, false, false)
+        .await
+        .unwrap();
+    let root = reload(&lead.db, &root.id).await;
+    let (task, target, reason) = service.review_failure_target(&root, None).await.unwrap();
+    assert_eq!(target.as_deref(), Some("in_progress"));
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert_eq!(
+        service
+            .review_rejection_bridge(&task, "in_progress", &reason)
+            .await
+            .unwrap()
+            .bridge_kind,
+        None
+    );
+    passes(&lead, 3).await;
+    assert_eq!(spent(&lead, &root.id, "replan").await, 1);
+    assert!(log(&lead, &root.id)
+        .await
+        .iter()
+        .all(|(_, to, bridge)| to != "planning" && bridge.is_none()));
+}
+
 /// The re-plan command re-derives its fact from current rows: a park that is
 /// gone, and a root the owner stopped in between, are left alone and charge
 /// nothing.
