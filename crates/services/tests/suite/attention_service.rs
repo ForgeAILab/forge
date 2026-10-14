@@ -3720,3 +3720,177 @@ async fn restart_wake_checkpoint_failure_rolls_back_decision_and_disposition() {
         .unwrap();
     assert_eq!(cursor.last_sequence, source);
 }
+
+// Two imported merge blockers in a Project without a Project Agent: the state
+// the upgrade rehearsal restarted. Returns the Project, its owner and Tasks.
+async fn restart_wake_two_merge_blockers(db: &Arc<SqliteDb>) -> (String, String, Vec<String>) {
+    let project_id = "restart-review-project".to_owned();
+    let at = "2026-01-01T00:00:00Z";
+    let owner = "restart-review-owner".to_owned();
+    db::UserRepo::create_user(
+        &**db,
+        &db::User {
+            id: owner.clone(),
+            email: "restart-review@example.test".into(),
+            password_hash: "test".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: at.into(),
+            updated_at: at.into(),
+        },
+    )
+    .await
+    .unwrap();
+    ProjectRepo::create(
+        &**db,
+        CreateProject {
+            id: project_id.clone(),
+            owner_id: Some(owner.clone()),
+            name: "Imported merges".into(),
+            primary_repo_id: None,
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut task_ids = Vec::new();
+    for (index, title) in ["merge_held", "merge_paused"].into_iter().enumerate() {
+        let task = project_task(db, &project_id, title).await;
+        let attempt = format!("imported-{title}");
+        sqlx::query("INSERT INTO integration_attempt (id,task_id,task_ref,project_ref,queue_seq,current,admission_key,expected_status,expected_epoch,observed_task_version,enqueued_at,state,failure_kind,failure_message,import_source_json,created_at,updated_at) VALUES (?,?,?,?,1,0,?,'merging',0,1,?,'quarantined','owner_required','missing execution or pinned workspace','{}',?,?)")
+            .bind(&attempt).bind(&task.id).bind(&task.id).bind(&project_id).bind(&attempt)
+            .bind(at).bind(at).bind(at).execute(db.pool()).await.unwrap();
+        let interruption = serde_json::json!({"source":"integration", "cause":"owner_required", "kind":"review_needs_owner", "owner_id":null, "reason":"missing execution or pinned workspace"});
+        let reason = serde_json::json!({"kind":"deferred", "attempt_id":attempt, "cause":"owner_required", "owner_id":null, "message":"missing execution or pinned workspace"});
+        let mut evidence =
+            serde_json::to_value(db::task_condition::ConditionEvidence::default()).unwrap();
+        evidence["material"] =
+            serde_json::json!({"requires_intervention":true,"interruption":interruption});
+        evidence["witnesses"] = serde_json::json!([{"kind":"integration", "reason":reason}]);
+        let condition = serde_json::json!({"kind":"parked", "primary":{"kind":"integration", "reason":reason}, "additional":[], "resume":{"kind":"integration", "attempt_id":attempt}, "since":null, "evidence":evidence});
+        db::task_condition::decode(&condition.to_string()).unwrap();
+        sqlx::query("UPDATE task SET status='merging', condition_json=? WHERE id=?")
+            .bind(condition.to_string())
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        append_attention_event_at(
+            db,
+            "task.interruption_changed",
+            &task.id,
+            &project_id,
+            serde_json::json!({"requires_intervention":true, "interruption":interruption}),
+            &format!("2026-01-01T00:00:0{index}Z"),
+        )
+        .await;
+        task_ids.push(task.id);
+    }
+    (project_id, owner, task_ids)
+}
+
+fn restart_wake_service(db: &Arc<SqliteDb>) -> Arc<AttentionService> {
+    Arc::new(AttentionService::new(
+        db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(db.clone())),
+    ))
+}
+
+async fn restart_wake_bind(db: &Arc<SqliteDb>, project_id: &str, owner: &str, responder: &str) {
+    identity(db, responder).await;
+    sqlx::query("UPDATE agent_identity SET owner_id=? WHERE id=?")
+        .bind(owner)
+        .bind(responder)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM project_agent_binding WHERE project_id=? AND state IN ('agent_setup_required','active')",
+    )
+    .bind(project_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    services::AgentChatService::new(db.clone())
+        .set_project_binding(services::SetProjectAgentBindingInput {
+            actor_user_id: owner.into(),
+            project_id: project_id.into(),
+            identity_id: Some(responder.into()),
+            state: "active".into(),
+            autonomy_policy_json: "{}".into(),
+            permission_ceiling_json: "{}".into(),
+            subscriptions_json: "[]".into(),
+            wake_budget: 10,
+            expected_version: Some(version),
+            replacement_reason: None,
+        })
+        .await
+        .unwrap();
+}
+
+async fn restart_wake_count(db: &SqliteDb, sql: &str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(db.pool()).await.unwrap()
+}
+
+/// A responder that is bound but cannot run (its Agent is paused) is a real
+/// setup change: each open blocker records one new setup decision naming the
+/// bound Agent, a restart records nothing more, and unpausing wakes once.
+#[tokio::test]
+async fn restart_wake_bound_but_paused_responder_records_one_setup_decision_per_blocker() {
+    let db = database().await;
+    let (project_id, owner, _) = restart_wake_two_merge_blockers(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let setup = "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.setup_required'";
+    assert_eq!(restart_wake_count(&db, setup).await, 2);
+
+    let responder = "restart-paused-responder";
+    restart_wake_bind(&db, &project_id, &owner, responder).await;
+    sqlx::query("UPDATE agent_identity SET paused=1 WHERE id=?")
+        .bind(responder)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    assert_eq!(
+        restart_wake_count(&db, setup).await,
+        4,
+        "the changed responder setup records one decision per open blocker"
+    );
+    assert_eq!(
+        restart_wake_count(&db, "SELECT COUNT(*) FROM agent_wake_disposition").await,
+        4
+    );
+    let latest: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT identity_id FROM agent_wake_attention_latest ORDER BY 1")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(latest, vec![Some(responder.to_owned()); 2]);
+
+    let before = restart_wake_snapshot(&db).await;
+    restart_wake_observe_writes(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    assert_eq!(before, restart_wake_snapshot(&db).await);
+    let writes: i64 = restart_wake_count(&db, "SELECT COUNT(*) FROM restart_wake_writes").await;
+    assert_eq!(writes, 0, "an unchanged restart writes nothing");
+
+    sqlx::query("UPDATE agent_identity SET paused=0 WHERE id=?")
+        .bind(responder)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    assert_eq!(
+        restart_wake_count(
+            &db,
+            "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.admitted'"
+        )
+        .await,
+        1,
+        "the runnable responder is woken exactly once for both blockers"
+    );
+}

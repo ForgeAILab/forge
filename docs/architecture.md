@@ -3216,7 +3216,10 @@ bus notification for the zero configured-budget branch, using the budget scope.
 
 Setup-required decisions retain each Attention item's canonical incident digest,
 including when the startup sweep finds several blockers in the same Project.
-Only a prepared turn uses a batch admission digest. The latest-decision row is
+Only a prepared turn uses a batch admission digest. A setup or suppression
+decision is deduplicated by scope, incident, source event, reason, digest and,
+when one is bound, the responder identity, so a changed binding records a new
+decision rather than colliding with the earlier one. The latest-decision row is
 updated only when its digest, disposition, reason or responder identity changes;
 an unchanged startup sweep writes no wake audit, disposition, latest-decision
 timestamp or consumer checkpoint. Event projection commits its decision and

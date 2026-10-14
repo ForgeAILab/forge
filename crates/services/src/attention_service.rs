@@ -1414,12 +1414,19 @@ impl AttentionService {
         let decision_dedupe = if event_type == "agent.wake.admitted" {
             wake_admitted_dedupe_key(request, context)
         } else {
+            // The responder is part of the decision: a changed binding records
+            // a new one instead of colliding with the earlier decision's key.
+            // Identity-less decisions keep their stored key.
+            let responder = identity_id
+                .as_deref()
+                .map(|id| format!(":{id}"))
+                .unwrap_or_default();
             format!(
                 "agent-wake-decision:{}:{}",
                 event_type.replace('.', "-"),
                 wake_incident_digest(
                     &format!(
-                        "{}:{}:{}:{}:{}:{}:{}",
+                        "{}:{}:{}:{}:{}:{}:{}{}",
                         request.scope_type,
                         request.scope_id,
                         request.incident_key,
@@ -1427,6 +1434,7 @@ impl AttentionService {
                         reason_code,
                         event_type,
                         incident_digest,
+                        responder,
                     ),
                     None,
                 )
