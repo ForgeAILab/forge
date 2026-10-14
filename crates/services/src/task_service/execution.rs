@@ -256,6 +256,8 @@ const TERMINAL_EXECUTION_SETTLEMENT_KEY: &str = "terminal_execution_settlement";
 
 pub(super) use recovery::REPLAYING_RECOVERY;
 pub(crate) use runner::discard_execution_plan_stage;
+#[cfg(test)]
+pub(crate) use runner::launch_gate;
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 
 pub(crate) use cascade::should_block_task_for_failed_execution;

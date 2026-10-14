@@ -1360,6 +1360,8 @@ impl TaskService {
             let project = ProjectRepo::get_by_id(&*self.db, &fresh_task.project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", fresh_task.project_id.clone()))?;
+            #[cfg(test)]
+            crate::task_service::execution::launch_gate::before_reissue(&fresh_task.id).await;
             let replacement = self
                 .issue_workspace_lease_with_operation_key(
                     &fresh_task,
