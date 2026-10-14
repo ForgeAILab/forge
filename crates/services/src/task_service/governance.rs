@@ -1388,13 +1388,8 @@ impl TaskService {
                     let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
                         .await?
                         .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
-                    self.ensure_execution_launch_preconditions(
-                        &current,
-                        &task,
-                        role,
-                        execution_id,
-                    )
-                    .await?;
+                    self.ensure_execution_launch_preconditions(&current, &task, role, execution_id)
+                        .await?;
                     return Ok(current);
                 }
                 Ok(None) => {

@@ -535,7 +535,10 @@ impl TaskService {
         )
         .await?;
         Ok(recent.items.len() == MAX_LAUNCH_CONTENTION_REFUSALS
-            && recent.items.iter().all(is_workspace_lease_pre_dispatch_failure))
+            && recent
+                .items
+                .iter()
+                .all(is_workspace_lease_pre_dispatch_failure))
     }
 
     pub(super) async fn fail_execution_before_dispatch_without_task_block(

@@ -612,9 +612,18 @@ async fn launch_contention_on_every_dispatch_parks_after_a_bound_without_budget(
         "contention refusals={refused}; blocked={:?}; condition={:?}",
         fresh.blocked_json, fresh.condition
     );
-    assert!(refused >= 2, "the refused launch is re-dispatched: {refused}");
-    assert!(refused <= 3, "launches under contention are bounded: {refused}");
-    assert!(fresh.blocked_json.is_some(), "the Task parks after the bound");
+    assert!(
+        refused >= 2,
+        "the refused launch is re-dispatched: {refused}"
+    );
+    assert!(
+        refused <= 3,
+        "launches under contention are bounded: {refused}"
+    );
+    assert!(
+        fresh.blocked_json.is_some(),
+        "the Task parks after the bound"
+    );
     assert_eq!(executor.0.load(Ordering::SeqCst), 0);
     assert_eq!(
         db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
@@ -630,11 +639,7 @@ async fn launch_contention_on_every_dispatch_parks_after_a_bound_without_budget(
 #[tokio::test]
 async fn a_task_write_after_a_committed_reissue_does_not_retry_the_launch() {
     let (db, service, task, execution, _repo) = fixture().await;
-    let _registered = register(
-        &task.id,
-        Arc::clone(&db),
-        Arc::new(|_| Box::pin(async {})),
-    );
+    let _registered = register(&task.id, Arc::clone(&db), Arc::new(|_| Box::pin(async {})));
     let (writer_db, id) = (Arc::clone(&db), task.id.clone());
     let _after = register_after(
         &task.id,
@@ -672,11 +677,13 @@ async fn an_agent_paused_during_the_reissue_defers_the_launch() {
             let (db, id, agent) = (Arc::clone(&writer_db), id.clone(), agent.clone());
             Box::pin(async move {
                 if attempt == 1 {
-                    sqlx::query("UPDATE agent_identity SET paused = 1, version = version + 1 WHERE id = ?")
-                        .bind(&agent)
-                        .execute(db.pool())
-                        .await
-                        .unwrap();
+                    sqlx::query(
+                        "UPDATE agent_identity SET paused = 1, version = version + 1 WHERE id = ?",
+                    )
+                    .bind(&agent)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
                 }
                 if attempt < 2 {
                     bump(&db, &id).await;
