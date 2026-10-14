@@ -2430,6 +2430,7 @@ impl World {
             if round >= QUIESCENCE_BOUND && started.elapsed() >= QUIESCENCE_PATIENCE {
                 break;
             }
+            self.adopt_unindexed_children().await?;
             self.sync_lead_tasks();
             self.move_deadlines(false).await?;
             for (index, id) in self.tasks.iter().enumerate() {
@@ -2473,6 +2474,38 @@ impl World {
             "(d) livelock: no quiescence after {QUIESCENCE_BOUND} rounds; last states {:#?}",
             &history[tail..]
         ))
+    }
+
+    /// A child the lead created is indexed by the scripted adapter after
+    /// its `lead.subtask create` returns. A run cancelled in that window
+    /// (the root's Cancel stops the planner) drops the future after the
+    /// create committed, and the model would never drive the child's Task
+    /// steps (the root's cancel cascade enqueues one), then report the
+    /// child it stranded itself under (o). The product's step worker runs
+    /// every pending step; the model indexes every child of a Task it
+    /// knows from the database.
+    async fn adopt_unindexed_children(&mut self) -> Result<(), String> {
+        let known: Vec<String> = self.shared.index.lock().unwrap().keys().cloned().collect();
+        let known = serde_json::to_string(&known).map_err(|error| error.to_string())?;
+        let found: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, parent_task_id FROM task
+             WHERE parent_task_id IN (SELECT value FROM json_each(?1))
+               AND id NOT IN (SELECT value FROM json_each(?1))
+             ORDER BY created_at, id",
+        )
+        .bind(&known)
+        .fetch_all(&self.live().pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let mut index = self.shared.index.lock().unwrap();
+        let mut parents = self.shared.parents.lock().unwrap();
+        for (id, parent) in found {
+            let next = index.len();
+            let root = index[&parent];
+            let child = *index.entry(id).or_insert(next);
+            parents.insert(child, root);
+        }
+        Ok(())
     }
 
     fn sync_lead_tasks(&mut self) {
@@ -2711,8 +2744,20 @@ impl World {
         )
         .await?;
         if !open.is_empty() {
+            // What happened to the subtask left behind: its Task steps and
+            // transitions, so a failing seed names the writer that skipped it.
+            let history = rows(
+                "SELECT c.id || ' created ' || c.created_at || ' root-cancelled ' || COALESCE((SELECT MAX(l.created_at) FROM transition_log l WHERE l.task_id=r.id AND l.to_state='cancelled'),'-')
+                   || ' now ' || strftime('%Y-%m-%dT%H:%M:%f','now') || ' steps ' || COALESCE((SELECT group_concat(s.seq || ':' || s.kind || ':' || s.status || ':' || s.attempts || ':' || s.priority || ':' || COALESCE(s.lane,'') || ':avail=' || COALESCE(s.available_at,'') || ':lease=' || COALESCE(s.lease_until,'') || ':' || COALESCE(json_extract(s.payload_json,'$.operation'),'') || ':' || COALESCE(s.last_error,''), ' | ') FROM task_step s WHERE s.task_id=c.id),'none')
+                   || ' log ' || COALESCE((SELECT group_concat(l.from_state || '->' || l.to_state || ' ' || l.trigger_reason, ' | ') FROM transition_log l WHERE l.task_id=c.id),'none')
+                 FROM task r JOIN task c ON c.parent_task_id = r.id
+                 WHERE r.parent_task_id IS NULL AND r.status IN ('review','merging','done','cancelled') AND c.status NOT IN ('done','cancelled')",
+            )
+            .await
+            .unwrap_or_default();
             return Err(format!(
-                "(o) roots past implementation with a subtask left to run: {open:?}"
+                "(o) roots past implementation with a subtask left to run: {open:?}\n  {}",
+                history.join("\n  ")
             ));
         }
         Ok(())
@@ -3596,9 +3641,9 @@ async fn run_all(mut cases: Vec<(String, Vec<Step>)>, avoid: bool) {
 }
 
 /// Seeds every run covers, so a regression in one of them is a stable failure.
-const FIXED_SEEDS: [u64; 16] = [
+const FIXED_SEEDS: [u64; 17] = [
     1, 2, 3, 5, 8, 909358760, 213412165, 974622785, 637240885, 277839211, 580812352, 610875980,
-    207044633, 749274245, 263753536, 625967944,
+    207044633, 749274245, 263753536, 625967944, 931180934,
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
