@@ -1,0 +1,343 @@
+name: Demo TestSprite
+
+# Builds the pull request, has Dokploy deploy that build onto the one public
+# demo instance, and runs the TestSprite suite against it. docs/demo-instance.md
+# lists the secrets and variables and explains the flow.
+
+on:
+  pull_request:
+    branches:
+      - main
+      - next/v0.14
+    # Draft pull requests are skipped (see the `build` job); marking one ready
+    # starts the check.
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Documentation-only changes do not rebuild and redeploy the demo.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # Builds run in parallel across pull requests; only the deploy is serialized.
+  build:
+    # Fork and Dependabot pull requests receive no repository secrets, so the
+    # deploy and the suite cannot run for them. Draft pull requests are
+    # skipped too: a long-lived draft would redeploy the public demo and spend
+    # a suite run on every push.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && !github.event.pull_request.draft) }}
+    name: Build demo image
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # A newer push to the same pull request supersedes its older build.
+    concurrency:
+      group: demo-build-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # Only the digest. The runner drops a job output that contains the value
+      # of any secret as a substring; `suite` rebuilds every name itself.
+      digest: ${{ steps.demo.outputs.digest }}
+    steps:
+      # Fail in seconds, not after the build, when the repository is not set up.
+      - name: Check demo configuration
+        env:
+          DEMO_URL: ${{ vars.DEMO_URL }}
+          TESTSPRITE_PROJECT_ID: ${{ vars.TESTSPRITE_PROJECT_ID }}
+          DOKPLOY_COMPOSE_ID: ${{ vars.DOKPLOY_COMPOSE_ID }}
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in DEMO_URL TESTSPRITE_PROJECT_ID DOKPLOY_COMPOSE_ID DOKPLOY_URL \
+            DOKPLOY_API_KEY TESTSPRITE_API_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is not configured for this repository. See docs/demo-instance.md."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      # On a pull request this is the commit the author pushed, the same one
+      # the tag and the build id name, not GitHub's temporary merge commit.
+      # The price: the build does not contain what the base branch gained
+      # since the branch was cut, so the suite tests the pull request as
+      # written, not the result of merging it.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Set image reference
+        id: ref
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The commit the author pushed, not the temporary merge commit.
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # A package of its own, so demo tags never mix with release tags.
+          # The `suite` job derives the same name; keep the two in step.
+          name="${REGISTRY}/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')-demo"
+          if [[ -n "$PR_NUMBER" ]]; then
+            tag="pr-${PR_NUMBER}-${COMMIT}"
+          else
+            tag="manual-${COMMIT}"
+          fi
+          {
+            echo "name=$name"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 1: the ordinary Forge image, from the root Dockerfile.
+      - name: Build and push Forge image
+        id: base
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ref.outputs.name }}:base-${{ steps.ref.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # Every run reads the cache. Only a manual run writes it: a pull
+          # request can read the cache of its base branch only, so a cache
+          # written by a pull request run would be read by nobody else and
+          # would only fill the repository's cache quota.
+          cache-from: type=gha,scope=demo-image
+          cache-to: ${{ github.event_name == 'workflow_dispatch' && 'type=gha,scope=demo-image,mode=max,ignore-error=true' || '' }}
+          provenance: false
+
+      # Step 2: the demo image on top of it: the seeding entrypoint, the health
+      # check, and the build id that the `suite` job waits for on the public
+      # URL. The id is unique per workflow run, so every run yields a new
+      # image digest and Dokploy recreates the container.
+      - name: Build and push demo image
+        id: demo
+        uses: docker/build-push-action@v7
+        with:
+          context: deploy/demo
+          push: true
+          tags: ${{ steps.ref.outputs.name }}:${{ steps.ref.outputs.tag }}
+          build-args: |
+            FORGE_BASE_IMAGE=${{ steps.ref.outputs.name }}@${{ steps.base.outputs.digest }}
+            FORGE_DEMO_BUILD_ID=${{ github.run_id }}-${{ github.run_attempt }}-${{ github.event.pull_request.head.sha || github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha || github.sha }}
+          provenance: false
+
+  suite:
+    name: Demo TestSprite suite
+    # Skipped when the build did not succeed, so a failed build never enters
+    # the queue below and cannot push another pull request's waiting run out
+    # of it. The `result` job is what turns that into a failed check.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # There is one demo instance. Runs queue instead of cancelling each other.
+    # GitHub keeps one waiting run per group: a newer waiting run replaces an
+    # older waiting one, which then shows as cancelled and must be re-run.
+    concurrency:
+      group: demo-testsprite
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # Moving the `live` tag is a registry write.
+      packages: write
+    steps:
+      - name: Set image reference
+        id: image
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::The build reported no image digest."
+            exit 1
+          fi
+          # Same name as in the `build` job.
+          name="${REGISTRY}/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')-demo"
+          {
+            echo "name=$name"
+            echo "ref=${name}@${DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The build id is read back from the image that will be deployed, so a
+      # re-run of this job alone still waits for the right value.
+      - name: Read the build id of the image
+        id: build-id
+        env:
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          container="$(docker create "$IMAGE")"
+          trap 'docker rm "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/local/share/forge/web/dist/demo-build.txt" "$RUNNER_TEMP/demo-build.txt"
+          build_id="$(tr -d '\r\n' < "$RUNNER_TEMP/demo-build.txt")"
+          if [[ ! "$build_id" =~ ^[0-9]+-[0-9]+-[0-9a-f]{40}$ ]]; then
+            echo "::error::The image carries no usable build id."
+            exit 1
+          fi
+          echo "value=$build_id" >> "$GITHUB_OUTPUT"
+
+      # Dokploy deploys the `live` tag. Only this serialized job moves it.
+      - name: Move the live tag to this build
+        env:
+          NAME: ${{ steps.image.outputs.name }}
+          IMAGE: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${NAME}:live" "$IMAGE"
+
+      # Stop first: a start of the container is what resets the instance, and
+      # a stopped instance cannot be mistaken for the new one below.
+      - name: Deploy through Dokploy
+        env:
+          DOKPLOY_URL: ${{ secrets.DOKPLOY_URL }}
+          DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+          DOKPLOY_COMPOSE_ID: ${{ vars.DOKPLOY_COMPOSE_ID }}
+          DEMO_URL: ${{ vars.DEMO_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          api="${DOKPLOY_URL%/}/api"
+          build_url="${DEMO_URL%/}/demo-build.txt"
+
+          # dokploy <endpoint> <json body>. The API key is given to curl in a
+          # config read from stdin, so it is never a process argument.
+          dokploy() {
+            local status
+            status="$(printf 'header = "x-api-key: %s"\n' "$DOKPLOY_API_KEY" |
+              curl --config - --silent --show-error --max-time 60 \
+                --output "$RUNNER_TEMP/dokploy-response" --write-out '%{http_code}' \
+                --request POST --header 'Content-Type: application/json' \
+                --data "$2" "$api/$1")" || { echo "Dokploy $1: no response."; return 1; }
+            if [[ "$status" != 2* ]]; then
+              echo "Dokploy $1 answered HTTP $status."
+              return 1
+            fi
+          }
+          served() { curl --silent --max-time 10 "$build_url" 2>/dev/null | tr -d '\r\n' || true; }
+
+          # A stop can fail when nothing was deployed yet; the wait below is
+          # what decides whether it is safe to go on.
+          dokploy compose.stop "$(jq -cn --arg id "$DOKPLOY_COMPOSE_ID" '{composeId: $id}')" ||
+            echo "::warning::compose.stop failed; continuing if no instance answers."
+          # Three misses in a row: one failed request is not a stopped instance.
+          echo "Waiting for the previous instance to stop answering."
+          misses=0
+          for attempt in $(seq 1 60); do
+            previous="$(served)"
+            if [[ "$previous" =~ ^[0-9]+-[0-9]+-[0-9a-f]{40}$ ]]; then
+              misses=0
+            else
+              misses=$((misses + 1))
+              ((misses < 3)) || break
+            fi
+            if ((attempt == 60)); then
+              echo "::error::The previous instance still answers at $build_url three minutes after compose.stop."
+              exit 1
+            fi
+            sleep 3
+          done
+
+          dokploy compose.deploy "$(jq -cn --arg id "$DOKPLOY_COMPOSE_ID" --arg url "$RUN_URL" \
+            '{composeId: $id, title: "Demo TestSprite check", description: $url}')" ||
+            { echo "::error::Dokploy did not accept the deploy. Check DOKPLOY_URL, DOKPLOY_API_KEY and DOKPLOY_COMPOSE_ID."; exit 1; }
+          echo "Dokploy accepted the deploy."
+
+      # The public URL must serve THIS build. /demo-build.txt is a static file
+      # baked into the image, and Forge listens publicly only after the
+      # accounts exist, so a match also means the instance is seeded.
+      - name: Wait for this build on the public URL
+        env:
+          DEMO_URL: ${{ vars.DEMO_URL }}
+          BUILD_ID: ${{ steps.build-id.outputs.value }}
+        run: |
+          set -euo pipefail
+          base="${DEMO_URL%/}"
+          for attempt in $(seq 1 120); do
+            served="$(curl --silent --max-time 10 "$base/demo-build.txt" 2>/dev/null | tr -d '\r\n' || true)"
+            if [[ "$served" == "$BUILD_ID" ]] &&
+              curl --fail --silent --max-time 10 --output /dev/null "$base/healthz"; then
+              echo "The demo serves build $BUILD_ID."
+              exit 0
+            fi
+            if ((attempt % 6 == 0)); then
+              echo "Still waiting for build $BUILD_ID at $base (attempt $attempt)."
+            fi
+            sleep 5
+          done
+          echo "::error::$base did not serve build $BUILD_ID within 10 minutes. Check the deployment log in Dokploy: a failed seeding leaves the container unhealthy and offline."
+          exit 1
+
+      # A full-project run tests the URL configured in the TestSprite project;
+      # the action's target-url input applies to single-test runs only.
+      - name: Run TestSprite suite
+        uses: TestSprite/testsprite-action@v1
+        with:
+          api-key: ${{ secrets.TESTSPRITE_API_KEY }}
+          project: ${{ vars.TESTSPRITE_PROJECT_ID }}
+          timeout: "1800"
+
+  # The one check to mark as required. It is outside the deploy queue, runs
+  # even when the jobs before it failed or were cancelled, and is green only
+  # when the image was built and the suite passed. For fork and Dependabot
+  # pull requests it is skipped with the rest, which does not block a merge.
+  result:
+    name: Demo TestSprite result
+    needs: [build, suite]
+    if: ${{ always() && needs.build.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require a built image and a passed suite
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: |
+          set -euo pipefail
+          echo "Build: $BUILD_RESULT"
+          echo "Suite: $SUITE_RESULT"
+          if [[ "$BUILD_RESULT" != success ]]; then
+            echo "::error::The demo image build finished with '$BUILD_RESULT'; nothing was deployed or tested."
+            exit 1
+          fi
+          if [[ "$SUITE_RESULT" != success ]]; then
+            echo "::error::The deploy and suite job finished with '$SUITE_RESULT'. A 'cancelled' run was pushed out of the deploy queue: re-run it."
+            exit 1
+          fi
