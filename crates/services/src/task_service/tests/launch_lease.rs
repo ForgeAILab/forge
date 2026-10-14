@@ -656,3 +656,55 @@ async fn a_task_write_after_a_committed_reissue_does_not_retry_the_launch() {
     assert_eq!(executor.0.load(Ordering::SeqCst), 1);
     assert_eq!(probe(&task.id).unwrap().attempts.load(Ordering::SeqCst), 1);
 }
+
+/// An Agent paused while its run's lease is being reissued does not launch:
+/// the run ends as the Agent wait (no retry spent, no blocker), as a pause
+/// before an unchanged grant's check does.
+#[tokio::test]
+async fn an_agent_paused_during_the_reissue_defers_the_launch() {
+    let (db, service, task, execution, _repo) = fixture().await;
+    let agent = execution.agent_id.clone().unwrap();
+    let (writer_db, id) = (Arc::clone(&db), task.id.clone());
+    let _registered = register(
+        &task.id,
+        Arc::clone(&db),
+        Arc::new(move |attempt| {
+            let (db, id, agent) = (Arc::clone(&writer_db), id.clone(), agent.clone());
+            Box::pin(async move {
+                if attempt == 1 {
+                    sqlx::query("UPDATE agent_identity SET paused = 1, version = version + 1 WHERE id = ?")
+                        .bind(&agent)
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+                if attempt < 2 {
+                    bump(&db, &id).await;
+                }
+            })
+        }),
+    );
+    let executor = CountingExecutor(AtomicUsize::new(0));
+    let ended = service
+        .run_execution(execution.id.clone(), &executor)
+        .await
+        .expect("a paused Agent defers the launch");
+    assert_eq!(ended.status, ExecutionStatus::Failed);
+    assert!(
+        execution::is_agent_paused_pre_dispatch_failure(&ended),
+        "{:?}",
+        ended.error
+    );
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Execution.key())
+            .await
+            .unwrap(),
+        0
+    );
+    let fresh = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fresh.blocked_json.is_none(), "{:?}", fresh.blocked_json);
+}
