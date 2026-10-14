@@ -646,3 +646,8 @@ GitHub evicts caches when storage fills or entries expire. Default-branch
 cache hits are the useful baseline for pull requests.
 See [GitHub's cache scope and eviction reference](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 and [Docker's registry cache reference](https://docs.docker.com/build/cache/backends/registry/).
+
+The separate [Demo TestSprite workflow](../.github/workflows/demo-testsprite.yml)
+builds each same-repository pull request, has Dokploy deploy it to the public
+demo instance and runs the TestSprite suite there; see
+[demo-instance.md](demo-instance.md).
