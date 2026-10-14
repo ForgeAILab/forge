@@ -400,6 +400,34 @@ async fn running(lead: &Lead, task: &str, role: &str) -> bool {
         .contains(&(role.to_owned(), "running".to_owned()))
 }
 
+/// Wait until the launch of the planner run on `task` is decided: its
+/// embedded runner holds the run's lease (the executor is next), or the run
+/// is no longer running.
+async fn launched(lead: &Lead, task: &str) {
+    let decided = async {
+        loop {
+            let (status, owner): (String, Option<String>) = sqlx::query_as(
+                "SELECT status, lease_owner FROM execution WHERE task_id=? AND role=?
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )
+            .bind(task)
+            .bind(PLANNER)
+            .fetch_one(lead.db.pool())
+            .await
+            .unwrap();
+            if status != "running"
+                || owner.is_some_and(|owner| owner.starts_with("embedded-execution:"))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), decided)
+        .await
+        .expect("the planner run's launch is decided");
+}
+
 async fn comments(lead: &Lead, task: &str) -> Vec<db::TaskComment> {
     db::TaskCommentRepo::list_comments(
         &*lead.db,
@@ -649,14 +677,65 @@ async fn an_ordinary_planner_run_has_no_lead_operation() {
 /// key, and is bounded per run.
 #[tokio::test]
 async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() {
-    let ops = ops_fixture(false).await;
-    let lead = &ops.lead;
-    let (root, started, later) = root_with_parked_child(lead, true).await;
-    seed_completed_coder_execution(&lead.db, &started.id).await;
-    until(lead, "the root re-plans", async || {
-        running(lead, &root.id, PLANNER).await
+    started_subtask_and_bounded_creation(false).await;
+}
+
+/// The same lead with a slow launch, in a fixed order: the run's launch is
+/// held before its final authority check (released at the latest before the
+/// sixth extra create), and a write of the root lands in each WorkspaceLease
+/// reissue attempt it makes. Lead operations issued before the run reached
+/// its executor moved the root under that launch; both reissue attempts then
+/// lost to root writes, the run failed before it started ("version
+/// conflict") and the sixth create was refused `authority_revoked`. The
+/// lead's operations wait for its run, so they never meet the launch.
+#[tokio::test]
+async fn a_slow_launch_of_the_leads_run_keeps_its_operations() {
+    started_subtask_and_bounded_creation(true).await;
+}
+
+async fn started_subtask_and_bounded_creation(slow_launch: bool) {
+    let mut ops = ops_fixture(false).await;
+    let (root, started, later) = root_with_parked_child(&ops.lead, true).await;
+    let held = slow_launch.then(|| {
+        let (db, id) = (Arc::clone(&ops.lead.db), root.id.clone());
+        crate::task_service::execution::launch_gate::hold(
+            &root.id,
+            Arc::new(move || {
+                let (db, id) = (Arc::clone(&db), id.clone());
+                Box::pin(async move {
+                    sqlx::query(
+                        "UPDATE task SET version = version + 1, updated_at = ? WHERE id = ?",
+                    )
+                    .bind(now_rfc3339())
+                    .bind(&id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                })
+            }),
+        )
+    });
+    seed_completed_coder_execution(&ops.lead.db, &started.id).await;
+    until(&ops.lead, "the root re-plans", async || {
+        running(&ops.lead, &root.id, PLANNER).await
     })
     .await;
+    if let Some(held) = &held {
+        tokio::time::timeout(Duration::from_secs(30), held.reached())
+            .await
+            .expect("the lead's run reaches its final launch check");
+        held.release();
+    }
+    // The lead's operations come from its run, so they start once the
+    // executor has it. A `running` row is not that yet: the launch still
+    // checks the run's authority, and the lead's writes to the root inside
+    // that window could make the check fail and end the run.
+    let run = tokio::time::timeout(Duration::from_secs(30), ops.lead.rx.recv())
+        .await
+        .expect("the lead's run reaches its executor")
+        .expect("the executor channel is open");
+    assert_eq!(run.task_id, root.id);
+    let lead = &ops.lead;
     let read = ops
         .call(&root.id, "lead.read", json!({}), "read")
         .await
@@ -819,6 +898,10 @@ async fn a_started_subtask_is_recovered_not_rewritten_and_creation_is_bounded() 
     // The per-run bound: one was created above, seven more fit, the next is
     // refused, typed, and creates nothing.
     for index in 0..7 {
+        if let Some(held) = held.as_ref().filter(|_| index == 5) {
+            held.release();
+            launched(lead, &root.id).await;
+        }
         let result = ops
             .call(
                 &root.id,

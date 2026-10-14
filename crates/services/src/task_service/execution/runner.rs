@@ -129,6 +129,95 @@ async fn append_late_terminal_diagnostic(
     }
 }
 
+/// Test-only: a slow launch, in a fixed order. A held launch of a Task parks
+/// just before its final pre-launch authority check (after the execution row
+/// is `running`, before the executor has the run) until the test releases
+/// it, and the test's write lands in each WorkspaceLease reissue attempt the
+/// launch then makes.
+#[cfg(test)]
+pub(crate) mod launch_gate {
+    use std::collections::HashMap;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::{Notify, Semaphore};
+
+    /// A write of the held launch's Task, landed in every reissue attempt.
+    pub(crate) type Writer =
+        Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+    struct Gate {
+        reached: Notify,
+        open: Semaphore,
+        writer: Writer,
+    }
+
+    fn gates() -> &'static Mutex<HashMap<String, Arc<Gate>>> {
+        static GATES: OnceLock<Mutex<HashMap<String, Arc<Gate>>>> = OnceLock::new();
+        GATES.get_or_init(Mutex::default)
+    }
+
+    fn gate(task_id: &str) -> Option<Arc<Gate>> {
+        gates().lock().unwrap().get(task_id).cloned()
+    }
+
+    /// The launches of one Task, held until [`Held::release`]; dropping it
+    /// removes the gate.
+    pub(crate) struct Held(String);
+
+    pub(crate) fn hold(task_id: &str, writer: Writer) -> Held {
+        let gate = Gate {
+            reached: Notify::new(),
+            open: Semaphore::new(0),
+            writer,
+        };
+        gates()
+            .lock()
+            .unwrap()
+            .insert(task_id.to_owned(), Arc::new(gate));
+        Held(task_id.to_owned())
+    }
+
+    impl Held {
+        /// Wait until a launch of the Task is parked at the gate.
+        pub(crate) async fn reached(&self) {
+            if let Some(gate) = gate(&self.0) {
+                gate.reached.notified().await;
+            }
+        }
+
+        /// Let the parked launch, and every later one, go on.
+        pub(crate) fn release(&self) {
+            if let Some(gate) = gate(&self.0) {
+                if gate.open.available_permits() == 0 {
+                    gate.open.add_permits(1);
+                }
+            }
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Ok(mut gates) = gates().lock() {
+                gates.remove(&self.0);
+            }
+        }
+    }
+
+    pub(super) async fn pass(task_id: &str) {
+        if let Some(gate) = gate(task_id) {
+            gate.reached.notify_one();
+            let _ = gate.open.acquire().await;
+        }
+    }
+
+    pub(crate) async fn before_reissue(task_id: &str) {
+        if let Some(gate) = gate(task_id) {
+            (gate.writer)().await;
+        }
+    }
+}
+
 fn parse_rfc3339(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -657,6 +746,8 @@ impl TaskService {
             None
         };
 
+        #[cfg(test)]
+        launch_gate::pass(&execution.task_id).await;
         let execution_before_launch = ExecutionRepo::get_by_id(&*self.db, &execution_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("execution", execution_id.clone()))?;
