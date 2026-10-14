@@ -3894,3 +3894,236 @@ async fn restart_wake_bound_but_paused_responder_records_one_setup_decision_per_
         "the runnable responder is woken exactly once for both blockers"
     );
 }
+
+/// The deployed release's startup sweep stored one extra setup decision under
+/// a batch digest. After the upgrade that row is inert: the first start writes
+/// nothing, and the next real change still wakes exactly once.
+#[tokio::test]
+async fn restart_wake_stored_batch_digest_decision_is_inert_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    let db = database().await;
+    let (project_id, owner, _) = restart_wake_two_merge_blockers(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    // Seed what the deployed sweep added: a copy of the first member's setup
+    // decision keyed and digested by the batch (both member digests).
+    let members: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT e.id, d.incident_digest, e.dedupe_key FROM domain_event e JOIN agent_wake_disposition d ON d.source_event_id=e.id ORDER BY e.sequence",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(members.len(), 2);
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}:{}", members[0].1, members[1].1).as_bytes());
+    hasher.update([0]);
+    let batch = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let event_id = new_uuid_v4();
+    sqlx::query("INSERT INTO domain_event (id,event_type,entity_type,entity_id,actor_type,actor_id,scope_type,scope_id,correlation_id,causation_id,causation_depth,dedupe_key,payload_json,created_at) SELECT ?,event_type,entity_type,entity_id,actor_type,actor_id,scope_type,scope_id,correlation_id,causation_id,causation_depth,?,json_set(payload_json,'$.incident_digest',?),'2026-01-02T00:00:00Z' FROM domain_event WHERE id=?")
+        .bind(&event_id).bind(format!("agent-wake-decision:agent-wake-setup_required:{batch}")).bind(&batch).bind(&members[0].0)
+        .execute(db.pool()).await.unwrap();
+    let disposition_id = new_uuid_v4();
+    sqlx::query("INSERT INTO agent_wake_disposition (id,consumer_name,source_event_id,source_event_sequence,attempt_number,max_attempts,disposition,reason,turn_job_id,attention_id,retry_at,incident_key,incident_digest,binding_id,binding_version,profile_id,profile_version,provenance_json,parent_disposition_id,created_at,updated_at) SELECT ?,consumer_name,?,(SELECT sequence FROM domain_event WHERE id=?),attempt_number,max_attempts,disposition,reason,turn_job_id,attention_id,retry_at,incident_key,?,binding_id,binding_version,profile_id,profile_version,provenance_json,parent_disposition_id,created_at,updated_at FROM agent_wake_disposition WHERE source_event_id=?")
+        .bind(&disposition_id).bind(&event_id).bind(&event_id).bind(&batch).bind(&members[0].0)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_wake_disposition_current (consumer_name,source_event_id,disposition_id,attempt_number,updated_at) SELECT consumer_name,source_event_id,id,attempt_number,updated_at FROM agent_wake_disposition WHERE id=?")
+        .bind(&disposition_id).execute(db.pool()).await.unwrap();
+    // The deployed consumers had already read past the stored decision.
+    sqlx::query(
+        "UPDATE event_consumer_cursor SET last_sequence=(SELECT MAX(sequence) FROM domain_event)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let before = restart_wake_snapshot(&db).await;
+    restart_wake_observe_writes(&db).await;
+    for _ in 0..2 {
+        restart_wake_cycle(&db, restart_wake_service(&db)).await;
+        assert_eq!(before, restart_wake_snapshot(&db).await);
+        let writes: i64 = restart_wake_count(&db, "SELECT COUNT(*) FROM restart_wake_writes").await;
+        assert_eq!(
+            writes, 0,
+            "the first start after the upgrade writes nothing"
+        );
+    }
+
+    restart_wake_bind(&db, &project_id, &owner, "restart-upgrade-responder").await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    assert_eq!(
+        restart_wake_count(
+            &db,
+            "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.admitted'"
+        )
+        .await,
+        1
+    );
+}
+
+/// With a bound responder that cannot run, the deployed release stored only
+/// the batch decision (projection deferred the blockers to the sweep). The
+/// first start after the upgrade records each blocker's own decision once;
+/// later starts write nothing.
+#[tokio::test]
+async fn restart_wake_unready_responder_batch_decision_is_replaced_once_after_upgrade() {
+    use sha2::{Digest, Sha256};
+    let db = database().await;
+    // Bind a paused responder before the blockers are projected.
+    let (project_id, owner, _) = restart_wake_two_merge_blockers(&db).await;
+    let responder = "restart-unready-responder";
+    restart_wake_bind(&db, &project_id, &owner, responder).await;
+    sqlx::query("UPDATE agent_identity SET paused=1 WHERE id=?")
+        .bind(responder)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // Projection defers bound blockers; the next start's sweep decides them.
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let members: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.id, d.incident_digest FROM domain_event e JOIN agent_wake_disposition d ON d.source_event_id=e.id WHERE e.event_type='agent.wake.setup_required' ORDER BY e.sequence",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let decided: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_type, payload_json FROM domain_event WHERE event_type LIKE 'agent.wake.%' ORDER BY sequence",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        members.len(),
+        2,
+        "only the sweep decided these blockers: {decided:?}"
+    );
+    // Replace the per-blocker decisions with the deployed batch decision.
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{}:{}", members[0].1, members[1].1).as_bytes());
+    hasher.update([0]);
+    let batch = format!("sha256:{}", hex::encode(hasher.finalize()));
+    let event_id = new_uuid_v4();
+    sqlx::query("INSERT INTO domain_event (id,event_type,entity_type,entity_id,actor_type,actor_id,scope_type,scope_id,correlation_id,causation_id,causation_depth,dedupe_key,payload_json,created_at) SELECT ?,event_type,entity_type,entity_id,actor_type,actor_id,scope_type,scope_id,correlation_id,causation_id,causation_depth,?,json_set(payload_json,'$.incident_digest',?),created_at FROM domain_event WHERE id=?")
+        .bind(&event_id).bind(format!("agent-wake-decision:agent-wake-setup_required:{batch}")).bind(&batch).bind(&members[0].0)
+        .execute(db.pool()).await.unwrap();
+    let disposition_id = new_uuid_v4();
+    sqlx::query("INSERT INTO agent_wake_disposition (id,consumer_name,source_event_id,source_event_sequence,attempt_number,max_attempts,disposition,reason,turn_job_id,attention_id,retry_at,incident_key,incident_digest,binding_id,binding_version,profile_id,profile_version,provenance_json,parent_disposition_id,created_at,updated_at) SELECT ?,consumer_name,?,(SELECT sequence FROM domain_event WHERE id=?),attempt_number,max_attempts,disposition,reason,turn_job_id,attention_id,retry_at,incident_key,?,binding_id,binding_version,profile_id,profile_version,provenance_json,parent_disposition_id,created_at,updated_at FROM agent_wake_disposition WHERE source_event_id=?")
+        .bind(&disposition_id).bind(&event_id).bind(&event_id).bind(&batch).bind(&members[0].0)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_wake_disposition_current (consumer_name,source_event_id,disposition_id,attempt_number,updated_at) SELECT consumer_name,source_event_id,id,attempt_number,updated_at FROM agent_wake_disposition WHERE id=?")
+        .bind(&disposition_id).execute(db.pool()).await.unwrap();
+    for (id, _) in &members {
+        for sql in [
+            "DELETE FROM agent_wake_disposition_current WHERE source_event_id=?",
+            "DELETE FROM agent_wake_disposition WHERE source_event_id=?",
+            "DELETE FROM domain_event WHERE id=?",
+        ] {
+            sqlx::query(sql).bind(id).execute(db.pool()).await.unwrap();
+        }
+    }
+    sqlx::query(
+        "UPDATE event_consumer_cursor SET last_sequence=(SELECT MAX(sequence) FROM domain_event)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    restart_wake_observe_writes(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let writes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT table_name, operation FROM restart_wake_writes WHERE table_name <> 'event_consumer_cursor' ORDER BY 1, 2",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let expected = [
+        ("agent_wake_disposition", "INSERT"),
+        ("agent_wake_disposition", "INSERT"),
+        ("agent_wake_disposition_current", "INSERT"),
+        ("agent_wake_disposition_current", "INSERT"),
+        ("domain_event", "INSERT"),
+        ("domain_event", "INSERT"),
+    ]
+    .map(|(t, o)| (t.to_owned(), o.to_owned()));
+    assert_eq!(writes, expected, "once: one decision per blocker");
+    sqlx::query("DELETE FROM restart_wake_writes")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let writes: i64 = restart_wake_count(&db, "SELECT COUNT(*) FROM restart_wake_writes").await;
+    assert_eq!(writes, 0, "not forever");
+}
+
+/// A blocker whose Task went away while Forge was down is settled by the
+/// startup sweep, even when it is not the first member of the Project's
+/// blockers; the other blocker's decision is left untouched.
+#[tokio::test]
+async fn restart_wake_blocker_closed_during_downtime_is_settled_once() {
+    let db = database().await;
+    let (_, _, task_ids) = restart_wake_two_merge_blockers(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    sqlx::query("UPDATE task SET deleted_at=? WHERE id=?")
+        .bind(now_rfc3339())
+        .bind(&task_ids[1])
+        .execute(db.pool())
+        .await
+        .unwrap();
+    restart_wake_observe_writes(&db).await;
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT json_extract(details_json,'$.entity_id'), status FROM attention_projection ORDER BY occurred_at",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses,
+        vec![
+            (task_ids[0].clone(), "open".to_owned()),
+            (task_ids[1].clone(), "resolved".to_owned())
+        ]
+    );
+    let suppressed: Vec<String> = sqlx::query_scalar(
+        "SELECT json_extract(payload_json,'$.reason') FROM domain_event WHERE event_type='agent.wake.suppressed'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(suppressed, vec!["resolved_incident".to_owned()]);
+    let setup = "SELECT COUNT(*) FROM domain_event WHERE event_type='agent.wake.setup_required'";
+    assert_eq!(restart_wake_count(&db, setup).await, 2);
+    sqlx::query("DELETE FROM restart_wake_writes")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    restart_wake_cycle(&db, restart_wake_service(&db)).await;
+    let writes: i64 = restart_wake_count(&db, "SELECT COUNT(*) FROM restart_wake_writes").await;
+    assert_eq!(writes, 0);
+}
+
+/// The latest-decision upsert compares every stored value except the
+/// timestamp. A new column must be added to that comparison too.
+#[tokio::test]
+async fn restart_wake_latest_guard_covers_every_column() {
+    use sqlx::Row;
+    let db = database().await;
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(agent_wake_attention_latest)")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "attention_id",
+            "incident_digest",
+            "disposition",
+            "reason",
+            "identity_id",
+            "updated_at"
+        ],
+        "update the guard in record_latest_attention_wake_in_tx for a new column"
+    );
+}
