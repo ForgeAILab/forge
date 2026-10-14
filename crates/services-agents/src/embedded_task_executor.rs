@@ -7,8 +7,8 @@
 //! adapter only translates one admitted Task execution into a native runtime
 //! turn and returns the normal executor result.
 
-use crate::task_service::execution::embedded_task_executor::is_read_only_task_role;
-use crate::task_service::execution::{execution_lease_for, UNCOMMITTED_WORKTREE_FAILURE};
+use services::task_service::execution::embedded_task_executor::is_read_only_task_role;
+use services::task_service::execution::{execution_lease_for, UNCOMMITTED_WORKTREE_FAILURE};
 use std::{
     collections::HashMap,
     path::Path,
@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
+use services::{
     embedded_agent_service::{CreateScopedSession, EmbeddedAgentService, RequestedCanonicalScope},
     turn_log_sink::{TurnLogSink, TurnProgressObserver},
     ContextManifestInput, ContextManifestService, ContextSourceInput, Result, ServiceError,
@@ -48,7 +48,7 @@ pub struct EmbeddedTaskExecutor {
     db: Arc<SqliteDb>,
     embedded_agents: Arc<EmbeddedAgentService>,
     backend: Arc<NativeAgentRuntimeBackend>,
-    workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
     provider_admissions: Arc<StdMutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>>,
 }
@@ -81,7 +81,7 @@ impl EmbeddedTaskExecutor {
     pub fn new_with_router(
         db: Arc<SqliteDb>,
         embedded_agents: Arc<EmbeddedAgentService>,
-        workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+        workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     ) -> Self {
         let backend = embedded_agents.native_backend();
         Self {
@@ -103,9 +103,9 @@ impl EmbeddedTaskExecutor {
     pub fn new_for_test(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
         let backend = embedded_agents.native_backend();
         let workspace_backend_router =
-            crate::lifecycle::context::embedded_workspace_router_for_test(
+            services::lifecycle::context::embedded_workspace_router_for_test(
                 Arc::clone(&db),
-                crate::workspace_root::fixture_root(),
+                services::workspace_root::fixture_root(),
                 None,
             );
         Self {
@@ -120,7 +120,7 @@ impl EmbeddedTaskExecutor {
 
     pub fn with_workspace_backend_router(
         mut self,
-        router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+        router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     ) -> Self {
         self.workspace_backend_router = router;
         self
@@ -221,11 +221,11 @@ impl EmbeddedTaskExecutor {
         let task_service = self.embedded_agents.task_service_handle();
         let workspace_root = match task_service.as_ref() {
             Some(service) => service.workspace_root().to_path_buf(),
-            None => crate::workspace_root::root_of(&self.db)
+            None => services::workspace_root::root_of(&self.db)
                 .await
                 .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
         };
-        let valid = crate::workspace_manager::WorkspaceManager::new(
+        let valid = services::workspace_manager::WorkspaceManager::new(
             &self.db,
             &workspace_root,
             task_service
@@ -234,7 +234,11 @@ impl EmbeddedTaskExecutor {
             &self.workspace_backend_router,
         )
         .waiting_for_disk()
-        .ensure_valid(&task, workspace, crate::workspace_manager::Purpose::Execute)
+        .ensure_valid(
+            &task,
+            workspace,
+            services::workspace_manager::Purpose::Execute,
+        )
         .await;
         let valid = match valid {
             Ok(valid) => valid,
@@ -253,7 +257,7 @@ impl EmbeddedTaskExecutor {
         };
         let worktree_path = valid.path().map(Path::to_path_buf).ok_or_else(|| {
             ServiceError::from(
-                crate::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
+                services::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
                     owner_kind: valid.resolved().placement.owner_kind.clone(),
                 },
             )
@@ -332,7 +336,7 @@ impl EmbeddedTaskExecutor {
 
         let native_provider = {
             let (context_tokens, max_input_tokens, max_output_tokens) =
-                crate::embedded_agent_service::effective_native_limits(
+                services::embedded_agent_service::effective_native_limits(
                     &provider,
                     config.context_tokens,
                     config.max_input_tokens,
@@ -381,7 +385,7 @@ impl EmbeddedTaskExecutor {
         self.active.write().await.remove(&ctx.execution_id);
         if !cancellation.is_cancelled() {
             let error_text = output.as_ref().err().map(ToString::to_string);
-            if let Err(error) = crate::provider_health::record_entry_outcome(
+            if let Err(error) = services::provider_health::record_entry_outcome(
                 &self.db,
                 credential_ref,
                 error_text.as_deref().map_or(Ok(()), Err),
@@ -482,23 +486,24 @@ impl EmbeddedTaskExecutor {
             }
             Err(error) => return native_dispatch_failure(error),
         };
-        let output =
-            if role == crate::workflow::default_roles::REVIEWER && !cancellation.is_cancelled() {
-                self.correct_review_report(
-                    ctx,
-                    output,
-                    &turn_request,
-                    &log_sink,
-                    ReviewCorrectionProvider {
-                        runtime_session_id: &runtime_session_id,
-                        credential_ref,
-                    },
-                    &cancellation,
-                )
-                .await
-            } else {
-                output
-            };
+        let output = if role == services::workflow::default_roles::REVIEWER
+            && !cancellation.is_cancelled()
+        {
+            self.correct_review_report(
+                ctx,
+                output,
+                &turn_request,
+                &log_sink,
+                ReviewCorrectionProvider {
+                    runtime_session_id: &runtime_session_id,
+                    credential_ref,
+                },
+                &cancellation,
+            )
+            .await
+        } else {
+            output
+        };
         if cancellation.is_cancelled() {
             let usage_reports = native_usage_reports(
                 &ctx.execution_id,
@@ -637,7 +642,7 @@ impl EmbeddedTaskExecutor {
                     let result = self.backend.run_turn(request, log_sink).await;
                     if !cancellation.is_cancelled() {
                         let error_text = result.as_ref().err().map(ToString::to_string);
-                        if let Err(error) = crate::provider_health::record_entry_outcome(
+                        if let Err(error) = services::provider_health::record_entry_outcome(
                             &self.db,
                             provider.credential_ref,
                             error_text.as_deref().map_or(Ok(()), Err),

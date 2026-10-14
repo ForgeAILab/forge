@@ -388,11 +388,7 @@ impl TaskService {
     /// takes the disk capacity wait (`Capacity{disk}`), which the
     /// dispatcher looks at again every 30 s. `false` for any other error:
     /// the caller handles it as before.
-    pub(crate) async fn defer_launch_for_disk(
-        &self,
-        execution_id: &str,
-        error: &ServiceError,
-    ) -> bool {
+    pub async fn defer_launch_for_disk(&self, execution_id: &str, error: &ServiceError) -> bool {
         if crate::placement::capacity_wait_of(error) != Some(crate::placement::CapacityWait::Disk) {
             return false;
         }

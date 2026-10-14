@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use db::{UpdateTask, UpdateTaskStatus};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
-pub(crate) mod embedded_task_executor;
+pub mod embedded_task_executor;
 
 /// The execution whose outbox is ingested. Provenance comes from here, never
 /// from the files the harness wrote.
@@ -49,7 +49,7 @@ pub trait ExecutionSupport: Send + Sync {
     ) -> ExecutionOutboxReport;
 }
 
-pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
+pub const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
 
 /// Shared state for the server-owned execution lease.
 ///
@@ -59,7 +59,7 @@ pub(crate) const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed
 /// handle immediately before dispatch and removes it after the future exits.
 /// Both heartbeat and semantic-progress calls serialize on the same mutex so
 /// every successful CAS advances one authoritative execution version.
-pub(crate) struct EmbeddedExecutionLease {
+pub struct EmbeddedExecutionLease {
     db: Arc<SqliteDb>,
     execution_id: String,
     owner: String,
@@ -228,7 +228,7 @@ pub(crate) fn unregister_execution_lease(
     }
 }
 
-pub(crate) fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
+pub fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
     embedded_execution_leases()
         .lock()
         .ok()

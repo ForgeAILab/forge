@@ -1180,7 +1180,7 @@ impl Drop for Checks {
 struct Live {
     checks: Checks,
     pool: sqlx::SqlitePool,
-    runtime: Arc<services::ForgeRuntime>,
+    runtime: Arc<services_agents::ForgeRuntime>,
     state: AppState,
     app: Router,
     script: Arc<Script>,
@@ -1630,7 +1630,7 @@ impl World {
         config.workspace.root = workspaces.clone();
         config.server.max_concurrent_runs = run_cap();
         let runtime = Arc::new(
-            services::ForgeRuntimeBuilder::from_config(
+            services_agents::ForgeRuntimeBuilder::from_config(
                 Arc::clone(&db),
                 Arc::clone(&event_bus),
                 config,

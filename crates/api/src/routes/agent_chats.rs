@@ -33,8 +33,8 @@ use serde_json::{json, Value};
 use services::{
     CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
     SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
-    StartMainChatTopicInput,
 };
+use services_agents::StartMainChatTopicInput;
 
 use crate::{
     errors::{ApiError, ApiResult},

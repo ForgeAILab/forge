@@ -110,18 +110,18 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 The full version lives in [docs/architecture.md](docs/architecture.md). Quick orientation:
 
 ```
-forge-cli → api → services → db
-                → events      ↑
-          → mcp-server -------┘
-          → executors → workspace → git
-          → config
-          → api-types (shared, zero internal deps)
-api / services → pricing → db / api-types
-forge-solo → services (Solo bootstrap and session services live in forge-solo)
+forge-cli → api / mcp-server / services-agents / services
+api / mcp-server / forge-solo → services-agents → services → db
+api / mcp-server / forge-solo → services
+services-agents / services → events / agent-host / executors / workspace → git
+forge-cli / forge-solo → config
+api-types (shared, zero internal deps)
+api / services-agents / services → pricing → db / api-types
+forge-solo owns its Solo bootstrap and session services
 ```
 
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
-- **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, hands them to `AppState::new()` which builds `TaskService` / `AgentService` internally. `AppState` is `Clone` (all fields `Arc`) and used as Axum state.
+- **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, builds the shared graph through `services_agents::ForgeRuntimeBuilder`, and hands it to `AppState::from_runtime_arc()`. `AppState` is `Clone` (shared services use `Arc`) and used as Axum state.
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.

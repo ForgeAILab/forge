@@ -4,7 +4,7 @@
 //! flow, no state machine, and the only user verb is cancel. This module is
 //! deliberately thin -- all authorization (an inquiry is reachable only
 //! through the chat that dispatched it) lives in
-//! `services::agent_inquiry_service::AgentInquiryService`.
+//! `services_agents::agent_inquiry_service::AgentInquiryService`.
 
 use api_types::{
     AgentInquiryListResponse, AgentInquiryResponse, AgentInquiryStatus, AgentInquiryTokenUsage,

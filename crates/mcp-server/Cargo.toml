@@ -14,6 +14,7 @@ api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 db = { path = "../db" }
 services = { path = "../services" }
+services-agents = { path = "../services-agents" }
 events = { path = "../events" }
 axum = "0.8"
 futures-util = "0.3"

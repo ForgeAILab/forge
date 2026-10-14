@@ -132,9 +132,9 @@ impl OperatorStatusService {
 
     /// Monitor only durable consumers owned by the process's started workers.
     /// Persisted cursors from other assemblies are not evidence of a live worker.
-    pub fn set_runtime_workers(&self, workers: &[crate::runtime::RuntimeWorker]) {
+    pub fn set_runtime_workers(&self, workers: &[crate::worker_runtime::assembly::RuntimeWorker]) {
         self.relay_enabled.store(
-            workers.contains(&crate::runtime::RuntimeWorker::DomainEventBroadcast),
+            workers.contains(&crate::worker_runtime::assembly::RuntimeWorker::DomainEventBroadcast),
             Ordering::SeqCst,
         );
 
@@ -1238,7 +1238,7 @@ mod tests {
         run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
         let service = OperatorStatusService::new(Arc::clone(&db));
-        service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
+        service.set_runtime_workers(&crate::worker_runtime::assembly::COMMON_WORKERS);
         (db, service)
     }
 
@@ -2119,7 +2119,7 @@ mod tests {
         ));
         assert!(outbound.try_recv().is_err());
         let service = service.with_daemon_connections(registry);
-        service.set_runtime_workers(&crate::runtime::COMMON_WORKERS);
+        service.set_runtime_workers(&crate::worker_runtime::assembly::COMMON_WORKERS);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('upgrade-lag', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         sync_fixtures(&service).await;
         let status = service.compute_status().await.unwrap();
@@ -2363,7 +2363,7 @@ mod tests {
         let old = (now - Duration::minutes(10)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (sequence, id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES (1, 'processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?), (10, 'pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
             .bind(&old).bind(&old).execute(db.pool()).await.unwrap();
-        for consumer in crate::runtime::COMMON_WORKERS
+        for consumer in crate::worker_runtime::assembly::COMMON_WORKERS
             .into_iter()
             .filter_map(|worker| worker.event_consumer_name())
         {
@@ -2412,7 +2412,7 @@ mod tests {
     #[tokio::test]
     async fn consumer_migrated_health_reports_live_lag_and_age_without_worker_updates() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        service.set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Memory]);
         let now = Utc::now();
         let old = (now - Duration::minutes(10)).to_rfc3339();
         let name = crate::memory_consumer_name();
@@ -2486,7 +2486,7 @@ mod tests {
     #[tokio::test]
     async fn consumer_deferral_text_and_dead_letters_have_distinct_operator_lifetimes() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Memory]);
+        service.set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Memory]);
         let name = crate::memory_consumer_name();
         crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
             .run_once(1)
@@ -2592,7 +2592,7 @@ mod tests {
     #[tokio::test]
     async fn idle_consumer_with_old_cursor_is_never_stalled() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Attention]);
+        service.set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Attention]);
         sqlx::query("INSERT INTO domain_event (id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES ('processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES ('attention_projection', 1, '2000-01-01T00:00:00Z')").execute(db.pool()).await.unwrap();
         sync_fixtures(&service).await;
@@ -2625,7 +2625,9 @@ mod tests {
     #[tokio::test]
     async fn consumer_tail_has_no_durable_lag_entry_or_stall() {
         let (_, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::DomainEventBroadcast]);
+        service.set_runtime_workers(&[
+            crate::worker_runtime::assembly::RuntimeWorker::DomainEventBroadcast,
+        ]);
         assert!(service
             .compute_status()
             .await
@@ -2636,7 +2638,8 @@ mod tests {
     #[tokio::test]
     async fn audit2_dead_letter_history_does_not_expire_or_degrade_old_failures() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        service
+            .set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Coordination]);
         let name = crate::coordination_consumer_name();
         let health = db::WorkerHealth::new(Arc::clone(&db), name);
         let mut tx = db::begin_immediate(db.pool()).await.unwrap();
@@ -2694,7 +2697,8 @@ mod tests {
     #[tokio::test]
     async fn resolved_dead_letters_are_excluded_from_counts_recent_history_and_alerts() {
         let (db, service) = test_service().await;
-        service.set_runtime_workers(&[crate::runtime::RuntimeWorker::Coordination]);
+        service
+            .set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Coordination]);
         let name = crate::coordination_consumer_name();
         let health = db::WorkerHealth::new(Arc::clone(&db), name);
         let mut tx = db::begin_immediate(db.pool()).await.unwrap();

@@ -256,7 +256,7 @@ async fn run() {
     let mut runtime_config = effective_config.clone();
     runtime_config.workspace.root = workspace_root.clone();
     let runtime = Arc::new(
-        services::ForgeRuntimeBuilder::new(Arc::clone(&db), Arc::clone(&event_bus))
+        services_agents::ForgeRuntimeBuilder::new(Arc::clone(&db), Arc::clone(&event_bus))
             .with_adapter_registry(Arc::clone(&adapter_registry))
             .with_config(runtime_config)
             .with_workspace_root(workspace_root.clone())
@@ -332,9 +332,9 @@ async fn run() {
         Ok(_) => {}
         Err(error) => warn!(%error, "failed to mark stale external daemons offline at startup"),
     }
-    let mut runtime_supervisor = services::RuntimeSupervisor::new(
+    let mut runtime_supervisor = services_agents::RuntimeSupervisor::new(
         Arc::clone(&runtime),
-        services::RuntimeAssemblyMode::Server,
+        services_agents::RuntimeAssemblyMode::Server,
     );
     match runtime_supervisor.start().await {
         Ok(count) if count > 0 => info!(recovered_count = count, "recovered orphaned tasks"),

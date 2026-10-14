@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use db::{SqliteDb, TaskStepRepo};
 use tokio::{sync::watch, task::JoinHandle};
 
-use crate::Result;
+use services::Result;
 
 // 100 pages every five seconds drains about 580 MB in two hours at 4 KiB/page.
 // Each statement holds the writer lock for at most 100 page reclamations.
@@ -47,7 +47,7 @@ impl StorageMaintenanceWorker {
 
     pub fn start(
         self: Arc<Self>,
-        workers: &crate::worker_runtime::PeriodicWorkers,
+        workers: &services::worker_runtime::PeriodicWorkers,
         shutdown: watch::Receiver<bool>,
     ) -> JoinHandle<()> {
         workers.worker("storage-maintenance").start(shutdown, || false, move |worker, mut shutdown| {
@@ -397,7 +397,7 @@ mod tests {
         worker.maintain_once(&rx).await.unwrap();
         Arc::clone(&worker)
             .start(
-                &crate::worker_runtime::PeriodicWorkers::new(Arc::clone(&db)),
+                &services::worker_runtime::PeriodicWorkers::new(Arc::clone(&db)),
                 rx,
             )
             .await

@@ -468,7 +468,7 @@ pub struct TaskService {
     pub(crate) daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     pub(crate) workspace_exec_locks: Option<Arc<WorkspaceExecutionLockManager>>,
     pub(crate) terminal_activity: Option<Arc<TerminalActivityTracker>>,
-    pub(crate) repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
+    pub repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
     pub(crate) workspace_backend_router: Arc<WorkspaceBackendRouter>,
     test_workspace_backend: bool,
     pub(crate) workspace_root: PathBuf,
@@ -801,7 +801,7 @@ impl TaskService {
         self
     }
 
-    pub(crate) fn workspace_root(&self) -> &std::path::Path {
+    pub fn workspace_root(&self) -> &std::path::Path {
         &self.workspace_root
     }
 

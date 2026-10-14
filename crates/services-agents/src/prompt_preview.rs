@@ -4,7 +4,7 @@ use api_types::{StateDefinition, WorkflowDefinition, WorkflowTrigger, WorkflowTr
 use db::{ProjectRepo, TaskRepo};
 use serde_json::{json, Value};
 
-use crate::{
+use services::{
     workflow::{
         default_states,
         dispatch::{
@@ -19,7 +19,7 @@ use crate::{
 
 pub async fn preview_effective_prompt(
     db: Arc<db::SqliteDb>,
-    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    router: &services::workspace_backend::WorkspaceBackendRouter,
     task_id: &str,
     role: &str,
     trigger: Option<WorkflowTrigger>,
@@ -44,8 +44,8 @@ pub async fn preview_effective_prompt(
     let state_dispatch = dispatch_intent_from_workflow_dispatch(preview_state.dispatch.as_ref());
     let selection =
         effective_prompt_selection(role, trigger_dispatch.as_ref(), state_dispatch.as_ref());
-    let dispatch_ctx =
-        load_agent_dispatch_context(crate::workflow::dispatch::loader::DispatchContextParams {
+    let dispatch_ctx = load_agent_dispatch_context(
+        services::workflow::dispatch::loader::DispatchContextParams {
             db: Arc::clone(&db),
             router,
             task_id,
@@ -54,8 +54,9 @@ pub async fn preview_effective_prompt(
             state_config,
             execution_policy: Some(selection.execution_policy.as_str()),
             workflow: &workflow,
-        })
-        .await?;
+        },
+    )
+    .await?;
     let (mut prompt, selection) = build_effective_prompt(
         &dispatch_ctx,
         trigger_dispatch.as_ref(),
@@ -67,8 +68,8 @@ pub async fn preview_effective_prompt(
     prompt
         .user
         .push_str(&::review::contract::governing_prompt(&context));
-    if role == crate::workflow::default_roles::REVIEWER
-        || selection.builder_id == crate::workflow::dispatch::BUILDER_ID_REVIEWER_CONFORMANCE_V1
+    if role == services::workflow::default_roles::REVIEWER
+        || selection.builder_id == services::workflow::dispatch::BUILDER_ID_REVIEWER_CONFORMANCE_V1
     {
         prompt.system.push_str("\n\n");
         prompt

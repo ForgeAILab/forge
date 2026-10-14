@@ -1679,6 +1679,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Split internal runtime composition and selected agent services into `services-agents`, above the `services` task core; no behaviour change.
+
 - **Pricing and the Solo services left the `services` crate (developer-only).**
   Provider pricing is the new `pricing` crate (`services → pricing → db`), and
   the Solo bootstrap and session services are `forge_solo::bootstrap` and

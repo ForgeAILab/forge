@@ -347,7 +347,7 @@ impl EmbeddedAgentService {
     /// Apply the server's optional public-search configuration to the shared
     /// provider used by all subsequently composed native sessions.
     /// The Task service the server wired in, when there is one.
-    pub(crate) fn task_service_handle(&self) -> Option<Arc<crate::TaskService>> {
+    pub fn task_service_handle(&self) -> Option<Arc<crate::TaskService>> {
         self.tool_provider.task_service_handle()
     }
 
@@ -2573,7 +2573,7 @@ fn native_model_limits(provider: &str) -> (u32, u32, u32) {
 /// the old generic triple baked into their config. That exact triple can only
 /// be a baked default — never a deliberate user choice of all three values —
 /// so it resolves to the provider defaults instead of capping the model.
-pub(crate) fn effective_native_limits(
+pub fn effective_native_limits(
     provider: &str,
     context_tokens: u32,
     max_input_tokens: u32,

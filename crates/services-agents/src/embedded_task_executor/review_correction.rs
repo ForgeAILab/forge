@@ -24,7 +24,7 @@ pub(super) fn correction_prompt(problem: &str) -> String {
          Reply with ONLY the result block for the review you just wrote, for example:\n\
          {{\"result\": \"fail\", \"reason\": \"one sentence\", \"fixable_by\": \"coder\", \"repeat\": false}}\n\
          result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation.\n\n{}",
-        crate::workflow::dispatch::REVIEW_FINDING_ROUTING_CONTRACT
+        services::workflow::dispatch::REVIEW_FINDING_ROUTING_CONTRACT
     )
 }
 

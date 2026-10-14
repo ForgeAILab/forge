@@ -34,7 +34,7 @@ use crate::{
 /// Why a caller needs the workspace. It decides what the manager may repair
 /// and whether HEAD must be on the Task branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Purpose {
+pub enum Purpose {
     /// Launch an execution. May recreate the worktree and may put a clean
     /// worktree back on the Task branch.
     Execute,
@@ -79,7 +79,7 @@ pub(crate) enum Repair {
 
 /// A workspace checked against disk and Git by [`WorkspaceManager::ensure_valid`].
 #[derive(Clone)]
-pub(crate) struct ValidWorkspace {
+pub struct ValidWorkspace {
     workspace: Workspace,
     resolved: ResolvedWorkspace,
     path: Option<PathBuf>,
@@ -103,13 +103,13 @@ impl ValidWorkspace {
         self.workspace
     }
 
-    pub(crate) fn resolved(&self) -> &ResolvedWorkspace {
+    pub fn resolved(&self) -> &ResolvedWorkspace {
         &self.resolved
     }
 
     /// The validated directory on the Forge host. `None` for a daemon-owned
     /// placement, whose handle is never a local path.
-    pub(crate) fn path(&self) -> Option<&Path> {
+    pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
@@ -127,7 +127,7 @@ impl ValidWorkspace {
 
 /// Why no valid workspace was returned.
 #[derive(Debug)]
-pub(crate) enum WorkspaceUnavailable {
+pub enum WorkspaceUnavailable {
     /// [`Purpose::Inspect`] only: the workspace is not usable right now and
     /// nothing was changed.
     Absent { reason: String },
@@ -250,7 +250,7 @@ enum Observed {
     },
 }
 
-pub(crate) struct WorkspaceManager<'a> {
+pub struct WorkspaceManager<'a> {
     db: &'a SqliteDb,
     workspace_root: &'a Path,
     repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
@@ -261,7 +261,7 @@ pub(crate) struct WorkspaceManager<'a> {
 }
 
 impl<'a> WorkspaceManager<'a> {
-    pub(crate) fn new(
+    pub fn new(
         db: &'a SqliteDb,
         workspace_root: &'a Path,
         repo_cache_locks: Option<Arc<RepoCacheLockManager>>,
@@ -286,7 +286,7 @@ impl<'a> WorkspaceManager<'a> {
     /// checkout it avoids, so without this the recreate is admitted as it
     /// always was. A worktree that is there and valid is never refused
     /// either way.
-    pub(crate) fn waiting_for_disk(mut self) -> Self {
+    pub fn waiting_for_disk(mut self) -> Self {
         self.wait_for_disk = true;
         self
     }
@@ -294,7 +294,7 @@ impl<'a> WorkspaceManager<'a> {
     /// Check `workspace` against disk and Git for `purpose`, repairing it
     /// through the recreate path when the purpose allows. The row is kept when
     /// its Task branch is gone, so the reset stays an explicit operation.
-    pub(crate) async fn ensure_valid(
+    pub async fn ensure_valid(
         &self,
         task: &Task,
         workspace: Workspace,

@@ -969,12 +969,12 @@ async fn newer_message_turn_supersedes_retry_and_resolves_snoozed_incident() {
     .await
     .unwrap();
         if topic_divider {
-            services::MainChatTopicService::new(
+            services_agents::MainChatTopicService::new(
                 db.clone(),
                 Arc::new(AgentChatService::new(db.clone())),
                 services::ProductGenesisService::for_sqlite(db.clone()),
             )
-            .start_topic(services::StartMainChatTopicInput {
+            .start_topic(services_agents::StartMainChatTopicInput {
                 actor_user_id: ACCOUNT_ID.into(),
                 chat_id: job.chat_id.clone(),
                 label: Some("new topic".into()),

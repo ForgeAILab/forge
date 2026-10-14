@@ -8,7 +8,7 @@ use db::{DeadLetter, DeadLetterAction, SqliteDb};
 
 use crate::{
     worker_runtime::{EventReplay, Worker, WorkerRuntime},
-    ForgeRuntime, Result, ServiceError,
+    Result, ServiceError,
 };
 
 pub struct DeadLetterActor<'a> {
@@ -36,17 +36,6 @@ impl DeadLetterService {
             db,
             consumers: HashMap::new(),
         }
-    }
-    pub fn for_runtime(runtime: &ForgeRuntime) -> Self {
-        let mut service = Self::new(Arc::clone(&runtime.db));
-        service.register(Arc::clone(&runtime.memory_consumer));
-        service.register(Arc::clone(&runtime.coordination_consumer));
-        service.register(Arc::clone(&runtime.attention_projection));
-        service.register(Arc::clone(&runtime.wake_turn_consumer));
-        service.register(Arc::clone(&runtime.project_hook_service));
-        service.register(Arc::clone(&runtime.notification_service));
-        service.register(Arc::clone(&runtime.conflict_hotspot_consumer));
-        service
     }
     pub fn register<W: Worker<C>, C: Send + Sync + 'static>(&mut self, worker: Arc<W>) {
         self.consumers.insert(

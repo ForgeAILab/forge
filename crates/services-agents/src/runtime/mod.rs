@@ -22,83 +22,23 @@ use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use tokio::{sync::watch, task::JoinHandle};
 use workspace::RepoCacheLockManager;
 
-use crate::{
+use services::worker_runtime::assembly::{RuntimeWorker, ShutdownSignal, COMMON_WORKERS};
+
+use crate::{MainChatTopicService, ProviderAuthorizationService};
+use services::{
     AgentActionService, AgentChatMemoryConsumer, AgentChatTurnLogRoot, AgentChatTurnWorker,
     AgentInboxService, AgentService, AttentionService, AuthService, CommitmentService,
     CoordinationOutcomeConsumer, CrashRecovery, DaemonService, DomainEventBroadcastConsumer,
-    EmbeddedAgentService, EmbeddedInquiryRunner, HeartbeatMonitor, MainChatTopicService,
-    MemoryService, MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
-    ProjectHookService, ProviderAuthorizationService, TaskDispatcher, TaskService,
-    TerminalActivityTracker, TerminalService, WakeTurnConsumer, WorkspaceCleanupScheduler,
-    WorkspaceExecutionLockManager,
+    EmbeddedAgentService, EmbeddedInquiryRunner, HeartbeatMonitor, MemoryService, MergeService,
+    NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
+    TaskDispatcher, TaskService, TerminalActivityTracker, TerminalService, WakeTurnConsumer,
+    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
 
 mod storage_maintenance;
 use storage_maintenance::StorageMaintenanceWorker;
 
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Stable module paths for callers that want to keep builder and supervisor
-/// imports separate. The implementation intentionally stays in one module so
-/// the component graph cannot drift between the two layers.
-pub mod builder {
-    pub use super::{ForgeRuntime, ForgeRuntimeBuilder};
-}
-
-pub mod supervisor {
-    pub use super::{
-        RuntimeAssemblyMode, RuntimeMode, RuntimeSupervisor, RuntimeTaskHandle, RuntimeWorker,
-        ShutdownSignal,
-    };
-}
-
-/// A one-shot process-local shutdown signal shared by every runtime worker.
-///
-/// This used to live in `api::state`; keeping it in `services` means a local
-/// presentation can own the exact same signal without depending on Axum.
-#[derive(Clone)]
-pub struct ShutdownSignal {
-    sender: Arc<watch::Sender<bool>>,
-}
-
-impl ShutdownSignal {
-    #[must_use]
-    pub fn new() -> Self {
-        let (sender, _) = watch::channel(false);
-        Self {
-            sender: Arc::new(sender),
-        }
-    }
-
-    /// Request shutdown. Repeated requests are intentionally harmless.
-    pub fn request(&self) {
-        self.sender.send_replace(true);
-    }
-
-    #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<bool> {
-        self.sender.subscribe()
-    }
-
-    pub async fn wait(&self) {
-        let mut receiver = self.subscribe();
-        if *receiver.borrow_and_update() {
-            return;
-        }
-
-        while receiver.changed().await.is_ok() {
-            if *receiver.borrow_and_update() {
-                return;
-            }
-        }
-    }
-}
-
-impl Default for ShutdownSignal {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Explicit runtime assembly modes.  This is a composition choice rather
 /// than a rollout flag: both modes use the same graph, but only the server
@@ -108,71 +48,6 @@ pub enum RuntimeAssemblyMode {
     Server,
     Solo,
 }
-
-/// Short alias for callers that prefer the concise name.
-pub type RuntimeMode = RuntimeAssemblyMode;
-
-/// Names of correctness-critical workers owned by [`RuntimeSupervisor`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RuntimeWorker {
-    CrashRecovery,
-    NotificationProjection,
-    OperatorStatusProjection,
-    LifecycleProjection,
-    TaskDispatcher,
-    HeartbeatMonitor,
-    AgentChatTurns,
-    Memory,
-    Coordination,
-    Attention,
-    WakeDelivery,
-    ProjectHooks,
-    ConflictHotspots,
-    WorkspaceCleanup,
-    DomainEventBroadcast,
-    StorageMaintenance,
-    TaskSteps,
-    CheckRuns,
-    IntegrationQueue,
-}
-
-impl RuntimeWorker {
-    pub(crate) fn event_consumer_name(self) -> Option<&'static str> {
-        match self {
-            Self::NotificationProjection => Some(crate::notification_service::CONSUMER_NAME),
-            Self::ProjectHooks => Some(crate::project_hooks::CONSUMER_NAME),
-            Self::ConflictHotspots => Some(crate::worker_runtime::conflict_hotspot::CONSUMER_NAME),
-            Self::Memory => Some(crate::memory_consumer_name()),
-            Self::Coordination => Some(crate::coordination_consumer_name()),
-            Self::Attention => Some(crate::attention_service::attention_consumer_name()),
-            Self::WakeDelivery => Some(crate::wake_turn_consumer_name()),
-            Self::DomainEventBroadcast => None, // Read-only tail, no durable checkpoint/lag.
-            _ => None,
-        }
-    }
-}
-
-pub(crate) const COMMON_WORKERS: [RuntimeWorker; 19] = [
-    RuntimeWorker::CrashRecovery,
-    RuntimeWorker::NotificationProjection,
-    RuntimeWorker::OperatorStatusProjection,
-    RuntimeWorker::LifecycleProjection,
-    RuntimeWorker::TaskDispatcher,
-    RuntimeWorker::HeartbeatMonitor,
-    RuntimeWorker::AgentChatTurns,
-    RuntimeWorker::Memory,
-    RuntimeWorker::Coordination,
-    RuntimeWorker::Attention,
-    RuntimeWorker::WakeDelivery,
-    RuntimeWorker::ProjectHooks,
-    RuntimeWorker::WorkspaceCleanup,
-    RuntimeWorker::DomainEventBroadcast,
-    RuntimeWorker::StorageMaintenance,
-    RuntimeWorker::TaskSteps,
-    RuntimeWorker::ConflictHotspots,
-    RuntimeWorker::CheckRuns,
-    RuntimeWorker::IntegrationQueue,
-];
 
 /// Abortable ownership for a compatibility worker that starts before a
 /// [`RuntimeSupervisor`] exists. A supervisor can take the join handle; if no
@@ -229,6 +104,18 @@ pub fn workspace_disk_floor(workspace: &config::WorkspaceConfig) -> api_types::D
 }
 
 impl ForgeRuntime {
+    pub fn dead_letter_service(&self) -> services::dead_letter_service::DeadLetterService {
+        let mut service =
+            services::dead_letter_service::DeadLetterService::new(Arc::clone(&self.db));
+        service.register(Arc::clone(&self.memory_consumer));
+        service.register(Arc::clone(&self.coordination_consumer));
+        service.register(Arc::clone(&self.attention_projection));
+        service.register(Arc::clone(&self.wake_turn_consumer));
+        service.register(Arc::clone(&self.project_hook_service));
+        service.register(Arc::clone(&self.notification_service));
+        service.register(Arc::clone(&self.conflict_hotspot_consumer));
+        service
+    }
     /// Turn disk-pressure admission on. Only a running server does this,
     /// beside adopting its workspace root: nothing built for a test reads
     /// the real disk to decide whether work may start.
@@ -247,7 +134,7 @@ pub struct ForgeRuntime {
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
-    pub agent_chat_service: Arc<crate::AgentChatService<SqliteDb>>,
+    pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
     pub main_chat_topic_service: Arc<MainChatTopicService<SqliteDb>>,
     pub agent_inquiry_service: Arc<crate::agent_inquiry_service::AgentInquiryService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
@@ -256,8 +143,9 @@ pub struct ForgeRuntime {
     pub agent_inbox_service: Arc<AgentInboxService>,
     pub agent_action_service: Arc<AgentActionService>,
     pub daemon_service: Arc<DaemonService>,
-    pub daemon_connections: Arc<crate::daemon_transport::DaemonConnectionRegistry>,
-    pub workflow_template_service: Arc<crate::workflow::template_service::WorkflowTemplateService>,
+    pub daemon_connections: Arc<services::daemon_transport::DaemonConnectionRegistry>,
+    pub workflow_template_service:
+        Arc<services::workflow::template_service::WorkflowTemplateService>,
     pub memory_service: Arc<MemoryService>,
     pub merge_service: Arc<MergeService>,
     pub notification_service: Arc<NotificationService>,
@@ -281,22 +169,22 @@ pub struct ForgeRuntime {
     pub attention_projection: Arc<AttentionService>,
     pub wake_turn_consumer: Arc<WakeTurnConsumer>,
     pub(crate) conflict_hotspot_consumer:
-        Arc<crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer>,
+        Arc<services::worker_runtime::conflict_hotspot::ConflictHotspotConsumer>,
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
-    pub check_runner: Arc<crate::check_runner::CheckRunner>,
+    pub check_runner: Arc<services::check_runner::CheckRunner>,
     /// Where a consumer family registers and a Task step asks for a check.
-    pub check_consumers: Arc<crate::check_runner::consumer::TaskCheckConsumers>,
-    check_worker: Arc<crate::check_runner::worker::CheckRunWorker>,
-    integration_worker: Arc<crate::integration_worker::IntegrationQueueWorker>,
-    pub lifecycle_emitter: Arc<crate::lifecycle::LifecycleEventEmitter>,
+    pub check_consumers: Arc<services::check_runner::consumer::TaskCheckConsumers>,
+    check_worker: Arc<services::check_runner::worker::CheckRunWorker>,
+    integration_worker: Arc<services::integration_worker::IntegrationQueueWorker>,
+    pub lifecycle_emitter: Arc<services::lifecycle::LifecycleEventEmitter>,
     pub workspace_exec_locks: Arc<WorkspaceExecutionLockManager>,
     pub repo_cache_locks: Arc<RepoCacheLockManager>,
-    pub workspace_backend_router: Arc<crate::workspace_backend::WorkspaceBackendRouter>,
+    pub workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
     pub event_bus: Arc<EventBus>,
     pub shutdown_signal: ShutdownSignal,
     pub auth_service: Arc<AuthService>,
-    pub oauth_service: Arc<crate::OAuthService>,
+    pub oauth_service: Arc<services::OAuthService>,
     pub provider_authorization_service: Arc<ProviderAuthorizationService>,
     pub config_path: Arc<PathBuf>,
     pub effective_config: Arc<ForgeConfig>,
@@ -330,7 +218,7 @@ impl ForgeRuntime {
         );
         self.agent_chat_turn_logs
             .set_root(agent_chat_turn_log_root(&config));
-        self.oauth_service = Arc::new(crate::OAuthService::new(
+        self.oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&self.auth_service),
             config.mcp_resource_url(),
@@ -348,12 +236,14 @@ impl ForgeRuntime {
             terminal_activity,
             Arc::clone(&self.workspace_backend_router),
         ));
-        let terminal_cleanup_handler: Arc<dyn crate::workspace_cleanup::WorkspaceCleanupObserver> =
-            terminal_service.clone();
+        let terminal_cleanup_handler: Arc<
+            dyn services::workspace_cleanup::WorkspaceCleanupObserver,
+        > = terminal_service.clone();
         self.cleanup_scheduler
             .set_terminal_cleanup_handler(terminal_cleanup_handler);
-        let terminal_event_handler: Arc<dyn crate::daemon_transport::DaemonTerminalEventHandler> =
-            terminal_service.clone();
+        let terminal_event_handler: Arc<
+            dyn services::daemon_transport::DaemonTerminalEventHandler,
+        > = terminal_service.clone();
         self.daemon_connections
             .set_terminal_event_handler(terminal_event_handler);
         self.terminal_service = terminal_service;
@@ -552,21 +442,23 @@ impl ForgeRuntimeBuilder {
         });
         let workspace_exec_locks = Arc::new(WorkspaceExecutionLockManager::default());
         let repo_cache_locks = Arc::new(RepoCacheLockManager::default());
-        let execution_events = Arc::new(crate::daemon_transport::ServerExecutionEventSink::new(
+        let execution_events = Arc::new(services::daemon_transport::ServerExecutionEventSink::new(
             Arc::clone(&self.db),
             Arc::clone(&self.event_bus),
             workspace_root.clone(),
         ));
-        let execution_event_handler: Arc<dyn crate::daemon_transport::DaemonExecutionEventHandler> =
-            execution_events.clone();
-        let daemon_connections = Arc::new(crate::daemon_transport::DaemonConnectionRegistry::new(
-            Arc::clone(&self.event_bus),
-            execution_event_handler,
-        ));
+        let execution_event_handler: Arc<
+            dyn services::daemon_transport::DaemonExecutionEventHandler,
+        > = execution_events.clone();
+        let daemon_connections =
+            Arc::new(services::daemon_transport::DaemonConnectionRegistry::new(
+                Arc::clone(&self.event_bus),
+                execution_event_handler,
+            ));
         execution_events.set_connection_registry(Arc::downgrade(&daemon_connections));
         let workspace_backend_router = Arc::new(
-            crate::workspace_backend::WorkspaceBackendRouter::new(Arc::new(
-                crate::workspace_backend::EmbeddedWorkspaceBackend::new(
+            services::workspace_backend::WorkspaceBackendRouter::new(Arc::new(
+                services::workspace_backend::EmbeddedWorkspaceBackend::new(
                     Arc::clone(&self.db),
                     Arc::clone(&merge_service),
                     workspace_root.clone(),
@@ -574,7 +466,7 @@ impl ForgeRuntimeBuilder {
                 .with_repo_cache_locks(Arc::clone(&repo_cache_locks)),
             ))
             .with_daemon(Arc::new(
-                crate::workspace_backend::DaemonWorkspaceBackend::new(
+                services::workspace_backend::DaemonWorkspaceBackend::new(
                     Arc::clone(&self.db),
                     Arc::clone(&daemon_connections),
                 ),
@@ -621,14 +513,14 @@ impl ForgeRuntimeBuilder {
             effective_config.server.project_working_set_target_tokens,
             effective_config.server.project_working_set_hard_tokens,
         );
-        let agent_chat_service = Arc::new(crate::AgentChatService::new(Arc::clone(&self.db)));
+        let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&self.db)));
         let main_chat_topic_service = Arc::new(
             MainChatTopicService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&agent_chat_service),
-                crate::ProductGenesisService::for_sqlite(Arc::clone(&self.db)),
+                services::ProductGenesisService::for_sqlite(Arc::clone(&self.db)),
             )
-            .with_rotator(Arc::new(crate::TopicRotationCoordinator::new(
+            .with_rotator(Arc::new(services::TopicRotationCoordinator::new(
                 self.db.clone(),
                 embedded_agent_service.clone(),
             ))),
@@ -657,7 +549,7 @@ impl ForgeRuntimeBuilder {
         let terminal_activity = Arc::new(TerminalActivityTracker::default());
         let memory_service = Arc::new(MemoryService::new(Arc::clone(&self.db)));
         let workflow_template_service = Arc::new(
-            crate::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
+            services::workflow::template_service::WorkflowTemplateService::new(workflows_dir),
         );
         let terminal_service = Arc::new(TerminalService::new_with_activity_tracker(
             Arc::clone(&self.db),
@@ -718,11 +610,13 @@ impl ForgeRuntimeBuilder {
             DaemonService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
                 .with_task_service(Arc::clone(&task_service)),
         );
-        let terminal_cleanup_handler: Arc<dyn crate::workspace_cleanup::WorkspaceCleanupObserver> =
-            terminal_service.clone();
+        let terminal_cleanup_handler: Arc<
+            dyn services::workspace_cleanup::WorkspaceCleanupObserver,
+        > = terminal_service.clone();
         cleanup_scheduler.set_terminal_cleanup_handler(terminal_cleanup_handler);
-        let terminal_event_handler: Arc<dyn crate::daemon_transport::DaemonTerminalEventHandler> =
-            terminal_service.clone();
+        let terminal_event_handler: Arc<
+            dyn services::daemon_transport::DaemonTerminalEventHandler,
+        > = terminal_service.clone();
         daemon_connections.set_terminal_event_handler(terminal_event_handler);
         let notification_service = Arc::new(NotificationService::new(
             Arc::clone(&self.db),
@@ -756,7 +650,7 @@ impl ForgeRuntimeBuilder {
             self.jwt_secret,
             self.bcrypt_cost,
         ));
-        let oauth_service = Arc::new(crate::OAuthService::new(
+        let oauth_service = Arc::new(services::OAuthService::new(
             Arc::clone(&self.db),
             Arc::clone(&auth_service),
             effective_config.mcp_resource_url(),
@@ -797,7 +691,7 @@ impl ForgeRuntimeBuilder {
                 .with_action_connections(Arc::clone(&daemon_connections)),
         );
         let conflict_hotspot_consumer = Arc::new(
-            crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer::new(Arc::clone(
+            services::worker_runtime::conflict_hotspot::ConflictHotspotConsumer::new(Arc::clone(
                 &self.db,
             )),
         );
@@ -813,11 +707,11 @@ impl ForgeRuntimeBuilder {
         );
         // One configuration for both sides of the queue's Task-step
         // handshake: the worker and the merge-path check family.
-        let integration_config = crate::integration_worker::IntegrationWorkerConfig::default();
+        let integration_config = services::integration_worker::IntegrationWorkerConfig::default();
         // One constructor composes the runner, both consumer families
         // (review entry and the merge path) and the worker; tests build the
         // same set through it.
-        let crate::task_service::ComposedChecks {
+        let services::task_service::ComposedChecks {
             runner: check_runner,
             consumers: check_consumers,
             worker: check_worker,
@@ -840,12 +734,13 @@ impl ForgeRuntimeBuilder {
             workspace_disk_floor(&effective_config.workspace),
         );
         let plugin_registry = lifecycle_plugin_registry();
-        let lifecycle_emitter = Arc::new(crate::lifecycle::LifecycleEventEmitter::new_with_router(
-            Arc::clone(&self.db),
-            plugin_registry,
-            Arc::clone(&workspace_backend_router),
-            workspace_root.clone(),
-        ));
+        let lifecycle_emitter =
+            Arc::new(services::lifecycle::LifecycleEventEmitter::new_with_router(
+                Arc::clone(&self.db),
+                plugin_registry,
+                Arc::clone(&workspace_backend_router),
+                workspace_root.clone(),
+            ));
 
         let runtime = ForgeRuntime {
             db: self.db,
@@ -974,22 +869,22 @@ impl RuntimeSupervisor {
     }
 
     /// Alias for callers that use a lifecycle-oriented vocabulary.
-    pub async fn stop(&mut self) -> crate::Result<()> {
+    pub async fn stop(&mut self) -> services::Result<()> {
         self.shutdown().await
     }
 
     /// Alias for callers that separate requesting shutdown from joining the
     /// owned child tasks.
-    pub async fn join(&mut self) -> crate::Result<()> {
+    pub async fn join(&mut self) -> services::Result<()> {
         self.shutdown().await
     }
 
     /// Run recovery and initialize workflow templates once, then start each
     /// common worker in a deterministic order. Calling this again is a no-op.
-    pub async fn start(&mut self) -> crate::Result<u64> {
+    pub async fn start(&mut self) -> services::Result<u64> {
         let mut shutdown = self.runtime.shutdown_signal.subscribe();
         if *shutdown.borrow_and_update() {
-            return Err(crate::ServiceError::invalid_operation(
+            return Err(services::ServiceError::invalid_operation(
                 "cannot start Forge runtime after shutdown was requested",
             ));
         }
@@ -1016,7 +911,7 @@ impl RuntimeSupervisor {
         // Take every Task that was merging the old way into the integration
         // queue, before any worker runs. Storage-only, bounded per pass,
         // idempotent: a failure is logged and the next start continues.
-        match crate::integration_steps::import::import_at_start(&self.runtime.db).await {
+        match services::integration_steps::import::import_at_start(&self.runtime.db).await {
             Ok(report) if report.imported > 0 || report.continuations > 0 => tracing::info!(
                 imported = report.imported,
                 quarantined = report.quarantined,
@@ -1115,7 +1010,7 @@ impl RuntimeSupervisor {
                         while pending.load(Ordering::Acquire) {
                             let imported = periodic
                                 .tick(async {
-                                    crate::integration_steps::import::import_at_start(&db)
+                                    services::integration_steps::import::import_at_start(&db)
                                         .await
                                         .map(|_| ())
                                 })
@@ -1149,10 +1044,12 @@ impl RuntimeSupervisor {
         // what it wrote into `integration.updated` for SSE clients.
         self.handles.push((
             RuntimeWorker::IntegrationQueue,
-            Arc::new(crate::queue_invalidation::IntegrationUpdateProjector::new(
-                Arc::clone(&self.runtime.db),
-                Arc::clone(&self.runtime.event_bus),
-            ))
+            Arc::new(
+                services::queue_invalidation::IntegrationUpdateProjector::new(
+                    Arc::clone(&self.runtime.db),
+                    Arc::clone(&self.runtime.event_bus),
+                ),
+            )
             .start(&periodic_workers, shutdown.clone()),
         ));
         self.handles.push((
@@ -1198,7 +1095,7 @@ impl RuntimeSupervisor {
         ));
         self.handles.push((
             RuntimeWorker::ConflictHotspots,
-            Arc::new(crate::worker_runtime::WorkerRuntime::new(
+            Arc::new(services::worker_runtime::WorkerRuntime::new(
                 Arc::clone(&self.runtime.db),
                 Arc::clone(&self.runtime.conflict_hotspot_consumer),
             ))
@@ -1228,7 +1125,7 @@ impl RuntimeSupervisor {
 
     /// Stop all common workers and settle active local Task executions within
     /// bounded deadlines. This method is safe to call more than once.
-    pub async fn shutdown(&mut self) -> crate::Result<()> {
+    pub async fn shutdown(&mut self) -> services::Result<()> {
         if self.shutdown_started {
             return Ok(());
         }
@@ -1238,7 +1135,7 @@ impl RuntimeSupervisor {
         self.runtime.heartbeat_monitor.stop();
         self.runtime.task_dispatcher.stop();
 
-        let graceful = crate::GracefulShutdown::new(
+        let graceful = services::GracefulShutdown::new(
             Arc::clone(&self.runtime.db),
             Arc::clone(&self.runtime.event_bus),
         )
@@ -1246,11 +1143,11 @@ impl RuntimeSupervisor {
         let graceful_result = match remaining_until(deadline) {
             Some(remaining) => match tokio::time::timeout(remaining, graceful.shutdown()).await {
                 Ok(result) => result,
-                Err(_) => Err(crate::ServiceError::invalid_operation(
+                Err(_) => Err(services::ServiceError::invalid_operation(
                     "runtime shutdown timed out",
                 )),
             },
-            None => Err(crate::ServiceError::invalid_operation(
+            None => Err(services::ServiceError::invalid_operation(
                 "runtime shutdown timed out",
             )),
         };
@@ -1305,8 +1202,8 @@ fn remaining_until(deadline: Instant) -> Option<Duration> {
     (!remaining.is_zero()).then_some(remaining)
 }
 
-fn lifecycle_plugin_registry() -> Arc<crate::lifecycle::PluginRegistry> {
-    Arc::new(crate::lifecycle::PluginRegistry::new())
+fn lifecycle_plugin_registry() -> Arc<services::lifecycle::PluginRegistry> {
+    Arc::new(services::lifecycle::PluginRegistry::new())
 }
 
 fn agent_chat_turn_log_root(config: &ForgeConfig) -> PathBuf {
@@ -1378,18 +1275,18 @@ mod tests {
         for has_cursor in [false, true] {
             if has_cursor {
                 sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, '2000-01-01T00:00:00Z')")
-                    .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
+                    .bind(services::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
             }
             let status = service.compute_status().await.unwrap();
             assert_eq!(status.event_consumers.len(), 6);
             assert!(status
                 .event_consumers
                 .iter()
-                .all(|consumer| consumer.consumer_name != crate::memory_consumer_name()));
+                .all(|consumer| consumer.consumer_name != services::memory_consumer_name()));
             assert!(!status
                 .recent_errors
                 .iter()
-                .any(|error| error.entity_id == crate::memory_consumer_name()));
+                .any(|error| error.entity_id == services::memory_consumer_name()));
         }
     }
 
@@ -1514,3 +1411,6 @@ mod tests {
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }
+
+#[cfg(test)]
+mod recovery_tests;
