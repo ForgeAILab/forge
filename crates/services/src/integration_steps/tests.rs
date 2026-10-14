@@ -3011,7 +3011,33 @@ impl World {
             .bind(format!("s-{task}")).bind(&now).bind(effects.to_string())
             .execute(self.db.pool()).await.unwrap();
     }
-    async fn imported(&self, task: &str) -> (IntegrationAttempt, u64) {
+    /// Stop the Task-step worker and wait until it has stopped.
+    pub(super) async fn stop_steps(&mut self) {
+        let worker = self
+            .step_worker
+            .take()
+            .expect("the Task-step worker is running");
+        let _ = self.stop.send(true);
+        tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .expect("the Task-step worker stops")
+            .unwrap();
+    }
+    /// Start the Task-step worker again, as the server runs it.
+    pub(super) fn start_steps(&mut self) {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        self.stop = stop;
+        self.step_worker = Some(self.service.task_step_worker().start(stopped));
+    }
+    /// The start's import, in the server's order: `import_at_start` runs
+    /// before any worker, so the row read here is the one the importer
+    /// wrote. The Task-step worker is stopped while the importer runs and
+    /// the row is read, then started again to run the continuation. Left
+    /// running, it may run the continuation first, and a row that is
+    /// admitted again (P6, P9, P10, P18) is then superseded by a fresh
+    /// attempt with no import source.
+    async fn imported(&mut self, task: &str) -> (IntegrationAttempt, u64) {
+        self.stop_steps().await;
         let report = super::import::import_at_start(&self.db).await.unwrap();
         assert_eq!(report.continuations, 1, "{report:?}");
         // A second start imports and enqueues nothing.
@@ -3026,6 +3052,7 @@ impl World {
         let priority = attempt.import_source_json.as_ref().unwrap()["priority"]
             .as_u64()
             .unwrap();
+        self.start_steps();
         (attempt, priority)
     }
     async fn carries(&self, task: &str) -> Vec<(String, String)> {
@@ -3046,7 +3073,7 @@ impl World {
 /// `merging` before it is `done`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_imported_clean_rebase_is_checked_and_its_review_carried_without_a_new_review() {
-    let world = World::new().await;
+    let mut world = World::new().await;
     let reviewed = world.legacy_task("six", "six.txt", "merging").await;
     review_ci(&world, "six", &["test -f moved"]).await;
     let contract = world.seed_passed_review("six", &["six.txt"]).await;
@@ -3123,7 +3150,7 @@ async fn an_imported_clean_rebase_is_checked_and_its_review_carried_without_a_ne
 /// is, with no new check, no second carry and no review.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_imported_stored_carry_merges_the_carried_commit_as_it_is() {
-    let world = World::new().await;
+    let mut world = World::new().await;
     world.legacy_task("nine", "nine.txt", "merging").await;
     review_ci(&world, "nine", &["test -f moved"]).await;
     let contract = world.seed_passed_review("nine", &["nine.txt"]).await;
@@ -3167,7 +3194,7 @@ async fn an_imported_stored_carry_merges_the_carried_commit_as_it_is() {
 /// "fix" a clean rebase by this step, and nothing can claim the row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_imported_clean_rebase_parked_in_merge_failed_is_left_to_its_own_flow() {
-    let world = World::new().await;
+    let mut world = World::new().await;
     world.legacy_task("pair", "pair.txt", "merge_failed").await;
     world.seed_passed_review("pair", &["pair.txt"]).await;
     world.old_path_rebase("pair").await;
