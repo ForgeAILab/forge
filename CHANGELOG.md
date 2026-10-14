@@ -8,6 +8,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- **Retry is no longer offered on a Task whose implementation role has no
+  assigned Agent.** `available_actions` (REST Task detail and
+  `GET /api/v1/tasks/{id}/actions`, MCP, web) used to offer Retry on an
+  implementation state (`in_progress`, `merge_failed`, a custom workflow's
+  active state) when no coder/assignee role assignment existed, because a
+  previous run's Agent, the legacy `assignee_id` or a default Agent stood in
+  for it. Applying it never ran: `role_retry` was accepted (200) and then
+  parked `recovery_required: task ... has no assignment for workflow role
+  coder` with Retry offered again; `merge_fix_retry` without any available
+  Agent answered `400 validation_error: accepted role action lost its Agent`.
+  Retry now appears once a coder (or the state's role) is assigned; the park
+  names the missing assignment ("Assign a coder Agent before retrying, or
+  Cancel.") and Cancel stays offered. The same rule holds while the Project is
+  paused for `merge_fix_retry`, as it already did for a role retry.
+
 - **Dependency links and subtask reorders that make Tasks wait on each
   other are refused.** `POST /api/v1/tasks/{id}/dependencies` (MCP
   `forge_add_task_dependency`, the lead's `lead.subtask create` links) and
@@ -4210,8 +4225,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   start, so an orphan's 60-second lease no longer blocks the first Task write.
 - Durable Task command replies preserve error kinds and public fields, including
   version conflicts, missing resources, policy refusals and task-busy details.
-- A failure without its assigned implementation Agent no longer offers a Retry
-  that cannot run; the park names the missing assignment and retains Cancel.
 
 ### Known issues
 

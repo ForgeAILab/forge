@@ -179,6 +179,28 @@ async fn task_response_action_projection_paginates_execution_history() {
         .execute(harness.state.db.pool())
         .await
         .unwrap();
+    // The coder role row is what a Retry launches: the legacy assignee
+    // alone never passed execution admission, so Retry is offered only
+    // with it.
+    let now = db::now_rfc3339();
+    db::TaskRoleAssignmentRepo::assign(
+        &*harness.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            role_name: "coder".to_owned(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(agent_id.clone()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let task = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
     let task = TaskRepo::update_status(
         &*harness.state.db,
         db::UpdateTaskStatus {

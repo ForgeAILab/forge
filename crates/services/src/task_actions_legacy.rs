@@ -992,7 +992,9 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
             )
             && (!snapshot.coordination_root || state.kind == StateKind::Gate)
             && ((role.is_some() && (snapshot.has_agent && !snapshot.project_paused))
-                || (reason != "role_retry" && reason != "initial_retry")
+                // A merge fix launches the coder: without an Agent the
+                // handler refuses it ("accepted role action lost its Agent").
+                || !matches!(reason, "role_retry" | "initial_retry" | "merge_fix_retry")
                 || (state.kind == StateKind::Initial
                     && (snapshot.has_agent && !snapshot.project_paused)
                     && task.status != "backlog"))

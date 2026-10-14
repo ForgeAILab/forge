@@ -79,7 +79,11 @@ async fn execution_stop_exposes_task_action_offers() {
         "stopping a side session leaves the Task condition unchanged"
     );
     let actions = task["available_actions"].as_array().expect("offers");
-    assert!(actions
+    // This fixture has no coder assignment (the Project defaults are
+    // cleared above). A Retry here was accepted and then parked by the
+    // dispatcher, "task has no assignment for workflow role coder", with
+    // Retry offered again: it is not offered until a coder is assigned.
+    assert!(!actions
         .iter()
         .any(|offer| offer["action"]["verb"] == "retry"));
     assert!(actions
