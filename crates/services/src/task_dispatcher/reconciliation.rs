@@ -1200,12 +1200,7 @@ impl TaskDispatcher {
                 // a park that says why.
                 let ended: i64 = self
                     .db
-                    .ended_entry_cascade_step_count(
-                        &task.id,
-                        p.read.epoch,
-                        format!("{key}:"),
-                        format!("{key}:"),
-                    )
+                    .ended_entry_cascade_step_count(&task.id, p.read.epoch, &format!("{key}:"))
                     .await?;
                 let cascade = self
                     .task_service

@@ -1269,12 +1269,11 @@ impl SqliteDb {
         &self,
         task_id: &str,
         expected_epoch: i64,
-        prefix_for_length: String,
-        prefix: String,
+        prefix: &str,
     ) -> crate::Result<i64> {
         Ok(sqlx::query_scalar(
                     "SELECT COUNT(*) FROM task_step WHERE task_id=? AND expected_epoch=? AND status IN ('failed','parked','superseded') AND substr(causation_key,1,length(?))=?",
-                ).bind(task_id).bind(expected_epoch).bind(prefix_for_length).bind(prefix).fetch_one(self.pool()).await?)
+                ).bind(task_id).bind(expected_epoch).bind(prefix).bind(prefix).fetch_one(self.pool()).await?)
     }
 }
 
