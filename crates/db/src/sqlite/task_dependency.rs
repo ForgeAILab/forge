@@ -6,9 +6,11 @@ use super::*;
 /// starts after its parent started; a parent completes after its children;
 /// a later sibling starts after the preceding unfinished sibling completed.
 /// Settled Tasks contribute no waits. Dependencies and parentage never cross
-/// a Project, so one indexed read loads the Task's Project and the search
-/// runs in memory, linear in that graph: a reorder checks every child
-/// against one load. The writer transaction also fences a concurrent write.
+/// a Project, so one statement loads the Task's Project graph (and whether
+/// an admission's candidate is live in it), and one strongly-connected-
+/// component pass decides every Task asked about: linear in that graph,
+/// whether an admission asks about one Task or a reorder about all its
+/// children. The writer transaction also fences a concurrent write.
 struct WaitGraph {
     index: std::collections::HashMap<(String, bool), usize>,
     edges: Vec<Vec<usize>>,
@@ -17,8 +19,46 @@ struct WaitGraph {
 const START: bool = false;
 const DONE: bool = true;
 
+/// What one evaluation cost: statements run, the graph's size and the
+/// steps of the search. Read by the cost test only.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WaitGraphCost {
+    pub(crate) statements: usize,
+    pub(crate) nodes: usize,
+    pub(crate) edges: usize,
+    pub(crate) steps: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WAIT_GRAPH_COST: std::cell::Cell<WaitGraphCost> =
+        std::cell::Cell::new(WaitGraphCost::default());
+}
+
+/// The cost of the evaluations on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_wait_graph_cost() -> WaitGraphCost {
+    WAIT_GRAPH_COST.with(|cost| cost.take())
+}
+
+#[cfg(test)]
+fn record_cost(update: impl FnOnce(&mut WaitGraphCost)) {
+    WAIT_GRAPH_COST.with(|cost| {
+        let mut current = cost.get();
+        update(&mut current);
+        cost.set(current);
+    });
+}
+
 impl WaitGraph {
-    async fn load(tx: &mut Transaction<'_, Sqlite>, project_of: &str) -> Result<Self> {
+    /// One statement: the Project's wait edges, and the candidate's own
+    /// completion-to-start edge when it is live there (its node exists then).
+    async fn load(
+        tx: &mut Transaction<'_, Sqlite>,
+        project_of: &str,
+        candidate: Option<&str>,
+    ) -> Result<Self> {
         let rows: Vec<(String, bool, String, bool)> = sqlx::query_as(
             "WITH live AS (
                 SELECT id,parent_task_id,subtask_order,created_at FROM task
@@ -33,9 +73,11 @@ impl WaitGraph {
              UNION ALL SELECT child.id,0,parent.id,0 FROM live parent JOIN live child ON child.parent_task_id=parent.id
              UNION ALL SELECT parent.id,1,child.id,1 FROM live parent JOIN live child ON child.parent_task_id=parent.id
              UNION ALL SELECT later.id,0,earlier.id,1 FROM ordered later JOIN ordered earlier
-               ON later.parent_task_id=earlier.parent_task_id AND later.position=earlier.position+1",
+               ON later.parent_task_id=earlier.parent_task_id AND later.position=earlier.position+1
+             UNION ALL SELECT id,1,id,0 FROM live WHERE id=?2",
         )
         .bind(project_of)
+        .bind(candidate)
         .fetch_all(&mut **tx)
         .await?;
         let mut graph = Self {
@@ -47,6 +89,12 @@ impl WaitGraph {
             let to = graph.node(to, to_phase);
             graph.edges[from].push(to);
         }
+        #[cfg(test)]
+        record_cost(|cost| {
+            cost.statements += 1;
+            cost.nodes += graph.edges.len();
+            cost.edges += graph.edges.iter().map(Vec::len).sum::<usize>();
+        });
         Ok(graph)
     }
 
@@ -66,23 +114,72 @@ impl WaitGraph {
         node
     }
 
-    /// Whether `task_id`'s start waits on itself, with `extra` (a candidate
-    /// prerequisite's completion) added to its start's waits.
-    fn waits_on_itself(&self, task_id: &str, extra: Option<usize>) -> bool {
-        let Some(&origin) = self.index.get(&(task_id.to_owned(), START)) else {
-            return false;
-        };
-        let mut seen = vec![false; self.edges.len()];
-        let mut stack: Vec<usize> = self.edges[origin].iter().copied().chain(extra).collect();
-        while let Some(node) = stack.pop() {
-            if node == origin {
-                return true;
+    /// The nodes that wait on themselves: members of a strongly connected
+    /// component with more than one node (iterative Tarjan, each node and
+    /// edge visited once).
+    fn cyclic(&self) -> Vec<bool> {
+        const UNSEEN: usize = usize::MAX;
+        let count = self.edges.len();
+        let (mut order, mut low) = (vec![UNSEEN; count], vec![0; count]);
+        let (mut on_stack, mut cyclic) = (vec![false; count], vec![false; count]);
+        let (mut stack, mut call, mut next) = (Vec::new(), Vec::<(usize, usize)>::new(), 0);
+        #[cfg(test)]
+        let mut steps = 0_usize;
+        for root in 0..count {
+            if order[root] != UNSEEN {
+                continue;
             }
-            if !std::mem::replace(&mut seen[node], true) {
-                stack.extend(self.edges[node].iter().copied());
+            order[root] = next;
+            low[root] = next;
+            next += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            call.push((root, 0));
+            while let Some(&(node, position)) = call.last() {
+                #[cfg(test)]
+                {
+                    steps += 1;
+                }
+                if let Some(&target) = self.edges[node].get(position) {
+                    if let Some(frame) = call.last_mut() {
+                        frame.1 += 1;
+                    }
+                    if order[target] == UNSEEN {
+                        order[target] = next;
+                        low[target] = next;
+                        next += 1;
+                        stack.push(target);
+                        on_stack[target] = true;
+                        call.push((target, 0));
+                    } else if on_stack[target] {
+                        low[node] = low[node].min(order[target]);
+                    }
+                    continue;
+                }
+                call.pop();
+                if let Some(&(parent, _)) = call.last() {
+                    low[parent] = low[parent].min(low[node]);
+                }
+                if low[node] == order[node] {
+                    let mut members = Vec::new();
+                    while let Some(member) = stack.pop() {
+                        on_stack[member] = false;
+                        members.push(member);
+                        if member == node {
+                            break;
+                        }
+                    }
+                    if members.len() > 1 {
+                        for member in members {
+                            cyclic[member] = true;
+                        }
+                    }
+                }
             }
         }
-        false
+        #[cfg(test)]
+        record_cost(|cost| cost.steps += steps);
+        cyclic
     }
 }
 
@@ -106,24 +203,23 @@ pub(super) async fn dependency_cycle_any_in_tx(
     let Some(first) = task_ids.first() else {
         return Ok(false);
     };
-    let mut graph = WaitGraph::load(tx, first).await?;
-    let extra = match candidate {
-        Some(candidate) => {
-            let live: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND deleted_at IS NULL
-                   AND json_extract(condition_json,'$.kind') != 'settled')",
-            )
-            .bind(candidate)
-            .fetch_one(&mut **tx)
-            .await?;
-            live.then(|| graph.node(candidate.to_owned(), DONE))
+    let mut graph = WaitGraph::load(tx, first, candidate).await?;
+    if let Some(candidate) = candidate {
+        let target = graph.index.get(&(candidate.to_owned(), DONE)).copied();
+        let origin = graph.index.get(&(first.to_string(), START)).copied();
+        if let (Some(origin), Some(target)) = (origin, target) {
+            if origin != target && !graph.edges[origin].contains(&target) {
+                graph.edges[origin].push(target);
+            }
         }
-        None => None,
-    };
-    Ok(task_ids
-        .iter()
-        .enumerate()
-        .any(|(position, id)| graph.waits_on_itself(id, extra.filter(|_| position == 0))))
+    }
+    let cyclic = graph.cyclic();
+    Ok(task_ids.iter().any(|id| {
+        graph
+            .index
+            .get(&(id.to_string(), START))
+            .is_some_and(|&node| cyclic[node])
+    }))
 }
 
 impl SqliteDb {
