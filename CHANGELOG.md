@@ -3357,10 +3357,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   bound Agent in their dedupe identity: binding a different Agent that cannot run
   yet (for example, a paused one) records one new decision per open item
   instead of failing that Project's sweep on every tick. On the first start
-  after the upgrade, an open item whose last decision named a bound Agent
-  (for example, blockers whose bound Agent is paused) records that decision
-  once more; it is audit only and wakes nobody. Decisions without a bound
-  Agent are unchanged and write nothing.
+  after the upgrade, an open item whose last decision named a bound Agent and
+  that the sweep reconsiders (blockers whose bound Agent cannot run, or a
+  wake held by cooldown, budget or a duplicate) records that decision once
+  more; it is audit only and wakes nobody. Decisions without a bound Agent
+  are unchanged and write nothing.
 
 - Task launch now retries WorkspaceLease replacement across repeated harmless
   Task writes with bounded backoff. Cancellation, holds, reassignment and changed
