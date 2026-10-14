@@ -330,8 +330,13 @@ impl TaskService {
         }
         // Remote and local adapters both require the scheduler-issued lease;
         // checking at this boundary closes the gap between execution-row
-        // creation and adapter launch/recovery.
-        if let Err(error) = self.verify_execution_workspace_authority(&execution).await {
+        // creation and adapter launch/recovery. A grant left stale by a Task
+        // write since the claim is reissued (bounded) instead of failing.
+        let verified = match self.verify_execution_workspace_authority(&execution).await {
+            Ok(_) => Ok(()),
+            Err(error) => self.reissue_stale_start_authority(&execution, error).await,
+        };
+        if let Err(error) = verified {
             if self
                 .defer_launch_for_paused_agent(&execution, &error)
                 .await?

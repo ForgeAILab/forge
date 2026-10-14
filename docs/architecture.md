@@ -948,6 +948,12 @@ specific reason. Exhausted version contention is an auto-resumable pre-dispatch
 infrastructure refusal: no executor starts, no executor-failure Task blocker is
 created, and no execution retry budget is charged. Normal dispatcher recovery
 admits the next launch under current authority.
+The start of every run, embedded or daemon-placed, checks the grant first
+(`start_execution`). When the only change since the claim is that the Task's
+version moved past the run's own grant (a manual Launch or a session follow-up
+starts in a later Task step than its claim), the start takes the same bounded
+reissue, fenced to the run's state entry. A daemon-placed run has no later
+server-side lease check.
 The runner fences status and state-entry epoch against the Task captured before
 launch preparation. Already admitted checks may finish during a Project pause;
 explicit interactive recovery may inspect a Task held at admission. A new hold

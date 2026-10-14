@@ -3352,6 +3352,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Task writes with bounded backoff. Cancellation, holds, reassignment and changed
   authority still stop launch; exhausted launch contention stays outside the
   executor failure path and consumes no Task execution retry budget.
+- The start of a run (embedded or daemon-placed) no longer fails, and no
+  longer parks its Task, when a harmless Task write lands between the run's
+  claim and its start; the start reissues the run's lease the same bounded way.
 
 - A subtask that cannot leave its merge state stops automatic reconciliation
   after eight failed Task-step attempts in that entry and shows the existing

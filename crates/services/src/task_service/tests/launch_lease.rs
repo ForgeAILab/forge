@@ -490,3 +490,47 @@ async fn launch_lease_real_executor_failure_still_charges_execution_retry() {
         1
     );
 }
+
+async fn settled(db: &SqliteDb, task: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !ExecutionRepo::list_running_by_task(db, task)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Task's launch settles");
+}
+
+/// The run's start is a separate step from its claim (manual Launch, a
+/// session follow-up), and it is the only server-side lease check a
+/// daemon-placed run gets. A harmless Task write between the two must not
+/// fail the run.
+#[tokio::test]
+async fn a_task_write_between_claim_and_start_does_not_fail_the_run() {
+    let (db, service, task, execution, _repo) = fixture().await;
+    bump(&db, &task.id).await;
+    let executor = Arc::new(CountingExecutor(AtomicUsize::new(0)));
+    let service = service.with_task_executor(executor.clone());
+    let started = service.start_execution(execution.id.clone()).await;
+    settled(&db, &task.id).await;
+    let terminal = ExecutionRepo::get_by_id(&*db, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        started.as_ref().is_ok_and(|started| started.accepted),
+        "{started:?}; terminal error: {:?}",
+        terminal.error
+    );
+    assert_eq!(terminal.status, ExecutionStatus::Completed);
+    assert_eq!(executor.0.load(Ordering::SeqCst), 1);
+    let fresh = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(fresh.blocked_json.is_none(), "{:?}", fresh.blocked_json);
+}

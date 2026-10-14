@@ -1459,6 +1459,42 @@ impl TaskService {
         .await
     }
 
+    /// `start_execution`'s strict check failed. When the only change is that
+    /// the Task's version moved past this execution's own grant, recover
+    /// through the bounded reissue above (fenced to the run's state entry);
+    /// any other failure keeps its original error.
+    pub(super) async fn reissue_stale_start_authority(
+        &self,
+        execution: &db::Execution,
+        verify_error: ServiceError,
+    ) -> Result<()> {
+        let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
+        let stale_own_grant = WorkspaceLeaseRepo::get_active_for_task(&*self.db, &task.id)
+            .await?
+            .is_some_and(|lease| {
+                lease.execution_id == execution.id && lease.task_version != task.version
+            });
+        if !stale_own_grant {
+            return Err(verify_error);
+        }
+        if execution.role != "interactive"
+            && !super::execution::execution_belongs_to_current_state_entry(
+                &self.db, &task, execution,
+            )
+            .await?
+        {
+            return Err(ServiceError::conflict(format!(
+                "Task '{}' changed state or state entry to '{}'; execution start stopped",
+                task.id, task.status
+            )));
+        }
+        self.verify_or_reissue_execution_workspace_authority(execution, &task)
+            .await
+            .map(|_| ())
+    }
+
     pub(super) async fn revoke_workspace_lease(&self, lease: &db::WorkspaceLease) {
         if let Err(error) =
             WorkspaceLeaseRepo::revoke(&*self.db, &lease.id, lease.version, &now_rfc3339()).await
