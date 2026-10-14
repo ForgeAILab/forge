@@ -4200,6 +4200,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Transient workflow guard and review-refresh precondition failures now use the
   Task step queue's eight-attempt retry bound before parking for the owner.
+  Transient means a busy or locked database, a version conflict from a
+  concurrent write, or a checkout read that can clear by itself (interrupted,
+  would block, timed out, resource busy). A missing checkout path or a refused
+  permission is deterministic and parks at once.
 - Retry on an imported quarantined merge accepts an offline checkout owner,
   names the machine it waits for, and continues when that owner reconnects.
 - Startup releases Task-step claims left by the previous process before workers

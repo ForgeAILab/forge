@@ -793,7 +793,8 @@ async fn open_item_1_transient_repair_guard_uses_the_step_attempt_bound() {
         let error = match attempt % 4 {
             0 => busy(),
             1 => ServiceError::Db(db::DbError::VersionConflict),
-            2 => ServiceError::Git(git::GitError::Io(std::io::Error::other(
+            2 => ServiceError::Git(git::GitError::Io(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
                 "checkout read interrupted",
             ))),
             _ => ServiceError::Db(db::DbError::Sqlx(sqlx::Error::Io(std::io::Error::other(
@@ -1851,4 +1852,47 @@ async fn owner_command_busy_retains_its_write_until_predecessor_releases() {
         .unwrap()
         .iter()
         .all(|s| s.status == "done"));
+}
+
+/// Only an I/O failure that can clear by itself is retried by the step
+/// bound. A missing checkout or a refused permission is deterministic: it
+/// parks at once instead of spending eight attempts first.
+#[test]
+fn open_items_fix_only_transient_io_errors_are_retryable() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::NotFound,
+        ErrorKind::PermissionDenied,
+        ErrorKind::InvalidInput,
+        ErrorKind::InvalidData,
+        ErrorKind::Other,
+    ] {
+        assert!(
+            !retryable(&ServiceError::Git(git::GitError::Io(Error::from(kind)))),
+            "git {kind:?}"
+        );
+        assert!(
+            !retryable(&ServiceError::Review(::review::ReviewError::Io(
+                Error::from(kind)
+            ))),
+            "review {kind:?}"
+        );
+    }
+    for kind in [
+        ErrorKind::Interrupted,
+        ErrorKind::WouldBlock,
+        ErrorKind::TimedOut,
+        ErrorKind::ResourceBusy,
+    ] {
+        assert!(
+            retryable(&ServiceError::Git(git::GitError::Io(Error::from(kind)))),
+            "git {kind:?}"
+        );
+        assert!(
+            retryable(&ServiceError::Review(::review::ReviewError::Io(
+                Error::from(kind)
+            ))),
+            "review {kind:?}"
+        );
+    }
 }

@@ -1905,12 +1905,22 @@ where
 }
 
 pub(crate) fn retryable(error: &ServiceError) -> bool {
-    matches!(
-        error,
-        ServiceError::Db(db::DbError::VersionConflict)
-            | ServiceError::Git(git::GitError::Io(_))
-            | ServiceError::Review(::review::ReviewError::Io(_))
-    ) || consumer_error_kind(error) == WorkerErrorKind::Transient
+    match error {
+        ServiceError::Db(db::DbError::VersionConflict) => true,
+        // A checkout read that can clear by itself. A missing path or a
+        // refused permission stays the same on every attempt: it parks.
+        ServiceError::Git(git::GitError::Io(io))
+        | ServiceError::Review(::review::ReviewError::Io(io)) => {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::ResourceBusy
+            )
+        }
+        _ => consumer_error_kind(error) == WorkerErrorKind::Transient,
+    }
 }
 
 // The step uses the same actor as the former recursive hop.
