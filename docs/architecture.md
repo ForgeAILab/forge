@@ -7852,6 +7852,11 @@ and notification projections also use typed DB query helpers.
 Task-step queue, conflict-hotspot episodes, periodic worker health and workflow
 transition/hook statements likewise live in their DB aggregate modules; queue
 and workflow services retain each statement's original connection and await order.
+The remaining dispatcher admission/reconciliation reads, workflow action and
+prompt-loader queries, and fenced Task creation, review and recovery writes
+also live in the DB aggregates. Task services keep their `TaskQuery` identity
+fences, applied-result checks and caller-owned transactions through typed DB
+functions; production services contain no raw SQLx query calls.
 Workspace-root path statements live in `sqlite/workspace_root.rs`; their rewrite transaction
 remains owned by the migration service, including its original deferred begin.
 The services retain policy and transaction ownership; queries participating in

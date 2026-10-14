@@ -1226,6 +1226,58 @@ impl SqliteDb {
     }
 }
 
+impl SqliteDb {
+    pub async fn hook_checkpoint_execution_id(
+        &self,
+        step_id: &str,
+        hook_index: i64,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT execution_id FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?",
+        )
+        .bind(step_id)
+        .bind(hook_index)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn claim_run_ci_helper_step(
+        &self,
+        lease_until: String,
+        step_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+        "UPDATE task_step SET status='claimed',claimed_by='run-ci-steps',lease_until=? WHERE id=?",
+    ).bind(lease_until).bind(step_id).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn remove_run_ci_helper_steps(
+        &self,
+        task_id: &str,
+        step_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("DELETE FROM task_step WHERE task_id=? AND (id=? OR (kind='command' AND json_extract(payload_json,'$.operation') IN ('apply_check_result','apply_check_progress')))").bind(task_id).bind(step_id).execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn ended_entry_cascade_step_count(
+        &self,
+        task_id: &str,
+        expected_epoch: i64,
+        prefix_for_length: String,
+        prefix: String,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM task_step WHERE task_id=? AND expected_epoch=? AND status IN ('failed','parked','superseded') AND substr(causation_key,1,length(?))=?",
+                ).bind(task_id).bind(expected_epoch).bind(prefix_for_length).bind(prefix).fetch_one(self.pool()).await?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

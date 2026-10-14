@@ -284,15 +284,11 @@ impl TaskService {
                 // Missing work belongs to this entry, never to an older
                 // failed Review. Reusing that Review's receipt would let
                 // every later empty entry re-plan without spending budget.
-                let epoch: i64 = sqlx::query_scalar(
-                    "SELECT status_epoch FROM task WHERE id=? AND version=? AND status=?",
-                )
-                .bind(&task.id)
-                .bind(task.version)
-                .bind(&task.status)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or(DbError::VersionConflict)?;
+                let epoch: i64 = self
+                    .db
+                    .review_candidate_task_epoch(&task.id, task.version, &task.status)
+                    .await?
+                    .ok_or(DbError::VersionConflict)?;
                 let subject = format!("entry:{}:{epoch}", task.status);
                 let receipt = crate::task_hierarchy::replan_receipt_for_review(&subject);
                 if self.charge_replan(task, &receipt).await?

@@ -1127,9 +1127,15 @@ pub(super) async fn clear_manual_advance_error_annotation(
     // may already have moved the Task. A replaced annotation is a no-op,
     // never a post-commit 409. The event shares the clear's transaction.
     let mut tx = db::begin_immediate(db.pool()).await?;
-    let cleared = db::task_writer::TaskQuery::new(db,&advanced_task.id,"UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL")
-        .bind(now_rfc3339()).bind(&advanced_task.id).bind(&source_task.error_annotation)
-        .execute_in_tx(&mut tx).await?.require_applied()?;
+    let cleared = db
+        .clear_manual_advance_annotation_in_tx(
+            &mut tx,
+            now_rfc3339(),
+            &advanced_task.id,
+            &source_task.error_annotation,
+        )
+        .await?
+        .require_applied()?;
     let current = db
         .get_task_in_tx(&mut tx, &advanced_task.id)
         .await?

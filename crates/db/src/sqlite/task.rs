@@ -5568,3 +5568,211 @@ impl SqliteDb {
             .execute(connection).await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn task_governance_capability_class(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn annotate_before_work_hook_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        annotation: &str,
+        updated_at: &str,
+        task_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+        "UPDATE task SET error_annotation = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
+    ).bind(annotation).bind(updated_at).bind(task_id).execute(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn review_hook_task_status_version(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<(String, i64)>> {
+        Ok(sqlx::query_as("SELECT status,version FROM task WHERE id=?")
+            .bind(task_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn review_candidate_task_epoch(
+        &self,
+        task_id: &str,
+        version: i64,
+        status: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT status_epoch FROM task WHERE id=? AND version=? AND status=?",
+        )
+        .bind(task_id)
+        .bind(version)
+        .bind(status)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_coordination_root_review_dispatch_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        updated_at: &str,
+        task_id: &str,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task
+                     SET review_passed_at = NULL,
+                         version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
+                         metadata_json = CASE
+                             WHEN json_valid(COALESCE(metadata_json, '{}'))
+                             THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
+                             ELSE metadata_json
+                         END,
+                         updated_at = CASE
+                             WHEN review_passed_at IS NOT NULL
+                                  OR (json_valid(COALESCE(metadata_json, '{}'))
+                                      AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                           OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
+                             THEN ? ELSE updated_at END
+                     WHERE id = ? AND deleted_at IS NULL
+                       AND (review_passed_at IS NOT NULL
+                            OR (json_valid(COALESCE(metadata_json, '{}'))
+                                AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
+                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))").bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(transaction).await
+    }
+}
+
+pub struct RecordReviewCiFailureInTxInput<'a> {
+    pub entry_barrier_json: String,
+    pub error_annotation: String,
+    pub blocked_json: Option<String>,
+    pub deferral: &'a Option<String>,
+    pub updated_at: &'a str,
+    pub task_id: &'a str,
+    pub version: i64,
+    pub status: &'a str,
+}
+impl SqliteDb {
+    pub async fn record_review_ci_failure_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: RecordReviewCiFailureInTxInput<'_>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(
+            self,
+            input.task_id,
+            "UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
+            blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
+            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
+            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
+            updated_at = ?, version = version + 1
+            WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL",
+        )
+        .bind(input.entry_barrier_json)
+        .bind(input.error_annotation)
+        .bind(input.blocked_json)
+        .bind(input.deferral)
+        .bind(input.deferral)
+        .bind(input.updated_at)
+        .bind(input.task_id)
+        .bind(input.version)
+        .bind(input.status)
+        .execute_in_tx(transaction)
+        .await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_manual_advance_annotation_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        updated_at: String,
+        task_id: &str,
+        expected_annotation: &Option<String>,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL").bind(updated_at).bind(task_id).bind(expected_annotation).execute_in_tx(transaction).await
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_manual_review_follow_up_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        owner_task_id: &str,
+        metadata_json: String,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(
+            self,
+            owner_task_id,
+            "UPDATE task SET metadata_json = ?, version = version + 1
+                 WHERE id = ? AND version = ?",
+        )
+        .bind(metadata_json)
+        .bind(task_id)
+        .bind(version)
+        .execute_in_tx(transaction)
+        .await
+    }
+}
+
+impl SqliteDb {
+    pub async fn clear_manual_review_failure_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        updated_at: &str,
+        task_id: &str,
+        version: i64,
+    ) -> crate::Result<crate::task_writer::TaskQueryResult> {
+        crate::task_writer::TaskQuery::new(
+            self,
+            task_id,
+            "UPDATE task SET error_annotation = NULL, blocked_json = NULL,
+                 updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
+        )
+        .bind(updated_at)
+        .bind(task_id)
+        .bind(version)
+        .execute_in_tx(transaction)
+        .await
+    }
+}
+
+pub struct ClearDaemonUpgradeDispatchRefusalInput<'a> {
+    pub clear_annotation: bool,
+    pub updated_at: String,
+    pub task_id: &'a str,
+    pub version: i64,
+    pub metadata_json: &'a Option<String>,
+    pub error_annotation: &'a Option<String>,
+    pub refusal_code: &'a str,
+}
+impl SqliteDb {
+    pub async fn clear_daemon_upgrade_dispatch_refusal(
+        &self,
+        input: ClearDaemonUpgradeDispatchRefusalInput<'_>,
+    ) -> crate::Result<u64> {
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET
+            error_annotation = CASE WHEN ? THEN NULL ELSE error_annotation END,
+            metadata_json = NULLIF(json_remove(metadata_json, '$.daemon_upgrade_refusal', '$.dispatch_disposition', '$.deferred_dispatch'), '{}'),
+            version = version + 1, updated_at = ?
+         WHERE id = ? AND deleted_at IS NULL AND version = ?
+            AND metadata_json IS ? AND error_annotation IS ?
+            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?").bind(input.clear_annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).bind(input.error_annotation).bind(input.refusal_code).execute(self.pool()).await
+    }
+}

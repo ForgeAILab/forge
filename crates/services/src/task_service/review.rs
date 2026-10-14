@@ -194,16 +194,19 @@ impl TaskService {
             "target_state": task.status, "reason": reason,
             "not_before": (Utc::now() + chrono::Duration::seconds(5 * (1_i64 << attempts.saturating_sub(1).clamp(0,4)))).to_rfc3339(),
         }).to_string());
-        let changed = db::task_writer::TaskQuery::new(&self.db,&task.id,"UPDATE task SET entry_barrier_json = ?, error_annotation = ?,
-            blocked_json = ?, metadata_json = CASE WHEN ? IS NULL THEN
-            json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
-            json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
-            updated_at = ?, version = version + 1
-            WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL")
-            .bind(barrier.to_string()).bind(annotation.to_string())
-            .bind((!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()))
-            .bind(&deferral).bind(&deferral).bind(&now).bind(&task.id).bind(task.version).bind(&task.status)
-            .execute_in_tx(&mut tx).await?;
+        let changed = self.db.record_review_ci_failure_in_tx(
+            &mut tx,
+            db::RecordReviewCiFailureInTxInput {
+                entry_barrier_json: barrier.to_string(),
+                error_annotation: annotation.to_string(),
+                blocked_json: (!retry).then(|| json!({"kind": if reset { api_types::FailureKind::WorkspaceResetRequired } else { api_types::FailureKind::BeforeWorkHookFailed }, "reason": reason, "created_at": now, "execution_id": null}).to_string()),
+                deferral: &deferral,
+                updated_at: &now,
+                task_id: &task.id,
+                version: task.version,
+                status: &task.status,
+            },
+        ).await?;
         // Runs in the Task's review hook step; a queued write would make the
         // attention and returned Task below untruthful.
         if changed.require_applied()? != 1 {

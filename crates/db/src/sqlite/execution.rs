@@ -3393,3 +3393,55 @@ impl SqliteDb {
         Ok(execution_ids)
     }
 }
+
+impl SqliteDb {
+    pub async fn previous_sibling_execution_head(
+        &self,
+        root_id: &str,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT e.after_sha FROM execution e JOIN task sibling ON sibling.id = e.task_id
+         WHERE sibling.parent_task_id = ?1 AND sibling.id != ?2
+           AND e.after_sha IS NOT NULL AND e.after_sha != ''
+           AND e.created_at <= COALESCE(
+               (SELECT MIN(own.created_at) FROM execution own WHERE own.task_id = ?2),
+               e.created_at)
+         ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1",
+        )
+        .bind(root_id)
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn dispatch_running_agent_execution_count(
+        &self,
+        agent_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM execution WHERE agent_id=? AND status='running'",
+        )
+        .bind(agent_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn retired_review_settlement_execution_ids(
+        &self,
+        task_id: &str,
+        error: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM execution WHERE task_id = ? AND status <> 'running' AND error = ?",
+        )
+        .bind(task_id)
+        .bind(error)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}

@@ -129,7 +129,10 @@ impl TaskService {
                 &now_rfc3339(),
             )
             .await?;
-            let integrated: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_step WHERE task_id=? AND integration_started_at IS NOT NULL AND status='done')").bind(&task_id).fetch_one(self.db.pool()).await?;
+            let integrated: bool = self
+                .db
+                .task_has_completed_integration_step(&task_id)
+                .await?;
             if snapshot.workflow.state_kind(&snapshot.task.status)
                 == Some(api_types::StateKind::Terminal)
                 && snapshot.workflow.cancellation_state.as_deref()
@@ -925,14 +928,13 @@ impl TaskService {
         if released.status != crate::workflow::default_states::REVIEW {
             return Ok(released);
         }
-        let deferred: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM execution WHERE task_id = ? AND status <> 'running' AND error = ?",
-        )
-        .bind(&released.id)
-        .bind(super::review::RETIRED_REVIEW_RERUN_HELD)
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(DbError::from)?;
+        let deferred: Vec<String> = self
+            .db
+            .retired_review_settlement_execution_ids(
+                &released.id,
+                super::review::RETIRED_REVIEW_RERUN_HELD,
+            )
+            .await?;
         if !deferred.is_empty() {
             for execution_id in &deferred {
                 if let Some(execution) = ExecutionRepo::get_by_id(&*self.db, execution_id).await? {

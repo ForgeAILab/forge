@@ -372,14 +372,10 @@ async fn persist_before_work_annotation(
     // annotation and uses its own mutation id for dedupe.
     let updated_at = now_rfc3339();
     let mut transaction = db::begin_immediate(ctx.db.pool()).await?;
-    let update = sqlx::query(
-        "UPDATE task SET error_annotation = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL",
-    )
-    .bind(&annotation)
-    .bind(&updated_at)
-    .bind(&task.id)
-    .execute(&mut *transaction)
-    .await?;
+    let update = ctx
+        .db
+        .annotate_before_work_hook_in_tx(&mut transaction, &annotation, &updated_at, &task.id)
+        .await?;
     if update.rows_affected() != 1 {
         return Err(db::DbError::NotFound);
     }
@@ -430,24 +426,27 @@ async fn schedule_cleanup(
             + chrono::Duration::from_std(delay)
                 .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))?)
         .to_rfc3339();
-        let changed = sqlx::query("UPDATE workspace SET cleanup_after=?,updated_at=? WHERE id=?")
-            .bind(deadline)
-            .bind(now_rfc3339())
-            .bind(workspace_id.as_ref())
-            .execute(&mut *tx)
+        let changed = ctx
+            .db
+            .schedule_hook_workspace_cleanup_in_tx(
+                &mut tx,
+                deadline,
+                now_rfc3339(),
+                workspace_id.as_ref(),
+            )
             .await?
             .rows_affected();
         if changed != 1 {
             return Err(db::DbError::NotFound.into());
         }
-        sqlx::query(
-            "UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?",
-        )
-        .bind(serde_json::to_string(&HookResult::Ok).expect("hook outcome serializes"))
-        .bind(&attempt.step.id)
-        .bind(attempt.index)
-        .execute(&mut *tx)
-        .await?;
+        ctx.db
+            .record_terminal_cleanup_hook_result_in_tx(
+                &mut tx,
+                serde_json::to_string(&HookResult::Ok).expect("hook outcome serializes"),
+                &attempt.step.id,
+                attempt.index,
+            )
+            .await?;
         tx.commit().await?;
         Ok(())
     } else {

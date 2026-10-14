@@ -1198,16 +1198,15 @@ impl TaskDispatcher {
                 // the next attempt has its own identity: the ended one must
                 // not swallow it and leave the Task with neither a step nor
                 // a park that says why.
-                let ended: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM task_step WHERE task_id=? AND expected_epoch=? AND status IN ('failed','parked','superseded') AND substr(causation_key,1,length(?))=?",
-                )
-                .bind(&task.id)
-                .bind(p.read.epoch)
-                .bind(format!("{key}:"))
-                .bind(format!("{key}:"))
-                .fetch_one(self.db.pool())
-                .await
-                .map_err(db::DbError::from)?;
+                let ended: i64 = self
+                    .db
+                    .ended_entry_cascade_step_count(
+                        &task.id,
+                        p.read.epoch,
+                        format!("{key}:"),
+                        format!("{key}:"),
+                    )
+                    .await?;
                 let cascade = self
                     .task_service
                     .workflow_execution()

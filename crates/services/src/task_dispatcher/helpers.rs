@@ -193,13 +193,10 @@ pub(super) async fn reviewer_dispatch_ready(
     task: &db::Task,
     state_config: &Value,
 ) -> Result<bool> {
-    let capability_class = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT capability_class FROM project_task_governance WHERE task_id = ?",
-    )
-    .bind(&task.id)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let capability_class = db
+        .task_governance_capability_class(&task.id)
+        .await?
+        .flatten();
     if crate::execution_setup::classify_task_execution(
         &task.task_type,
         capability_class.as_deref(),

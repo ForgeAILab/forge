@@ -881,3 +881,36 @@ impl SqliteDb {
             .execute(connection).await?)
     }
 }
+
+impl SqliteDb {
+    pub async fn schedule_hook_workspace_cleanup_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        deadline: String,
+        updated_at: String,
+        workspace_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("UPDATE workspace SET cleanup_after=?,updated_at=? WHERE id=?")
+                .bind(deadline)
+                .bind(updated_at)
+                .bind(workspace_id)
+                .execute(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn latest_task_workspace_repo_id(
+        &self,
+        task_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT repo_id FROM workspace WHERE task_id=? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
