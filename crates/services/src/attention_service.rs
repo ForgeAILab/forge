@@ -173,15 +173,17 @@ enum WakeDecisionEvent {
 #[derive(Clone)]
 pub struct AttentionService {
     db: Arc<SqliteDb>,
+    wake_turns: Arc<dyn WakeTurns>,
     action_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
     event_bus: Option<Arc<events::EventBus>>,
     last_sweep: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl AttentionService {
-    pub fn new(db: Arc<SqliteDb>) -> Self {
+    pub fn new(db: Arc<SqliteDb>, wake_turns: Arc<dyn WakeTurns>) -> Self {
         Self {
             db,
+            wake_turns,
             event_bus: None,
             action_connections: None,
             last_sweep: Arc::default(),
@@ -258,7 +260,8 @@ impl AttentionService {
         if let Some(id) = context.attention_id.as_deref() {
             if let Some(attention) = self.db.get_attention(id).await? {
                 let dedupe = wake_admitted_dedupe_key(&request, &context);
-                context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                context.turn = self
+                    .wake_turns
                     .prepare_attention(
                         &attention,
                         &dedupe,
@@ -480,7 +483,8 @@ impl AttentionService {
         }
         let combined = parts.join(":");
         context.incident_digest = Some(wake_incident_digest(&combined, None));
-        context.turn = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+        context.turn = self
+            .wake_turns
             .prepare_attention(
                 &first,
                 &wake_admitted_dedupe_key(&request, &context),
@@ -1490,7 +1494,8 @@ impl AttentionService {
                     .get_attention_in_tx(transaction, id)
                     .await?
                     .ok_or(db::DbError::NotFound)?;
-                let admitted = crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                let admitted = self
+                    .wake_turns
                     .build_prepared_turn(&event, prepared, &actual)?;
                 (
                     db::AgentWakeDispositionKind::TurnAdmitted,
@@ -1549,7 +1554,7 @@ impl AttentionService {
             .db
             .get_agent_wake_disposition_in_tx(
                 transaction,
-                crate::wake_turn_consumer_name(),
+                self.wake_turns.consumer_name(),
                 &event.id,
             )
             .await?
@@ -1564,7 +1569,7 @@ impl AttentionService {
                 format!("wake-disposition:{}", event.id).as_bytes(),
             )
             .to_string(),
-            consumer_name: crate::wake_turn_consumer_name().to_owned(),
+            consumer_name: self.wake_turns.consumer_name().to_owned(),
             source_event_id: event.id.clone(),
             source_event_sequence: event.sequence,
             attempt_number: 1,
@@ -2619,7 +2624,7 @@ impl AttentionService {
                     incident_digest: Some(wake_attention_incident_digest(&candidate)),
                     ..Default::default()
                 };
-                crate::WakeTurnConsumer::new(Arc::clone(&self.db))
+                self.wake_turns
                     .prepare_attention(
                         &candidate,
                         &wake_admitted_dedupe_key(&request, &context),
@@ -4241,7 +4246,8 @@ mod tests {
     async fn health_service() -> AttentionService {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
-        AttentionService::new(Arc::new(SqliteDb::new(pool)))
+        let db = Arc::new(SqliteDb::new(pool));
+        AttentionService::new(Arc::clone(&db), Arc::new(crate::WakeTurnConsumer::new(db)))
     }
 
     async fn append_projection_event(

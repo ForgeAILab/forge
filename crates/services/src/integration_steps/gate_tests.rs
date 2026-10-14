@@ -76,10 +76,13 @@ async fn quarantined_imports_without_execution_or_pinned_workspace_park_and_retr
             "{offers:?}"
         );
         assert!(offers.iter().any(|(verb, _)| verb == "cancel"));
-        crate::AttentionService::new(world.db.clone())
-            .project_once(100)
-            .await
-            .unwrap();
+        crate::AttentionService::new(
+            world.db.clone(),
+            std::sync::Arc::new(crate::WakeTurnConsumer::new(world.db.clone())),
+        )
+        .project_once(100)
+        .await
+        .unwrap();
         let attention: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status='open' AND json_extract(details_json,'$.entity_id')='orphan'")
             .fetch_one(world.db.pool()).await.unwrap();
         assert_eq!(attention, 1);

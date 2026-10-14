@@ -57,7 +57,10 @@ async fn assert_missing_candidate(lead: &root_lead::Lead, id: &str) {
         !actions.iter().any(|offer| offer.action.verb() == "retry"),
         "a reviewer retry has no candidate: {actions:?}"
     );
-    let service = crate::AttentionService::new(lead.db.clone());
+    let service = crate::AttentionService::new(
+        lead.db.clone(),
+        std::sync::Arc::new(crate::WakeTurnConsumer::new(lead.db.clone())),
+    );
     service.project_once(1000).await.unwrap();
     let attention = service
         .mission_control_home("test-user", None, 50)

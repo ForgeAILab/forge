@@ -257,10 +257,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let feed = crate::AttentionService::new(db.clone())
-            .mission_control_home("test-user", None, 50)
-            .await
-            .unwrap();
+        let feed = crate::AttentionService::new(
+            db.clone(),
+            std::sync::Arc::new(crate::WakeTurnConsumer::new(db.clone())),
+        )
+        .mission_control_home("test-user", None, 50)
+        .await
+        .unwrap();
         let row = feed
             .needs_attention
             .iter()

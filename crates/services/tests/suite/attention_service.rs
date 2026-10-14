@@ -204,7 +204,10 @@ async fn user_pause_and_stop_keep_manual_controls_without_recovery_wakes() {
     let project_id = configured_project(&db, &identity_id, "intentional-stops").await;
     let tasks =
         services::TaskService::new_for_test(Arc::clone(&db), Arc::new(events::EventBus::default()));
-    let attention = AttentionService::new(Arc::clone(&db));
+    let attention = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
 
     for pause in [true, false] {
         let task = project_task(&db, &project_id, "Wait for the user to resume").await;
@@ -278,7 +281,10 @@ async fn superseded_terminal_attempts_never_become_orphans_or_delay_other_events
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
     let project_id = configured_project(&db, &identity_id, "recovered-attempts").await;
-    let attention = AttentionService::new(Arc::clone(&db));
+    let attention = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     for age_seconds in [0, 60] {
         for (successor_status, linked) in [
             (ExecutionStatus::Running, true),
@@ -376,7 +382,10 @@ async fn obsolete_orphan_wakes_recheck_task_and_attempt_before_spending_budget()
             &terminal_at,
         )
         .await;
-        let attention = AttentionService::new(Arc::clone(&db));
+        let attention = AttentionService::new(
+            Arc::clone(&db),
+            Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+        );
         attention.project_once(100).await.unwrap();
         let (id, incident_key, source_event_id, status): (String, String, String, String) =
             sqlx::query_as(
@@ -586,7 +595,10 @@ async fn wake_admission_deduplicates_and_suppresses_recursive_events() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
-    let service = AttentionService::new(db.clone());
+    let service = AttentionService::new(
+        db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(db.clone())),
+    );
     assert!(matches!(
         service
             .admit_wake(request(&identity_id, "missing-incident"))
@@ -648,7 +660,10 @@ async fn identical_suppressed_wake_decision_is_deduped() {
     let db = database().await;
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let mut request = request(&identity_id, "incident-deduped-suppression");
     request.reaction_depth = 8;
 
@@ -722,7 +737,10 @@ async fn retry_exhausted_agent_chat_is_suppressed_before_binding_setup() {
     .await
     .unwrap();
 
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     let (reason, attention_scope): (String, String) = sqlx::query_as(
         "SELECT
@@ -786,7 +804,10 @@ async fn binding_replacement_cannot_create_a_second_active_incident_lease() {
     )
     .await
     .unwrap();
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     let admitted_identity: String = sqlx::query_scalar(
         "SELECT json_extract(payload_json, '$.identity_id') FROM domain_event
@@ -934,23 +955,26 @@ async fn resolved_attention_is_suppressed_with_incident_reference() {
     .await
     .unwrap();
 
-    let result = AttentionService::new(Arc::clone(&db))
-        .admit_wake(WakeAdmissionRequest {
-            identity_id,
-            scope_type: "account".to_owned(),
-            scope_id: "account-1".to_owned(),
-            incident_key,
-            lease_owner: "resolved-worker".to_owned(),
-            correlation_id: "resolved-correlation".to_owned(),
-            causation_id: Some(source_event_id),
-            caused_by_identity_id: None,
-            reaction_depth: 0,
-            now: "2026-01-01T00:00:00Z".to_owned(),
-            lease_seconds: 30,
-            cooldown_seconds: 60,
-        })
-        .await
-        .unwrap();
+    let result = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .admit_wake(WakeAdmissionRequest {
+        identity_id,
+        scope_type: "account".to_owned(),
+        scope_id: "account-1".to_owned(),
+        incident_key,
+        lease_owner: "resolved-worker".to_owned(),
+        correlation_id: "resolved-correlation".to_owned(),
+        causation_id: Some(source_event_id),
+        caused_by_identity_id: None,
+        reaction_depth: 0,
+        now: "2026-01-01T00:00:00Z".to_owned(),
+        lease_seconds: 30,
+        cooldown_seconds: 60,
+    })
+    .await
+    .unwrap();
     assert!(matches!(
         result,
         WakeAdmissionResult::Suppressed {
@@ -1050,23 +1074,26 @@ async fn recovered_task_suppresses_a_stale_interruption_wake_before_budget() {
     .await
     .unwrap();
 
-    let result = AttentionService::new(Arc::clone(&db))
-        .admit_wake(WakeAdmissionRequest {
-            identity_id,
-            scope_type: "project".to_owned(),
-            scope_id: project_id.clone(),
-            incident_key,
-            lease_owner: "stale-recovery-worker".to_owned(),
-            correlation_id: source_event.correlation_id,
-            causation_id: Some(source_event.id),
-            caused_by_identity_id: None,
-            reaction_depth: 0,
-            now: now_rfc3339(),
-            lease_seconds: 30,
-            cooldown_seconds: 60,
-        })
-        .await
-        .unwrap();
+    let result = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .admit_wake(WakeAdmissionRequest {
+        identity_id,
+        scope_type: "project".to_owned(),
+        scope_id: project_id.clone(),
+        incident_key,
+        lease_owner: "stale-recovery-worker".to_owned(),
+        correlation_id: source_event.correlation_id,
+        causation_id: Some(source_event.id),
+        caused_by_identity_id: None,
+        reaction_depth: 0,
+        now: now_rfc3339(),
+        lease_seconds: 30,
+        cooldown_seconds: 60,
+    })
+    .await
+    .unwrap();
     assert!(matches!(
         result,
         WakeAdmissionResult::Suppressed {
@@ -1130,7 +1157,10 @@ async fn projection_health_uses_buffered_checkpoints_and_idle_polls_do_not_write
         .await
         .unwrap();
     }
-    let service = Arc::new(AttentionService::new(Arc::clone(&db)));
+    let service = Arc::new(AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    ));
     let runtime =
         services::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service));
     assert_eq!(
@@ -1190,7 +1220,10 @@ async fn projection_worker_drains_events_reports_health_and_stops() {
     .await
     .unwrap();
 
-    let service = std::sync::Arc::new(AttentionService::new(std::sync::Arc::clone(&db)));
+    let service = std::sync::Arc::new(AttentionService::new(
+        std::sync::Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(std::sync::Arc::clone(&db))),
+    ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = std::sync::Arc::clone(&service).start(shutdown_rx);
     let mut health = None;
@@ -1268,7 +1301,10 @@ async fn semantic_progress_warning_is_typed_deduped_and_resolved_by_progress() {
         .to_string(),
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
 
     let first: (String, String, String, String) = sqlx::query_as(
@@ -1367,7 +1403,10 @@ async fn projected_incident_emits_one_durable_wake_action_and_replay_is_suppress
     .await
     .unwrap();
 
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let run = service.project_once(100).await.unwrap();
     assert_eq!(run.processed_events, 1);
 
@@ -1453,10 +1492,13 @@ async fn auto_retried_execution_failure_is_audit_only() {
     )
     .await;
 
-    AttentionService::new(Arc::clone(&db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
 
     let attention_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM attention_projection
@@ -1544,7 +1586,10 @@ async fn undisposed_manual_execution_failure_becomes_actionable_after_grace() {
     )
     .await;
 
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
 
     let attention: (String, String) = sqlx::query_as(
@@ -1715,7 +1760,10 @@ async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention
     .await
     .unwrap();
 
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
 
     let attention: (String, String, String) = sqlx::query_as(
@@ -1861,7 +1909,10 @@ async fn completed_task_wakes_project_agent_until_readiness_is_reconciled() {
     .await
     .unwrap();
 
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     let attention: (String, String, String, Option<String>) = sqlx::query_as(
         "SELECT attention_type, status, recommended_action, identity_id
@@ -2041,10 +2092,13 @@ async fn expected_cancellation_is_audit_only_without_attention_or_wake() {
     .await
     .unwrap();
 
-    AttentionService::new(Arc::clone(&db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
 
     let attention_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM attention_projection
@@ -2166,10 +2220,13 @@ async fn review_attention_rows(db: &Arc<SqliteDb>, workflow_definition: &str) ->
     )
     .await
     .unwrap();
-    AttentionService::new(Arc::clone(db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     sqlx::query_scalar(
         "SELECT attention_type FROM attention_projection
          WHERE scope_type = 'project' AND scope_id = ? ORDER BY updated_at",
@@ -2205,7 +2262,10 @@ async fn review_ready_wakes_only_for_a_human_required_review_gate() {
 #[tokio::test]
 async fn audit_skipped_activity_is_not_stale() {
     let db = database().await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(1).await.unwrap(); // initialize the worker row
     for _ in 0..5 {
         append_attention_event(&db, "ignored.kind", "t", "p", serde_json::json!({})).await;
@@ -2285,7 +2345,11 @@ async fn audit_in_window_budget_exhaustion_does_not_publish_autonomy_stall() {
     .unwrap();
     let bus = Arc::new(events::EventBus::new(64));
     let mut rx = bus.subscribe();
-    let service = AttentionService::new(Arc::clone(&db)).with_event_bus(Arc::clone(&bus));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .with_event_bus(Arc::clone(&bus));
     service.project_once(100).await.unwrap();
     let suppressed: Vec<String> = sqlx::query_scalar(
         "SELECT payload_json FROM domain_event WHERE event_type = 'agent.wake.suppressed'",
@@ -2312,7 +2376,10 @@ async fn audit_in_window_budget_exhaustion_does_not_publish_autonomy_stall() {
 #[tokio::test]
 async fn audit_idle_and_new_upgrade_health_are_not_stale_and_stalled_backlog_is() {
     let db = database().await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(1).await.unwrap();
     sqlx::query("UPDATE worker_health SET last_success_at = '2000-01-01T00:00:00Z' WHERE worker_name = 'attention_projection'").execute(db.pool()).await.unwrap();
     assert!(!service.consumer_health().await.unwrap().unwrap().stale);
@@ -2347,7 +2414,10 @@ async fn audit_health_reports_worker_error_kind_and_message() {
     use services::worker_runtime::{HealthErrorKind, WorkItem, WorkerHealth};
 
     let db = database().await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(1).await.unwrap();
     let health = WorkerHealth::new(Arc::clone(&db), "attention_projection");
     for kind in ["failure", "transient", "terminal"] {
@@ -2426,7 +2496,11 @@ async fn audit_zero_budget_chat_stall_uses_project_scope() {
     tx.commit().await.unwrap();
     let bus = Arc::new(events::EventBus::new(16));
     let mut rx = bus.subscribe();
-    let service = AttentionService::new(Arc::clone(&db)).with_event_bus(bus);
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .with_event_bus(bus);
     let result = service
         .admit_wake(services::WakeAdmissionRequest {
             identity_id: id,
@@ -2487,7 +2561,10 @@ async fn audit_admitted_source_replay_is_a_noop() {
         serde_json::json!({}),
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     let before: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'agent.wake.%'), (SELECT version FROM attention_projection LIMIT 1), (SELECT admitted_count FROM agent_wake_budget_window LIMIT 1)").fetch_one(db.pool()).await.unwrap();
     sqlx::query("UPDATE event_consumer_cursor SET last_sequence = 0 WHERE consumer_name = 'attention_projection'").execute(db.pool()).await.unwrap();
@@ -2548,7 +2625,10 @@ async fn audit_lost_wake_lease_cas_suppresses_without_charging_budget() {
     })
     .await
     .unwrap();
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     sqlx::raw_sql("CREATE TRIGGER lose_wake_lease BEFORE INSERT ON agent_wake_lease BEGIN SELECT RAISE(IGNORE); END;").execute(db.pool()).await.unwrap();
     let mut input = request(&id, "cas-loss");
     input.scope_type = "project".to_owned();
@@ -2573,7 +2653,10 @@ async fn conflict_hotspots_project_per_path_reopen_and_keep_wake_rules() {
     let identity_id = new_uuid_v4();
     identity(&db, &identity_id).await;
     let project_id = configured_project(&db, &identity_id, "conflict-hotspots").await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let mut first_id: Option<String> = None;
     for (path, count) in [("src/共有.rs", 3), ("src/共有.rs", 4), ("src/other.rs", 3)] {
         if count == 4 {
@@ -2697,7 +2780,10 @@ async fn condition_reader_upgrade_keeps_open_incident_and_wake_identity() {
         .unwrap();
     tx.commit().await.unwrap();
     append_attention_event(&db,"task.interruption_changed",&task.id,&project_id,serde_json::json!({"task_id":task.id,"task_version":task.version,"task_status":task.status,"requires_intervention":true,"interruption":{"source":"blocked","kind":"workspace_error","reason":reason,"execution_id":"historical-reporter"}})).await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     let incident_id: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?").bind(&project_id).fetch_one(db.pool()).await.unwrap();
     // The incident row as `777b5f1f` stored it. That server copied the
@@ -2941,10 +3027,13 @@ async fn incident_stored_by_the_deployed_build_survives_this_builds_first_pass()
 
     // The wake rows, written by code that is unchanged since the deployed
     // build. The incident row this pass also writes is replaced below.
-    AttentionService::new(Arc::clone(&db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     let incident_id: String = sqlx::query_scalar(
         "SELECT id FROM attention_projection WHERE attention_type='execution_failed' AND scope_id=?",
     )
@@ -3051,7 +3140,10 @@ async fn incident_stored_by_the_deployed_build_survives_this_builds_first_pass()
     );
 
     // This build starts: its first projection pass and wake sweep.
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     service.project_once(100).await.unwrap();
     service.sweep_once_at(&now_rfc3339()).await.unwrap();
     assert_eq!(

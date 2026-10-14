@@ -7,8 +7,10 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use std::sync::Arc;
+
 use db::{PageRequest, SortBy, SortOrder};
-use services::{attention_service, AttentionService};
+use services::{attention_service, AttentionService, WakeTurnConsumer};
 
 use crate::{errors::ApiResult, routes::auth::AuthenticatedUser, state::AppState};
 
@@ -21,7 +23,10 @@ pub async fn home(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<MissionControlHomeResponse>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(
         service
             .mission_control_home(
@@ -38,7 +43,10 @@ pub async fn list_attention(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<AttentionListResponse>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let (page, consumer_health) = service
         .list_for_user(
@@ -76,7 +84,10 @@ pub async fn acknowledge(
     Path(id): Path<String>,
     Json(body): Json<AttentionMutationRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
             .acknowledge(&user.user_id, &id, body.expected_version)
@@ -90,7 +101,10 @@ pub async fn snooze(
     Path(id): Path<String>,
     Json(body): Json<AttentionSnoozeRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
             .snooze(
@@ -109,7 +123,10 @@ pub async fn resolve(
     Path(id): Path<String>,
     Json(body): Json<AttentionResolveRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
             .resolve_with_answer(
@@ -128,7 +145,10 @@ pub async fn agent_detail(
     Path(identity_id): Path<String>,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<AgentDetailResponse>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(
         service
             .agent_detail(&user.user_id, &identity_id, query.limit.unwrap_or(20))

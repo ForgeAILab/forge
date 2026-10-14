@@ -10749,7 +10749,10 @@ async fn permanent_merge_failure_annotates_and_owner_retry_recovers() {
         .any(|s| s.kind == "hooks" && s.expected_status == "merging" && s.status == "failed"));
     assert!(super::helpers::has_blocking_annotation(&failed));
 
-    let attention_service = crate::AttentionService::new(Arc::clone(&fixture.db));
+    let attention_service = crate::AttentionService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&fixture.db))),
+    );
     while attention_service
         .project_once(100)
         .await

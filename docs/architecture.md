@@ -187,9 +187,12 @@ runtime builder injects `EmbeddedAgentService` through that interface. Provider
 endpoint defaults and URL-shape validation live in `provider_credentials`, and
 plain system chat notices in `chat_notices`. The core `wake_turns` module owns
 `WakeTurns` and `PreparedWakeTurn`; the agents-side callback builds the admission
-at the original transaction boundary using the current Attention row. Attention
-still constructs `WakeTurnConsumer` directly pending constructor injection, so
-this preparatory refactor has not completed the agents/core dependency cut.
+at the original transaction boundary using the current Attention row.
+`AttentionService::new` takes the `WakeTurns` implementation as an
+`Arc<dyn WakeTurns>`: the runtime builder passes the `WakeTurnConsumer` it
+starts as a worker, and Mission Control routes pass one built on the same
+database. Outside `runtime/`, core modules no longer name the agents/chat
+modules.
 
 The graph shares one `WorkspaceBackendRouter` across Task execution, workflow
 hooks, lifecycle hooks, merge, cleanup, terminals, and operator status. Consumers

@@ -166,10 +166,13 @@ impl Fixture {
     }
 
     async fn project(&self) {
-        AttentionService::new(Arc::clone(&self.db))
-            .project_once(100)
-            .await
-            .unwrap();
+        AttentionService::new(
+            Arc::clone(&self.db),
+            Arc::new(services::WakeTurnConsumer::new(Arc::clone(&self.db))),
+        )
+        .project_once(100)
+        .await
+        .unwrap();
     }
 
     async fn commit_transition(

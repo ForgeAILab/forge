@@ -790,12 +790,12 @@ impl ForgeRuntimeBuilder {
         let memory_consumer = Arc::new(AgentChatMemoryConsumer::new(Arc::clone(&self.db)));
         let coordination_consumer =
             Arc::new(CoordinationOutcomeConsumer::new(Arc::clone(&self.db)));
+        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
         let attention_projection = Arc::new(
-            AttentionService::new(Arc::clone(&self.db))
+            AttentionService::new(Arc::clone(&self.db), wake_turn_consumer.clone())
                 .with_event_bus(Arc::clone(&self.event_bus))
                 .with_action_connections(Arc::clone(&daemon_connections)),
         );
-        let wake_turn_consumer = Arc::new(WakeTurnConsumer::new(Arc::clone(&self.db)));
         let conflict_hotspot_consumer = Arc::new(
             crate::worker_runtime::conflict_hotspot::ConflictHotspotConsumer::new(Arc::clone(
                 &self.db,

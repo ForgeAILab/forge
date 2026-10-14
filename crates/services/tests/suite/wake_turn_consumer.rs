@@ -373,10 +373,13 @@ async fn user_handoff_and_retry_turns_freeze_admitted_profile_after_edit_and_reb
         .await
         .unwrap()
         .unwrap();
-    AttentionService::new(fixture.db.clone())
-        .admit_wake(wake_request(&fixture, &attention, &now_rfc3339()))
-        .await
-        .unwrap();
+    AttentionService::new(
+        fixture.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(fixture.db.clone())),
+    )
+    .admit_wake(wake_request(&fixture, &attention, &now_rfc3339()))
+    .await
+    .unwrap();
     wake_consumer.run_once(100).await.unwrap();
     let wake_turn = AgentChatTurnJobRepo::get_agent_chat_turn_job(
         &*fixture.db,
@@ -616,7 +619,10 @@ async fn suppressed_blocker_is_readmitted_after_cooldown_without_another_event()
     let f = chat_turn_fixture().await;
     let a = incident(&f, "execution_failed", "cooling").await;
     let now = chrono::Utc::now();
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let request = wake_request(&f, &a, &now.to_rfc3339());
     sqlx::query("INSERT INTO agent_wake_lease(identity_id,scope_type,scope_id,incident_key,lease_owner,leased_until,reaction_depth,updated_at,cooldown_until) VALUES(?,'project',?,?,?, ?,0,?,?)")
         .bind(&f.identity_id).bind(&f.project_id).bind(&a.dedupe_key).bind("old-lease").bind((now-chrono::Duration::seconds(1)).to_rfc3339()).bind(now.to_rfc3339()).bind((now+chrono::Duration::seconds(300)).to_rfc3339()).execute(f.db.pool()).await.unwrap();
@@ -641,7 +647,10 @@ async fn suppressed_blocker_is_readmitted_after_cooldown_without_another_event()
 async fn unchanged_admitted_blocker_escalates_once_after_a_silent_turn() {
     let f = chat_turn_fixture().await;
     incident(&f, "execution_failed", "cannot-fix").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let worker = AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(ProseOnlyWakeRunner));
     assert_eq!(worker.run_once().await.unwrap(), 1);
@@ -675,7 +684,10 @@ async fn budget_is_charged_only_with_an_atomic_turn_admission() {
         .execute(f.db.pool())
         .await
         .unwrap();
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let result = service
         .admit_wake(wake_request(&f, &a, &now_rfc3339()))
         .await
@@ -701,7 +713,10 @@ async fn budget_is_charged_only_with_an_atomic_turn_admission() {
 #[tokio::test]
 async fn delivery_spam_cannot_consume_the_blocker_share() {
     let f = chat_turn_fixture().await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     for n in 0..4 {
         let a = incident(&f, "delivery_followup", &format!("delivery-{n}")).await;
         assert!(matches!(
@@ -744,10 +759,13 @@ async fn two_project_blockers_share_one_wake_and_one_directive() {
     let a = incident(&f, "execution_failed", "one").await;
     let b = incident(&f, "review_risk", "two").await;
     assert_eq!(
-        AttentionService::new(f.db.clone())
-            .sweep_once_at(&now_rfc3339())
-            .await
-            .unwrap(),
+        AttentionService::new(
+            f.db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(f.db.clone()))
+        )
+        .sweep_once_at(&now_rfc3339())
+        .await
+        .unwrap(),
         1
     );
     assert_eq!(turns(&f).await, 1);
@@ -787,10 +805,13 @@ async fn two_project_blockers_share_one_wake_and_one_directive() {
 async fn deterministic_provider_failure_is_terminal_on_attempt_one() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "delivery_followup", "capacity").await;
-    AttentionService::new(f.db.clone())
-        .admit_wake(wake_request(&f, &a, &now_rfc3339()))
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .admit_wake(wake_request(&f, &a, &now_rfc3339()))
+    .await
+    .unwrap();
     let worker = AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(FailingWakeRunner));
     worker.run_once().await.unwrap();
     let (status, count, code): (String, i64, String) = sqlx::query_as(
@@ -810,10 +831,13 @@ async fn deterministic_provider_failure_is_terminal_on_attempt_one() {
 async fn restart_lease_expiry_refunds_the_attempt_before_reclaim() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "delivery_followup", "restart").await;
-    AttentionService::new(f.db.clone())
-        .admit_wake(wake_request(&f, &a, &now_rfc3339()))
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .admit_wake(wake_request(&f, &a, &now_rfc3339()))
+    .await
+    .unwrap();
     sqlx::query("UPDATE agent_chat_turn_job SET status='leased',attempt_count=1,invocation_count=1,lease_owner='previous-process',leased_until='2000-01-01T00:00:00Z' WHERE chat_id=?").bind(&f.chat_id).execute(f.db.pool()).await.unwrap();
     AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(FailingWakeRunner))
         .run_once_at(chrono::Utc::now() + chrono::Duration::seconds(1))
@@ -877,10 +901,13 @@ async fn escalate_creates_one_owner_notification_and_attention_then_answer_wakes
     let item = f.db.get_attention(&e.attention_id).await.unwrap().unwrap();
     assert_eq!(item.recommended_action, "answer_escalation");
     assert_eq!(
-        AttentionService::new(f.db.clone())
-            .sweep_once_at(&now_rfc3339())
-            .await
-            .unwrap(),
+        AttentionService::new(
+            f.db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(f.db.clone()))
+        )
+        .sweep_once_at(&now_rfc3339())
+        .await
+        .unwrap(),
         0,
         "owner escalation never wakes the blocked Agent"
     );
@@ -896,10 +923,13 @@ async fn escalate_creates_one_owner_notification_and_attention_then_answer_wakes
         )
         .await
         .unwrap();
-    AttentionService::new(f.db.clone())
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     assert_eq!(turns(&f).await, 1);
     assert_eq!(
         charged(&f, "decision").await,
@@ -995,7 +1025,10 @@ async fn unchanged_delivery_metadata_does_not_create_a_new_blocker_digest() {
 #[tokio::test]
 async fn unchanged_failed_delivery_is_suppressed_as_repeated_failure() {
     let f = chat_turn_fixture().await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let a = incident(&f, "delivery_followup", "repeated").await;
     service
         .admit_wake(wake_request(&f, &a, &now_rfc3339()))
@@ -1023,10 +1056,13 @@ async fn turn_admission_failure_rolls_back_budget_lease_and_audit() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "delivery_followup", "atomic").await;
     sqlx::raw_sql("CREATE TRIGGER reject_turn BEFORE INSERT ON agent_chat_turn_job BEGIN SELECT RAISE(ABORT,'synthetic turn failure'); END;").execute(f.db.pool()).await.unwrap();
-    assert!(AttentionService::new(f.db.clone())
-        .admit_wake(wake_request(&f, &a, &now_rfc3339()))
-        .await
-        .is_err());
+    assert!(AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone()))
+    )
+    .admit_wake(wake_request(&f, &a, &now_rfc3339()))
+    .await
+    .is_err());
     assert_eq!(turns(&f).await, 0);
     assert_eq!(charged(&f, "delivery").await, 0);
     let audit: i64 = sqlx::query_scalar(
@@ -1047,7 +1083,10 @@ async fn zero_budget_sweep_does_not_repeat_the_owner_stall_notice() {
         .execute(f.db.pool())
         .await
         .unwrap();
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     service.sweep_once_at(&now_rfc3339()).await.unwrap();
     service
         .sweep_once_at(&(chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
@@ -1130,7 +1169,10 @@ async fn audit35_finish_turns(f: &ChatTurnFixture) {
 async fn audit35_changed_blocker_digest_after_an_admitted_turn_is_admitted_again() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "execution_failed", "first-cause").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     audit35_finish_turns(&f).await;
     let changed = audit35_reproject(&f, &a, "a different, new cause").await;
@@ -1155,7 +1197,10 @@ async fn audit35_changed_blocker_digest_after_an_admitted_turn_is_admitted_again
 async fn audit35_failed_blocker_turn_does_not_consume_the_digest() {
     let f = chat_turn_fixture().await;
     incident(&f, "execution_failed", "provider-down").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(FailingWakeRunner))
         .run_once()
@@ -1175,7 +1220,10 @@ async fn audit35_failed_blocker_turn_does_not_consume_the_digest() {
 async fn audit35_recorded_recovery_outcome_prevents_owner_escalation() {
     let f = chat_turn_fixture().await;
     incident(&f, "environment_not_ready", "env").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let turn_id: String = sqlx::query_scalar("SELECT id FROM agent_chat_turn_job WHERE chat_id=?")
         .bind(&f.chat_id)
@@ -1243,10 +1291,13 @@ async fn audit35_small_wake_budget_still_wakes_on_owner_answer() {
         )
         .await
         .unwrap();
-    AttentionService::new(f.db.clone())
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     let stalled: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE event_type='notification.requested' AND scope_id=?",
     )
@@ -1267,7 +1318,10 @@ async fn audit35_small_wake_budget_still_wakes_on_owner_answer() {
 #[tokio::test]
 async fn audit35_budget_suppressed_owner_answer_is_reconsidered() {
     let f = chat_turn_fixture().await;
-    let attention = AttentionService::new(f.db.clone());
+    let attention = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let mut results = Vec::new();
     for n in 0..3 {
         let decision = incident(&f, "decision_recorded", &format!("decision-{n}")).await;
@@ -1338,7 +1392,10 @@ async fn audit35_budget_suppressed_owner_answer_is_reconsidered() {
 async fn audit35_imported_admitted_blocker_escalates_on_first_sweep() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "execution_failed", "legacy").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     audit35_finish_turns(&f).await;
     // Shape of a row the V202610042145 import writes for a pre-upgrade turn.
@@ -1366,7 +1423,10 @@ async fn audit35_imported_admitted_blocker_escalates_on_first_sweep() {
 #[tokio::test]
 async fn audit35_busy_chat_is_not_audited_as_missing_binding() {
     let f = chat_turn_fixture().await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let a = incident(&f, "delivery_followup", "first").await;
     service
         .admit_wake(wake_request(&f, &a, &now_rfc3339()))
@@ -1389,7 +1449,10 @@ async fn audit35_second_batch_member_is_not_rewoken_while_batch_turn_is_queued()
     let f = chat_turn_fixture().await;
     let _a = incident(&f, "execution_failed", "one").await;
     let b = incident(&f, "review_risk", "two").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     // Batch turn is still queued; B's material state changes.
     audit35_reproject(&f, &b, "review risk changed").await;
@@ -1676,7 +1739,10 @@ async fn admitted_wake_becomes_a_project_agent_turn() {
         "inspect_run",
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let (turn_count, status, responder): (i64, String, String) = sqlx::query_as(
         "SELECT COUNT(*), MAX(status), MAX(responder_identity_id)
@@ -1982,7 +2048,10 @@ async fn delivery_followup_with_all_tasks_done_orders_validation_before_readines
     let (project_id, chat_id) = bound_project(&db, &identity_id, &profile_id).await;
     let fixture = seed_delivery_milestone(&db, &project_id).await;
     let task_id = seed_governed_task(&db, &project_id, &fixture.milestone_id, "done").await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let first = seed_delivery_incident(
         &db,
         &project_id,
@@ -2076,15 +2145,18 @@ async fn delivery_followup_reports_open_tasks_without_claiming_completion() {
         &done_task,
     )
     .await;
-    AttentionService::new(Arc::clone(&db))
-        .admit_wake(project_request(
-            &identity_id,
-            &project_id,
-            &a,
-            &now_rfc3339(),
-        ))
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .admit_wake(project_request(
+        &identity_id,
+        &project_id,
+        &a,
+        &now_rfc3339(),
+    ))
+    .await
+    .unwrap();
     let (_, content, _) = wake_turn_for(&db, &chat_id, &a).await;
     assert!(content.contains("1 Task(s) still open"));
     assert!(!content.contains("every Task bound to it is done"));
@@ -2121,15 +2193,18 @@ async fn delivery_followup_requires_newer_readiness_before_turn_success() {
         &task_id,
     )
     .await;
-    AttentionService::new(Arc::clone(&db))
-        .admit_wake(project_request(
-            &identity_id,
-            &project_id,
-            &a,
-            &now_rfc3339(),
-        ))
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .admit_wake(project_request(
+        &identity_id,
+        &project_id,
+        &a,
+        &now_rfc3339(),
+    ))
+    .await
+    .unwrap();
     let (turn_id, content, source_metadata_json) = wake_turn_for(&db, &chat_id, &a).await;
     // The postcondition is anchored on the admitting audit event.
     let wake_event_sequence: i64 = sqlx::query_scalar(
@@ -2235,7 +2310,10 @@ async fn wake_incident_for_another_project_fails_closed_without_cross_project_tu
     )
     .await;
     // The request claims the first Project; the incident belongs to the other.
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let before = admitted_count(&db).await;
     let result = service
         .admit_wake(project_request(
@@ -2287,15 +2365,18 @@ async fn admitted_wake_runner_failure_is_terminal_on_budget_and_keeps_admission_
         "inspect_run",
     )
     .await;
-    AttentionService::new(Arc::clone(&db))
-        .admit_wake(project_request(
-            &identity_id,
-            &project_id,
-            &a,
-            &now_rfc3339(),
-        ))
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .admit_wake(project_request(
+        &identity_id,
+        &project_id,
+        &a,
+        &now_rfc3339(),
+    ))
+    .await
+    .unwrap();
     let (turn_id, _, _) = wake_turn_for(&db, &chat_id, &a).await;
     let worker = AgentChatTurnWorker::with_runner(
         Arc::clone(&db),
@@ -2371,7 +2452,10 @@ async fn setup_required_wake_reconsiders_after_binding_change() {
         "configure_binding",
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
     let (disposition, linked): (String, Option<String>) = sqlx::query_as(
         "SELECT disposition, attention_id FROM agent_wake_disposition ORDER BY created_at LIMIT 1",
@@ -2539,10 +2623,13 @@ async fn actionable_task_interruption_wakes_the_project_agent_end_to_end() {
     )
     .await
     .unwrap();
-    AttentionService::new(Arc::clone(&db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     let wake_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted'",
     )
@@ -2616,10 +2703,13 @@ async fn wake_re_evaluates_current_replacement_binding() {
         .await
         .unwrap();
     assert_eq!(
-        AttentionService::new(Arc::clone(&db))
-            .sweep_once_at(&now_rfc3339())
-            .await
-            .unwrap(),
+        AttentionService::new(
+            Arc::clone(&db),
+            Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db)))
+        )
+        .sweep_once_at(&now_rfc3339())
+        .await
+        .unwrap(),
         1
     );
     let (responder, profile): (String, String) = sqlx::query_as(
@@ -2647,10 +2737,13 @@ async fn wake_turn_resolves_identity_current_profile_after_profile_edit() {
     )
     .await;
     assert_eq!(
-        AttentionService::new(Arc::clone(&fixture.db))
-            .sweep_once_at(&now_rfc3339())
-            .await
-            .unwrap(),
+        AttentionService::new(
+            Arc::clone(&fixture.db),
+            Arc::new(services::WakeTurnConsumer::new(Arc::clone(&fixture.db)))
+        )
+        .sweep_once_at(&now_rfc3339())
+        .await
+        .unwrap(),
         1
     );
     let profile: String =
@@ -2716,10 +2809,13 @@ async fn alternate_wake_producer_cannot_override_server_resolved_responder() {
         .await
         .unwrap();
     assert_eq!(chat_turn_count(&db, &chat_id).await, 0);
-    AttentionService::new(Arc::clone(&db))
-        .sweep_once_at(&now_rfc3339())
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    )
+    .sweep_once_at(&now_rfc3339())
+    .await
+    .unwrap();
     let (responder, profile): (String, String) = sqlx::query_as(
         "SELECT responder_identity_id, profile_id FROM agent_chat_turn_job WHERE chat_id = ?",
     )
@@ -2754,7 +2850,10 @@ async fn deferred_wake_retries_after_authoritative_responder_recovery() {
         "restore_responder",
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
     let latest: String = sqlx::query_scalar(
         "SELECT disposition FROM agent_wake_attention_latest WHERE attention_id = ?",
@@ -2797,7 +2896,10 @@ async fn deferred_wake_rechecks_changed_incident_material_before_delivery() {
         "inspect_run",
     )
     .await;
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
     sqlx::query(
         "UPDATE attention_projection SET details_json = ?, version = version + 1, updated_at = ?
@@ -2873,7 +2975,10 @@ async fn runtime_deferred_agent_and_failing_tick_do_not_block_other_agent_and_ad
     .execute(db.pool())
     .await
     .unwrap();
-    let service = AttentionService::new(Arc::clone(&db));
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     assert_eq!(chat_turn_count(&db, &chat_b).await, 1);
     assert_eq!(chat_turn_count(&db, &chat_a).await, 0);
@@ -2911,7 +3016,10 @@ async fn decision_resolves_only_when_its_turn_is_admitted() {
         .execute(f.db.pool())
         .await
         .unwrap();
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert!(service
         .admit_wake(wake_request(&f, &decision, &now_rfc3339()))
         .await
@@ -2957,8 +3065,14 @@ async fn audit_two_runtimes_race_one_wake_event() {
         "inspect_run",
     )
     .await;
-    let a = AttentionService::new(Arc::clone(&db));
-    let b = AttentionService::new(Arc::clone(&db));
+    let a = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
+    let b = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
     let now = now_rfc3339();
     let (run_a, run_b) = tokio::join!(a.sweep_once_at(&now), b.sweep_once_at(&now));
     assert_eq!(
@@ -3004,7 +3118,10 @@ async fn audit2_responder_read_failure_keeps_existing_deferral() {
     // The unreadable responder fails only this Project's scope: the sweep
     // still succeeds, nothing is dead-lettered, and the blocker stays open
     // for the next sweep.
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
     assert_eq!(turns(&f).await, 0);
     let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_dead_letter")
@@ -3052,10 +3169,13 @@ async fn conflict_hotspot_wake_routes_to_project_agent_with_bounded_directive() 
         })
         .await
         .unwrap();
-    AttentionService::new(Arc::clone(&fixture.db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&fixture.db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     let admitted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted' AND scope_type = 'project' AND scope_id = ?")
         .bind(&fixture.project_id).fetch_one(fixture.db.pool()).await.unwrap();
     assert_eq!(admitted, 1);
@@ -3157,10 +3277,13 @@ async fn audit39b_refresh_before_delivery_loses_the_only_wake() {
     let fixture = chat_turn_fixture().await;
     audit39b_detection(&fixture, "src/shared.rs", 3).await;
     audit39b_detection(&fixture, "src/shared.rs", 4).await;
-    AttentionService::new(Arc::clone(&fixture.db))
-        .project_once(100)
-        .await
-        .unwrap();
+    AttentionService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&fixture.db))),
+    )
+    .project_once(100)
+    .await
+    .unwrap();
     let detections: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE event_type = 'project.conflict_hotspot.detected'",
     )
@@ -3178,7 +3301,10 @@ async fn audit39b_refresh_before_delivery_loses_the_only_wake() {
 #[tokio::test]
 async fn audit39b_each_refresh_after_cooldown_rewakes_project_agent() {
     let fixture = chat_turn_fixture().await;
-    let attention = AttentionService::new(Arc::clone(&fixture.db));
+    let attention = AttentionService::new(
+        Arc::clone(&fixture.db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&fixture.db))),
+    );
     audit39b_detection(&fixture, "src/shared.rs", 3).await;
     attention.project_once(100).await.unwrap();
     for count in 4..=20 {
@@ -3215,7 +3341,10 @@ async fn audit39b_each_refresh_after_cooldown_rewakes_project_agent() {
 #[tokio::test]
 async fn wake_policy_persists_cooldown_budget_and_global_identity_suppression() {
     let f = chat_turn_fixture().await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     let t0 = chrono::Utc::now();
     let at = |seconds: i64| (t0 + chrono::Duration::seconds(seconds)).to_rfc3339();
     let a = incident(&f, "delivery_followup", "cooldown").await;
@@ -3336,7 +3465,10 @@ async fn stall_notices(f: &ChatTurnFixture) -> i64 {
 async fn infrastructure_failed_blocker_turn_is_readmitted_after_cooldown() {
     let f = chat_turn_fixture().await;
     incident(&f, "execution_failed", "outage").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let worker = AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(TransientWakeRunner));
     for _ in 0..3 {
@@ -3375,7 +3507,10 @@ async fn infrastructure_failed_blocker_turn_is_readmitted_after_cooldown() {
 async fn deterministic_blocker_failure_notifies_once_and_holds_until_the_profile_changes() {
     let f = chat_turn_fixture().await;
     incident(&f, "execution_failed", "auth").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     // A usage limit with no reset hint holds for an hour.
     AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(FailingWakeRunner))
@@ -3415,10 +3550,13 @@ async fn deterministic_blocker_failure_notifies_once_and_holds_until_the_profile
 async fn lease_expiry_refunds_are_capped_at_three_per_turn() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "delivery_followup", "crash-loop").await;
-    AttentionService::new(f.db.clone())
-        .admit_wake(wake_request(&f, &a, &now_rfc3339()))
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .admit_wake(wake_request(&f, &a, &now_rfc3339()))
+    .await
+    .unwrap();
     let worker = AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(FailingWakeRunner));
     let mut seen = Vec::new();
     for _ in 0..6 {
@@ -3469,7 +3607,10 @@ async fn small_wake_budget_shares_one_pool_across_categories() {
     .execute(f.db.pool())
     .await
     .unwrap();
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     for (category, key) in [
         ("decision_recorded", "decision"),
         ("delivery_followup", "delivery-1"),
@@ -3508,10 +3649,13 @@ async fn answer_by_resolve(f: &ChatTurnFixture, escalation: &api_types::ProjectE
             .await
             .unwrap()
             .unwrap();
-    AttentionService::new(f.db.clone())
-        .resolve(&f.account_id, &item.id, item.version)
-        .await
-        .unwrap();
+    AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    )
+    .resolve(&f.account_id, &item.id, item.version)
+    .await
+    .unwrap();
 }
 
 /// M4: a generic Resolve on an escalation item is the owner's answer: it
@@ -3520,7 +3664,10 @@ async fn answer_by_resolve(f: &ChatTurnFixture, escalation: &api_types::ProjectE
 async fn resolving_an_escalation_answers_it_and_never_strands_the_blocker() {
     let f = chat_turn_fixture().await;
     incident(&f, "execution_failed", "needs-owner").await;
-    let attention = AttentionService::new(f.db.clone());
+    let attention = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(attention.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let worker = AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(ProseOnlyWakeRunner));
     worker.run_once().await.unwrap();
@@ -3673,7 +3820,10 @@ async fn imported_blockers_get_one_batched_readmission_per_project() {
                 .execute(f.db.pool()).await.unwrap();
         }
     }
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 2);
     let wakes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM domain_event WHERE event_type = 'agent.wake.admitted'",
@@ -3729,7 +3879,10 @@ async fn recorded_task_transition_prevents_escalation_until_the_blocker_recurs()
         "inspect_run",
     )
     .await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     let transition_id = new_uuid_v4();
     f.db.append_event(CreateDomainEvent::task_transition(
@@ -3828,7 +3981,10 @@ async fn sweep_candidate_query_does_not_scan_dispositions() {
 async fn resolved_then_reopened_blocker_is_woken_again() {
     let f = chat_turn_fixture().await;
     let a = incident(&f, "execution_failed", "flaky").await;
-    let service = AttentionService::new(f.db.clone());
+    let service = AttentionService::new(
+        f.db.clone(),
+        Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+    );
     assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 1);
     AgentChatTurnWorker::with_runner(f.db.clone(), Arc::new(ProseOnlyWakeRunner))
         .run_once()
@@ -3925,7 +4081,10 @@ async fn a_subtask_blocker_under_a_lead_wakes_the_project_agent_only_after_the_r
             .execute(f.db.pool())
             .await
             .unwrap();
-        let service = AttentionService::new(f.db.clone());
+        let service = AttentionService::new(
+            f.db.clone(),
+            Arc::new(services::WakeTurnConsumer::new(f.db.clone())),
+        );
         let admitted = service.sweep_once_at(&now_rfc3339()).await.unwrap();
         if !with_lead {
             assert_eq!(
