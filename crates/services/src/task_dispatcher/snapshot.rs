@@ -507,6 +507,16 @@ impl TaskDispatcher {
                     {
                         f.terminal_execution = Some(e.id.clone());
                     }
+                    // Older retry admission committed metadata before its policy.
+                    // Recover that crash prefix even before the deadline: a
+                    // durable retry is not an owner's manual stop.
+                    if e.status == ExecutionStatus::Failed
+                        && metadata["last_execution_failure_execution_id"] == e.id
+                        && deferred_dispatch::pending_until(t).is_some()
+                        && matches!(e.resume_policy, None | Some(db::ResumePolicy::Manual))
+                    {
+                        f.terminal_execution = Some(e.id.clone());
+                    }
                     if settled && config_version == Some(project.version) {
                         f.human_wait = true;
                     }

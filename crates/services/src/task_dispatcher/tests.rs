@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use workspace::RepoCacheLockManager;
 
 use crate::{deferred_dispatch, ServiceError};
+use db::TaskStepRepo;
 
 use super::*;
 
@@ -6155,6 +6156,283 @@ async fn dispatcher_schedules_retry_for_unrecorded_failure_once() {
         .expect("task exists");
     assert_eq!(again.version, scheduled.version);
     assert!(rx.try_recv().is_err());
+}
+
+/// Crash after the retry metadata commits, before the separate execution
+/// resume-policy write. Startup must honor that durable retry, not mistake
+/// the failed execution's default policy for an owner's manual stop.
+#[tokio::test]
+async fn startup_recovers_retry_committed_before_resume_policy() {
+    for deadline in ["1970-01-01T00:00:00Z", "2099-01-01T00:00:00Z"] {
+        let db = Arc::new(sqlite_db().await);
+        let repo_dir = TempDir::new().unwrap();
+        let workspace_dir = TempDir::new().unwrap();
+        let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+        let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+        let task = seed_task(&db, &project_id, "crashed retry", "in_progress", 0).await;
+        assign_role(&db, &task.id, "coder", &agent_id).await;
+        let execution_id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
+        deferred_dispatch::set_with_mutations(
+            &db,
+            &task,
+            "in_progress",
+            deadline,
+            "usage limit; capacity retry (attempt 1)",
+            vec![db::TaskMetadataMutation::Set {
+                key: "last_execution_failure_execution_id".into(),
+                value: serde_json::json!(execution_id),
+            }],
+        )
+        .await
+        .unwrap();
+        // No old dispatcher/executor exists: this is exactly the durable prefix
+        // left when the process dies at the boundary above.
+        let (dispatcher, mut rx) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+        dispatcher.startup_reconcile().await.unwrap();
+        for _ in 0..3 {
+            dispatcher.check_once_and_drain().await.unwrap();
+        }
+        if deadline.starts_with("2099") {
+            assert!(rx.try_recv().is_err(), "the future deadline still holds");
+            let armed = db.schedule_wait_deadline(&task.id).await.unwrap().unwrap();
+            assert_eq!(
+                chrono::DateTime::parse_from_rfc3339(&armed).unwrap(),
+                chrono::DateTime::parse_from_rfc3339(deadline).unwrap()
+            );
+            let current = TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            deferred_dispatch::set(
+                &db,
+                &current,
+                "in_progress",
+                "1970-01-01T00:00:00Z",
+                "deadline expired",
+            )
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                dispatcher.check_once_and_drain().await.unwrap();
+            }
+        }
+        assert_eq!(
+            ExecutionRepo::count_by_task_and_role(&*db, &task.id, "coder")
+                .await
+                .unwrap(),
+            2
+        );
+        let ctx = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.task_id, task.id);
+        let task = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(deferred_dispatch::pending_until(&task).is_none());
+        assert_eq!(
+            ExecutionRepo::count_by_task_and_role(&*db, &task.id, "coder")
+                .await
+                .unwrap(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn retry_metadata_commits_automatic_resume_policy_atomically() {
+    let db = sqlite_db().await;
+    let repo_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let agent_id = seed_agent(&db, 1, DaemonStatus::Online, AgentStatus::Idle).await;
+    let task = seed_task(&db, &project_id, "atomic retry", "in_progress", 0).await;
+    assign_role(&db, &task.id, "coder", &agent_id).await;
+    let id = seed_failed_coder_execution(&db, &task.id, &project_id, &agent_id).await;
+    let execution = ExecutionRepo::get_by_id(&db, &id).await.unwrap().unwrap();
+    let project = ProjectRepo::get_by_id(&db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(deferred_dispatch::set_with_mutations_for_latest_execution(
+        &db,
+        &task,
+        db::LatestExecutionAuthority {
+            execution_id: id.clone(),
+            role: execution.role.clone(),
+            agent_id: execution.agent_id.clone(),
+            execution_updated_at: execution.updated_at.clone(),
+            expected_project_version: project.version,
+        },
+        "in_progress",
+        "2099-01-01T00:00:00Z",
+        "usage limit",
+        vec![db::TaskMetadataMutation::Set {
+            key: "last_execution_failure_execution_id".into(),
+            value: serde_json::json!(id),
+        }],
+    )
+    .await
+    .unwrap());
+    // No service-level execution update has run: the admission's commit alone
+    // must include the policy that makes its deadline actionable.
+    let execution = ExecutionRepo::get_by_id(&db, &id).await.unwrap().unwrap();
+    assert_eq!(execution.resume_policy, Some(ResumePolicy::Auto));
+}
+
+async fn refuse_subtask_merge_target(db: &db::SqliteDb, project_id: &str) {
+    let mut workflow = WorkflowEngine::resolve_workflow("{}");
+    let index = workflow
+        .states
+        .iter()
+        .position(|s| s.name == "merging")
+        .unwrap();
+    let mut merging = workflow.states.remove(index);
+    merging.triggers.remove(&api_types::WorkflowTrigger::Accept);
+    // No implicit next-state Accept either: every named state is valid, but
+    // this merge state has no landed-merge edge and refuses the fallback Done.
+    workflow.states.push(merging);
+    let project = ProjectRepo::get_by_id(db, project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_workflow(
+        db,
+        project_id,
+        &serde_json::to_string(&workflow).unwrap(),
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn subtask_merge_transition_refusal_parks_at_the_step_attempt_bound() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let root = seed_task(&db, &project_id, "root", "in_progress", 0).await;
+    let child = seed_subtask(&db, &root, "refused child", "merging", 0).await;
+    refuse_subtask_merge_target(&db, &project_id).await;
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    for attempt in 1..=crate::worker_runtime::queue::MAX_STEP_ATTEMPTS {
+        let current = TaskRepo::get_by_id(&*db, &child.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = dispatcher
+            .task_service
+            .reconcile_integration_admission(&current)
+            .await;
+        if attempt < crate::worker_runtime::queue::MAX_STEP_ATTEMPTS {
+            assert!(result.is_err(), "attempt {attempt}: {result:?}");
+            assert!(TaskRepo::get_by_id(&*db, &child.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .blocked_json
+                .is_none());
+        } else {
+            assert!(!result.unwrap(), "the bound records a park");
+        }
+    }
+    let parked = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(parked.condition, db::TaskCondition::Parked { .. }));
+    assert!(parked
+        .blocked_json
+        .as_deref()
+        .unwrap()
+        .contains("integration_admission_failed"));
+    let before = db.task_steps(&child.id).await.unwrap().len();
+    for _ in 0..3 {
+        dispatcher.check_once_and_drain().await.unwrap();
+    }
+    assert_eq!(
+        db.task_steps(&child.id).await.unwrap().len(),
+        before,
+        "the dispatcher stops asking"
+    );
+    let offers = dispatcher
+        .task_service
+        .task_action_offers(&child.id, &Actor::user(api_types::UserActionSource::Api))
+        .await
+        .unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .any(|o| o.action.verb() == "retry"));
+    let cancel = offers
+        .available_actions
+        .iter()
+        .find(|o| o.action.verb() == "cancel")
+        .unwrap();
+    dispatcher
+        .task_service
+        .perform_task_action(&child.id, cancel.action.clone(), offers.version)
+        .await
+        .unwrap();
+    assert_eq!(
+        TaskRepo::get_by_id(&*db, &child.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+}
+
+#[tokio::test]
+async fn subtask_merge_transition_success_on_second_pass_does_not_park() {
+    let db = Arc::new(sqlite_db().await);
+    let repo_dir = TempDir::new().unwrap();
+    let workspace_dir = TempDir::new().unwrap();
+    let (project_id, _) = seed_project_repo(&db, repo_dir.path()).await;
+    let root = seed_task(&db, &project_id, "root", "in_progress", 0).await;
+    let child = seed_subtask(&db, &root, "transient refusal", "merging", 0).await;
+    refuse_subtask_merge_target(&db, &project_id).await;
+    let (dispatcher, _) = build_dispatcher(Arc::clone(&db), workspace_dir.path()).await;
+    assert!(dispatcher
+        .task_service
+        .reconcile_integration_admission(&child)
+        .await
+        .is_err());
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectRepo::update_workflow(
+        &*db,
+        &project_id,
+        "{}",
+        None,
+        project.version,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let current = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(dispatcher
+        .task_service
+        .reconcile_integration_admission(&current)
+        .await
+        .unwrap());
+    dispatcher.task_service.drain(&child.id).await.unwrap();
+    let child = TaskRepo::get_by_id(&*db, &child.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.status, "done");
+    assert!(child.blocked_json.is_none());
 }
 
 async fn seed_environment_pause(

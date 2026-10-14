@@ -1,5 +1,35 @@
 use super::*;
 
+/// Explicit prerequisites and the hierarchy's completion/order waits form
+/// one graph. The writer transaction also fences a concurrent reorder.
+pub(super) async fn dependency_cycle_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task_id: &str,
+    candidate: Option<&str>,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "WITH RECURSIVE live AS (
+            SELECT id,parent_task_id,subtask_order,created_at FROM task
+            WHERE deleted_at IS NULL AND json_extract(condition_json,'$.kind') != 'settled'
+         ), ordered AS (
+            SELECT *,ROW_NUMBER() OVER(PARTITION BY parent_task_id ORDER BY subtask_order,created_at,id) AS position
+            FROM live WHERE parent_task_id IS NOT NULL
+         ), edges(from_id,from_phase,to_id,to_phase) AS (
+            SELECT d.task_id,'start',d.depends_on_id,'done' FROM task_dependency d
+            JOIN live t ON t.id=d.task_id JOIN live p ON p.id=d.depends_on_id
+            UNION SELECT id,'done',id,'start' FROM live
+            UNION SELECT child.id,'start',parent.id,'start' FROM live parent JOIN live child ON child.parent_task_id=parent.id
+            UNION SELECT parent.id,'done',child.id,'done' FROM live parent JOIN live child ON child.parent_task_id=parent.id
+            UNION SELECT later.id,'start',earlier.id,'done' FROM ordered later JOIN ordered earlier
+              ON later.parent_task_id=earlier.parent_task_id AND later.position=earlier.position+1
+         ), reachable(id,phase) AS (
+            SELECT to_id,to_phase FROM edges WHERE from_id=?1 AND from_phase='start'
+            UNION SELECT id,'done' FROM live WHERE id=?2
+            UNION SELECT e.to_id,e.to_phase FROM edges e JOIN reachable r ON e.from_id=r.id AND e.from_phase=r.phase
+         ) SELECT EXISTS(SELECT 1 FROM reachable WHERE id=?1 AND phase='start')"
+    ).bind(task_id).bind(candidate).fetch_one(&mut **tx).await?)
+}
+
 #[async_trait]
 impl TaskDependencyRepo for SqliteDb {
     async fn add_dependency(&self, task_id: &str, depends_on_id: &str, now: &str) -> Result<()> {
@@ -21,19 +51,7 @@ impl TaskDependencyRepo for SqliteDb {
             return Err(DbError::CycleDetected);
         }
 
-        let cycle_count = sqlx::query_scalar::<_, i64>(
-            "WITH RECURSIVE reachable(id) AS (
-                SELECT depends_on_id FROM task_dependency WHERE task_id = ?
-                UNION
-                SELECT td.depends_on_id FROM task_dependency td JOIN reachable r ON td.task_id = r.id
-            )
-            SELECT COUNT(*) FROM reachable WHERE id = ?",
-        )
-        .bind(depends_on_id)
-        .bind(task_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if cycle_count > 0 {
+        if dependency_cycle_in_tx(transaction, task_id, Some(depends_on_id)).await? {
             return Err(DbError::CycleDetected);
         }
 

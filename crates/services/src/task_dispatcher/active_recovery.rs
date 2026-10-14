@@ -660,7 +660,6 @@ impl TaskDispatcher {
             || !crate::task_service::execution::should_block_task_for_failed_execution(execution)
             || role_name == crate::workflow::default_roles::REVIEWER
             || helpers::has_blocking_annotation(task)
-            || deferred_dispatch::is_pending(task, chrono::Utc::now())
         {
             return Ok(ReviewerReconciliation::None);
         }
@@ -676,6 +675,39 @@ impl TaskDispatcher {
             .as_deref()
             == Some(execution.id.as_str());
         if retry_recorded {
+            if deferred_dispatch::pending_until(task).is_some()
+                && matches!(
+                    execution.resume_policy,
+                    None | Some(db::ResumePolicy::Manual)
+                )
+                && crate::task_service::execution::execution_belongs_to_current_state_entry(
+                    &self.db, task, execution,
+                )
+                .await?
+            {
+                let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                if self
+                    .db
+                    .restore_recorded_execution_retry(
+                        &task.id,
+                        db::LatestExecutionAuthority {
+                            execution_id: execution.id.clone(),
+                            role: execution.role.clone(),
+                            agent_id: execution.agent_id.clone(),
+                            execution_updated_at: execution.updated_at.clone(),
+                            expected_project_version: project.version,
+                        },
+                    )
+                    .await?
+                {
+                    return Ok(ReviewerReconciliation::Reconciled);
+                }
+            }
+            return Ok(ReviewerReconciliation::None);
+        }
+        if deferred_dispatch::is_pending(task, chrono::Utc::now()) {
             return Ok(ReviewerReconciliation::None);
         }
         if helpers::has_running_execution_for_roles(

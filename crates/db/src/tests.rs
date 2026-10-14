@@ -9889,6 +9889,87 @@ async fn test_add_dependency_cycle_rejected() {
     assert!(matches!(result, Err(DbError::CycleDetected)));
 }
 
+/// The first child's retry needs its prerequisites before it runs again;
+/// the later child cannot run until that first child completes. These
+/// implicit sequence edges belong in cycle admission just like explicit ones.
+#[tokio::test]
+async fn dependency_cycles_include_ordered_siblings_and_reordering() {
+    let db = sqlite_db().await;
+    let now = now_rfc3339();
+    let (project_id, _, _) = seed_project_repo_agent(&db).await;
+    let root = seed_task(&db, &project_id, None, "in_progress".into(), "root").await;
+    let first = seed_task(
+        &db,
+        &project_id,
+        None,
+        "in_progress".into(),
+        "retrying first",
+    )
+    .await;
+    let later = seed_task(&db, &project_id, None, "todo".into(), "later").await;
+    let external = seed_task(&db, &project_id, None, "todo".into(), "external").await;
+    for (id, order) in [(&first, 0), (&later, 1)] {
+        sqlx::query("UPDATE task SET parent_task_id=?, subtask_order=? WHERE id=?")
+            .bind(&root)
+            .bind(order)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        TaskDependencyRepo::add_dependency(&db, &first, &later, &now).await,
+        Err(DbError::CycleDetected)
+    ));
+    assert!(TaskDependencyRepo::list_dependencies(&db, &first)
+        .await
+        .unwrap()
+        .is_empty());
+    TaskDependencyRepo::add_dependency(&db, &first, &external, &now)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            TaskDependencyRepo::add_dependency(&db, &external, &later, &now).await,
+            Err(DbError::CycleDetected)
+        ),
+        "transitive dependency plus sibling order is also a cycle"
+    );
+    TaskDependencyRepo::remove_dependency(&db, &first, &external)
+        .await
+        .unwrap();
+    TaskDependencyRepo::add_dependency(&db, &later, &first, &now)
+        .await
+        .unwrap();
+    assert!(matches!(
+        TaskRepo::reorder_subtasks(&db, &root, &[later.clone(), first.clone()], &now).await,
+        Err(DbError::CycleDetected)
+    ));
+    let children = TaskRepo::list_subtasks_ordered(&db, &root).await.unwrap();
+    assert_eq!(
+        children.iter().map(|t| &t.id).collect::<Vec<_>>(),
+        [&first, &later],
+        "refused reordering rolls back"
+    );
+    assert!(
+        matches!(
+            TaskDependencyRepo::add_dependency(&db, &root, &first, &now).await,
+            Err(DbError::CycleDetected)
+        ),
+        "planning cannot wait on a child that needs the parent to start"
+    );
+    TaskDependencyRepo::add_dependency(&db, &root, &external, &now)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            TaskDependencyRepo::add_dependency(&db, &external, &first, &now).await,
+            Err(DbError::CycleDetected)
+        ),
+        "the parent-start wait also closes transitive cycles"
+    );
+}
+
 #[tokio::test]
 async fn test_dependency_gate_blocks_non_context_holder() {
     let db = sqlite_db().await;

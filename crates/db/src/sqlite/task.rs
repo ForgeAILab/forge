@@ -6,6 +6,64 @@ use crate::{
 };
 use std::collections::HashSet;
 
+async fn restore_recorded_retry_policy_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &Task,
+    metadata: &TaskMetadata,
+    authority: &LatestExecutionAuthority,
+    updated_at: &str,
+) -> Result<bool> {
+    if metadata
+        .extra
+        .get("last_execution_failure_execution_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(authority.execution_id.as_str())
+        || metadata
+            .extra
+            .get("deferred_dispatch")
+            .and_then(|retry| retry.get("target_state"))
+            .and_then(serde_json::Value::as_str)
+            != Some(task.status.as_str())
+    {
+        return Ok(false);
+    }
+    Ok(sqlx::query("UPDATE execution SET resume_policy='auto', updated_at=? WHERE id=? AND task_id=? AND status='failed' AND (resume_policy IS NULL OR resume_policy='manual')")
+        .bind(updated_at).bind(&authority.execution_id).bind(&task.id)
+        .execute(&mut **tx).await?.rows_affected() > 0)
+}
+
+impl SqliteDb {
+    /// Heal a pre-atomic retry admission left by a crash. The exact retry,
+    /// current execution and current assignment/Project authority must agree.
+    pub async fn restore_recorded_execution_retry(
+        &self,
+        task_id: &str,
+        authority: LatestExecutionAuthority,
+    ) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.fence_current_step_in_tx(&mut tx).await?;
+        let task = self
+            .get_task_in_tx(&mut tx, task_id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if !latest_execution_authority_matches_in_tx(&mut tx, &task, &authority).await? {
+            return Ok(false);
+        }
+        let metadata = TaskMetadata::parse(task.metadata_json.as_deref())
+            .map_err(|error| DbError::Check(format!("invalid task metadata: {error}")))?;
+        let changed = restore_recorded_retry_policy_in_tx(
+            &mut tx,
+            &task,
+            &metadata,
+            &authority,
+            &crate::now_rfc3339(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+}
+
 // Existing Project and Task/state/time indexes bound the seek before parsing.
 // One query supplies every eligible path; UTC RFC3339 bounds match DB writers.
 pub const CONFLICT_HANDOFF_QUERY: &str =
@@ -1381,6 +1439,16 @@ impl TaskRepo for SqliteDb {
                 return Err(DbError::NotFound);
             }
         }
+        // A new order cannot make an earlier child depend (even transitively)
+        // on one that the same order requires to wait for it. Roll back the
+        // whole order if the implicit waits close a prerequisite cycle.
+        for task_id in ordered_ids {
+            if super::task_dependency::dependency_cycle_in_tx(&mut transaction, task_id, None)
+                .await?
+            {
+                return Err(DbError::CycleDetected);
+            }
+        }
         // Child witnesses follow the sequence order.
         crate::task_condition::produce_children(&mut transaction, parent_task_id).await?;
 
@@ -2073,6 +2141,16 @@ impl TaskRepo for SqliteDb {
             changed |=
                 apply_task_mutation(&mut transaction, &task.id, &mut metadata, mutation).await?;
         }
+        // Retry admission and its resume policy are one durable effect. A
+        // process crash must not leave a deferred Task behind a manual stop.
+        changed |= restore_recorded_retry_policy_in_tx(
+            &mut transaction,
+            &task,
+            &metadata,
+            &authority,
+            updated_at,
+        )
+        .await?;
         if !changed {
             transaction.commit().await?;
             return Ok(Some(task));

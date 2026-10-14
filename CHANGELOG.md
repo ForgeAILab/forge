@@ -3290,6 +3290,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A subtask that cannot leave its merge state stops automatic reconciliation
+  after eight failed Task-step attempts in that entry and shows the existing
+  integration-admission failure park with owner recovery actions.
+
+- Dependency admission and subtask reordering now check implicit sibling-order
+  and parent-completion waits as well as explicit prerequisites, preventing
+  an earlier subtask from waiting on a later one that cannot start.
+
+- Execution retry admission now commits its automatic resume policy with the
+  durable deadline. Startup also repairs a retry committed by an older build
+  before that policy write, so usage-limit retries survive a crash.
+
 - Startup reconciliation retires obsolete machine/Project capacity waits when
   the assigned Agent is unavailable, including a paused Agent whose last run
   was cancelled by crash recovery. The Task names the Agent that can unblock it.

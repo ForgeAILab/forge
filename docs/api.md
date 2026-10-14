@@ -3136,7 +3136,11 @@ execution, never a `coder` execution.
 Dependency IDs describe a separate prerequisite DAG. They gate dispatch until
 each named prerequisite reaches `done`; they do not create parent/child
 hierarchy and never imply workspace sharing. Dependency edges are same-Project
-and acyclic. Forge rejects a child that lists its coordination parent as a
+and acyclic, including the implicit completion waits imposed by parentage and
+sibling order. An earlier subtask cannot depend, directly or through another
+Task, on a later sibling that must wait for it. Reordering is refused with the
+existing cycle error if the resulting order closes such a cycle; no links or
+partial order changes are committed. Forge rejects a child that lists its coordination parent as a
 dependency. A dependency edge between independent roots or between siblings
 does not merge their workspaces, and changing subtask order does not rewrite
 dependency edges. Cancelling a prerequisite projects a durable blocker onto
