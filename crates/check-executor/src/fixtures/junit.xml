@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<testsuites name="vitest tests" tests="2" failures="2" errors="0" time="0.003787">
+    <testsuite name="parser.test.js" timestamp="2026-10-15T09:55:04.237Z" hostname="Michaels-Mac-mini.local" tests="2" failures="2" errors="0" skipped="0" time="0.003787">
+        <testcase classname="parser.test.js" name="parser &gt; empty input" time="0.002429916">
+            <failure message="expected &apos;&apos; to be &apos;value&apos; // Object.is equality" type="AssertionError">
+AssertionError: expected &apos;&apos; to be &apos;value&apos; // Object.is equality
+
+- Expected
++ Received
+
+- value
+
+ ❯ parser.test.js:2:65
+            </failure>
+        </testcase>
+        <testcase classname="parser.test.js" name="parser &gt; unicode input" time="0.000796875">
+            <failure message="expected &apos;猫&apos; to be &apos;dog&apos; // Object.is equality" type="AssertionError">
+AssertionError: expected &apos;猫&apos; to be &apos;dog&apos; // Object.is equality
+
+Expected: &quot;dog&quot;
+Received: &quot;猫&quot;
+
+ ❯ parser.test.js:2:121
+            </failure>
+        </testcase>
+    </testsuite>
+</testsuites>

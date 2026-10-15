@@ -36,6 +36,13 @@ pub struct CheckCommandReceipt {
     pub duration_ms: u64,
     pub stdout_tail: String,
     pub stderr_tail: String,
+    /// Normalised failing test identities, collected before output tails are cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub failures_truncated: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     /// The command finished while something outside its process group still

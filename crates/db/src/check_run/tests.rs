@@ -87,6 +87,8 @@ fn evidence(outcome: CheckResultOutcome, cleanup: CheckCleanup) -> CheckResultEv
         outcome,
         cleanup,
         commands: vec![CheckCommandOutcome {
+            failures: vec![],
+            failures_truncated: false,
             index: 0,
             command: "cargo test".into(),
             exit_code: if outcome == CheckResultOutcome::Pass {
@@ -356,6 +358,8 @@ async fn a_long_bundle_shrinks_its_tails_to_fit_the_row_instead_of_refusing_to_s
     let step = output.commands[0].clone();
     output.commands = (0..64)
         .map(|index| CheckCommandOutcome {
+            failures: vec![],
+            failures_truncated: false,
             index,
             output_tail: "o".repeat(CHECK_OUTPUT_TAIL_BYTES),
             stderr_tail: format!("{}end-{index}", "e".repeat(CHECK_OUTPUT_TAIL_BYTES)),
@@ -2596,4 +2600,49 @@ async fn an_integration_consumer_withdrawn_under_its_head_waits_again_on_a_fresh
         .unwrap()
         .cancelled_at
         .is_some());
+}
+
+#[tokio::test]
+async fn failure_signature_lists_are_capped_redacted_and_fit_aggregate_row_budget() {
+    let db = fixture().await;
+    let mut req = request("signatures");
+    let template = req.identity.inputs.spec.commands[0].clone();
+    req.identity.inputs.spec.commands = (0..32)
+        .map(|index| CheckCommandSpec {
+            id: format!("ci:{index}"),
+            ..template.clone()
+        })
+        .collect();
+    req.identity.inputs.spec.configured_commands = 32;
+    let run = cleaning(&db, req).await;
+    let mut output = evidence(CheckResultOutcome::Fail, CheckCleanup::Success);
+    let template = output.commands[0].clone();
+    output.commands = (0..32)
+        .map(|index| CheckCommandOutcome {
+            index,
+            failures: (0..201)
+                .map(|test| format!("private-value/{test:03}/{}", "猫".repeat(301)))
+                .collect(),
+            ..template.clone()
+        })
+        .collect();
+    output.redaction_values = vec!["private-value".into()];
+    let result = db
+        .finish_check_run(&fence(&run), output, NOW)
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, CheckResultOutcome::Fail);
+    assert_eq!(result.commands.len(), 32);
+    let json = serde_json::to_string(&result.commands).unwrap();
+    assert!(json.len() <= CHECK_STEPS_BYTES);
+    assert!(!json.contains("private-value"));
+    for step in result.commands {
+        assert!(step.failures_truncated);
+        assert!(!step.failures.is_empty() && step.failures.len() <= 200);
+        assert!(step
+            .failures
+            .iter()
+            .all(|signature| signature.chars().count() <= 300));
+        assert!(step.failures[0].contains("[REDACTED]"));
+    }
 }

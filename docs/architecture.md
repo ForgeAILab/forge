@@ -7560,6 +7560,7 @@ and are not budget counters.
 | Kind | Standard allowance | Natural window / charge |
 |---|---|---|
 | Review | 2 failures, 1 routed bounce (fallback/autonomous limit 3) | Review origin window; failed verdict and existing charged gate outcome |
+| RepairNoChange | 1 reminder, then owner park | Review origin window; unchanged clean candidate at the end of a coder repair |
 | GateRejection(state) | Planning 2; merging 1; cancelled review entry `max_rejections - 1`; custom gate limit | Matching gate; rejected transition |
 | MergeFix | 1 ordinary repair; 0 disables | Merging origin window; ordinary repair transition |
 | Execution | 3 additional automatic failure retries | Explicit reset window; failure-driven retry scheduling |
@@ -8962,7 +8963,19 @@ the primitive still supports exact detached checkouts for commit-scoped callers.
 
 Each command runs through `process-supervisor`, the single process-group
 implementation shared with Git. It continuously drains both pipes, retains
-bounded redacted UTF-8 tails and sets truncation flags. Output size cannot fail a
+bounded redacted UTF-8 tails and sets truncation flags. Synchronous byte observers
+feed line extractors before tail truncation; streaming ANSI removal precedes the
+text budget. Cargo test, vitest/jest, pytest and Go failures become normalised
+identities (up to 200 per command, 300 Unicode characters each, deduplicated).
+Each command gets an isolated `FORGE_CI_REPORT_DIR` under the reserved Task root
+(or an owner temporary directory when no Task root exists); failed and errored
+JUnit cases in XML reports there contribute identities before the directory is
+removed. Reports never change exit verdicts. Optional `failures` and
+`failures_truncated` flow through owner receipts, durable results and Review
+steps; default-empty/default-false values are omitted, preserving historical
+JSON and older-daemon receipts. If all step signatures would exceed the durable
+256 KiB row budget after tails are cut, signature lists are reduced with
+`failures_truncated` set, so evidence volume cannot prevent settlement. Output size cannot fail a
 check. The command limit is clamped to the remaining absolute run deadline;
 wall exhaustion is `timed_out`. Cancellation, timeout and dropped futures stop
 the entire group with SIGTERM, a 500 ms grace period, then SIGKILL; the leader is
@@ -9630,6 +9643,20 @@ canonical request. No result was ever stored under `canonical-ci/1` before
 this definition, so the policy revision stays `1`.
 
 #### Review-entry CI on the check runner (3.3 stage D part 2)
+
+Before configurable entry hooks, a persistent no-change guard compares the clean
+workspace HEAD on its placement owner with the latest failed Review's judged
+commit in the current Review budget window. It applies after a completed coder
+repair, and exempts owner-started moves and owner-requested re-reviews. The first
+unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate's
+reject target with a brief headed "No change since review N". A second parks
+`review_needs_owner` with `no change after repair round`. Neither creates a
+Review, starts checks or a reviewer, nor charges Review or gate-rejection
+budgets. Dirty worktrees and changed commits continue through ordinary review.
+The decision and reminder debit share an authority-fenced checkpoint at reserved
+index -1, before Project hook ordinals, so crash resumption cannot debit twice or
+reconsider an entry whose checks already started. Explicit retry-window resets
+reset this allowance with Review; ordinary review laps do not.
 
 `run_ci_steps` no longer runs commands. In its hooks step it
 

@@ -1360,3 +1360,77 @@ fn a_returned_step_carries_the_leads_findings_into_the_implementation_prompt() {
         .user;
     assert!(!user.contains("returned it"));
 }
+
+#[test]
+fn coder_prompt_ci_follow_up_lists_signatures_for_every_failing_step() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"ci_steps":[
+            {"index":0,"command":"cargo test","exit_code":1,"output_tail":"rust failure","failures":["parser::empty", "parser::unicode"]},
+            {"index":1,"command":"true","exit_code":0,"failures":["must not appear"]},
+            {"index":2,"command":"pnpm test","exit_code":1,"stderr_tail":"web failure","failures":["web > input"]},
+            {"index":3,"command":"unknown-runner","exit_code":2,"stderr_tail":"unknown failure"}
+        ]}).to_string(),
+        ..fake_review(2, db::ReviewStatus::Failed)
+    }];
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2).build(&ctx);
+    for expected in [
+        "cargo test",
+        "parser::empty",
+        "parser::unicode",
+        "pnpm test",
+        "web > input",
+        "unknown-runner",
+        "rust failure",
+        "web failure",
+        "unknown failure",
+    ] {
+        assert!(
+            prompt.user.contains(expected),
+            "missing {expected}: {}",
+            prompt.user
+        );
+    }
+    assert!(!prompt.user.contains("must not appear"));
+}
+
+#[test]
+fn coder_prompt_ci_signatures_have_per_step_display_limit() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"ci_steps":[{"command":"test","exit_code":1,"failures":(0..23).map(|n| format!("signature-{n:03}")).collect::<Vec<_>>(),"failures_truncated":true}]}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2).build(&ctx);
+    assert!(prompt.user.contains("signature-019"));
+    assert!(!prompt.user.contains("signature-020"));
+    assert!(prompt.user.contains("+3 more"));
+    assert!(prompt
+        .user
+        .contains("Additional failure signatures were truncated"));
+}
+
+#[test]
+fn coder_prompt_no_change_brief_precedes_prior_ci_feedback() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.transition_log.push(db::TransitionLog {
+        id: "no-change".into(),
+        task_id: ctx.task.id.clone(),
+        from_state: "review".into(),
+        to_state: ctx.state_name.clone(),
+        triggered_by: "system:workflow".into(),
+        trigger_name: None,
+        bridge: api_types::TransitionBridge::recovery("repair_no_change", false),
+        trigger_reason: "No change since review 2\nCommit the repair before resubmitting.".into(),
+        rejection: false,
+        created_at: db::now_rfc3339(),
+        hook_results_json: None,
+    });
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let prompt = resolve_prompt_builder(builder).build(&ctx);
+        assert!(prompt.user.starts_with("No change since review 2\n"));
+    }
+}

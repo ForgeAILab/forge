@@ -326,6 +326,11 @@ pub struct CheckCommandOutcome {
     pub command: String,
     pub exit_code: i32,
     pub stderr_tail: String,
+    /// Normalised failing test identities, collected before output tails are cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failures_truncated: bool,
     pub output_tail: String,
     pub started_at: String,
     pub finished_at: String,

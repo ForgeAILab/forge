@@ -10,6 +10,8 @@ use std::collections::HashMap;
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Review,
+    /// One reminder per Review window when a coder returns the same clean HEAD.
+    RepairNoChange,
     GateRejection,
     MergeFix,
     Execution,
@@ -31,8 +33,9 @@ pub enum Kind {
     Replan,
 }
 impl Kind {
-    pub const PERSISTED: [Self; 9] = [
+    pub const PERSISTED: [Self; 10] = [
         Self::Review,
+        Self::RepairNoChange,
         Self::MergeFix,
         Self::Execution,
         Self::WorkflowGuard,
@@ -45,6 +48,7 @@ impl Kind {
     pub fn key(self) -> &'static str {
         match self {
             Self::Review => "review",
+            Self::RepairNoChange => "repair_no_change",
             Self::GateRejection => "gate",
             Self::MergeFix => "merge_fix",
             Self::Execution => "execution",
@@ -62,7 +66,7 @@ impl Kind {
     pub const fn default_limit(self) -> i32 {
         match self {
             Self::Review | Self::Execution | Self::WorkflowGuard => 3,
-            Self::MergeFix | Self::AutomaticReviewRecovery => 1,
+            Self::MergeFix | Self::AutomaticReviewRecovery | Self::RepairNoChange => 1,
             Self::GateRejection => i32::MAX,
             Self::TargetMovedRebase
             | Self::ConflictHandoff
@@ -77,6 +81,104 @@ impl Kind {
         matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
     }
 }
+/// Reserved checkpoint before configurable review-entry hooks. Negative keeps
+/// every existing Project hook ordinal stable, including suspended entries.
+pub const REPAIR_NO_CHANGE_CHECKPOINT: i64 = -1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RepairNoChangeDecision {
+    Continue,
+    SendBack { attempt: i64 },
+    Park,
+}
+
+/// The latest failed Review in the current Review budget window and the commit
+/// it judged. Frozen reviewer contracts take precedence over entry CI evidence,
+/// then delivery evidence supports historical rows without either.
+pub async fn failed_review_for_no_change(
+    db: &SqliteDb,
+    task: &str,
+) -> Result<Option<(Review, Option<String>)>> {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT r.id, COALESCE(
+            CASE WHEN json_valid(r.step_results_json) THEN json_extract(r.step_results_json,'$.conformance.contract.commit_sha') END,
+            (SELECT cr.commit_sha FROM check_consumer c JOIN check_run cr ON cr.id=c.run_id
+             WHERE c.task_id=r.task_id AND c.origin='entry'
+               AND c.request_key='task-step/1|entry|'||r.task_id||'|'||c.status_epoch||'|'||r.id
+             ORDER BY c.created_at DESC,c.id DESC LIMIT 1),
+            e.after_sha)
+         FROM review r JOIN execution e ON e.id=r.execution_id
+         LEFT JOIN task_budget b ON b.task_id=r.task_id AND b.kind='review'
+         LEFT JOIN transition_log boundary ON boundary.id=b.window_id AND boundary.task_id=r.task_id
+         WHERE r.task_id=? AND r.status='failed'
+           AND (boundary.id IS NULL OR r.created_at >= boundary.created_at)
+         ORDER BY r.attempt_number DESC,r.id DESC LIMIT 1",
+    ).bind(task).fetch_optional(db.pool()).await?;
+    match row {
+        Some((id, head)) => Ok(crate::ReviewRepo::get_by_id(db, &id)
+            .await?
+            .map(|review| (review, head))),
+        None => Ok(None),
+    }
+}
+
+/// Save the guard's decision and its one allowed reminder charge together.
+/// A replay returns that decision before checking mutable Git state again.
+pub async fn settle_repair_no_change(
+    db: &SqliteDb,
+    task: &Task,
+    step: &crate::TaskStep,
+    unchanged_attempt: Option<i64>,
+) -> Result<RepairNoChangeDecision> {
+    let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_hook_in_tx(&mut tx, step).await?;
+    let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND version=? AND status=? AND deleted_at IS NULL)")
+        .bind(&task.id).bind(task.version).bind(&task.status).fetch_one(&mut *tx).await?;
+    if !current {
+        return Err(DbError::VersionConflict);
+    }
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT result_json FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?",
+    )
+    .bind(&step.id)
+    .bind(REPAIR_NO_CHANGE_CHECKPOINT)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    if let Some(recorded) = recorded {
+        return serde_json::from_str(&recorded).map_err(|error| DbError::Check(error.to_string()));
+    }
+    let decision = match unchanged_attempt {
+        None => RepairNoChangeDecision::Continue,
+        Some(attempt) => {
+            let window: String = sqlx::query_scalar("SELECT COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='review'),'initial')")
+                .bind(&task.id).fetch_one(&mut *tx).await?;
+            reset(&mut tx, &task.id, Kind::RepairNoChange.key(), &window).await?;
+            let charge = charge(
+                &mut tx,
+                &task.id,
+                Kind::RepairNoChange.key(),
+                i64::from(Kind::RepairNoChange.default_limit()),
+                &format!("entry:{}", step.id),
+            )
+            .await?;
+            if charge.charged {
+                RepairNoChangeDecision::SendBack { attempt }
+            } else {
+                RepairNoChangeDecision::Park
+            }
+        }
+    };
+    sqlx::query("UPDATE task_hook_checkpoint SET result_json=? WHERE step_id=? AND hook_index=?")
+        .bind(serde_json::to_string(&decision).map_err(|error| DbError::Check(error.to_string()))?)
+        .bind(&step.id)
+        .bind(REPAIR_NO_CHANGE_CHECKPOINT)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(decision)
+}
+
 /// Bounds on what a coordination root's lead may repeat. The rows live on
 /// the ROOT under these keys, in the root's budget window: only a Retry with
 /// a new budget on the root (the owner's or the Project Agent's) opens a new

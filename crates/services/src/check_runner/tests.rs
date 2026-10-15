@@ -91,6 +91,8 @@ async fn settle(
                 outcome,
                 cleanup,
                 commands: vec![CheckCommandOutcome {
+                    failures: vec![],
+                    failures_truncated: false,
                     index: 0,
                     command: "true".into(),
                     exit_code: if outcome == CheckResultOutcome::Pass {
@@ -404,6 +406,8 @@ fn receipt(record: &CheckWorkerRecord) -> CheckReceipt {
             .commands
             .iter()
             .map(|command| CheckCommandReceipt {
+                failures: vec![],
+                failures_truncated: false,
                 id: command.id.clone(),
                 command: command.shell_text.clone(),
                 exit_code: Some(0),
@@ -3515,4 +3519,91 @@ async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
     assert!(on.identity.inputs.reusable_inputs());
     assert_eq!(on.identity.inputs, off.identity.inputs);
     assert_eq!(on.identity.key().unwrap(), off.identity.key().unwrap());
+}
+
+#[tokio::test]
+async fn older_daemon_receipt_without_failures_round_trips_and_certifies() {
+    let (_temp, store, runner) = fixture().await;
+    let run = scheduled(
+        runner
+            .request(cacheable_request("older-daemon"))
+            .await
+            .unwrap(),
+    );
+    let run = admit(&store, &run).await;
+    let deadline = store
+        .check_worker_record(&run.id)
+        .await
+        .unwrap()
+        .deadline_at
+        .unwrap();
+    store
+        .record_check_dispatch(&fence(&run), &intent(), &db::now_rfc3339(), &deadline)
+        .await
+        .unwrap();
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    let old = receipt(&record);
+    let json = serde_json::to_string(&old).unwrap();
+    assert!(!json.contains("failures"));
+    let restored: CheckReceipt = serde_json::from_str(&json).unwrap();
+    assert!(restored.commands[0].failures.is_empty());
+    assert!(!restored.commands[0].failures_truncated);
+    assert_eq!(serde_json::to_string(&restored).unwrap(), json);
+    let evidence =
+        super::receipt::validate_receipt(&run, record.dispatch.as_ref().unwrap(), &restored)
+            .unwrap();
+    assert!(evidence.commands[0].failures.is_empty());
+    assert!(!serde_json::to_string(&evidence.commands[0])
+        .unwrap()
+        .contains("failures"));
+    assert!(evidence.reusable);
+}
+
+#[tokio::test]
+async fn daemon_receipt_failure_signatures_and_ansi_tails_reach_durable_evidence() {
+    let (_temp, store, runner) = fixture().await;
+    let run = scheduled(
+        runner
+            .request(cacheable_request("failure-signatures"))
+            .await
+            .unwrap(),
+    );
+    let run = admit(&store, &run).await;
+    let deadline = store
+        .check_worker_record(&run.id)
+        .await
+        .unwrap()
+        .deadline_at
+        .unwrap();
+    store
+        .record_check_dispatch(&fence(&run), &intent(), &db::now_rfc3339(), &deadline)
+        .await
+        .unwrap();
+    let record = store.check_worker_record(&run.id).await.unwrap();
+    let mut failed = receipt(&record);
+    failed.outcome = CheckExecutionOutcome::Failed;
+    let command = &mut failed.commands[0];
+    command.exit_code = Some(1);
+    command.outcome = CheckExecutionOutcome::Failed;
+    command.failures = vec!["parser::empty".into(), "parser::unicode".into()];
+    command.failures_truncated = true;
+    command.stdout_tail = "\x1b[31mfailure\x1b[0m".into();
+    command.stderr_tail = "\x1b[32mdetail\x1b[0m".into();
+    let evidence =
+        super::receipt::validate_receipt(&run, record.dispatch.as_ref().unwrap(), &failed).unwrap();
+    assert_eq!(
+        evidence.commands[0].failures,
+        ["parser::empty", "parser::unicode"]
+    );
+    assert!(evidence.commands[0].failures_truncated);
+    assert_eq!(evidence.commands[0].output_tail, "failure\ndetail");
+    assert_eq!(evidence.commands[0].stderr_tail, "detail");
+    let step: StepResultEntry =
+        serde_json::from_value(serde_json::to_value(&evidence.commands[0]).unwrap()).unwrap();
+    assert_eq!(step.failures, ["parser::empty", "parser::unicode"]);
+    let mut old = serde_json::to_value(&step).unwrap();
+    old.as_object_mut().unwrap().remove("failures");
+    old.as_object_mut().unwrap().remove("failures_truncated");
+    let old: StepResultEntry = serde_json::from_value(old).unwrap();
+    assert!(old.failures.is_empty());
 }

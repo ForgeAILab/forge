@@ -6149,6 +6149,36 @@ reviewable sink. Task acceptance, linked-Document acceptance, and requirements
 from `scope.explicit_non_goals` and `success.non_claims` are added automatically.
 All other Project requirements stay deferred to milestone readiness.
 
+Check command outcomes, owner `CheckCommandReceipt` values, and Review step
+results (`step_results` and `details.ci_steps`) accept optional
+`failures: string[]` and `failures_truncated: boolean`. Missing fields mean `[]`
+and `false`; empty/false fields are omitted when serialized, including receipts
+from older daemons, with no daemon protocol revision. Signatures identify failing
+cargo, vitest/jest, pytest or Go tests, or failed/errored JUnit cases. They are
+ANSI-free, have durations and absolute Task-root prefixes removed, and are
+bounded to 200 distinct entries of 300 Unicode characters per step. Stored
+`output_tail` and `stderr_tail` are ANSI-free text, each under its existing
+4096-byte budget. The durable result's 256 KiB aggregate budget can further
+truncate signature lists after shrinking tails; `failures_truncated` reports it.
+Unknown runners retain empty signatures and ordinary step-level failure output.
+
+Forge exports `FORGE_CI_REPORT_DIR` to each check command. Write `*.xml` JUnit
+reports there (subdirectories are accepted). The directory is isolated per
+command, inside the reserved Task root when available, and removed after
+collection. Reports are optional; malformed XML is ignored. Collection reads at
+most 200 directory entries and 4 MiB per file, without following symbolic links.
+CI repair prompts include every failing step, up to 20 signatures per step,
+then `+N more`, alongside that step's output.
+
+After a coder repair, entering review with the same clean HEAD as the latest
+failed Review in the current budget window starts no checks or reviewer and
+creates no Review. The first occurrence sends the Task back with "No change
+since review N" and spends the persistent `repair_no_change` allowance (fixed
+limit 1); the second parks it as `review_needs_owner` with
+`no change after repair round`. Review and gate-rejection budgets are unchanged.
+Owner-started re-reviews are exempt. A changed commit or dirty worktree takes
+the normal review path; an explicit retry-window reset restores the allowance.
+
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. Forge re-runs them in the Task's worktree at the reviewed commit
 (reusing its ignored dependency and build output), setup commands first and each

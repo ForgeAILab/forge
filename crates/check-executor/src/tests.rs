@@ -997,3 +997,50 @@ async fn check_in_a_task_worktree_gets_the_shared_compiler_cache() {
         &store,
     );
 }
+
+#[tokio::test]
+async fn failures_precede_tail_truncation_and_ansi_does_not_spend_text_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let receipt = run(temp.path(), &spec(r"printf '\033[31mtest parser::empty ... FAILED\033[0m\n'; head -c 10000 /dev/zero; printf '\033[31mfinal failure\033[0m'; printf '\033[32mstderr failure\033[0m' >&2; exit 1"), &[], Duration::from_secs(10), &CancellationToken::new()).await;
+    let command = &receipt.commands[0];
+    assert_eq!(command.failures, ["parser::empty"]);
+    assert!(!command.failures_truncated);
+    assert!(command.stdout_truncated);
+    assert!(!command.stdout_tail.contains("parser::empty"));
+    assert!(!command.stdout_tail.contains('\x1b'));
+    assert_eq!(command.stderr_tail, "stderr failure");
+    assert!(command.stdout_tail.ends_with("final failure"));
+}
+
+#[tokio::test]
+async fn junit_reports_are_exported_inside_task_root_and_isolated_per_step() {
+    let temp = tempfile::tempdir().unwrap();
+    executors::sandbox::TaskRoot::reserve(temp.path()).unwrap();
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir(&worktree).unwrap();
+    let mut bundle = spec("case \"$FORGE_CI_REPORT_DIR\" in */.forge-task/ci-reports-*) ;; *) exit 91;; esac; mkdir -p \"$FORGE_CI_REPORT_DIR/nested\"; printf '<testsuite><testcase classname=\"parser\" name=\"empty\"><failure/></testcase><testcase name=\"error\"><error/></testcase></testsuite>' > \"$FORGE_CI_REPORT_DIR/nested/web.xml\"; exit 1");
+    bundle.commands[0].failure_policy = CheckFailurePolicy::Continue;
+    let mut second = step("test -z \"$(ls -A \"$FORGE_CI_REPORT_DIR\")\"");
+    second.id = "second".into();
+    bundle.commands.push(second);
+    bundle.configured_commands = 2;
+    let receipt = run(
+        &worktree,
+        &bundle,
+        &[],
+        Duration::from_secs(10),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(receipt.commands.len(), 2);
+    assert_eq!(receipt.commands[0].failures, ["parser > empty", "error"]);
+    assert_eq!(receipt.commands[1].exit_code, Some(0));
+    assert!(receipt.commands[1].failures.is_empty());
+    assert!(!std::fs::read_dir(temp.path().join(".forge-task"))
+        .unwrap()
+        .flatten()
+        .any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("ci-reports-")));
+}

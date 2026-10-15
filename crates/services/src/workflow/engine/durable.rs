@@ -589,7 +589,55 @@ impl WorkflowExecution<'_> {
             }
         }
 
-        if !payload.skip_before_enter && cascade.is_none() && !review_refresh_bridge {
+        // This guard precedes every review-entry check and every path that
+        // creates a Review (including a gate without configured CI).
+        let mut no_change_send_back = false;
+        if cascade.is_none()
+            && to_state.kind == StateKind::Gate
+            && to_state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+        {
+            match crate::workflow::actions::no_change::repair_no_change_gate(
+                &enter_ctx, &task, step,
+            )
+            .await?
+            {
+                db::budget::RepairNoChangeDecision::Continue => {}
+                db::budget::RepairNoChangeDecision::SendBack { attempt } => {
+                    let target = to_state
+                        .gate_config
+                        .as_ref()
+                        .and_then(|gate| gate.reject_target.clone())
+                        .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
+                    if WorkflowEngine::find_state(workflow, &target).is_some() {
+                        let reason = format!("No change since review {attempt}\nHEAD still matches the failed candidate and the worktree is clean. Address the review feedback, run the required checks, and commit the repair before resubmitting.");
+                        cascade = Some((
+                            target,
+                            reason,
+                            api_types::TransitionBridge::recovery("repair_no_change", false),
+                        ));
+                        no_change_send_back = true;
+                        // Bypass an owner-approval wait without charging a rejection.
+                        before_enter_rejection_cascade = true;
+                    } else {
+                        crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task)
+                            .await?;
+                    }
+                    skip_target_enter_hooks = true;
+                }
+                db::budget::RepairNoChangeDecision::Park => {
+                    crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task).await?;
+                    skip_target_enter_hooks = true;
+                }
+            }
+            self.refresh_task_after_hook(&mut task, &target_state, Some(step))
+                .await?;
+        }
+
+        if !payload.skip_before_enter
+            && cascade.is_none()
+            && !skip_target_enter_hooks
+            && !review_refresh_bridge
+        {
             for (index, hook) in to_state.hooks.before_enter.iter().enumerate() {
                 if !hook_audience_matches(hook.applies_to, &actor) {
                     log_hook_skipped_by_audience(
@@ -1271,14 +1319,15 @@ impl WorkflowExecution<'_> {
                 });
             }
 
-            let cascade_rejection = before_enter_rejection_cascade
-                || (to_state.kind == StateKind::Gate
-                    && cascade_bridge.bridge_kind
-                        != Some(api_types::TransitionBridgeKind::GateSkipped)
-                    && !cascade_bridge.is_review_refresh()
-                    && cascade_bridge.bridge_kind
-                        != Some(api_types::TransitionBridgeKind::ConflictHandoff)
-                    && !WorkflowEngine::is_terminal(workflow, &cascade_to));
+            let cascade_rejection = !no_change_send_back
+                && (before_enter_rejection_cascade
+                    || (to_state.kind == StateKind::Gate
+                        && cascade_bridge.bridge_kind
+                            != Some(api_types::TransitionBridgeKind::GateSkipped)
+                        && !cascade_bridge.is_review_refresh()
+                        && cascade_bridge.bridge_kind
+                            != Some(api_types::TransitionBridgeKind::ConflictHandoff)
+                        && !WorkflowEngine::is_terminal(workflow, &cascade_to)));
             // Fence the entry this transition committed, not a later
             // writer's. The hook row carries that entry's epoch (read inside
             // the status CAS, or by the startup recovery sweep for an entry

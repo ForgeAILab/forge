@@ -1569,6 +1569,8 @@ fn application(
         certified: false,
         cacheable: false,
         commands: vec![api_types::CheckCommandOutcome {
+            failures: vec![],
+            failures_truncated: false,
             index: 0,
             command: "make test".into(),
             exit_code,
