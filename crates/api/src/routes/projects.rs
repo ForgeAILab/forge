@@ -1223,6 +1223,16 @@ pub async fn test_project_lifecycle_hook(
         crate::routes::authorization::ProjectAccess::Admin,
     )
     .await?;
+    // The body's Task id is a second lookup: a Task in a Project the caller
+    // cannot see reads exactly like an unknown Task, never as the service's
+    // cross-Project 400.
+    crate::routes::authorization::require_task_access(
+        &state,
+        &request.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let response = state
         .task_service
         .test_lifecycle_hook(&id, &request.task_id, request.event, request.hook_index)

@@ -1004,3 +1004,45 @@ async fn ownerless_project_keeps_owner_rights_for_every_signed_in_user() {
     }
 }
 
+/// The hook-test body names a second Task id. A Task of a Project the caller
+/// cannot see must read exactly like an unknown Task (no 400/404 oracle).
+#[tokio::test]
+async fn hook_test_hides_a_foreign_task_behind_the_unknown_task_404() {
+    let f = Fixture::new().await;
+    let (status, foreign_project) = f
+        .request(
+            Method::POST,
+            "/api/v1/projects",
+            Some(json!({"name":"Foreign"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_project}");
+    let (status, foreign_task) = f
+        .request(
+            Method::POST,
+            &format!(
+                "/api/v1/projects/{}/tasks",
+                foreign_project["id"].as_str().unwrap()
+            ),
+            Some(json!({"title":"Foreign task"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_task}");
+    let owner = common::test_jwt();
+    let hook_test = |task_id: String| {
+        f.request(
+            Method::POST,
+            "/api/v1/projects/{project}/hooks/test",
+            Some(json!({"task_id":task_id,"event":"before_work","hook_index":0})),
+            &owner,
+        )
+    };
+    let foreign = hook_test(foreign_task["id"].as_str().unwrap().to_owned()).await;
+    let unknown = hook_test("missing-task".to_owned()).await;
+    assert_eq!(foreign.0, StatusCode::NOT_FOUND, "{}", foreign.1);
+    assert_eq!(foreign.0, unknown.0);
+    assert_eq!(foreign.1["code"], unknown.1["code"]);
+    assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
+}
