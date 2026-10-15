@@ -16,9 +16,18 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
     reviews.sort_by_key(|review| (review.attempt_number, &review.id));
     let mut ledger = BTreeMap::<String, ReviewFindingEntry>::new();
     let mut next_id = 1;
+    let mut observed_contracts = BTreeSet::new();
     for review in reviews {
         let details: Value = serde_json::from_str(&review.step_results_json)
             .map_err(|error| format!("invalid Review {} details: {error}", review.id))?;
+        // An owner's manual pass copies the failed Review's details verbatim;
+        // no source ran in it.
+        if details
+            .get("manual_override")
+            .is_some_and(|value| !value.is_null())
+        {
+            continue;
+        }
         let steps: Vec<StepResultEntry> = match &details {
             Value::Array(_) => serde_json::from_value(details.clone()),
             Value::Object(_) => serde_json::from_value(
@@ -37,6 +46,15 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             .transpose()
             .map_err(|error| format!("invalid Review {} conformance: {error}", review.id))?
             .unwrap_or_default();
+        // A queue-rebase carry copies the passed Review's frozen conformance
+        // next to its own CI steps. Each frozen assessment and its checks are
+        // one observation, however many Reviews hold a copy.
+        let conformance = match &conformance.contract {
+            Some(contract) if !observed_contracts.insert(contract.execution_id.clone()) => {
+                ReviewConformance::default()
+            }
+            _ => conformance,
+        };
         let attempt = review.attempt_number;
         // A source can occur in both pre-review CI and the frozen conformance.
         // Count it once per attempt, preferring the check's final observation.
@@ -367,6 +385,55 @@ mod tests {
         assert_eq!(ledger.len(), 1);
         assert_eq!((ledger[0].id.as_str(), ledger[0].first_attempt), ("F1", 3));
         assert!(finding_ledger(&[]).unwrap().is_empty());
+    }
+    /// A Review whose reviewer execution froze `assessment` under a contract.
+    fn frozen(attempt: i64, status: &str, execution: &str, assessment: Value) -> Value {
+        json!({"ci_steps":[{"index":0,"command":"tests","exit_code":0,"stderr_tail":""}],"conformance":{"status":status,"contract":{"execution_id":execution,"policy":"p","commit_sha":format!("c{attempt}"),"base_sha":"b","context":{"project_id":"p","task_id":"task","repo_id":null,"charter_revision_id":null,"charter_digest":null,"charter":null,"task_scope":{},"linked_documents":[],"requirements":[],"required_checks":[],"source_digest":"d"},"digest":"x"},"checks":[{"check_id":"schema","command":"check-schema","exit_code":1,"output":"x"}],"reason":null,"assessment":assessment}})
+    }
+    #[test]
+    fn finding_ledger_counts_a_copied_assessment_once() {
+        // The owner's manual pass copies the failed Review's details.
+        let failed = frozen(
+            1,
+            "failed",
+            "reviewer-1",
+            json!({"result":"fail","reason":"problems","findings":[{"summary":"one"},{"summary":"two"}]}),
+        );
+        let mut manual_pass = failed.clone();
+        manual_pass["manual_override"] = json!({"actor_type":"user","source_attempt_number":1});
+        let before = finding_ledger(&[review(1, failed.clone())]).unwrap();
+        assert_eq!(
+            finding_ledger(&[review(1, failed.clone()), review(2, manual_pass)]).unwrap(),
+            before
+        );
+        // A queue-rebase carry copies the passed Review's frozen conformance
+        // next to its own (passing) CI steps.
+        let continued = frozen(
+            2,
+            "passed",
+            "reviewer-2",
+            json!({"result":"pass","reason":"fine","findings":[{"id":"F1","summary":"one","severity":"minor"}],"resolved":["F2"]}),
+        );
+        let carried = json!({"ci_steps":[{"index":0,"command":"tests","exit_code":0,"stderr_tail":""}],"conformance":continued["conformance"].clone()});
+        let before =
+            finding_ledger(&[review(1, failed.clone()), review(2, continued.clone())]).unwrap();
+        let after =
+            finding_ledger(&[review(1, failed), review(2, continued), review(3, carried)]).unwrap();
+        assert_eq!(after.len(), 3, "{after:?}");
+        assert_eq!(
+            after
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.status, entry.streak))
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.status, entry.streak))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (entry(&after, "F1").status, entry(&after, "F1").streak),
+            (Status::Open, 2)
+        );
     }
     #[test]
     fn finding_ledger_deduplicates_sources_and_bounds_check_tails() {
