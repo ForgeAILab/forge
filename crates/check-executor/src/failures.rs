@@ -8,6 +8,9 @@ const MAX_SIGNATURE_CHARS: usize = 300;
 const MAX_LINE_BYTES: usize = 16 * 1024;
 const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REPORT_FILES: usize = 200;
+/// Report bytes one command may make Forge read and parse, over all files.
+/// Parsing is synchronous; 200 files at the per-file bound would be 800 MiB.
+const MAX_REPORT_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 static DURATION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\s*\(?\b\d+(?:\.\d+)?\s*(?:ms|µs|μs|ns|s|seconds?)\)?\s*$").unwrap()
 });
@@ -217,6 +220,7 @@ pub(crate) fn junit(
 ) {
     let mut directories = vec![directory.to_owned()];
     let mut visited = 0;
+    let mut total = 0_u64;
     while let Some(directory) = directories.pop() {
         let Ok(entries) = std::fs::read_dir(directory) else {
             continue;
@@ -243,16 +247,19 @@ pub(crate) fn junit(
             let Ok(file) = std::fs::File::open(entry.path()) else {
                 continue;
             };
-            let mut xml = String::new();
-            if file
-                .take(MAX_REPORT_BYTES + 1)
-                .read_to_string(&mut xml)
-                .is_err()
-                || xml.len() as u64 > MAX_REPORT_BYTES
-            {
+            let mut bytes = Vec::new();
+            let read = file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes);
+            total = total.saturating_add(bytes.len() as u64);
+            if total > MAX_REPORT_TOTAL_BYTES {
+                return;
+            }
+            let (Ok(_), Ok(xml)) = (read, std::str::from_utf8(&bytes)) else {
+                continue;
+            };
+            if bytes.len() as u64 > MAX_REPORT_BYTES {
                 continue;
             }
-            parse_junit(&xml, roots, env, failures);
+            parse_junit(xml, roots, env, failures);
         }
     }
 }
@@ -437,6 +444,23 @@ mod tests {
             failures.signatures,
             ["test login with [REDACTED]", "test uses [REDACTED]"]
         );
+    }
+    #[test]
+    fn junit_collection_stops_at_the_total_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let padding = " ".repeat(3 * 1024 * 1024 + 512 * 1024);
+        for name in ["a", "b", "c", "d", "e"] {
+            std::fs::write(
+                dir.path().join(format!("{name}.xml")),
+                format!(
+                    r#"<testsuite><!--{padding}--><testcase name="{name}"><failure/></testcase></testsuite>"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut failures = Failures::default();
+        junit(dir.path(), &[dir.path()], &BTreeMap::new(), &mut failures);
+        assert_eq!(failures.signatures, ["a", "b", "c", "d"]);
     }
     #[test]
     fn merged_identities_are_not_normalised_twice() {

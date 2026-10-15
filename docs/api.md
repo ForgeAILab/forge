@@ -6167,7 +6167,8 @@ Forge exports `FORGE_CI_REPORT_DIR` to each check command. Write `*.xml` JUnit
 reports there (subdirectories are accepted). The directory is isolated per
 command, inside the reserved Task root when available, and removed after
 collection. Reports are optional; malformed XML is ignored. Collection reads at
-most 200 directory entries and 4 MiB per file, without following symbolic links.
+most 200 directory entries, 4 MiB per file and 16 MiB in total, without
+following symbolic links.
 CI repair prompts include every failing step, up to 20 signatures per step,
 then `+N more`. Step output follows while the prompt's 8 KiB output allowance
 lasts; later steps show their command and signatures only.
