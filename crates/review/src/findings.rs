@@ -161,16 +161,18 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             }
             let mut continued = BTreeSet::new();
             for finding in assessment.findings {
-                let id = finding
-                    .id
-                    .as_ref()
-                    .filter(|id| known.contains(*id) && continued.insert((*id).clone()))
-                    .cloned()
-                    .unwrap_or_else(|| {
+                let id = match finding.id.as_ref().filter(|id| known.contains(*id)) {
+                    // A known id names one finding. A repeated item is the
+                    // reviewer's duplicate, not a new open finding that would
+                    // count against progress; the first item continues it.
+                    Some(id) if !continued.insert(id.clone()) => continue,
+                    Some(id) => id.clone(),
+                    None => {
                         let id = format!("F{next_id}");
                         next_id += 1;
                         id
-                    });
+                    }
+                };
                 // Continue from the previous source check, before omission or
                 // explicit resolution in this block. A continued item wins.
                 if let Some(previous) = prior.get(&id) {
@@ -277,6 +279,23 @@ mod tests {
         assert_eq!(one.summary, "still one");
         assert_eq!(entry(&ledger, "F2").status, Status::Resolved);
         assert_eq!(entry(&ledger, "F3").first_attempt, 2);
+        // A known id repeated in one block is one finding: the duplicate adds
+        // no open finding that phase 4's progress count would see.
+        let duplicated = reviewer(
+            2,
+            json!([{"id":"F1","summary":"still one"},{"id":"F1","summary":"one again"}]),
+            json!(["F2"]),
+        );
+        let first = reviewer(1, json!([{"summary":"one"},{"summary":"two"}]), json!([]));
+        let ledger = finding_ledger(&[first, duplicated]).unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.status, entry.streak))
+                .collect::<Vec<_>>(),
+            [("F1", Status::Open, 2), ("F2", Status::Resolved, 0)]
+        );
+        assert_eq!(entry(&ledger, "F1").summary, "still one");
         assert_eq!(
             before,
             reviews
