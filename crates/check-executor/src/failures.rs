@@ -56,11 +56,14 @@ impl Failures {
         root: &Path,
         env: &std::collections::BTreeMap<String, String>,
     ) {
-        let signature = strip_ansi(signature).replace('\\', "/");
+        // Redact the text as printed: separator and duration normalisation
+        // would otherwise rewrite a secret (or cut its suffix) past redaction.
+        let signature =
+            executors::environment::redact_environment_values(&strip_ansi(signature), env)
+                .replace('\\', "/");
         let prefix = root.to_string_lossy().replace('\\', "/");
         let signature = signature.replace(&format!("{}/", prefix.trim_end_matches('/')), "");
         let signature = DURATION.replace(signature.trim(), "");
-        let signature = executors::environment::redact_environment_values(&signature, env);
         let signature: String = signature
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -407,6 +410,20 @@ mod tests {
         failures.add("test_197", root, &env);
         assert!(failures.truncated);
         assert_eq!(failures.signatures.len(), 200);
+    }
+    #[test]
+    fn signature_redaction_runs_before_separator_and_duration_normalisation() {
+        let env = BTreeMap::from([
+            ("PASSWORD".into(), r"pa\ss".into()),
+            ("TOKEN".into(), "tok-15s".into()),
+        ]);
+        let mut failures = Failures::default();
+        failures.add(r"test login with pa\ss", Path::new("/task"), &env);
+        failures.add("test uses tok-15s", Path::new("/task"), &env);
+        assert_eq!(
+            failures.signatures,
+            ["test login with [REDACTED]", "test uses [REDACTED]"]
+        );
     }
     #[test]
     fn junit_captured_report_and_errors_skip_passes_and_malformed_xml() {
