@@ -142,12 +142,11 @@ async fn task_detail_and_list_carry_the_summary_and_the_list_reads_it_in_one_sta
         assert_eq!(response.status(), StatusCode::OK);
         let etag = response.headers()["etag"].to_str().unwrap().to_owned();
         to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        // The event relay polls its cursor on its own clock; it is not the list.
-        queries
-            .statements
-            .lock()
-            .unwrap()
-            .retain(|statement| !statement.contains("event_consumer_cursor"));
+        // The event relay reads its cursor, head, and ledger on its own clock;
+        // those statements are not part of the Task list.
+        queries.statements.lock().unwrap().retain(|statement| {
+            !statement.contains("event_consumer_cursor") && !statement.contains("FROM domain_event")
+        });
         let statements = queries.statements.lock().unwrap().clone();
         (count(&queries), etag, statements)
     };
