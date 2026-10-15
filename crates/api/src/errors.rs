@@ -27,6 +27,10 @@ pub type ApiResult<T> = Result<T, ApiError>;
 impl ApiError {
     /// Hide an indirect resource behind the same 404 as an unknown caller-
     /// supplied ID, without disclosing its owning Task or Project ID.
+    pub(crate) fn is_not_found(&self) -> bool {
+        self.status == StatusCode::NOT_FOUND
+    }
+
     pub(crate) fn mask_not_found(self, hidden: Self) -> Self {
         if self.status == StatusCode::NOT_FOUND {
             hidden

@@ -214,13 +214,22 @@ pub async fn list_session_interactions(
     user: AuthenticatedUser,
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Vec<ProtectedInteractionSummaryResponse>>> {
-    crate::routes::authorization::require_session_access(
+    // A session the caller cannot reach has no pending interactions for
+    // them: the same empty list the broker's owner join returns.
+    if let Err(error) = crate::routes::authorization::require_session_access(
         &state,
         &session_id,
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Read,
     )
-    .await?;
+    .await
+    {
+        return if error.is_not_found() {
+            Ok(Json(Vec::new()))
+        } else {
+            Err(error)
+        };
+    }
     let summaries = state
         .embedded_agent_service
         .interaction_broker()
@@ -247,7 +256,12 @@ pub async fn answer_session_interaction(
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Write,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.mask_not_found(protected_interaction_error(
+            AgentHostError::SessionNotFound,
+        ))
+    })?;
     let answer = InteractionAnswer::new(
         interaction_id,
         request.expected_version,
@@ -278,7 +292,12 @@ pub async fn cancel_session_interaction(
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Write,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.mask_not_found(protected_interaction_error(
+            AgentHostError::SessionNotFound,
+        ))
+    })?;
     let summary = state
         .embedded_agent_service
         .interaction_broker()
