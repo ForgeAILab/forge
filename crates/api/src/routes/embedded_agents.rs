@@ -258,9 +258,7 @@ pub async fn answer_session_interaction(
     )
     .await
     .map_err(|error| {
-        error.mask_not_found(protected_interaction_error(
-            AgentHostError::SessionNotFound,
-        ))
+        error.mask_not_found(protected_interaction_error(AgentHostError::SessionNotFound))
     })?;
     let answer = InteractionAnswer::new(
         interaction_id,
@@ -294,9 +292,7 @@ pub async fn cancel_session_interaction(
     )
     .await
     .map_err(|error| {
-        error.mask_not_found(protected_interaction_error(
-            AgentHostError::SessionNotFound,
-        ))
+        error.mask_not_found(protected_interaction_error(AgentHostError::SessionNotFound))
     })?;
     let summary = state
         .embedded_agent_service

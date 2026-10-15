@@ -441,10 +441,7 @@ fn resync_frame(reason: &str, reset_to: Option<i64>) -> Event {
     }
 }
 
-fn replay_events(
-    db: Arc<SqliteDb>,
-    replay: Replay,
-) -> impl tokio_stream::Stream<Item = Item> {
+fn replay_events(db: Arc<SqliteDb>, replay: Replay) -> impl tokio_stream::Stream<Item = Item> {
     // Preflight seeks at most 1,001 sequences; the stream keeps just one page.
     futures_util::stream::unfold(
         (db, replay, VecDeque::new(), MAX_REPLAY_EVENTS),

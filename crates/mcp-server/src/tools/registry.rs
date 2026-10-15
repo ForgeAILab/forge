@@ -785,15 +785,12 @@ pub(crate) async fn require_project_access(
         return Ok(());
     };
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    let allowed = member.map_or(
-        owner_id == user_id,
-        |member| match role {
-            RequiredRole::Member => matches!(member.role.as_str(), "owner" | "admin" | "member"),
-            RequiredRole::Admin => matches!(member.role.as_str(), "owner" | "admin"),
-            RequiredRole::Owner => member.role == "owner",
-            _ => true,
-        },
-    );
+    let allowed = member.map_or(owner_id == user_id, |member| match role {
+        RequiredRole::Member => matches!(member.role.as_str(), "owner" | "admin" | "member"),
+        RequiredRole::Admin => matches!(member.role.as_str(), "owner" | "admin"),
+        RequiredRole::Owner => member.role == "owner",
+        _ => true,
+    });
     if !allowed {
         return Err(McpToolError::new(-32003, "insufficient Project role")
             .with_data(json!({"code":"insufficient_role"})));

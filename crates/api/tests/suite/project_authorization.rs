@@ -1044,7 +1044,10 @@ async fn hook_test_hides_a_foreign_task_behind_the_unknown_task_404() {
     assert_eq!(foreign.0, StatusCode::NOT_FOUND, "{}", foreign.1);
     assert_eq!(foreign.0, unknown.0);
     assert_eq!(foreign.1["code"], unknown.1["code"]);
-    assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
+    assert_eq!(
+        foreign.1["details"]["entity"],
+        unknown.1["details"]["entity"]
+    );
 }
 
 /// A board move names neighbor Task ids. A neighbor in a Project the caller
@@ -1110,8 +1113,14 @@ async fn task_move_does_not_confirm_a_foreign_neighbor_id() {
     assert_eq!(foreign.0, unknown.0, "{} vs {}", foreign.1, unknown.1);
     assert_eq!(foreign.1["code"], unknown.1["code"]);
     assert_eq!(
-        foreign.1["message"].as_str().unwrap().replace(&foreign_id, "ID"),
-        unknown.1["message"].as_str().unwrap().replace("missing-task", "ID")
+        foreign.1["message"]
+            .as_str()
+            .unwrap()
+            .replace(&foreign_id, "ID"),
+        unknown.1["message"]
+            .as_str()
+            .unwrap()
+            .replace("missing-task", "ID")
     );
 }
 
@@ -1225,7 +1234,10 @@ async fn sse_delivers_project_events_only_to_subscribers_who_can_see_the_project
     let mut viewer = sse_stream(&f, &f.other_token).await;
     publish_project_events(&f, "marker-two");
     let viewer_frames = sse_until(&mut viewer, "marker-two").await;
-    assert!(viewer_frames.contains("private-log-line"), "{viewer_frames}");
+    assert!(
+        viewer_frames.contains("private-log-line"),
+        "{viewer_frames}"
+    );
 }
 
 /// A handoff addressed through a visible Project but targeting another
@@ -1281,7 +1293,10 @@ async fn handoff_into_a_hidden_chat_reads_like_an_unknown_handoff() {
     assert_eq!(foreign.0, StatusCode::NOT_FOUND, "{}", foreign.1);
     assert_eq!(foreign.0, unknown.0);
     assert_eq!(foreign.1["code"], unknown.1["code"]);
-    assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
+    assert_eq!(
+        foreign.1["details"]["entity"],
+        unknown.1["details"]["entity"]
+    );
 }
 
 /// Two reads keep their existing, stricter contracts: Project escalations are
@@ -1331,7 +1346,9 @@ async fn owner_only_escalation_and_admin_only_location_reads_hide_the_project() 
         ),
         ("/api/v1/repos/{repo}/locations", StatusCode::OK),
     ] {
-        let (status, body) = f.request(Method::GET, path, None, &common::test_jwt()).await;
+        let (status, body) = f
+            .request(Method::GET, path, None, &common::test_jwt())
+            .await;
         assert_eq!(status, expected, "owner {path}: {body}");
     }
 }
@@ -1341,18 +1358,30 @@ async fn owner_only_escalation_and_admin_only_location_reads_hide_the_project() 
 #[tokio::test]
 async fn hidden_project_chat_reads_like_an_unknown_chat() {
     let f = Fixture::new().await;
-    let chat_id: String =
-        sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
-            .bind(&f.project.id)
-            .fetch_one(f.harness.state.db.pool())
-            .await
-            .expect("Project Chat exists");
-    for path in ["/api/v1/agent-chats/{chat}", "/api/v1/agent-chats/{chat}/messages"] {
+    let chat_id: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
+        .bind(&f.project.id)
+        .fetch_one(f.harness.state.db.pool())
+        .await
+        .expect("Project Chat exists");
+    for path in [
+        "/api/v1/agent-chats/{chat}",
+        "/api/v1/agent-chats/{chat}/messages",
+    ] {
         let hidden = f
-            .request(Method::GET, &path.replace("{chat}", &chat_id), None, &f.other_token)
+            .request(
+                Method::GET,
+                &path.replace("{chat}", &chat_id),
+                None,
+                &f.other_token,
+            )
             .await;
         let unknown = f
-            .request(Method::GET, &path.replace("{chat}", "missing-chat"), None, &f.other_token)
+            .request(
+                Method::GET,
+                &path.replace("{chat}", "missing-chat"),
+                None,
+                &f.other_token,
+            )
             .await;
         assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{path}: {}", hidden.1);
         assert_eq!(hidden.1["code"], unknown.1["code"], "{path}");
@@ -1361,7 +1390,11 @@ async fn hidden_project_chat_reads_like_an_unknown_chat() {
             "{path}: {}",
             hidden.1
         );
-        assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
+        assert!(
+            !hidden.1.to_string().contains(&f.project.id),
+            "{}",
+            hidden.1
+        );
     }
 }
 
@@ -1457,7 +1490,11 @@ async fn attention_of_a_hidden_project_reads_like_an_unknown_item() {
             "{action}: {}",
             hidden.1
         );
-        assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
+        assert!(
+            !hidden.1.to_string().contains(&f.project.id),
+            "{}",
+            hidden.1
+        );
     }
 }
 
@@ -1499,6 +1536,13 @@ async fn primary_repo_of_a_hidden_project_reads_like_an_unknown_repo() {
     let unknown = patch("missing-repo".to_owned()).await;
     assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.1);
     assert_eq!(hidden.0, unknown.0);
-    assert_eq!(hidden.1["details"]["entity"], unknown.1["details"]["entity"]);
-    assert!(!hidden.1.to_string().contains(&foreign_project_id), "{}", hidden.1);
+    assert_eq!(
+        hidden.1["details"]["entity"],
+        unknown.1["details"]["entity"]
+    );
+    assert!(
+        !hidden.1.to_string().contains(&foreign_project_id),
+        "{}",
+        hidden.1
+    );
 }
