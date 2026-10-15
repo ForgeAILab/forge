@@ -1434,3 +1434,28 @@ fn coder_prompt_no_change_brief_precedes_prior_ci_feedback() {
         assert!(prompt.user.starts_with("No change since review 2\n"));
     }
 }
+
+#[test]
+fn coder_prompt_ci_follow_up_stays_bounded_with_many_failing_steps() {
+    // Every failing step keeps its command and signatures; stored tails
+    // (4 KiB each) stop once the prompt's output budget is spent.
+    let mut ctx = fake_context(default_roles::CODER);
+    let steps: Vec<_> = (0..12)
+        .map(|n| json!({"index":n,"command":format!("step-{n}"),"exit_code":1,"output_tail":"x".repeat(4096),"failures":[format!("signature-{n}")]}))
+        .collect();
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({ "ci_steps": steps }).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let prompt = resolve_prompt_builder(builder).build(&ctx);
+        for n in 0..12 {
+            assert!(prompt.user.contains(&format!("step-{n}")));
+            assert!(prompt.user.contains(&format!("signature-{n}")));
+        }
+        assert!(prompt.user.len() < 16 * 1024, "{}", prompt.user.len());
+    }
+}

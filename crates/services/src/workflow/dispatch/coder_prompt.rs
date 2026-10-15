@@ -401,11 +401,18 @@ fn review_failure_reason(step_results_json: &str) -> Option<String> {
         .or_else(|| ci_failure_reason(&value))
 }
 
+/// Output kept across all failing steps of one CI repair prompt. Every
+/// failing step is listed with its signatures; once this much output has been
+/// shown, later steps name their command and signatures only. Two full stored
+/// tails fit.
+const CI_FAILURE_OUTPUT_BUDGET: usize = 8 * 1024;
+
 pub(super) fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
     let steps = value
         .get("ci_steps")
         .or_else(|| if value.is_array() { Some(value) } else { None })?
         .as_array()?;
+    let mut output_budget = CI_FAILURE_OUTPUT_BUDGET;
     let reasons: Vec<_> = steps
         .iter()
         .filter(|step| {
@@ -449,7 +456,13 @@ pub(super) fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
             {
                 reason.push_str("Additional failure signatures were truncated.\n");
             }
-            reason.push_str(output);
+            if output.len() <= output_budget {
+                output_budget -= output.len();
+                reason.push_str(output);
+            } else {
+                output_budget = 0;
+                reason.push_str("(output omitted; see the Review's CI step results)");
+            }
             reason
         })
         .collect();
