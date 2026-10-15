@@ -3412,7 +3412,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Replaying a frozen review assessment across an upgrade accepts equivalent
   explicit or omitted default fields without rewriting its stored JSON.
 - Finding objects inside a broken reviewer result block can no longer supply
-  the review verdict; unreadable replies require result correction.
+  the review verdict; unreadable replies require result correction. An object
+  listed right after `[` or `,` is never read as the verdict; everything else
+  is read as before (the last complete result object wins), so code quoted
+  with apostrophes or Rust lifetimes and a correction turn appended after a
+  reply cut off mid-string or mid-list still settle the review.
 
 - An unchanged restart no longer records another setup-required wake decision
   for a Project's open blockers (one or several), or refreshes the timestamps

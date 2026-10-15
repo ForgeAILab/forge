@@ -8201,11 +8201,14 @@ from the previous attempt. The response format is kept
 this small on purpose so any model can review: an earlier contract demanded one
 JSON object with per-requirement dispositions and exact file/commit citations,
 and live reviewers lost whole reviews to an invented extra field or a truncated
-commit SHA. `review::contract::parse_assessment` takes the last standalone JSON
+commit SHA. `review::contract::parse_assessment` takes the last complete JSON
 object in the reply that names a result, ignores unknown keys, accepts `verdict` for
-`result`, and keeps everything else as the Markdown `report`. A malformed outer
-result block owns its nested findings: their `result` or `verdict` keys cannot
-become the verdict. An unreadable reply goes through result correction.
+`result`, and keeps everything else as the Markdown `report`. An object listed
+right after `[` or `,` (no blank line between) is a list item, never the
+verdict, so a finding inside a malformed outer result block cannot become the
+verdict through its `result` or `verdict` key. A correction turn is appended
+after a blank line and is read even when the reply before it was cut off. An
+unreadable reply goes through result correction.
 Re-recording an immutable assessment compares parsed `ReviewConformance`
 values, so explicit and omitted defaults are equivalent without rewriting the
 stored JSON; any content change is still refused. The hard gate is
