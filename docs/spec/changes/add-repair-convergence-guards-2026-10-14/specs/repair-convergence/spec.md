@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: An unchanged candidate is not reviewed again
-Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round ends with a commit (and clean worktree) equal to the one the latest failed Review in the window judged. In that case it creates no Review row.
+Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round ends with a commit (and clean worktree) equal to the one the latest Review in the window judged, only when that latest Review failed. In that case it creates no Review row.
 
 - **First time:** Forge sends the Task back to the coder with a brief headed "No change since review N". This is charged to the persistent `repair_no_change` budget (Review window, limit 1).
 - **Second time:** the Task parks with `review_needs_owner` and the message `no change after repair round`.
@@ -11,6 +11,18 @@ Neither case charges the review budget. A re-review the owner starts is exempt.
 #### Scenario: Coder changes nothing
 - **WHEN** after failed review 2 at commit `c2`, the coder's repair round ends with HEAD still `c2`
 - **THEN** no CI or reviewer runs, the coder is sent back once with "No change since review 2", and the review budget is unchanged
+
+#### Scenario: Later pass
+- **WHEN** a failed Review is followed by a passed Review of the same commit, and a repair entry is unchanged
+- **THEN** the entry runs normal review without a reminder or no-change budget charge
+
+#### Scenario: Entry suspended before the gate shipped
+- **WHEN** an entry resumes with entry checkpoints or `awaited_consumer_id` but no recorded gate decision
+- **THEN** it records `Continue` and resumes normal entry without evaluating the gate
+
+#### Scenario: Repair entry retries after reconnect
+- **WHEN** an offline owner caused a typed `review_ci_infrastructure` wait before a repair entry could compare HEAD, and the entry retries after reconnect
+- **THEN** the retry retains the original source state and actor, and an unchanged candidate gets the reminder instead of another review, clearing the resolved infrastructure blocker before returning to the coder
 
 #### Scenario: Still nothing
 - **WHEN** the next repair round also ends at `c2`

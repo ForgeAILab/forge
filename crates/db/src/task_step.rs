@@ -714,6 +714,12 @@ impl SqliteDb {
         Ok(sqlx::query_scalar("SELECT json_extract(effects_json,?1) FROM task_hook_checkpoint WHERE step_id=?2 AND json_extract(effects_json,?1) IS NOT NULL ORDER BY hook_index DESC LIMIT 1")
             .bind(format!("$.{key}")).bind(step_id).fetch_optional(self.pool()).await?.flatten())
     }
+    /// The hooks payload of the Task's current entry, including settled steps.
+    /// An entry retry carries its original admission context into the next step.
+    pub async fn current_entry_hook_payload(&self, task_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT s.payload_json FROM task_step s JOIN task t ON t.id=s.task_id WHERE s.task_id=? AND s.kind='hooks' AND s.expected_status=t.status AND s.expected_epoch=t.status_epoch ORDER BY s.seq DESC LIMIT 1")
+            .bind(task_id).fetch_optional(self.pool()).await?)
+    }
     pub async fn record_hook_effect(
         &self,
         step: &TaskStep,

@@ -384,3 +384,261 @@ async fn no_change_owner_started_entry_after_repair_is_exempt() {
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await.2, 0);
 }
+
+#[tokio::test]
+async fn no_change_latest_pass_on_the_same_commit_reviews_normally() {
+    let f = red_fixture().await;
+    let failed = reviews(&f).await.remove(0);
+    let now = now_rfc3339();
+    db::ReviewRepo::create(
+        &*f.db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: f.task.id.clone(),
+            execution_id: failed.execution_id,
+            attempt_number: 2,
+            status: db::ReviewStatus::Passed,
+            step_results_json: failed.step_results_json,
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    // Do not rely on the Task's acceptance marker: the latest Review itself
+    // must suppress the older failure, even after acceptance was invalidated.
+    assert!(TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap()
+        .review_passed_at
+        .is_none());
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    assert_eq!(reviews(&f).await.len(), 3);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await, (2, 2, 0));
+}
+
+#[tokio::test]
+async fn no_change_pre_gate_entry_checkpoint_resumes_without_a_reminder() {
+    use db::TaskStepRepo;
+    // Old entries can retain either their entry checkpoint or their recorded
+    // wait. Neither had a reserved gate checkpoint when admitted.
+    for checkpoint_only in [true, false] {
+        let f = red_fixture().await;
+        repair(&f).await;
+        let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        f.engine
+            .workflow_execution()
+            .transition_with_authority(
+                &task.id,
+                "review",
+                task.version,
+                &f.workflow,
+                &workflow_actor(),
+                "pre-gate repair entry",
+                false,
+                f.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+        let step =
+            f.db.claim_step(
+                "pre-gate-worker",
+                Some(&task.id),
+                &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(step.kind, "hooks");
+        sqlx::query("UPDATE task_step SET payload_json=json_remove(payload_json,'$.entry_origin') WHERE id=?")
+            .bind(&step.id).execute(f.db.pool()).await.unwrap();
+        if checkpoint_only {
+            let index = f
+                .workflow
+                .states
+                .iter()
+                .find(|s| s.name == "in_progress")
+                .unwrap()
+                .hooks
+                .on_exit
+                .len() as i64;
+            f.db.start_hook(&step, index).await.unwrap();
+            f.db.finish_hook(
+                &step,
+                index,
+                &serde_json::to_string(&crate::workflow::HookResult::Ok).unwrap(),
+            )
+            .await
+            .unwrap();
+            f.db.retry_step(
+                &step,
+                "worker interrupted before the gate shipped",
+                &now_rfc3339(),
+            )
+            .await
+            .unwrap();
+        } else {
+            f.db.suspend_hook_step(&step, &now_rfc3339(), "disk")
+                .await
+                .unwrap();
+            f.db.wake_suspended_hooks(&task.id, "disk").await.unwrap();
+        }
+        drain(f.engine.clone(), &task.id).await;
+        assert_eq!(
+            reviews(&f).await.len(),
+            2,
+            "checkpoint_only={checkpoint_only}"
+        );
+        assert_eq!(check_runs(&f).await, 2);
+        assert_eq!(spending(&f).await, (2, 2, 0));
+        let decision: String = sqlx::query_scalar(
+            "SELECT result_json FROM task_hook_checkpoint WHERE step_id=? AND hook_index=-1",
+        )
+        .bind(&step.id)
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(decision, "\"Continue\"");
+    }
+}
+
+#[tokio::test]
+async fn no_change_exit_checkpoint_does_not_skip_the_gate() {
+    let mut f = red_fixture().await;
+    let exit_hook = f
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .hooks
+        .before_enter[0]
+        .clone();
+    f.workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "in_progress")
+        .unwrap()
+        .hooks
+        .on_exit
+        .push(exit_hook);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "in_progress");
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(check_runs(&f).await, 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+}
+
+async fn retry_offline_entry(f: &FailedCiFixture) -> db::Task {
+    let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = f
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &task.id,
+            task.version,
+            &f.workflow,
+            &api_types::Actor::system(api_types::SystemComponent::TaskDispatcher),
+            "owner reconnected",
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    drain_result(f.engine.clone(), result).await.task
+}
+
+async fn make_owner_away(f: &mut FailedCiFixture) -> Arc<std::sync::atomic::AtomicBool> {
+    let owner = f
+        .engine
+        .workspace_backend_router
+        .resolve(&f.db, &f.workspace)
+        .await
+        .unwrap()
+        .backend;
+    let away = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    f.engine.workspace_backend_router =
+        Arc::new(crate::workspace_backend::WorkspaceBackendRouter::new(
+            Arc::new(AwayOwner(away.clone(), owner)),
+        ));
+    away
+}
+
+#[tokio::test]
+async fn no_change_offline_entry_retry_retains_the_repair_origin() {
+    let mut f = red_fixture().await;
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "review");
+    let annotation: serde_json::Value =
+        serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
+    // More than one same-state retry must retain the first source role.
+    retry_offline_entry(&f).await;
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    let task = retry_offline_entry(&f).await;
+    assert_eq!(task.status, "in_progress");
+    assert!(task.entry_barrier_json.is_none());
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none());
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(check_runs(&f).await, 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+    assert!(TransitionLogRepo::list_by_task(&*f.db, &f.task.id)
+        .await
+        .unwrap()
+        .iter()
+        .any(|entry| entry
+            .trigger_reason
+            .starts_with("No change since review 1\n")));
+}
+
+#[tokio::test]
+async fn no_change_offline_owner_entry_retry_retains_the_owner_exemption() {
+    let mut f = red_fixture().await;
+    // This owner-controlled gate stays blocked on a failed entry instead of
+    // routing user-entry failures back to the coder, so it has a retry barrier.
+    f.workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .reject_target = None;
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    enter(&f, api_types::Actor::user(api_types::UserActionSource::Api)).await;
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    retry_offline_entry(&f).await;
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await.2, 0);
+}

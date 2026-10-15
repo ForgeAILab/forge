@@ -1,0 +1,53 @@
+   Compiling guards-nextest-fixture v0.1.0 (/Volumes/Data/tmp/guards-fixtures/nextest)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+────────────
+ Nextest run ID 8af0b98d-836e-4e7c-acc1-f6d54b345bd8 with nextest profile: default
+    Starting 3 tests across 1 binary
+        PASS [   0.008s] (1/3) guards-nextest-fixture parser::accepts_input
+        FAIL [   0.008s] (2/3) guards-nextest-fixture parser::empty_input
+  stdout ───
+
+    running 1 test
+    test parser::empty_input ... FAILED
+
+    failures:
+
+    failures:
+        parser::empty_input
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'parser::empty_input' (6015321) panicked at src/lib.rs:4:24:
+    assertion `left == right` failed
+      left: ""
+     right: "value"
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   0.008s] (3/3) guards-nextest-fixture parser::unicode_input
+  stdout ───
+
+    running 1 test
+    test parser::unicode_input ... FAILED
+
+    failures:
+
+    failures:
+        parser::unicode_input
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'parser::unicode_input' (6015320) panicked at src/lib.rs:6:26:
+    assertion `left == right` failed
+      left: "猫"
+     right: "dog"
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.008s] 3 tests run: 1 passed, 2 failed, 0 skipped
+        FAIL [   0.008s] (2/3) guards-nextest-fixture parser::empty_input
+        FAIL [   0.008s] (3/3) guards-nextest-fixture parser::unicode_input
+error: test run failed

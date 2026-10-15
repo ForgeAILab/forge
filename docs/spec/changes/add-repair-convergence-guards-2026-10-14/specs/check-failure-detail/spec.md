@@ -3,7 +3,8 @@
 ### Requirement: Check steps report failing tests
 The check executor SHALL extract failure signatures from each step's full output while the step runs. It strips ANSI codes first and recognises:
 - cargo test (`test <path> ... FAILED`);
-- vitest and jest (`FAIL <file> > <suite> > <test>`);
+- cargo nextest (`FAIL [ <duration>] <binary> <test>`, optionally with a progress counter);
+- vitest and jest (`FAIL <file> > <suite> > <test>`, and failure glyphs only inside a recognised runner block, ending at its summary);
 - pytest (`FAILED <file>::<test>`);
 - go test (`--- FAIL: <Test>`);
 - failed and errored cases in JUnit XML files a step writes under `FORGE_CI_REPORT_DIR`.
@@ -18,6 +19,18 @@ They SHALL be stored as optional `failures` on `CheckCommandOutcome` and `StepRe
 #### Scenario: Vitest suite with two failures
 - **WHEN** `pnpm test` exits 1 and its output contains `FAIL src/a.test.ts > parser > empty input` and `FAIL src/b.test.ts > cli > json flag`
 - **THEN** the step result's `failures` holds exactly those two normalised signatures
+
+#### Scenario: Linter and progress glyphs
+- **WHEN** a linter or progress renderer emits `×`, `✗` or `●` outside a recognised vitest/jest output block
+- **THEN** those lines produce no test signatures, including after a test runner's summary
+
+#### Scenario: Nextest repeats a failure
+- **WHEN** nextest reports a binary and failing test with durations, repeats libtest output in a stdout block and lists the same failure in its summary
+- **THEN** one stable binary/test identity is retained without durations or progress counters
+
+#### Scenario: Abandoned report directories
+- **WHEN** a check starts in a worktree with abandoned Forge-generated `ci-reports-*` directories under its reserved `.forge-task` directory
+- **THEN** those directories are removed before the command runs, without following symlinks or removing unrelated entries
 
 #### Scenario: JUnit report
 - **WHEN** a step runs `vitest --reporter=junit --outputFile=$FORGE_CI_REPORT_DIR/web.xml` and two cases fail

@@ -21,6 +21,7 @@ const SECRET_FRAGMENT_BYTES: usize = 4;
 const WITNESS_TIMEOUT: Duration = Duration::from_secs(2);
 /// `git status` walks the worktree; a large one needs longer than a HEAD read.
 const CLEAN_WITNESS_TIMEOUT: Duration = Duration::from_secs(20);
+const REPORT_RANDOM_CHARS: usize = 6;
 const LEGACY_SERVER: &str = "legacy-server/1";
 const LEGACY_DAEMON: &str = "legacy-daemon/1";
 fn legacy(policy: &str) -> bool {
@@ -427,6 +428,34 @@ pub async fn run_command(
         .await
         .map(|(receipt, _)| receipt)
 }
+
+/// Only Forge's tempfile names inside its reserved Task directory are eligible.
+/// Directory-entry types and remove_dir_all do not follow symbolic links,
+/// including links nested inside an abandoned directory.
+fn remove_abandoned_reports(root: &executors::sandbox::TaskRoot) {
+    let directory = root.path().join(".forge-task");
+    if !std::fs::symlink_metadata(&directory).is_ok_and(|m| m.file_type().is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name.strip_prefix("ci-reports-") else {
+            continue;
+        };
+        if suffix.len() == REPORT_RANDOM_CHARS
+            && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            // Reports are optional; a failed cleanup must not fail the check.
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Also returns the command's process group, when one was started.
 async fn run_command_group(
     path: &Path,
@@ -448,9 +477,13 @@ async fn run_command_group(
     // Reports are optional evidence: a directory that cannot be made leaves the
     // command without one rather than failing it as infrastructure.
     let task_root = executors::sandbox::TaskRoot::of_worktree(path);
+    if let Some(root) = &task_root {
+        remove_abandoned_reports(root);
+    }
     let reports = match &task_root {
         Some(root) => tempfile::Builder::new()
             .prefix("ci-reports-")
+            .rand_bytes(REPORT_RANDOM_CHARS)
             .tempdir_in(root.path().join(".forge-task")),
         None => tempfile::Builder::new()
             .prefix("forge-ci-reports-")

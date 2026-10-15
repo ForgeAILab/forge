@@ -14,6 +14,23 @@ const MAX_REPORT_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 static DURATION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\s*\(?\b\d+(?:\.\d+)?\s*(?:ms|µs|μs|ns|s|seconds?)\)?\s*$").unwrap()
 });
+static NEXTEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^FAIL\s+\[\s*\d+(?:\.\d+)?s\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+)$").unwrap()
+});
+static JS_TEST_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:\.(?:test|spec)\.[cm]?[jt]sx?|(?:^|/)__tests__/\S+\.[cm]?[jt]sx?)(?:\s|$)")
+        .unwrap()
+});
+static VITEST_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:RUN|DEV)\s+v\d+\.").unwrap());
+
+#[derive(Default, PartialEq, Eq)]
+enum Runner {
+    #[default]
+    Unknown,
+    JavaScript,
+    Nextest,
+}
 
 /// ANSI parser state survives pipe chunk boundaries, including OSC hyperlinks.
 #[derive(Default)]
@@ -134,6 +151,7 @@ pub(crate) struct Stream<'a> {
     tail: Vec<u8>,
     line: Vec<u8>,
     file: Option<String>,
+    runner: Runner,
     limit: usize,
     roots: &'a [&'a Path],
     env: &'a std::collections::BTreeMap<String, String>,
@@ -151,6 +169,7 @@ impl<'a> Stream<'a> {
             tail: vec![],
             line: vec![],
             file: None,
+            runner: Runner::Unknown,
             limit,
             roots,
             env,
@@ -175,7 +194,35 @@ impl<'a> Stream<'a> {
     fn end_line(&mut self) {
         let line = String::from_utf8_lossy(&self.line);
         let line = line.trim();
-        let identity = if let Some(test) = line
+        // A runner block ends at its summary. A later linter or progress
+        // renderer may print the same glyphs, without reporting any tests.
+        if line.starts_with("Test Suites:")
+            || line.starts_with("Test Files ")
+            || line.starts_with("Summary [")
+            || line.starts_with("SUMMARY [")
+        {
+            self.runner = Runner::Unknown;
+            self.file = None;
+        } else if VITEST_HEADER.is_match(line) {
+            self.runner = Runner::JavaScript;
+            self.file = None;
+        } else if line.starts_with("Nextest run ID ") {
+            self.runner = Runner::Nextest;
+            self.file = None;
+        }
+        let identity = if let Some(failure) = NEXTEST_FAILURE.captures(line) {
+            self.runner = Runner::Nextest;
+            self.file = None;
+            Some(format!("{} > {}", &failure[1], &failure[2]))
+        } else if self.runner == Runner::Nextest {
+            // Both nextest's --- STDOUT:/STDERR: blocks and newer indented
+            // stdout/stderr sections can repeat libtest failures. The binary
+            // plus test on nextest's own FAIL line is the identity, once.
+            if line == "error: test run failed" {
+                self.runner = Runner::Unknown;
+            }
+            None
+        } else if let Some(test) = line
             .strip_prefix("test ")
             .and_then(|s| s.split_once(" ... FAILED").map(|(name, _)| name))
         {
@@ -189,16 +236,21 @@ impl<'a> Stream<'a> {
         } else if let Some(test) = line.strip_prefix("--- FAIL: ") {
             Some(test.to_owned())
         } else if let Some(test) = line.strip_prefix("FAIL ") {
+            let test = test.trim();
             if test.contains(" > ") {
                 Some(test.to_owned())
             } else {
-                self.file = Some(test.to_owned());
+                if JS_TEST_FILE.is_match(test) {
+                    self.runner = Runner::JavaScript;
+                    self.file = Some(test.to_owned());
+                }
                 None
             }
         } else if let Some(test) = line
             .strip_prefix('×')
             .or_else(|| line.strip_prefix('✗'))
             .or_else(|| line.strip_prefix('●'))
+            .filter(|_| self.runner == Runner::JavaScript)
         {
             let test = test.trim().replace(" › ", " > ");
             if test.contains(" > ") && self.file.is_none() {
@@ -214,7 +266,9 @@ impl<'a> Stream<'a> {
             if let Some(file) = line
                 .strip_prefix('❯')
                 .and_then(|s| s.trim().split_once(" ("))
+                .filter(|(file, summary)| JS_TEST_FILE.is_match(file) && summary.contains("test"))
             {
+                self.runner = Runner::JavaScript;
                 self.file = Some(file.0.to_owned());
             }
             None
@@ -554,5 +608,33 @@ mod tests {
     fn unknown_runner_has_no_signature_and_unterminated_failure_is_kept() {
         assert!(extract("compiler: nope\nunknown runner: 9 failed\n").is_empty());
         assert_eq!(extract("test parser::empty ... FAILED"), ["parser::empty"]);
+    }
+
+    #[test]
+    fn linter_and_progress_glyphs_are_not_test_signatures() {
+        assert!(extract("lint starting\n× unused import\n✗ checking dependencies\n● compiling > modules\nFAIL compilation\n● packaging\n").is_empty());
+        // A completed test block cannot lend its context to the next tool.
+        assert!(extract(
+            "RUN v4.1.11 /task\nTest Files  1 passed (1)\n× unused import\n✗ done\n● bundling\n"
+        )
+        .is_empty());
+        assert_eq!(extract("FAIL ./parser.test.js\n● parser › empty input\nTest Suites: 1 failed, 1 total\n× lint error\n✗ progress\n● bundling\n"), ["./parser.test.js > parser > empty input"]);
+        assert_eq!(extract("FAIL [ 0.123s] crate::module test_name\n--- STDOUT: crate::module test_name ---\n× custom progress\n✗ custom lint\n● custom progress\nSUMMARY [ 0.123s] 1 test run: 1 failed\n"), ["crate::module > test_name"]);
+    }
+
+    #[test]
+    fn nextest_extractor_captured_output_has_stable_binary_test_identities() {
+        let captured = include_str!("fixtures/cargo-nextest.txt");
+        let expected = [
+            "guards-nextest-fixture > parser::empty_input",
+            "guards-nextest-fixture > parser::unicode_input",
+        ];
+        assert_eq!(extract(captured), expected);
+        let changed_durations = Regex::new(r"\[\s*\d+\.\d+s\]")
+            .unwrap()
+            .replace_all(captured, "[ 12.345s]");
+        assert_eq!(extract(&changed_durations), expected);
+        assert_eq!(extract("FAIL [ 0.123s] crate::module test_name\n--- STDOUT: crate::module test_name ---\ntest test_name ... FAILED\nSUMMARY [ 0.123s] 1 test run: 1 failed\nFAIL [ 0.123s] crate::module test_name\n"), ["crate::module > test_name"]);
+        assert_eq!(extract("Nextest run ID captured\nSummary [ 0.123s] 1 test run: 1 passed\ntest other_runner::failure ... FAILED\n"), ["other_runner::failure"]);
     }
 }

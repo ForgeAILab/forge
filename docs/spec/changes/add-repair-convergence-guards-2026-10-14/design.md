@@ -53,7 +53,7 @@ Non-Goals:
   itself.
 - Automatically creating follow-up Tasks from `out_of_scope` findings. They
   are listed, and the owner acts.
-- Test runners beyond cargo test, vitest/jest, pytest, go test and JUnit XML.
+- Test runners beyond cargo test/nextest, vitest/jest, pytest, go test and JUnit XML.
 
 ## Decisions
 
@@ -65,13 +65,20 @@ Non-Goals:
   | Runner | Lines matched |
   |---|---|
   | cargo test | `test <path> ... FAILED` |
-  | vitest/jest | `FAIL <file> > <suite> > <test>` and `×`/`✗` lines |
+  | cargo nextest | `FAIL [ <duration>] <binary> <test>` (optional progress counter); binary and test form the identity |
+  | vitest/jest | `FAIL <file> > <suite> > <test>` and `×`/`✗`/`●` lines inside recognised runner blocks |
   | pytest | `FAILED <file>::<test>` |
   | go test | `--- FAIL: <Test>` |
 
+- Runner headers open vitest/jest blocks and their summaries close them. Glyphs
+  outside those blocks are not test failures. Nextest stdout/stderr blocks and
+  summary repetitions do not add duplicate libtest identities.
 - **JUnit XML.** Forge exports `FORGE_CI_REPORT_DIR` (per run, inside the
   Task root). Any `*.xml` JUnit file a step writes there is parsed for
-  failed and errored cases. The step list stays plain strings.
+  failed and errored cases. The step list stays plain strings. At the next check
+  command in that worktree, abandoned report directories matching Forge's
+  generated names under `.forge-task` are removed without following symlinks
+  or removing unrelated entries.
 - **Normalisation.** Durations, absolute Task-root prefixes and ANSI codes
   are stripped. Each signature is at most 300 characters. At most 200
   signatures are kept per step, with a `failures_truncated` flag.
@@ -155,15 +162,23 @@ Non-Goals:
 
 **D4 — No-change gate.**
 - When a coder repair round ends and the commit about to enter review equals
-  the commit judged by the latest failed Review in the window (with a clean
-  worktree), Forge starts no CI, verify or reviewer, and creates no Review
-  row.
+  the commit judged by the latest Review in the window, and that Review failed
+  (with a clean worktree), Forge starts no CI, verify or reviewer, and creates
+  no Review row.
 - **First time:** it sends the Task back to the coder with a brief headed
   "No change since review N". This is charged to the persistent
   `RepairNoChange` budget (Review window, limit 1).
 - **Second time:** it parks with `review_needs_owner` and the message
   `no change after repair round`.
+- A later passing Review of the same commit means no reminder is due.
 - Owner-initiated re-reviews are exempt.
+- Entries already past the guard when it ships continue: entry checkpoints or
+  a recorded `awaited_consumer_id`, without a guard decision, record `Continue`.
+- Same-state retries after an offline entry carry the original source state and
+  actor in the hooks payload, so reconnect still evaluates a repair entry as a
+  repair and retains owner exemptions. A reminder clears the resolved entry's
+  infrastructure blocker before returning to the coder. No schema migration is
+  needed.
 
 **D5 — Reviewer anchoring.** Finding fields:
 - `requirement_ids`: ids of the frozen contract's requirements. Unknown ids
