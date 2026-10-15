@@ -1,0 +1,81 @@
+────────────
+ Nextest run ID e99a1c66-98b7-4fe5-a290-9d661526cc28 with nextest profile: default
+    Starting 3 tests across 1 binary
+  TRY 1 ABRT [   0.008s] (───) nextest-status parser::aborts
+  stdout ───
+
+    running 1 test
+
+    (test aborted with signal 6: SIGABRT)
+
+  TRY 1 FAIL [   0.008s] (───) nextest-status parser::fails
+  stdout ───
+
+    running 1 test
+    test parser::fails ... FAILED
+
+    failures:
+
+    failures:
+        parser::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'parser::fails' (9551920) panicked at src/lib.rs:8:18:
+    assertion `left == right` failed
+      left: 1
+     right: 2
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 2 ABRT [   0.008s] (1/3) nextest-status parser::aborts
+  stdout ───
+
+    running 1 test
+
+    (test aborted with signal 6: SIGABRT)
+
+  TRY 2 FAIL [   0.008s] (2/3) nextest-status parser::fails
+  stdout ───
+
+    running 1 test
+    test parser::fails ... FAILED
+
+    failures:
+
+    failures:
+        parser::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'parser::fails' (9551929) panicked at src/lib.rs:8:18:
+    assertion `left == right` failed
+      left: 1
+     right: 2
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+TRY 1 TRMNTG [>  1.000s] (───) nextest-status parser::hangs
+   TRY 1 TMT [   1.003s] (───) nextest-status parser::hangs
+  stdout ───
+
+    running 1 test
+
+    (test timed out)
+
+TRY 2 TRMNTG [>  1.000s] (───) nextest-status parser::hangs
+   TRY 2 TMT [   1.002s] (3/3) nextest-status parser::hangs
+  stdout ───
+
+    running 1 test
+
+    (test timed out)
+
+────────────
+     Summary [   2.006s] 3 tests run: 0 passed, 2 failed, 1 timed out, 0 skipped
+  TRY 2 ABRT [   0.008s] (1/3) nextest-status parser::aborts
+  TRY 2 FAIL [   0.008s] (2/3) nextest-status parser::fails
+   TRY 2 TMT [   1.002s] (3/3) nextest-status parser::hangs
+error: test run failed

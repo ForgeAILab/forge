@@ -14,8 +14,12 @@ const MAX_REPORT_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 static DURATION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\s*\(?\b\d+(?:\.\d+)?\s*(?:ms|µs|μs|ns|s|seconds?)\)?\s*$").unwrap()
 });
+/// The final status of a nextest test that failed, timed out or died of a
+/// signal (`TRY n` and short statuses such as `ABRT`/`TMT` under retries).
+/// An attempt that will be retried shows `(───)` instead of its counter and
+/// is not matched: a test that passes on a retry did not fail.
 static NEXTEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^FAIL\s+\[\s*\d+(?:\.\d+)?s\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+)$").unwrap()
+    Regex::new(r"^(?:TRY \d+\s+)?(?:FAIL|LEAK-FAIL|TIMEOUT|TMT|ABORT|ABRT|SIG[A-Z]+)\s+\[\s*\d+(?:\.\d+)?s\]\s+(?:\(\d+/\d+\)\s+)?([^\s(]\S*)\s+(.+)$").unwrap()
 });
 /// A JS/TS source path. jest `testRegex`/`testMatch` and vitest `include` are
 /// configurable (NestJS names e2e suites `*.e2e-spec.ts`), so a test-name
@@ -665,5 +669,29 @@ mod tests {
         };
         assert_eq!(run("5.296"), ["test/slow.e2e-spec.js > slow > waits"]);
         assert_eq!(run("6.01"), run("5.296"));
+    }
+
+    #[test]
+    fn nextest_timeouts_signals_and_retried_failures_keep_their_identities() {
+        // Captured from cargo-nextest 0.9.144 with a 1 s terminate-after, and
+        // again with `--retries 1`, where statuses shorten and gain `TRY n`.
+        assert_eq!(
+            extract(include_str!("fixtures/cargo-nextest-statuses.txt")),
+            [
+                "nextest-status > parser::fails",
+                "nextest-status > parser::aborts",
+                "nextest-status > parser::hangs"
+            ]
+        );
+        assert_eq!(
+            extract(include_str!("fixtures/cargo-nextest-retries.txt")),
+            [
+                "nextest-status > parser::aborts",
+                "nextest-status > parser::fails",
+                "nextest-status > parser::hangs"
+            ]
+        );
+        // A failed attempt that passes on its retry is flaky, not a failure.
+        assert!(extract("Nextest run ID captured\n  TRY 1 FAIL [   0.008s] (\u{2500}\u{2500}\u{2500}) crate parser::flaky\n  TRY 2 PASS [   0.008s] (1/1) crate parser::flaky\n     Summary [   0.020s] 1 test run: 1 passed (1 flaky), 0 skipped\n").is_empty());
     }
 }
