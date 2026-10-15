@@ -1438,6 +1438,8 @@ mod tests {
                 reason: "owner access".into(),
                 fixable_by: api_types::FixableBy::Owner,
                 repeat: false,
+                findings: Vec::new(),
+                resolved: Vec::new(),
                 report: String::new(),
             }),
             ..Default::default()

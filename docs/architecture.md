@@ -49,6 +49,7 @@ services-agents / services → events / agent-host / executors / workspace → g
 agent-host → agent-runtime
 forge-cli / forge-solo → config
 forge-solo → api-types / review / cli-adapters / operation-registry
+api → review → db (finding ledger projection)
 api-types (shared request/response types, zero internal deps)
 
 api / services-agents / services → pricing → db / api-types
@@ -8218,6 +8219,18 @@ plus the full diff when it fits in 48 KiB) and, on a re-review, the latest
 earlier verdict with its reason, a bounded slice of its report, and the diff
 since the commit it judged when that commit is still an ancestor. These
 sections are best effort and stay inside the prepared-prompt byte limit.
+
+Reviewer result blocks also accept optional structured `findings` and
+`resolved` ids. The frozen assessment keeps only the reviewer's bounded input;
+Forge assigns ids and derives open/resolved/unconfirmed status and streaks with
+`review::finding_ledger`. `SqliteDb::review_window` reads the persisted Review
+budget window and its Reviews together. A retry-window reset starts a fresh
+ledger; a source that did not run leaves its findings unchanged. A reviewer
+that omits an open finding makes it unconfirmed, while passing Forge checks
+resolve their own findings. The re-review prompt carries the prior ledger's
+open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
+the same projection. Merge failures stay outside it. This projection does not
+change verdict routing, budgets, or Task comments.
 
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and

@@ -198,6 +198,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}` | Get task |
 | GET    | `/api/v1/tasks/{id}/detail` | Load the Task detail bootstrap in one request: task, effective workflow, and a page of executions |
 | GET    | `/api/v1/tasks/{id}/relations` | Read direct subtask, dependency, and dependent summaries without scanning the Project task list |
+| GET    | `/api/v1/tasks/{id}/findings` | Current review-window findings (same Project read authority as Task reviews) |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
@@ -6083,9 +6084,42 @@ Forge metadata, a scope/product decision, or changed acceptance criteria.
 Optional `repeat` defaults to `false`; `true` means the previous review raised
 the same blocking finding and it remains unaddressed. Missing or unknown values
 use the defaults. The stored `assessment` is
-`{result, reason, fixable_by, repeat, report}`, where `report`
+`{result, reason, fixable_by, repeat, findings?, resolved?, report}`, where `report`
 is the reviewer's Markdown with the block removed. A reply with no readable
 result block is `unverified`.
+
+The optional `findings` list accepts `summary` (required and nonblank),
+`severity` (`blocking` by default, or `minor`), `where`, `expected`, `observed`,
+and `id` only when continuing an earlier finding. New findings receive Forge ids.
+`resolved` lists fixed reviewer ids. Malformed lists are ignored; invalid items
+are dropped. At most 50 valid items per list are retained, with each text field
+limited to 1,000 Unicode characters. These fields default to empty and are
+omitted from stored assessments when empty; derived ids and status never alter
+frozen assessments.
+
+`GET /api/v1/tasks/{id}/findings` returns
+`{items, window_started_at, review_attempts}` for the persisted Review budget
+window. Before a reset the window starts at Task creation; after a recovery
+reset it starts at that reset's transition timestamp. Review attempts created
+at or after that timestamp belong to the window. `review_attempts` counts all
+attempts in it, including running and cancelled attempts. `items` is ordered
+lexically by id and capped at 200 entries after the full ledger is derived.
+Project members with Task read access may use the route; hidden and unknown
+Tasks get the same refusal as `/tasks/{id}/reviews`.
+
+Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
+`summary`, `where`, `expected`, `observed`, `first_attempt`,
+`last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`), and
+`streak`. Nullable text fields are `null` when unavailable. Reviewer ids are
+`F1`, `F2`, ... in first-seen list order within the window. Known ids continue
+findings; unknown ids become new findings. Forge sources use the stored,
+zero-based `CI-<step index>`, `CHK-<check id>` and `V-<check name>` ids.
+Merge failures do not enter this ledger. A source that did not run leaves its
+findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
+an explicit resolution or passing Forge check resolves it. Reopening a resolved
+or unconfirmed finding starts its streak at one. A reset empties the ledger
+and restarts reviewer numbering. Findings are informational in this phase;
+existing verdict routing and retry budgets remain authoritative.
 
 Conformance `status` follows from the result and Forge's own checks. A failing
 setup step or required check makes the review `failed` whatever the reviewer

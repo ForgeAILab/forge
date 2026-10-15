@@ -3048,6 +3048,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Optional structured findings and resolved ids in reviewer results, with lenient
+  parsing and stable finding ids derived across review attempts.
+- `GET /api/v1/tasks/{id}/findings` reads the current review-window ledger,
+  including open, resolved and unconfirmed findings and their streaks.
+- `forge-ctl task findings <task>` prints the same ledger as a table or JSON.
 - **A public demo deployment and a pull-request suite check.** `deploy/demo/`
   holds a Compose application for Dokploy and a demo image for a throwaway
   public instance: seeded demo data, no agent daemon, no MCP endpoint, no

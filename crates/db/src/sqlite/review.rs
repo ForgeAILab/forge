@@ -1,6 +1,39 @@
 use super::*;
 
 impl SqliteDb {
+    /// Use the accounting window, including upgrade backfills and resets from
+    /// any state. Do not infer a reset from a reviewer verdict or Task status.
+    pub async fn review_window(&self, task_id: &str) -> Result<crate::ReviewWindow> {
+        let mut tx = self.pool().begin().await?;
+        let window_started_at: String = sqlx::query_scalar(
+            "SELECT COALESCE(l.created_at,t.created_at) FROM task t
+             LEFT JOIN task_budget b ON b.task_id=t.id AND b.kind='review'
+             LEFT JOIN transition_log l ON l.id=b.window_id AND l.task_id=t.id
+             WHERE t.id=?",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DbError::NotFound)?;
+        let rows = sqlx::query(
+            "SELECT * FROM review WHERE task_id=? AND created_at>=?
+             ORDER BY attempt_number ASC,id ASC",
+        )
+        .bind(task_id)
+        .bind(&window_started_at)
+        .fetch_all(&mut *tx)
+        .await?;
+        let reviews = rows
+            .into_iter()
+            .map(map_review)
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(crate::ReviewWindow {
+            window_started_at,
+            reviews,
+        })
+    }
+
     /// A human-authored branch submission is delivery evidence, not a
     /// dispatched execution. Keep the exact Git evidence and all authority
     /// fences in the Review candidate's existing execution record.

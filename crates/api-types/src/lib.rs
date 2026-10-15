@@ -130,6 +130,12 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ReviewContract::export().expect("export ReviewContract");
     ReviewResult::export().expect("export ReviewResult");
     FixableBy::export().expect("export FixableBy");
+    ReviewFinding::export().expect("export ReviewFinding");
+    ReviewFindingSeverity::export().expect("export ReviewFindingSeverity");
+    ReviewFindingSource::export().expect("export ReviewFindingSource");
+    ReviewFindingStatus::export().expect("export ReviewFindingStatus");
+    ReviewFindingEntry::export().expect("export ReviewFindingEntry");
+    TaskFindingsResponse::export().expect("export TaskFindingsResponse");
     ReviewAssessment::export().expect("export ReviewAssessment");
     ConformanceStatus::export().expect("export ConformanceStatus");
     ConformanceCheckResult::export().expect("export ConformanceCheckResult");

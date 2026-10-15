@@ -641,6 +641,10 @@ pub fn api_router(state: AppState) -> Router {
             put(routes::tasks::assign_task_role).delete(routes::tasks::remove_task_role),
         )
         .route(
+            "/api/v1/tasks/{id}/findings",
+            get(routes::tasks::list_findings),
+        )
+        .route(
             "/api/v1/tasks/{id}/reviews",
             get(routes::tasks::list_reviews),
         )

@@ -61,6 +61,10 @@ pub enum TaskCmd {
     Actions {
         id: String,
     },
+    /// Read the finding ledger in the Task's current review-budget window.
+    Findings {
+        id: String,
+    },
     /// Apply an offered action. Exit code 3 means action_unavailable; refresh with task actions.
     Action {
         /// Task ID.
@@ -163,6 +167,58 @@ fn format_offer(offer: &api_types::Offer) -> String {
     )
 }
 
+fn format_findings(response: &api_types::TaskFindingsResponse) -> Result<String> {
+    let rows = response
+        .items
+        .iter()
+        .map(|entry| {
+            Ok(vec![
+                entry.id.clone(),
+                serde_json::to_value(entry.status)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                serde_json::to_value(entry.source)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                serde_json::to_value(entry.severity)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                entry.streak.to_string(),
+                entry.first_attempt.to_string(),
+                entry.last_checked_attempt.to_string(),
+                entry.summary.clone(),
+                entry.r#where.clone().unwrap_or_default(),
+                entry.expected.clone().unwrap_or_default(),
+                entry.observed.clone().unwrap_or_default(),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
+        "Window started: {}\nReview attempts: {}\n{}",
+        response.window_started_at,
+        response.review_attempts,
+        tabled::Table::from_rows(
+            &[
+                "ID",
+                "Status",
+                "Source",
+                "Severity",
+                "Streak",
+                "First attempt",
+                "Last checked",
+                "Summary",
+                "Where",
+                "Expected",
+                "Observed"
+            ],
+            rows
+        )
+    ))
+}
+
 impl TaskArgs {
     pub async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
         match &self.cmd {
@@ -240,6 +296,17 @@ impl TaskArgs {
                     .post(&format!("/api/v1/tasks/{id}/transition"), &request)
                     .await?;
                 print_task(output, &response.task)
+            }
+            TaskCmd::Findings { id } => {
+                let response: api_types::TaskFindingsResponse =
+                    client.get(&format!("/api/v1/tasks/{id}/findings")).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        println!("{}", format_findings(&response)?);
+                        Ok(())
+                    }
+                }
             }
             TaskCmd::Actions { id } => {
                 let response: api_types::TaskActionsResponse =
@@ -605,6 +672,52 @@ mod tests {
         #[command(flatten)]
         task: TaskArgs,
     }
+    #[tokio::test]
+    async fn findings_command_reads_the_ledger_and_formats_every_field() {
+        use axum::{routing::get, Json, Router};
+        let response: api_types::TaskFindingsResponse = serde_json::from_value(json!({
+            "items":[{"id":"F1","source":"reviewer","severity":"blocking","summary":"crash","where":"src/lib.rs:2","expected":"error","observed":"panic","first_attempt":1,"last_checked_attempt":2,"status":"open","streak":2}],
+            "window_started_at":"2026-10-15T00:00:00Z","review_attempts":2
+        })).unwrap();
+        let table = format_findings(&response).unwrap();
+        for expected in [
+            "F1",
+            "reviewer",
+            "blocking",
+            "crash",
+            "src/lib.rs:2",
+            "error",
+            "panic",
+            "open",
+            "2026-10-15T00:00:00Z",
+            "Review attempts: 2",
+        ] {
+            assert!(table.contains(expected), "{table}");
+        }
+        let expected = response.clone();
+        let app = Router::new().route(
+            "/api/v1/tasks/the-task/findings",
+            get(move || async move { Json(expected) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ForgeClient::new_without_credentials(format!("http://{address}"));
+        let command = Cli::try_parse_from(["ctl", "findings", "the-task"]).unwrap();
+        assert!(matches!(&command.task.cmd,TaskCmd::Findings{id} if id=="the-task"));
+        command
+            .task
+            .run(&client, &OutputFormat::Json)
+            .await
+            .unwrap();
+        command
+            .task
+            .run(&client, &OutputFormat::Table)
+            .await
+            .unwrap();
+        server.abort();
+    }
+
     #[test]
     fn show_is_the_documented_name_of_get() {
         for name in ["show", "get"] {

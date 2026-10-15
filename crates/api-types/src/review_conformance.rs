@@ -194,6 +194,85 @@ pub enum FixableBy {
     Coder,
 }
 
+/// A problem reported by the reviewer. Forge assigns ids in the derived ledger,
+/// never in this frozen value. On re-review, `id` continues a known finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct ReviewFinding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub id: Option<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub severity: ReviewFindingSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub r#where: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observed: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingSeverity {
+    Minor,
+    #[default]
+    #[serde(other)]
+    Blocking,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingSource {
+    Reviewer,
+    Ci,
+    Check,
+    Verify,
+    /// Reserved for repair briefs; merge failures never enter the ledger.
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingStatus {
+    Open,
+    Resolved,
+    Unconfirmed,
+}
+
+/// Derived state of one finding in the current review-budget window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct ReviewFindingEntry {
+    pub id: String,
+    pub source: ReviewFindingSource,
+    pub severity: ReviewFindingSeverity,
+    pub summary: String,
+    pub r#where: Option<String>,
+    pub expected: Option<String>,
+    pub observed: Option<String>,
+    pub first_attempt: i64,
+    pub last_checked_attempt: i64,
+    pub status: ReviewFindingStatus,
+    pub streak: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct TaskFindingsResponse {
+    /// Id-ordered view, limited to 200 entries. The derivation retains all ids.
+    pub items: Vec<ReviewFindingEntry>,
+    pub window_started_at: String,
+    pub review_attempts: usize,
+}
+
 /// What Forge keeps from a reviewer's reply: the result block it ended with
 /// and the Markdown review written before it.
 ///
@@ -213,6 +292,12 @@ pub struct ReviewAssessment {
     /// The previous review raised the same finding and it remains unaddressed.
     #[serde(default)]
     pub repeat: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<ReviewFinding>>", optional)]
+    pub findings: Vec<ReviewFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub resolved: Vec<String>,
     /// The reviewer's Markdown review, without the result block.
     #[serde(default)]
     pub report: String,

@@ -3271,6 +3271,8 @@ mod reviewer_message_tests {
             reason: "api not exported".to_owned(),
             fixable_by: api_types::FixableBy::Coder,
             repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
             report: "## R1\n\nExpected the api exported; `src/lib.rs:3` does not.".to_owned(),
         };
         let mut failed = conformance(Some(assessment.clone()));
@@ -3287,6 +3289,8 @@ mod reviewer_message_tests {
             reason: "tsc not found".to_owned(),
             fixable_by: api_types::FixableBy::Coder,
             repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
             report: String::new(),
         }));
         blocked.status = api_types::ConformanceStatus::Blocked;

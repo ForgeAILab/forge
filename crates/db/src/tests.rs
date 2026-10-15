@@ -5951,6 +5951,8 @@ async fn seed_review_digest_contract(
             reason: "checked".into(),
             fixable_by: api_types::FixableBy::Coder,
             repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
             report: String::new(),
         }),
         checks: Vec::new(),
@@ -12258,5 +12260,52 @@ async fn archived_interruption_shape_decodes_at_the_event_boundary() {
     assert_eq!(
         raw, reloaded.payload_json,
         "decoding does not rewrite stored history"
+    );
+}
+
+/// The pre-findings V145 result/reason/report format, including the routing
+/// fields already emitted by v0.13.12. Construct its JSON independently of the
+/// new serializer and compare it with the immutable row before and after replay.
+#[tokio::test]
+async fn review_findings_v145_conformance_round_trip_is_byte_identical() {
+    let (db, _, _, contract) = seed_review_digest_contract(2).await;
+    let historical = format!(
+        "{{\"status\":\"passed\",\"contract\":{},\"assessment\":{{\"result\":\"pass\",\"reason\":\"checked\",\"fixable_by\":\"coder\",\"repeat\":false,\"report\":\"\"}},\"checks\":[],\"reason\":null}}",
+        serde_json::to_string(&contract).unwrap()
+    );
+    let before: String = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id=?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(before, historical);
+    let assessment = db
+        .review_conformance(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(assessment.assessment.as_ref().unwrap().findings.is_empty());
+    assert!(assessment.assessment.as_ref().unwrap().resolved.is_empty());
+    assert_eq!(serde_json::to_string(&assessment).unwrap(), historical);
+    db.record_review_conformance(&assessment).await.unwrap();
+    let after: String = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id=?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    let mut changed = assessment;
+    changed
+        .assessment
+        .as_mut()
+        .unwrap()
+        .resolved
+        .push("F1".into());
+    assert!(
+        matches!(db.record_review_conformance(&changed).await,Err(DbError::Check(message)) if message=="assessment is already frozen")
     );
 }

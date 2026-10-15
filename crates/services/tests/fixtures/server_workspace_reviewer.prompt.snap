@@ -35,6 +35,9 @@ fixable_by is "coder" (default) or "owner". Use "owner" only when the blocking f
 repeat defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
 Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
 Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}.
+findings is an optional list of problems. Each item needs a one-sentence summary; severity is "blocking" (default) or "minor". Include where (file and line, command, or screen), expected, and observed when available. Keep at most 50 items and each text field at most 1,000 characters. A pass may include minor findings; a fail remains a fail even without blocking findings.
+Forge assigns new finding ids. For a prior finding still open, copy its id into the item; list prior ids that are fixed in the optional resolved list. Do not invent ids for new findings. An omitted prior finding is unconfirmed, not resolved.
+Findings example: {"result":"fail","reason":"Empty input still crashes","findings":[{"id":"F1","summary":"Empty input crashes parse()","severity":"blocking","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"summary":"Help text has a typo","severity":"minor"}],"resolved":["F2"]}.
 Do not pass work you could not check.
 
 Frozen review contract:
