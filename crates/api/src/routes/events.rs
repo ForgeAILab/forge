@@ -1,5 +1,10 @@
-use db::{DomainEventRepo, SqliteDb};
-use std::{collections::VecDeque, convert::Infallible, sync::Arc};
+use db::{AgentChatRepo, DomainEventRepo, IntegrationRepo, ProjectRepo, SqliteDb, TaskRepo};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::State,
@@ -9,11 +14,16 @@ use axum::{
 use serde_json::json;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
-use crate::state::AppState;
+use crate::{routes::auth::AuthenticatedUser, state::AppState};
 
 const MAX_REPLAY_EVENTS: i64 = 1_000;
 const REPLAY_PAGE_SIZE: i64 = 100;
 const DURABLE_ID_PREFIX: &str = "domain-event:";
+/// How long one connection trusts a Project visibility answer. A membership
+/// added or removed reaches open streams within this window.
+const VISIBILITY_TTL: Duration = Duration::from_secs(10);
+/// Bound on each per-connection lookup cache.
+const AUDIENCE_CACHE_LIMIT: usize = 10_000;
 
 enum Replay {
     None,
@@ -29,6 +39,7 @@ enum Replay {
 
 pub async fn stream_events(
     State(state): State<AppState>,
+    user: AuthenticatedUser,
     headers: HeaderMap,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     // Register before the snapshot so an append during replay is still live.
@@ -103,15 +114,303 @@ pub async fn stream_events(
             {
                 return None;
             }
-            frame(event).map(Ok)
+            Some(Item::Event(event))
         }
-        Err(error) => Some(Ok(resync_frame(&error.to_string(), None))),
+        Err(error) => Some(Item::Frame(resync_frame(&error.to_string(), None))),
     });
-    Sse::new(futures_util::StreamExt::take_until(
+    // Replay and live frames pass the same per-subscriber filter: an event
+    // of a Project the caller cannot see never reaches them.
+    let audience = Arc::new(tokio::sync::Mutex::new(Audience::new(
+        Arc::clone(&state.db),
+        user.user_id,
+    )));
+    let frames = futures_util::StreamExt::filter_map(
         tokio_stream::StreamExt::chain(replay, stream),
+        move |item| {
+            let audience = Arc::clone(&audience);
+            async move {
+                match item {
+                    Item::Frame(frame) => Some(Ok(frame)),
+                    Item::Event(event) => {
+                        if audience.lock().await.admits(&event).await {
+                            frame(event).map(Ok)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        },
+    );
+    Sse::new(futures_util::StreamExt::take_until(
+        frames,
         shutdown_requested,
     ))
     .keep_alive(KeepAlive::default())
+}
+
+/// A stream item before the subscriber filter: an event still to be judged,
+/// or a transport frame (resync) every subscriber receives.
+enum Item {
+    Event(events::ForgeEvent),
+    Frame(Event),
+}
+
+/// What an event is about, for deciding who may receive it.
+enum Subject<'a> {
+    Project(&'a str),
+    Projects(&'a [String]),
+    Task(&'a str),
+    Chat(&'a str),
+    Account(&'a str),
+    Integration(&'a str),
+    /// Instance-level events (Agents, profiles, daemons, operations status):
+    /// no Project data, delivered to every subscriber as before.
+    Unscoped,
+}
+
+fn subject(event: &events::ForgeEvent) -> Subject<'_> {
+    use events::EventContext as C;
+    match &event.context {
+        C::TaskCreated { project_id, .. }
+        | C::TaskStatusChanged { project_id, .. }
+        | C::TaskAssigned { project_id, .. }
+        | C::TaskBlocked { project_id, .. }
+        | C::TaskUnblocked { project_id, .. }
+        | C::ProjectAutonomyStalled { project_id, .. }
+        | C::TaskFailed { project_id, .. }
+        | C::TaskRestarted { project_id, .. }
+        | C::TaskCancelled { project_id, .. }
+        | C::TaskRecovered { project_id, .. }
+        | C::RecoveryApplied { project_id, .. }
+        | C::TaskUpdated { project_id, .. }
+        | C::TaskDeleted { project_id, .. }
+        | C::NotificationCreated { project_id, .. }
+        | C::ProjectHookRunChanged { project_id, .. } => Subject::Project(project_id),
+        C::TaskMoved(payload) => Subject::Project(&payload.project_id),
+        C::ProjectCreated { .. }
+        | C::ProjectUpdated { .. }
+        | C::ProjectDeleted { .. }
+        | C::ProjectPaused { .. }
+        | C::ProjectResumed { .. } => Subject::Project(&event.entity_id),
+        C::TaskAutoTransitioned { task_id, .. }
+        | C::TaskRoleReassigned { task_id, .. }
+        | C::TaskDependencySatisfied { task_id, .. }
+        | C::ExecutionStarted { task_id, .. }
+        | C::ExecutionLog { task_id, .. }
+        | C::ExecutionCompleted { task_id, .. }
+        | C::ExecutionFailed { task_id, .. }
+        | C::ExecutionCancelled { task_id, .. }
+        | C::TaskExecutionRetry { task_id, .. }
+        | C::ExecutionStalled { task_id, .. }
+        | C::ExecutionDaemonDisconnected { task_id, .. }
+        | C::TaskExecutionCancelled { task_id, .. }
+        | C::WorkspaceCreated { task_id, .. }
+        | C::WorkspaceExecutionWaiting { task_id, .. }
+        | C::WorkspaceCleaned { task_id, .. }
+        | C::TaskTerminalSessionChanged { task_id, .. }
+        | C::ReviewStarted { task_id, .. }
+        | C::ReviewDecided { task_id, .. }
+        | C::ReviewPassed { task_id, .. }
+        | C::ReviewFailed { task_id, .. }
+        | C::ReviewApproved { task_id, .. }
+        | C::ReviewRejected { task_id, .. }
+        | C::MergeStarted { task_id, .. }
+        | C::MergeSucceeded { task_id, .. }
+        | C::MergeFailed { task_id, .. }
+        | C::CommentCreated { task_id, .. }
+        | C::TaskMediaUploaded { task_id, .. }
+        | C::TaskMediaDeleted { task_id, .. }
+        | C::FollowUpDispatched { task_id, .. }
+        | C::TaskRoleAgentDispatched { task_id, .. }
+        | C::TaskAwaitingHuman { task_id, .. }
+        | C::TransitionEffectFailed { task_id, .. }
+        | C::TransitionGuardRejected { task_id, .. }
+        | C::TransitionLoopDetected { task_id, .. }
+        | C::TaskRoleNotified { task_id, .. }
+        | C::ReconciliationEvent {
+            task_id: Some(task_id),
+            ..
+        } => Subject::Task(task_id),
+        C::IntegrationUpdated { project_ids, .. } => Subject::Projects(project_ids),
+        C::AgentChatMessageAdmitted { chat_id, .. }
+        | C::AgentChatTurnProgress { chat_id, .. }
+        | C::AgentChatResponseCompleted { chat_id, .. }
+        | C::AgentChatUpdated { chat_id, .. } => Subject::Chat(chat_id),
+        C::ExternalSyncCompleted { integration_id, .. }
+        | C::ExternalSyncFailed { integration_id, .. } => Subject::Integration(integration_id),
+        C::DomainEventCommitted {
+            scope_type,
+            scope_id,
+            ..
+        } => match scope_type.as_str() {
+            "project" => Subject::Project(scope_id),
+            "task" => Subject::Task(scope_id),
+            "agent_chat" => Subject::Chat(scope_id),
+            "account" => Subject::Account(scope_id),
+            _ => Subject::Unscoped,
+        },
+        _ => Subject::Unscoped,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Visibility {
+    Visible,
+    Hidden,
+    /// No such Project (never created, or already deleted): nothing to
+    /// protect, so the event is delivered as before.
+    Unknown,
+}
+
+/// One SSE connection's view of which events its user may receive. Project
+/// visibility answers expire after `VISIBILITY_TTL` (membership changes reach
+/// open streams within that window); a Task's or Chat's Project never changes
+/// and is cached for the connection. A Project that disappears keeps its last
+/// answer, so its own deletion frames reach exactly the subscribers who could
+/// see it. A lookup error withholds the event.
+struct Audience {
+    db: Arc<SqliteDb>,
+    user_id: String,
+    projects: HashMap<String, (Visibility, Instant)>,
+    task_projects: HashMap<String, String>,
+    chats: HashMap<String, db::AgentChat>,
+}
+
+impl Audience {
+    fn new(db: Arc<SqliteDb>, user_id: String) -> Self {
+        Self {
+            db,
+            user_id,
+            projects: HashMap::new(),
+            task_projects: HashMap::new(),
+            chats: HashMap::new(),
+        }
+    }
+
+    async fn admits(&mut self, event: &events::ForgeEvent) -> bool {
+        match subject(event) {
+            Subject::Unscoped => true,
+            Subject::Account(account_id) => account_id == self.user_id,
+            Subject::Project(project_id) => self.project(project_id).await != Visibility::Hidden,
+            Subject::Projects(project_ids) => {
+                if project_ids.is_empty() {
+                    return true;
+                }
+                let mut unknown = false;
+                for project_id in project_ids {
+                    match self.project(project_id).await {
+                        Visibility::Visible => return true,
+                        Visibility::Unknown => unknown = true,
+                        Visibility::Hidden => {}
+                    }
+                }
+                unknown
+            }
+            Subject::Task(task_id) => match self.task_project(task_id).await {
+                Ok(Some(project_id)) => self.project(&project_id).await != Visibility::Hidden,
+                Ok(None) => true,
+                Err(()) => false,
+            },
+            Subject::Chat(chat_id) => match self.chat(chat_id).await {
+                Ok(Some(chat)) => match (chat.account_id.as_deref(), chat.project_id.as_deref()) {
+                    (_, Some(project_id)) => self.project(project_id).await != Visibility::Hidden,
+                    (Some(account_id), None) => account_id == self.user_id,
+                    (None, None) => true,
+                },
+                Ok(None) => true,
+                Err(()) => false,
+            },
+            Subject::Integration(integration_id) => {
+                match IntegrationRepo::get_by_id(&*self.db, integration_id).await {
+                    Ok(Some(integration)) => {
+                        self.project(&integration.project_id).await != Visibility::Hidden
+                    }
+                    Ok(None) => true,
+                    Err(error) => {
+                        tracing::warn!(%error, "SSE integration lookup failed");
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    async fn project(&mut self, project_id: &str) -> Visibility {
+        let cached = self.projects.get(project_id).copied();
+        if let Some((visibility, at)) = cached {
+            if at.elapsed() < VISIBILITY_TTL {
+                return visibility;
+            }
+        }
+        let fresh = match ProjectRepo::get_visible_by_id(&*self.db, project_id, &self.user_id).await
+        {
+            Ok(Some(_)) => Visibility::Visible,
+            Ok(None) => match ProjectRepo::get_by_id(&*self.db, project_id).await {
+                Ok(Some(_)) => Visibility::Hidden,
+                Ok(None) => Visibility::Unknown,
+                Err(error) => {
+                    tracing::warn!(%error, "SSE Project lookup failed");
+                    return Visibility::Hidden;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "SSE Project visibility lookup failed");
+                return Visibility::Hidden;
+            }
+        };
+        let answer = match (fresh, cached) {
+            (Visibility::Unknown, Some((previous, _))) => previous,
+            _ => fresh,
+        };
+        if self.projects.len() >= AUDIENCE_CACHE_LIMIT {
+            self.projects.clear();
+        }
+        self.projects
+            .insert(project_id.to_owned(), (answer, Instant::now()));
+        answer
+    }
+
+    async fn task_project(&mut self, task_id: &str) -> Result<Option<String>, ()> {
+        if let Some(project_id) = self.task_projects.get(task_id) {
+            return Ok(Some(project_id.clone()));
+        }
+        match TaskRepo::get_by_id(&*self.db, task_id, true).await {
+            Ok(Some(task)) => {
+                if self.task_projects.len() >= AUDIENCE_CACHE_LIMIT {
+                    self.task_projects.clear();
+                }
+                self.task_projects
+                    .insert(task_id.to_owned(), task.project_id.clone());
+                Ok(Some(task.project_id))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(%error, "SSE Task lookup failed");
+                Err(())
+            }
+        }
+    }
+
+    async fn chat(&mut self, chat_id: &str) -> Result<Option<db::AgentChat>, ()> {
+        if let Some(chat) = self.chats.get(chat_id) {
+            return Ok(Some(chat.clone()));
+        }
+        match AgentChatRepo::get_agent_chat(&*self.db, chat_id).await {
+            Ok(Some(chat)) => {
+                if self.chats.len() >= AUDIENCE_CACHE_LIMIT {
+                    self.chats.clear();
+                }
+                self.chats.insert(chat_id.to_owned(), chat.clone());
+                Ok(Some(chat))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                tracing::warn!(%error, "SSE Agent Chat lookup failed");
+                Err(())
+            }
+        }
+    }
 }
 
 fn durable_sequence(id: &str) -> Option<i64> {
@@ -145,7 +444,7 @@ fn resync_frame(reason: &str, reset_to: Option<i64>) -> Event {
 fn replay_events(
     db: Arc<SqliteDb>,
     replay: Replay,
-) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> {
+) -> impl tokio_stream::Stream<Item = Item> {
     // Preflight seeks at most 1,001 sequences; the stream keeps just one page.
     futures_util::stream::unfold(
         (db, replay, VecDeque::new(), MAX_REPLAY_EVENTS),
@@ -153,7 +452,7 @@ fn replay_events(
             match replay {
                 Replay::None => None,
                 Replay::Resync { reason, reset_to } => Some((
-                    Ok(resync_frame(reason, reset_to)),
+                    Item::Frame(resync_frame(reason, reset_to)),
                     (db, Replay::None, pending, 0),
                 )),
                 Replay::Events { after, through } => {
@@ -170,7 +469,7 @@ fn replay_events(
                             Err(error) => {
                                 tracing::warn!(%error, "SSE ledger replay failed");
                                 return Some((
-                                    Ok(resync_frame("ledger replay failed", None)),
+                                    Item::Frame(resync_frame("ledger replay failed", None)),
                                     (db, Replay::None, pending, 0),
                                 ));
                             }
@@ -179,10 +478,8 @@ fn replay_events(
                     let event = pending.pop_front()?;
                     let after = event.sequence;
                     remaining -= 1;
-                    let frame = frame(services::DomainEventService::committed_frame(&event))
-                        .expect("committed event envelope serializes");
                     Some((
-                        Ok(frame),
+                        Item::Event(services::DomainEventService::committed_frame(&event)),
                         (db, Replay::Events { after, through }, pending, remaining),
                     ))
                 }

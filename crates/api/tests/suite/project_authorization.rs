@@ -1114,3 +1114,116 @@ async fn task_move_does_not_confirm_a_foreign_neighbor_id() {
         unknown.1["message"].as_str().unwrap().replace("missing-task", "ID")
     );
 }
+
+async fn sse_stream(f: &Fixture, bearer: &str) -> axum::body::BodyDataStream {
+    let response = f
+        .harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/events?token={bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().into_data_stream()
+}
+
+/// Read SSE frames until the unscoped marker every subscriber receives.
+async fn sse_until(stream: &mut axum::body::BodyDataStream, marker: &str) -> String {
+    use futures_util::StreamExt;
+    let mut seen = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !seen.contains(marker) {
+            let bytes = stream.next().await.expect("stream open").expect("frame");
+            seen.push_str(std::str::from_utf8(&bytes).unwrap());
+        }
+    })
+    .await
+    .expect("marker frame arrives");
+    seen
+}
+
+fn publish_project_events(f: &Fixture, marker: &str) {
+    let bus = &f.harness.state.event_bus;
+    let event = |event_type: &str, entity_id: &str, context| events::ForgeEvent {
+        event_type: event_type.into(),
+        entity_id: entity_id.into(),
+        timestamp: events::event_timestamp(),
+        context,
+    };
+    bus.publish(event(
+        "task.updated",
+        &f.task.id,
+        events::EventContext::TaskUpdated {
+            project_id: f.project.id.clone(),
+        },
+    ));
+    bus.publish(event(
+        "execution.log",
+        "private-execution-log",
+        events::EventContext::ExecutionLog {
+            task_id: f.task.id.clone(),
+            log: json!({"line":"private-log-line"}),
+            logs: None,
+        },
+    ));
+    bus.publish(event(
+        "domain_event.committed",
+        "private-domain-event",
+        events::EventContext::DomainEventCommitted {
+            sequence: 0,
+            domain_event_type: "project.updated".into(),
+            domain_entity_id: f.project.id.clone(),
+            entity_type: "project".into(),
+            scope_type: "project".into(),
+            scope_id: f.project.id.clone(),
+        },
+    ));
+    bus.publish(event(
+        "project.updated",
+        &f.project.id,
+        events::EventContext::ProjectUpdated {},
+    ));
+    bus.publish(event(
+        "operations.status_changed",
+        marker,
+        events::EventContext::OperationsStatusChanged {
+            trigger: "test".into(),
+        },
+    ));
+}
+
+/// The SSE stream delivers a Project's events only to subscribers who can
+/// see that Project; instance-level events still reach everyone.
+#[tokio::test]
+async fn sse_delivers_project_events_only_to_subscribers_who_can_see_the_project() {
+    let f = Fixture::new().await;
+    let mut owner = sse_stream(&f, &common::test_jwt()).await;
+    let mut stranger = sse_stream(&f, &f.other_token).await;
+    publish_project_events(&f, "marker-one");
+    let owner_frames = sse_until(&mut owner, "marker-one").await;
+    let stranger_frames = sse_until(&mut stranger, "marker-one").await;
+    for private in [
+        f.task.id.as_str(),
+        "private-log-line",
+        "private-domain-event",
+        f.project.id.as_str(),
+    ] {
+        assert!(owner_frames.contains(private), "owner misses {private}");
+        assert!(
+            !stranger_frames.contains(private),
+            "non-member receives {private}: {stranger_frames}"
+        );
+    }
+
+    // A new membership is honoured by a new connection immediately.
+    f.role(Some("viewer")).await;
+    let mut viewer = sse_stream(&f, &f.other_token).await;
+    publish_project_events(&f, "marker-two");
+    let viewer_frames = sse_until(&mut viewer, "marker-two").await;
+    assert!(viewer_frames.contains("private-log-line"), "{viewer_frames}");
+}
