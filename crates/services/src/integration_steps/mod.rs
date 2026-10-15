@@ -47,6 +47,8 @@ pub(crate) mod admission;
 pub(crate) mod deferral;
 pub(crate) mod gate;
 pub mod import;
+#[cfg(test)]
+mod offline_retry_tests;
 mod port;
 #[cfg(test)]
 pub(crate) mod preemption_tests;

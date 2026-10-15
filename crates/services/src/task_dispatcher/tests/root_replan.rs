@@ -141,6 +141,61 @@ async fn a_rejected_aggregate_review_sends_a_lead_root_back_to_planning() {
     assert_eq!(attempts, 0, "no integration attempt is owned for the root");
 }
 
+/// The owner's ordinary gate rejection keeps the configured target; only
+/// automatic rejection re-plans through the lead. Pin the committed action
+/// before the dispatcher can advance the root's already completed children.
+#[tokio::test]
+async fn owner_reject_of_a_lead_root_keeps_the_configured_implementation_target() {
+    let lead = lead_fixture(false).await;
+    let root = root_with_failed_review(&lead, true).await;
+    let service = &lead.dispatcher.task_service;
+    let owner = Actor::user(api_types::UserActionSource::Api);
+    let offers = service.task_action_offers(&root.id, &owner).await.unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .any(|offer| offer.action.verb() == "send_back" && offer.reason == "gate_can_reject"));
+    let rejected = service
+        .perform_task_action_as(
+            &root.id,
+            api_types::TaskAction::SendBack {
+                guidance: "Add a corrective subtask".to_owned(),
+            },
+            offers.version,
+            owner,
+        )
+        .await
+        .unwrap()
+        .task;
+    service.drain(&root.id).await.unwrap();
+    assert_eq!(rejected.status, "in_progress");
+    let current = reload(&lead.db, &root.id).await;
+    assert_eq!(current.status, "in_progress");
+    assert!(!current
+        .condition
+        .reasons()
+        .any(|reason| matches!(reason, db::ParkReason::Held { .. })));
+    let entries = log(&lead, &root.id).await;
+    assert_eq!(
+        entries
+            .last()
+            .map(|(from, to, _)| (from.as_str(), to.as_str())),
+        Some(("review", "in_progress"))
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|(_, to, bridge)| to != "planning" && bridge.is_none()),
+        "{entries:?}"
+    );
+    assert_eq!(spent(&lead, &root.id, "replan").await, 0);
+    assert_eq!(spent(&lead, &root.id, "review").await, 0);
+    assert!(executions(&lead.db, &root.id)
+        .await
+        .iter()
+        .all(|(role, _)| role != PLANNER));
+}
+
 /// With no lead nothing changes: the rejection goes where the gate says.
 #[tokio::test]
 async fn a_rejected_aggregate_review_without_a_lead_keeps_the_configured_target() {

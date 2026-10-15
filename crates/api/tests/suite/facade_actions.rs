@@ -8,6 +8,274 @@ use axum::http::{Method, StatusCode};
 use db::{CreateExecution, ExecutionRepo, ExecutionStatus, TaskRepo, TransitionLogRepo};
 use serde_json::{json, Value};
 
+/// O2: an embedded lead cannot run in its root's daemon-owned checkout.
+/// Exercise dispatch and the REST read/action projection, including the
+/// absence of both remote execution and a server fallback.
+#[tokio::test]
+async fn native_root_lead_on_daemon_placement_parks_with_rest_refusal_and_no_execution() {
+    let root_dir = common::TestDir::new("native-lead-daemon");
+    let repo_path = common::setup_git_repo(root_dir.path());
+    let h = common::test_app(&root_dir.path().join("workspaces"), "native-lead-daemon").await;
+    h.stop_step_worker();
+    let (project, repo) = common::create_project_and_repo(&h.app, "Remote lead", &repo_path).await;
+    let now = db::now_rfc3339();
+    let pool = h.state.db.pool();
+    let planner = db::new_uuid_v4();
+    let agent = db::AgentRepo::create_identity_with_profile(
+        &*h.state.db,
+        db::CreateAgentIdentity {
+            id: planner.clone(),
+            name: "Native lead".into(),
+            description: None,
+            max_concurrent_tasks: 2,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: Some("test-user-id".into()),
+            visibility: "account".into(),
+            account_permission_ceiling: "{}".into(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: db::new_uuid_v4(),
+            identity_id: planner.clone(),
+            backend_kind: "native".into(),
+            executor_type: "embedded".into(),
+            provider: Some("fixture".into()),
+            model: Some("fixture-model".into()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".into(),
+            tool_policy_json: "{}".into(),
+            config_json: "{}".into(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    db::AgentConnectionHealthRepo::upsert_connection_health(
+        &*h.state.db,
+        db::UpsertAgentConnectionHealth {
+            profile_id: agent.profile_id,
+            status: "healthy".into(),
+            capability_status_json: "{}".into(),
+            checked_at: Some(now.clone()),
+            error_code: None,
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let root = create_task(&h.app, &project, "coordination root").await;
+    let child: TaskResponse = common::json_request(
+        &h.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/tasks"),
+        json!({"title":"child", "description":"child work", "parent_task_id":root.id}),
+        StatusCode::OK,
+    )
+    .await;
+    db::TaskRoleAssignmentRepo::assign(
+        &*h.state.db,
+        db::CreateTaskRoleAssignment {
+            id: db::new_uuid_v4(),
+            task_id: root.id.clone(),
+            role_name: "planner".into(),
+            assignee_type: Some(db::AssigneeKind::Agent),
+            assignee_id: Some(planner),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO daemon(id,machine_id,hostname,os,arch,status,owner_id,created_at,updated_at) VALUES('lead-owner','lead-owner','Lead workstation','linux','x86_64','online','test-user-id',?,?)")
+        .bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO runtime(id,daemon_id,kind,workspace_root,status,created_at,updated_at) VALUES('lead-runtime','lead-owner','local','/remote','ready',?,?)")
+        .bind(&now).bind(&now).execute(pool).await.unwrap();
+    let (connection, mut remote_requests) =
+        services::daemon_transport::DaemonConnection::new("lead-owner".to_owned());
+    h.state
+        .daemon_connections
+        .register("lead-owner".to_owned(), connection);
+    h.state.daemon_connections.dispatch_incoming("lead-owner", api_types::DaemonFrame::Notification {
+        method: api_types::METHOD_DAEMON_HANDSHAKE.into(),
+        params: json!({"protocol_revision":api_types::DAEMON_PROTOCOL_REVISION,
+            "capabilities":["workspace.v1",api_types::DAEMON_CAPABILITY_PLAN_TRANSPORT,api_types::DAEMON_CAPABILITY_USAGE_REPORTS,api_types::DAEMON_CAPABILITY_JOURNAL_ACK],
+            "executor_capabilities":{"shell":{"structured_events":true,"usage":true,"resume":true,"cancel_ack":true,"terminal_observed":true}},"workspace_run_policy":{"allowed_purposes":["ci_step","hook","environment_setup"]}}),
+    });
+    // Task detail reads the plan file from its owner even when dispatch is
+    // refused. Answer that read; no execution or workspace run is permitted.
+    let registry = h.state.daemon_connections.clone();
+    let (stop_owner, mut stopped) = tokio::sync::watch::channel(false);
+    let owner = tokio::spawn(async move {
+        let mut methods = Vec::new();
+        loop {
+            tokio::select! {
+                _ = stopped.changed() => return methods,
+                frame = remote_requests.recv() => {
+                    let api_types::DaemonFrame::Request { id, method, .. } = frame.unwrap() else { panic!("unexpected daemon frame"); };
+                    assert_eq!(method, api_types::METHOD_WORKSPACE_READ, "the refused lead starts no daemon execution or workspace command");
+                    methods.push(method);
+                    registry.dispatch_incoming("lead-owner", api_types::DaemonFrame::Error { id: Some(id), error: api_types::DaemonErrorPayload {
+                        code: api_types::WORKSPACE_FILE_NOT_FOUND.into(), message: "workspace file not found".into(), details: None,
+                    }});
+                }
+            }
+        }
+    });
+    sqlx::query("UPDATE daemon SET detected_clis_json=? WHERE id='lead-owner'")
+        .bind(json!([{"kind":"shell","availability":"authenticated"}]).to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    let coder = db::AgentRepo::create(
+        &*h.state.db,
+        db::CreateAgent {
+            id: db::new_uuid_v4(),
+            name: "Remote CLI worker".into(),
+            description: None,
+            executor_type: "shell".into(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            capabilities_json: "[]".into(),
+            config_json: "{}".into(),
+            credential_ref: None,
+            daemon_id: Some("lead-owner".into()),
+            max_concurrent_tasks: 2,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: Some("test-user-id".into()),
+            visibility: "account".into(),
+            prompt_template: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    common::configure_execution_test_setup(&h.state.db, &project, &repo, &coder.id, &coder.id)
+        .await;
+    sqlx::query("INSERT INTO repo_location(id,repo_id,owner_kind,daemon_id,runtime_id,path,kind,is_default,status,created_at,updated_at) VALUES('lead-location',?,'daemon','lead-owner','lead-runtime','/remote/repo','managed_clone',0,'ready',?,?)")
+        .bind(&repo).bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO workspace(id,task_id,repo_id,worktree_path,branch,status,created_at,updated_at) VALUES('lead-workspace',?,?,'','lead-branch','ready',?,?)")
+        .bind(&root.id).bind(&repo).bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,daemon_id,runtime_id,repo_location_id,execution_daemon_id,workspace_handle,generation,state,selected_by,selection_reason,created_at,updated_at) VALUES('lead-placement','lead-workspace',?,'daemon','lead-owner','lead-runtime','lead-location','lead-owner','opaque-lead-workspace',1,'ready','scheduler','{}',?,?)")
+        .bind(&root.id).bind(&now).bind(&now).execute(pool).await.unwrap();
+    sqlx::query("UPDATE task SET status='todo' WHERE id IN (?,?)")
+        .bind(&root.id)
+        .bind(&child.id)
+        .execute(pool)
+        .await
+        .unwrap();
+    let dispatcher = services::TaskDispatcher::new(
+        h.state.db.clone(),
+        h.state.event_bus.clone(),
+        h.state.task_service.clone(),
+    );
+    for _ in 0..3 {
+        dispatcher.check_once().await.unwrap();
+        h.state.task_service.drain(&root.id).await.unwrap();
+        h.state.task_service.drain(&child.id).await.unwrap();
+    }
+    let detail: Value = common::empty_request(
+        &h.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", root.id),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["condition"]["kind"], "parked", "{detail}");
+    assert_eq!(
+        detail["condition"]["details"]["failure_kind"], "dispatch_failed",
+        "{detail}"
+    );
+    assert!(
+        detail["condition"]["details"]["diagnostic"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("workspace") && message.contains("Lead workstation")
+            ),
+        "{detail}"
+    );
+    let stored = TaskRepo::get_by_id(&*h.state.db, &root.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata: Value = serde_json::from_str(stored.metadata_json.as_deref().unwrap()).unwrap();
+    assert!(
+        metadata["placement_refusal"]["annotation"]["rejected_candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["daemon_id"] == "lead-owner"
+                && candidate["filter_codes"] == json!(["native_backend_unsupported"])),
+        "{metadata}"
+    );
+    let actions: api_types::TaskActionsResponse = common::empty_request(
+        &h.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/actions", root.id),
+        StatusCode::OK,
+    )
+    .await;
+    let mut offers: Vec<_> = actions
+        .available_actions
+        .iter()
+        .map(|offer| (offer.action.verb(), offer.reason.as_str()))
+        .collect();
+    offers.sort_unstable();
+    assert_eq!(
+        offers,
+        [
+            ("approve", "state_advance_override"),
+            ("cancel", "cancellable"),
+            ("restart", "interrupted_restart"),
+            ("retry", "placement_retry")
+        ]
+    );
+    let executions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id IN (?,?)")
+            .bind(&root.id)
+            .bind(&child.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        executions, 0,
+        "neither the daemon nor the server starts work"
+    );
+    stop_owner.send(true).unwrap();
+    assert!(owner
+        .await
+        .unwrap()
+        .iter()
+        .all(|method| method == api_types::METHOD_WORKSPACE_READ));
+    let owner: (String, Option<String>, Option<String>) = sqlx::query_as("SELECT owner_kind,daemon_id,workspace_handle FROM workspace_placement WHERE id='lead-placement'")
+        .fetch_one(pool).await.unwrap();
+    assert_eq!(
+        owner,
+        (
+            "daemon".into(),
+            Some("lead-owner".into()),
+            Some("opaque-lead-workspace".into())
+        )
+    );
+}
+
 #[tokio::test]
 async fn unavailable_actions_include_capabilities_for_both_workflows() {
     let workspace_root = common::TestDir::new("facade-invalid-actions");

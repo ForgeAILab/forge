@@ -367,6 +367,61 @@ async fn gate_spent(db: &db::SqliteDb, task: &str) -> i64 {
         .unwrap()
 }
 
+/// The action endpoint's owner send-back is a rejected transition for audit,
+/// but it is not an automatic lead verdict and spends no retry budget.
+#[tokio::test]
+async fn owner_send_back_from_lead_check_spends_no_automatic_budget() {
+    let steps = steps(&[], Some("first")).await;
+    let (_root, child) = in_progress_root_with_a_step_in_the_gate(&steps, true).await;
+    let service = &steps.dispatcher.task_service;
+    let owner = Actor::user(api_types::UserActionSource::Api);
+    let offers = service.task_action_offers(&child.id, &owner).await.unwrap();
+    assert!(offers
+        .available_actions
+        .iter()
+        .any(|offer| offer.action.verb() == "send_back"));
+    let sent_back = service
+        .perform_task_action_as(
+            &child.id,
+            api_types::TaskAction::SendBack {
+                guidance: "Please cover the final row".to_owned(),
+            },
+            offers.version,
+            owner,
+        )
+        .await
+        .unwrap()
+        .task;
+    service.drain(&child.id).await.unwrap();
+    assert_eq!(sent_back.status, "in_progress");
+    let transitions = log(&steps.db, &child.id).await;
+    assert_eq!(transitions.len(), 1, "{transitions:?}");
+    assert_eq!(transitions[0].0, "lead_check");
+    assert_eq!(transitions[0].1, "in_progress");
+    assert!(
+        transitions[0].3,
+        "the owner decision retains rejection audit evidence"
+    );
+    assert_eq!(gate_spent(&steps.db, &child.id).await, 0);
+    assert_eq!(
+        count(
+            &steps.db,
+            "SELECT COUNT(*) FROM task_budget_charge WHERE task_id=?",
+            &child.id
+        )
+        .await,
+        0,
+        "neither the gate nor any other automatic budget is charged"
+    );
+    assert!(
+        executions(&steps.db, &child.id)
+            .await
+            .iter()
+            .all(|(role, _)| role == "coder"),
+        "no lead verdict caused the send-back"
+    );
+}
+
 async fn check_runs(db: &db::SqliteDb) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
         .fetch_one(db.pool())
