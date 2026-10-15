@@ -1124,11 +1124,21 @@ pub(super) async fn forge_list_agent_profiles(
 pub(super) async fn forge_list_agent_sessions(
     state: &AppState,
     params: ListAgentSessionsParams,
-    _context: &McpContext,
+    context: &McpContext,
 ) -> Result<Value, McpToolError> {
     let sessions = AgentSessionRepo::list_agent_sessions(&*state.db, &params.identity_id).await?;
+    let user_id = authenticated_user(context)?;
+    let mut visible = Vec::new();
+    for session in sessions {
+        if super::registry::require_session_scope(state, &session, user_id)
+            .await
+            .is_ok()
+        {
+            visible.push(agent_session_value(session));
+        }
+    }
     Ok(json!({
-        "items": sessions.into_iter().map(agent_session_value).collect::<Vec<_>>(),
+        "items": visible,
     }))
 }
 

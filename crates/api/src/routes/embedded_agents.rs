@@ -136,6 +136,38 @@ pub async fn create_session(
     Path(identity_id): Path<String>,
     Json(request): Json<CreateAgentSessionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    match &request.scope {
+        CanonicalScopeRequest::Account => {}
+        CanonicalScopeRequest::Project { project_id } => {
+            crate::routes::authorization::require_project_access(
+                &state,
+                project_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+        CanonicalScopeRequest::Task { task_id, .. } => {
+            crate::routes::authorization::require_task_access(
+                &state,
+                task_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+        CanonicalScopeRequest::AgentChat { chat_id } => {
+            crate::routes::authorization::require_scope_access(
+                &state,
+                "agent_chat",
+                chat_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+    }
+
     let session = state
         .embedded_agent_service
         .create_or_resume_session(CreateScopedSession {
@@ -157,7 +189,21 @@ pub async fn list_sessions(
         .embedded_agent_service
         .list_sessions(&user.user_id, &identity_id)
         .await?;
-    Ok(Json(sessions.into_iter().map(session_response).collect()))
+    let mut visible = Vec::new();
+    for session in sessions {
+        if crate::routes::authorization::require_session_access(
+            &state,
+            &session.id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await
+        .is_ok()
+        {
+            visible.push(session_response(session));
+        }
+    }
+    Ok(Json(visible))
 }
 
 /// List only redaction-safe pending interactions for an authenticated
@@ -168,6 +214,13 @@ pub async fn list_session_interactions(
     user: AuthenticatedUser,
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Vec<ProtectedInteractionSummaryResponse>>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let summaries = state
         .embedded_agent_service
         .interaction_broker()
@@ -188,6 +241,13 @@ pub async fn answer_session_interaction(
     Path((session_id, interaction_id)): Path<(String, String)>,
     Json(request): Json<ProtectedInteractionAnswerRequest>,
 ) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let answer = InteractionAnswer::new(
         interaction_id,
         request.expected_version,
@@ -212,6 +272,13 @@ pub async fn cancel_session_interaction(
     Path((session_id, interaction_id)): Path<(String, String)>,
     Json(request): Json<ProtectedInteractionCancelRequest>,
 ) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let summary = state
         .embedded_agent_service
         .interaction_broker()
@@ -232,6 +299,13 @@ pub async fn rotate_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let session = state
         .embedded_agent_service
         .rotate_session(&user.user_id, &session_id, request.version)
@@ -245,6 +319,13 @@ pub async fn suspend_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     set_session_status(state, user, session_id, request.version, "suspended").await
 }
 
@@ -254,6 +335,13 @@ pub async fn resume_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     set_session_status(state, user, session_id, request.version, "ready").await
 }
 
@@ -262,6 +350,13 @@ pub async fn cancel_session_turn(
     user: AuthenticatedUser,
     Path(session_id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     state
         .embedded_agent_service
         .cancel_session_turn(&user.user_id, &session_id)
@@ -275,6 +370,13 @@ pub async fn steer_session_turn(
     Path(session_id): Path<String>,
     Json(request): Json<SteerAgentSessionRequest>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     state
         .embedded_agent_service
         .steer_session_turn(&user.user_id, &session_id, request.content)

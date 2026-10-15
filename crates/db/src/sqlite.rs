@@ -2206,3 +2206,18 @@ pub use workflow::LatestWorkflowTransitionSourceRow;
 pub use task::RecordReviewCiFailureInTxInput;
 
 pub use task::ClearDaemonUpgradeDispatchRefusalInput;
+
+/// Restrict human coordination reads before their bound, while native identity
+/// reads use their separately admitted canonical scope.
+fn push_coordination_visibility<'a>(
+    builder: &mut sqlx::QueryBuilder<'a, Sqlite>,
+    table: &str,
+    user_id: &'a str,
+) {
+    builder.push(format!(" AND (({table}.scope_type = 'account' AND {table}.scope_id = ")).push_bind(user_id)
+        .push(format!(") OR ({table}.scope_type = 'agent' AND EXISTS (SELECT 1 FROM agent WHERE agent.id = {table}.scope_id AND agent.owner_id = ")).push_bind(user_id)
+        .push(format!(")) OR EXISTS (SELECT 1 FROM project WHERE (({table}.scope_type = 'project' AND project.id = {table}.scope_id) OR ({table}.scope_type = 'task' AND EXISTS (SELECT 1 FROM task WHERE task.id = {table}.scope_id AND task.deleted_at IS NULL AND task.project_id = project.id)) OR ({table}.scope_type = 'agent_chat' AND EXISTS (SELECT 1 FROM agent_chat WHERE agent_chat.id = {table}.scope_id AND agent_chat.project_id = project.id))) AND (project.owner_id IS NULL OR project.owner_id = ")).push_bind(user_id)
+        .push(" OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ").push_bind(user_id)
+        .push(format!("))) OR ({table}.scope_type = 'agent_chat' AND EXISTS (SELECT 1 FROM agent_chat WHERE agent_chat.id = {table}.scope_id AND agent_chat.kind = 'account_main' AND agent_chat.account_id = ")).push_bind(user_id)
+        .push(")))");
+}

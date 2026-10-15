@@ -2,9 +2,24 @@ use super::*;
 
 pub async fn claim_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<ClaimTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    let authorized_task = crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_agent_usable(
+        &state,
+        &authorized_task.project_id,
+        &request.agent_id,
+        &user.user_id,
+    )
+    .await?;
     let assignee = Assignee::Agent(request.agent_id.clone());
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
@@ -23,9 +38,24 @@ pub async fn claim_task(
 
 pub async fn launch_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<LaunchExecutionRequest>,
 ) -> ApiResult<Json<LaunchExecutionResponse>> {
+    let authorized_task = crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_agent_usable(
+        &state,
+        &authorized_task.project_id,
+        &request.agent_id,
+        &user.user_id,
+    )
+    .await?;
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,

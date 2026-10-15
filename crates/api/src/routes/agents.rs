@@ -149,6 +149,7 @@ pub async fn list_agent_tasks(
         &*state.db,
         AgentTaskListQuery {
             agent_id: id,
+            user_id: user.user_id.clone(),
             include_archived: params.include_archived.unwrap_or(false),
             include_cancelled: params.include_cancelled.unwrap_or(false),
             include_deleted: false,

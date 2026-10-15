@@ -3,7 +3,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use db::{MemoryScopeGrant, ProjectMemberRepo, ProjectRepo};
+use db::MemoryScopeGrant;
 use services::{MemoryAccessContext, MemorySearchResult};
 use uuid::Uuid;
 
@@ -19,12 +19,25 @@ pub async fn search_project_memory(
     Path(project_id): Path<String>,
     Query(params): Query<MemorySearchQuery>,
 ) -> ApiResult<Json<MemorySearchResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     if params.query.trim().is_empty() {
         return Err(ApiError::bad_request("query must not be empty"));
     }
     let project_uuid = parse_uuid(&project_id, "project_id")?;
     let normalized_project_id = project_uuid.to_string();
-    require_project_visible(&state, &normalized_project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &normalized_project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let layer = response_layer(params.layer, params.token_budget)?;
     let limit = params.limit.unwrap_or(20);
     let access = MemoryAccessContext::for_scope(
@@ -66,7 +79,13 @@ pub async fn get_memory_item(
     let grants = if let Some(project_id) = params.project_id.as_deref() {
         let project_uuid = parse_uuid(project_id, "project_id")?;
         let normalized_project_id = project_uuid.to_string();
-        require_project_visible(&state, &normalized_project_id, &user).await?;
+        crate::routes::authorization::require_project_access(
+            &state,
+            &normalized_project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
         vec![MemoryScopeGrant {
             scope_type: "project".to_owned(),
             scope_id: normalized_project_id,
@@ -175,22 +194,4 @@ async fn visible_project_grants(
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()
         .map_err(|error| ApiError::from(db::DbError::from(error)))
-}
-
-async fn require_project_visible(
-    state: &AppState,
-    project_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_none() {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id).await?;
-    if member.is_none() {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(())
 }

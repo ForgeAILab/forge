@@ -20,6 +20,20 @@ pub async fn list_locations(
     Path(repo_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<RepoLocationResponse>>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &repo_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", repo_id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", repo_id.clone()))
+    })?;
+
     let page = state
         .repo_location_service
         .list(
@@ -38,6 +52,20 @@ pub async fn register_location(
     Path(repo_id): Path<String>,
     Json(request): Json<CreateRepoLocationRequest>,
 ) -> ApiResult<Json<RepoLocationResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &repo_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", repo_id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", repo_id.clone()))
+    })?;
+
     let location = state
         .repo_location_service
         .register(&repo_id, request, &user.user_id, user.is_admin)
@@ -51,6 +79,20 @@ pub async fn update_location(
     Path((repo_id, location_id)): Path<(String, String)>,
     Json(request): Json<UpdateRepoLocationRequest>,
 ) -> ApiResult<Json<RepoLocationResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &repo_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", repo_id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", repo_id.clone()))
+    })?;
+
     let location = state
         .repo_location_service
         .update(
@@ -70,6 +112,20 @@ pub async fn verify_location(
     Path((repo_id, location_id)): Path<(String, String)>,
     Json(request): Json<VerifyRepoLocationRequest>,
 ) -> ApiResult<Json<RepoLocationResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &repo_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", repo_id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", repo_id.clone()))
+    })?;
+
     let location = state
         .repo_location_service
         .verify(
@@ -88,6 +144,20 @@ pub async fn remove_location(
     user: AuthenticatedUser,
     Path((repo_id, location_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &repo_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", repo_id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", repo_id.clone()))
+    })?;
+
     state
         .repo_location_service
         .remove(&repo_id, &location_id, &user.user_id, user.is_admin)

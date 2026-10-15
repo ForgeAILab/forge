@@ -1336,6 +1336,7 @@ impl TaskRepo for SqliteDb {
         let offset = decode_offset(&query.page.cursor)?;
         let mut where_parts =
             vec!["id IN (SELECT DISTINCT task_id FROM execution WHERE agent_id = ?)".to_owned()];
+        where_parts.push("EXISTS (SELECT 1 FROM project WHERE project.id = task.project_id AND (project.owner_id IS NULL OR project.owner_id = ? OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ?)))".to_owned());
         if !query.include_deleted {
             where_parts.push("deleted_at IS NULL".to_owned());
         }
@@ -1353,6 +1354,8 @@ impl TaskRepo for SqliteDb {
         );
         let rows = sqlx::query(&sql)
             .bind(&query.agent_id)
+            .bind(&query.user_id)
+            .bind(&query.user_id)
             .bind(limit(&query.page) + 1)
             .bind(offset)
             .fetch_all(&self.pool)
@@ -1363,6 +1366,8 @@ impl TaskRepo for SqliteDb {
             Some(
                 sqlx::query_scalar::<_, i64>(&count_sql)
                     .bind(&query.agent_id)
+                    .bind(&query.user_id)
+                    .bind(&query.user_id)
                     .fetch_one(&self.pool)
                     .await?,
             )

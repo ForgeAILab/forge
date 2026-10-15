@@ -18,7 +18,10 @@ use std::collections::HashMap;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{auth::AuthenticatedUser, projects::require_project_visible},
+    routes::{
+        auth::AuthenticatedUser,
+        authorization::{require_project_access, ProjectAccess},
+    },
     state::AppState,
 };
 
@@ -36,10 +39,18 @@ pub async fn get_project_overview(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<ProjectOverview>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     // Authorization is intentionally before every orchestration-table query.
     // A non-member receives the same not-found response as an unknown Project
     // and cannot probe Charter, milestone, media, or release identifiers.
-    let project = require_project_visible(&state, &project_id, &user.user_id).await?;
+    let project =
+        require_project_access(&state, &project_id, &user.user_id, ProjectAccess::Read).await?;
 
     let mut stale = false;
     let (current_charter, vision, charter_stale) = load_current_charter(&state, &project).await?;

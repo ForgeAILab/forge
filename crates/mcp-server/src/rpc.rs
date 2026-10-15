@@ -57,7 +57,16 @@ pub(crate) async fn dispatch_with_context(
             // in the bound Project.
             {
                 let admission = async {
-                    let authority = if context.project_id.is_some() {
+                    let authority = if let Some(project_id) = context.project_id.as_deref() {
+                        super::tools::registry::require_project_access(
+                            state,
+                            project_id,
+                            context.user_id.as_deref().unwrap_or_default(),
+                            operation_registry::mcp::lookup(&params.name)
+                                .expect("known operation")
+                                .role,
+                        )
+                        .await?;
                         super::tools::registry::authority(state, context).await?
                     } else {
                         operation_registry::authority::mcp_authority(

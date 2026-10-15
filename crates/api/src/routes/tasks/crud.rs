@@ -2,10 +2,41 @@ use super::*;
 
 pub async fn create_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let request: CreateTaskRequest = serde_json::from_value(body)?;
+    if let Some(parent_id) = request.parent_task_id.as_deref() {
+        crate::routes::authorization::require_task_access(
+            &state,
+            parent_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
+    for assignment in request.role_assignments.iter().flatten() {
+        if assignment.assignee_type == api_types::assignee::AssigneeKind::Agent {
+            if let Some(agent_id) = assignment.assignee_id.as_deref() {
+                crate::routes::authorization::require_agent_usable(
+                    &state,
+                    &project_id,
+                    agent_id,
+                    &user.user_id,
+                )
+                .await?;
+            }
+        }
+    }
+
     let review_config = match request.review_config {
         Some(review_config) => Some(review_config),
         None => project_default_review_config(&state.db, &project_id).await?,
@@ -47,10 +78,18 @@ const TASK_LIST_PROJECTION_VERSION: u32 = 3;
 
 pub async fn list_tasks(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
     headers: axum::http::HeaderMap,
 ) -> ApiResult<axum::response::Response> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     use axum::response::IntoResponse;
     use sha2::{Digest, Sha256};
     // Validate the page before considering a conditional response.
@@ -301,8 +340,16 @@ pub async fn list_tasks(
 
 pub async fn get_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id))?;
@@ -319,9 +366,26 @@ pub async fn get_task(
 
 pub async fn update_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<UpdateTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    if let Some(Some(parent_id)) = request.parent_task_id.as_ref() {
+        crate::routes::authorization::require_task_access(
+            &state,
+            parent_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
     let task = state.task_service.update_task(id, request).await?;
     Ok(Json(
         task_response(&state.db, &state.workspace_backend_router, task).await?,
@@ -330,8 +394,16 @@ pub async fn update_task(
 
 pub async fn delete_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let task = state.task_service.soft_delete(id).await?;
     super::media::delete_task_media_for_task(&state, &task.id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -339,9 +411,26 @@ pub async fn delete_task(
 
 pub async fn reorder_subtasks(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(task_id): Path<String>,
     Json(request): Json<ReorderSubtasksRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    for child_id in &request.ordered_ids {
+        crate::routes::authorization::require_task_access(
+            &state,
+            child_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Write,
+        )
+        .await?;
+    }
     state
         .task_service
         .reorder_subtasks(task_id.clone(), request.ordered_ids)
@@ -356,9 +445,17 @@ pub async fn reorder_subtasks(
 
 pub async fn move_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<MoveTaskRequest>,
 ) -> ApiResult<Json<MoveTaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let operation_id = request.operation_id.clone();
     let result = state
         .task_service
@@ -379,8 +476,16 @@ pub async fn move_task(
 
 pub async fn archive_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let task = state.task_service.archive_task(id).await?;
     Ok(Json(
         task_response(&state.db, &state.workspace_backend_router, task).await?,
@@ -389,8 +494,16 @@ pub async fn archive_task(
 
 pub async fn duplicate_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let task = state.task_service.duplicate_task(&id).await?;
     Ok(Json(
         task_response(&state.db, &state.workspace_backend_router, task).await?,

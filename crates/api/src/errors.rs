@@ -25,6 +25,24 @@ pub struct ApiError {
 pub type ApiResult<T> = Result<T, ApiError>;
 
 impl ApiError {
+    /// Hide an indirect resource behind the same 404 as an unknown caller-
+    /// supplied ID, without disclosing its owning Task or Project ID.
+    pub(crate) fn mask_not_found(self, hidden: Self) -> Self {
+        if self.status == StatusCode::NOT_FOUND {
+            hidden
+        } else {
+            self
+        }
+    }
+
+    pub(crate) fn map_forbidden(self, code: &'static str, message: &'static str) -> Self {
+        if self.status == StatusCode::FORBIDDEN {
+            Self::forbidden_with_code(code, message)
+        } else {
+            self
+        }
+    }
+
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

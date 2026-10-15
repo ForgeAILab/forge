@@ -61,6 +61,9 @@ impl AgentCommitmentRepo for SqliteDb {
         if let Some(status) = &query.status {
             builder.push(" AND status = ").push_bind(status.to_string());
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_commitment", user_id);
+        }
         builder
             .push(" ORDER BY COALESCE(due_at, created_at) ASC, created_at ASC, id ASC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));

@@ -20,8 +20,8 @@ use axum::{
     Json,
 };
 use db::{
-    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, ProjectMediaTombstone, ProjectMemberRepo,
-    ProjectRepo, SharedMediaRepo, SoftDeleteProjectMediaAttachmentMutation,
+    new_uuid_v4, now_rfc3339, CreateProjectMediaAsset, ProjectMediaTombstone, SharedMediaRepo,
+    SoftDeleteProjectMediaAttachmentMutation,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,7 +73,13 @@ pub async fn list_media(
     Path(project_id): Path<String>,
     Query(query): Query<MediaListQuery>,
 ) -> ApiResult<Json<ProjectMediaListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let (cursor_created_at, cursor_id) = decode_cursor(query.cursor.as_deref())?
         .map_or((None, None), |(created_at, id)| {
             (Some(created_at), Some(id))
@@ -153,7 +159,13 @@ pub async fn upload_media(
     Path(project_id): Path<String>,
     mut multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<MediaAsset>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let mut mutation: Option<api_types::MutationEnvelope> = None;
     let mut upload: Option<(String, String, Vec<u8>)> = None;
     while let Some(mut field) = multipart
@@ -325,7 +337,13 @@ pub async fn serve_media(
     user: AuthenticatedUser,
     Path((project_id, asset_id)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let asset = SharedMediaRepo::get_media_asset(&*state.db, &asset_id)
         .await?
         .filter(|asset| asset.project_id == project_id)
@@ -370,6 +388,13 @@ pub async fn redact_media(
     Path((project_id, asset_id)): Path<(String, String)>,
     Json(request): Json<api_types::ProjectMediaTombstoneRequest>,
 ) -> ApiResult<Json<MediaAsset>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     tombstone_media(
         &state,
         &user,
@@ -388,6 +413,13 @@ pub async fn purge_media(
     Path((project_id, asset_id)): Path<(String, String)>,
     Json(request): Json<api_types::ProjectMediaTombstoneRequest>,
 ) -> ApiResult<Json<MediaAsset>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     tombstone_media(
         &state,
         &user,
@@ -414,7 +446,13 @@ async fn tombstone_media(
     // lets an exact retry return the stored projection while any changed
     // authority, target, version, or reason is rejected by the repository's
     // complete receipt comparison.
-    require_project_access(state, project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        state,
+        project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     if request.mutation.idempotency_key.trim().is_empty() {
         return Err(ApiError::bad_request("idempotency_key is required"));
     }
@@ -459,7 +497,13 @@ async fn tombstone_media(
 
     // No receipt exists, so this is a new mutation and must pass the current
     // role and explicit user authorization checks before any write occurs.
-    require_project_media_admin(state, project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        state,
+        project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     validate_authorization(&request.mutation.authorization, &user.user_id, action)?;
     if request.reason.trim().is_empty() || request.reason.len() > 4096 {
         return Err(ApiError::bad_request(
@@ -501,7 +545,13 @@ pub async fn attach_evidence(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<AttachEvidenceRequest>,
 ) -> ApiResult<Json<EvidenceAttachment>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     if request.milestone_id != milestone_id {
         return Err(ApiError::bad_request(
             "milestone_id in the path and request must match",
@@ -567,7 +617,13 @@ pub async fn list_evidence(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Query(query): Query<EvidenceListQuery>,
 ) -> ApiResult<Json<EvidenceAttachmentListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let (cursor_created_at, cursor_id) = decode_cursor(query.cursor.as_deref())?
         .map_or((None, None), |(created_at, id)| {
             (Some(created_at), Some(id))
@@ -625,7 +681,13 @@ pub async fn get_evidence(
     user: AuthenticatedUser,
     Path((project_id, milestone_id, evidence_id)): Path<(String, String, String)>,
 ) -> ApiResult<Json<EvidenceAttachment>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let row = sqlx::query(
         "SELECT * FROM project_media_attachment
          WHERE id = ? AND project_id = ? AND milestone_id = ?
@@ -648,7 +710,13 @@ pub async fn remove_evidence(
     Path((project_id, milestone_id, evidence_id)): Path<(String, String, String)>,
     Json(request): Json<api_types::MutationEnvelope>,
 ) -> ApiResult<StatusCode> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.authorization,
         &user.user_id,
@@ -806,53 +874,9 @@ fn evidence_attachment_response(row: db::ProjectMediaAttachment) -> ApiResult<Ev
     })
 }
 
-async fn require_project_access(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    let membership_exists = match project.owner_id.as_deref() {
-        Some(owner_id) if owner_id != user_id => {
-            ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-                .await?
-                .is_some()
-        }
-        _ => false,
-    };
-    if !project_access_allowed(project.owner_id.as_deref(), user_id, membership_exists) {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn project_access_allowed(owner_id: Option<&str>, user_id: &str, membership_exists: bool) -> bool {
     owner_id.is_none() || owner_id == Some(user_id) || membership_exists
-}
-
-async fn require_project_media_admin(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if member.role == "owner" || member.role == "admin" {
-        return Ok(());
-    }
-    Err(ApiError::forbidden_with_code(
-        "insufficient_role",
-        "project owner or admin role is required for media disposition",
-    ))
 }
 
 fn validate_authorization(

@@ -32,6 +32,9 @@ impl AgentInboxRepo for SqliteDb {
         if let Some(scope_id) = &query.scope_id {
             builder.push(" AND scope_id = ").push_bind(scope_id);
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_inbox_item", user_id);
+        }
         builder
             .push(" ORDER BY created_at DESC, id DESC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));
@@ -229,6 +232,9 @@ impl AgentInboxRepo for SqliteDb {
         }
         if let Some(scope_id) = &query.scope_id {
             builder.push(" AND scope_id = ").push_bind(scope_id);
+        }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_question", user_id);
         }
         builder
             .push(" ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, created_at DESC, id DESC LIMIT ")

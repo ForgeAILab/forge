@@ -20,8 +20,7 @@ use axum::{
 use chrono::DateTime;
 use db::{
     AgentProfileRepo, AgentRepo, ProjectAgentBindingRepo, ProjectCharterApprovalRecord,
-    ProjectCharterRecord, ProjectCharterRevisionRecord, ProjectMemberRepo,
-    ProjectOrchestrationRepo, ProjectRepo,
+    ProjectCharterRecord, ProjectCharterRevisionRecord, ProjectOrchestrationRepo,
 };
 use services::{
     evaluate_project_charter_readiness, project_agent_policy_digest, ProjectCharterApprovalCommand,
@@ -44,7 +43,20 @@ pub async fn get_project_charter(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<ProductGenesisCharterResponse>> {
-    let project = authorized_project(&state, &user.user_id, &project_id, false).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    let project = crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let account_id = project.owner_id.as_deref().unwrap_or(&user.user_id);
     let selected_project_agent = selected_project_agent(&state, &project.id, account_id).await?;
     let Some(charter) = project_charter_for_project(&state, &project, account_id).await? else {
@@ -69,6 +81,13 @@ pub async fn save_project_charter_revision(
     Path(project_id): Path<String>,
     Json(request): Json<SaveProjectCharterRevisionRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectCharterRevision>)> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     validate_user_authorization_envelope(
         &request.mutation.authorization,
         &user.user_id,
@@ -152,6 +171,13 @@ pub async fn approve_project_charter_revision(
     Path((project_id, revision_id)): Path<(String, String)>,
     Json(request): Json<ApproveProjectCharterRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectCharterApproval>)> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let storage_idempotency_key = scoped_idempotency_key(
         "charter-approval",
         &project_id,
@@ -212,34 +238,6 @@ pub async fn approve_project_charter_revision(
         )
         .await?;
     Ok((StatusCode::CREATED, Json(api_approval(outcome.approval)?)))
-}
-
-async fn authorized_project(
-    state: &AppState,
-    user_id: &str,
-    project_id: &str,
-    require_owner_or_admin: bool,
-) -> ApiResult<db::Project> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    let is_owner = project.owner_id.as_deref() == Some(user_id);
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    if !is_owner && member.is_none() {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    if require_owner_or_admin
-        && !is_owner
-        && !member
-            .as_ref()
-            .is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"))
-    {
-        return Err(ApiError::forbidden_with_code(
-            "project_owner_required",
-            "Project owner or admin role is required for Charter mutation",
-        ));
-    }
-    Ok(project)
 }
 
 async fn project_charter_for_project(

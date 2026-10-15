@@ -26,8 +26,8 @@ use db::{
     AgentChatMessageAuthorType as DbMessageAuthorType, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo, AgentChatTopic,
     AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
-    AgentRepo, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, SortBy, SortOrder,
+    AgentRepo, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectRepo, SortBy,
+    SortOrder,
 };
 use serde_json::{json, Value};
 use services::{
@@ -80,7 +80,13 @@ pub async fn get_project_agent(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<ProjectAgentBindingResponse>> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let binding = current_project_binding(&state, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project_agent_binding", project_id.clone()))?;
@@ -93,7 +99,13 @@ pub async fn set_project_agent(
     Path(project_id): Path<String>,
     Json(request): Json<SetProjectAgentBindingRequest>,
 ) -> ApiResult<Json<ProjectAgentBindingResponse>> {
-    require_project_admin(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     if request.wake_budget < 0 {
         return Err(ApiError::bad_request("wake_budget must be non-negative"));
     }
@@ -142,6 +154,14 @@ pub async fn get_agent_chat(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<AgentChatDetailResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let chat = state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -180,6 +200,14 @@ pub async fn list_agent_chat_messages(
     Path(chat_id): Path<String>,
     Query(query): Query<AgentChatMessagesQuery>,
 ) -> ApiResult<Json<AgentChatMessageListResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -216,6 +244,14 @@ pub async fn send_agent_chat_message(
     Path(chat_id): Path<String>,
     Json(request): Json<SendAgentChatMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<SendAgentChatMessageResponse>)> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let actor_user_id = user.user_id;
     let source_chat_id = chat_id.clone();
     let admitted = state
@@ -260,6 +296,14 @@ pub async fn list_agent_chat_turns(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentChatTurnJobResponse>>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -278,6 +322,14 @@ pub async fn get_agent_chat_turn_logs(
     Path((chat_id, turn_id)): Path<(String, String)>,
     Query(params): Query<LogsQuery>,
 ) -> ApiResult<Json<Value>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -298,6 +350,14 @@ pub async fn cancel_agent_chat_turn(
     Path((chat_id, turn_id)): Path<(String, String)>,
     Json(request): Json<CancelAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let job = state
         .agent_chat_service
         .cancel_turn(CancelAgentChatTurnInput {
@@ -319,6 +379,14 @@ pub async fn retry_agent_chat_turn(
     Path((chat_id, turn_id)): Path<(String, String)>,
     Json(request): Json<api_types::RetryAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let job = state
         .agent_chat_service
         .retry_turn(services::RetryAgentChatTurnInput {
@@ -340,6 +408,14 @@ pub async fn list_agent_chat_topics(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<AgentChatTopicListResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let topics = state
         .main_chat_topic_service
         .list_topics(&user.user_id, &chat_id)
@@ -363,6 +439,14 @@ pub async fn start_agent_chat_topic(
     Path(chat_id): Path<String>,
     Json(request): Json<StartAgentChatTopicRequest>,
 ) -> ApiResult<Json<StartAgentChatTopicResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let rotation = state
         .main_chat_topic_service
         .start_topic(StartMainChatTopicInput {
@@ -408,7 +492,13 @@ pub async fn list_agent_handoffs(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentHandoffResponse>>> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("agent_chat", project_id.clone()))?;
@@ -423,8 +513,15 @@ pub async fn list_agent_handoffs(
 pub async fn get_agent_handoff(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Path((_project_id, handoff_id)): Path<(String, String)>,
+    Path((project_id, handoff_id)): Path<(String, String)>,
 ) -> ApiResult<Json<AgentHandoffResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let handoff = AgentHandoffRepo::get_agent_handoff(&*state.db, &handoff_id)
         .await?
         .ok_or_else(|| ApiError::not_found("agent_handoff", handoff_id.clone()))?;
@@ -432,7 +529,7 @@ pub async fn get_agent_handoff(
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &handoff.target_chat_id)
         .await?;
-    if target.project_id.as_deref() != Some(_project_id.as_str()) {
+    if target.project_id.as_deref() != Some(project_id.as_str()) {
         return Err(ApiError::not_found("agent_handoff", handoff_id));
     }
     Ok(Json(handoff_response(&state, handoff).await?))
@@ -444,7 +541,13 @@ pub async fn create_agent_handoff(
     Path(project_id): Path<String>,
     Json(request): Json<CreateAgentHandoffRequest>,
 ) -> ApiResult<(StatusCode, Json<AgentHandoffResponse>)> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let source = state
         .agent_chat_service
         .ensure_main_chat(&user.user_id)
@@ -469,30 +572,6 @@ pub async fn create_agent_handoff(
         StatusCode::CREATED,
         Json(handoff_response(&state, outcome.handoff).await?),
     ))
-}
-
-async fn require_project_member(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    Ok(())
-}
-
-async fn require_project_admin(state: &AppState, project_id: &str, user_id: &str) -> ApiResult<()> {
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(ApiError::forbidden_with_code(
-            "insufficient_role",
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
 }
 
 async fn current_project_binding(

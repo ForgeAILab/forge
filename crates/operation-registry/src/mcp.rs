@@ -641,7 +641,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<CreateTaskParams>(
             "forge_create_task",
             "Create a Task; parent shares a workspace, dependencies gate execution.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::CreateTask,
             McpInput::CreateTask,
         ),
@@ -683,7 +683,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<AssignAgentParams>(
             "forge_assign_agent",
             "Assign the implementation worker without starting execution.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::Task,
             McpInput::AssignAgent,
         )
@@ -694,7 +694,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<TaskActionParams>(
             "forge_task_action",
             "Apply a current available_actions command at an exact version.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::Task,
             McpInput::TaskAction,
         ),
@@ -715,14 +715,14 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<UpdateTaskParams>(
             "forge_update_task",
             "Edit mutable Task fields at an exact version.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::Task,
             McpInput::UpdateTask,
         ),
         typed::<TransitionTaskParams>(
             "forge_transition_task",
             "Transition a Task; pending_steps counts asynchronous follow-ups.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::Task,
             McpInput::TransitionTask,
         ),
@@ -764,7 +764,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<UpdateProjectParams>(
             "forge_update_project",
             "Edit Project fields and validated settings at an exact version.",
-            RequiredRole::Project,
+            RequiredRole::Admin,
             ResourceRule::None,
             McpInput::UpdateProject,
         ),
@@ -778,7 +778,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<FollowUpExecutionParams>(
             "forge_follow_up_execution",
             "Resume a terminal interactive execution with a follow-up message.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::Execution,
             McpInput::FollowUpExecution,
         )
@@ -789,14 +789,14 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<AddTaskDependencyParams>(
             "forge_add_task_dependency",
             "Add a prerequisite gate without sharing a workspace. Refused with cycle_detected when the Tasks would wait on each other, counting sibling order and parentage.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::DependencyMutation,
             McpInput::AddTaskDependency,
         ),
         typed::<RemoveTaskDependencyParams>(
             "forge_remove_task_dependency",
             "Remove a prerequisite gate without changing hierarchy.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::DependencyMutation,
             McpInput::RemoveTaskDependency,
         ),
@@ -817,7 +817,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<CreateSubTasksParams>(
             "forge_create_sub_tasks",
             "Create ordered children; they share the root workspace and run serially.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::ParentTask,
             McpInput::CreateSubTasks,
         )
@@ -836,7 +836,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<ReorderSubTasksParams>(
             "forge_reorder_sub_tasks",
             "Reorder direct children; preserve the terminal prefix and active child. Refused with cycle_detected when the order reverses a prerequisite.",
-            RequiredRole::Project,
+            RequiredRole::Member,
             ResourceRule::ReorderSubTasks,
             McpInput::ReorderSubTasks,
         ),
@@ -878,7 +878,7 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<GetProjectAgentParams>(
             "forge_get_project_agent",
             "Read binding.",
-            RequiredRole::Member,
+            RequiredRole::Project,
             ResourceRule::Project,
             McpInput::GetProjectAgent,
         ),
@@ -908,14 +908,14 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<GetAgentChatParams>(
             "forge_get_agent_chat",
             "Read Chat.",
-            RequiredRole::Member,
+            RequiredRole::Project,
             ResourceRule::Chat,
             McpInput::GetAgentChat,
         ),
         typed::<ListAgentChatMessagesParams>(
             "forge_list_agent_chat_messages",
             "Read messages.",
-            RequiredRole::Member,
+            RequiredRole::Project,
             ResourceRule::Chat,
             McpInput::ListAgentChatMessages,
         ),
@@ -929,14 +929,14 @@ pub static CATALOG: LazyLock<Vec<McpOperation>> = LazyLock::new(|| {
         typed::<ListAgentHandoffsParams>(
             "forge_list_agent_handoffs",
             "List all.",
-            RequiredRole::Member,
+            RequiredRole::Project,
             ResourceRule::Project,
             McpInput::ListAgentHandoffs,
         ),
         typed::<GetAgentHandoffParams>(
             "forge_get_agent_handoff",
             "Read handoff.",
-            RequiredRole::Member,
+            RequiredRole::Project,
             ResourceRule::Handoff,
             McpInput::GetAgentHandoff,
         ),

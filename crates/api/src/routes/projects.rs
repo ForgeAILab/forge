@@ -33,7 +33,7 @@ use services::{
 use crate::{
     errors::{ApiError, ApiResult},
     routes::auth::AuthenticatedUser,
-    routes::{page_request, project_agents::require_project_admin, project_response, ListParams},
+    routes::{page_request, project_response, ListParams},
     state::AppState,
 };
 
@@ -222,6 +222,13 @@ pub async fn get_project(
     user: AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let read = state
         .db
         .get_visible_project_slot_read(&id, &user.user_id)
@@ -248,7 +255,13 @@ pub async fn list_project_hook_runs(
     Path(id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<ProjectHookRunsResponse>> {
-    require_project_visible(&state, &id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let page = ProjectHookRunRepo::list_for_project(
         &*state.db,
         &id,
@@ -277,7 +290,13 @@ pub async fn get_project_analytics(
     Path(id): Path<String>,
     Query(params): Query<AnalyticsQuery>,
 ) -> Result<Json<ProjectAnalyticsResponse>, ApiError> {
-    require_project_visible(&state, &id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
 
     let from = params.from.as_deref();
     let to = params.to.as_deref();
@@ -339,8 +358,16 @@ pub async fn get_project_analytics(
 
 pub async fn get_project_workflow(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<WorkflowDefinition>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id))?;
@@ -351,9 +378,17 @@ pub async fn get_project_workflow(
 
 pub async fn update_project_workflow(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<UpdateProjectWorkflowRequest>,
 ) -> ApiResult<Json<WorkflowDefinition>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let UpdateProjectWorkflowRequest {
         template_name,
         definition,
@@ -415,10 +450,16 @@ pub async fn delete_project(
     Path(id): Path<String>,
     Query(query): Query<DeleteProjectQuery>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     // Authorization must precede both the in-use counts and filesystem
-    // cleanup. `require_project_admin` intentionally returns a project-scoped
+    // cleanup. The Project authorization guard intentionally returns a project-scoped
     // 404 for callers who are not members, avoiding an existence/count oracle.
-    require_project_admin(&state, &id, &user.user_id).await?;
 
     const MAX_FORCE_DELETE_ATTEMPTS: usize = 3;
     /// What a forced delete waits, in all, for the check runs it stopped to
@@ -965,8 +1006,16 @@ async fn remove_confined_direct_child(
 
 pub async fn pause_project(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
@@ -993,9 +1042,17 @@ pub async fn pause_project(
 /// Run every Project environment check now, without filtering by Task role.
 pub async fn recheck_project_environment(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     request: Option<Json<api_types::ProjectEnvironmentRecheckRequest>>,
 ) -> ApiResult<Json<api_types::ProjectEnvironmentRecheckResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let request = request.map(|Json(request)| request).unwrap_or_default();
     let (machines, project) = services::environment_surfaces::recheck(
         &state.task_service,
@@ -1013,8 +1070,16 @@ pub async fn recheck_project_environment(
 
 pub async fn resume_project(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let project = ProjectRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", id.clone()))?;
@@ -1048,6 +1113,25 @@ pub async fn update_project(
     Path(id): Path<String>,
     Json(request): Json<UpdateProjectRequest>,
 ) -> ApiResult<Json<ProjectResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
+    if let Some(repo_id) = request.primary_repo_id.as_deref() {
+        let repo = db::RepoRepo::get_by_id(&*state.db, repo_id)
+            .await?
+            .ok_or_else(|| ApiError::not_found("repo", repo_id.to_owned()))?;
+        crate::routes::authorization::require_project_access(
+            &state,
+            &repo.project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
     let UpdateProjectRequest {
         name,
         settings,
@@ -1099,16 +1183,6 @@ pub async fn update_project(
     Ok(Json(project_response(&state.db, project).await?))
 }
 
-pub(crate) async fn require_project_visible(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<db::Project> {
-    ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))
-}
-
 fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {
     ProjectHookRunResponse {
         id: run.id,
@@ -1138,9 +1212,17 @@ fn project_hook_run_response(run: ProjectHookRun) -> ProjectHookRunResponse {
 
 pub async fn test_project_lifecycle_hook(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<TestLifecycleHookRequest>,
 ) -> ApiResult<Json<api_types::LifecycleHookTestResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let response = state
         .task_service
         .test_lifecycle_hook(&id, &request.task_id, request.event, request.hook_index)

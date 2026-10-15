@@ -5,9 +5,17 @@ use api_types::{
 
 pub async fn get_task_detail(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<TaskDetailResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
@@ -55,8 +63,16 @@ pub async fn get_task_detail(
 
 pub async fn get_task_relations(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskRelationsResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
@@ -91,15 +107,43 @@ pub async fn get_task_relations(
             .await
             .map_err(ApiError::from)
     };
-    let (parent, subtasks, dependencies, dependency_ids, dependents) =
+    let (mut parent, subtasks, dependencies, dependency_ids, dependents) =
         tokio::try_join!(parent, subtasks, dependencies, dependency_ids, dependents)?;
     let visible_dependency_ids: std::collections::HashSet<_> =
         dependencies.iter().map(|task| task.id.clone()).collect();
-    let mut missing_dependency_ids = dependency_ids
+    let missing_dependency_ids = dependency_ids
         .into_iter()
         .filter(|dependency_id| !visible_dependency_ids.contains(dependency_id))
         .collect::<Vec<_>>();
+    let mut missing_visible = Vec::new();
+    for dependency_id in missing_dependency_ids {
+        if let Some(dependency) = TaskRepo::get_by_id(&*state.db, &dependency_id, true).await? {
+            if ProjectRepo::get_visible_by_id(&*state.db, &dependency.project_id, &user.user_id)
+                .await?
+                .is_some()
+            {
+                missing_visible.push(dependency_id);
+            }
+        }
+    }
+    let mut missing_dependency_ids = missing_visible;
     missing_dependency_ids.sort();
+    if let Some(value) = &parent {
+        if crate::routes::authorization::require_task_access(
+            &state,
+            &value.id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await
+        .is_err()
+        {
+            parent = None;
+        }
+    }
+    let subtasks = visible_relation_tasks(&state, subtasks, &user.user_id).await?;
+    let dependencies = visible_relation_tasks(&state, dependencies, &user.user_id).await?;
+    let dependents = visible_relation_tasks(&state, dependents, &user.user_id).await?;
 
     Ok(Json(TaskRelationsResponse {
         parent,
@@ -126,4 +170,21 @@ fn task_relation_summary(task: db::Task) -> TaskRelationSummary {
         subtask_order: task.subtask_order,
         created_at: task.created_at,
     }
+}
+
+async fn visible_relation_tasks(
+    state: &AppState,
+    tasks: Vec<db::Task>,
+    user_id: &str,
+) -> ApiResult<Vec<db::Task>> {
+    let mut visible = Vec::new();
+    for task in tasks {
+        if ProjectRepo::get_visible_by_id(&*state.db, &task.project_id, user_id)
+            .await?
+            .is_some()
+        {
+            visible.push(task);
+        }
+    }
+    Ok(visible)
 }

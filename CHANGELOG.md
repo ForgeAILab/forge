@@ -6,7 +6,31 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Security
+
+- Scope Project and Task REST reads and mutations, including indirect comments,
+  media, executions, reviews, repositories, diffs, terminals, chats, sessions,
+  memory and coordination records, to the authenticated caller. Enforce member
+  write and owner/admin configuration roles; filter cross-Project Task,
+  notification and coordination lists before limits and counts. Apply the same
+  role checks to authenticated MCP Project/Task tools. The SSE broadcast remains
+  an outstanding authorization gap documented in `docs/api.md`.
+
 ### Breaking
+
+- **Project access and mutation roles are now enforced across REST and MCP.**
+  Non-members receive scoped `404` responses on `/projects/{id}` and its
+  subroutes, `/tasks/{id}` and its subroutes, `/repos/{id}`, `/executions/{id}`,
+  `/reviews/{id}`, `/comments/{id}`, `/media/{id}`, `/workspaces/{id}/diff`, and
+  Project-scoped chat, terminal, session, memory, notification and coordination
+  resources. Viewers can no longer write these resources. Project PATCH
+  (including settings and shell hooks), pause/resume/delete, environment,
+  workflow, repositories, integrations, members and Agent binding/setup writes
+  require owner/admin authority. Task actions, transitions, comments and uploads
+  require member authority; approval overrides require the owner. Cross-Project
+  lists and notification bulk operations omit inaccessible Projects. Normal
+  single-user installations whose first user owns everything see no change to
+  their authorized operations. No request/response fields or tool names change.
 
 - **Retry is no longer offered on a Task whose implementation role has no
   assigned Agent.** `available_actions` (REST Task detail and

@@ -2304,6 +2304,7 @@ impl CoordinationToolProvider {
         let items = AgentInboxRepo::list_inbox_items(
             &*self.db,
             AgentInboxListQuery {
+                visible_to_user_id: None,
                 recipient_identity_id: actor_identity_id.to_owned(),
                 status: None,
                 scope_type: Some(scope_type_name(scope.scope_type).to_owned()),
@@ -2337,6 +2338,7 @@ impl CoordinationToolProvider {
         let items = AgentCommitmentRepo::list_commitments(
             &*self.db,
             AgentCommitmentListQuery {
+                visible_to_user_id: None,
                 owner_identity_id: Some(actor_identity_id.to_owned()),
                 scope_type: Some(scope_type_name(scope.scope_type).to_owned()),
                 scope_id: Some(scope.scope_id.clone()),
@@ -2369,6 +2371,7 @@ impl CoordinationToolProvider {
         let inbox = AgentInboxRepo::list_inbox_items(
             &*self.db,
             AgentInboxListQuery {
+                visible_to_user_id: None,
                 recipient_identity_id: actor_identity_id.to_owned(),
                 status: None,
                 scope_type: Some(scope_type_name(scope.scope_type).to_owned()),
@@ -2381,6 +2384,7 @@ impl CoordinationToolProvider {
         let actions = AgentActionRepo::list_actions(
             &*self.db,
             AgentActionListQuery {
+                visible_to_user_id: None,
                 actor_identity_id: Some(actor_identity_id.to_owned()),
                 scope_type: Some(scope_type_name(scope.scope_type).to_owned()),
                 scope_id: Some(scope.scope_id.clone()),

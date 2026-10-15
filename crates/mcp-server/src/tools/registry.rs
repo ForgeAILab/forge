@@ -131,15 +131,16 @@ async fn load_project_facts(
     };
     authority.ceiling.insert("mcp_project_visible".into());
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    if project.owner_id.as_deref() == Some(user_id) {
+    let role = member.as_ref().map(|member| member.role.as_str());
+    let owner =
+        role == Some("owner") || (role.is_none() && project.owner_id.as_deref() == Some(user_id));
+    if owner {
         authority.ceiling.insert("mcp_project_owner".into());
     }
-    if project.owner_id.as_deref() == Some(user_id) || member.is_some() {
+    if owner || matches!(role, Some("admin" | "member")) {
         authority.ceiling.insert("mcp_project_member".into());
     }
-    if project.owner_id.as_deref() == Some(user_id)
-        || member.is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"))
-    {
+    if owner || role == Some("admin") {
         authority.ceiling.insert("mcp_project_admin".into());
     }
     Ok(())
@@ -186,6 +187,88 @@ pub(crate) async fn authorize_resource(
     }
     let user_id = context.user_id.as_deref().unwrap_or_default();
     let mut authority = mcp_authority(user_id, context.project_id.as_deref());
+    let get_id = |field: &str| arguments.get(field).and_then(Value::as_str);
+    let mut project_id = get_id("project_id").map(str::to_owned);
+    let task_field = match spec.resource {
+        ResourceRule::Task
+        | ResourceRule::DependencyMutation
+        | ResourceRule::Dependencies
+        | ResourceRule::Dependents => Some("task_id"),
+        ResourceRule::ParentTask | ResourceRule::SubTasks | ResourceRule::ReorderSubTasks => {
+            Some("parent_task_id")
+        }
+        _ => None,
+    };
+    if let Some(task_id) = task_field.and_then(get_id) {
+        project_id = Some(
+            TaskRepo::get_by_id(&*state.db, task_id, false)
+                .await?
+                .ok_or_else(|| McpToolError::not_found("task", task_id.to_owned()))?
+                .project_id,
+        );
+    }
+    if spec.resource == ResourceRule::Execution {
+        if let Some(id) = get_id("execution_id") {
+            let execution = ExecutionRepo::get_by_id(&*state.db, id)
+                .await?
+                .ok_or_else(|| McpToolError::not_found("execution", id.to_owned()))?;
+            project_id = Some(
+                TaskRepo::get_by_id(&*state.db, &execution.task_id, false)
+                    .await?
+                    .ok_or_else(|| McpToolError::not_found("execution", id.to_owned()))?
+                    .project_id,
+            );
+        }
+    }
+    if spec.resource == ResourceRule::Chat {
+        if let Some(chat_id) = get_id("chat_id") {
+            project_id = state
+                .agent_chat_service
+                .get_authorized_chat(user_id, chat_id)
+                .await?
+                .project_id;
+        }
+    }
+    if let Some(project_id) = project_id.as_deref() {
+        require_project_access(state, project_id, user_id, spec.role).await?;
+        if spec.name == "forge_task_action" {
+            if let (Some(task_id), Some(value)) = (get_id("task_id"), arguments.get("action")) {
+                if let Ok(action) = serde_json::from_value::<api_types::TaskAction>(value.clone()) {
+                    let needs_owner = match &action {
+                        api_types::TaskAction::Approve {
+                            override_checks: Some(value),
+                            ..
+                        } => *value,
+                        api_types::TaskAction::Approve {
+                            override_checks: None,
+                            ..
+                        } => {
+                            let offers = state
+                                .task_service
+                                .task_action_offers(
+                                    task_id,
+                                    &api_types::Actor::user(api_types::UserActionSource::Api),
+                                )
+                                .await?;
+                            offers.available_actions.iter().find(|offer| offer.action.verb() == "approve" && operation_registry::task_proposals::action_parameters_allowed(offer, &action, true))
+                                .is_some_and(|offer| offer.parameters.iter().find(|parameter| parameter.name == "override").and_then(|parameter| parameter.boolean_values.as_ref()).is_some_and(|values| values.as_slice() == [true]) || matches!(offer.action, api_types::TaskAction::Approve { override_checks: Some(true), .. }))
+                        }
+                        _ => false,
+                    };
+                    if needs_owner {
+                        require_project_access(
+                            state,
+                            project_id,
+                            user_id,
+                            operation_registry::mcp::RequiredRole::Owner,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(rule) = &spec.field_authority {
         if rule.applies(arguments) {
             if rule.permission == "mcp_account_admin" {
@@ -238,16 +321,25 @@ pub(crate) async fn authorize_resource(
                 authority.ceiling.insert("mcp_owned_identity".into());
             }
             evaluate_resource(&authority, "mcp_owned_identity").map_err(|_| hidden)?;
+            if spec.resource == ResourceRule::OwnedSession {
+                if let Some(id) = get("session_id") {
+                    let session = AgentSessionRepo::get_agent_session(&*state.db, id)
+                        .await?
+                        .ok_or_else(|| McpToolError::not_found("agent_session", id.to_owned()))?;
+                    require_session_scope(state, &session, user_id).await?;
+                }
+            }
         }
         ResourceRule::Project | ResourceRule::Handoff => {
             let Some(project_id) = get("project_id") else {
                 return Ok(());
             };
             load_project_facts(state, &mut authority, project_id, user_id).await?;
-            let permission = if spec.role == operation_registry::mcp::RequiredRole::Admin {
-                "mcp_project_admin"
-            } else {
-                "mcp_project_member"
+            let permission = match spec.role {
+                operation_registry::mcp::RequiredRole::Admin => "mcp_project_admin",
+                operation_registry::mcp::RequiredRole::Member => "mcp_project_member",
+                operation_registry::mcp::RequiredRole::Owner => "mcp_project_owner",
+                _ => "mcp_project_visible",
             };
             evaluate_resource(&authority, permission)?;
             if spec.resource == ResourceRule::Handoff {
@@ -645,4 +737,79 @@ pub(crate) async fn dispatch(
     context: &McpContext,
 ) -> Result<Value, McpToolError> {
     input.dispatch(&HandlerContext { state, context }).await
+}
+
+pub(crate) async fn require_project_access(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+    role: operation_registry::mcp::RequiredRole,
+) -> Result<(), McpToolError> {
+    use operation_registry::mcp::RequiredRole;
+    let project = ProjectRepo::get_visible_by_id(&*state.db, project_id, user_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("project", project_id.to_owned()))?;
+    if !matches!(
+        role,
+        RequiredRole::Member | RequiredRole::Admin | RequiredRole::Owner
+    ) {
+        return Ok(());
+    }
+    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
+    let allowed = member.map_or(
+        project.owner_id.as_deref() == Some(user_id),
+        |member| match role {
+            RequiredRole::Member => matches!(member.role.as_str(), "owner" | "admin" | "member"),
+            RequiredRole::Admin => matches!(member.role.as_str(), "owner" | "admin"),
+            RequiredRole::Owner => member.role == "owner",
+            _ => true,
+        },
+    );
+    if !allowed {
+        return Err(McpToolError::new(-32003, "insufficient Project role")
+            .with_data(json!({"code":"insufficient_role"})));
+    }
+    Ok(())
+}
+
+pub(super) async fn require_session_scope(
+    state: &AppState,
+    session: &db::AgentSession,
+    user_id: &str,
+) -> Result<(), McpToolError> {
+    let scope = db::AgentContextScopeRepo::get_context_scope(&*state.db, &session.context_scope_id)
+        .await?
+        .ok_or_else(|| McpToolError::not_found("agent_session", session.id.clone()))?;
+    match scope.scope_type.as_str() {
+        "account" if scope.scope_id == user_id => Ok(()),
+        "project" => {
+            require_project_access(
+                state,
+                &scope.scope_id,
+                user_id,
+                operation_registry::mcp::RequiredRole::Project,
+            )
+            .await
+        }
+        "task" => {
+            let task = TaskRepo::get_by_id(&*state.db, &scope.scope_id, false)
+                .await?
+                .ok_or_else(|| McpToolError::not_found("agent_session", session.id.clone()))?;
+            require_project_access(
+                state,
+                &task.project_id,
+                user_id,
+                operation_registry::mcp::RequiredRole::Project,
+            )
+            .await
+        }
+        "agent_chat" => {
+            state
+                .agent_chat_service
+                .get_authorized_chat(user_id, &scope.scope_id)
+                .await?;
+            Ok(())
+        }
+        _ => Err(McpToolError::not_found("agent_session", session.id.clone())),
+    }
 }

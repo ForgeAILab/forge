@@ -8,9 +8,17 @@ pub struct PromptPreviewQuery {
 
 pub async fn prompt_preview(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Query(params): Query<PromptPreviewQuery>,
 ) -> ApiResult<Json<PromptPreviewResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     if params.role.trim().is_empty() {
         return Err(ApiError::bad_request("role must not be empty"));
     }

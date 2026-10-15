@@ -35,9 +35,17 @@ const MAX_HOOK_LOG_FILES: usize = 256;
 
 pub async fn list_executions(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(task_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<ExecutionSummaryResponse>>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let page = ExecutionRepo::list_by_task(&*state.db, &task_id, page_request(&params)?).await?;
     let items = page
         .items
@@ -55,8 +63,23 @@ pub async fn list_executions(
 
 pub async fn get_execution(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<ExecutionResponse>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
     let execution = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id))?;
@@ -77,9 +100,24 @@ const MAX_LOG_LIMIT: usize = 1_000;
 
 pub async fn get_logs(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
     let execution = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
@@ -135,9 +173,24 @@ pub struct HookLogsQuery {
 
 pub async fn get_hook_logs(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Query(params): Query<HookLogsQuery>,
 ) -> ApiResult<Json<Vec<serde_json::Value>>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
     let execution = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
@@ -240,9 +293,43 @@ fn read_file_tail(path: &StdPath, max_bytes: usize) -> Option<(Vec<u8>, bool)> {
 
 pub async fn follow_up_execution(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<FollowUpRequest>,
 ) -> ApiResult<Json<LaunchExecutionResponse>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
+    if let Some(agent_id) = request.agent_id.as_deref() {
+        let task = crate::routes::authorization::require_task_access(
+            &state,
+            &addressed_execution.task_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Write,
+        )
+        .await
+        .map_err(|error| {
+            error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+        })?;
+        crate::routes::authorization::require_agent_usable(
+            &state,
+            &task.project_id,
+            agent_id,
+            &user.user_id,
+        )
+        .await?;
+    }
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
@@ -304,8 +391,23 @@ fn map_follow_up_error(error: ServiceError) -> ApiError {
 
 pub async fn get_usage_breakdowns(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<api_types::UsageBreakdown>>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
     let _ = ExecutionRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("execution", id.clone()))?;
@@ -315,8 +417,16 @@ pub async fn get_usage_breakdowns(
 
 pub async fn get_task_usage(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(task_id): Path<String>,
 ) -> ApiResult<Json<api_types::UsageAggregate>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let usage = services::usage_projection::usage_aggregate_for_task(&state.db, &task_id).await?;
     Ok(Json(usage))
 }
@@ -324,9 +434,24 @@ pub async fn get_task_usage(
 /// Stop one execution without cancelling its Task or another side session.
 pub async fn stop_execution(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<api_types::StopExecutionRequest>,
 ) -> ApiResult<Json<ExecutionResponse>> {
+    let addressed_execution = db::ExecutionRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("execution", id.clone()))?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_execution.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("execution", id.clone()))
+    })?;
+
     if request
         .reason
         .as_deref()

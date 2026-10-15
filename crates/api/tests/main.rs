@@ -269,3 +269,6 @@ mod workflow_migration_safety;
 
 #[path = "suite/workflow_templates.rs"]
 mod workflow_templates;
+
+#[path = "suite/project_authorization.rs"]
+mod project_authorization;

@@ -3161,3 +3161,6 @@ fn project_constrained_catalog_matches_call_authority_and_projects_only_the_boun
         assert_eq!(error.code, -32602);
     });
 }
+
+#[path = "tests/authorization.rs"]
+mod authorization;

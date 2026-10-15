@@ -57,6 +57,11 @@ async fn manual_bounce_is_not_a_rejection_but_gate_reject_is() {
 
     let Json(rejection) = api::routes::tasks::apply_task_action(
         State(api_state),
+        api::routes::auth::AuthenticatedUser {
+            user_id: "human".to_owned(),
+            email: "human@example.test".to_owned(),
+            is_admin: false,
+        },
         Path(rejected_task_id.clone()),
         Json(TaskActionRequest {
             action: api_types::TaskAction::SendBack {

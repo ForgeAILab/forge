@@ -129,6 +129,101 @@ impl NotificationRepo for SqliteDb {
 }
 
 impl SqliteDb {
+    /// Apply Project visibility before LIMIT/OFFSET and the optional count.
+    pub async fn list_visible_notifications(
+        &self,
+        user_id: &str,
+        query: NotificationListQuery,
+    ) -> Result<Page<Notification>> {
+        let offset = decode_offset(&query.page.cursor)?;
+        let mut rows =
+            visible_notification_query("SELECT * FROM notification", user_id, &query, false);
+        rows.push(" ORDER BY created_at DESC, id DESC LIMIT ")
+            .push_bind(limit(&query.page) + 1)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let items = rows
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(map_notification)
+            .collect::<Result<Vec<_>>>()?;
+        let total = if query.page.include_total {
+            Some(
+                visible_notification_query(
+                    "SELECT COUNT(*) FROM notification",
+                    user_id,
+                    &query,
+                    false,
+                )
+                .build_query_scalar::<i64>()
+                .fetch_one(&self.pool)
+                .await?,
+            )
+        } else {
+            None
+        };
+        page_from_items(items, &query.page, offset, total)
+    }
+
+    pub async fn get_notification(&self, id: &str) -> Result<Option<Notification>> {
+        sqlx::query("SELECT * FROM notification WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(map_notification)
+            .transpose()
+    }
+
+    pub async fn visible_notification_unread_count(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<i64> {
+        let query = NotificationListQuery {
+            project_id: project_id.map(str::to_owned),
+            read: Some(false),
+            page: PageRequest {
+                cursor: None,
+                limit: 50,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        };
+        visible_notification_query("SELECT COUNT(*) FROM notification", user_id, &query, false)
+            .build_query_scalar::<i64>()
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_visible_notifications_read(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<u64> {
+        let query = NotificationListQuery {
+            project_id: project_id.map(str::to_owned),
+            read: Some(false),
+            page: PageRequest {
+                cursor: None,
+                limit: 50,
+                include_total: false,
+                sort_by: SortBy::CreatedAt,
+                sort_order: SortOrder::Desc,
+            },
+        };
+        Ok(
+            visible_notification_query("UPDATE notification SET read = 1", user_id, &query, true)
+                .build()
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
     pub async fn create_notification_in_tx(
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
@@ -156,4 +251,37 @@ impl SqliteDb {
             .transpose()?
             .ok_or(DbError::NotFound)
     }
+}
+
+fn visible_notification_query<'a>(
+    prefix: &'a str,
+    user_id: &'a str,
+    query: &'a NotificationListQuery,
+    writable: bool,
+) -> sqlx::QueryBuilder<'a, Sqlite> {
+    let mut sql = sqlx::QueryBuilder::new(prefix);
+    sql.push(
+        " WHERE EXISTS (SELECT 1 FROM project WHERE project.id = notification.project_id AND (",
+    );
+    if !writable {
+        sql.push("project.owner_id IS NULL OR ");
+    }
+    sql.push("project.owner_id = ").push_bind(user_id);
+    if writable {
+        sql.push(" AND NOT EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ").push_bind(user_id).push(")");
+    }
+    sql
+        .push(" OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ")
+        .push_bind(user_id);
+    if writable {
+        sql.push(" AND project_member.role IN ('owner', 'admin', 'member')");
+    }
+    sql.push(")))");
+    if let Some(project_id) = &query.project_id {
+        sql.push(" AND project_id = ").push_bind(project_id);
+    }
+    if let Some(read) = query.read {
+        sql.push(" AND read = ").push_bind(if read { 1 } else { 0 });
+    }
+    sql
 }

@@ -31,6 +31,7 @@ pub mod agent_inquiries;
 pub mod agents;
 pub mod analytics;
 pub mod auth;
+pub(crate) mod authorization;
 pub mod clis;
 pub mod coordination;
 pub mod daemons;

@@ -9721,6 +9721,7 @@ async fn agent_task_list_uses_execution_history() {
         &db,
         AgentTaskListQuery {
             agent_id,
+            user_id: "test-user".to_owned(),
             include_archived: false,
             include_cancelled: true,
             include_deleted: false,

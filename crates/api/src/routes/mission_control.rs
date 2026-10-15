@@ -23,6 +23,15 @@ pub async fn home(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<MissionControlHomeResponse>> {
+    if let Some(project_id) = query.project_id.as_deref() {
+        crate::routes::authorization::require_project_access(
+            &state,
+            project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -43,6 +52,15 @@ pub async fn list_attention(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<AttentionListResponse>> {
+    if let Some(project_id) = query.project_id.as_deref() {
+        crate::routes::authorization::require_project_access(
+            &state,
+            project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -84,6 +102,17 @@ pub async fn acknowledge(
     Path(id): Path<String>,
     Json(body): Json<AttentionMutationRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -101,6 +130,17 @@ pub async fn snooze(
     Path(id): Path<String>,
     Json(body): Json<AttentionSnoozeRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -123,6 +163,17 @@ pub async fn resolve(
     Path(id): Path<String>,
     Json(body): Json<AttentionResolveRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),

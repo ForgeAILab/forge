@@ -302,6 +302,7 @@ async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_on
     let inbox = AgentInboxRepo::list_inbox_items(
         &*db,
         db::AgentInboxListQuery {
+            visible_to_user_id: None,
             recipient_identity_id: identity_id.to_owned(),
             status: None,
             scope_type: Some("project".to_owned()),
@@ -341,6 +342,7 @@ async fn runtime_upgrade_preserves_cursor_ignores_legacy_lease_and_reconciles_on
         AgentInboxRepo::list_inbox_items(
             &*db,
             db::AgentInboxListQuery {
+                visible_to_user_id: None,
                 recipient_identity_id: identity_id.to_owned(),
                 status: None,
                 scope_type: Some("project".to_owned()),
@@ -674,6 +676,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     let old_inbox = AgentInboxRepo::list_inbox_items(
         &*db,
         db::AgentInboxListQuery {
+            visible_to_user_id: None,
             recipient_identity_id: old_identity.to_owned(),
             status: None,
             scope_type: None,
@@ -686,6 +689,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
     let new_inbox = AgentInboxRepo::list_inbox_items(
         &*db,
         db::AgentInboxListQuery {
+            visible_to_user_id: None,
             recipient_identity_id: new_identity.to_owned(),
             status: None,
             scope_type: None,
@@ -716,6 +720,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
         AgentInboxRepo::list_inbox_items(
             &*db,
             db::AgentInboxListQuery {
+                visible_to_user_id: None,
                 recipient_identity_id: new_identity.to_owned(),
                 status: None,
                 scope_type: None,

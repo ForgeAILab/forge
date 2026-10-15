@@ -2496,6 +2496,7 @@ pub struct TaskListQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTaskListQuery {
     pub agent_id: String,
+    pub user_id: String,
     pub include_archived: bool,
     pub include_cancelled: bool,
     pub include_deleted: bool,
@@ -3820,6 +3821,7 @@ pub struct CreateAgentCommitment {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCommitmentListQuery {
+    pub visible_to_user_id: Option<String>,
     pub owner_identity_id: Option<String>,
     pub scope_type: Option<String>,
     pub scope_id: Option<String>,
@@ -3907,6 +3909,7 @@ pub struct CreateAgentInboxItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentInboxListQuery {
+    pub visible_to_user_id: Option<String>,
     pub recipient_identity_id: String,
     pub status: Option<AgentInboxStatus>,
     pub scope_type: Option<String>,
@@ -3941,6 +3944,7 @@ pub struct CreateAgentQuestion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentQuestionListQuery {
+    pub visible_to_user_id: Option<String>,
     pub recipient_identity_id: String,
     pub status: Option<AgentQuestionStatus>,
     pub scope_type: Option<String>,
@@ -3983,6 +3987,7 @@ pub struct CreateAgentAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentActionListQuery {
+    pub visible_to_user_id: Option<String>,
     pub actor_identity_id: Option<String>,
     pub scope_type: Option<String>,
     pub scope_id: Option<String>,

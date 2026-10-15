@@ -762,6 +762,13 @@ pub async fn create_cost_estimation_preview(
     Path(project_id): Path<String>,
     Json(request): Json<CreateCostEstimationPreviewRequest>,
 ) -> ApiResult<Json<ApiCostEstimationPreview>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let project = visible_project(&state, &project_id, &user.user_id).await?;
     validate_preview_request(&request)?;
     let owner_user_id = project.owner_id.clone().ok_or_else(|| {
@@ -898,6 +905,13 @@ pub async fn create_cost_estimation_run(
     Path(project_id): Path<String>,
     Json(request): Json<CreateCostEstimationRunRequest>,
 ) -> ApiResult<Json<ApiCostEstimationRun>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let project = visible_project(&state, &project_id, &user.user_id).await?;
     validate_run_request(&request)?;
     let owner_user_id = project.owner_id.clone().ok_or_else(|| {
@@ -1041,6 +1055,13 @@ pub async fn get_cost_estimation_run(
     user: AuthenticatedUser,
     Path((project_id, run_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ApiCostEstimationRun>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let _project = visible_project(&state, &project_id, &user.user_id).await?;
     let run = RetrospectiveEstimateRepo::get_cost_estimation_run(&*state.db, &run_id)
         .await

@@ -41,7 +41,13 @@ pub async fn upload_media(
     Path(id): Path<String>,
     mut multipart: Multipart,
 ) -> ApiResult<(StatusCode, Json<TaskMediaResponse>)> {
-    require_task_media_access(&state, &id, &user).await?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
 
     let mut author_name = "User".to_owned();
     let mut upload = None;
@@ -149,7 +155,13 @@ pub async fn list_media(
     Path(id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<TaskMediaResponse>>> {
-    require_task_media_access(&state, &id, &user).await?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
 
     let media = TaskMediaRepo::list_media(
         &*state.db,
@@ -174,7 +186,19 @@ pub async fn get_media(
     let media = TaskMediaRepo::get_media_by_id(&*state.db, &media_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("media", media_id.clone()))?;
-    require_task_media_access(&state, &media.task_id, &user).await?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &media.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found(
+            "media",
+            media_id.clone(),
+        ))
+    })?;
     let path = media_storage_path(&state, &media.storage_key)?;
     let bytes = std::fs::read(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -212,7 +236,19 @@ pub async fn delete_media(
     let media = TaskMediaRepo::get_media_by_id(&*state.db, &media_id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("media", media_id.clone()))?;
-    require_task_media_delete_access(&state, &media.task_id, &user).await?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &media.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found(
+            "media",
+            media_id.clone(),
+        ))
+    })?;
     let asset = SharedMediaRepo::get_media_asset_for_task_media(&*state.db, &media.id).await?;
     let deleted_at = now_rfc3339();
     let deleted = TaskMediaRepo::soft_delete_media(&*state.db, &media_id, &deleted_at).await?;
@@ -409,71 +445,6 @@ fn is_svg_content_type(content_type: &str) -> bool {
         .unwrap_or(content_type)
         .trim()
         .eq_ignore_ascii_case("image/svg+xml")
-}
-
-async fn require_task_media_access(
-    state: &AppState,
-    task_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<db::Task> {
-    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    require_project_media_access(state, &task.project_id, user).await?;
-    Ok(task)
-}
-
-async fn require_task_media_delete_access(
-    state: &AppState,
-    task_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<db::Task> {
-    let task = TaskRepo::get_by_id(&*state.db, task_id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", task_id.to_owned()))?;
-    require_project_media_delete_access(state, &task.project_id, user).await?;
-    Ok(task)
-}
-
-async fn require_project_media_access(
-    state: &AppState,
-    project_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user.user_id.as_str()) || project.owner_id.is_none() {
-        return Ok(());
-    }
-    let member = db::ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id).await?;
-    if member.is_none() {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(())
-}
-
-async fn require_project_media_delete_access(
-    state: &AppState,
-    project_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user.user_id.as_str()) || project.owner_id.is_none() {
-        return Ok(());
-    }
-    let member = db::ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(ApiError::forbidden_with_code(
-            "insufficient_role",
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
 }
 
 fn media_root(state: &AppState) -> PathBuf {

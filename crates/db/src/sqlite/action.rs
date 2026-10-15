@@ -75,6 +75,9 @@ impl AgentActionRepo for SqliteDb {
         if let Some(status) = &query.status {
             builder.push(" AND status = ").push_bind(status.to_string());
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_action", user_id);
+        }
         builder
             .push(" ORDER BY created_at DESC, id DESC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));
