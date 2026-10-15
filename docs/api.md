@@ -6084,9 +6084,12 @@ Forge metadata, a scope/product decision, or changed acceptance criteria.
 Optional `repeat` defaults to `false`; `true` means the previous review raised
 the same blocking finding and it remains unaddressed. Missing or unknown values
 use the defaults. The stored `assessment` is
-`{result, reason, fixable_by, repeat, findings?, resolved?, report}`, where `report`
-is the reviewer's Markdown with the block removed. A reply with no readable
-result block is `unverified`.
+`{result, reason, fixable_by?, repeat?, findings?, resolved?, report}`, where
+`report` is the reviewer's Markdown with the block removed. Optional fields are
+omitted when they hold their default (`coder`, `false`, empty), so an assessment
+frozen by v0.13.12 (`{result, reason, report}`) reads back byte for byte;
+clients treat a missing `fixable_by` as `coder` and a missing `repeat` as
+`false`. A reply with no readable result block is `unverified`.
 
 The optional `findings` list accepts `summary` (required and nonblank),
 `severity` (`blocking` by default, or `minor`), `where`, `expected`, `observed`,

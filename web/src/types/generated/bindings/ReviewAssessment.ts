@@ -16,12 +16,14 @@ import type { ReviewResult } from "./ReviewResult";
 export type ReviewAssessment = { result: ReviewResult, reason: string, 
 /**
  * Owner-only findings park the Task instead of returning it to the coder.
+ * Defaults are omitted, like `findings`, so an assessment frozen by
+ * v0.13.12 (`{result, reason, report}`) re-serializes byte for byte.
  */
-fixable_by: FixableBy, 
+fixable_by?: FixableBy, 
 /**
  * The previous review raised the same finding and it remains unaddressed.
  */
-repeat: boolean, findings?: Array<ReviewFinding>, resolved?: Array<string>, 
+repeat?: boolean, findings?: Array<ReviewFinding>, resolved?: Array<string>, 
 /**
  * The reviewer's Markdown review, without the result block.
  */

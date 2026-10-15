@@ -12263,16 +12263,41 @@ async fn archived_interruption_shape_decodes_at_the_event_boundary() {
     );
 }
 
-/// The pre-findings V145 result/reason/report format, including the routing
-/// fields already emitted by v0.13.12. Construct its JSON independently of the
-/// new serializer and compare it with the immutable row before and after replay.
+/// A v0.13.12 server froze assessments as `{result, reason, report}`: no
+/// routing fields and no findings. Insert those exact bytes (not the current
+/// writer's output) and replay them through the current reader and writer.
 #[tokio::test]
-async fn review_findings_v145_conformance_round_trip_is_byte_identical() {
-    let (db, _, _, contract) = seed_review_digest_contract(2).await;
+async fn review_findings_v0_13_12_conformance_round_trip_is_byte_identical() {
+    let (db, _, _, seeded) = seed_review_digest_contract(2).await;
+    let now = now_rfc3339();
+    let mut contract = seeded.clone();
+    contract.execution_id = new_uuid_v4();
+    contract.digest = String::new();
+    contract.digest = api_types::canonical_digest(&contract).unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'reviewer','completed',?,?)")
+        .bind(&contract.execution_id).bind(&contract.context.task_id).bind(&now).bind(&now)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&contract.context.task_id)
+        .bind(&contract.digest)
+        .bind(&contract.context.source_digest)
+        .bind(serde_json::to_string(&contract).unwrap())
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let historical = format!(
-        "{{\"status\":\"passed\",\"contract\":{},\"assessment\":{{\"result\":\"pass\",\"reason\":\"checked\",\"fixable_by\":\"coder\",\"repeat\":false,\"report\":\"\"}},\"checks\":[],\"reason\":null}}",
+        "{{\"status\":\"failed\",\"contract\":{},\"assessment\":{{\"result\":\"fail\",\"reason\":\"missing test\",\"report\":\"## Review\\n\\nNo test.\"}},\"checks\":[],\"reason\":\"missing test\"}}",
         serde_json::to_string(&contract).unwrap()
     );
+    sqlx::query("INSERT INTO execution_review_assessment VALUES(?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&historical)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let before: String = sqlx::query_scalar(
         "SELECT conformance_json FROM execution_review_assessment WHERE execution_id=?",
     )

@@ -1848,9 +1848,19 @@ mod tests {
         let parsed = parse_assessment(r#"{"result":"fail","reason":"legacy"}"#).unwrap();
         assert!(parsed.findings.is_empty());
         assert!(parsed.resolved.is_empty());
+        // The v0.13.12 shape: defaults are omitted, so a frozen row from that
+        // writer and a new default verdict serialize the same way.
         assert_eq!(
             serde_json::to_string(&parsed).unwrap(),
-            r#"{"result":"fail","reason":"legacy","fixable_by":"coder","repeat":false,"report":""}"#
+            r#"{"result":"fail","reason":"legacy","report":""}"#
+        );
+        let routed = parse_assessment(
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&routed).unwrap(),
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true,"report":""}"#
         );
     }
 

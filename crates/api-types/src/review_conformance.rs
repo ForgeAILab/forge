@@ -194,6 +194,12 @@ pub enum FixableBy {
     Coder,
 }
 
+impl FixableBy {
+    fn is_coder(&self) -> bool {
+        *self == Self::Coder
+    }
+}
+
 /// A problem reported by the reviewer. Forge assigns ids in the derived ledger,
 /// never in this frozen value. On re-review, `id` continues a known finding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -287,10 +293,14 @@ pub struct ReviewAssessment {
     pub result: ReviewResult,
     pub reason: String,
     /// Owner-only findings park the Task instead of returning it to the coder.
-    #[serde(default)]
+    /// Defaults are omitted, like `findings`, so an assessment frozen by
+    /// v0.13.12 (`{result, reason, report}`) re-serializes byte for byte.
+    #[serde(default, skip_serializing_if = "FixableBy::is_coder")]
+    #[ts(as = "Option<FixableBy>", optional)]
     pub fixable_by: FixableBy,
     /// The previous review raised the same finding and it remains unaddressed.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
     pub repeat: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[ts(as = "Option<Vec<ReviewFinding>>", optional)]

@@ -3372,7 +3372,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the active task limit and environment re-check interval (default 600 seconds).
 - Project `slots` usage and visible Task capacity queue reasons, including the
   parked-owner guard.
-- Reviewer result fields `fixable_by` and `repeat`, owner parks with
+- Reviewer result fields `fixable_by` and `repeat` (stored and returned only
+  when not the default `coder` / `false`, so assessments frozen by v0.13.12
+  read back byte for byte), owner parks with
   `review_needs_owner` without coder dispatch or review retry budget spent,
   and `defer_to_follow_up` recovery with a required reason. Deferring atomically
   creates a linked backlog Task and records a manual review pass for the original.
