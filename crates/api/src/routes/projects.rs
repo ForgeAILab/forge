@@ -1130,7 +1130,8 @@ pub async fn update_project(
             &user.user_id,
             crate::routes::authorization::ProjectAccess::Read,
         )
-        .await?;
+        .await
+        .map_err(|error| error.mask_not_found(ApiError::not_found("repo", repo_id.to_owned())))?;
     }
     let UpdateProjectRequest {
         name,

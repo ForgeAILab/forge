@@ -1460,3 +1460,45 @@ async fn attention_of_a_hidden_project_reads_like_an_unknown_item() {
         assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
     }
 }
+
+/// A Project's primary repository is chosen by id. A repository of a Project
+/// the caller cannot see must read like an unknown repository and never name
+/// its Project.
+#[tokio::test]
+async fn primary_repo_of_a_hidden_project_reads_like_an_unknown_repo() {
+    let f = Fixture::new().await;
+    let (status, foreign_project) = f
+        .request(
+            Method::POST,
+            "/api/v1/projects",
+            Some(json!({"name":"Foreign"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_project}");
+    let foreign_project_id = foreign_project["id"].as_str().unwrap().to_owned();
+    let (status, foreign_repo) = f
+        .request(
+            Method::POST,
+            &format!("/api/v1/projects/{foreign_project_id}/repos"),
+            Some(json!({"name":"foreign","remote_url":"https://example.invalid/foreign.git"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_repo}");
+    let owner = common::test_jwt();
+    let patch = |repo_id: String| {
+        f.request(
+            Method::PATCH,
+            "/api/v1/projects/{project}",
+            Some(json!({"primary_repo_id":repo_id,"version":f.project.version})),
+            &owner,
+        )
+    };
+    let hidden = patch(foreign_repo["id"].as_str().unwrap().to_owned()).await;
+    let unknown = patch("missing-repo".to_owned()).await;
+    assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{}", hidden.1);
+    assert_eq!(hidden.0, unknown.0);
+    assert_eq!(hidden.1["details"]["entity"], unknown.1["details"]["entity"]);
+    assert!(!hidden.1.to_string().contains(&foreign_project_id), "{}", hidden.1);
+}

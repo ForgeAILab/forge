@@ -452,7 +452,10 @@ async fn authorized_scope_grant(
                 &user.user_id,
                 crate::routes::authorization::ProjectAccess::Read,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                error.mask_not_found(ApiError::not_found("task", scope_id.to_owned()))
+            })?;
             vec!["project".to_owned()]
         }
         _ => {

@@ -793,7 +793,10 @@ async fn require_identity_scope(
                 user_id,
                 crate::routes::authorization::ProjectAccess::Read,
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                error.mask_not_found(ApiError::not_found("task", scope_id.to_owned()))
+            })?;
             let assigned_directly = task.assignee_type.as_deref() == Some("agent")
                 && task.assignee_id.as_deref() == Some(identity_id);
             let assigned_role = TaskRoleAssignmentRepo::list_by_task(&*state.db, scope_id)
