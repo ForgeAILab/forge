@@ -927,6 +927,11 @@ pub fn assemble_prepared_prompt(
 const MAX_INLINE_DIFF_BYTES: usize = 48 * 1024;
 /// Largest slice of the previous review's report carried into a re-review.
 const MAX_PRIOR_REPORT_BYTES: usize = 8 * 1024;
+/// Largest open-findings list carried into a re-review; ids past it are
+/// listed bare. Each line's summary and location are clipped first.
+const MAX_PRIOR_FINDINGS_BYTES: usize = 8 * 1024;
+const MAX_PRIOR_FINDING_SUMMARY_CHARS: usize = 200;
+const MAX_PRIOR_FINDING_WHERE_CHARS: usize = 120;
 
 /// Context a reviewer would otherwise spend its first turns fetching: the
 /// candidate diff and, on a re-review, the previous verdict and what changed
@@ -1009,7 +1014,7 @@ async fn prior_review_section(
     contract: &ReviewContract,
     budget: usize,
 ) -> Option<String> {
-    let mut reviews = db.review_window(task_id).await.ok()?.reviews;
+    let mut reviews = ReviewRepo::list_by_task(db, task_id).await.ok()?;
     let current_attempt = reviews
         .iter()
         .find(|review| {
@@ -1018,9 +1023,19 @@ async fn prior_review_section(
                 || review.execution_id == execution_id
         })
         .map(|review| review.attempt_number);
-    reviews.retain(|review| current_attempt.is_none_or(|attempt| review.attempt_number < attempt));
-    let latest = reviews.last()?;
-    let ledger = crate::finding_ledger(&reviews).ok()?;
+    let earlier =
+        |review: &Review| current_attempt.is_none_or(|attempt| review.attempt_number < attempt);
+    reviews.retain(earlier);
+    // The previous verdict is context whatever the budget window; only the
+    // ledger restarts at a recovery reset. A ledger read that fails drops the
+    // open list, not the verdict.
+    let mut window = db
+        .review_window(task_id)
+        .await
+        .map(|window| window.reviews)
+        .unwrap_or_default();
+    window.retain(earlier);
+    let ledger = crate::finding_ledger(&window).unwrap_or_default();
     let mut section = String::new();
     let mut prior_commit = None;
     for review in reviews.iter().rev() {
@@ -1063,6 +1078,7 @@ async fn prior_review_section(
         break;
     }
     if section.is_empty() {
+        let latest = window.last()?;
         section.push_str(&format!(
             "\n\nPrevious review (attempt {}, status {}):\n",
             latest.attempt_number, latest.status
@@ -1074,12 +1090,34 @@ async fn prior_review_section(
         .collect();
     if !open.is_empty() {
         section.push_str("Open findings in the prior review ledger:\n");
+        // Every id fits: the ids are what keep findings stable across rounds.
+        let mut listed = 0;
+        let mut overflow = Vec::new();
         for entry in open {
-            section.push_str(&format!("- {}: {}", entry.id, entry.summary));
+            let mut line = format!(
+                "- {}: {}",
+                entry.id,
+                clip_chars(&entry.summary, MAX_PRIOR_FINDING_SUMMARY_CHARS)
+            );
             if let Some(location) = &entry.r#where {
-                section.push_str(&format!(" ({location})"));
+                line.push_str(&format!(
+                    " ({})",
+                    clip_chars(location, MAX_PRIOR_FINDING_WHERE_CHARS)
+                ));
             }
-            section.push('\n');
+            line.push('\n');
+            if overflow.is_empty() && listed + line.len() <= MAX_PRIOR_FINDINGS_BYTES {
+                listed += line.len();
+                section.push_str(&line);
+            } else {
+                overflow.push(entry.id.as_str());
+            }
+        }
+        if !overflow.is_empty() {
+            section.push_str(&format!(
+                "Also open (details in the Review history): {}\n",
+                overflow.join(", ")
+            ));
         }
         section.push_str("For each reviewer finding still open, copy its id into findings. Put fixed reviewer ids in resolved; omission means unconfirmed. Forge re-checks its own CI, check and verify ids.\n");
     }
@@ -1110,6 +1148,13 @@ async fn prior_review_section(
         }
     }
     (section.len() <= budget).then_some(section)
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
@@ -1702,7 +1747,14 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        let assessment = parse_assessment(&format!("{}END\n{{\"result\":\"fail\",\"reason\":\"observed problem\",\"findings\":[{{\"summary\":\"one\"}},{{\"summary\":\"two\"}}]}}","R".repeat(9000))).unwrap();
+        // Two short findings, then 48 at the 1,000-character field limit.
+        let mut findings = vec![json!({"summary":"one"}), json!({"summary":"two"})];
+        findings.extend((3..=50).map(
+            |n| json!({"summary":format!("{n}{}", "S".repeat(1_000)),"where":"W".repeat(1_000)}),
+        ));
+        let block = json!({"result":"fail","reason":"observed problem","findings":findings});
+        let assessment = parse_assessment(&format!("{}END\n{block}", "R".repeat(9000))).unwrap();
+        assert_eq!(assessment.findings.len(), 50);
         let conformance = ReviewConformance {
             status: ConformanceStatus::Failed,
             contract: Some(contract.clone()),
@@ -1766,6 +1818,22 @@ mod tests {
         assert!(section.contains(&"R".repeat(8192)));
         assert!(!section.contains(&"R".repeat(8193)));
         assert!(!section.contains("END"));
+        // 50 open findings at the field limits stay bounded, and every id is
+        // offered for continuation.
+        let overflow: Vec<&str> = section
+            .lines()
+            .find_map(|line| line.strip_prefix("Also open (details in the Review history): "))
+            .map(|ids| ids.split(", ").collect())
+            .unwrap_or_default();
+        for n in 1..=50 {
+            let id = format!("F{n}");
+            assert!(
+                section.contains(&format!("- {id}: ")) || overflow.contains(&id.as_str()),
+                "missing {id}"
+            );
+        }
+        assert!(!section.contains(&"S".repeat(201)));
+        assert!(section.len() < 18 * 1024, "{}", section.len());
         TransitionLogRepo::insert_recovery_marker(
             &db,
             "task",
@@ -1776,16 +1844,22 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(prior_review_section(
+        // A recovery reset restarts the ledger, not the reviewer's context:
+        // the previous verdict and report stay; no stale ids are offered.
+        let section = prior_review_section(
             &db,
             "task",
             "next-reviewer",
             &directory.path().to_path_buf(),
             &contract,
-            32 * 1024
+            32 * 1024,
         )
         .await
-        .is_none());
+        .unwrap();
+        assert!(section.contains("Previous review (attempt 1, result fail"));
+        assert!(section.contains(&"R".repeat(8192)));
+        assert!(!section.contains("Open findings"));
+        assert!(!section.contains("F1: one"));
     }
 
     #[test]
