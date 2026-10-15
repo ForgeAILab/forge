@@ -192,16 +192,7 @@ pub(super) fn no_change_brief(ctx: &AgentDispatchContext) -> Option<&str> {
         .iter()
         .rev()
         .find(|entry| entry.to_state == ctx.state_name)
-        .filter(|entry| {
-            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::Recovery)
-                && entry
-                    .bridge
-                    .bridge_payload
-                    .as_ref()
-                    .and_then(|payload| payload.get("verb"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some("repair_no_change")
-        })
+        .filter(|entry| entry.bridge.is_repair_no_change())
         .map(|entry| entry.trigger_reason.as_str())
 }
 

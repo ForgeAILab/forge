@@ -613,7 +613,7 @@ impl WorkflowExecution<'_> {
                         cascade = Some((
                             target,
                             reason,
-                            api_types::TransitionBridge::recovery("repair_no_change", false),
+                            api_types::TransitionBridge::repair_no_change(),
                         ));
                         no_change_send_back = true;
                         // Bypass an owner-approval wait without charging a rejection.

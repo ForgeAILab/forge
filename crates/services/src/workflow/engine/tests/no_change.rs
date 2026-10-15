@@ -242,6 +242,34 @@ async fn no_change_worker_repair_uses_the_same_guard() {
 }
 
 #[tokio::test]
+async fn no_change_send_back_leaves_an_owner_approval_review_gate() {
+    // The autonomous default's review gate waits for the owner. The reminder
+    // is not a rejection, yet it must still leave the gate: a superseded
+    // cascade would strand the Task in review with nothing running.
+    let mut f = red_fixture().await;
+    f.workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap()
+        .requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "in_progress");
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+}
+
+#[tokio::test]
 async fn no_change_owner_started_entry_after_repair_is_exempt() {
     let f = red_fixture().await;
     repair(&f).await;

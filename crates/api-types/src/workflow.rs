@@ -121,6 +121,21 @@ impl TransitionBridge {
         }
         serde_json::from_value(payload.get("requested_by")?.clone()).ok()
     }
+    /// The no-change guard's reminder: Forge returns an unchanged repair to
+    /// the gate's reject target without a Review or a rejection.
+    pub fn repair_no_change() -> Self {
+        Self::recovery(Self::REPAIR_NO_CHANGE, false)
+    }
+    pub const REPAIR_NO_CHANGE: &'static str = "repair_no_change";
+    pub fn is_repair_no_change(&self) -> bool {
+        self.bridge_kind == Some(TransitionBridgeKind::Recovery)
+            && self
+                .bridge_payload
+                .as_ref()
+                .and_then(|payload| payload.get("verb"))
+                .and_then(serde_json::Value::as_str)
+                == Some(Self::REPAIR_NO_CHANGE)
+    }
     pub fn is_review_refresh(&self) -> bool {
         self.bridge_kind
             .is_some_and(TransitionBridgeKind::is_review_refresh)
