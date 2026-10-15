@@ -27,7 +27,7 @@ pub async fn list_locations(
         &state,
         &addressed_repo.project_id,
         &user.user_id,
-        crate::routes::authorization::ProjectAccess::Admin,
+        crate::routes::authorization::ProjectAccess::Read,
     )
     .await
     .map_err(|error| {
@@ -59,7 +59,7 @@ pub async fn register_location(
         &state,
         &addressed_repo.project_id,
         &user.user_id,
-        crate::routes::authorization::ProjectAccess::Admin,
+        crate::routes::authorization::ProjectAccess::Read,
     )
     .await
     .map_err(|error| {
@@ -86,7 +86,7 @@ pub async fn update_location(
         &state,
         &addressed_repo.project_id,
         &user.user_id,
-        crate::routes::authorization::ProjectAccess::Admin,
+        crate::routes::authorization::ProjectAccess::Read,
     )
     .await
     .map_err(|error| {
@@ -119,7 +119,7 @@ pub async fn verify_location(
         &state,
         &addressed_repo.project_id,
         &user.user_id,
-        crate::routes::authorization::ProjectAccess::Admin,
+        crate::routes::authorization::ProjectAccess::Read,
     )
     .await
     .map_err(|error| {
@@ -151,7 +151,7 @@ pub async fn remove_location(
         &state,
         &addressed_repo.project_id,
         &user.user_id,
-        crate::routes::authorization::ProjectAccess::Admin,
+        crate::routes::authorization::ProjectAccess::Read,
     )
     .await
     .map_err(|error| {
