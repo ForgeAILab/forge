@@ -584,6 +584,18 @@ identifiers at 375/768/1280px. Loading uses the existing Skeleton; empty results
 the absence of assessment. Failed and unverified results keep their reason visible
 when collapsed.
 
+The Review tab places a named finding-ledger table above the latest attempt.
+Reuse the card, outline Badge, Skeleton, ErrorBanner and native table/disclosure
+primitives. Columns show id, source, severity, status, streak and summary; numeric
+id runs sort naturally. A focusable, labelled scroll region contains the table
+at narrow widths. Finding details expand with a keyboard-accessible summary and
+wrapping location/expected/observed text. Loading, empty and retryable error states
+stay inside the ledger section. Each attempt shows its own input findings and
+resolved ids; an id absent from the reviewer input is labelled as newly assigned
+by Forge rather than guessed. Verify appears only when recorded facts exist,
+using the existing authenticated Task media previews for evidence. No new tokens,
+motion, or owner-action controls are introduced.
+
 ### Operations consumer and storage diagnostics
 
 The Operations page reuses its Section, StatCard, SeverityBadge, and operator
