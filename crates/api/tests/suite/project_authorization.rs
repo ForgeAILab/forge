@@ -1364,3 +1364,99 @@ async fn hidden_project_chat_reads_like_an_unknown_chat() {
         assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
     }
 }
+
+/// Mission Control writes address an Attention item by id. An item of a
+/// Project the caller cannot see must read like an unknown item and never
+/// name its Project.
+#[tokio::test]
+async fn attention_of_a_hidden_project_reads_like_an_unknown_item() {
+    use db::{AgentRepo, DomainEventRepo};
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    let now = db::now_rfc3339();
+    let identity = AgentRepo::create(
+        db,
+        db::CreateAgent {
+            id: db::new_uuid_v4(),
+            name: "Attention identity".into(),
+            description: None,
+            executor_type: "codex".into(),
+            model: None,
+            reasoning_effort: None,
+            permission_policy: None,
+            capabilities_json: "[]".into(),
+            config_json: "{}".into(),
+            credential_ref: None,
+            daemon_id: None,
+            max_concurrent_tasks: 1,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: None,
+            is_default: false,
+            paused: false,
+            owner_id: Some("test-user-id".into()),
+            visibility: "account".into(),
+            prompt_template: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let source = db
+        .append_event(db::CreateDomainEvent {
+            id: db::new_uuid_v4(),
+            event_type: "validation.failed".into(),
+            entity_type: "task".into(),
+            entity_id: f.task.id.clone(),
+            actor_type: "system".into(),
+            actor_id: None,
+            scope_type: "project".into(),
+            scope_id: f.project.id.clone(),
+            correlation_id: "authz-attention".into(),
+            causation_id: None,
+            causation_depth: 0,
+            dedupe_key: Some("authz-attention".into()),
+            payload_json: "{}".into(),
+            created_at: now.clone(),
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, identity_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at) VALUES ('hidden-attention', 'validation_failed', 'project', ?, ?, ?, 1, 'open', 'Needs work', '{}', 'authz-attention', ?, ?)")
+        .bind(&f.project.id)
+        .bind(&identity.id)
+        .bind(&source.id)
+        .bind(&now)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for action in ["acknowledge", "resolve"] {
+        let hidden = f
+            .request(
+                Method::POST,
+                &format!("/api/v1/mission-control/attention/hidden-attention/{action}"),
+                Some(json!({"expected_version":1})),
+                &f.other_token,
+            )
+            .await;
+        let unknown = f
+            .request(
+                Method::POST,
+                &format!("/api/v1/mission-control/attention/missing-attention/{action}"),
+                Some(json!({"expected_version":1})),
+                &f.other_token,
+            )
+            .await;
+        assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{action}: {}", hidden.1);
+        assert_eq!(hidden.0, unknown.0, "{action}");
+        assert_eq!(hidden.1["code"], unknown.1["code"], "{action}");
+        assert_eq!(
+            hidden.1["details"]["entity"], unknown.1["details"]["entity"],
+            "{action}: {}",
+            hidden.1
+        );
+        assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
+    }
+}

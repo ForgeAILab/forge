@@ -112,7 +112,10 @@ pub async fn acknowledge(
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Write,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -140,7 +143,10 @@ pub async fn snooze(
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Write,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
@@ -173,7 +179,10 @@ pub async fn resolve(
         &user.user_id,
         crate::routes::authorization::ProjectAccess::Write,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
     let service = AttentionService::new(
         Arc::clone(&state.db),
         Arc::new(WakeTurnConsumer::new(state.db)),
