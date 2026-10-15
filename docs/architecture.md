@@ -8254,7 +8254,9 @@ pointer. Open findings are unchecked, resolved findings checked, and unconfirmed
 findings say "not re-checked" without a checkbox, listed in that order. Each line
 is one line of text (summary clipped to 200 characters); the lines stop at 8 KiB
 and the remaining ids follow on one "Also in the ledger" line, because comments
-are read back into agent prompts. The full report stays with the
+are read back into agent prompts. A window Review the ledger cannot read (an
+older details shape) leaves the list out of the comment; rendering a comment
+never stops the cascade that posts it. The full report stays with the
 Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
 Review-entry CI failures post the same result comment even without a reviewer.
 Repair-round system comments name the review budget and open/resolved ids; owner

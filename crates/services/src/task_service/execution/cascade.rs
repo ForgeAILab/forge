@@ -2447,7 +2447,14 @@ impl TaskService {
             .into_iter()
             .filter(|row| row.attempt_number <= review.attempt_number)
             .collect();
-        ::review::finding_ledger(&reviews).map_err(ServiceError::invalid_operation)
+        // A comment never decides routing: a Review in the window the ledger
+        // cannot read (an older details shape) leaves the list out of the
+        // comment instead of stopping the cascade that posts it.
+        Ok(::review::finding_ledger(&reviews).unwrap_or_else(|error| {
+            tracing::warn!(task_id = %review.task_id, review_id = %review.id, %error,
+                "review comment posted without its finding ledger");
+            Vec::new()
+        }))
     }
 
     pub(crate) async fn publish_review_repair_comment(
