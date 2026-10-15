@@ -362,12 +362,10 @@ async fn no_change_away_owner_keeps_the_typed_review_entry_wait() {
         .unwrap()
         .backend;
     let away = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    f.engine.workspace_backend_router = Arc::new(
-        crate::workspace_backend::WorkspaceBackendRouter::new(Arc::new(AwayOwner(
-            away.clone(),
-            owner,
-        ))),
-    );
+    f.engine.workspace_backend_router =
+        Arc::new(crate::workspace_backend::WorkspaceBackendRouter::new(
+            Arc::new(AwayOwner(away.clone(), owner)),
+        ));
     let task = enter(&f, workflow_actor()).await;
     assert_eq!(task.status, "review");
     let annotation: serde_json::Value =
