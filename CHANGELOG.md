@@ -3060,7 +3060,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   commit as the latest failed Review: one reminder per Review window, then
   `review_needs_owner`, without another Review or review-budget charge.
   Owner-started re-reviews remain exempt.
-
+- Optional structured findings and resolved ids in reviewer results, with lenient
+  parsing and stable finding ids derived across review attempts.
+- `GET /api/v1/tasks/{id}/findings` reads the current review-window ledger,
+  including open, resolved and unconfirmed findings and their streaks.
+- `forge-ctl task findings <task>` prints the same ledger as a table or JSON.
 - **A public demo deployment and a pull-request suite check.** `deploy/demo/`
   holds a Compose application for Dokploy and a demo image for a throwaway
   public instance: seeded demo data, no agent daemon, no MCP endpoint, no
@@ -3380,7 +3384,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the active task limit and environment re-check interval (default 600 seconds).
 - Project `slots` usage and visible Task capacity queue reasons, including the
   parked-owner guard.
-- Reviewer result fields `fixable_by` and `repeat`, owner parks with
+- Reviewer result fields `fixable_by` and `repeat` (stored and returned only
+  when not the default `coder` / `false`, so assessments frozen by v0.13.12
+  read back byte for byte), owner parks with
   `review_needs_owner` without coder dispatch or review retry budget spent,
   and `defer_to_follow_up` recovery with a required reason. Deferring atomically
   creates a linked backlog Task and records a manual review pass for the original.
@@ -3403,6 +3409,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- Task Review and findings reads no longer return HTTP 500 after an owner's
+  manual review pass or a carried review. Readers of persisted details recognize
+  Forge's `manual_override`, `carry_hook_step_id`, and `carry_hook_index`
+  metadata while still refusing unknown fields and malformed values.
+- Replaying a frozen review assessment across an upgrade accepts equivalent
+  explicit or omitted default fields without rewriting its stored JSON.
+- Finding objects inside a broken reviewer result block can no longer supply
+  the review verdict; unreadable replies require result correction.
 
 - An unchanged restart no longer records another setup-required wake decision
   for a Project's open blockers (one or several), or refreshes the timestamps

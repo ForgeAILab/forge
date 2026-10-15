@@ -435,6 +435,199 @@ fn test_jwt() -> String {
     .expect("encode test jwt")
 }
 
+async fn assert_reviews_and_findings_readable(harness: &TestHarness, task_id: &str) {
+    let mut responses = Vec::new();
+    for route in ["reviews", "findings"] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/tasks/{task_id}/{route}"))
+                    .header("authorization", format!("Bearer {}", test_jwt()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        responses.push((
+            route,
+            status,
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        ));
+    }
+    assert!(
+        responses
+            .iter()
+            .all(|(_, status, _)| *status == StatusCode::OK),
+        "{responses:?}"
+    );
+    let reviews: Vec<ReviewResponse> = serde_json::from_value(responses[0].2.clone()).unwrap();
+    assert_eq!(
+        reviews.last().unwrap().status,
+        api_types::ReviewStatus::Passed
+    );
+    let findings: api_types::TaskFindingsResponse =
+        serde_json::from_value(responses[1].2.clone()).unwrap();
+    assert_eq!(findings.review_attempts, reviews.len());
+}
+
+#[tokio::test]
+async fn reviews_after_manual_pass_are_readable_through_rest() {
+    let workspace_root = common::TestDir::new("forge-reviews-manual-pass");
+    let harness = test_app(workspace_root.path()).await;
+    let (review_id, task_id) = seed_review_with_status(
+        &harness.state.db,
+        json!({"ci_steps":[], "auditor":{"verdict":"fail","reason":"check manually"}}).to_string(),
+        ReviewStatus::Failed,
+    )
+    .await;
+    let review = ReviewRepo::get_by_id(&*harness.state.db, &review_id)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("UPDATE execution SET role = 'coder' WHERE id = ?")
+        .bind(&review.execution_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
+    let _: serde_json::Value = common::json_request(
+        &harness.app, Method::POST, &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({"version":common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,
+            "action":{"verb":"approve","override":true,"reason":"Verified manually"}}),
+        StatusCode::OK,
+    ).await;
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task_id)
+        .await
+        .unwrap();
+    let details: serde_json::Value =
+        serde_json::from_str(&reviews.last().unwrap().step_results_json).unwrap();
+    assert_eq!(details["manual_override"]["reason"], "Verified manually");
+    assert_reviews_and_findings_readable(&harness, &task_id).await;
+}
+
+#[tokio::test]
+async fn reviews_after_carry_are_readable_through_rest() {
+    let workspace_root = common::TestDir::new("forge-reviews-carry");
+    let harness = test_app(workspace_root.path()).await;
+    let (review_id, task_id) = seed_review_with_status(
+        &harness.state.db,
+        json!({"ci_steps":[]}).to_string(),
+        ReviewStatus::Running,
+    )
+    .await;
+    let db = &*harness.state.db;
+    let review = ReviewRepo::get_by_id(db, &review_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // The candidate is a completed implementation, as required by carry settlement.
+    sqlx::query("UPDATE execution SET role = 'coder' WHERE id = ?")
+        .bind(&review.execution_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let project = ProjectRepo::get_by_id(db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    // Settle through the same atomic carry boundary as the durable entry hook,
+    // including both of the checkpoint fields that hook writes.
+    ReviewRepo::settle_carried_review(
+        db,
+        db::SettleCarriedReview {
+            review_id,
+            expected_review_updated_at: review.updated_at,
+            step_results_json: json!({
+                "ci_steps":[], "auditor":{"verdict":"pass","reason":"carried"},
+                "carry_hook_step_id":new_uuid_v4(), "carry_hook_index":1,
+            })
+            .to_string(),
+            candidate_execution_id: review.execution_id.clone(),
+            expected_task_version: task.version,
+            expected_task_status: task.status,
+            expected_project_version: project.version,
+            expected_workflow_definition: project.workflow_definition,
+            carry: db::NewReviewAuthorityCarry {
+                task_id: task_id.clone(),
+                contract_execution_id: review.execution_id,
+                commit_sha: "rebased".into(),
+                base_sha: "new-target".into(),
+                kind: db::ReviewCarryKind::CleanRebase,
+                changed_paths: vec!["file.rs".into()],
+            },
+            occurred_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_reviews_and_findings_readable(&harness, &task_id).await;
+}
+
+#[tokio::test]
+async fn reviews_unknown_metadata_is_still_refused_through_rest() {
+    let workspace_root = common::TestDir::new("forge-reviews-unknown-metadata");
+    let harness = test_app(workspace_root.path()).await;
+    let (review_id, task_id) = seed_review_with_status(
+        &harness.state.db,
+        json!({"ci_steps":[], "unknown_forge_field":{}}).to_string(),
+        ReviewStatus::Failed,
+    )
+    .await;
+    for route in ["reviews", "findings"] {
+        let error: ErrorResponse = json_empty_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{task_id}/{route}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        assert_eq!(error.code, "internal_error");
+    }
+    let _: ErrorResponse = common::json_request(
+        &harness.app, Method::POST, &format!("/api/v1/tasks/{task_id}/actions"),
+        json!({"version":common::task_action_version(&harness.app, &format!("/api/v1/tasks/{task_id}/actions")).await,
+            "action":{"verb":"approve","override":true,"reason":"Verified manually"}}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ).await;
+    let review = ReviewRepo::get_by_id(&*harness.state.db, &review_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(review.status, ReviewStatus::Failed);
+}
+
+#[tokio::test]
+async fn reviews_malformed_forge_metadata_is_still_refused_through_rest() {
+    let workspace_root = common::TestDir::new("forge-reviews-malformed-metadata");
+    let harness = test_app(workspace_root.path()).await;
+    for details in [
+        json!({"manual_override":false}),
+        json!({"carry_hook_step_id":12}),
+        json!({"carry_hook_index":-1}),
+    ] {
+        let (_, task_id) =
+            seed_review_with_status(&harness.state.db, details.to_string(), ReviewStatus::Passed)
+                .await;
+        for route in ["reviews", "findings"] {
+            let error: ErrorResponse = json_empty_request(
+                &harness.app,
+                Method::GET,
+                &format!("/api/v1/tasks/{task_id}/{route}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            )
+            .await;
+            assert_eq!(error.code, "internal_error");
+        }
+    }
+}
+
 #[tokio::test]
 async fn review_returns_head_check_evidence_without_losing_entry_ci_or_execution_metadata() {
     let workspace_root = common::TestDir::new("forge-review-head-evidence");

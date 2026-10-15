@@ -42,6 +42,9 @@ fixable_by is "coder" (default) or "owner". Use "owner" only when the blocking f
 repeat defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
 Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
 Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}.
+findings is an optional list of problems. Each item needs a one-sentence summary; severity is "blocking" (default) or "minor". Include where (file and line, command, or screen), expected, and observed when available. Keep at most 50 items and each text field at most 1,000 characters. A pass may include minor findings; a fail remains a fail even without blocking findings.
+Forge assigns new finding ids. For a prior finding still open, copy its id into the item; list prior ids that are fixed in the optional resolved list. Do not invent ids for new findings. An omitted prior finding is unconfirmed, not resolved.
+Findings example: {"result":"fail","reason":"Empty input still crashes","findings":[{"id":"F1","summary":"Empty input crashes parse()","severity":"blocking","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"summary":"Help text has a typo","severity":"minor"}],"resolved":["F2"]}.
 Do not pass work you could not check."#;
 
 pub async fn load_context(
@@ -924,6 +927,11 @@ pub fn assemble_prepared_prompt(
 const MAX_INLINE_DIFF_BYTES: usize = 48 * 1024;
 /// Largest slice of the previous review's report carried into a re-review.
 const MAX_PRIOR_REPORT_BYTES: usize = 8 * 1024;
+/// Largest open-findings list carried into a re-review; ids past it are
+/// listed bare. Each line's summary and location are clipped first.
+const MAX_PRIOR_FINDINGS_BYTES: usize = 8 * 1024;
+const MAX_PRIOR_FINDING_SUMMARY_CHARS: usize = 200;
+const MAX_PRIOR_FINDING_WHERE_CHARS: usize = 120;
 
 /// Context a reviewer would otherwise spend its first turns fetching: the
 /// candidate diff and, on a re-review, the previous verdict and what changed
@@ -1007,26 +1015,49 @@ async fn prior_review_section(
     budget: usize,
 ) -> Option<String> {
     let mut reviews = ReviewRepo::list_by_task(db, task_id).await.ok()?;
-    reviews.sort_by_key(|review| std::cmp::Reverse(review.attempt_number));
-    for review in reviews {
-        let Some(reviewer_execution_id) = review.reviewer_execution_id.as_deref() else {
+    let current_attempt = reviews
+        .iter()
+        .find(|review| {
+            review.reviewer_execution_id.as_deref() == Some(execution_id)
+                || review.auditor_execution_id.as_deref() == Some(execution_id)
+                || review.execution_id == execution_id
+        })
+        .map(|review| review.attempt_number);
+    let earlier =
+        |review: &Review| current_attempt.is_none_or(|attempt| review.attempt_number < attempt);
+    reviews.retain(earlier);
+    // The previous verdict is context whatever the budget window; only the
+    // ledger restarts at a recovery reset. A ledger read that fails drops the
+    // open list, not the verdict.
+    let mut window = db
+        .review_window(task_id)
+        .await
+        .map(|window| window.reviews)
+        .unwrap_or_default();
+    window.retain(earlier);
+    let ledger = crate::finding_ledger(&window).unwrap_or_default();
+    let mut section = String::new();
+    let mut prior_commit = None;
+    for review in reviews.iter().rev() {
+        let Some(reviewer_execution_id) = review
+            .reviewer_execution_id
+            .as_deref()
+            .or(review.auditor_execution_id.as_deref())
+        else {
             continue;
         };
-        if reviewer_execution_id == execution_id {
-            continue;
-        }
         let Ok(Some(conformance)) = db.review_conformance(reviewer_execution_id).await else {
             continue;
         };
         let Some(assessment) = conformance.assessment else {
             continue;
         };
-        let prior_commit = conformance.contract.map(|prior| prior.commit_sha);
+        prior_commit = conformance.contract.map(|prior| prior.commit_sha);
         let result = serde_json::to_value(assessment.result)
             .ok()
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_default();
-        let mut section = format!(
+        section.push_str(&format!(
             "\n\nPrevious review (attempt {}, result {result}{}): {}\n",
             review.attempt_number,
             prior_commit
@@ -1034,7 +1065,7 @@ async fn prior_review_section(
                 .map(|sha| format!(", commit {sha}"))
                 .unwrap_or_default(),
             assessment.reason
-        );
+        ));
         let report = assessment.report.trim();
         if !report.is_empty() {
             section.push_str("Its report:\n");
@@ -1044,35 +1075,86 @@ async fn prior_review_section(
             }
             section.push('\n');
         }
-        section.push_str("Confirm each problem it raised is resolved, and review what changed since. Do not reopen parts it accepted unless the new changes touch them.\n");
-        if let Some(prior_commit) = prior_commit.filter(|sha| *sha != contract.commit_sha) {
-            let is_ancestor = try_git_read(
-                path,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &prior_commit,
-                    &contract.commit_sha,
-                ],
-            )
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-            if is_ancestor {
-                let range = format!("{prior_commit}..{}", contract.commit_sha);
-                let limit = MAX_INLINE_DIFF_BYTES.min(budget.saturating_sub(section.len()) / 2);
-                if let Some(diff) = diff_section(path, &range, limit).await {
-                    section.push_str(&format!("Changes since the previous review ({range}):\n"));
-                    section.push_str(&diff);
-                }
+        break;
+    }
+    if section.is_empty() {
+        let latest = window.last()?;
+        section.push_str(&format!(
+            "\n\nPrevious review (attempt {}, status {}):\n",
+            latest.attempt_number, latest.status
+        ));
+    }
+    let open: Vec<_> = ledger
+        .iter()
+        .filter(|entry| entry.status == ReviewFindingStatus::Open)
+        .collect();
+    if !open.is_empty() {
+        section.push_str("Open findings in the prior review ledger:\n");
+        // Every id fits: the ids are what keep findings stable across rounds.
+        let mut listed = 0;
+        let mut overflow = Vec::new();
+        for entry in open {
+            let mut line = format!(
+                "- {}: {}",
+                entry.id,
+                clip_chars(&entry.summary, MAX_PRIOR_FINDING_SUMMARY_CHARS)
+            );
+            if let Some(location) = &entry.r#where {
+                line.push_str(&format!(
+                    " ({})",
+                    clip_chars(location, MAX_PRIOR_FINDING_WHERE_CHARS)
+                ));
+            }
+            line.push('\n');
+            if overflow.is_empty() && listed + line.len() <= MAX_PRIOR_FINDINGS_BYTES {
+                listed += line.len();
+                section.push_str(&line);
             } else {
-                section.push_str("The branch was rewritten since that review (for example rebased), so there is no incremental diff; compare against the candidate diff above.\n");
+                overflow.push(entry.id.as_str());
             }
         }
-        return (section.len() <= budget).then_some(section);
+        if !overflow.is_empty() {
+            section.push_str(&format!(
+                "Also open (details in the Review history): {}\n",
+                overflow.join(", ")
+            ));
+        }
+        section.push_str("For each reviewer finding still open, copy its id into findings. Put fixed reviewer ids in resolved; omission means unconfirmed. Forge re-checks its own CI, check and verify ids.\n");
     }
-    None
+    section.push_str("Confirm each problem it raised is resolved, and review what changed since. Do not reopen parts it accepted unless the new changes touch them.\n");
+    if let Some(prior_commit) = prior_commit.filter(|sha| *sha != contract.commit_sha) {
+        let is_ancestor = try_git_read(
+            path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &prior_commit,
+                &contract.commit_sha,
+            ],
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if is_ancestor {
+            let range = format!("{prior_commit}..{}", contract.commit_sha);
+            let limit = MAX_INLINE_DIFF_BYTES.min(budget.saturating_sub(section.len()) / 2);
+            if let Some(diff) = diff_section(path, &range, limit).await {
+                section.push_str(&format!("Changes since the previous review ({range}):\n"));
+                section.push_str(&diff);
+            }
+        } else {
+            section.push_str("The branch was rewritten since that review (for example rebased), so there is no incremental diff; compare against the candidate diff above.\n");
+        }
+    }
+    (section.len() <= budget).then_some(section)
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
@@ -1089,8 +1171,8 @@ fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
 /// Parse a reviewer's reply: free Markdown ending in one result block
 /// `{"result": "pass|fail|blocked", "reason": "..."}`.
 ///
-/// The last JSON object that names a result wins, so a reviewer may quote
-/// JSON or code in its review, or correct itself later in the same reply. The
+/// The last standalone JSON object that names a result wins, so a reviewer may
+/// quote JSON or code in its review, or correct itself later in the same reply. The
 /// block is read leniently — unknown keys are ignored, `verdict` is accepted
 /// for `result`, and case does not matter — because a well-meant extra field
 /// or a slightly different key used to throw away a whole review. Everything
@@ -1099,10 +1181,28 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     if message.len() > MAX_REPORT_BYTES {
         return Err("review report exceeds size budget".into());
     }
-    let (span, result, reason, fixable_by, repeat) = message
+    let mut object_end = 0;
+    let (span, result, reason, fixable_by, repeat, findings, resolved) = message
         .match_indices('{')
-        .rev()
-        .find_map(|(open, _)| {
+        .filter_map(|(open, _)| {
+            if open < object_end {
+                return None;
+            }
+            // Prose and code can contain unmatched braces. Only an object-like
+            // opener owns its nested objects, even when its JSON is broken.
+            let body = message[open + 1..].trim_start();
+            let bare_key = body
+                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .next()
+                .unwrap_or_default();
+            let (end, has_quoted_key) = json_object_end(message, open);
+            if !body.starts_with(['"', '\''])
+                && (bare_key.is_empty() || !body[bare_key.len()..].trim_start().starts_with(':'))
+                && !has_quoted_key
+            {
+                return None;
+            }
+            object_end = end;
             let mut values =
                 serde_json::Deserializer::from_str(&message[open..]).into_iter::<Value>();
             let value = values.next()?.ok()?;
@@ -1122,8 +1222,11 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
                 reason,
                 fixable_by,
                 repeat,
+                parse_findings(value.get("findings")),
+                parse_resolved(value.get("resolved")),
             ))
         })
+        .fold(None, |_, block| Some(block))
         .ok_or(
             "review must end with one result block: {\"result\": \"pass|fail|blocked\", \
              \"reason\": \"one sentence\"}",
@@ -1133,8 +1236,113 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
         reason,
         fixable_by,
         repeat,
+        findings,
+        resolved,
         report: report_without_block(message, span),
     })
+}
+
+/// Find the enclosing object's boundary without requiring valid JSON. A broken
+/// result block still owns its findings; none can become a standalone verdict.
+fn json_object_end(message: &str, open: usize) -> (usize, bool) {
+    let mut depth = 0;
+    let mut arrays = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut previous = open;
+    let mut has_quoted_key = false;
+    for (offset, byte) in message.as_bytes()[open..].iter().copied().enumerate() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+                if depth == 1
+                    && arrays == 0
+                    && message[open + offset + 1..].trim_start().starts_with(':')
+                {
+                    has_quoted_key = true;
+                }
+            }
+        } else {
+            match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'[' => arrays += 1,
+                b']' => arrays -= 1,
+                b'{' => {
+                    // A correction turn is appended as a new paragraph. If
+                    // only the outer closing brace was truncated, that new
+                    // block is independent, rather than an object value.
+                    if depth == 1
+                        && arrays == 0
+                        && !matches!(message.as_bytes()[previous], b':' | b',' | b'{')
+                        && message[previous + 1..open + offset].contains("\n\n")
+                    {
+                        return (open + offset, has_quoted_key);
+                    }
+                    depth += 1;
+                }
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (open + offset + 1, has_quoted_key);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !byte.is_ascii_whitespace() {
+            previous = open + offset;
+        }
+    }
+    (message.len(), has_quoted_key)
+}
+
+const MAX_FINDINGS: usize = 50;
+const MAX_FINDING_TEXT_CHARS: usize = 1_000;
+
+fn finding_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.chars().take(MAX_FINDING_TEXT_CHARS).collect())
+}
+
+fn parse_findings(value: Option<&Value>) -> Vec<ReviewFinding> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some(ReviewFinding {
+                summary: finding_text(item.get("summary"))?,
+                id: finding_text(item.get("id")),
+                severity: match item.get("severity").and_then(Value::as_str) {
+                    Some(severity) if severity.trim().eq_ignore_ascii_case("minor") => {
+                        ReviewFindingSeverity::Minor
+                    }
+                    _ => ReviewFindingSeverity::Blocking,
+                },
+                r#where: finding_text(item.get("where")),
+                expected: finding_text(item.get("expected")),
+                observed: finding_text(item.get("observed")),
+            })
+        })
+        .take(MAX_FINDINGS)
+        .collect()
+}
+
+fn parse_resolved(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| finding_text(Some(id)))
+        .take(MAX_FINDINGS)
+        .collect()
 }
 
 fn result_block(value: &Value) -> Option<(ReviewResult, String)> {
@@ -1567,6 +1775,287 @@ mod tests {
         assert_eq!(verdict.reason, "");
         assert_eq!(verdict.fixable_by, FixableBy::Coder);
         assert!(!verdict.repeat);
+    }
+
+    #[tokio::test]
+    async fn prior_review_prompt_includes_window_open_ids_and_an_8k_report_slice() {
+        use db::TransitionLogRepo;
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let start = "2026-10-15T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO project(id,name,created_at,updated_at) VALUES('project','Review',?,?)",
+        )
+        .bind(start)
+        .bind(start)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('task','project','Review','review',?,?)")
+            .bind(start).bind(start).execute(db.pool()).await.unwrap();
+        for id in ["candidate", "prior-reviewer"] {
+            sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,'task','reviewer','completed',?,?)")
+                .bind(id).bind(start).bind(start).execute(db.pool()).await.unwrap();
+        }
+        let contract = ReviewContract {
+            execution_id: "prior-reviewer".into(),
+            policy: REVIEW_CONFORMANCE_POLICY.into(),
+            commit_sha: "same".into(),
+            base_sha: "same".into(),
+            candidate_changed_paths: Vec::new(),
+            context: context_from_source(&source()).unwrap(),
+            check_results: Vec::new(),
+            digest: "prior-contract".into(),
+        };
+        // A historical contract fixture lets this test exercise prompt reads
+        // without requiring Git or admitting a new reviewer execution.
+        sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+            .bind(&contract.execution_id)
+            .bind("task")
+            .bind(&contract.digest)
+            .bind(&contract.context.source_digest)
+            .bind(serde_json::to_string(&contract).unwrap())
+            .bind(start)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Two short findings, then 48 at the 1,000-character field limit.
+        let mut findings = vec![json!({"summary":"one"}), json!({"summary":"two"})];
+        findings.extend((3..=50).map(
+            |n| json!({"summary":format!("{n}{}", "S".repeat(1_000)),"where":"W".repeat(1_000)}),
+        ));
+        let block = json!({"result":"fail","reason":"observed problem","findings":findings});
+        let assessment = parse_assessment(&format!("{}END\n{block}", "R".repeat(9000))).unwrap();
+        assert_eq!(assessment.findings.len(), 50);
+        let conformance = ReviewConformance {
+            status: ConformanceStatus::Failed,
+            contract: Some(contract.clone()),
+            assessment: Some(assessment),
+            checks: Vec::new(),
+            reason: Some("observed problem".into()),
+        };
+        db.record_review_conformance(&conformance).await.unwrap();
+        for (attempt, details) in [
+            (1, json!({"conformance":conformance})),
+            (
+                2,
+                json!({"ci_steps":[{"index":2,"command":"cargo test","exit_code":101,"stderr_tail":"failed"}]}),
+            ),
+        ] {
+            let review = ReviewRepo::create(
+                &db,
+                db::CreateReview {
+                    id: format!("review-{attempt}"),
+                    task_id: "task".into(),
+                    execution_id: "candidate".into(),
+                    attempt_number: attempt,
+                    status: db::ReviewStatus::Failed,
+                    step_results_json: details.to_string(),
+                    started_at: format!("2026-10-15T00:00:0{attempt}Z"),
+                    created_at: format!("2026-10-15T00:00:0{attempt}Z"),
+                    updated_at: start.into(),
+                },
+            )
+            .await
+            .unwrap();
+            if attempt == 1 {
+                sqlx::query("UPDATE review SET reviewer_execution_id='prior-reviewer' WHERE id=?")
+                    .bind(review.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let section = prior_review_section(
+            &db,
+            "task",
+            "next-reviewer",
+            &directory.path().to_path_buf(),
+            &contract,
+            32 * 1024,
+        )
+        .await
+        .unwrap();
+        for expected in [
+            "F1: one",
+            "F2: two",
+            "CI-2: cargo test failed",
+            "copy its id into findings",
+            "in resolved",
+            "[report truncated]",
+        ] {
+            assert!(section.contains(expected), "missing {expected}");
+        }
+        assert!(section.contains(&"R".repeat(8192)));
+        assert!(!section.contains(&"R".repeat(8193)));
+        assert!(!section.contains("END"));
+        // 50 open findings at the field limits stay bounded, and every id is
+        // offered for continuation.
+        let overflow: Vec<&str> = section
+            .lines()
+            .find_map(|line| line.strip_prefix("Also open (details in the Review history): "))
+            .map(|ids| ids.split(", ").collect())
+            .unwrap_or_default();
+        for n in 1..=50 {
+            let id = format!("F{n}");
+            assert!(
+                section.contains(&format!("- {id}: ")) || overflow.contains(&id.as_str()),
+                "missing {id}"
+            );
+        }
+        assert!(!section.contains(&"S".repeat(201)));
+        assert!(section.len() < 18 * 1024, "{}", section.len());
+        TransitionLogRepo::insert_recovery_marker(
+            &db,
+            "task",
+            "review",
+            "reset_retry_window",
+            "test",
+            "new window",
+        )
+        .await
+        .unwrap();
+        // A recovery reset restarts the ledger, not the reviewer's context:
+        // the previous verdict and report stay; no stale ids are offered.
+        let section = prior_review_section(
+            &db,
+            "task",
+            "next-reviewer",
+            &directory.path().to_path_buf(),
+            &contract,
+            32 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(section.contains("Previous review (attempt 1, result fail"));
+        assert!(section.contains(&"R".repeat(8192)));
+        assert!(!section.contains("Open findings"));
+        assert!(!section.contains("F1: one"));
+    }
+
+    #[test]
+    fn findings_parser_reads_findings_and_resolutions() {
+        let parsed = parse_assessment(r#"Report.
+{"result":"fail","reason":"empty input crashes","findings":[{"summary":"Empty input crashes parse()","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"id":"F2","summary":"typo","severity":" MINOR "}],"resolved":["F1"]}"#).unwrap();
+        assert_eq!(parsed.result, ReviewResult::Fail);
+        assert_eq!(parsed.report, "Report.");
+        assert_eq!(parsed.findings.len(), 2);
+        assert_eq!(parsed.findings[0].severity, ReviewFindingSeverity::Blocking);
+        assert_eq!(
+            parsed.findings[0].r#where.as_deref(),
+            Some("src/parse.rs:42")
+        );
+        assert_eq!(
+            parsed.findings[0].expected.as_deref(),
+            Some("error message")
+        );
+        assert_eq!(parsed.findings[0].observed.as_deref(), Some("panic"));
+        assert_eq!(parsed.findings[1].severity, ReviewFindingSeverity::Minor);
+        assert_eq!(parsed.findings[1].id.as_deref(), Some("F2"));
+        assert_eq!(parsed.resolved, ["F1"]);
+    }
+
+    #[test]
+    fn findings_parser_ignores_malformed_lists_and_items() {
+        for malformed in [json!(null), json!("see above"), json!({}), json!(7)] {
+            let parsed = parse_assessment(
+                &json!({"result":"fail","reason":"x","findings":malformed,"resolved":malformed})
+                    .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.result, ReviewResult::Fail);
+            assert_eq!(parsed.reason, "x");
+            assert!(parsed.findings.is_empty());
+            assert!(parsed.resolved.is_empty());
+        }
+        let parsed = parse_assessment(&json!({"result":"pass","findings":[null,4,"x",{}, {"summary":"  "}, {"summary":4}, {"summary":"good","severity":{}}, {"summary":"other","severity":"unknown","where":4}],"resolved":[null,{},8," ","F1"]}).to_string()).unwrap();
+        assert_eq!(parsed.findings.len(), 2);
+        assert!(parsed
+            .findings
+            .iter()
+            .all(|finding| finding.severity == ReviewFindingSeverity::Blocking));
+        assert!(parsed.findings[1].r#where.is_none());
+        assert_eq!(parsed.resolved, ["F1"]);
+    }
+
+    #[test]
+    fn findings_parser_nested_result_keys_cannot_override_the_verdict() {
+        let parsed = parse_assessment(r#"{"result":"fail","reason":"outer","findings":[{"summary":"bug","result":"pass"}],"resolved":[{"result":"blocked"}]}"#).unwrap();
+        assert_eq!(parsed.result, ReviewResult::Fail);
+        assert_eq!(parsed.reason, "outer");
+        assert_eq!(parsed.findings.len(), 1);
+        assert!(parsed.resolved.is_empty());
+        assert!(parsed.report.is_empty());
+    }
+
+    #[test]
+    fn findings_parser_broken_outer_block_cannot_supply_a_nested_verdict() {
+        for key in ["result", "verdict"] {
+            for broken in [
+                format!(r#"{{"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}],}}"#),
+                format!(r#"{{"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]"#),
+                format!(r#"{{"result":fail,"findings":[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(r#"{{result:"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(r#"{{'result':'fail','findings':[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(
+                    r#"{{/* comment */"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#
+                ),
+                format!(
+                    r#"{{not-json,"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#
+                ),
+            ] {
+                assert!(parse_assessment(&broken).is_err(), "{broken}");
+                let corrected =
+                    format!("{broken}\n\n{{\"result\":\"fail\",\"reason\":\"corrected\"}}");
+                assert_eq!(parse_assessment(&corrected).unwrap().reason, "corrected");
+            }
+        }
+    }
+
+    #[test]
+    fn findings_parser_keeps_legacy_serialization() {
+        let parsed = parse_assessment(r#"{"result":"fail","reason":"legacy"}"#).unwrap();
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.resolved.is_empty());
+        // The v0.13.12 shape: defaults are omitted, so a frozen row from that
+        // writer and a new default verdict serialize the same way.
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            r#"{"result":"fail","reason":"legacy","report":""}"#
+        );
+        let routed = parse_assessment(
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&routed).unwrap(),
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true,"report":""}"#
+        );
+    }
+
+    #[test]
+    fn findings_parser_caps_valid_items_and_unicode_text() {
+        let long = "界".repeat(1_100);
+        let parsed = parse_assessment(&json!({"result":"fail","findings":[{"summary":long,"id":long,"where":long,"expected":long,"observed":long}],"resolved":[long]}).to_string()).unwrap();
+        let finding = &parsed.findings[0];
+        for text in [
+            Some(finding.summary.as_str()),
+            finding.id.as_deref(),
+            finding.r#where.as_deref(),
+            finding.expected.as_deref(),
+            finding.observed.as_deref(),
+            Some(parsed.resolved[0].as_str()),
+        ] {
+            assert_eq!(text.unwrap().chars().count(), 1_000);
+        }
+        let mut findings = vec![json!({"summary":""}); 10];
+        findings.extend((0..60).map(|n| json!({"summary":format!("finding {n}")})));
+        let parsed = parse_assessment(&json!({"result":"fail","findings":findings,"resolved":(0..60).map(|n|format!("F{n}")).collect::<Vec<_>>()} ).to_string()).unwrap();
+        assert_eq!(parsed.findings.len(), 50);
+        assert_eq!(parsed.findings.last().unwrap().summary, "finding 49");
+        assert_eq!(parsed.resolved.len(), 50);
     }
 
     #[test]

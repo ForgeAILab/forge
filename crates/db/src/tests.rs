@@ -5951,6 +5951,8 @@ async fn seed_review_digest_contract(
             reason: "checked".into(),
             fixable_by: api_types::FixableBy::Coder,
             repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
             report: String::new(),
         }),
         checks: Vec::new(),
@@ -12259,4 +12261,174 @@ async fn archived_interruption_shape_decodes_at_the_event_boundary() {
         raw, reloaded.payload_json,
         "decoding does not rewrite stored history"
     );
+}
+
+/// A v0.13.12 server froze assessments as `{result, reason, report}`: no
+/// routing fields and no findings. Insert those exact bytes (not the current
+/// writer's output) and replay them through the current reader and writer.
+#[tokio::test]
+async fn review_findings_v0_13_12_conformance_round_trip_is_byte_identical() {
+    let (db, _, _, seeded) = seed_review_digest_contract(2).await;
+    let now = now_rfc3339();
+    let mut contract = seeded.clone();
+    contract.execution_id = new_uuid_v4();
+    contract.digest = String::new();
+    contract.digest = api_types::canonical_digest(&contract).unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'reviewer','completed',?,?)")
+        .bind(&contract.execution_id).bind(&contract.context.task_id).bind(&now).bind(&now)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&contract.context.task_id)
+        .bind(&contract.digest)
+        .bind(&contract.context.source_digest)
+        .bind(serde_json::to_string(&contract).unwrap())
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let historical = format!(
+        "{{\"status\":\"failed\",\"contract\":{},\"assessment\":{{\"result\":\"fail\",\"reason\":\"missing test\",\"report\":\"## Review\\n\\nNo test.\"}},\"checks\":[],\"reason\":\"missing test\"}}",
+        serde_json::to_string(&contract).unwrap()
+    );
+    sqlx::query("INSERT INTO execution_review_assessment VALUES(?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&historical)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let before: String = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id=?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(before, historical);
+    let assessment = db
+        .review_conformance(&contract.execution_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(assessment.assessment.as_ref().unwrap().findings.is_empty());
+    assert!(assessment.assessment.as_ref().unwrap().resolved.is_empty());
+    assert_eq!(serde_json::to_string(&assessment).unwrap(), historical);
+    db.record_review_conformance(&assessment).await.unwrap();
+    let after: String = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id=?",
+    )
+    .bind(&contract.execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    let mut changed = assessment;
+    changed
+        .assessment
+        .as_mut()
+        .unwrap()
+        .resolved
+        .push("F1".into());
+    assert!(
+        matches!(db.record_review_conformance(&changed).await,Err(DbError::Check(message)) if message=="assessment is already frozen")
+    );
+}
+
+async fn long_form_review_assessment() -> (SqliteDb, api_types::ReviewConformance, String) {
+    let (db, _, _, mut contract) = seed_review_digest_contract(2).await;
+    let now = now_rfc3339();
+    contract.execution_id = new_uuid_v4();
+    contract.digest = String::new();
+    contract.digest = api_types::canonical_digest(&contract).unwrap();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'reviewer','completed',?,?)")
+        .bind(&contract.execution_id).bind(&contract.context.task_id).bind(&now).bind(&now)
+        .execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&contract.context.task_id)
+        .bind(&contract.digest)
+        .bind(&contract.context.source_digest)
+        .bind(serde_json::to_string(&contract).unwrap())
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let assessment = api_types::ReviewConformance {
+        status: api_types::ConformanceStatus::Failed,
+        contract: Some(contract.clone()),
+        assessment: Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Fail,
+            reason: "missing test".into(),
+            report: "## Review\n\nNo test.".into(),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
+        }),
+        checks: Vec::new(),
+        reason: Some("missing test".into()),
+    };
+    let mut historical = serde_json::to_value(&assessment).unwrap();
+    historical["assessment"]["fixable_by"] = serde_json::json!("coder");
+    historical["assessment"]["repeat"] = serde_json::json!(false);
+    let historical = serde_json::to_string_pretty(&historical).unwrap();
+    sqlx::query("INSERT INTO execution_review_assessment VALUES(?,?,?)")
+        .bind(&contract.execution_id)
+        .bind(&historical)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    (db, assessment, historical)
+}
+
+#[tokio::test]
+async fn review_frozen_long_form_assessment_replays_without_rewriting_bytes() {
+    let (db, assessment, historical) = long_form_review_assessment().await;
+    assert_ne!(serde_json::to_string(&assessment).unwrap(), historical);
+    db.record_review_conformance(&assessment).await.unwrap();
+    let stored: String = sqlx::query_scalar(
+        "SELECT conformance_json FROM execution_review_assessment WHERE execution_id = ?",
+    )
+    .bind(&assessment.contract.as_ref().unwrap().execution_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored, historical);
+}
+
+#[tokio::test]
+async fn review_frozen_long_form_assessment_refuses_changed_content() {
+    let (db, assessment, historical) = long_form_review_assessment().await;
+    for field in ["verdict", "reason", "report", "finding"] {
+        let mut changed = assessment.clone();
+        let report = changed.assessment.as_mut().unwrap();
+        match field {
+            "verdict" => report.result = api_types::ReviewResult::Pass,
+            "reason" => report.reason = "different reason".into(),
+            "report" => report.report = "different report".into(),
+            "finding" => report.findings.push(api_types::ReviewFinding {
+                id: None,
+                summary: "different finding".into(),
+                severity: api_types::ReviewFindingSeverity::Blocking,
+                r#where: None,
+                expected: None,
+                observed: None,
+            }),
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(db.record_review_conformance(&changed).await, Err(DbError::Check(message)) if message == "assessment is already frozen"),
+            "changed {field} must be refused"
+        );
+        let stored: String = sqlx::query_scalar(
+            "SELECT conformance_json FROM execution_review_assessment WHERE execution_id = ?",
+        )
+        .bind(&assessment.contract.as_ref().unwrap().execution_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored, historical, "changed {field} rewrote the frozen row");
+    }
 }

@@ -1546,3 +1546,183 @@ async fn primary_repo_of_a_hidden_project_reads_like_an_unknown_repo() {
         hidden.1
     );
 }
+
+#[tokio::test]
+async fn findings_read_uses_reviews_authority_and_resets_with_the_budget_window() {
+    use db::{CreateReview, ReviewRepo, ReviewStatus, TransitionLogRepo};
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    let now = db::now_rfc3339();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)")
+        .bind(&candidate).bind(&f.task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let first = json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":"problems","assessment":{"result":"fail","reason":"problems","findings":[{"summary":"one"},{"summary":"two"}]}}});
+    let second = json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":"problems","assessment":{"result":"fail","reason":"problems","findings":[{"id":"F1","summary":"still one"},{"summary":"three","severity":"minor"}],"resolved":["F2"]}}});
+    for (index, details) in [first, second].into_iter().enumerate() {
+        ReviewRepo::create(
+            db,
+            CreateReview {
+                id: db::new_uuid_v4(),
+                task_id: f.task.id.clone(),
+                execution_id: candidate.clone(),
+                attempt_number: index as i64 + 1,
+                status: ReviewStatus::Failed,
+                step_results_json: details.to_string(),
+                started_at: now.clone(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let reviews_refusal = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/reviews",
+            None,
+            &f.other_token,
+        )
+        .await;
+    let findings_refusal = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(reviews_refusal.0, StatusCode::NOT_FOUND);
+    // Correlation ids belong to individual requests, not the access refusal.
+    let (reviews_status, mut reviews_body) = reviews_refusal;
+    let (findings_status, mut findings_body) = findings_refusal;
+    reviews_body.as_object_mut().unwrap().remove("request_id");
+    findings_body.as_object_mut().unwrap().remove("request_id");
+    assert_eq!(
+        (findings_status, findings_body),
+        (reviews_status, reviews_body)
+    );
+    f.role(Some("viewer")).await;
+    let (status, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: api_types::TaskFindingsResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.review_attempts, 2);
+    assert_eq!(response.window_started_at, f.task.created_at);
+    assert_eq!(
+        response
+            .items
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["F1", "F2", "F3"]
+    );
+    assert_eq!(response.items[0].streak, 2);
+    assert_eq!(
+        response.items[1].status,
+        api_types::ReviewFindingStatus::Resolved
+    );
+    assert_eq!(
+        response.items[2].severity,
+        api_types::ReviewFindingSeverity::Minor
+    );
+
+    // A typed recovery reset, even from a state other than review, changes the
+    // accounting window. It is not inferred from review failures or status.
+    let boundary = "2030-01-01T00:00:00Z";
+    TransitionLogRepo::insert(
+        db,
+        db::CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: f.task.id.clone(),
+            from_state: f.task.status.clone(),
+            to_state: f.task.status.clone(),
+            trigger_name: Some("reset_retry_window".into()),
+            triggered_by: "test".into(),
+            bridge: api_types::TransitionBridge::recovery("reset_retry_window", true),
+            trigger_reason: "new budget".into(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: boundary.into(),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, empty) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(empty["items"], json!([]));
+    assert_eq!(empty["review_attempts"], 0);
+    assert_eq!(empty["window_started_at"], boundary);
+    ReviewRepo::create(db, CreateReview {
+        id: db::new_uuid_v4(), task_id: f.task.id.clone(), execution_id: candidate,
+        attempt_number: 3, status: ReviewStatus::Failed,
+        step_results_json: json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"new","findings":[{"id":"F3","summary":"new window"}]}}}).to_string(),
+        started_at: "2030-01-01T00:00:01Z".into(), created_at: "2030-01-01T00:00:01Z".into(), updated_at: now,
+    }).await.unwrap();
+    let (_, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(body["review_attempts"], 1);
+    assert_eq!(body["items"][0]["id"], "F1");
+    assert_eq!(body["items"][0]["first_attempt"], 3);
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn findings_read_caps_the_full_ledger_after_id_ordering() {
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    f.role(Some("viewer")).await;
+    let now = db::now_rfc3339();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)")
+        .bind(&candidate).bind(&f.task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    for attempt in 1..=5 {
+        db::ReviewRepo::create(db,db::CreateReview {
+            id: db::new_uuid_v4(),task_id:f.task.id.clone(),execution_id:candidate.clone(),
+            attempt_number:attempt,status:db::ReviewStatus::Failed,
+            step_results_json:json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"many","findings":(0..50).map(|n|json!({"summary":format!("{attempt}-{n}")})).collect::<Vec<_>>()}}}).to_string(),
+            started_at:now.clone(),created_at:now.clone(),updated_at:now.clone(),
+        }).await.unwrap();
+    }
+    let (status, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: api_types::TaskFindingsResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.review_attempts, 5);
+    assert_eq!(response.items.len(), 200);
+    let mut ids = (1..=250).map(|n| format!("F{n}")).collect::<Vec<_>>();
+    ids.sort();
+    ids.truncate(200);
+    assert_eq!(
+        response
+            .items
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        ids
+    );
+}

@@ -2727,6 +2727,8 @@ impl World {
             assessment: Some(api_types::ReviewAssessment {
                 fixable_by: api_types::FixableBy::Coder,
                 repeat: false,
+                findings: Vec::new(),
+                resolved: Vec::new(),
                 result: api_types::ReviewResult::Pass,
                 reason: "looks right".to_owned(),
                 report: String::new(),

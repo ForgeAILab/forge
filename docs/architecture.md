@@ -49,6 +49,7 @@ services-agents / services → events / agent-host / executors / workspace → g
 agent-host → agent-runtime
 forge-cli / forge-solo → config
 forge-solo → api-types / review / cli-adapters / operation-registry
+api → review → db (finding ledger projection)
 api-types (shared request/response types, zero internal deps)
 
 api / services-agents / services → pricing → db / api-types
@@ -8201,12 +8202,24 @@ from the previous attempt. The response format is kept
 this small on purpose so any model can review: an earlier contract demanded one
 JSON object with per-requirement dispositions and exact file/commit citations,
 and live reviewers lost whole reviews to an invented extra field or a truncated
-commit SHA. `review::contract::parse_assessment` takes the last JSON object in
-the reply that names a result, ignores unknown keys, accepts `verdict` for
-`result`, and keeps everything else as the Markdown `report`. The hard gate is
+commit SHA. `review::contract::parse_assessment` takes the last standalone JSON
+object in the reply that names a result, ignores unknown keys, accepts `verdict` for
+`result`, and keeps everything else as the Markdown `report`. A malformed outer
+result block owns its nested findings: their `result` or `verdict` keys cannot
+become the verdict. An unreadable reply goes through result correction.
+Re-recording an immutable assessment compares parsed `ReviewConformance`
+values, so explicit and omitted defaults are equivalent without rewriting the
+stored JSON; any content change is still refused. The hard gate is
 Forge's own setup steps and required checks, not the reviewer's citations: a
 failing check fails the review whatever the reviewer said, and a `pass` on a
 Task with no configured checks rests on the reviewer's judgment alone.
+
+Strict persisted Review-detail readers accept Forge's manual-pass object
+`manual_override` and durable carry checkpoint fields `carry_hook_step_id`
+(string) and `carry_hook_index` (nonnegative integer), alongside the CI,
+conformance, auditor, approval and execution fields. They preserve that metadata
+for workflow writes, omit it from public detail responses, and continue to
+refuse unknown top-level keys or malformed values.
 
 The server contract tells the reviewer to verify by exercising the change —
 build it, run its tests, and drive the changed behavior programmatically or
@@ -8219,6 +8232,18 @@ plus the full diff when it fits in 48 KiB) and, on a re-review, the latest
 earlier verdict with its reason, a bounded slice of its report, and the diff
 since the commit it judged when that commit is still an ancestor. These
 sections are best effort and stay inside the prepared-prompt byte limit.
+
+Reviewer result blocks also accept optional structured `findings` and
+`resolved` ids. The frozen assessment keeps only the reviewer's bounded input;
+Forge assigns ids and derives open/resolved/unconfirmed status and streaks with
+`review::finding_ledger`. `SqliteDb::review_window` reads the persisted Review
+budget window and its Reviews together. A retry-window reset starts a fresh
+ledger; a source that did not run leaves its findings unchanged. A reviewer
+that omits an open finding makes it unconfirmed, while passing Forge checks
+resolve their own findings. The re-review prompt carries the prior ledger's
+open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
+the same projection. Merge failures stay outside it. This projection does not
+change verdict routing, budgets, or Task comments.
 
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and

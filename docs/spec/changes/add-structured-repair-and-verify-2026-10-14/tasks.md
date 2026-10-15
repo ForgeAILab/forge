@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-15T02:22:50Z
+updated_at: 2026-10-15T09:11:52Z
 completed_at:
 ---
 
@@ -9,22 +9,22 @@ focused tests green. Run only the tests named in a phase; CI runs the full
 suite.
 
 ## 1. Findings contract and ledger
-- [ ] 1.1 `ReviewFinding` and `ReviewAssessment.findings` / `resolved` in `crates/api-types/src/review_conformance.rs`, with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`. Export them to `web/src/types/generated/bindings/`.
-- [ ] 1.2 Lenient parsing in `crates/review/src/contract.rs` `parse_assessment` / `result_block`:
+- [x] 1.1 `ReviewFinding` and `ReviewAssessment.findings` / `resolved` in `crates/api-types/src/review_conformance.rs`, with `#[serde(default, skip_serializing_if = "Vec::is_empty")]`. Export them to `web/src/types/generated/bindings/`.
+- [x] 1.2 Lenient parsing in `crates/review/src/contract.rs` `parse_assessment` / `result_block`:
   - drop items without a summary;
   - default the severity;
   - cap at 50 items and 1,000 characters per text field;
   - a malformed list never fails the block.
-- [ ] 1.3 Update `RESPONSE_INSTRUCTION` and the correction prompt (`review_correction.rs`). Refresh the snapshot `crates/services/tests/fixtures/server_workspace_reviewer.prompt.snap`.
-- [ ] 1.4 `prior_review_section` lists the prior ledger's open findings with their ids and asks for `id` / `resolved`. Keep the existing 8 KiB report slice.
-- [ ] 1.5 Write `finding_ledger(window_reviews)`, a pure function in the `review` crate or `services`. It covers:
+- [x] 1.3 Update `RESPONSE_INSTRUCTION` and the correction prompt (`review_correction.rs`). Refresh the snapshot `crates/services/tests/fixtures/server_workspace_reviewer.prompt.snap`.
+- [x] 1.4 `prior_review_section` lists the prior ledger's open findings with their ids and asks for `id` / `resolved`. Keep the existing 8 KiB report slice.
+- [x] 1.5 Write `finding_ledger(window_reviews)`, a pure function in the `review` crate or `services`. It covers:
   - Forge ids (`F<n>`, `CI-<i>`, `CHK-<id>`, `V-*`). `MERGE-*` stays out of the ledger and is brief-only;
   - the review window boundary;
   - checked versus not-run sources;
   - `unconfirmed`;
   - streaks.
-- [ ] 1.6 `GET /api/v1/tasks/{id}/findings` with the same authority as `/reviews`, its response type in `api-types`, generated TS, and `docs/api.md`. Add `forge-ctl task findings` and `docs/cli.md`.
-- [ ] 1.7 Focused tests:
+- [x] 1.6 `GET /api/v1/tasks/{id}/findings` with the same authority as `/reviews`, its response type in `api-types`, generated TS, and `docs/api.md`. Add `forge-ctl task findings` and `docs/cli.md`.
+- [x] 1.7 Focused tests:
   - parser cases: findings, malformed, legacy, caps;
   - a V145-era `conformance_json` round-trips byte-identical through `record_review_conformance`;
   - ledger unit tests for continue/resolve, forgotten finding (`unconfirmed`), CI-before-reviewer (source not run), and a new window after recovery;

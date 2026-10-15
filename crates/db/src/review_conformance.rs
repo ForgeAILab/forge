@@ -5,6 +5,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use sqlx::{Row, SqliteConnection};
 
+/// Reviews and the start of their persisted Review budget window, read together.
+#[derive(Debug, Clone)]
+pub struct ReviewWindow {
+    pub window_started_at: String,
+    pub reviews: Vec<crate::Review>,
+}
+
 #[async_trait]
 pub trait ReviewConformanceRepo: Send + Sync {
     async fn review_source(&self, task_id: &str, execution_id: Option<&str>) -> Result<Value>;
@@ -593,7 +600,8 @@ impl ReviewConformanceRepo for SqliteDb {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing) = existing {
-            if existing != value {
+            if serde_json::from_str::<ReviewConformance>(&existing).map_err(json_error)? != *result
+            {
                 return Err(DbError::Check("assessment is already frozen".into()));
             }
         } else {

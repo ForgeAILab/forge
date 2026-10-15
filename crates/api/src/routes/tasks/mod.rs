@@ -62,7 +62,7 @@ pub use detail::{get_task_detail, get_task_relations};
 pub use execution::{claim_task, launch_task};
 pub use media::{delete_media, get_media, list_media, upload_media};
 pub use prompt_preview::prompt_preview;
-pub use reviews::list_reviews;
+pub use reviews::{list_findings, list_reviews};
 pub use roles::{
     assign_task_role, list_task_roles, remove_task_role, RoleResetRequest,
     TaskRoleAssignmentListResponse,

@@ -133,6 +133,9 @@ pub(crate) fn strict_review_details(review: &Review) -> Result<Value> {
             "user_approval",
             "execution",
             "execution_retry",
+            "manual_override",
+            "carry_hook_step_id",
+            "carry_hook_index",
         ]
         .contains(&key.as_str())
         {
@@ -146,11 +149,34 @@ pub(crate) fn strict_review_details(review: &Review) -> Result<Value> {
             return Err(corrupt("persisted review ci_steps must be an array".into()));
         }
     }
-    for key in ["user_approval", "execution", "execution_retry"] {
+    for key in [
+        "user_approval",
+        "execution",
+        "execution_retry",
+        "manual_override",
+    ] {
         if let Some(value) = object.get(key) {
             if !value.is_object() {
                 return Err(corrupt(format!("persisted review {key} must be an object")));
             }
+        }
+    }
+    for (key, valid) in [
+        (
+            "carry_hook_step_id",
+            object
+                .get("carry_hook_step_id")
+                .is_none_or(Value::is_string),
+        ),
+        (
+            "carry_hook_index",
+            object
+                .get("carry_hook_index")
+                .is_none_or(|value| value.as_u64().is_some()),
+        ),
+    ] {
+        if !valid {
+            return Err(corrupt(format!("invalid persisted review {key}")));
         }
     }
     serde_json::from_value::<api_types::ReviewDetails>(value.clone())

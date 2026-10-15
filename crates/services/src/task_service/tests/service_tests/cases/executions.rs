@@ -4,6 +4,47 @@ use db::{PageRequest, SortBy, SortOrder};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[test]
+fn review_details_accept_forge_metadata_and_refuse_unknown_fields() {
+    let mut review = db::Review {
+        id: "review-metadata".into(),
+        task_id: "task".into(),
+        execution_id: "candidate".into(),
+        reviewer_execution_id: None,
+        auditor_execution_id: None,
+        attempt_number: 1,
+        status: ReviewStatus::Passed,
+        step_results_json: String::new(),
+        started_at: String::new(),
+        finished_at: None,
+        created_at: String::new(),
+        updated_at: String::new(),
+    };
+    for metadata in [
+        serde_json::json!({"ci_steps":[],"manual_override":{"reason":"checked"}}),
+        serde_json::json!({"ci_steps":[],"carry_hook_step_id":"step","carry_hook_index":1}),
+        serde_json::json!({"ci_steps":[],"manual_override":{},"carry_hook_step_id":"step","carry_hook_index":0}),
+    ] {
+        review.step_results_json = metadata.to_string();
+        assert_eq!(
+            crate::task_service::strict_review_details(&review).unwrap(),
+            metadata
+        );
+    }
+    for invalid in [
+        serde_json::json!({"unknown_forge_field":{}}),
+        serde_json::json!({"manual_override":false}),
+        serde_json::json!({"carry_hook_step_id":12}),
+        serde_json::json!({"carry_hook_index":-1}),
+    ] {
+        review.step_results_json = invalid.to_string();
+        assert!(
+            crate::task_service::strict_review_details(&review).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn claim_uses_injected_cli_availability() {
     use cli_adapters::test_support::TestAdapter;

@@ -23,7 +23,9 @@ pub(super) fn correction_prompt(problem: &str) -> String {
          Problem: {problem}\n\n\
          Reply with ONLY the result block for the review you just wrote, for example:\n\
          {{\"result\": \"fail\", \"reason\": \"one sentence\", \"fixable_by\": \"coder\", \"repeat\": false}}\n\
-         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation.\n\n{}",
+         result is \"pass\", \"fail\", or \"blocked\". Do not repeat the investigation.\n\
+         Optional findings lists problems: summary (required), severity (blocking by default or minor), where, expected, observed, and id only to continue a prior finding. Forge assigns new ids. Keep at most 50 findings and 1,000 characters per text field. Optional resolved lists fixed prior ids; omitted ids are unconfirmed.\n\
+         Example: {{\"result\":\"fail\",\"reason\":\"Still crashes\",\"findings\":[{{\"id\":\"F1\",\"summary\":\"Empty input crashes\",\"severity\":\"blocking\",\"where\":\"src/parse.rs:42\",\"expected\":\"error\",\"observed\":\"panic\"}}],\"resolved\":[\"F2\"]}}\n\n{}",
         services::workflow::dispatch::REVIEW_FINDING_ROUTING_CONTRACT
     )
 }
@@ -117,6 +119,47 @@ mod tests {
     fn problem_unless_valid(text: &str) -> Option<String> {
         (!text.ends_with("valid") || text.ends_with("invalid"))
             .then(|| format!("cannot parse {text}"))
+    }
+
+    #[test]
+    fn correction_prompt_defines_findings_and_resolved() {
+        let prompt = correction_prompt("missing result");
+        for field in [
+            "summary (required)",
+            "blocking by default or minor",
+            "where, expected, observed",
+            "Forge assigns new ids",
+            "50 findings",
+            "1,000 characters",
+            "Optional resolved",
+            "unconfirmed",
+            "\"findings\"",
+            "\"resolved\"",
+        ] {
+            assert!(prompt.contains(field), "missing {field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broken_outer_findings_block_requests_result_correction() {
+        let broken = r#"Review notes.
+{"result":"fail","findings":[{"summary":"bug","verdict":"pass"}]"#;
+        let prompts = RefCell::new(Vec::new());
+        let output = correct_report(
+            turn(broken, "first"),
+            |text| ::review::contract::parse_assessment(text).err(),
+            |problem, _| {
+                prompts.borrow_mut().push(correction_prompt(&problem));
+                async { Ok(turn(r#"{"result":"fail","reason":"corrected"}"#, "second")) }
+            },
+        )
+        .await;
+        assert_eq!(prompts.borrow().len(), 1);
+        assert!(prompts.borrow()[0].contains("Forge could not read the result"));
+        let parsed = ::review::contract::parse_assessment(&output.text).unwrap();
+        assert_eq!(parsed.result, api_types::ReviewResult::Fail);
+        assert_eq!(parsed.reason, "corrected");
+        assert!(parsed.report.contains(broken));
     }
 
     #[tokio::test]

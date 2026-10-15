@@ -248,9 +248,18 @@ forge-ctl agent register --name "Claude" --executor-type shell
 
 forge-ctl task list --project-id <ID>
 forge-ctl task show <TASK_ID>
+forge-ctl task findings <TASK_ID>
 forge-ctl task prompt-preview <TASK_ID> --role coder
 forge-ctl task action <TASK_ID> cancel
 ```
+
+`forge-ctl task findings <TASK_ID>` reads the current review-budget window's
+finding ledger with the same Project membership authority as Task reviews.
+Table output includes ids, status, source, severity, streak, attempt numbers,
+and the finding's summary, location, expected and observed text. Use
+`forge-ctl --output json task findings <TASK_ID>` for the API response
+`{items, window_started_at, review_attempts}`. The response contains at most
+200 entries ordered lexically by id; a recovery budget reset starts a new ledger.
 
 `task show` (also `task get`) prints the Task's row. For a Task in the merge
 queue the table output adds where it is and why it waits, from the Task's
