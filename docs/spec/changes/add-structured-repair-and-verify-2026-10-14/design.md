@@ -384,12 +384,12 @@ An infrastructure failure of the runner keeps the existing
 
 ## Open Questions
 
-- **Q1 — Daemon support.** Should version 1 include verify on daemon
-  placements? That needs a daemon policy that stops the run tree (protocol
-  bump). Recommendation: follow-up change.
-- **Q2 — Default `review_progress`.** Should it be 2, or 1 to start
-  conservatively? Recommendation: 2, because it only applies on strict
-  shrink.
+All resolved.
+
+- **Q1 — Daemon support.** Decided by the owner on 2026-10-14: verify on
+  daemon placements is a follow-up change. Version 1 records `not_run` /
+  `placement_unsupported` there, as D8 says.
+- **Q2 — Default `review_progress`.** Decided by the owner on 2026-10-14: 2.
 - **Q3 — A repair-round field in the coder's reply.** Resolved by
   `add-repair-convergence-guards-2026-10-14`: Forge derives attempt memory
   itself (D7 there), so the coder does not declare which ids it addressed.

@@ -277,16 +277,13 @@ a coder repeat. Per-test findings make the count fine-grained.
 
 ## Open Questions
 
-- **Q1.** Should the default for `review_ci_triage` be `full` (my
-  recommendation: don't block on the base's problems), or `report`
-  (classify but still block)? Either way, the base comparison only works
-  for Projects whose review config has `setup_steps` that install
-  dependencies. `world` would need `pnpm install --frozen-lockfile` there.
-- **Q2.** When anchoring leaves a reviewer `fail` with nothing blocking,
-  should Forge park for the owner (my recommendation) or pass automatically
-  with follow-up candidates?
-- **Q3.** Should `repair_switch_model_when_stuck` be opt-in (my
-  recommendation) or on by default?
-- **Q4.** Triage at the merge-queue head: my recommendation is yes. Without
-  it, a Task that passed review on a red base bounces at merge on the same
-  failures.
+All resolved. The owner accepted the recommendations on 2026-10-14.
+
+- **Q1.** `review_ci_triage` defaults to `full`: failures that are flaky or
+  already on the base do not block. The base comparison only works for
+  Projects whose review config has `setup_steps` that install dependencies.
+  `world` needs `pnpm install --frozen-lockfile` there.
+- **Q2.** A reviewer `fail` with nothing blocking left after anchoring parks
+  for the owner. Forge does not pass it automatically.
+- **Q3.** `repair_switch_model_when_stuck` is opt-in (default `false`).
+- **Q4.** Triage also runs at the merge-queue head.
