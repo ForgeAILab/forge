@@ -1283,3 +1283,55 @@ async fn handoff_into_a_hidden_chat_reads_like_an_unknown_handoff() {
     assert_eq!(foreign.1["code"], unknown.1["code"]);
     assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
 }
+
+/// Two reads keep their existing, stricter contracts: Project escalations are
+/// owner-only and repository locations owner/admin-only. A caller who cannot
+/// see the Project gets the unknown-id 404; a member who can gets the
+/// existing 403; the owner reads.
+#[tokio::test]
+async fn owner_only_escalation_and_admin_only_location_reads_hide_the_project() {
+    let f = Fixture::new().await;
+    let reads = [
+        (
+            "/api/v1/projects/{project}/escalations",
+            "/api/v1/projects/missing/escalations",
+        ),
+        (
+            "/api/v1/projects/{project}/escalations/missing-escalation",
+            "/api/v1/projects/missing/escalations/missing-escalation",
+        ),
+        (
+            "/api/v1/repos/{repo}/locations",
+            "/api/v1/repos/missing/locations",
+        ),
+    ];
+    for (path, unknown_path) in reads {
+        let hidden = f.request(Method::GET, path, None, &f.other_token).await;
+        let unknown = f
+            .request(Method::GET, unknown_path, None, &f.other_token)
+            .await;
+        assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{path}: {}", hidden.1);
+        assert_eq!(hidden.1["code"], unknown.1["code"], "{path}");
+        assert_eq!(
+            hidden.1["details"]["entity"], unknown.1["details"]["entity"],
+            "{path}"
+        );
+        for role in ["viewer", "member"] {
+            f.role(Some(role)).await;
+            let (status, body) = f.request(Method::GET, path, None, &f.other_token).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{role} {path}: {body}");
+        }
+        f.role(None).await;
+    }
+    for (path, expected) in [
+        ("/api/v1/projects/{project}/escalations", StatusCode::OK),
+        (
+            "/api/v1/projects/{project}/escalations/missing-escalation",
+            StatusCode::NOT_FOUND,
+        ),
+        ("/api/v1/repos/{repo}/locations", StatusCode::OK),
+    ] {
+        let (status, body) = f.request(Method::GET, path, None, &common::test_jwt()).await;
+        assert_eq!(status, expected, "owner {path}: {body}");
+    }
+}
