@@ -241,9 +241,12 @@ impl<'a> Stream<'a> {
             if test.contains(" > ") {
                 Some(test.to_owned())
             } else {
-                if JS_SOURCE_FILE.is_match(test) {
+                // Jest appends a slow suite's run time to its FAIL line. It
+                // must not reach the identity, which keeps only a trailing one.
+                let file = DURATION.replace(test, "");
+                if JS_SOURCE_FILE.is_match(&file) {
                     self.runner = Runner::JavaScript;
-                    self.file = Some(test.to_owned());
+                    self.file = Some(file.into_owned());
                 }
                 None
             }
@@ -651,5 +654,16 @@ mod tests {
             extract(&captured.replace('\n', "\r\n")),
             ["test/app.e2e-spec.js > AppController (e2e) > / (GET)"]
         );
+    }
+
+    #[test]
+    fn a_slow_jest_suite_duration_is_not_part_of_the_identity() {
+        // Captured from jest 30: a suite over the slow threshold prints its
+        // run time, which differs between the candidate run and its re-run.
+        let run = |seconds: &str| {
+            extract(&format!("FAIL test/slow.e2e-spec.js ({seconds} s)\n  \u{25cf} slow \u{203a} waits\n\nTest Suites: 1 failed, 1 total\n"))
+        };
+        assert_eq!(run("5.296"), ["test/slow.e2e-spec.js > slow > waits"]);
+        assert_eq!(run("6.01"), run("5.296"));
     }
 }
