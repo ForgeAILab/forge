@@ -130,17 +130,19 @@ async fn load_project_facts(
         return Ok(());
     };
     authority.ceiling.insert("mcp_project_visible".into());
+    // Catalog admission is the frozen contract (`mcp_h_base_authority.json`),
+    // unchanged; the role a mutation needs on the Project its arguments
+    // reference is enforced in `authorize_resource` (`project_role`).
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    let role = member.as_ref().map(|member| member.role.as_str());
-    let owner =
-        role == Some("owner") || (role.is_none() && project.owner_id.as_deref() == Some(user_id));
-    if owner {
+    if project.owner_id.as_deref() == Some(user_id) {
         authority.ceiling.insert("mcp_project_owner".into());
     }
-    if owner || matches!(role, Some("admin" | "member")) {
+    if project.owner_id.as_deref() == Some(user_id) || member.is_some() {
         authority.ceiling.insert("mcp_project_member".into());
     }
-    if owner || role == Some("admin") {
+    if project.owner_id.as_deref() == Some(user_id)
+        || member.is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"))
+    {
         authority.ceiling.insert("mcp_project_admin".into());
     }
     Ok(())
@@ -230,7 +232,7 @@ pub(crate) async fn authorize_resource(
         }
     }
     if let Some(project_id) = project_id.as_deref() {
-        require_project_access(state, project_id, user_id, spec.role).await?;
+        require_project_access(state, project_id, user_id, project_role(spec)).await?;
         if spec.name == "forge_task_action" {
             if let (Some(task_id), Some(value)) = (get_id("task_id"), arguments.get("action")) {
                 if let Ok(action) = serde_json::from_value::<api_types::TaskAction>(value.clone()) {
@@ -739,6 +741,28 @@ pub(crate) async fn dispatch(
     input.dispatch(&HandlerContext { state, context }).await
 }
 
+/// The Project role a tool needs on the Project its arguments reference.
+/// Catalog roles (`spec.role`) are the frozen admission contract; the REST
+/// role rule for the same change is applied here, once the Project is known:
+/// Task and dependency mutations need `member`, Project settings `admin`.
+fn project_role(spec: &McpOperation) -> operation_registry::mcp::RequiredRole {
+    use operation_registry::mcp::RequiredRole;
+    match spec.name {
+        "forge_create_task"
+        | "forge_assign_agent"
+        | "forge_task_action"
+        | "forge_update_task"
+        | "forge_transition_task"
+        | "forge_follow_up_execution"
+        | "forge_add_task_dependency"
+        | "forge_remove_task_dependency"
+        | "forge_create_sub_tasks"
+        | "forge_reorder_sub_tasks" => RequiredRole::Member,
+        "forge_update_project" | "forge_update_project_lifecycle_hooks" => RequiredRole::Admin,
+        _ => spec.role,
+    }
+}
+
 pub(crate) async fn require_project_access(
     state: &AppState,
     project_id: &str,
@@ -755,9 +779,14 @@ pub(crate) async fn require_project_access(
     ) {
         return Ok(());
     }
+    // A legacy ownerless Project keeps today's rights for every signed-in
+    // user, as in REST (`routes::authorization::require_project_access`).
+    let Some(owner_id) = project.owner_id.as_deref() else {
+        return Ok(());
+    };
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
     let allowed = member.map_or(
-        project.owner_id.as_deref() == Some(user_id),
+        owner_id == user_id,
         |member| match role {
             RequiredRole::Member => matches!(member.role.as_str(), "owner" | "admin" | "member"),
             RequiredRole::Admin => matches!(member.role.as_str(), "owner" | "admin"),

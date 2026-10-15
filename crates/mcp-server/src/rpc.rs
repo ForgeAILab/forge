@@ -57,16 +57,10 @@ pub(crate) async fn dispatch_with_context(
             // in the bound Project.
             {
                 let admission = async {
-                    let authority = if let Some(project_id) = context.project_id.as_deref() {
-                        super::tools::registry::require_project_access(
-                            state,
-                            project_id,
-                            context.user_id.as_deref().unwrap_or_default(),
-                            operation_registry::mcp::lookup(&params.name)
-                                .expect("known operation")
-                                .role,
-                        )
-                        .await?;
+                    // The bound Project's role ceilings (`load_project_facts`) are the
+                    // whole admission rule: an invisible Project or a missing role is
+                    // the catalog's policy denial, never a lookup result.
+                    let authority = if context.project_id.is_some() {
                         super::tools::registry::authority(state, context).await?
                     } else {
                         operation_registry::authority::mcp_authority(

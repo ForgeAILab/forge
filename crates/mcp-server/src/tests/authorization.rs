@@ -83,7 +83,10 @@ async fn project_and_task_tools_enforce_visibility_and_member_roles() {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.code, -32004, "non-member {name}: {error:?}");
+            // A bound (Project-constrained) grant is denied by catalog
+            // admission; an account grant sees the unknown-id lookup.
+            let expected = if constrained { -32001 } else { -32004 };
+            assert_eq!(error.code, expected, "non-member {name}: {error:?}");
         }
     }
     ProjectMemberRepo::add_member(
@@ -112,7 +115,10 @@ async fn project_and_task_tools_enforce_visibility_and_member_roles() {
             )
             .await;
             if *write {
-                assert_eq!(result.unwrap_err().code, -32003, "viewer {name}");
+                // Catalog admission (-32001) or the referenced Project's role
+                // (-32003); both are the `policy_denied` outcome.
+                let code = result.unwrap_err().code;
+                assert!(matches!(code, -32001 | -32003), "viewer {name}: {code}");
             } else {
                 assert!(result.is_ok(), "viewer {name}: {result:?}");
             }
