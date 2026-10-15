@@ -456,9 +456,11 @@ async fn run_command_group(
     }
     .map_err(|error| error.to_string())?;
     command.env("FORGE_CI_REPORT_DIR", reports.path());
-    let root = task_root.as_ref().map_or(path, |root| root.path());
-    let mut stdout = failures::Stream::new(limit, root, &env);
-    let mut stderr = failures::Stream::new(limit, root, &env);
+    let roots: Vec<&Path> = std::iter::once(path)
+        .chain(task_root.as_ref().map(|root| root.path()))
+        .collect();
+    let mut stdout = failures::Stream::new(limit, &roots, &env);
+    let mut stderr = failures::Stream::new(limit, &roots, &env);
     let per_command = spec
         .timeout_seconds
         .and_then(|s| start.checked_add(Duration::from_secs(s)));
@@ -512,8 +514,8 @@ async fn run_command_group(
     };
     let (stdout, stdout_truncated, mut failures) = stdout.finish();
     let (stderr, stderr_truncated, stderr_failures) = stderr.finish();
-    failures.merge(stderr_failures, root, &env);
-    failures::junit(reports.path(), root, &env, &mut failures);
+    failures.merge(stderr_failures, &roots, &env);
+    failures::junit(reports.path(), &roots, &env, &mut failures);
     let (stdout_tail, stdout_truncated) = redacted(
         &stdout,
         stdout_truncated,

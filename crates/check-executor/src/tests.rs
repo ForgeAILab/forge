@@ -1044,3 +1044,29 @@ async fn junit_reports_are_exported_inside_task_root_and_isolated_per_step() {
             .to_string_lossy()
             .starts_with("ci-reports-")));
 }
+
+#[tokio::test]
+async fn signatures_are_repository_relative_in_a_task_worktree() {
+    // An exact-commit checkout has no Task root and strips its own path; a
+    // Task worktree must name the same test the same way, without the
+    // worktree directory's name.
+    let temp = tempfile::tempdir().unwrap();
+    executors::sandbox::TaskRoot::reserve(temp.path()).unwrap();
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir(&worktree).unwrap();
+    let receipt = run(
+        &worktree,
+        &spec(&format!(
+            "printf 'FAIL {}/src/a.test.ts > parser > empty\\n'; exit 1",
+            worktree.display()
+        )),
+        &[],
+        Duration::from_secs(10),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(
+        receipt.commands[0].failures,
+        ["src/a.test.ts > parser > empty"]
+    );
+}

@@ -50,10 +50,14 @@ pub(crate) struct Failures {
     seen: BTreeSet<String>,
 }
 impl Failures {
+    /// `roots` are absolute prefixes removed from identities, most specific
+    /// first: the command's checkout, then its Task root. A candidate run in
+    /// a Task worktree and an exact-commit run elsewhere then name the same
+    /// test the same way.
     pub fn add(
         &mut self,
         signature: &str,
-        root: &Path,
+        roots: &[&Path],
         env: &std::collections::BTreeMap<String, String>,
     ) {
         // Redact the text as printed: separator and duration normalisation
@@ -61,8 +65,10 @@ impl Failures {
         let signature =
             executors::environment::redact_environment_values(&strip_ansi(signature), env)
                 .replace('\\', "/");
-        let prefix = root.to_string_lossy().replace('\\', "/");
-        let signature = signature.replace(&format!("{}/", prefix.trim_end_matches('/')), "");
+        let signature = roots.iter().fold(signature, |signature, root| {
+            let prefix = root.to_string_lossy().replace('\\', "/");
+            signature.replace(&format!("{}/", prefix.trim_end_matches('/')), "")
+        });
         let signature = DURATION.replace(signature.trim(), "");
         let signature: String = signature
             .split_whitespace()
@@ -84,12 +90,12 @@ impl Failures {
     pub fn merge(
         &mut self,
         other: Self,
-        root: &Path,
+        roots: &[&Path],
         env: &std::collections::BTreeMap<String, String>,
     ) {
         self.truncated |= other.truncated;
         for signature in other.signatures {
-            self.add(&signature, root, env);
+            self.add(&signature, roots, env);
         }
     }
 }
@@ -100,7 +106,7 @@ pub(crate) struct Stream<'a> {
     line: Vec<u8>,
     file: Option<String>,
     limit: usize,
-    root: &'a Path,
+    roots: &'a [&'a Path],
     env: &'a std::collections::BTreeMap<String, String>,
     pub failures: Failures,
     pub truncated: bool,
@@ -108,7 +114,7 @@ pub(crate) struct Stream<'a> {
 impl<'a> Stream<'a> {
     pub fn new(
         limit: usize,
-        root: &'a Path,
+        roots: &'a [&'a Path],
         env: &'a std::collections::BTreeMap<String, String>,
     ) -> Self {
         Self {
@@ -117,7 +123,7 @@ impl<'a> Stream<'a> {
             line: vec![],
             file: None,
             limit,
-            root,
+            roots,
             env,
             failures: Failures::default(),
             truncated: false,
@@ -185,7 +191,7 @@ impl<'a> Stream<'a> {
             None
         };
         if let Some(identity) = identity {
-            self.failures.add(&identity, self.root, self.env);
+            self.failures.add(&identity, self.roots, self.env);
         }
         self.line.clear();
     }
@@ -199,7 +205,7 @@ impl<'a> Stream<'a> {
 /// test identity or alter the command's real exit status. Never follow links.
 pub(crate) fn junit(
     directory: &Path,
-    root: &Path,
+    roots: &[&Path],
     env: &std::collections::BTreeMap<String, String>,
     failures: &mut Failures,
 ) {
@@ -240,13 +246,13 @@ pub(crate) fn junit(
             {
                 continue;
             }
-            parse_junit(&xml, root, env, failures);
+            parse_junit(&xml, roots, env, failures);
         }
     }
 }
 fn parse_junit(
     xml: &str,
-    root: &Path,
+    roots: &[&Path],
     env: &std::collections::BTreeMap<String, String>,
     failures: &mut Failures,
 ) {
@@ -314,7 +320,7 @@ fn parse_junit(
                 {
                     let (_, identity, failed) = case.take().unwrap();
                     if failed {
-                        parsed.add(&identity, root, env);
+                        parsed.add(&identity, roots, env);
                     }
                 }
             }
@@ -323,7 +329,7 @@ fn parse_junit(
             _ => {}
         }
     }
-    failures.merge(parsed, root, env);
+    failures.merge(parsed, roots, env);
 }
 
 #[cfg(test)]
@@ -333,7 +339,8 @@ mod tests {
 
     fn extract(text: &str) -> Vec<String> {
         let env = BTreeMap::new();
-        let mut stream = Stream::new(64, Path::new("/task"), &env);
+        let roots = [Path::new("/task")];
+        let mut stream = Stream::new(64, &roots, &env);
         // Pipe boundaries can cut a Unicode character or ANSI sequence.
         for chunk in text.as_bytes().chunks(7) {
             stream.push(chunk);
@@ -387,7 +394,7 @@ mod tests {
     #[test]
     fn signature_normalisation_deduplicates_caps_and_redacts() {
         let env = BTreeMap::from([("TOKEN".into(), "private-value".into())]);
-        let root = Path::new("/absolute/task");
+        let root: &[&Path] = &[Path::new("/absolute/task")];
         let mut failures = Failures::default();
         failures.add(
             "\x1b[31m/absolute/task/repo/a.test.ts > case (12.34s)\x1b[0m",
@@ -418,8 +425,8 @@ mod tests {
             ("TOKEN".into(), "tok-15s".into()),
         ]);
         let mut failures = Failures::default();
-        failures.add(r"test login with pa\ss", Path::new("/task"), &env);
-        failures.add("test uses tok-15s", Path::new("/task"), &env);
+        failures.add(r"test login with pa\ss", &[Path::new("/task")], &env);
+        failures.add("test uses tok-15s", &[Path::new("/task")], &env);
         assert_eq!(
             failures.signatures,
             ["test login with [REDACTED]", "test uses [REDACTED]"]
@@ -431,7 +438,7 @@ mod tests {
         let mut failures = Failures::default();
         parse_junit(
             include_str!("fixtures/junit.xml"),
-            Path::new("/task"),
+            &[Path::new("/task")],
             &env,
             &mut failures,
         );
@@ -444,7 +451,7 @@ mod tests {
         );
         parse_junit(
             r#"<testsuites><testsuite><testcase name="pass"/><testcase name="skip"><skipped/></testcase><testcase classname="suite" name="猫 &amp; dog"><error/></testcase></testsuite></testsuites>"#,
-            Path::new("/task"),
+            &[Path::new("/task")],
             &env,
             &mut failures,
         );
@@ -452,7 +459,7 @@ mod tests {
         let previous = failures.signatures.clone();
         parse_junit(
             r#"<testsuite><testcase name="bad"><failure/></testcase>"#,
-            Path::new("/task"),
+            &[Path::new("/task")],
             &env,
             &mut failures,
         );
@@ -461,7 +468,8 @@ mod tests {
     #[test]
     fn ansi_strip_handles_csi_osc_and_split_sequences_before_tail_budget() {
         let env = BTreeMap::new();
-        let mut stream = Stream::new(19, Path::new("/task"), &env);
+        let roots = [Path::new("/task")];
+        let mut stream = Stream::new(19, &roots, &env);
         let text = "\x1b]8;;https://example.test\x1b\\\x1b[31m4 failed\x1b[39m | \x1b[32m316 passed\x1b[39m\x1b]8;;\x07";
         for chunk in text.as_bytes().chunks(1) {
             stream.push(chunk);
