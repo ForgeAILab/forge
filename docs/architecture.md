@@ -9652,7 +9652,11 @@ unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate
 reject target with a brief headed "No change since review N". A second parks
 `review_needs_owner` with `no change after repair round`. Neither creates a
 Review, starts checks or a reviewer, nor charges Review or gate-rejection
-budgets. Dirty worktrees and changed commits continue through ordinary review.
+budgets. Dirty worktrees and changed commits continue through ordinary review,
+as does an entry whose workspace owner cannot describe the checkout (an away
+daemon): that entry meets the outage with the usual typed review-entry wait.
+The reminder is a `recovery` bridge (verb `repair_no_change`), which the cascade
+worker lets out of a gate that requires owner approval.
 The decision and reminder debit share an authority-fenced checkpoint at reserved
 index -1, before Project hook ordinals, so crash resumption cannot debit twice or
 reconsider an entry whose checks already started. Explicit retry-window resets

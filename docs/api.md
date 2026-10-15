@@ -6155,7 +6155,8 @@ results (`step_results` and `details.ci_steps`) accept optional
 and `false`; empty/false fields are omitted when serialized, including receipts
 from older daemons, with no daemon protocol revision. Signatures identify failing
 cargo, vitest/jest, pytest or Go tests, or failed/errored JUnit cases. They are
-ANSI-free, have durations and absolute Task-root prefixes removed, and are
+ANSI-free, have durations and absolute checkout and Task-root prefixes removed
+(so they are repository-relative), are redacted before normalisation, and are
 bounded to 200 distinct entries of 300 Unicode characters per step. Stored
 `output_tail` and `stderr_tail` are ANSI-free text, each under its existing
 4096-byte budget. The durable result's 256 KiB aggregate budget can further
@@ -6168,7 +6169,8 @@ command, inside the reserved Task root when available, and removed after
 collection. Reports are optional; malformed XML is ignored. Collection reads at
 most 200 directory entries and 4 MiB per file, without following symbolic links.
 CI repair prompts include every failing step, up to 20 signatures per step,
-then `+N more`, alongside that step's output.
+then `+N more`. Step output follows while the prompt's 8 KiB output allowance
+lasts; later steps show their command and signatures only.
 
 After a coder repair, entering review with the same clean HEAD as the latest
 failed Review in the current budget window starts no checks or reviewer and
