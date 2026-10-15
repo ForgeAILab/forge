@@ -66,8 +66,14 @@ async fn unchanged_attempt(ctx: &HookContext, task: &db::Task) -> crate::Result<
     else {
         return Ok(None);
     };
-    let resolved = super::review::resolve_workspace(ctx, &workspace).await?;
-    let state = resolved.backend.describe(&resolved.placement).await?;
+    // An owner that cannot answer (away daemon, timeout, disk wait) proves
+    // nothing: the ordinary entry meets that outage with its typed wait.
+    let Ok(resolved) = super::review::resolve_workspace(ctx, &workspace).await else {
+        return Ok(None);
+    };
+    let Ok(state) = resolved.backend.describe(&resolved.placement).await else {
+        return Ok(None);
+    };
     Ok(
         (!state.dirty && state.head_sha.as_deref() == Some(judged.as_str()))
             .then_some(review.attempt_number),

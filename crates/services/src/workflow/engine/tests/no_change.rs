@@ -269,6 +269,114 @@ async fn no_change_send_back_leaves_an_owner_approval_review_gate() {
     assert_eq!(spending(&f).await, (1, 1, 1));
 }
 
+/// The workspace owner is away while `away` is set: `describe` is refused.
+struct AwayOwner(
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<dyn crate::workspace_backend::WorkspaceBackend>,
+);
+#[async_trait::async_trait]
+impl crate::workspace_backend::WorkspaceBackend for AwayOwner {
+    async fn prepare(
+        &self,
+        p: &db::WorkspacePlacement,
+        s: &crate::workspace_backend::PrepareSpec,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::PreparedWorkspace> {
+        self.1.prepare(p, s).await
+    }
+    async fn describe(
+        &self,
+        p: &db::WorkspacePlacement,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::WorkspaceState> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(
+                crate::workspace_backend::WorkspaceBackendError::OwnerUnreachable {
+                    daemon_id: "away-owner".into(),
+                },
+            );
+        }
+        self.1.describe(p).await
+    }
+    async fn run(
+        &self,
+        p: &db::WorkspacePlacement,
+        s: &crate::workspace_backend::RunSpec,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::RunResult> {
+        self.1.run(p, s).await
+    }
+    async fn diff(
+        &self,
+        p: &db::WorkspacePlacement,
+        s: &crate::workspace_backend::DiffSpec,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::Diff> {
+        self.1.diff(p, s).await
+    }
+    async fn read(
+        &self,
+        p: &db::WorkspacePlacement,
+        path: &str,
+        limit: u64,
+    ) -> crate::workspace_backend::Result<Vec<u8>> {
+        self.1.read(p, path, limit).await
+    }
+    async fn reset(
+        &self,
+        p: &db::WorkspacePlacement,
+        s: &crate::workspace_backend::ResetSpec,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::PreparedWorkspace> {
+        self.1.reset(p, s).await
+    }
+    async fn cleanup(
+        &self,
+        p: &db::WorkspacePlacement,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::CleanupAck> {
+        self.1.cleanup(p).await
+    }
+    async fn harvest_outbox(
+        &self,
+        p: &db::WorkspacePlacement,
+        execution: &str,
+    ) -> crate::workspace_backend::Result<crate::workspace_backend::OutboxHarvest> {
+        self.1.harvest_outbox(p, execution).await
+    }
+    async fn consume_outbox(
+        &self,
+        p: &db::WorkspacePlacement,
+        execution: &str,
+    ) -> crate::workspace_backend::Result<()> {
+        self.1.consume_outbox(p, execution).await
+    }
+}
+
+#[tokio::test]
+async fn no_change_away_owner_keeps_the_typed_review_entry_wait() {
+    // An unreachable owner decides nothing at the guard: the entry meets the
+    // outage where every review entry does and waits as a typed interruption,
+    // instead of failing its hooks phase once the step's retries run out.
+    let mut f = red_fixture().await;
+    repair(&f).await;
+    let owner = f
+        .engine
+        .workspace_backend_router
+        .resolve(&f.db, &f.workspace)
+        .await
+        .unwrap()
+        .backend;
+    let away = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    f.engine.workspace_backend_router = Arc::new(
+        crate::workspace_backend::WorkspaceBackendRouter::new(Arc::new(AwayOwner(
+            away.clone(),
+            owner,
+        ))),
+    );
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "review");
+    let annotation: serde_json::Value =
+        serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 0));
+}
+
 #[tokio::test]
 async fn no_change_owner_started_entry_after_repair_is_exempt() {
     let f = red_fixture().await;
