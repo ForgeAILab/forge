@@ -525,10 +525,16 @@ pub async fn get_agent_handoff(
     let handoff = AgentHandoffRepo::get_agent_handoff(&*state.db, &handoff_id)
         .await?
         .ok_or_else(|| ApiError::not_found("agent_handoff", handoff_id.clone()))?;
+    // A handoff into a Chat the caller cannot reach reads like an unknown
+    // handoff, never as that Chat's own 404.
     let target = state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &handoff.target_chat_id)
-        .await?;
+        .await
+        .map_err(|error| {
+            ApiError::from(error)
+                .mask_not_found(ApiError::not_found("agent_handoff", handoff_id.clone()))
+        })?;
     if target.project_id.as_deref() != Some(project_id.as_str()) {
         return Err(ApiError::not_found("agent_handoff", handoff_id));
     }

@@ -1227,3 +1227,59 @@ async fn sse_delivers_project_events_only_to_subscribers_who_can_see_the_project
     let viewer_frames = sse_until(&mut viewer, "marker-two").await;
     assert!(viewer_frames.contains("private-log-line"), "{viewer_frames}");
 }
+
+/// A handoff addressed through a visible Project but targeting another
+/// account's Chat must read exactly like an unknown handoff id.
+#[tokio::test]
+async fn handoff_into_a_hidden_chat_reads_like_an_unknown_handoff() {
+    let f = Fixture::new().await;
+    let (status, foreign_project) = f
+        .request(
+            Method::POST,
+            "/api/v1/projects",
+            Some(json!({"name":"Foreign"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_project}");
+    let pool = f.harness.state.db.pool();
+    let chat_of = |project_id: String| async move {
+        sqlx::query_scalar::<_, String>("SELECT id FROM agent_chat WHERE project_id = ?")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await
+            .expect("Project Chat exists")
+    };
+    let source = chat_of(f.project.id.clone()).await;
+    let target = chat_of(foreign_project["id"].as_str().unwrap().to_owned()).await;
+    let now = db::now_rfc3339();
+    sqlx::query("INSERT INTO agent_handoff (id, source_chat_id, target_chat_id, content, correlation_id, dedupe_key, created_at, updated_at) VALUES ('hidden-handoff', ?, ?, 'Private brief', 'authz', 'authz-handoff', ?, ?)")
+        .bind(&source)
+        .bind(&target)
+        .bind(&now)
+        .bind(&now)
+        .execute(pool)
+        .await
+        .unwrap();
+    let owner = common::test_jwt();
+    let foreign = f
+        .request(
+            Method::GET,
+            "/api/v1/projects/{project}/agent-handoffs/hidden-handoff",
+            None,
+            &owner,
+        )
+        .await;
+    let unknown = f
+        .request(
+            Method::GET,
+            "/api/v1/projects/{project}/agent-handoffs/missing-handoff",
+            None,
+            &owner,
+        )
+        .await;
+    assert_eq!(foreign.0, StatusCode::NOT_FOUND, "{}", foreign.1);
+    assert_eq!(foreign.0, unknown.0);
+    assert_eq!(foreign.1["code"], unknown.1["code"]);
+    assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
+}
