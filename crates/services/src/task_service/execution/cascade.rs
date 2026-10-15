@@ -3225,6 +3225,10 @@ fn execution_failure_reason(execution: &Execution) -> String {
 
 /// Upper bound on the reviewer's Markdown carried into its Task comment.
 const REVIEW_COMMENT_REPORT_LIMIT: usize = 2 * 1024;
+/// Upper bound on the comment's checklist lines; later findings are named
+/// by id only. Comments are read back into agent prompts.
+const REVIEW_COMMENT_FINDINGS_LIMIT: usize = 8 * 1024;
+const REVIEW_COMMENT_SUMMARY_CHARS: usize = 200;
 
 /// Render the reviewer's Task comment: a `Review <outcome> (attempt N)`
 /// headline, the ledger after this attempt, optional verify facts, and the
@@ -3259,11 +3263,21 @@ fn reviewer_comment(
         ),
         _ => format!("Review updated (attempt {attempt_number})"),
     };
-    for entry in ledger {
-        use api_types::{ReviewFindingSource as Source, ReviewFindingStatus as Status};
+    use api_types::{ReviewFindingSource as Source, ReviewFindingStatus as Status};
+    // Open findings first, then resolved, then unconfirmed, each in id order,
+    // so the size limit drops the least actionable lines.
+    let mut entries: Vec<_> = ledger.iter().collect();
+    entries.sort_by_key(|entry| match entry.status {
+        Status::Open => 0,
+        Status::Resolved => 1,
+        Status::Unconfirmed => 2,
+    });
+    let mut listed = 0;
+    let mut overflow = Vec::new();
+    for entry in entries {
         // A line ending inside finding text would start a forged list item.
         let id = one_line(&entry.id);
-        let summary = one_line(&entry.summary);
+        let summary = clip_chars(&one_line(&entry.summary), REVIEW_COMMENT_SUMMARY_CHARS);
         let line = match entry.status {
             Status::Open if entry.first_attempt == attempt_number => format!(
                 "- [ ] {id} New: {summary} — open since attempt {}",
@@ -3283,8 +3297,19 @@ fn reviewer_comment(
             ),
             Status::Unconfirmed => format!("- {id} {summary} — not re-checked"),
         };
-        out.push('\n');
-        out.push_str(&line);
+        if overflow.is_empty() && listed + line.len() < REVIEW_COMMENT_FINDINGS_LIMIT {
+            listed += line.len() + 1;
+            out.push('\n');
+            out.push_str(&line);
+        } else {
+            overflow.push(id);
+        }
+    }
+    if !overflow.is_empty() {
+        out.push_str(&format!(
+            "\n\nAlso in the ledger (see the Review tab): {}",
+            overflow.join(", ")
+        ));
     }
     let report = conformance
         .assessment
@@ -3368,6 +3393,13 @@ fn repair_round_comment(
         entry.status == Status::Resolved && entry.last_checked_attempt == attempt
     });
     format!("Repair round {attempt} ({budget} budget {spent} of {limit}): {open} open; {resolved} resolved since the last round.")
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 /// Text on one Markdown line: CommonMark ends a line at a bare `\r` too.
@@ -3627,7 +3659,7 @@ mod reviewer_message_tests {
             resolved: Vec::new(),
         });
         let text = reviewer_comment(ReviewStatus::Failed, 2, &result, &ledger, None);
-        assert_eq!(text, "Review failed (attempt 2): blocking finding\n- [ ] F1 Issue F1 — open since attempt 1\n- [x] F2 Issue F2 — resolved\n- F3 Issue F3 — not re-checked\n- [ ] F4 New: Issue F4 — open since attempt 2\n- [x] CI-1 Issue CI-1 — passing now\n\nFull review: Review tab, attempt 2");
+        assert_eq!(text, "Review failed (attempt 2): blocking finding\n- [ ] F1 Issue F1 — open since attempt 1\n- [ ] F4 New: Issue F4 — open since attempt 2\n- [x] F2 Issue F2 — resolved\n- [x] CI-1 Issue CI-1 — passing now\n- F3 Issue F3 — not re-checked\n\nFull review: Review tab, attempt 2");
         assert!(!text.contains("FULL REPORT"));
         assert!(!text.contains("Verify:"));
     }
@@ -3779,5 +3811,35 @@ mod reviewer_message_tests {
         assert_eq!(open_code_fence("```rust\nx\n````\n"), None);
         assert_eq!(open_code_fence("````\nx\n```\n"), Some("````"));
         assert_eq!(open_code_fence("~~~\nx\n```\n"), Some("~~~"));
+    }
+
+    #[test]
+    fn reviewer_comment_stays_bounded_with_two_hundred_findings() {
+        use api_types::ReviewFindingStatus as Status;
+        let ledger: Vec<_> = (1..=200)
+            .map(|n| {
+                let mut entry = comment_finding(
+                    &format!("F{n}"),
+                    if n > 150 {
+                        Status::Open
+                    } else {
+                        Status::Resolved
+                    },
+                );
+                entry.summary = "界".repeat(1000);
+                entry
+            })
+            .collect();
+        let text = reviewer_comment(ReviewStatus::Failed, 2, &conformance(None), &ledger, None);
+        assert!(text.len() < 12 * 1024, "{} bytes", text.len());
+        // Open findings are listed first, and every id is still named.
+        assert!(text.contains("\n- [ ] F151 "));
+        let words: std::collections::BTreeSet<_> =
+            text.split(|ch: char| !ch.is_ascii_alphanumeric()).collect();
+        for n in 1..=200 {
+            assert!(words.contains(format!("F{n}").as_str()), "F{n} missing");
+        }
+        assert!(text.contains("Also in the ledger (see the Review tab): "));
+        assert!(text.ends_with("Full review: Review tab, attempt 2"));
     }
 }

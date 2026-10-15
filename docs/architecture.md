@@ -8251,7 +8251,10 @@ any API cap (`F2` before `F10`); the complete projection still reserves all ids.
 Task review comments now use this same projection after the settled attempt:
 headline, GFM checklist, optional recorded verify summary, then a Review-tab
 pointer. Open findings are unchecked, resolved findings checked, and unconfirmed
-findings say "not re-checked" without a checkbox. The full report stays with the
+findings say "not re-checked" without a checkbox, listed in that order. Each line
+is one line of text (summary clipped to 200 characters); the lines stop at 8 KiB
+and the remaining ids follow on one "Also in the ledger" line, because comments
+are read back into agent prompts. The full report stays with the
 Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
 Review-entry CI failures post the same result comment even without a reviewer.
 Repair-round system comments name the review budget and open/resolved ids; owner
