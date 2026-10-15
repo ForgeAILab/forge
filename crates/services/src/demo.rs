@@ -2,7 +2,8 @@ use crate::Result;
 use db::{
     new_uuid_v4, now_rfc3339, AgentListQuery, AgentRepo, AgentStatus, CreateAgent, CreateProject,
     CreateRepo, CreateTask, DaemonRepo, DaemonStatus, PageRequest, Project, ProjectRepo, Repo,
-    RepoRepo, SortBy, SortOrder, SqliteDb, TaskRepo, UpdateDaemonReport, UpdateTask, UpsertDaemon,
+    RepoRepo, SortBy, SortOrder, SqliteDb, SystemSettingRepo, TaskRepo, UpdateDaemonReport,
+    UpdateTask, UpsertDaemon, UserRepo,
 };
 
 struct DemoTask {
@@ -140,6 +141,7 @@ async fn find_or_create_demo_project(db: &SqliteDb, now: &str) -> Result<Project
         return Ok(project);
     }
 
+    let owner_id = demo_project_owner(db).await?;
     ProjectRepo::create(
         db,
         CreateProject {
@@ -148,13 +150,45 @@ async fn find_or_create_demo_project(db: &SqliteDb, now: &str) -> Result<Project
             settings: "{}".to_owned(),
             workflow_definition: "{}".to_owned(),
             primary_repo_id: None,
-            owner_id: None,
+            owner_id,
             created_at: now.to_owned(),
             updated_at: now.to_owned(),
         },
     )
     .await
     .map_err(Into::into)
+}
+
+/// Before anyone registers, the Demo Project starts ownerless and the first
+/// registration claims it (`AuthService` bootstrap). Once bootstrap has run
+/// nothing claims it any more, so it belongs to the earliest administrator:
+/// seeding never creates a new ownerless Project, which every signed-in user
+/// could see and change.
+async fn demo_project_owner(db: &SqliteDb) -> Result<Option<String>> {
+    if SystemSettingRepo::get_setting(db, "bootstrap_completed")
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let users = UserRepo::list_users(
+        db,
+        PageRequest {
+            sort_by: SortBy::CreatedAt,
+            ..page_request()
+        },
+    )
+    .await?;
+    users
+        .items
+        .into_iter()
+        .find(|user| user.is_admin)
+        .map(|user| Some(user.id))
+        .ok_or_else(|| {
+            crate::ServiceError::invalid_operation(
+                "demo data needs an administrator account to own the Demo Project",
+            )
+        })
 }
 
 async fn find_or_create_demo_repo(db: &SqliteDb, project_id: &str, now: &str) -> Result<Repo> {
@@ -392,6 +426,29 @@ mod tests {
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         SqliteDb::new(pool)
+    }
+
+    /// A `--demo` start after the first registration must not create a new
+    /// ownerless Project: the earliest administrator owns it.
+    #[tokio::test]
+    async fn demo_project_created_after_bootstrap_is_owned_by_the_administrator() {
+        let db = std::sync::Arc::new(test_db().await);
+        let auth = crate::auth_service::AuthService::new(
+            std::sync::Arc::clone(&db),
+            b"test-secret".to_vec(),
+            4,
+        );
+        let user = auth
+            .register("first@example.com", "password123", None)
+            .await
+            .expect("first user registers");
+        install_demo_data(&db).await.expect("install succeeds");
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_id FROM project WHERE name = 'Demo'")
+                .fetch_one(db.pool())
+                .await
+                .expect("demo project exists");
+        assert_eq!(owner.as_deref(), Some(user.id.as_str()));
     }
 
     #[tokio::test]
