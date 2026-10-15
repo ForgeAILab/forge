@@ -1046,3 +1046,71 @@ async fn hook_test_hides_a_foreign_task_behind_the_unknown_task_404() {
     assert_eq!(foreign.1["code"], unknown.1["code"]);
     assert_eq!(foreign.1["details"]["entity"], unknown.1["details"]["entity"]);
 }
+
+/// A board move names neighbor Task ids. A neighbor in a Project the caller
+/// cannot see must get the same answer as an unknown id.
+#[tokio::test]
+async fn task_move_does_not_confirm_a_foreign_neighbor_id() {
+    let f = Fixture::new().await;
+    let (status, foreign_project) = f
+        .request(
+            Method::POST,
+            "/api/v1/projects",
+            Some(json!({"name":"Foreign"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_project}");
+    let (status, foreign_task) = f
+        .request(
+            Method::POST,
+            &format!(
+                "/api/v1/projects/{}/tasks",
+                foreign_project["id"].as_str().unwrap()
+            ),
+            Some(json!({"title":"Foreign task"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{foreign_task}");
+    let owner = common::test_jwt();
+    let (status, board) = f
+        .request(
+            Method::GET,
+            "/api/v1/projects/{project}/tasks",
+            None,
+            &owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{board}");
+    let mv = |neighbor: String| {
+        f.request(
+            Method::POST,
+            "/api/v1/tasks/{task}/move",
+            Some(json!({
+                "operation_id": db::new_uuid_v4(),
+                "task_version": f.task.version,
+                "board_revision": board["board_revision"],
+                "target_status": f.task.status,
+                "before_id": neighbor,
+            })),
+            &owner,
+        )
+    };
+    let foreign_id = foreign_task["id"].as_str().unwrap().to_owned();
+    let foreign = mv(foreign_id.clone()).await;
+    let unknown = mv("missing-task".to_owned()).await;
+    assert!(
+        unknown.1["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("neighbor task")),
+        "the move reaches the neighbor check: {}",
+        unknown.1
+    );
+    assert_eq!(foreign.0, unknown.0, "{} vs {}", foreign.1, unknown.1);
+    assert_eq!(foreign.1["code"], unknown.1["code"]);
+    assert_eq!(
+        foreign.1["message"].as_str().unwrap().replace(&foreign_id, "ID"),
+        unknown.1["message"].as_str().unwrap().replace("missing-task", "ID")
+    );
+}

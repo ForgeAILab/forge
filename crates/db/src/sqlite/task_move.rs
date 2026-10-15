@@ -443,8 +443,10 @@ async fn load_neighbor(
     .ok_or_else(|| DbError::InvalidTaskMove(format!("neighbor task {neighbor_id} was not found")))?;
     let task = map_task(row)?;
     if task.project_id != input.project_id {
+        // The same answer as an unknown id: a neighbor in another Project
+        // must not confirm that the id exists.
         return Err(DbError::InvalidTaskMove(format!(
-            "neighbor task {neighbor_id} belongs to another project"
+            "neighbor task {neighbor_id} was not found"
         )));
     }
     if !input
