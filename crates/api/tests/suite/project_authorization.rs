@@ -946,3 +946,61 @@ async fn explicit_viewer_role_is_read_only_even_for_the_recorded_creator() {
         StatusCode::FORBIDDEN
     );
 }
+
+/// A legacy ownerless Project is visible to every signed-in user, and each of
+/// them keeps owner rights on it: Task writes and Project settings alike.
+#[tokio::test]
+async fn ownerless_project_keeps_owner_rights_for_every_signed_in_user() {
+    let f = Fixture::new().await;
+    let now = db::now_rfc3339();
+    let project_id = db::new_uuid_v4();
+    db::ProjectRepo::create(
+        &*f.harness.state.db,
+        db::CreateProject {
+            id: project_id.clone(),
+            name: "Legacy".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    for bearer in [f.other_token.clone(), common::test_jwt()] {
+        let (status, task) = f
+            .request(
+                Method::POST,
+                &format!("/api/v1/projects/{project_id}/tasks"),
+                Some(json!({"title":"Legacy task"})),
+                &bearer,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "task create: {task}");
+        let (status, response) = f
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/tasks/{}", task["id"].as_str().unwrap()),
+                Some(json!({"title":"Edited","version":task["version"]})),
+                &bearer,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "task edit: {response}");
+        let project = db::ProjectRepo::get_by_id(&*f.harness.state.db, &project_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (status, response) = f
+            .request(
+                Method::PATCH,
+                &format!("/api/v1/projects/{project_id}"),
+                Some(json!({"name":"Legacy edited","version":project.version})),
+                &bearer,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "project settings: {response}");
+    }
+}
+

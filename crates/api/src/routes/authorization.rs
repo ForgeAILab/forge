@@ -30,16 +30,20 @@ pub(crate) async fn require_project_access(
     if access == ProjectAccess::Read {
         return Ok(project);
     }
+    // A legacy ownerless Project is visible to every signed-in user
+    // (`PROJECT_VISIBLE_TO_USER`), and every one of them keeps owner rights on
+    // it. No creation path makes one; they come from rows written before
+    // Projects had owners.
+    let Some(owner_id) = project.owner_id.as_deref() else {
+        return Ok(project);
+    };
     let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id).await?;
-    let allowed = member.map_or(
-        project.owner_id.as_deref() == Some(user_id),
-        |member| match access {
-            ProjectAccess::Read => true,
-            ProjectAccess::Write => matches!(member.role.as_str(), "owner" | "admin" | "member"),
-            ProjectAccess::Admin => matches!(member.role.as_str(), "owner" | "admin"),
-            ProjectAccess::Owner => member.role == "owner",
-        },
-    );
+    let allowed = member.map_or(owner_id == user_id, |member| match access {
+        ProjectAccess::Read => true,
+        ProjectAccess::Write => matches!(member.role.as_str(), "owner" | "admin" | "member"),
+        ProjectAccess::Admin => matches!(member.role.as_str(), "owner" | "admin"),
+        ProjectAccess::Owner => member.role == "owner",
+    });
     if !allowed {
         let message = match access {
             ProjectAccess::Read => unreachable!(),
