@@ -114,7 +114,7 @@ pub async fn stream_events(
             {
                 return None;
             }
-            Some(Item::Event(event))
+            Some(Item::Event(Box::new(event)))
         }
         Err(error) => Some(Item::Frame(resync_frame(&error.to_string(), None))),
     });
@@ -133,7 +133,7 @@ pub async fn stream_events(
                     Item::Frame(frame) => Some(Ok(frame)),
                     Item::Event(event) => {
                         if audience.lock().await.admits(&event).await {
-                            frame(event).map(Ok)
+                            frame(*event).map(Ok)
                         } else {
                             None
                         }
@@ -152,7 +152,7 @@ pub async fn stream_events(
 /// A stream item before the subscriber filter: an event still to be judged,
 /// or a transport frame (resync) every subscriber receives.
 enum Item {
-    Event(events::ForgeEvent),
+    Event(Box<events::ForgeEvent>),
     Frame(Event),
 }
 
@@ -476,7 +476,9 @@ fn replay_events(db: Arc<SqliteDb>, replay: Replay) -> impl tokio_stream::Stream
                     let after = event.sequence;
                     remaining -= 1;
                     Some((
-                        Item::Event(services::DomainEventService::committed_frame(&event)),
+                        Item::Event(Box::new(services::DomainEventService::committed_frame(
+                            &event,
+                        ))),
                         (db, Replay::Events { after, through }, pending, remaining),
                     ))
                 }
