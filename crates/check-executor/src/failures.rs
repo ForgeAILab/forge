@@ -24,17 +24,37 @@ impl Ansi {
     pub(crate) fn strip(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut plain = Vec::with_capacity(bytes.len());
         for &byte in bytes {
+            // A line never continues an escape: a stray or unterminated
+            // introducer must not swallow the lines (and failures) after it.
+            if matches!(byte, b'\n' | b'\r') {
+                self.state = 0;
+                plain.push(byte);
+                continue;
+            }
+            // CAN and SUB abort any sequence.
+            if self.state != 0 && matches!(byte, 0x18 | 0x1a) {
+                self.state = 0;
+                continue;
+            }
+            // ESC inside a string is ST before '\\', else a new escape.
+            if self.state == 4 {
+                if byte == b'\\' {
+                    self.state = 0;
+                    continue;
+                }
+                self.state = 1;
+            }
             match (self.state, byte) {
                 (0, 0x1b) => self.state = 1,
                 (0, _) => plain.push(byte),
                 (1, b'[') => self.state = 2,
                 (1, b']' | b'P' | b'X' | b'^' | b'_') => self.state = 3,
                 (1, 0x20..=0x2f) => {}
+                (1 | 2, 0x1b) => self.state = 1,
                 (1, _) => self.state = 0,
                 (2, 0x40..=0x7e) => self.state = 0,
-                (3, 7) | (4, b'\\') => self.state = 0,
+                (3, 7) => self.state = 0,
                 (3, 0x1b) => self.state = 4,
-                (4, _) => self.state = 3,
                 _ => {}
             }
         }
@@ -519,6 +539,16 @@ mod tests {
         assert_eq!(String::from_utf8(tail).unwrap(), "failed | 316 passed");
         assert!(truncated);
         assert_eq!(strip_ansi(text), "4 failed | 316 passed");
+    }
+    #[test]
+    fn a_malformed_escape_never_swallows_the_following_lines() {
+        // Unterminated OSC title, an OSC cut short by a CSI, a stray ESC
+        // before a newline: the failure lines after each still count.
+        assert_eq!(
+            extract("\x1b]0;title\ntest a ... FAILED\n\x1b]8;;u\x1b[31mtest b ... FAILED\x1b[0m\nx\x1b\ntest c ... FAILED\n"),
+            ["a", "b", "c"]
+        );
+        assert_eq!(strip_ansi("\x1b]0;title\nkept"), "\nkept");
     }
     #[test]
     fn unknown_runner_has_no_signature_and_unterminated_failure_is_kept() {
