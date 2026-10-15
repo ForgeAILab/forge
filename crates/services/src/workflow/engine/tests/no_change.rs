@@ -424,8 +424,8 @@ async fn no_change_latest_pass_on_the_same_commit_reviews_normally() {
 #[tokio::test]
 async fn no_change_pre_gate_entry_checkpoint_resumes_without_a_reminder() {
     use db::TaskStepRepo;
-    // Old entries can retain either their entry checkpoint or their recorded
-    // wait. Neither had a reserved gate checkpoint when admitted.
+    // Old entries retain a settled entry checkpoint, or the open checkpoint of
+    // an entry hook that waited. Neither had a reserved gate checkpoint.
     for checkpoint_only in [true, false] {
         let f = red_fixture().await;
         repair(&f).await;
@@ -459,17 +459,17 @@ async fn no_change_pre_gate_entry_checkpoint_resumes_without_a_reminder() {
         assert_eq!(step.kind, "hooks");
         sqlx::query("UPDATE task_step SET payload_json=json_remove(payload_json,'$.entry_origin') WHERE id=?")
             .bind(&step.id).execute(f.db.pool()).await.unwrap();
+        let index = f
+            .workflow
+            .states
+            .iter()
+            .find(|s| s.name == "in_progress")
+            .unwrap()
+            .hooks
+            .on_exit
+            .len() as i64;
+        f.db.start_hook(&step, index).await.unwrap();
         if checkpoint_only {
-            let index = f
-                .workflow
-                .states
-                .iter()
-                .find(|s| s.name == "in_progress")
-                .unwrap()
-                .hooks
-                .on_exit
-                .len() as i64;
-            f.db.start_hook(&step, index).await.unwrap();
             f.db.finish_hook(
                 &step,
                 index,
@@ -507,6 +507,79 @@ async fn no_change_pre_gate_entry_checkpoint_resumes_without_a_reminder() {
         .unwrap();
         assert_eq!(decision, "\"Continue\"");
     }
+}
+
+#[tokio::test]
+async fn no_change_exit_hook_wait_does_not_skip_the_gate() {
+    use db::TaskStepRepo;
+    let mut f = red_fixture().await;
+    let exit_hook = f
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .hooks
+        .before_enter[0]
+        .clone();
+    f.workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "in_progress")
+        .unwrap()
+        .hooks
+        .on_exit
+        .push(exit_hook);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    f.engine
+        .workflow_execution()
+        .transition_with_authority(
+            &task.id,
+            "review",
+            task.version,
+            &f.workflow,
+            &workflow_actor(),
+            "repair entry",
+            false,
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let step =
+        f.db.claim_step(
+            "exit-wait-worker",
+            Some(&task.id),
+            &(chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    // The exit hook opened its checkpoint and waited for disk. The woken
+    // step keeps that wait recorded; it was not an entry past the guard.
+    f.db.start_hook(&step, 0).await.unwrap();
+    f.db.suspend_hook_step(&step, &now_rfc3339(), "disk")
+        .await
+        .unwrap();
+    f.db.wake_suspended_hooks(&task.id, "disk").await.unwrap();
+    drain(f.engine.clone(), &task.id).await;
+    let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, "in_progress");
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(check_runs(&f).await, 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
 }
 
 #[tokio::test]

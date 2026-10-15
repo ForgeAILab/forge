@@ -17,7 +17,7 @@ Neither case charges the review budget. A re-review the owner starts is exempt.
 - **THEN** the entry runs normal review without a reminder or no-change budget charge
 
 #### Scenario: Entry suspended before the gate shipped
-- **WHEN** an entry resumes with entry checkpoints or `awaited_consumer_id` but no recorded gate decision
+- **WHEN** an entry resumes with entry checkpoints (including a suspended entry hook's open checkpoint) but no recorded gate decision
 - **THEN** it records `Continue` and resumes normal entry without evaluating the gate
 
 #### Scenario: Repair entry retries after reconnect

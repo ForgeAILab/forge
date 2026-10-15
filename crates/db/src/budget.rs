@@ -125,7 +125,7 @@ pub async fn failed_review_for_no_change(
 
 /// Start the guard, retaining the decision of an entry already in progress when
 /// the guard shipped. Exit hooks precede the guard, so only entry checkpoints
-/// (or a recorded check wait) prove that it is too late to evaluate it.
+/// prove that it is too late to evaluate it.
 pub async fn start_repair_no_change(
     db: &SqliteDb,
     step: &crate::TaskStep,
@@ -144,13 +144,15 @@ pub async fn start_repair_no_change(
     let recorded = match recorded {
         Some(recorded) => Some(recorded),
         None => {
+            // Every hook, also one that suspended for a check or for disk,
+            // opened its checkpoint first. A recorded wait alone is no proof:
+            // a waking step keeps `awaited_consumer_id`, including after an
+            // exit hook's wait that precedes the guard.
             let started: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND hook_index>=?)
-                 OR EXISTS(SELECT 1 FROM task_step WHERE id=? AND awaited_consumer_id IS NOT NULL)",
+                "SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND hook_index>=?)",
             )
             .bind(&step.id)
             .bind(first_entry_index)
-            .bind(&step.id)
             .fetch_one(&mut *tx)
             .await?;
             started.then(|| serde_json::to_string(&RepairNoChangeDecision::Continue).unwrap())

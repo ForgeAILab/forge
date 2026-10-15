@@ -9698,8 +9698,9 @@ The decision and reminder debit share an authority-fenced checkpoint at reserved
 index -1, before Project hook ordinals, so crash resumption cannot debit twice or
 reconsider an entry whose checks already started. A suspended entry admitted
 before the guard shipped has no reserved decision: existing entry checkpoints
-or `awaited_consumer_id` make it record `Continue` without inspecting Git. Exit
-checkpoints alone do not skip the guard. Explicit retry-window resets
+(a suspended hook opened its own first) make it record `Continue` without
+inspecting Git. Exit checkpoints, and a wait recorded by an exit hook, do not
+skip the guard. Explicit retry-window resets
 reset this allowance with Review; ordinary review laps do not.
 
 `run_ci_steps` no longer runs commands. In its hooks step it

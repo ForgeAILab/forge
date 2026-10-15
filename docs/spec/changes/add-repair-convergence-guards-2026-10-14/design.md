@@ -172,8 +172,10 @@ Non-Goals:
   `no change after repair round`.
 - A later passing Review of the same commit means no reminder is due.
 - Owner-initiated re-reviews are exempt.
-- Entries already past the guard when it ships continue: entry checkpoints or
-  a recorded `awaited_consumer_id`, without a guard decision, record `Continue`.
+- Entries already past the guard when it ships continue: entry checkpoints
+  without a guard decision record `Continue`. A recorded `awaited_consumer_id`
+  is no proof (an exit hook's wait keeps it too); a suspended entry hook has
+  its own open checkpoint.
 - Same-state retries after an offline entry carry the original source state and
   actor in the hooks payload, so reconnect still evaluates a repair entry as a
   repair and retains owner exemptions. A reminder clears the resolved entry's
