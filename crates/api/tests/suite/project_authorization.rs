@@ -1335,3 +1335,32 @@ async fn owner_only_escalation_and_admin_only_location_reads_hide_the_project() 
         assert_eq!(status, expected, "owner {path}: {body}");
     }
 }
+
+/// A Project Chat of a Project the caller cannot see reads like an unknown
+/// Chat id and never names its Project.
+#[tokio::test]
+async fn hidden_project_chat_reads_like_an_unknown_chat() {
+    let f = Fixture::new().await;
+    let chat_id: String =
+        sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
+            .bind(&f.project.id)
+            .fetch_one(f.harness.state.db.pool())
+            .await
+            .expect("Project Chat exists");
+    for path in ["/api/v1/agent-chats/{chat}", "/api/v1/agent-chats/{chat}/messages"] {
+        let hidden = f
+            .request(Method::GET, &path.replace("{chat}", &chat_id), None, &f.other_token)
+            .await;
+        let unknown = f
+            .request(Method::GET, &path.replace("{chat}", "missing-chat"), None, &f.other_token)
+            .await;
+        assert_eq!(hidden.0, StatusCode::NOT_FOUND, "{path}: {}", hidden.1);
+        assert_eq!(hidden.1["code"], unknown.1["code"], "{path}");
+        assert_eq!(
+            hidden.1["details"]["entity"], unknown.1["details"]["entity"],
+            "{path}: {}",
+            hidden.1
+        );
+        assert!(!hidden.1.to_string().contains(&f.project.id), "{}", hidden.1);
+    }
+}

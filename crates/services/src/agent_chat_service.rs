@@ -1174,8 +1174,16 @@ where
                     .project_id
                     .as_deref()
                     .ok_or_else(|| ServiceError::not_found("agent_chat", chat.id.clone()))?;
+                // A Chat of a Project the caller is not a member of reads like
+                // an unknown Chat: the error never names that Project.
                 self.require_project_member(actor_user_id, project_id)
-                    .await?;
+                    .await
+                    .map_err(|error| match error {
+                        ServiceError::NotFound { .. } => {
+                            ServiceError::not_found("agent_chat", chat.id.clone())
+                        }
+                        other => other,
+                    })?;
             }
             _ => return Err(ServiceError::not_found("agent_chat", chat.id.clone())),
         }
