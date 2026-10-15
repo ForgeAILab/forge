@@ -1739,7 +1739,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Changed
 
 - Check failure signatures recognise cargo-nextest binary/test identities,
-  omitting durations, progress counters and repeated stdout or summary output.
+  omitting durations, progress counters and repeated stdout or summary output,
+  including timed-out, signalled and retried tests (final attempt only). A jest
+  suite with any JS/TS file name opens a jest block, and jest's slow-suite run
+  time is not part of the identity.
 
 - Stored check output and stderr tails strip ANSI escape codes before applying
   the text budget.

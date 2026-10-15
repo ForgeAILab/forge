@@ -8993,8 +8993,13 @@ feed line extractors before tail truncation; streaming ANSI removal precedes the
 text budget. Cargo test and nextest, vitest/jest, pytest and Go failures become
 normalised identities (up to 200 per command, 300 Unicode characters each, deduplicated).
 Vitest/jest failure glyphs (`×`, `✗`, `●`) count only within a recognised
-runner block; a summary closes that block. Nextest identities combine the binary
-and test name, omitting durations, progress counters and repeated stdout/stderr.
+runner block; a summary closes that block. A jest `FAIL <file>` line opens one
+for any JS/TS file (the test-name pattern is configurable), without jest's
+slow-suite run time. Nextest identities combine the binary and test name,
+omitting durations, progress counters and repeated stdout/stderr; failed,
+timed-out and signalled tests count, and under retries only the final attempt.
+They differ from plain `cargo test` identities (no binary), which is safe
+because triage compares runs of the same step command.
 Each command gets an isolated `FORGE_CI_REPORT_DIR` under the reserved Task root
 (or an owner temporary directory when no Task root exists); failed and errored
 JUnit cases in XML reports there contribute identities before the directory is

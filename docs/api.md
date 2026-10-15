@@ -6211,8 +6211,10 @@ bounded to 200 distinct entries of 300 Unicode characters per step. Stored
 truncate signature lists after shrinking tails; `failures_truncated` reports it.
 Unknown runners retain empty signatures and ordinary step-level failure output.
 The glyphs `×`, `✗` and `●` identify failures only inside recognised vitest/jest
-output blocks, ending at their summary. Nextest signatures include the binary
-and test name, without durations or progress counters.
+output blocks, ending at their summary; a jest `FAIL <file>` line opens one for
+any JS/TS file. Nextest signatures include the binary and test name, without
+durations or progress counters, for failed, timed-out and signalled tests (the
+final attempt under retries).
 
 Forge exports `FORGE_CI_REPORT_DIR` to each check command. Write `*.xml` JUnit
 reports there (subdirectories are accepted). The directory is isolated per

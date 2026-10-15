@@ -65,8 +65,8 @@ Non-Goals:
   | Runner | Lines matched |
   |---|---|
   | cargo test | `test <path> ... FAILED` |
-  | cargo nextest | `FAIL [ <duration>] <binary> <test>` (optional progress counter); binary and test form the identity |
-  | vitest/jest | `FAIL <file> > <suite> > <test>` and `×`/`✗`/`●` lines inside recognised runner blocks |
+  | cargo nextest | `FAIL [ <duration>] <binary> <test>` (optional progress counter; also `TIMEOUT`, `SIG*`, and final `TRY n` attempts with `ABRT`/`TMT`); binary and test form the identity |
+  | vitest/jest | `FAIL <file> > <suite> > <test>` and `×`/`✗`/`●` lines inside recognised runner blocks; `FAIL <any JS/TS file>` opens a jest block |
   | pytest | `FAILED <file>::<test>` |
   | go test | `--- FAIL: <Test>` |
 

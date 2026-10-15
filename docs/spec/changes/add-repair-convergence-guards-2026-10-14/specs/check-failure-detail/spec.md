@@ -3,7 +3,7 @@
 ### Requirement: Check steps report failing tests
 The check executor SHALL extract failure signatures from each step's full output while the step runs. It strips ANSI codes first and recognises:
 - cargo test (`test <path> ... FAILED`);
-- cargo nextest (`FAIL [ <duration>] <binary> <test>`, optionally with a progress counter);
+- cargo nextest (`FAIL [ <duration>] <binary> <test>`, optionally with a progress counter, and the timed-out, signalled and final retried statuses);
 - vitest and jest (`FAIL <file> > <suite> > <test>`, and failure glyphs only inside a recognised runner block, ending at its summary);
 - pytest (`FAILED <file>::<test>`);
 - go test (`--- FAIL: <Test>`);
