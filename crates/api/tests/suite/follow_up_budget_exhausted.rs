@@ -389,6 +389,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
             {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
+                common::commit_repair_round(&ctx.worktree_path, call_index);
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
                     after_sha: None,
@@ -414,6 +415,9 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
             }
 
             let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
+            if call_index > 0 {
+                common::commit_repair_round(&ctx.worktree_path, call_index);
+            }
             let session_id = if call_index == 0 {
                 FIRST_EXECUTOR_SESSION_ID.to_owned()
             } else {

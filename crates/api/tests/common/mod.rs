@@ -778,6 +778,31 @@ where
     serde_json::from_slice(&bytes).expect("parse JSON response")
 }
 
+/// What a fake coder's repair round leaves behind: a new commit. A round that
+/// addressed review feedback changes the candidate; an unchanged one is sent
+/// back by the no-change guard without a Review.
+pub fn commit_repair_round(worktree: &str, round: usize) {
+    let path = Path::new(worktree);
+    std::fs::write(
+        path.join(format!("repair-{round}.txt")),
+        format!("repair round {round}\n"),
+    )
+    .expect("repair file writes");
+    run_git(path, &["add", "-A"]);
+    run_git(
+        path,
+        &[
+            "-c",
+            "user.name=Forge Test",
+            "-c",
+            "user.email=test@forge.dev",
+            "commit",
+            "-m",
+            &format!("repair round {round}"),
+        ],
+    );
+}
+
 fn run_git(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
