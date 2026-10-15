@@ -1,7 +1,4 @@
-use db::{
-    budget::{self, Kind},
-    create_sqlite_pool, run_migrations, run_migrations_from,
-};
+use db::{budget, create_sqlite_pool, run_migrations, run_migrations_from};
 use serde_json::json;
 use sqlx::Row;
 
@@ -104,6 +101,7 @@ async fn upgrade_preserves_remaining_for_every_persisted_kind() {
         .await
         .unwrap();
     run_migrations(&pool).await.unwrap();
+    let upgraded: std::collections::BTreeSet<&str> = before.keys().copied().collect();
     for (kind, remaining) in before {
         let limit = match kind {
             "gate:review" => 1,
@@ -169,9 +167,15 @@ async fn upgrade_preserves_remaining_for_every_persisted_kind() {
     let barrier: serde_json::Value = serde_json::from_str(row.get("entry_barrier_json")).unwrap();
     assert_eq!(barrier["started_at"], "episode");
     assert!(barrier.get("infrastructure_attempts").is_none());
+    // The upgrade writes a row for every kind that existed when it ran; kinds
+    // added later (such as `repair_no_change`) start without one.
+    let loaded = budget::load(&pool, "t").await.unwrap();
     assert_eq!(
-        budget::load(&pool, "t").await.unwrap().len(),
-        Kind::PERSISTED.len() + 3
+        loaded
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        upgraded
     );
     let history: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transition_log")
         .fetch_one(&pool)
