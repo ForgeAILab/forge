@@ -5,8 +5,6 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { isTransientApiError } from '@/lib/api-error'
 import type { ReviewFindingEntry } from '@/types/generated/bindings/ReviewFindingEntry'
 
-const findingIdOrder = new Intl.Collator('en', { numeric: true })
-
 export function FindingDetails({
   finding,
 }: {
@@ -39,9 +37,8 @@ export function FindingDetails({
 
 export function ReviewFindingsLedger({ taskId }: { taskId: string }) {
   const findings = useTaskFindingsQuery(taskId)
-  const entries = [...(findings.data?.items ?? [])].sort((a, b) =>
-    findingIdOrder.compare(a.id, b.id),
-  )
+  // The server orders ids naturally before its cap; one order everywhere.
+  const entries = findings.data?.items ?? []
   return (
     <section
       aria-label="Finding ledger"

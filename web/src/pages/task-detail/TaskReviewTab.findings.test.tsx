@@ -136,9 +136,17 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks())
 
 describe('Review tab finding ledger', () => {
-  it('reads /findings and sorts F2 before F10 with expandable evidence text', async () => {
+  it('reads /findings in the server order with expandable evidence text', async () => {
+    // The API's natural order (byte order between digit runs) is the only
+    // order: a locale collator would move V-alpha before V-Zeta here.
     vi.mocked(apiFetch).mockResolvedValue({
-      items: [entry('F10'), entry('F2'), entry('F1', 'resolved')],
+      items: [
+        entry('F1', 'resolved'),
+        entry('F2'),
+        entry('F10'),
+        entry('V-Zeta'),
+        entry('V-alpha'),
+      ],
       window_started_at: review.created_at,
       review_attempts: 3,
     })
@@ -150,6 +158,8 @@ describe('Review tab finding ledger', () => {
       'F1',
       'F2',
       'F10',
+      'V-Zeta',
+      'V-alpha',
     ])
     expect(rows[1].textContent).toContain('reviewerblockingopen3')
     fireEvent.click(within(rows[1]).getByText('Finding details'))
