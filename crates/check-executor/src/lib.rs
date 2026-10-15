@@ -514,7 +514,7 @@ async fn run_command_group(
     };
     let (stdout, stdout_truncated, mut failures) = stdout.finish();
     let (stderr, stderr_truncated, stderr_failures) = stderr.finish();
-    failures.merge(stderr_failures, &roots, &env);
+    failures.merge(stderr_failures);
     failures::junit(reports.path(), &roots, &env, &mut failures);
     let (stdout_tail, stdout_truncated) = redacted(
         &stdout,

@@ -87,15 +87,21 @@ impl Failures {
         self.seen.insert(signature.clone());
         self.signatures.push(signature);
     }
-    pub fn merge(
-        &mut self,
-        other: Self,
-        roots: &[&Path],
-        env: &std::collections::BTreeMap<String, String>,
-    ) {
+    /// `other` holds identities [`Self::add`] already normalised; a second
+    /// pass would cut another duration-like suffix, so a test reported on
+    /// stderr or in a JUnit file would get a different identity than on stdout.
+    pub fn merge(&mut self, other: Self) {
         self.truncated |= other.truncated;
         for signature in other.signatures {
-            self.add(&signature, roots, env);
+            if self.seen.contains(&signature) {
+                continue;
+            }
+            if self.signatures.len() == MAX_FAILURES {
+                self.truncated = true;
+                return;
+            }
+            self.seen.insert(signature.clone());
+            self.signatures.push(signature);
         }
     }
 }
@@ -329,7 +335,7 @@ fn parse_junit(
             _ => {}
         }
     }
-    failures.merge(parsed, roots, env);
+    failures.merge(parsed);
 }
 
 #[cfg(test)]
@@ -431,6 +437,17 @@ mod tests {
             failures.signatures,
             ["test login with [REDACTED]", "test uses [REDACTED]"]
         );
+    }
+    #[test]
+    fn merged_identities_are_not_normalised_twice() {
+        let env = BTreeMap::new();
+        let roots = [Path::new("/task")];
+        let mut stderr = Failures::default();
+        stderr.add("api > retries after 5 s 12ms", &roots, &env);
+        assert_eq!(stderr.signatures, ["api > retries after 5 s"]);
+        let mut all = Failures::default();
+        all.merge(stderr);
+        assert_eq!(all.signatures, ["api > retries after 5 s"]);
     }
     #[test]
     fn junit_captured_report_and_errors_skip_passes_and_malformed_xml() {
