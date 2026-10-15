@@ -380,7 +380,21 @@ manifest list but could not pull it on the ARM64 server: the image was built
 for amd64 only. That run did not verify a running demo container or the
 TestSprite suite.
 
-<!-- ORCHESTRATOR: arm64 run result -->
+The ARM64 path then ran end to end (`DEMO_PLATFORM=linux/arm64`): the image
+was built on `ubuntu-24.04-arm`, `compose.stop` and `compose.deploy` were
+accepted, Dokploy pulled the image without a registry credential, the
+container seeded itself and turned healthy, and the public URL served the
+run's build id and `/healthz` to the workflow. The TestSprite step ran and
+reported that the project had no tests yet.
+
+**Cloudflare in front of the demo.** If the demo host name is proxied by
+Cloudflare, Bot Fight Mode answers requests from cloud address ranges (GitHub
+runners, TestSprite's browsers) with a challenge page (`403`,
+`cf-mitigated: challenge`) on every page except static files. The workflow
+then waits until its timeout: `/demo-build.txt` answers, `/healthz` does not.
+Bot Fight Mode cannot exempt one host name on the free plan: turn it off for
+the zone (Security → Settings → Bot traffic), or serve the demo from a host
+name that Cloudflare does not proxy.
 
 The following remain unverified:
 
