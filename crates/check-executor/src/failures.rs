@@ -17,10 +17,11 @@ static DURATION: LazyLock<Regex> = LazyLock::new(|| {
 static NEXTEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^FAIL\s+\[\s*\d+(?:\.\d+)?s\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(.+)$").unwrap()
 });
-static JS_TEST_FILE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:\.(?:test|spec)\.[cm]?[jt]sx?|(?:^|/)__tests__/\S+\.[cm]?[jt]sx?)(?:\s|$)")
-        .unwrap()
-});
+/// A JS/TS source path. jest `testRegex`/`testMatch` and vitest `include` are
+/// configurable (NestJS names e2e suites `*.e2e-spec.ts`), so a test-name
+/// convention cannot decide whether a `FAIL <file>` line opens a runner block.
+static JS_SOURCE_FILE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.[cm]?[jt]sx?(?:\s|$)").unwrap());
 static VITEST_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:RUN|DEV)\s+v\d+\.").unwrap());
 
@@ -240,7 +241,7 @@ impl<'a> Stream<'a> {
             if test.contains(" > ") {
                 Some(test.to_owned())
             } else {
-                if JS_TEST_FILE.is_match(test) {
+                if JS_SOURCE_FILE.is_match(test) {
                     self.runner = Runner::JavaScript;
                     self.file = Some(test.to_owned());
                 }
@@ -266,7 +267,7 @@ impl<'a> Stream<'a> {
             if let Some(file) = line
                 .strip_prefix('❯')
                 .and_then(|s| s.trim().split_once(" ("))
-                .filter(|(file, summary)| JS_TEST_FILE.is_match(file) && summary.contains("test"))
+                .filter(|(file, summary)| JS_SOURCE_FILE.is_match(file) && summary.contains("test"))
             {
                 self.runner = Runner::JavaScript;
                 self.file = Some(file.0.to_owned());
@@ -636,5 +637,19 @@ mod tests {
         assert_eq!(extract(&changed_durations), expected);
         assert_eq!(extract("FAIL [ 0.123s] crate::module test_name\n--- STDOUT: crate::module test_name ---\ntest test_name ... FAILED\nSUMMARY [ 0.123s] 1 test run: 1 failed\nFAIL [ 0.123s] crate::module test_name\n"), ["crate::module > test_name"]);
         assert_eq!(extract("Nextest run ID captured\nSummary [ 0.123s] 1 test run: 1 passed\ntest other_runner::failure ... FAILED\n"), ["other_runner::failure"]);
+    }
+
+    #[test]
+    fn jest_suites_outside_the_default_test_name_pattern_keep_their_failures() {
+        // Captured from jest 30 with `"testRegex": ".e2e-spec.js$"`.
+        let captured = "FAIL test/app.e2e-spec.js\n  \u{25cf} AppController (e2e) \u{203a} / (GET)\n\n    expect(received).toBe(expected) // Object.is equality\n\nTest Suites: 1 failed, 1 total\nTests:       1 failed, 1 total\n";
+        assert_eq!(
+            extract(captured),
+            ["test/app.e2e-spec.js > AppController (e2e) > / (GET)"]
+        );
+        assert_eq!(
+            extract(&captured.replace('\n', "\r\n")),
+            ["test/app.e2e-spec.js > AppController (e2e) > / (GET)"]
+        );
     }
 }
