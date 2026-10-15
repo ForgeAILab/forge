@@ -6,4 +6,4 @@ import type { ReviewFindingStatus } from "./ReviewFindingStatus";
 /**
  * Derived state of one finding in the current review-budget window.
  */
-export type ReviewFindingEntry = { id: string, source: ReviewFindingSource, severity: ReviewFindingSeverity, summary: string, where: string | null, expected: string | null, observed: string | null, first_attempt: bigint, last_checked_attempt: bigint, status: ReviewFindingStatus, streak: number, };
+export type ReviewFindingEntry = { id: string, source: ReviewFindingSource, severity: ReviewFindingSeverity, summary: string, where: string | null, expected: string | null, observed: string | null, first_attempt: number, last_checked_attempt: number, status: ReviewFindingStatus, streak: number, };

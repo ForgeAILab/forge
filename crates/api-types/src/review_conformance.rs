@@ -264,7 +264,9 @@ pub struct ReviewFindingEntry {
     pub r#where: Option<String>,
     pub expected: Option<String>,
     pub observed: Option<String>,
+    #[ts(type = "number")]
     pub first_attempt: i64,
+    #[ts(type = "number")]
     pub last_checked_attempt: i64,
     pub status: ReviewFindingStatus,
     pub streak: usize,
@@ -429,6 +431,15 @@ pub fn task_scope_is_read_only(source: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finding_attempts_are_json_numbers_in_typescript() {
+        // The wire carries JSON numbers; a `bigint` binding would not match.
+        let declaration = <ReviewFindingEntry as TS>::decl();
+        for field in ["first_attempt: number", "last_checked_attempt: number"] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+    }
 
     #[test]
     fn stored_assessments_default_finding_routing() {
