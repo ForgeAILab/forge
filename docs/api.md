@@ -6111,7 +6111,9 @@ window. Before a reset the window starts at Task creation; after a recovery
 reset it starts at that reset's transition timestamp. Review attempts created
 at or after that timestamp belong to the window. `review_attempts` counts all
 attempts in it, including running and cancelled attempts. `items` is ordered
-lexically by id and capped at 200 entries after the full ledger is derived.
+naturally by id (`F2` before `F10`, and `CI-2` before `CI-10`) and capped
+at 200 entries after the full ledger is derived and naturally sorted. The cap
+therefore retains the earliest numeric ids within each source prefix.
 Project members with Task read access may use the route; hidden and unknown
 Tasks get the same refusal as `/tasks/{id}/reviews`.
 
@@ -6126,14 +6128,29 @@ Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`), and
 `streak`. Nullable text fields are `null` when unavailable. Reviewer ids are
 `F1`, `F2`, ... in first-seen list order within the window. Known ids continue
-findings; unknown ids become new findings. Forge sources use the stored,
+findings; unknown ids become new findings. A known id repeated within one
+review is one finding: its first occurrence continues it and later duplicates
+are dropped. Forge sources use the stored,
 zero-based `CI-<step index>`, `CHK-<check id>` and `V-<check name>` ids.
+`source: merge` is reserved in the wire type and is not emitted in the ledger.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
 an explicit resolution or passing Forge check resolves it. Reopening a resolved
 or unconfirmed finding starts its streak at one. A reset empties the ledger
 and restarts reviewer numbering. Findings are informational in this phase;
 existing verdict routing and retry budgets remain authoritative.
+
+Finished review comments show the headline, the ledger as a Markdown checklist
+(open unchecked, resolved checked, unconfirmed labelled "not re-checked"), and
+`Full review: Review tab, attempt N`. The full report stays in the Review API and
+Review tab. Reviews without findings retain at most the first 2 KiB of their
+report, truncated on a UTF-8 boundary. CI-only failures get the same checklist.
+Repair and park system comments name the finding ids and current budget or
+parking rule. Result, repair and park comments each use a per-Review idempotency
+key, so replay does not append duplicates. The Review tab reads `/findings`,
+shows source, severity, status and streak with expandable finding details, and
+retains each attempt's input findings and full report. Verify presentation is
+conditional on recorded results; this phase adds no verify execution or config.
 
 Conformance `status` follows from the result and Forge's own checks. A failing
 setup step or required check makes the review `failed` whatever the reviewer

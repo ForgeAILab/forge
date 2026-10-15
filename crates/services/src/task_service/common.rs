@@ -139,6 +139,50 @@ impl TaskService {
         Ok(())
     }
 
+    /// Review output is replayable independently of the Task transition.
+    pub(crate) async fn create_review_comment(
+        &self,
+        review: &Review,
+        kind: &str,
+        agent_id: Option<&str>,
+        content: String,
+    ) -> Result<()> {
+        let author = match agent_id {
+            Some(id) => AgentRepo::get_by_id(&*self.db, id).await?,
+            None => None,
+        };
+        let now = now_rfc3339();
+        let id = new_uuid_v4();
+        let comment = TaskCommentRepo::create_comment(
+            &*self.db,
+            CreateTaskComment {
+                id: id.clone(),
+                task_id: review.task_id.clone(),
+                author_type: if author.is_some() {
+                    CommentAuthorType::Agent
+                } else {
+                    CommentAuthorType::System
+                },
+                author_id: author.as_ref().map(|agent| agent.id.clone()),
+                author_name: author.map_or_else(|| "Forge".to_owned(), |agent| agent.name),
+                content,
+                execution_id: None,
+                role: None,
+                worklog_kind: None,
+                idempotency_key: Some(format!("review:{}:{kind}", review.id)),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await?;
+        // The repository returns the original row on a replay. Only a new
+        // insert publishes an event or enters the memory index.
+        if comment.id == id {
+            self.after_project_hook_comment(&comment).await;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn after_project_hook_comment(&self, comment: &TaskComment) {
         let task_id = &comment.task_id;
         if let Err(error) = self.index_task_comment_memory(task_id, comment).await {
@@ -151,8 +195,8 @@ impl TaskService {
             context: EventContext::CommentCreated {
                 task_id: task_id.to_owned(),
                 comment_id: comment.id.clone(),
-                author_type: "system".to_owned(),
-                author_name: "Forge".to_owned(),
+                author_type: comment.author_type.to_string(),
+                author_name: comment.author_name.clone(),
             },
         });
     }

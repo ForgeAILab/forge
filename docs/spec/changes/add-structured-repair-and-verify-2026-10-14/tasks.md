@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-15T09:11:52Z
+updated_at: 2026-10-15T21:23:01Z
 completed_at:
 ---
 
@@ -31,14 +31,14 @@ suite.
   - a route test for the read and the refusal.
 
 ## 2. Comments and Review tab
-- [ ] 2.1 `reviewer_comment` (`cascade.rs`) renders the headline, the ledger task list, the verify line and the Review-tab pointer. Without findings it keeps the reason plus the first 2 KiB of the report. Update `reviewer_comment_*` unit tests.
-- [ ] 2.2 Repair-round and park system comments, idempotent per Review (`idempotency_key`).
-- [ ] 2.3 Web:
+- [x] 2.1 `reviewer_comment` (`cascade.rs`) renders the headline, the ledger task list, the verify line and the Review-tab pointer. Without findings it keeps the reason plus the first 2 KiB of the report. Update `reviewer_comment_*` unit tests.
+- [x] 2.2 Repair-round and park system comments, idempotent per Review (`idempotency_key`).
+- [x] 2.3 Web:
   - Ledger table in `TaskReviewTab.tsx`.
   - Per-attempt findings and verify block in `ReviewConformancePanel.tsx`.
   - Comment task lists render through the existing `remarkGfm`. Check this in `task-comments-panel.tsx`.
   - Vitest coverage for the ledger table and a park.
-- [ ] 2.4 Focused tests: comment text for failed with findings, failed without findings, and passed with minor findings. Assert that a replayed cascade posts no duplicate comment.
+- [x] 2.4 Focused tests: comment text for failed with findings, failed without findings, and passed with minor findings. Assert that a replayed cascade posts no duplicate comment.
 
 ## 3. Repair brief
 - [ ] 3.1 Add a `RepairBrief` builder in `crates/services/src/workflow/dispatch/`:

@@ -3,6 +3,10 @@ import { describe, expect, it, vi } from 'vitest'
 import type { Review, Task, Offer } from '@/types/generated'
 import { TaskReviewTab } from './TaskReviewTab'
 
+vi.mock('@/api/task-findings', () => ({
+  useTaskFindingsQuery: () => ({ data: { items: [] }, isPending: false, isError: false }),
+}))
+
 vi.mock('@/api/hooks', () => ({
   useTaskAction: () => ({ mutate: vi.fn(), isPending: false }),
   useTaskRelationsQuery: () => ({ data: { subtasks: [] } }),
@@ -36,7 +40,18 @@ describe('Needs owner review', () => {
           related_evidence: [],
           actions,
         },
-        condition: { kind: 'clear', details: { failure_kind: null, diagnostic: null, interruption: null, failed: false, blocked: false, human_wait: false, entry_wait: false } },
+        condition: {
+          kind: 'clear',
+          details: {
+            failure_kind: null,
+            diagnostic: null,
+            interruption: null,
+            failed: false,
+            blocked: false,
+            human_wait: false,
+            entry_wait: false,
+          },
+        },
       } as unknown as Task
       const review: Review = {
         id: 'review-1',

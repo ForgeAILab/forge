@@ -8242,7 +8242,22 @@ that omits an open finding makes it unconfirmed, while passing Forge checks
 resolve their own findings. The re-review prompt carries the prior ledger's
 open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. This projection does not
-change verdict routing, budgets, or Task comments.
+change verdict routing or budgets. Findings are naturally ordered by id before
+any API cap (`F2` before `F10`); the complete projection still reserves all ids.
+
+Task review comments now use this same projection after the settled attempt:
+headline, GFM checklist, optional recorded verify summary, then a Review-tab
+pointer. Open findings are unchecked, resolved findings checked, and unconfirmed
+findings say "not re-checked" without a checkbox. The full report stays with the
+Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
+Review-entry CI failures post the same result comment even without a reviewer.
+Repair-round system comments name the review budget and open/resolved ids; owner
+parks name the rule and open ids. Each result, repair and park comment has a
+separate Review-derived `idempotency_key`, using the existing comment repository
+transaction to suppress replay duplicates. The web Review tab reads the ledger
+above the latest attempt and keeps per-attempt findings and the full report in
+history. Verify rendering is conditional on recorded data; verify execution and
+progress-round policy are later phases.
 
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and

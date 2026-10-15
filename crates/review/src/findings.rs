@@ -9,7 +9,7 @@ use api_types::{
 use db::Review;
 use serde_json::Value;
 
-/// Derive every finding, ordered lexically by id. The API's 200-item limit is
+/// Derive every finding, ordered naturally by id. The API's 200-item limit is
 /// applied only after derivation, so hidden entries still reserve their ids.
 pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntry>, String> {
     let mut reviews: Vec<_> = window_reviews.iter().collect();
@@ -182,7 +182,42 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             }
         }
     }
-    Ok(ledger.into_values().collect())
+    let mut entries: Vec<_> = ledger.into_values().collect();
+    entries.sort_by(|a, b| compare_finding_ids(&a.id, &b.id));
+    Ok(entries)
+}
+
+/// Compare numeric runs by value without a fixed-width integer conversion.
+/// This also orders source ids such as CI-2 before CI-10.
+pub fn compare_finding_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a_bytes, b_bytes) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a_bytes[i].is_ascii_digit() && b_bytes[j].is_ascii_digit() {
+            let (start_i, start_j) = (i, j);
+            while i < a.len() && a_bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b_bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let left = a[start_i..i].trim_start_matches('0');
+            let right = b[start_j..j].trim_start_matches('0');
+            let order = left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let order = a_bytes[i].cmp(&b_bytes[j]);
+            if order != Ordering::Equal {
+                return order;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
 }
 
 fn open(
@@ -466,5 +501,43 @@ mod tests {
         assert_eq!(ledger[0].streak, 1);
         assert!(ledger[0].observed.as_ref().unwrap().len() <= 4096);
         assert!(finding_ledger(&[super::tests::review(2, json!({"ci_steps":"bad"}))]).is_err());
+    }
+    #[test]
+    fn finding_ledger_orders_numeric_id_runs_naturally_before_any_cap() {
+        let findings: Vec<_> = (1..=50)
+            .map(|n| json!({"summary":format!("finding {n}")}))
+            .collect();
+        let ledger = finding_ledger(&[reviewer(1, json!(findings), json!([]))]).unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            (1..=50).map(|n| format!("F{n}")).collect::<Vec<_>>()
+        );
+        let mut ids = [
+            "V-case10",
+            "F10",
+            "CI-10",
+            "CHK-step:10",
+            "CI-2",
+            "F2",
+            "V-case2",
+            "CHK-step:2",
+        ];
+        ids.sort_by(|a, b| compare_finding_ids(a, b));
+        assert_eq!(
+            ids,
+            [
+                "CHK-step:2",
+                "CHK-step:10",
+                "CI-2",
+                "CI-10",
+                "F2",
+                "F10",
+                "V-case2",
+                "V-case10"
+            ]
+        );
     }
 }

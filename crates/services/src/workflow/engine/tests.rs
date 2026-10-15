@@ -5267,3 +5267,71 @@ async fn cancelled_review_entry_cap_exhaustion_parks() {
     }
     assert_eq!(outcomes, vec!["bounce", "bounce", "block"]);
 }
+
+#[tokio::test]
+async fn review_comments_ci_only_failure_and_routing_replay_are_idempotent() {
+    for budget in [1, 3] {
+        let fixture = failed_ci_fixture(budget, FailurePolicy::Block).await;
+        let result = fixture
+            .engine
+            .workflow_execution()
+            .transition_with_authority(
+                &fixture.task.id,
+                "review",
+                fixture.task.version,
+                &fixture.workflow,
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
+                "review comment coverage",
+                false,
+                fixture.workflow_authority().await,
+            )
+            .await
+            .unwrap();
+        let result = drain_result(fixture.engine.clone(), result).await;
+        let review = result.review.unwrap();
+        fixture
+            .engine
+            .publish_finished_review_comment(&review, None)
+            .await
+            .unwrap();
+        fixture
+            .engine
+            .publish_finished_review_comment(&review, None)
+            .await
+            .unwrap();
+        let comments = db::TaskCommentRepo::list_comments(
+            &*fixture.db,
+            &fixture.task.id,
+            db::PageRequest {
+                cursor: None,
+                limit: 100,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Asc,
+                include_total: false,
+            },
+        )
+        .await
+        .unwrap()
+        .items;
+        let results: Vec<_> = comments
+            .iter()
+            .filter(|comment| comment.content.starts_with("Review failed (attempt"))
+            .collect();
+        assert_eq!(results.len(), 1, "{comments:?}");
+        assert!(results[0].content.contains("- [ ] CI-0 New:"));
+        assert!(results[0]
+            .content
+            .contains("Full review: Review tab, attempt 1"));
+        let prefix = if budget == 1 {
+            "Task parked after review"
+        } else {
+            "Repair round"
+        };
+        let routing: Vec<_> = comments
+            .iter()
+            .filter(|comment| comment.content.starts_with(prefix))
+            .collect();
+        assert_eq!(routing.len(), 1, "{comments:?}");
+        assert!(routing[0].content.contains("CI-0"));
+    }
+}

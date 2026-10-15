@@ -1726,3 +1726,43 @@ async fn findings_read_caps_the_full_ledger_after_id_ordering() {
         ids
     );
 }
+
+#[tokio::test]
+async fn findings_read_caps_after_natural_id_ordering() {
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    f.role(Some("viewer")).await;
+    let now = db::now_rfc3339();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)")
+        .bind(&candidate).bind(&f.task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    for attempt in 1..=5 {
+        db::ReviewRepo::create(db,db::CreateReview {
+            id: db::new_uuid_v4(),task_id:f.task.id.clone(),execution_id:candidate.clone(),
+            attempt_number:attempt,status:db::ReviewStatus::Failed,
+            step_results_json:json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"many","findings":(0..50).map(|n|json!({"summary":format!("{attempt}-{n}")})).collect::<Vec<_>>()}}}).to_string(),
+            started_at:now.clone(),created_at:now.clone(),updated_at:now.clone(),
+        }).await.unwrap();
+    }
+    let (status, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: api_types::TaskFindingsResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.review_attempts, 5);
+    assert_eq!(response.items.len(), 200);
+    let ids = (1..=200).map(|n| format!("F{n}")).collect::<Vec<_>>();
+    assert_eq!(
+        response
+            .items
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>(),
+        ids
+    );
+}

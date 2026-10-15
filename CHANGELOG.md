@@ -1738,6 +1738,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Review comments show the finding checklist and drop the full report. Read the
+  full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
+  findings retain a 2 KiB excerpt. CI-only failures now get review comments, and
+  repair/park system comments name findings once per Review. The Review tab
+  displays the current ledger and per-attempt findings. Finding IDs now sort
+  naturally before the API's 200-entry cap (`F2` before `F10`).
+
 - **The runtime composition root and five agents modules moved to the new
   `services-agents` crate (developer-only).** `ForgeRuntime`,
   `ForgeRuntimeBuilder`, `RuntimeSupervisor`, `RuntimeAssemblyMode` and

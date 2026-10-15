@@ -9791,3 +9791,107 @@ async fn execution_budget_is_not_refunded_by_a_review_lap() {
     );
     assert_eq!(db::budget::remaining(3, 2), 1);
 }
+
+async fn review_comment_contents(db: &SqliteDb, task_id: &str) -> Vec<String> {
+    TaskCommentRepo::list_comments(
+        db,
+        task_id,
+        PageRequest {
+            cursor: None,
+            limit: 100,
+            sort_by: SortBy::CreatedAt,
+            sort_order: SortOrder::Asc,
+            include_total: false,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+    .into_iter()
+    .map(|comment| comment.content)
+    .collect()
+}
+
+#[tokio::test]
+async fn review_comments_cascade_replay_posts_one_result_and_repair() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(&db, &service, &execution,
+        "Full report stays in the Review tab.\n{\"result\":\"fail\",\"reason\":\"empty input crashes\",\"findings\":[{\"summary\":\"Empty input crashes\"}]}").await;
+    for _ in 0..2 {
+        service
+            .maybe_cascade_executor_completion(&execution.id)
+            .await
+            .unwrap();
+    }
+    let comments = review_comment_contents(&db, &task.id).await;
+    let results: Vec<_> = comments
+        .iter()
+        .filter(|text| text.starts_with("Review failed (attempt"))
+        .collect();
+    assert_eq!(results.len(), 1, "{comments:?}");
+    assert!(results[0].contains("- [ ] F1 New: Empty input crashes"));
+    assert!(results[0].contains("Full review: Review tab, attempt 1"));
+    assert!(!results[0].contains("Full report stays"));
+    let repairs: Vec<_> = comments
+        .iter()
+        .filter(|text| text.starts_with("Repair round"))
+        .collect();
+    assert_eq!(repairs.len(), 1, "{comments:?}");
+    assert!(repairs[0].contains("review budget 1 of 3"));
+    assert!(repairs[0].contains("F1 open; none resolved"));
+}
+
+#[tokio::test]
+async fn review_comments_park_and_system_comments_are_idempotent_per_review() {
+    let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
+    complete_review_with(&db, &service, &execution,
+        r#"{"result":"fail","reason":"credentials required","fixable_by":"owner","findings":[{"summary":"Credentials required"}]}"#).await;
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|review| review.attempt_number)
+        .unwrap();
+    // Exercise the actual durable-key path as well as the cascade's terminal guard.
+    let (first, second) = tokio::join!(
+        service.publish_review_park_comment(&review, "fixable by owner: credentials required"),
+        service.publish_review_park_comment(&review, "fixable by owner: credentials required"),
+    );
+    first.unwrap();
+    second.unwrap();
+    service
+        .publish_review_repair_comment(&review, 1, 2)
+        .await
+        .unwrap();
+    service
+        .publish_review_repair_comment(&review, 1, 2)
+        .await
+        .unwrap();
+    let comments = review_comment_contents(&db, &task.id).await;
+    assert_eq!(
+        comments
+            .iter()
+            .filter(|text| text.starts_with("Review failed (attempt"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        comments
+            .iter()
+            .filter(|text| text.starts_with("Repair round"))
+            .count(),
+        1
+    );
+    let parks: Vec<_> = comments
+        .iter()
+        .filter(|text| text.starts_with("Task parked after review"))
+        .collect();
+    assert_eq!(parks.len(), 1, "{comments:?}");
+    assert!(parks[0].contains("fixable by owner"));
+    assert!(parks[0].contains("Open findings: F1"));
+    assert!(parks[0].contains("Owner actions:"));
+}

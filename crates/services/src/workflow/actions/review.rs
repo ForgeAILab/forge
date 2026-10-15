@@ -261,6 +261,17 @@ impl HookAction for RunCiSteps {
         };
         // An earlier delivery of this step already wrote the CI result.
         if let Some(settled) = settled_ci_result(&review) {
+            if review.status == ReviewStatus::Failed {
+                if let Err(error) = ctx
+                    .task_service
+                    .publish_finished_review_comment(&review, None)
+                    .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+            }
             return settled;
         }
         // The settlement below is fenced on the authority this hook asked
@@ -533,6 +544,15 @@ impl HookAction for RunCiSteps {
                 tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
             }
             publish_review_failed(ctx, &review, failed_step_index);
+            if let Err(error) = ctx
+                .task_service
+                .publish_finished_review_comment(&review, None)
+                .await
+            {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                };
+            }
             if had_review_passed && ctx.triggered_by.is_user() {
                 let reason = "merge-fix follow-up failed: ci";
                 if let Err(error) = block_task(
@@ -1388,8 +1408,26 @@ impl HookAction for AutoCascadeOnReviewPass {
                             reason: error.to_string(),
                         };
                     }
+                    if let Err(error) = ctx
+                        .task_service
+                        .publish_review_park_comment(&review, reason)
+                        .await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
                     HookResult::Ok
                 } else {
+                    if let Err(error) = ctx
+                        .task_service
+                        .publish_review_repair_comment(&review, existing_count, budget)
+                        .await
+                    {
+                        return HookResult::Failed {
+                            reason: error.to_string(),
+                        };
+                    }
                     HookResult::Cascade {
                         to: default_states::IN_PROGRESS.to_string(),
                         reason: "review failed".to_string(),
