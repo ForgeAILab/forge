@@ -9895,3 +9895,37 @@ async fn review_comments_park_and_system_comments_are_idempotent_per_review() {
     assert!(parks[0].contains("Open findings: F1"));
     assert!(parks[0].contains("Owner actions:"));
 }
+
+#[tokio::test]
+async fn review_comments_reviewer_exit_failure_posts_one_result_on_replay() {
+    let (db, service, task, execution, _repo_dir) =
+        seed_admitted_review_with(r#"{"retry_budgets":{"execution":0,"review":3}}"#).await;
+    sqlx::query("UPDATE execution SET status = 'failed', error = 'reviewer crashed', updated_at = ? WHERE id = ?")
+        .bind(now_rfc3339())
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    // A crash after the result comment, before the executor-failure park:
+    // the duplicate terminal delivery reconciles the settled Review.
+    sqlx::query("UPDATE task SET blocked_json = NULL, error_annotation = NULL, failed_json = NULL WHERE id = ?")
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    let comments = review_comment_contents(&db, &task.id).await;
+    let results: Vec<_> = comments
+        .iter()
+        .filter(|text| text.starts_with("Review failed (attempt 1)"))
+        .collect();
+    assert_eq!(results.len(), 1, "{comments:?}");
+    assert!(results[0].contains("reviewer crashed"), "{comments:?}");
+}

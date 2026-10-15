@@ -2372,9 +2372,12 @@ impl TaskService {
                 failed_step_index: 0,
             },
         });
-        self.publish_reviewer_comment(
-            execution,
-            &task.id,
+        // This is the Review's result comment: a replay that reconciles the
+        // settled Review must find it under the same key.
+        self.create_review_comment(
+            &updated_review,
+            "result",
+            execution.agent_id.as_deref(),
             format!(
                 "Review failed (attempt {}): reviewer execution {}",
                 updated_review.attempt_number, reason
