@@ -141,6 +141,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_broken_outer_findings_block_requests_result_correction() {
+        let broken = r#"Review notes.
+{"result":"fail","findings":[{"summary":"bug","verdict":"pass"}]"#;
+        let prompts = RefCell::new(Vec::new());
+        let output = correct_report(
+            turn(broken, "first"),
+            |text| ::review::contract::parse_assessment(text).err(),
+            |problem, _| {
+                prompts.borrow_mut().push(correction_prompt(&problem));
+                async { Ok(turn(r#"{"result":"fail","reason":"corrected"}"#, "second")) }
+            },
+        )
+        .await;
+        assert_eq!(prompts.borrow().len(), 1);
+        assert!(prompts.borrow()[0].contains("Forge could not read the result"));
+        let parsed = ::review::contract::parse_assessment(&output.text).unwrap();
+        assert_eq!(parsed.result, api_types::ReviewResult::Fail);
+        assert_eq!(parsed.reason, "corrected");
+        assert!(parsed.report.contains(broken));
+    }
+
+    #[tokio::test]
     async fn a_malformed_report_is_corrected_in_the_same_run() {
         let prompts = RefCell::new(Vec::new());
         let output = correct_report(

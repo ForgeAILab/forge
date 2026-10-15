@@ -8201,12 +8201,24 @@ from the previous attempt. The response format is kept
 this small on purpose so any model can review: an earlier contract demanded one
 JSON object with per-requirement dispositions and exact file/commit citations,
 and live reviewers lost whole reviews to an invented extra field or a truncated
-commit SHA. `review::contract::parse_assessment` takes the last JSON object in
-the reply that names a result, ignores unknown keys, accepts `verdict` for
-`result`, and keeps everything else as the Markdown `report`. The hard gate is
+commit SHA. `review::contract::parse_assessment` takes the last standalone JSON
+object in the reply that names a result, ignores unknown keys, accepts `verdict` for
+`result`, and keeps everything else as the Markdown `report`. A malformed outer
+result block owns its nested findings: their `result` or `verdict` keys cannot
+become the verdict. An unreadable reply goes through result correction.
+Re-recording an immutable assessment compares parsed `ReviewConformance`
+values, so explicit and omitted defaults are equivalent without rewriting the
+stored JSON; any content change is still refused. The hard gate is
 Forge's own setup steps and required checks, not the reviewer's citations: a
 failing check fails the review whatever the reviewer said, and a `pass` on a
 Task with no configured checks rests on the reviewer's judgment alone.
+
+Strict persisted Review-detail readers accept Forge's manual-pass object
+`manual_override` and durable carry checkpoint fields `carry_hook_step_id`
+(string) and `carry_hook_index` (nonnegative integer), alongside the CI,
+conformance, auditor, approval and execution fields. They preserve that metadata
+for workflow writes, omit it from public detail responses, and continue to
+refuse unknown top-level keys or malformed values.
 
 The server contract tells the reviewer to verify by exercising the change —
 build it, run its tests, and drive the changed behavior programmatically or

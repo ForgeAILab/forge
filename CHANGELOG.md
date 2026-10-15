@@ -3398,6 +3398,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Task Review and findings reads no longer return HTTP 500 after an owner's
+  manual review pass or a carried review. Readers of persisted details recognize
+  Forge's `manual_override`, `carry_hook_step_id`, and `carry_hook_index`
+  metadata while still refusing unknown fields and malformed values.
+- Replaying a frozen review assessment across an upgrade accepts equivalent
+  explicit or omitted default fields without rewriting its stored JSON.
+- Finding objects inside a broken reviewer result block can no longer supply
+  the review verdict; unreadable replies require result correction.
+
 - An unchanged restart no longer records another setup-required wake decision
   for a Project's open blockers (one or several), or refreshes the timestamps
   of unchanged Attention wake decisions. The startup sweep decides each

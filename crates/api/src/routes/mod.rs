@@ -1470,6 +1470,9 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
             "user_approval",
             "execution",
             "execution_retry",
+            "manual_override",
+            "carry_hook_step_id",
+            "carry_hook_index",
         ]
         .contains(&key.as_str())
         {
@@ -1487,7 +1490,12 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
             )));
         }
     }
-    for key in ["user_approval", "execution", "execution_retry"] {
+    for key in [
+        "user_approval",
+        "execution",
+        "execution_retry",
+        "manual_override",
+    ] {
         if let Some(value) = object.get(key) {
             if !value.is_object() {
                 return Err(serde_json::Error::io(std::io::Error::new(
@@ -1495,6 +1503,27 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
                     format!("persisted review {key} must be an object"),
                 )));
             }
+        }
+    }
+    for (key, valid) in [
+        (
+            "carry_hook_step_id",
+            object
+                .get("carry_hook_step_id")
+                .is_none_or(Value::is_string),
+        ),
+        (
+            "carry_hook_index",
+            object
+                .get("carry_hook_index")
+                .is_none_or(|value| value.as_u64().is_some()),
+        ),
+    ] {
+        if !valid {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid persisted review {key}"),
+            )));
         }
     }
     serde_json::from_value(value)

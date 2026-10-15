@@ -6075,10 +6075,12 @@ The reviewer answers in Markdown and ends its reply with one result block:
 
 `result` is `pass`, `fail`, or `blocked` (the review environment, not the code,
 prevented a verdict — for example a missing toolchain). The block is read
-leniently so any model can produce it: the last JSON object in the reply that
-names a result wins, unknown keys are ignored, `verdict` is accepted for
+leniently so any model can produce it: the last standalone JSON object in the
+reply that names a result wins, unknown keys are ignored, `verdict` is accepted for
 `result`, case does not matter, and a Markdown fence around the block is
-allowed. Optional `fixable_by` is `coder` (default) or `owner`; owner-only
+allowed. Nested objects, including findings inside a malformed result block,
+cannot supply a verdict; an unreadable block requires result correction.
+Optional `fixable_by` is `coder` (default) or `owner`; owner-only
 findings need another OS/hardware, an external service or credential,
 Forge metadata, a scope/product decision, or changed acceptance criteria.
 Optional `repeat` defaults to `false`; `true` means the previous review raised
@@ -6090,6 +6092,9 @@ omitted when they hold their default (`coder`, `false`, empty), so an assessment
 frozen by v0.13.12 (`{result, reason, report}`) reads back byte for byte;
 clients treat a missing `fixable_by` as `coder` and a missing `repeat` as
 `false`. A reply with no readable result block is `unverified`.
+Re-recording a frozen assessment compares its parsed values, including these
+defaults, rather than JSON formatting or optional-field spelling. Identical
+replays preserve the stored bytes; changed assessment content is refused.
 
 The optional `findings` list accepts `summary` (required and nonblank),
 `severity` (`blocking` by default, or `minor`), `where`, `expected`, `observed`,
@@ -6109,6 +6114,12 @@ attempts in it, including running and cancelled attempts. `items` is ordered
 lexically by id and capped at 200 entries after the full ledger is derived.
 Project members with Task read access may use the route; hidden and unknown
 Tasks get the same refusal as `/tasks/{id}/reviews`.
+
+Review and findings reads accept the metadata Forge persists for manual passes
+(`manual_override`, an object) and durable review carry checkpoints
+(`carry_hook_step_id`, a string, and `carry_hook_index`, a nonnegative integer).
+These internal fields do not add response fields. Unknown top-level persisted
+detail keys or malformed metadata still produce a server corruption error.
 
 Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `summary`, `where`, `expected`, `observed`, `first_attempt`,

@@ -600,7 +600,8 @@ impl ReviewConformanceRepo for SqliteDb {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(existing) = existing {
-            if existing != value {
+            if serde_json::from_str::<ReviewConformance>(&existing).map_err(json_error)? != *result
+            {
                 return Err(DbError::Check("assessment is already frozen".into()));
             }
         } else {
