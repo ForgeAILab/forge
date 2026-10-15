@@ -1070,3 +1070,30 @@ async fn signatures_are_repository_relative_in_a_task_worktree() {
         ["src/a.test.ts > parser > empty"]
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_report_directory_that_cannot_be_made_does_not_fail_the_command() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    executors::sandbox::TaskRoot::reserve(temp.path()).unwrap();
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir(&worktree).unwrap();
+    let reserved = temp.path().join(".forge-task");
+    std::fs::set_permissions(&reserved, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let receipt = run(
+        &worktree,
+        &spec("test -z \"$FORGE_CI_REPORT_DIR\""),
+        &[],
+        Duration::from_secs(10),
+        &CancellationToken::new(),
+    )
+    .await;
+    std::fs::set_permissions(&reserved, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        receipt.outcome,
+        CheckExecutionOutcome::Passed,
+        "{receipt:?}"
+    );
+    assert_eq!(receipt.commands[0].exit_code, Some(0));
+}

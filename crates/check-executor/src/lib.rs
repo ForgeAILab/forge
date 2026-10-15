@@ -445,6 +445,8 @@ async fn run_command_group(
         executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
     // An isolated directory prevents one step from inheriting another's reports.
+    // Reports are optional evidence: a directory that cannot be made leaves the
+    // command without one rather than failing it as infrastructure.
     let task_root = executors::sandbox::TaskRoot::of_worktree(path);
     let reports = match &task_root {
         Some(root) => tempfile::Builder::new()
@@ -454,8 +456,10 @@ async fn run_command_group(
             .prefix("forge-ci-reports-")
             .tempdir(),
     }
-    .map_err(|error| error.to_string())?;
-    command.env("FORGE_CI_REPORT_DIR", reports.path());
+    .ok();
+    if let Some(reports) = &reports {
+        command.env("FORGE_CI_REPORT_DIR", reports.path());
+    }
     let roots: Vec<&Path> = std::iter::once(path)
         .chain(task_root.as_ref().map(|root| root.path()))
         .collect();
@@ -515,7 +519,9 @@ async fn run_command_group(
     let (stdout, stdout_truncated, mut failures) = stdout.finish();
     let (stderr, stderr_truncated, stderr_failures) = stderr.finish();
     failures.merge(stderr_failures);
-    failures::junit(reports.path(), &roots, &env, &mut failures);
+    if let Some(reports) = &reports {
+        failures::junit(reports.path(), &roots, &env, &mut failures);
+    }
     let (stdout_tail, stdout_truncated) = redacted(
         &stdout,
         stdout_truncated,
