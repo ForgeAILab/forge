@@ -10,27 +10,46 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
-  memory and coordination records, to the authenticated caller. Enforce member
-  write and owner/admin configuration roles; filter cross-Project Task,
-  notification and coordination lists before limits and counts. Apply the same
-  role checks to authenticated MCP Project/Task tools. The SSE broadcast remains
-  an outstanding authorization gap documented in `docs/api.md`.
+  memory and coordination records, to the authenticated caller. Any signed-in
+  account could previously read, edit, cancel or delete another account's Tasks
+  and change another account's Project settings and shell hooks by id. Enforce
+  member write and owner/admin configuration roles; filter cross-Project Task,
+  notification and coordination lists before limits and counts. MCP tools apply
+  the same roles to the Project their arguments reference.
+- `GET /api/v1/events` (SSE) no longer broadcasts every event to every
+  signed-in account. Live and replayed events of a Project the subscriber cannot
+  see (Task changes, execution logs, dispatched role prompts, reviews, chat
+  activity, committed domain events) are withheld per connection.
+- Ids no longer confirm the existence of objects in other accounts' Projects:
+  a hidden Project Chat answers like an unknown Chat (it used to name its
+  Project id), as do a handoff into a hidden Chat, a hook-test Task id in a
+  hidden Project (was `400` vs `404`) and a board-move neighbor in another
+  Project.
+- `forge --demo` started after the first registration no longer creates an
+  ownerless Demo Project (one every signed-in user could see and change); the
+  earliest administrator owns it.
 
 ### Breaking
 
-- **Project access and mutation roles are now enforced across REST and MCP.**
-  Non-members receive scoped `404` responses on `/projects/{id}` and its
+- **Project access and mutation roles are now enforced across REST, MCP and
+  SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its
   subroutes, `/tasks/{id}` and its subroutes, `/repos/{id}`, `/executions/{id}`,
   `/reviews/{id}`, `/comments/{id}`, `/media/{id}`, `/workspaces/{id}/diff`, and
   Project-scoped chat, terminal, session, memory, notification and coordination
-  resources. Viewers can no longer write these resources. Project PATCH
-  (including settings and shell hooks), pause/resume/delete, environment,
-  workflow, repositories, integrations, members and Agent binding/setup writes
-  require owner/admin authority. Task actions, transitions, comments and uploads
-  require member authority; approval overrides require the owner. Cross-Project
-  lists and notification bulk operations omit inaccessible Projects. Normal
-  single-user installations whose first user owns everything see no change to
-  their authorized operations. No request/response fields or tool names change.
+  resources, the same response as an unknown id. Viewers can no longer write
+  these resources (`403 insufficient_role`). Project PATCH (including settings
+  and shell hooks), pause/resume/delete, environment, workflow, repositories,
+  integrations, members and Agent binding/setup writes require owner/admin.
+  Task creation, edits, actions, transitions, comments and uploads require
+  `member`; approval overrides require the owner. Cross-Project lists and
+  notification bulk operations omit inaccessible Projects. `GET /api/v1/events`
+  delivers a Project's events only to accounts that can see it (visibility is
+  re-read at most every 10 s per connection). MCP catalog admission and tool
+  names are unchanged; a Task/dependency write through MCP now needs `member`
+  and `forge_update_project` needs owner/admin on the referenced Project.
+  Legacy ownerless Projects (no `owner_id`) stay visible to, and writable by,
+  every signed-in user, as before. A single-user install, whose first account
+  owns every Project, sees no change. No request or response fields change.
 
 - **Retry is no longer offered on a Task whose implementation role has no
   assigned Agent.** `available_actions` (REST Task detail and

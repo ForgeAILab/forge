@@ -22,43 +22,75 @@ Authentication identifies the caller; it does not grant access to every
 Project. Project and Task REST handlers resolve the owning Project before
 returning data or applying a mutation. A Project is visible through
 `ProjectRepo::get_visible_by_id`: its owner and every member role may read it.
-That repository's existing visibility for ownerless Projects is unchanged;
-instance administrator status does not add a Project visibility bypass.
+Instance administrator status does not add a Project visibility bypass.
 
 | Route family | Required authority |
 |---|---|
 | Project/Task details, boards, relations, comments, media, reviews, executions/logs/usage, diffs, analytics, memory, workflow and Agent catalogs | Visible Project; existing account/identity ownership and principal constraints also apply |
 | Task creation, edits, deletion, duplication, ordering, dependencies, actions, transitions, role assignments, execution controls, workspace reset, comments and media upload | `member`, `admin` or `owner` |
-| Project settings and hooks, environment recheck, pause/resume/delete, workflow, repositories/integrations, membership, execution setup and Project Agent binding | `admin` or `owner`; existing owner-only operations remain owner-only |
+| Project settings and hooks, hook tests, environment recheck, pause/resume/delete, workflow, repositories/integrations, membership, execution setup and Project Agent binding | `admin` or `owner`; existing owner-only operations remain owner-only |
 | Task media deletion and Project media redaction/purge | `admin` or `owner` |
 | Project Documents, milestones, evidence and scoped memory mutations | At least `member`; existing approval, release, provenance and principal policies also apply |
 | Project chats, scoped sessions and coordination mutations | At least `member`, plus existing identity, chat binding and record-owner policies |
 | Task approval overrides, including an override selected by omitted parameters | `owner` |
+| Project escalations: list, read and answer | Project owner only (existing contract) |
+| Repository locations: list and every location mutation | `admin` or `owner` (existing contract) |
 
-An explicit `viewer` membership is read-only, including when the member is
-also the Project's recorded creator. A canonical owner without a membership
-row retains owner authority. A visible caller without the required mutation
-role receives `403 insufficient_role`; existing domain-specific forbidden
-errors remain in place. An inaccessible Project receives the same scoped
-`404` as an unknown Project. Indirect Task, repository, execution, review,
-comment, media and session IDs are hidden behind their own unknown-ID `404`,
-without disclosing their parent IDs. Task-list authorization runs before ETag
-comparison, so a non-member cannot receive a cached `304`.
+**404 versus 403.** A caller who cannot see the Project receives the same
+scoped `404` as an unknown id, on reads and writes alike. Indirect ids (Task,
+repository, execution, review, comment, media, session, Chat, handoff) are
+hidden behind their own unknown-id `404` and never name their parent Project;
+a second id in a request body (a hook-test Task, a dependency, a board-move
+neighbor) gets the same answer as an unknown id when it belongs to a Project
+the caller cannot see. A caller who can see the Project but lacks the role
+receives `403 insufficient_role`; existing domain-specific forbidden errors
+stay in place (repository locations answer `403 authorization.invalid`,
+escalation reads the escalation service's `403`). Task-list authorization runs
+before ETag comparison, so a non-member cannot receive a cached `304`.
 
-Project lists, Agent Task lists, notifications and coordination lists filter
-visibility before their pagination, counts or limits. Session and context
-manifest lists exclude scopes the caller can no longer access. Notification
-bulk mutations affect only Projects the caller can write. MCP tools apply the
-same Project visibility and role rules to both account-wide and
-Project-constrained credentials, while retaining the delegated grant and
-native command policies. These changes do not change request or response
-shapes. A normal single-user installation, whose first user owns its Projects,
-sees no change to its authorized operations.
+**Roles.** An explicit `viewer` membership is read-only, including when the
+member is also the Project's recorded creator. A recorded owner without a
+membership row keeps owner authority.
 
-Two audit limitations remain: Project escalation reads retain their existing
-owner-only domain contract, and `/api/v1/events` is still an instance-wide SSE
-broadcast, including durable replay. SSE does **not** yet filter Project data
-per subscriber; it must not be treated as a Project-authorized read API.
+**Ownerless Projects.** A Project with no `owner_id` (legacy rows written
+before Projects had owners) is visible to every signed-in user, and every
+signed-in user keeps owner rights on it, including users with an explicit
+membership row. No creation path makes one: REST, MCP, Genesis, Solo and the
+CLI record the creator, and `--demo` data seeded after the first registration
+is owned by the earliest administrator (before it, the first registration
+claims it).
+
+**Lists.** Project lists, Agent Task lists, notifications and coordination
+lists filter visibility before their pagination, counts or limits. Session and
+context manifest lists exclude scopes the caller can no longer access.
+Notification bulk mutations affect only Projects the caller can write.
+
+**MCP.** Tool admission (`tools/list` and the catalog check on `tools/call`) is
+unchanged, including for Project-constrained grants and ownerless Projects. The
+role a tool needs on the Project its arguments reference is then enforced for
+account-wide and Project-constrained credentials alike: Task and dependency
+writes need `member`, `forge_update_project` and lifecycle hooks need `admin`
+or `owner`, approval overrides the owner. A Project-constrained grant on a
+Project its user cannot see is a `policy_denied` admission failure; an account
+grant naming such a Project gets the unknown-id `not_found`.
+
+**SSE.** `GET /api/v1/events` filters live and replayed events per connection.
+Each event is resolved to its Project directly, through its Task, Agent Chat or
+integration, or through a committed domain event's scope, and is withheld when
+that Project exists and the subscriber cannot see it. Account-scoped domain
+events reach only their account, and an account Main Chat's events only its
+account. Instance-level events with no Project (Agents, profiles, daemons,
+operations status) and events whose Project does not exist reach every
+subscriber, as before; a Project that disappears keeps the connection's last
+answer, so its deletion frames reach the subscribers who could see it. A
+connection re-reads a Project's visibility at most every 10 seconds, so a
+membership change reaches an open stream within that window. A lookup error
+withholds the event. Withheld durable events do not advance the client's
+`Last-Event-ID`.
+
+These changes do not change request or response shapes. A normal single-user
+installation, whose first user owns its Projects, sees no change to its
+authorized operations or its event stream.
 
 Request tracing records the peer `client_addr` and untrusted `x-forwarded-for`
 header on the `http.request` span only. The logged `forwarded_for` value is
@@ -4879,7 +4911,9 @@ release.
 
 ### SSE events
 
-`GET /api/v1/events` streams typed `EventBus` events. Orchestration and media
+`GET /api/v1/events` streams typed `EventBus` events, filtered per subscriber
+to the Projects the caller can see (see [Authorization](#authorization)).
+Orchestration and media
 mutations also append replayable events to the durable `domain_event` ledger in
 the same transaction as their authoritative rows. The current route
 implementation does not yet define a typed `EventContext` mirror for every new

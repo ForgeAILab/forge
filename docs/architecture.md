@@ -3124,7 +3124,11 @@ durable wake path to recover those existing incidents after restart.
 The `events` crate still wraps `tokio::sync::broadcast`, and the SSE endpoint at
 `/api/v1/events` still drives live clients. For durable events it is a
 post-commit delivery/cache-invalidation projection, not authoritative history
-and never sufficient by itself to wake an agent.
+and never sufficient by itself to wake an agent. The bus itself is
+instance-wide; each SSE connection filters it for its user (`routes::events`
+`Audience`): an event resolved to a Project the user cannot see is withheld,
+with per-connection visibility answers re-read at most every 10 seconds (see
+[api.md](api.md#authorization)).
 
 ### Scoped semantic memory and context provenance
 
