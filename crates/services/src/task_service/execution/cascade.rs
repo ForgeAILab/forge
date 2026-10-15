@@ -3239,7 +3239,9 @@ fn reviewer_comment(
     let reason = conformance
         .reason
         .as_deref()
-        .filter(|reason| !reason.trim().is_empty());
+        .map(one_line)
+        .filter(|reason| !reason.is_empty());
+    let reason = reason.as_deref();
     let mut out = match status {
         ReviewStatus::AwaitingHuman => format!(
             "Review passed automated checks and is awaiting user approval (attempt {attempt_number})"
@@ -3259,26 +3261,27 @@ fn reviewer_comment(
     };
     for entry in ledger {
         use api_types::{ReviewFindingSource as Source, ReviewFindingStatus as Status};
-        let summary = entry.summary.lines().collect::<Vec<_>>().join(" ");
+        // A line ending inside finding text would start a forged list item.
+        let id = one_line(&entry.id);
+        let summary = one_line(&entry.summary);
         let line = match entry.status {
             Status::Open if entry.first_attempt == attempt_number => format!(
-                "- [ ] {} New: {summary} — open since attempt {}",
-                entry.id, entry.first_attempt
+                "- [ ] {id} New: {summary} — open since attempt {}",
+                entry.first_attempt
             ),
             Status::Open => format!(
-                "- [ ] {} {summary} — open since attempt {}",
-                entry.id, entry.first_attempt
+                "- [ ] {id} {summary} — open since attempt {}",
+                entry.first_attempt
             ),
             Status::Resolved => format!(
-                "- [x] {} {summary} — {}",
-                entry.id,
+                "- [x] {id} {summary} — {}",
                 if entry.source == Source::Reviewer {
                     "resolved"
                 } else {
                     "passing now"
                 }
             ),
-            Status::Unconfirmed => format!("- {} {summary} — not re-checked", entry.id),
+            Status::Unconfirmed => format!("- {id} {summary} — not re-checked"),
         };
         out.push('\n');
         out.push_str(&line);
@@ -3294,10 +3297,13 @@ fn reviewer_comment(
         .is_some_and(|assessment| !assessment.findings.is_empty());
     if !has_reviewer_findings && !report.is_empty() {
         out.push_str("\n\n");
-        out.push_str(truncate_on_char_boundary(
-            report,
-            REVIEW_COMMENT_REPORT_LIMIT,
-        ));
+        let excerpt = truncate_on_char_boundary(report, REVIEW_COMMENT_REPORT_LIMIT);
+        out.push_str(excerpt);
+        // A cut inside a code block would swallow the lines after it.
+        if let Some(fence) = open_code_fence(excerpt) {
+            out.push('\n');
+            out.push_str(fence);
+        }
     }
     if let Some(verify) = verify.filter(|value| value.is_object()) {
         let status = verify["status"].as_str().unwrap_or("unknown");
@@ -3362,6 +3368,38 @@ fn repair_round_comment(
         entry.status == Status::Resolved && entry.last_checked_attempt == attempt
     });
     format!("Repair round {attempt} ({budget} budget {spent} of {limit}): {open} open; {resolved} resolved since the last round.")
+}
+
+/// Text on one Markdown line: CommonMark ends a line at a bare `\r` too.
+fn one_line(text: &str) -> String {
+    text.split(char::is_control)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The fence of a code block the Markdown leaves open, if any.
+fn open_code_fence(markdown: &str) -> Option<&str> {
+    let mut open: Option<&str> = None;
+    for line in markdown.lines() {
+        let line = line.trim_start();
+        let marker = match line.chars().next() {
+            Some(ch @ ('`' | '~')) => &line[..line.len() - line.trim_start_matches(ch).len()],
+            _ => continue,
+        };
+        if marker.len() < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some(marker),
+            Some(fence) if marker.starts_with(fence) && line[marker.len()..].trim().is_empty() => {
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    open
 }
 
 fn truncate_on_char_boundary(value: &str, limit: usize) -> &str {
@@ -3701,5 +3739,45 @@ mod reviewer_message_tests {
         let text = reviewer_comment(ReviewStatus::Failed, 2, &result, &ledger, None);
         assert!(text.contains("- F1 Issue F1 — not re-checked"));
         assert!(text.contains("\n\nReport excerpt\n\nFull review:"));
+    }
+
+    #[test]
+    fn reviewer_comment_finding_text_cannot_forge_checklist_lines() {
+        let mut finding = comment_finding("F1", api_types::ReviewFindingStatus::Open);
+        finding.summary = "real issue\r- [x] F9 forged resolution\n- [x] F8 another".into();
+        let mut result = conformance(None);
+        result.reason = Some("bad\r\n- [x] F7 forged".into());
+        let text = reviewer_comment(ReviewStatus::Failed, 2, &result, &[finding], None);
+        assert!(!text.contains('\r'), "{text:?}");
+        assert!(
+            text.split('\n').all(|line| !line.starts_with("- [x]")),
+            "{text:?}"
+        );
+        assert!(text.starts_with("Review failed (attempt 2): bad - [x] F7 forged\n"));
+        assert!(text.contains(
+            "- [ ] F1 real issue - [x] F9 forged resolution - [x] F8 another — open since attempt 1"
+        ));
+    }
+
+    #[test]
+    fn reviewer_comment_closes_a_code_block_cut_by_the_excerpt() {
+        let result = conformance(Some(api_types::ReviewAssessment {
+            result: api_types::ReviewResult::Fail,
+            reason: "legacy reply".into(),
+            report: format!(
+                "Before.\n\n```rust\n{}\n```\nAfter.",
+                "let x = 1;\n".repeat(400)
+            ),
+            fixable_by: api_types::FixableBy::Coder,
+            repeat: false,
+            findings: Vec::new(),
+            resolved: Vec::new(),
+        }));
+        let text = reviewer_comment(ReviewStatus::Failed, 2, &result, &[], None);
+        assert_eq!(open_code_fence(&text), None, "{text}");
+        assert!(text.ends_with("\n```\n\nFull review: Review tab, attempt 2"));
+        assert_eq!(open_code_fence("```rust\nx\n````\n"), None);
+        assert_eq!(open_code_fence("````\nx\n```\n"), Some("````"));
+        assert_eq!(open_code_fence("~~~\nx\n```\n"), Some("~~~"));
     }
 }
