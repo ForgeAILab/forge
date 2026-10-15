@@ -72,7 +72,10 @@ account-wide and Project-constrained credentials alike: Task and dependency
 writes need `member`, `forge_update_project` and lifecycle hooks need `admin`
 or `owner`, approval overrides the owner. A Project-constrained grant on a
 Project its user cannot see is a `policy_denied` admission failure; an account
-grant naming such a Project gets the unknown-id `not_found`.
+grant naming such a Project gets the unknown-id `not_found`. Admission keeps
+its existing ceilings, so a recorded creator holding an explicit `viewer` row
+is still admitted to owner-only tools; the role check on the referenced
+Project then refuses them.
 
 **SSE.** `GET /api/v1/events` filters live and replayed events per connection.
 Each event is resolved to its Project directly, through its Task, Agent Chat or
