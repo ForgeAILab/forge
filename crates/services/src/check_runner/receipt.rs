@@ -84,7 +84,9 @@ pub(super) fn validate_receipt(
             index,
             command: command.command.clone(),
             exit_code: command.exit_code.unwrap_or(-1),
-            stderr_tail: command.stderr_tail.clone(),
+            stderr_tail: check_executor::strip_ansi(&command.stderr_tail),
+            failures: command.failures.clone(),
+            failures_truncated: command.failures_truncated,
             output_tail: combined_tail(&command.stdout_tail, &command.stderr_tail),
             started_at: command.started_at.clone(),
             finished_at: command.finished_at.clone(),
@@ -173,5 +175,5 @@ fn combined_tail(stdout: &str, stderr: &str) -> String {
     } else {
         format!("{stdout}\n{stderr}")
     };
-    crate::integration_effects::check::tail_bytes(&combined, 4096)
+    crate::integration_effects::check::tail_bytes(&check_executor::strip_ansi(&combined), 4096)
 }

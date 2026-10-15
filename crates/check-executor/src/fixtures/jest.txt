@@ -1,0 +1,38 @@
+[0m[7m[1m[31m FAIL [39m[22m[27m[0m [2m./[22m[1mparser.test.js[22m
+[1m[31m  [1m● [22m[1mparser › empty input[39m[22m
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"value"[39m
+    Received: [31m""[39m
+
+[2m      1 | describe('parser', () => {[22m
+[2m    > 2 |   test('empty input', () => expect('').toBe('value'));[22m
+[2m        |                                        ^[22m
+[2m      3 |   test('unicode input', () => expect('猫').toBe('dog'));[22m
+[2m      4 | });[22m
+[2m      5 |[22m
+
+[2m      [2mat Object.toBe ([22m[2m[0m[36mparser.test.js[39m[0m[2m:2:40)[22m[2m[22m
+
+[1m[31m  [1m● [22m[1mparser › unicode input[39m[22m
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"dog"[39m
+    Received: [31m"猫"[39m
+
+[2m      1 | describe('parser', () => {[22m
+[2m      2 |   test('empty input', () => expect('').toBe('value'));[22m
+[2m    > 3 |   test('unicode input', () => expect('猫').toBe('dog'));[22m
+[2m        |                                           ^[22m
+[2m      4 | });[22m
+[2m      5 |[22m
+
+[2m      [2mat Object.toBe ([22m[2m[0m[36mparser.test.js[39m[0m[2m:3:43)[22m[2m[22m
+
+[1mTest Suites: [22m[1m[31m1 failed[39m[22m, 1 total
+[1mTests:       [22m[1m[31m2 failed[39m[22m, 2 total
+[1mSnapshots:   [22m0 total
+[1mTime:[22m        0.349 s
+[2mRan all test suites[22m[2m.[22m

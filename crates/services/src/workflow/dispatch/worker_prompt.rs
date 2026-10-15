@@ -150,6 +150,14 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
+    let body = review_fix_body(ctx);
+    match super::coder_prompt::no_change_brief(ctx) {
+        Some(brief) => format!("{brief}\n\n{body}"),
+        None => body,
+    }
+}
+
+fn review_fix_body(ctx: &AgentDispatchContext) -> String {
     let mut user = format!(
         "Task: {}\n\nThe delivery was sent back for changes. Inspect the current worktree and address all review and validation findings, then run the relevant checks and resubmit with updated evidence.\n",
         ctx.task.title
@@ -278,25 +286,7 @@ fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
             {
                 return None;
             }
-            let steps = value
-                .get("ci_steps")
-                .or_else(|| value.is_array().then_some(&value))?
-                .as_array()?;
-            let failed = steps.iter().find(|step| {
-                step.get("exit_code")
-                    .and_then(serde_json::Value::as_i64)
-                    .is_some_and(|code| code != 0)
-            })?;
-            let command = failed
-                .get("command")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("validation step");
-            let output = failed
-                .get("output_tail")
-                .or_else(|| failed.get("stderr_tail"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            Some(format!("{command}\n{output}"))
+            super::coder_prompt::ci_failure_reason(&value)
         })
 }
 

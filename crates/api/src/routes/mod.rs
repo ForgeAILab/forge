@@ -1535,6 +1535,8 @@ fn step_result_response(step: &StepResultEntry) -> StepResultResponse {
         command: step.command.clone(),
         exit_code: step.exit_code,
         stderr_tail: step.stderr_tail.clone(),
+        failures: step.failures.clone(),
+        failures_truncated: step.failures_truncated,
         output_tail: step.output_tail.clone(),
         started_at: step.started_at.clone(),
         finished_at: step.finished_at.clone(),

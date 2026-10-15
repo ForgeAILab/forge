@@ -159,14 +159,21 @@ pub fn stop_group(id: u32) -> bool {
 pub fn stop_group(_id: u32) -> bool {
     false
 }
+/// A synchronous, bounded observer of each drained output chunk.
+pub type OutputObserver<'a> = &'a mut (dyn FnMut(&[u8]) + Send + 'a);
+
 #[derive(Default)]
-struct Stream {
+struct Stream<'a> {
+    observer: Option<OutputObserver<'a>>,
     bytes: Vec<u8>,
     truncated: bool,
     eof: bool,
 }
-impl Stream {
+impl Stream<'_> {
     fn keep(&mut self, capture: Capture, chunk: &[u8]) {
+        if let Some(observer) = &mut self.observer {
+            observer(chunk);
+        }
         let count = chunk.len();
         match capture {
             Capture::All => self.bytes.extend_from_slice(chunk),
@@ -192,7 +199,7 @@ impl Stream {
 async fn drain(
     pipe: &mut (impl AsyncRead + Unpin),
     capture: Capture,
-    retained: &mut Stream,
+    retained: &mut Stream<'_>,
 ) -> io::Result<()> {
     let mut chunk = [0; 8192];
     loop {
@@ -212,7 +219,11 @@ const FINAL_DRAIN_BYTES: usize = 4 * 1024 * 1024;
 /// during it has read nothing. So when a bound ends the wait, what the pipe
 /// already holds is still taken: read without waiting until end of file, a
 /// read that would block, or [`FINAL_DRAIN_BYTES`].
-async fn drain_ready(pipe: &mut (impl AsyncRead + Unpin), capture: Capture, retained: &mut Stream) {
+async fn drain_ready(
+    pipe: &mut (impl AsyncRead + Unpin),
+    capture: Capture,
+    retained: &mut Stream<'_>,
+) {
     let mut chunk = [0; 8192];
     let mut budget = FINAL_DRAIN_BYTES;
     while !retained.eof && budget > 0 {
@@ -250,6 +261,21 @@ pub async fn run(
     cancel: &CancellationToken,
     completion: CompletionPolicy,
 ) -> io::Result<ProcessOutput> {
+    run_observed(command, capture, deadline, cancel, completion, None, None).await
+}
+
+/// Like [`run`], with synchronous observers for every drained byte, including
+/// final buffered output after cancellation or the post-exit bound. Observers
+/// must do bounded work; they neither own pipes nor affect process settlement.
+pub async fn run_observed(
+    command: &mut Command,
+    capture: Capture,
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
+    completion: CompletionPolicy,
+    stdout_observer: Option<OutputObserver<'_>>,
+    stderr_observer: Option<OutputObserver<'_>>,
+) -> io::Result<ProcessOutput> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -263,8 +289,14 @@ pub async fn run(
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
     let leader = child.id();
     let mut group = Group { child, leader };
-    let mut stdout = Stream::default();
-    let mut stderr = Stream::default();
+    let mut stdout = Stream {
+        observer: stdout_observer,
+        ..Stream::default()
+    };
+    let mut stderr = Stream {
+        observer: stderr_observer,
+        ..Stream::default()
+    };
     let stop_descendants = matches!(completion, CompletionPolicy::StopDescendants);
     let leader_exited = AtomicBool::new(false);
     let (exited, finished) = tokio::sync::oneshot::channel::<()>();

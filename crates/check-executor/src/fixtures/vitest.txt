@@ -1,0 +1,47 @@
+
+ RUN  v4.1.11 /Volumes/Data/tmp/guards-fixtures/vitest
+
+ × parser.test.js > parser > empty input 2ms
+   → expected '' to be 'value' // Object.is equality
+ × parser.test.js > parser > unicode input 1ms
+   → expected '猫' to be 'dog' // Object.is equality
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  parser.test.js > parser > empty input
+AssertionError: expected '' to be 'value' // Object.is equality
+
+- Expected
++ Received
+
+- value
+
+ ❯ parser.test.js:2:65
+      1| import { describe, test, expect } from "vitest";
+      2| describe("parser", () => { test("empty input", () => expect("").toBe("…
+       |                                                                 ^
+      3|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  parser.test.js > parser > unicode input
+AssertionError: expected '猫' to be 'dog' // Object.is equality
+
+Expected: "dog"
+Received: "猫"
+
+ ❯ parser.test.js:2:121
+      1| import { describe, test, expect } from "vitest";
+      2| describe("parser", () => { test("empty input", () => expect("").toBe("…
+       |                                                                                                                         ^
+      3|
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed (2)
+   Start at  05:55:04
+   Duration  114ms (transform 13ms, setup 0ms, import 24ms, tests 4ms, environment 0ms)
+
+JUNIT report written to /Volumes/Data/tmp/guards-fixtures/vitest/results.xml

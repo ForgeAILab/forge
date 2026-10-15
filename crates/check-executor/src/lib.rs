@@ -1,4 +1,7 @@
 //! Persistence-free, owner-local mechanical execution. Admission is the caller's.
+mod failures;
+pub use failures::strip_ansi;
+
 use api_types::*;
 use std::{
     collections::BTreeMap,
@@ -283,7 +286,7 @@ fn redacted(
     env: &BTreeMap<String, String>,
     limit: usize,
 ) -> (String, bool) {
-    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let mut text = strip_ansi(&String::from_utf8_lossy(bytes));
     // A retained tail may begin halfway through a secret. Mask that fragment
     // too; otherwise truncation could disclose a secret suffix. Similarly the
     // final bytes of an interrupted command may be only a secret prefix.
@@ -441,6 +444,27 @@ async fn run_command_group(
     let run_scope =
         executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
+    // An isolated directory prevents one step from inheriting another's reports.
+    // Reports are optional evidence: a directory that cannot be made leaves the
+    // command without one rather than failing it as infrastructure.
+    let task_root = executors::sandbox::TaskRoot::of_worktree(path);
+    let reports = match &task_root {
+        Some(root) => tempfile::Builder::new()
+            .prefix("ci-reports-")
+            .tempdir_in(root.path().join(".forge-task")),
+        None => tempfile::Builder::new()
+            .prefix("forge-ci-reports-")
+            .tempdir(),
+    }
+    .ok();
+    if let Some(reports) = &reports {
+        command.env("FORGE_CI_REPORT_DIR", reports.path());
+    }
+    let roots: Vec<&Path> = std::iter::once(path)
+        .chain(task_root.as_ref().map(|root| root.path()))
+        .collect();
+    let mut stdout = failures::Stream::new(limit, &roots, &env);
+    let mut stderr = failures::Stream::new(limit, &roots, &env);
     let per_command = spec
         .timeout_seconds
         .and_then(|s| start.checked_add(Duration::from_secs(s)));
@@ -450,6 +474,8 @@ async fn run_command_group(
     };
     if cancel.is_cancelled() || deadline.is_some_and(|d| d <= start) {
         let receipt = CheckCommandReceipt {
+            failures: vec![],
+            failures_truncated: false,
             id: spec.id.clone(),
             command: spec.shell_text.clone(),
             exit_code: None,
@@ -471,12 +497,14 @@ async fn run_command_group(
         };
         return Ok((receipt, None));
     }
-    let output = process_supervisor::run(
+    let output = process_supervisor::run_observed(
         &mut command,
-        process_supervisor::Capture::Tail(limit),
+        process_supervisor::Capture::Tail(0),
         deadline,
         cancel,
         completion(policy),
+        Some(&mut |bytes| stdout.push(bytes)),
+        Some(&mut |bytes| stderr.push(bytes)),
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -488,16 +516,22 @@ async fn run_command_group(
         }
         process_supervisor::Termination::Exited => CheckExecutionOutcome::Failed,
     };
+    let (stdout, stdout_truncated, mut failures) = stdout.finish();
+    let (stderr, stderr_truncated, stderr_failures) = stderr.finish();
+    failures.merge(stderr_failures);
+    if let Some(reports) = &reports {
+        failures::junit(reports.path(), &roots, &env, &mut failures);
+    }
     let (stdout_tail, stdout_truncated) = redacted(
-        &output.stdout,
-        output.stdout_truncated,
+        &stdout,
+        stdout_truncated,
         output.termination != process_supervisor::Termination::Exited,
         &env,
         limit,
     );
     let (stderr_tail, stderr_truncated) = redacted(
-        &output.stderr,
-        output.stderr_truncated,
+        &stderr,
+        stderr_truncated,
         output.termination != process_supervisor::Termination::Exited,
         &env,
         limit,
@@ -514,6 +548,8 @@ async fn run_command_group(
             .filter(|_| output.termination == process_supervisor::Termination::Exited),
         outcome,
         duration_ms: milliseconds(start.elapsed()),
+        failures: failures.signatures,
+        failures_truncated: failures.truncated,
         stdout_tail,
         stderr_tail,
         stdout_truncated,
@@ -933,8 +969,8 @@ impl CheckSequence {
         }
     }
 }
-/// Legacy evidence projection shared by both CI consumers. Tails and the
-/// signal-exit fallback are unchanged; output volume never selects the verdict.
+/// Legacy evidence projection with bounded ANSI-free tails. The signal-exit
+/// fallback is unchanged; output volume never selects the verdict.
 pub struct LegacyCommandOutput<'a> {
     pub exit_code: Option<i32>,
     pub stdout: &'a str,
@@ -948,8 +984,8 @@ pub fn command_outcome(
     started_at: String,
     finished_at: String,
 ) -> CheckCommandOutcome {
-    let stderr = executors::environment::redact_environment_values(output.stderr, env);
-    let stdout = executors::environment::redact_environment_values(output.stdout, env);
+    let stderr = executors::environment::redact_environment_values(&strip_ansi(output.stderr), env);
+    let stdout = executors::environment::redact_environment_values(&strip_ansi(output.stdout), env);
     let combined = if stdout.is_empty() {
         stderr.clone()
     } else if stderr.is_empty() {
@@ -961,6 +997,8 @@ pub fn command_outcome(
         index,
         command,
         exit_code: output.exit_code.filter(|code| *code >= 0).unwrap_or(1),
+        failures: vec![],
+        failures_truncated: false,
         stderr_tail: tail(&stderr, 4096),
         output_tail: tail(&combined, 4096),
         started_at,

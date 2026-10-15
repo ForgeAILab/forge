@@ -533,6 +533,16 @@ impl CheckRunRepo for SqliteDb {
             if step.index != index || step.command != expected.shell_text {
                 return Err(DbError::Check("result commands differ from spec".into()));
             }
+            if step.failures.len() > 200 {
+                step.failures.truncate(200);
+                step.failures_truncated = true;
+            }
+            for signature in &mut step.failures {
+                for secret in evidence.redaction_values.iter().filter(|s| !s.is_empty()) {
+                    *signature = signature.replace(secret, "[REDACTED]");
+                }
+                *signature = signature.chars().take(300).collect();
+            }
             for text in [&mut step.stderr_tail, &mut step.output_tail] {
                 for secret in evidence.redaction_values.iter().filter(|s| !s.is_empty()) {
                     *text = text.replace(secret, "[REDACTED]");
@@ -569,12 +579,28 @@ impl CheckRunRepo for SqliteDb {
         // immutable evidence; reconciliation can append a later cleanup receipt.
         // A long bundle with full tails can exceed the row budget. Output is
         // evidence, not the verdict: halve every tail until the row fits, so a
-        // finished run can always settle. Only command text alone can refuse.
+        // finished run can always settle. If signatures alone exceed the row
+        // budget, reduce their lists too and record that loss explicitly.
+        // Only command text alone can refuse.
         let mut budget = CHECK_OUTPUT_TAIL_BYTES;
         let steps = loop {
             match json(&evidence.commands, CHECK_STEPS_BYTES) {
                 Ok(steps) => break steps,
-                Err(error) if budget == 0 => return Err(error),
+                Err(error) if budget == 0 => {
+                    if evidence
+                        .commands
+                        .iter()
+                        .all(|step| step.failures.is_empty())
+                    {
+                        return Err(error);
+                    }
+                    for step in &mut evidence.commands {
+                        if !step.failures.is_empty() {
+                            step.failures.truncate(step.failures.len() / 2);
+                            step.failures_truncated = true;
+                        }
+                    }
+                }
                 Err(_) => {
                     budget /= 2;
                     for step in &mut evidence.commands {

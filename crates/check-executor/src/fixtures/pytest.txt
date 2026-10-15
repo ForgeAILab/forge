@@ -1,0 +1,37 @@
+Downloading pygments (1.2MiB)
+ Downloaded pygments
+Installed 5 packages in 8ms
+[1m============================= test session starts ==============================[0m
+platform darwin -- Python 3.12.11, pytest-9.1.1, pluggy-1.7.0 -- /Volumes/Data/tmp/guards-fixtures/uv-cache/builds-v0/.tmpmt8GN8/bin/python
+cachedir: .pytest_cache
+rootdir: /Volumes/Data/tmp/guards-fixtures/pytest
+[1mcollecting ... [0mcollected 2 items
+
+test_parser.py::test_empty_input [31mFAILED[0m[31m                                  [ 50%][0m
+test_parser.py::test_unicode_input [31mFAILED[0m[31m                                [100%][0m
+
+=================================== FAILURES ===================================
+[31m[1m_______________________________ test_empty_input _______________________________[0m
+
+    [0m[94mdef[39;49;00m[90m [39;49;00m[92mtest_empty_input[39;49;00m():[90m[39;49;00m
+>       [94massert[39;49;00m [33m"[39;49;00m[33m"[39;49;00m == [33m"[39;49;00m[33mvalue[39;49;00m[33m"[39;49;00m[90m[39;49;00m
+[1m[31mE       AssertionError: assert '' == 'value'[0m
+[1m[31mE         [0m
+[1m[31mE         [0m[91m- value[39;49;00m[90m[39;49;00m[0m
+
+[1m[31mtest_parser.py[0m:2: AssertionError
+[31m[1m______________________________ test_unicode_input ______________________________[0m
+
+    [0m[94mdef[39;49;00m[90m [39;49;00m[92mtest_unicode_input[39;49;00m():[90m[39;49;00m
+>       [94massert[39;49;00m [33m"[39;49;00m[33m猫[39;49;00m[33m"[39;49;00m == [33m"[39;49;00m[33mdog[39;49;00m[33m"[39;49;00m[90m[39;49;00m
+[1m[31mE       AssertionError: assert '猫' == 'dog'[0m
+[1m[31mE         [0m
+[1m[31mE         [0m[91m- dog[39;49;00m[90m[39;49;00m[0m
+[1m[31mE         [92m+ 猫[39;49;00m[90m[39;49;00m[0m
+
+[1m[31mtest_parser.py[0m:5: AssertionError
+--- generated xml file: /Volumes/Data/tmp/guards-fixtures/pytest/results.xml ---
+[36m[1m=========================== short test summary info ============================[0m
+[31mFAILED[0m test_parser.py::[1mtest_empty_input[0m - AssertionError: assert '' == 'value'
+[31mFAILED[0m test_parser.py::[1mtest_unicode_input[0m - AssertionError: assert '猫' == 'dog'
+[31m============================== [31m[1m2 failed[0m[31m in 0.03s[0m[31m ===============================[0m

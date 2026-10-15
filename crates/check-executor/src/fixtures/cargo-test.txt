@@ -1,0 +1,6 @@
+test integration_steps::tests::gate_tests::an_unreadable_task_is_quarantined_and_the_import_continues has been running for over 60 seconds
+test integration_steps::tests::gate_tests::an_unreadable_task_is_quarantined_and_the_import_continues ... FAILED
+test integration_worker::tests::head_table_is_total_and_inside_the_storage_graph ... ok
+test integration_worker::tests::crash_matrix_every_state_and_await_point_recovers_after_takeover ... ok
+test integration_steps::tests::imported_rows_that_wait_for_their_owner_stay_put_with_a_typed_reason ... FAILED
+

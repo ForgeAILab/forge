@@ -11,6 +11,8 @@ git = { path = "../git" }
 process-supervisor = { path = "../process-supervisor" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
+regex = "1"
+quick-xml = "0.41"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

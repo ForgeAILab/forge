@@ -121,6 +121,8 @@ async fn settle(db: &db::SqliteDb, run: &StoredCheckRun, outcome: CheckResultOut
             cleanup: CheckCleanup::NotPerformed,
             commands: if outcome == CheckResultOutcome::Pass {
                 vec![api_types::CheckCommandOutcome {
+                    failures: vec![],
+                    failures_truncated: false,
                     index: 0,
                     command: "true".into(),
                     exit_code: 0,

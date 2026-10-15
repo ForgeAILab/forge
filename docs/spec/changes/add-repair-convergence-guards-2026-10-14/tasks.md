@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T02:22:51Z
+updated_at: 2026-10-15T10:11:28Z
 completed_at:
 ---
 
@@ -11,14 +11,14 @@ completed_at:
 - Each phase lands as its own commit with its focused tests green. Run only the named tests; CI runs the full suite.
 
 ## 1. Check failure detail
-- [ ] 1.1 Signature extractors in `crates/check-executor`:
+- [x] 1.1 Signature extractors in `crates/check-executor`:
   - cargo test, vitest/jest, pytest, go test;
   - JUnit XML under `FORGE_CI_REPORT_DIR`;
   - normalisation, a cap of 200 signatures at 300 characters each, `failures_truncated`.
-- [ ] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
-- [ ] 1.3 Add `CheckCommandOutcome.failures` and `StepResultEntry.failures` (optional, `serde(default)`). Wire them through the durable runner, daemon receipts (an absent field is an empty list), generated TS and `docs/api.md`.
-- [ ] 1.4 Until the ledger lands, the CI repair prompt (`ci_failure_reason`) lists signatures for every failing step, not only the first. Once the ledger exists, add `CI-<step>#<hash>` findings in `finding_ledger`.
-- [ ] 1.5 Focused tests:
+- [x] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
+- [x] 1.3 Add `CheckCommandOutcome.failures` and `StepResultEntry.failures` (optional, `serde(default)`). Wire them through the durable runner, daemon receipts (an absent field is an empty list), generated TS and `docs/api.md`.
+- [x] 1.4 **Pre-ledger half complete.** Until the ledger lands, the CI repair prompt (`ci_failure_reason`) lists signatures for every failing step, not only the first. Once the ledger exists, add `CI-<step>#<hash>` findings in `finding_ledger`.
+- [x] 1.5 Focused tests:
   - extractor unit tests per runner, using real captured output from the `world` and NovelKit logs;
   - JUnit parse;
   - ANSI strip;
@@ -54,9 +54,9 @@ completed_at:
   - Keep `system_review_ci_failure_routes_to_coder_and_spends_review_budget` green under `off`.
 
 ## 3. No-change gate
-- [ ] 3.1 Persistent budget `RepairNoChange` (Review window, limit 1).
-- [ ] 3.2 At review entry after a coder repair round: if HEAD equals the latest failed Review's judged commit and the worktree is clean, create no Review. Send back once with the "No change since review N" brief, then park `review_needs_owner` with `no change after repair round`. Owner-started re-reviews are exempt.
-- [ ] 3.3 Focused tests: unchanged once sends back without a Review row or review budget; unchanged twice parks; an owner re-review of the same commit runs; a changed commit reviews normally.
+- [x] 3.1 Persistent budget `RepairNoChange` (Review window, limit 1).
+- [x] 3.2 At review entry after a coder repair round: if HEAD equals the latest failed Review's judged commit and the worktree is clean, create no Review. Send back once with the "No change since review N" brief, then park `review_needs_owner` with `no change after repair round`. Owner-started re-reviews are exempt.
+- [x] 3.3 Focused tests: unchanged once sends back without a Review row or review budget; unchanged twice parks; an owner re-review of the same commit runs; a changed commit reviews normally.
 
 ## 4. Reviewer anchoring
 - [ ] 4.1 Finding fields `requirement_ids`, `kind`, `same_cause_as`: lenient parsing, omitted when empty, TS, `docs/api.md`.

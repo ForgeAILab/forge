@@ -250,6 +250,9 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
             if pause_after_unblock.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
+            if call_index > 0 {
+                common::commit_repair_round(&ctx.worktree_path, call_index);
+            }
             let session_id = if call_index == 0 {
                 FIRST_EXECUTOR_SESSION_ID.to_owned()
             } else {

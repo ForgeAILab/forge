@@ -2385,10 +2385,15 @@ async fn a_before_work_hook_whose_worktree_cannot_be_recreated_waits_for_disk_an
         waits_for_disk(&fixture).await,
         "the Task states the disk wait"
     );
+    // The built-in no-change guard records its decision at its reserved
+    // index before any configured hook; that is not a hook result.
     assert_eq!(
         count(
             &fixture,
-            "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json IS NOT NULL"
+            &format!(
+                "SELECT COUNT(*) FROM task_hook_checkpoint WHERE result_json IS NOT NULL AND hook_index<>{}",
+                db::budget::REPAIR_NO_CHANGE_CHECKPOINT
+            )
         )
         .await,
         0,

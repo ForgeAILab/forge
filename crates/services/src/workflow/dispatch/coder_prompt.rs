@@ -180,10 +180,27 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
+    let body = review_fix_body(ctx);
+    match no_change_brief(ctx) {
+        Some(brief) => format!("{brief}\n\n{body}"),
+        None => body,
+    }
+}
+
+pub(super) fn no_change_brief(ctx: &AgentDispatchContext) -> Option<&str> {
+    ctx.transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == ctx.state_name)
+        .filter(|entry| entry.bridge.is_repair_no_change())
+        .map(|entry| entry.trigger_reason.as_str())
+}
+
+fn review_fix_body(ctx: &AgentDispatchContext) -> String {
     if let Some(reason) = latest_ci_failure_reason(ctx) {
         let mut user = format!("Task: {}\n", ctx.task.title);
         user.push_str(
-            "\nCI failed during review. Fix only the failing check below, keep the existing implementation direction, and complete the minimal correction according to the execution harness contract.\n",
+            "\nCI failed during review. Fix the failing checks below, keep the existing implementation direction, and complete the minimal correction according to the execution harness contract.\n",
         );
         user.push_str("\nCI failure:\n");
         user.push_str(&reason);
@@ -384,29 +401,70 @@ fn review_failure_reason(step_results_json: &str) -> Option<String> {
         .or_else(|| ci_failure_reason(&value))
 }
 
-fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
+/// Output kept across all failing steps of one CI repair prompt. Every
+/// failing step is listed with its signatures; once this much output has been
+/// shown, later steps name their command and signatures only. Two full stored
+/// tails fit.
+const CI_FAILURE_OUTPUT_BUDGET: usize = 8 * 1024;
+
+pub(super) fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
     let steps = value
         .get("ci_steps")
         .or_else(|| if value.is_array() { Some(value) } else { None })?
         .as_array()?;
-    let failed = steps.iter().find(|step| {
-        step.get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-    })?;
-    let command = failed
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("CI step");
-    let output = failed
-        .get("output_tail")
-        .and_then(serde_json::Value::as_str)
-        .filter(|output| !output.trim().is_empty())
-        .or_else(|| {
-            failed
-                .get("stderr_tail")
-                .and_then(serde_json::Value::as_str)
+    let mut output_budget = CI_FAILURE_OUTPUT_BUDGET;
+    let reasons: Vec<_> = steps
+        .iter()
+        .filter(|step| {
+            step.get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|code| code != 0)
         })
-        .unwrap_or("");
-    Some(format!("CI failed: {command}\n{output}"))
+        .map(|failed| {
+            let command = failed
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("CI step");
+            let output = failed
+                .get("output_tail")
+                .and_then(serde_json::Value::as_str)
+                .filter(|output| !output.trim().is_empty())
+                .or_else(|| {
+                    failed
+                        .get("stderr_tail")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("");
+            let failures = failed.get("failures").and_then(serde_json::Value::as_array);
+            let mut reason = format!("CI failed: {command}\n");
+            if let Some(failures) = failures {
+                for signature in failures
+                    .iter()
+                    .take(20)
+                    .filter_map(serde_json::Value::as_str)
+                {
+                    reason.push_str(&format!("- {signature}\n"));
+                }
+                if failures.len() > 20 {
+                    reason.push_str(&format!("+{} more\n", failures.len() - 20));
+                }
+            }
+            if failed
+                .get("failures_truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                reason.push_str("Additional failure signatures were truncated.\n");
+            }
+            if output.len() <= output_budget {
+                output_budget -= output.len();
+                reason.push_str(output);
+            } else {
+                output_budget = 0;
+                reason.push_str("(output omitted; see the Review's CI step results)");
+            }
+            reason
+        })
+        .collect();
+    (!reasons.is_empty()).then(|| reasons.join("\n\n"))
 }

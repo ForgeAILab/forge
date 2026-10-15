@@ -1,0 +1,11 @@
+=== RUN   TestParser
+=== RUN   TestParser/Empty
+    parser_test.go:3: empty input
+=== RUN   TestParser/Unicode
+    parser_test.go:3: unicode input
+--- FAIL: TestParser (0.00s)
+    --- FAIL: TestParser/Empty (0.00s)
+    --- FAIL: TestParser/Unicode (0.00s)
+FAIL
+exit status 1
+FAIL	guards-fixture	0.154s

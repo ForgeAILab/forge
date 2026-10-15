@@ -1745,6 +1745,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   repair/park system comments name findings once per Review. The Review tab
   displays the current ledger and per-attempt findings. Finding IDs now sort
   naturally before the API's 200-entry cap (`F2` before `F10`).
+- Stored check output and stderr tails strip ANSI escape codes before applying
+  the text budget.
+- CI repair prompts list the signatures and output of every failing step,
+  with up to 20 signatures per step and the remaining count.
 
 - **The runtime composition root and five agents modules moved to the new
   `services-agents` crate (developer-only).** `ForgeRuntime`,
@@ -3056,6 +3060,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Check steps report normalised failing test signatures from cargo test,
+  vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with
+  bounded signature lists and explicit truncation in receipts and Review details.
+- A no-change gate catches coder repair rounds that return the same clean
+  commit as the latest failed Review: one reminder per Review window, then
+  `review_needs_owner`, without another Review or review-budget charge.
+  Owner-started re-reviews remain exempt.
 - Optional structured findings and resolved ids in reviewer results, with lenient
   parsing and stable finding ids derived across review attempts.
 - `GET /api/v1/tasks/{id}/findings` reads the current review-window ledger,

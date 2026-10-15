@@ -262,6 +262,7 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
             let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
             if call_index > 0 {
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                common::commit_repair_round(&ctx.worktree_path, call_index);
             }
             let session_id = if call_index == 0 {
                 FIRST_EXECUTOR_SESSION_ID.to_owned()

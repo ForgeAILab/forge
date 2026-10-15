@@ -307,8 +307,19 @@ mod tests {
             &env,
         );
         assert!(direct.contains("PROJECT_TOKEN=[REDACTED]") && direct.contains("PATH="));
+        // The one addition: each check command gets its own JUnit report
+        // directory (`FORGE_CI_REPORT_DIR`); everything else is unchanged.
+        let (reports, moved): (Vec<&str>, Vec<&str>) = moved
+            .stdout
+            .lines()
+            .partition(|line| line.starts_with("FORGE_CI_REPORT_DIR="));
+        assert_eq!(reports.len(), 1, "one report directory per command");
+        let moved = moved
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
         // Not `assert_eq!`: a failure must not print the process environment.
-        assert!(moved.stdout == direct, "the step environment differs");
+        assert!(moved == direct, "the step environment differs");
     }
 
     #[tokio::test]

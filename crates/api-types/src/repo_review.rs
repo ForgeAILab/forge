@@ -316,6 +316,10 @@ pub struct StepResultResponse {
     pub command: String,
     pub exit_code: i32,
     pub stderr_tail: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failures_truncated: bool,
     #[serde(default)]
     pub output_tail: String,
     #[serde(default)]
@@ -331,6 +335,13 @@ pub struct StepResultEntry {
     pub command: String,
     pub exit_code: i32,
     pub stderr_tail: String,
+    /// Normalised failing test identities, collected before output tails are cut.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub failures: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub failures_truncated: bool,
     #[serde(default)]
     pub output_tail: String,
     #[serde(default)]

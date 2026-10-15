@@ -1976,6 +1976,9 @@ impl WorkflowEngine {
     ) -> bool {
         state.kind != StateKind::Gate
             || rejection
+            // The no-change reminder leaves before the gate ever asks for
+            // approval; it is not a rejection and charges none.
+            || bridge.is_repair_no_change()
             || !state
                 .gate_config
                 .as_ref()
