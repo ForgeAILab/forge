@@ -982,17 +982,19 @@ pub fn owner_review_failure_message(
     let assessment = conformance.assessment.as_ref()?;
     if conformance.status != api_types::ConformanceStatus::Failed
         || assessment.result != api_types::ReviewResult::Fail
-        || conformance.checks.iter().any(|check| check.exit_code != 0)
-        || conformance.reason.as_deref().unwrap_or_default() != assessment.reason
     {
         return None;
     }
+    // Owner routing and the self-reported repeat need the reviewer's verdict
+    // to be the cause; the derived repeat is Forge's own rule over the ledger.
+    let verdict_caused = conformance.checks.iter().all(|check| check.exit_code == 0)
+        && conformance.reason.as_deref().unwrap_or_default() == assessment.reason;
     let reason = if assessment.reason.is_empty() {
         "reviewer reported a blocking finding"
     } else {
         &assessment.reason
     };
-    if assessment.fixable_by == api_types::FixableBy::Owner {
+    if verdict_caused && assessment.fixable_by == api_types::FixableBy::Owner {
         return Some(format!("fixable by owner: {reason}"));
     }
     if derived_rules {
@@ -1008,6 +1010,9 @@ pub fn owner_review_failure_message(
                 return policy.repeat;
             }
         }
+    }
+    if !verdict_caused {
+        return None;
     }
     let previous_failed = reviews
         .iter()
@@ -1922,5 +1927,64 @@ mod tests {
         )
         .await
         .is_err());
+    }
+    // D5 rule 1 is Forge's own rule: a reviewer finding on its third check
+    // parks even when a required conformance check also failed (which
+    // replaces the reported reason). Only owner routing (`fixable_by`) and the
+    // self-reported `repeat` require the reviewer's verdict to be the cause.
+    #[test]
+    fn derived_repeat_parks_when_a_required_check_also_failed() {
+        let row = |attempt: i64, details: Value| Review {
+            id: format!("review-{attempt}"),
+            task_id: "t".into(),
+            execution_id: "e".into(),
+            reviewer_execution_id: None,
+            auditor_execution_id: None,
+            attempt_number: attempt,
+            status: ReviewStatus::Failed,
+            step_results_json: details.to_string(),
+            started_at: format!("2026-10-15T00:00:{attempt:02}Z"),
+            finished_at: None,
+            created_at: format!("2026-10-15T00:00:{attempt:02}Z"),
+            updated_at: "now".into(),
+        };
+        let assessment = |findings: Value| json!({"result":"fail","reason":"problems","findings":findings,"repeat":true});
+        let window = vec![
+            row(
+                1,
+                json!({"conformance":{"status":"failed","checks":[],"reason":"problems",
+                "assessment":assessment(json!([{"summary":"stuck"},{"summary":"other"}]))}}),
+            ),
+            row(
+                2,
+                json!({"conformance":{"status":"failed","checks":[],"reason":"problems",
+                "assessment":assessment(json!([{"id":"F1","summary":"stuck"},{"id":"F2","summary":"other"}]))}}),
+            ),
+        ];
+        let current = row(3, json!({}));
+        for owner in [false, true] {
+            let mut verdict = assessment(json!([{"id":"F1","summary":"stuck"}]));
+            if owner {
+                verdict["fixable_by"] = json!("owner");
+            }
+            let conformance: api_types::ReviewConformance = serde_json::from_value(json!({
+                "status":"failed","reason":"required conformance check failed",
+                "checks":[{"check_id":"lint","command":"lint","exit_code":1,"output":"bad"}],
+                "assessment":verdict,
+            }))
+            .unwrap();
+            assert_eq!(
+                owner_review_failure_message(&conformance, &current, &window, &window, true)
+                    .as_deref(),
+                Some("repeated finding: F1 stuck"),
+                "owner={owner}"
+            );
+            // Derived rules off: the reviewer did not cause this failure, so
+            // neither its owner routing nor its self-reported repeat applies.
+            assert_eq!(
+                owner_review_failure_message(&conformance, &current, &window, &window, false),
+                None
+            );
+        }
     }
 }

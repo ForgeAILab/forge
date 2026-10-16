@@ -6683,7 +6683,8 @@ persisted or projected as Task spending; verify execution is a later phase.
 After a coder-fixable failed Review, a reviewer finding open on its third
 source check parks with `review_needs_owner`, message
 `repeated finding: <id> <summary>`. A second appearance parks only when the
-number of open blocking findings did not decrease. Forge-owned findings count
+number of open blocking findings did not decrease. These parks apply even when
+a required conformance check also failed in that Review. Forge-owned findings count
 for progress but never cause repeat parks. Normal Review allowance is used
 first; when it has no retry left, a smaller open blocking count can spend one
 `review_progress` round. Otherwise normal exhaustion/recovery applies. Triage

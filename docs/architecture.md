@@ -8341,8 +8341,10 @@ completion and review-entry hook disposition. Progress means strictly fewer
 Review in the same persisted window, including unchecked sources. Triage-waived
 CI findings do not count. Only reviewer findings (`F*`) checked in this attempt
 trigger repeats: streak three always parks, and streak two parks without
-progress, with `review_needs_owner` and `repeated finding: <id> <summary>`.
-Those parks spend no retry budget. While derived rules are on, the reviewer's
+progress, with `review_needs_owner` and `repeated finding: <id> <summary>`,
+also when a required conformance check failed in the same Review (owner
+routing and the self-reported `repeat` still need the reviewer's verdict to be
+the cause). Those parks spend no retry budget. While derived rules are on, the reviewer's
 `repeat` flag is ignored. A reviewer fail with no blocking findings (including
 a minor-only list) disables derived rules for the rest of the window and
 restores the previous matching-failed-review/self-reported-repeat behavior.
