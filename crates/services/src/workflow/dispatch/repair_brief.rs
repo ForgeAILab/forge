@@ -291,10 +291,18 @@ impl RepairBrief {
         } else {
             "Checks failed after integration rebased this Task onto the target branch. Fix the command failure shown below, preserve the Task's intent, run the relevant checks, commit, and complete delivery. Never rebase, merge, or rewrite history — Forge owns integration."
         };
+        if !conflict && ctx.task.review_passed_at.is_some() {
+            brief.round.push_str("\n\nReview already passed before the merge failure. Preserve that reviewed implementation and verify the repair; do not redesign the Task.");
+        }
         // A merge handoff has no reviewer execution to inspect.
         brief.logs = String::new();
-        if let Some(path) = &ctx.continuation_logs_path {
-            brief.logs = format!("Previous coder log file:\n{path}");
+        for (label, value) in [
+            ("Previous execution", &ctx.continuation_of_execution_id),
+            ("Previous log file", &ctx.continuation_logs_path),
+        ] {
+            if let Some(value) = value {
+                brief.logs.push_str(&format!("{label}:\n{value}\n"));
+            }
         }
         Some(brief)
     }

@@ -1798,3 +1798,27 @@ fn worker_repair_brief_keeps_the_task_comments() {
         "{text}"
     );
 }
+
+#[test]
+fn merge_ci_brief_keeps_the_passed_review_and_the_previous_execution() {
+    for (builder, role) in [
+        (BUILDER_ID_CODER_MERGE_FIX_V2, default_roles::CODER),
+        (BUILDER_ID_WORKER_MERGE_FIX_V1, default_roles::WORKER),
+    ] {
+        let mut ctx = fake_context(role);
+        ctx.state_name = default_states::MERGE_FAILED.into();
+        ctx.task.review_passed_at = Some("2026-10-16T00:00:00Z".into());
+        ctx.task.error_annotation = Some(json!({"type":"ci_failed", "message":"checks failed after the rebase onto main: `cargo test` exited 101: boom"}).to_string());
+        ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
+        ctx.continuation_of_execution_id = Some("execution-previous".into());
+        ctx.continuation_logs_path = Some("/logs/previous.jsonl".into());
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        for expected in [
+            "Review already passed before the merge failure",
+            "execution-previous",
+            "/logs/previous.jsonl",
+        ] {
+            assert!(text.contains(expected), "{expected}: {text}");
+        }
+    }
+}
