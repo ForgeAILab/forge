@@ -23,6 +23,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  DEMO_PLATFORM: ${{ vars.DEMO_PLATFORM || 'linux/amd64' }}
 
 jobs:
   # Builds run in parallel across pull requests; only the deploy is serialized.
@@ -33,7 +34,7 @@ jobs:
     # a suite run on every push.
     if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && !github.event.pull_request.draft) }}
     name: Build demo image
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEMO_PLATFORM == 'linux/arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 90
     # A newer push to the same pull request supersedes its older build.
     concurrency:
@@ -58,6 +59,13 @@ jobs:
           TESTSPRITE_API_KEY: ${{ secrets.TESTSPRITE_API_KEY }}
         run: |
           set -euo pipefail
+          case "$DEMO_PLATFORM" in
+            linux/amd64|linux/arm64) ;;
+            *)
+              echo "::error::DEMO_PLATFORM must be linux/amd64 or linux/arm64. See docs/demo-instance.md."
+              exit 1
+              ;;
+          esac
           missing=0
           for name in DEMO_URL TESTSPRITE_PROJECT_ID DOKPLOY_COMPOSE_ID DOKPLOY_URL \
             DOKPLOY_API_KEY TESTSPRITE_API_KEY; do
@@ -118,6 +126,7 @@ jobs:
         with:
           context: .
           push: true
+          platforms: ${{ env.DEMO_PLATFORM }}
           tags: ${{ steps.ref.outputs.name }}:base-${{ steps.ref.outputs.tag }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
@@ -125,8 +134,8 @@ jobs:
           # request can read the cache of its base branch only, so a cache
           # written by a pull request run would be read by nobody else and
           # would only fill the repository's cache quota.
-          cache-from: type=gha,scope=demo-image
-          cache-to: ${{ github.event_name == 'workflow_dispatch' && 'type=gha,scope=demo-image,mode=max,ignore-error=true' || '' }}
+          cache-from: type=gha,scope=demo-image-${{ env.DEMO_PLATFORM }}
+          cache-to: ${{ github.event_name == 'workflow_dispatch' && format('type=gha,scope=demo-image-{0},mode=max,ignore-error=true', env.DEMO_PLATFORM) || '' }}
           provenance: false
 
       # Step 2: the demo image on top of it: the seeding entrypoint, the health
@@ -139,6 +148,7 @@ jobs:
         with:
           context: deploy/demo
           push: true
+          platforms: ${{ env.DEMO_PLATFORM }}
           tags: ${{ steps.ref.outputs.name }}:${{ steps.ref.outputs.tag }}
           build-args: |
             FORGE_BASE_IMAGE=${{ steps.ref.outputs.name }}@${{ steps.base.outputs.digest }}
@@ -203,7 +213,7 @@ jobs:
           IMAGE: ${{ steps.image.outputs.ref }}
         run: |
           set -euo pipefail
-          container="$(docker create "$IMAGE")"
+          container="$(docker create --platform "$DEMO_PLATFORM" "$IMAGE")"
           trap 'docker rm "$container" >/dev/null' EXIT
           docker cp "$container:/usr/local/share/forge/web/dist/demo-build.txt" "$RUNNER_TEMP/demo-build.txt"
           build_id="$(tr -d '\r\n' < "$RUNNER_TEMP/demo-build.txt")"
