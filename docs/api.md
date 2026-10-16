@@ -6169,8 +6169,12 @@ detail keys or malformed metadata still produce a server corruption error.
 
 Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `summary`, `where`, `expected`, `observed`, `first_attempt`,
-`last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`), and
-`streak`. Nullable text fields are `null` when unavailable. Reviewer ids are
+`last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`, `flaky`,
+`pre_existing`), `streak`, and optional `ci_triage` (the CI failure class of a
+triaged CI finding). `flaky` and `pre_existing` are CI findings that
+`review_ci_triage: full` waived: minor, with zero streak. Under `report` the same
+classes stay `open` and blocking, with `ci_triage` set. Nullable text fields are
+`null` when unavailable. Reviewer ids are
 `F1`, `F2`, ... in first-seen list order within the window. Known ids continue
 findings; unknown ids become new findings. A known id repeated within one
 review is one finding: its first occurrence continues it and later duplicates
@@ -6193,7 +6197,8 @@ existing verdict routing and retry budgets remain authoritative.
 
 Finished review comments show the headline, the ledger as a Markdown checklist
 (open unchecked, resolved in this review checked, unconfirmed labelled
-"not re-checked"), omitting earlier-resolved findings, and
+"not re-checked", waived CI findings labelled "flaky (non-blocking)" or
+"pre-existing (non-blocking)"), omitting earlier-resolved findings, and
 `Full review: Review tab, attempt N`. The full report stays in the Review API and
 Review tab. Reviews without findings retain at most the first 2 KiB of their
 report, truncated on a UTF-8 boundary. CI-only failures get the same checklist.
