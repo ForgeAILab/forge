@@ -38,3 +38,7 @@ async fn normal_environment_assets_copy() {
 async fn normal_integrations_unchanged() {
     support::integrations(false).await;
 }
+#[tokio::test]
+async fn normal_daemon_owned_repository_locations() {
+    support::daemon_owned_location(false).await;
+}

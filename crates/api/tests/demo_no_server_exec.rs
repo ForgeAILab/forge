@@ -280,3 +280,9 @@ async fn demo_seed_and_entrypoint_calls_succeed_under_the_policy() {
     .await;
     assert!(projects.to_string().contains("\"name\":\"Demo\""));
 }
+
+#[tokio::test]
+async fn demo_keeps_daemon_owned_repository_locations() {
+    demo();
+    support::daemon_owned_location(true).await;
+}

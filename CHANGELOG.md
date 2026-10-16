@@ -14,8 +14,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   command tools and terminals refuse before spawn. Review entries requiring CI park with the reason.
 - Demo mode runs no agent in the server process and reads nothing from the
   server through configuration. Adding provider credentials or authorizations
-  and admitting Chat turns return `422 server_agents_disabled`; any native turn
-  queued another way fails with that code before a provider request.
+  and admitting native Chat turns return `422 server_agents_disabled`; any
+  native turn queued another way fails with that code before a provider
+  request. CLI Agents on remote daemons are unaffected.
   Repositories must be `https://` remotes at a public address: local paths,
   `file://` and other non-https remotes, private hosts, option-like branch
   names and server-owned repository locations return

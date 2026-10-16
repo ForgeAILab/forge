@@ -5047,9 +5047,11 @@ The same demo switch refuses two more things, also with HTTP **422**:
 
 - `server_agents_disabled` ("This demo does not run agents or connect model
   providers"): `POST /api/v1/providers`, `POST /api/v1/provider-authorizations`
-  and Chat turn admission (`POST /api/v1/agent-chats/{id}/messages`, turn
-  retry, handoffs, Genesis start). Turns queued by any other path fail in the
-  agent runtime with the same code before a provider request. MCP reports
+  and admission of a Chat turn answered by a native (embedded) Agent (`POST
+  /api/v1/agent-chats/{id}/messages`, turn retry, handoffs, Genesis start);
+  Chats answered by a CLI Agent on a daemon are admitted. Native turns queued
+  by any other path fail in the agent runtime with the same code before a
+  provider request. MCP reports
   `-32602` with `data.code: "server_agents_disabled"`; native orchestration
   outcomes use the `server_commands_disabled` outcome code.
 - `server_location_refused` (message starts "This demo reads nothing from the
@@ -5059,7 +5061,7 @@ The same demo switch refuses two more things, also with HTTP **422**:
   private address, a `default_branch` that is not a valid Git branch name), a Task
   `merge_config.target_branch` that is not a valid Git branch name,
   repository sync of a stored local path, registering a server-owned or
-  `shared_mount` repository location, Project settings with
+  `shared_mount` repository location (daemon-owned locations are accepted), Project settings with
   `environment.assets`, `POST`/`PATCH /api/v1/projects/{id}/integration` and
   integration sync, and `POST /api/v1/config/mcp`. MCP reports `-32602` with
   `data.code: "server_location_refused"`; native outcomes use

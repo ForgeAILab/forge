@@ -116,15 +116,19 @@ that Project settings cannot turn off. It refuses three things, each with HTTP
 - **Agents** (`server_agents_disabled`, "This demo does not run agents or
   connect model providers"): adding a provider credential (`POST
   /api/v1/providers`) or starting a provider authorization, and admitting a
-  Chat turn (send, retry, handoff, Genesis). Project Agent wakes admit no turn.
-  Any native turn that reaches the agent runtime by another path (inquiries,
-  native Task executions, topic rotation) fails with the same code before a
-  provider request.
+  Chat turn whose responder is a native (embedded) Agent (send, retry,
+  handoff, Genesis); Project Agent wakes admit no native turn. Any native turn
+  that reaches the agent runtime by another path (inquiries, native Task
+  executions, topic rotation) fails with the same code before a provider
+  request. CLI Agents placed on a remote daemon, and Chats answered by them,
+  are not affected: they run on the daemon's machine.
 - **Server files and data** (`server_location_refused`): a repository or
   repository location on the server's filesystem (a local path, `file://`, any
   non-`https` URL, or a host that is local, private or resolves to such an
   address; the provider-request address policy is reused), a branch name Git
-  could read as an option, a server-owned repository location, Project
+  could read as an option, a server-owned repository location (including a
+  `shared_mount`; daemon-owned locations, paths on the daemon's machine, stay
+  allowed), Project
   environment assets (they copy server files into a worktree), issue-tracker
   integrations (their token is read from the server's environment) and writes
   of agent configuration files (`POST /api/v1/config/mcp`). Stored

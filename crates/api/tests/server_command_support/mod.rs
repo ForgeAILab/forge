@@ -505,12 +505,9 @@ pub async fn provider_and_chat_turns(disabled: bool) {
             "server_agents_disabled",
             "provider authorization",
         );
-        assert_refused(&message, "server_agents_disabled", "chat message");
-        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job")
-            .fetch_one(harness.state.db.pool())
-            .await
-            .unwrap();
-        assert_eq!(turns, 0, "no turn is queued");
+        // Only a native responder runs in the server; a Chat without one (or
+        // with a CLI responder on a daemon) is admitted as before.
+        assert_ne!(message.1["code"], "server_agents_disabled", "{}", message.1);
     } else {
         assert_eq!(provider.0, StatusCode::OK, "{}", provider.1);
         assert_ne!(message.1["code"], "server_agents_disabled", "{}", message.1);
@@ -698,4 +695,64 @@ pub async fn send_with_bearer(
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+/// A daemon-owned repository location is a path on the daemon's machine, not
+/// the server's: demo mode keeps it.
+pub async fn daemon_owned_location(disabled: bool) {
+    let (_root, harness, _, repo_id, _) = fixture("demo-daemon-location").await;
+    let now = db::now_rfc3339();
+    let daemon_id = db::new_uuid_v4();
+    db::DaemonRepo::upsert_by_machine_id(
+        &*harness.state.db,
+        db::UpsertDaemon {
+            max_concurrent_runs: None,
+            id: daemon_id.clone(),
+            machine_id: db::new_uuid_v4(),
+            hostname: "visitor".to_owned(),
+            os: "linux".to_owned(),
+            arch: "aarch64".to_owned(),
+            agent_version: None,
+            labels_json: "{}".to_owned(),
+            status: db::DaemonStatus::Online,
+            registration_token_hash: None,
+            owner_id: Some("test-user-id".to_owned()),
+            visibility: "account".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let runtime_id = db::new_uuid_v4();
+    db::RuntimeRepo::create(
+        &*harness.state.db,
+        db::CreateRuntime {
+            id: runtime_id.clone(),
+            daemon_id: daemon_id.clone(),
+            kind: "cli".to_owned(),
+            workspace_root: "/remote/workspaces".to_owned(),
+            status: db::RuntimeStatus::Ready,
+            labels_json: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let response = send(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/repos/{repo_id}/locations"),
+        json!({"owner_kind":"daemon","daemon_id":daemon_id,"runtime_id":runtime_id,
+            "path":"/remote/workspaces/repo","kind":"primary_checkout"}),
+    )
+    .await;
+    assert_eq!(
+        response.0,
+        StatusCode::OK,
+        "demo={disabled}: {}",
+        response.1
+    );
+    assert_eq!(response.1["path"], "/remote/workspaces/repo");
 }
