@@ -843,7 +843,9 @@ async fn poll_until_executor_attempts(
     task_id: &str,
     expected_executor_count: usize,
 ) -> Vec<ExecutionSummaryResponse> {
-    for _ in 0..100 {
+    // The convergence case runs three full candidate/reviewer cycles (about
+    // 4 s alone); a loaded suite run needs far more than a 5 s budget.
+    for _ in 0..600 {
         let executions = executions_for_task(app, task_id).await;
         let executor_count = executions
             .iter()
