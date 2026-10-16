@@ -1649,6 +1649,23 @@ fn repair_brief_limits_ci_findings_across_open_and_resolved_sections() {
 }
 
 #[test]
+fn repair_brief_does_not_call_a_step_replaced_by_test_findings_resolved() {
+    let ci = |attempt, failures: serde_json::Value| {
+        db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":101,"stderr_tail":"error[E0425]","failures":failures}]}).to_string(),
+        ..fake_review(attempt, db::ReviewStatus::Failed)
+    }
+    };
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![ci(1, json!([])), ci(2, json!(["parser::empty"]))];
+    let text = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2)
+        .build(&ctx)
+        .user;
+    assert!(text.contains("- CI-0#"), "{text}");
+    assert!(!text.contains("CI-0: resolved"), "{text}");
+}
+
+#[test]
 fn repair_brief_hard_cap_clips_fifty_long_findings_and_lists_the_rest_by_id() {
     let long = |tag: &str, index: usize| format!("{tag}{index:02}{}", "x".repeat(998));
     let findings: Vec<_> = (0..50)

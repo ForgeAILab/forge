@@ -203,8 +203,9 @@ impl RepairBrief {
         Self {
             task, round,
             open: ledger.iter().filter(|entry| entry.status == Status::Open).cloned().collect(),
-            updates: ledger.into_iter().filter(|entry| entry.status != Status::Open && entry.last_checked_attempt == attempt
-                && !previous_ledger.iter().any(|prior| prior.id == entry.id && prior.status == entry.status)).collect(),
+            updates: ledger.iter().filter(|entry| entry.status != Status::Open && entry.last_checked_attempt == attempt
+                && !review::findings::superseded_by_tests(entry, &ledger)
+                && !previous_ledger.iter().any(|prior| prior.id == entry.id && prior.status == entry.status)).cloned().collect(),
             checks, verify: render_verify(&details["verify"]), report,
             previous: ctx.previous_coder_summary.clone().unwrap_or_default(), logs,
             merge: None,

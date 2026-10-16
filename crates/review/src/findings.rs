@@ -19,6 +19,21 @@ pub fn ci_finding_id(step: usize, signature: &str) -> String {
     )
 }
 
+/// A step-level `CI-<n>` the ledger closed because the step's failures are now
+/// tracked per test. The step did not pass, so it is not a resolution to show.
+pub fn superseded_by_tests(entry: &ReviewFindingEntry, ledger: &[ReviewFindingEntry]) -> bool {
+    entry.source == Source::Ci
+        && entry.status == Status::Resolved
+        && !entry.id.contains('#')
+        && ledger.iter().any(|other| {
+            other.status == Status::Open
+                && other
+                    .id
+                    .strip_prefix(entry.id.as_str())
+                    .is_some_and(|rest| rest.starts_with('#'))
+        })
+}
+
 /// Derive every finding, ordered naturally by id. The API's 200-item limit is
 /// applied only after derivation, so hidden entries still reserve their ids.
 pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntry>, String> {

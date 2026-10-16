@@ -3288,13 +3288,15 @@ fn current_comment_findings(
 ) -> Vec<api_types::ReviewFindingEntry> {
     use api_types::ReviewFindingStatus as Status;
     ledger
-        .into_iter()
+        .iter()
         .filter(|entry| {
             entry.status != Status::Resolved
-                || !previous
-                    .iter()
-                    .any(|prior| prior.id == entry.id && prior.status == Status::Resolved)
+                || (!::review::findings::superseded_by_tests(entry, &ledger)
+                    && !previous
+                        .iter()
+                        .any(|prior| prior.id == entry.id && prior.status == Status::Resolved))
         })
+        .cloned()
         .collect()
 }
 
@@ -3951,6 +3953,38 @@ mod reviewer_message_tests {
         }
         assert!(text.contains("Also in the ledger (see the Review tab): "));
         assert!(text.ends_with("Full review: Review tab, attempt 2"));
+    }
+    #[test]
+    fn review_comment_does_not_tick_a_step_finding_replaced_by_test_findings() {
+        let review = |attempt, failures: Value| {
+            db::Review {
+            id: format!("r{attempt}"),
+            task_id: "task".into(),
+            execution_id: "candidate".into(),
+            reviewer_execution_id: None,
+            auditor_execution_id: None,
+            attempt_number: attempt,
+            status: ReviewStatus::Failed,
+            step_results_json: json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":101,"stderr_tail":"error[E0425]","failures":failures}]}).to_string(),
+            started_at: "now".into(),
+            finished_at: None,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        }
+        };
+        let prior = ::review::finding_ledger(&[review(1, json!([]))]).unwrap();
+        let ledger =
+            ::review::finding_ledger(&[review(1, json!([])), review(2, json!(["parser::empty"]))])
+                .unwrap();
+        let ledger = current_comment_findings(ledger, &prior);
+        let text = reviewer_comment(ReviewStatus::Failed, 2, &conformance(None), &ledger, None);
+        assert!(text.contains("- [ ] CI-0#"), "{text}");
+        assert!(!text.contains("[x] CI-0"), "{text}");
+        let repair = repair_round_comment(2, 1, 3, &ledger, "review");
+        assert!(
+            repair.ends_with("none resolved since the last round."),
+            "{repair}"
+        );
     }
     #[test]
     fn reviewer_comment_does_not_repeat_resolutions_on_later_passing_checks() {
