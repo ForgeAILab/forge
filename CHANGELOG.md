@@ -8,6 +8,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
+- Demo mode refuses every command the server would run from user configuration.
+  Command-bearing Project, Task and workflow writes return `422 server_commands_disabled`;
+  stored hooks, checks, environment setup, scaffolds, executors, native Chat
+  command tools and terminals refuse before spawn. Review entries requiring CI park with the reason.
+
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
   memory and coordination records, to the authenticated caller. Any signed-in
@@ -30,6 +35,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   earliest administrator owns it.
 
 ### Breaking
+
+- `forge --demo` no longer executes configured server commands or starts the
+  embedded daemon. Git operations performed by Forge remain available.
 
 - **Project access and mutation roles are now enforced across REST, MCP and
   SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its

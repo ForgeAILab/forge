@@ -526,6 +526,7 @@ impl TaskService {
         };
         let task_state_config =
             merge_review_requirement_ids(task_state_config, &payload.review_requirement_ids)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
         let metadata_json = parent.as_ref().and_then(|_| {
             db::TaskMetadata {
                 ..db::TaskMetadata::default()

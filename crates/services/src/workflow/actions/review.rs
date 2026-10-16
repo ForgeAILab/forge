@@ -121,6 +121,11 @@ impl HookAction for RunCiSteps {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        if review_ci_steps(&ctx.state_config).is_ok_and(|steps| !steps.is_empty()) {
+            if let Err(error) = executors::server_commands::ensure_allowed() {
+                return interrupt_ci(ctx, &task, &error.to_string(), false, false).await;
+            }
+        }
         match prepare_review_entry(ctx, &task).await {
             Ok(Some(result)) => return result,
             Ok(None) => {}

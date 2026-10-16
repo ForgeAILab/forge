@@ -5028,6 +5028,21 @@ All errors render as:
 }
 ```
 
+In demo mode (`forge --demo`), command-bearing Project settings, Task state
+configuration, workflow/template definitions and scaffold configuration are
+refused with HTTP **422**, code `server_commands_disabled`, and message
+`This demo does not run commands`. This includes Script lifecycle hooks,
+review `ci_steps`/`setup_steps`, environment check commands and Project command
+allowlists. Empty CI/setup/environment-check lists can be saved to remove
+configuration. REST and
+MCP use the shared domain validation; MCP reports `-32602` with
+`data.code: "server_commands_disabled"`. Native orchestration outcomes use the
+same code with status `failed`. Stored commands are also refused at execution:
+hook/check results retain the reason and review entry requiring CI parks the
+Task. Native Chat command tools also refuse execution, including when a visitor
+connects their own provider credential; other native tools keep their permissions.
+Forge's built-in Git operations remain available. Normal mode is unchanged.
+
 Common HTTP mappings:
 
 | Status | When |
@@ -5403,6 +5418,7 @@ records when the operation produced them.
 | `transient_failure` | The operation may succeed after the bounded retry guidance is followed. |
 | `internal_failure` | The operation failed without a safe caller-facing diagnosis. |
 | `validation_error` | The operation or its closed arguments are invalid. |
+| `server_commands_disabled` | Demo mode refuses configured server commands. |
 
 `status` is one of `succeeded`, `approval_required`, `setup_required`, or
 `failed`. `ok` maps to `succeeded`; `approval_required` and `setup_required`

@@ -11,6 +11,9 @@ use crate::{
 };
 
 pub fn validate_workflow(def: &WorkflowDefinition) -> Result<(), ServiceError> {
+    crate::server_commands::validate_configuration(
+        &serde_json::to_value(def).map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+    )?;
     let initial_states = def
         .states
         .iter()

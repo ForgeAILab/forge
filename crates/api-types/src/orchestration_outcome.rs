@@ -24,6 +24,7 @@ pub enum OutcomeCode {
     TransientFailure,
     InternalFailure,
     ValidationError,
+    ServerCommandsDisabled,
     ActionUnavailable,
 }
 
@@ -44,6 +45,7 @@ impl OutcomeCode {
             Self::TransientFailure => "transient_failure",
             Self::InternalFailure => "internal_failure",
             Self::ValidationError => "validation_error",
+            Self::ServerCommandsDisabled => "server_commands_disabled",
             Self::ActionUnavailable => "action_unavailable",
         }
     }
@@ -629,6 +631,7 @@ impl OrchestrationOutcome {
             | OutcomeCode::TransientFailure
             | OutcomeCode::InternalFailure
             | OutcomeCode::ValidationError
+            | OutcomeCode::ServerCommandsDisabled
             | OutcomeCode::ActionUnavailable => OutcomeStatus::Failed,
         }
     }

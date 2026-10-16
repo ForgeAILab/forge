@@ -108,6 +108,7 @@ impl TaskService {
         let title = title.into();
         validate_required("project_id", &project_id)?;
         validate_required("title", &title)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
 
         let mut unique_dependency_ids = HashSet::with_capacity(dependency_ids.len());
         for dependency_id in &dependency_ids {
@@ -454,6 +455,7 @@ impl TaskService {
         let title = title.into();
         validate_required("project_id", &project_id)?;
         validate_required("title", &title)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
 
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?

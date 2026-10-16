@@ -238,6 +238,12 @@ impl IntoResponse for ApiError {
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {
+            ServiceError::ServerCommandsDisabled => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: executors::server_commands::CODE,
+                message: executors::server_commands::MESSAGE.to_owned(),
+                details: None,
+            },
             ServiceError::TaskBusy {pending_steps,retry_after_ms} => Self::conflict_with_code_and_details(api_types::TASK_BUSY,
                 "Task has pending steps; accepted work remains queued",serde_json::to_value(api_types::TaskBusyDetails {
                     pending_steps,retry_after_ms,retry_hint:"Retry after pending steps settle; refetch the Task version first".to_owned(),

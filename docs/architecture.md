@@ -994,6 +994,28 @@ assigned explicitly. Read-only planning/discovery and write-capable
 implementation both derive authority from the current Charter and their Task
 workflow.
 
+#### Demo server command policy
+
+The CLI enables `executors::server_commands` once, before runtime composition,
+when `--demo` is present. The process-wide decision is monotonic and cannot be
+changed by stored settings. No new flag, database field or daemon policy is
+introduced. Demo startup also omits the embedded daemon. Normal server and
+separate daemon processes keep their existing behavior.
+
+`services::server_commands::validate_configuration` is shared by Project
+settings, workflow/template validation, Task overrides and Charter scaffold
+writes, including native command boundaries. Refusals are typed
+`ServiceError::ServerCommandsDisabled`: REST 422, MCP `-32602`, and code
+`server_commands_disabled` with the message "This demo does not run commands".
+Execution sources independently consult the same decision before shell probes,
+hook/check/environment commands, scaffold processes, CLI/shell executors,
+native Chat command tools, compiler-cache helpers or embedded terminals can start. Stored asynchronous
+hooks also leave the ordinary hook-not-run comment on the Task. Review entry
+with configured CI records the refusal through the existing interruption park,
+without spending retries or leaving a suspended check consumer. Stored durable
+checks return unstarted infrastructure receipts carrying the refusal. Forge's
+own Git operations remain outside this policy.
+
 #### Project environment
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,

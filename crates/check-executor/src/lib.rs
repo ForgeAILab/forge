@@ -143,6 +143,8 @@ pub async fn inherited_environment() -> Result<InheritedEnvironment, ProbeUnansw
 }
 /// `home` replaces the inherited `HOME`, so a test can supply a profile.
 async fn probe_environment(home: Option<&Path>) -> Result<InheritedEnvironment, ProbeUnanswered> {
+    executors::server_commands::ensure_allowed()
+        .map_err(|e| ProbeUnanswered::NotStarted(e.to_string()))?;
     PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // `compgen -e`: the exported names. Works on bash 3.2.
     let script = format!(
@@ -366,6 +368,7 @@ fn sandboxed_command(
     policy: &str,
     sandbox: &executors::sandbox::SandboxEnv,
 ) -> Result<(Command, BTreeMap<String, String>), String> {
+    executors::server_commands::ensure_allowed().map_err(|e| e.to_string())?;
     if spec.shell != "bash -lc" {
         return Err("unsupported check shell".into());
     }
@@ -629,6 +632,14 @@ pub fn unstarted_receipt(
 }
 
 pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
+    if let Err(error) = executors::server_commands::ensure_allowed() {
+        return unstarted_receipt(
+            input.operation_id,
+            input.owner.clone(),
+            CheckExecutionOutcome::Infrastructure,
+            Some(error.to_string()),
+        );
+    }
     let mut receipt = unstarted_receipt(
         input.operation_id,
         input.owner.clone(),

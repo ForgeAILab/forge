@@ -175,7 +175,9 @@ impl TaskService {
                 attempts,
             );
         let retry = retry && !exhausted;
-        let kind = if reset {
+        let kind = if reason.starts_with(executors::server_commands::CODE) {
+            executors::server_commands::CODE
+        } else if reset {
             "workspace_reset_required"
         } else if retry {
             "review_ci_infrastructure"

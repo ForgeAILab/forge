@@ -558,6 +558,22 @@ impl TaskService {
                 "only running executions can be executed",
             ));
         }
+        if executors::server_commands::ensure_allowed().is_err() {
+            // Remote execution belongs to its daemon. A legacy workspace
+            // without a placement is server-owned until resolved otherwise.
+            let placement = match execution.workspace_id.as_deref() {
+                Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id).await?,
+                None => None,
+            };
+            if placement.is_none_or(|p| p.execution_daemon_id.is_none()) {
+                return self
+                    .fail_execution_before_dispatch(
+                        &execution.id,
+                        executors::server_commands::ServerCommandsDisabled.to_string(),
+                    )
+                    .await;
+            }
+        }
         if let Some(failed) = self
             .wait_for_agent_active_before_dispatch(&execution)
             .await?

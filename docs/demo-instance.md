@@ -31,8 +31,9 @@ _Not published yet._
   a placeholder Agent (`Null Default`), a placeholder daemon record and 14
   Tasks spread over `backlog`, `todo`, `in_progress`, `review`, `done` and
   `blocked`.
-- **No agent daemon.** `--no-embedded-daemon`: nothing on the host launches a
-  coding agent.
+- **No embedded execution daemon.** Demo mode skips its startup; the deployment
+  also passes `--no-embedded-daemon`. Server CLI/shell Agent launches are refused.
+  Native Chat turns using visitor-supplied credentials are described below.
 - **No MCP endpoint.** `--no-mcp`: `POST /mcp` is not served.
 - **No provider credentials.** The instance is started without any model
   provider key.
@@ -95,46 +96,43 @@ in. Through the product, a visitor's account is an ordinary one.
 
 A visitor who registers their own account starts with no Projects and can use
 the product as an ordinary user: create Projects and Tasks of their own.
-Nothing they create runs an agent, because no daemon is attached and no
-provider is configured.
+The instance supplies no model credentials and starts no embedded daemon.
+A visitor can connect their own provider credential and run native Chat turns;
+the demo policy also refuses those turns' server-side command tools. Other
+native tools keep their existing permissions.
 
-**Known limit — read before publishing the URL.** `--no-embedded-daemon` stops
-agent runs. It does not remove every place where the server process itself
-starts a shell command: Project lifecycle hooks and review check steps are
-`bash -lc` commands run by the server
-(`crates/services/src/lifecycle/runner.rs` and the review check runner under
-`crates/review/`), and any signed-in user can create a Project
-and edit its settings. Whether a visitor can make one of those commands run on
-an instance without a daemon has not been tested. Until it is, treat a
-signed-in visitor as someone who may be able to run a command **inside the
-`forge` container**, as the user the server runs as. Such a visitor can:
+**Demo command policy.** `--demo` refuses commands the server would run from
+user configuration, including Script lifecycle hooks, review CI and setup
+steps, environment checks/setup, scaffolding, server Agent executors, native Chat command tools and
+interactive terminals. Project settings, Task overrides and workflow/template
+writes containing these commands return HTTP **422** with code
+`server_commands_disabled` and message **"This demo does not run commands"**.
+The same domain rule applies through MCP if it is enabled separately.
 
-- read and change the instance's database and signing key, and so make any
-  account an administrator and read or change every other visitor's data;
-- **open connections from the container.** The service sits on Dokploy's
-  shared proxy network, which has a route to the internet and to every other
-  application on that network. A command in the container can send data out,
-  fetch tools, scan or call the other applications that Dokploy hosts, and
-  reach services of the host that listen on Docker's bridge addresses. The
-  earlier design of this demo had no outbound network; with Dokploy's proxy
-  that is not possible, because the proxy must reach the service over a
-  shared network. This makes the limit above worse than it was.
+Previously stored, seeded or template-derived commands are refused before
+spawning. Script hooks record failed results; asynchronous lifecycle refusals
+also appear in the Task's comments. A review entry requiring CI parks the Task
+with that reason, without scheduling commands or silently approving the Task.
+Environment checks return failed results with the refusal. This policy comes
+only from `--demo`; Project settings cannot turn it off. Demo mode also skips
+embedded-daemon startup. Ordinary installations keep their execution behavior.
 
-What the container still keeps from them: the host's filesystem and Docker
-socket (nothing is mounted), Linux capabilities, and more memory, CPU or
-processes than the limits allow. Storage: the root filesystem is read-only,
-and the only writable places are memory-backed filesystems with a size cap
-each (`/data`, `/data/logs`, `/tmp`, and Docker's own 64 MB `/dev/shm`), all
-counted against the memory limit. That list was drawn up by reading where
-Forge writes (data directory, log directory, the system temp directory,
-`HOME`, which the entrypoint points into `/tmp`); it was not confirmed on a
-running container, where a write to any other path now fails instead of
-filling the host's disk.
+**Git and network access remain.** Forge still performs its own Git operations
+(clone, fetch, worktree, merge and inspection) with Forge-built arguments.
+Repository setup can therefore consume resources and make outbound Git
+connections. Provider requests also remain available, subject to their existing
+HTTPS/public-address validation. The container remains attached to Dokploy's shared proxy network,
+which can reach the internet and other applications on that network. This
+change removes configured server command execution; it does not isolate that
+network or make repository access an outbound-network policy. Use a dedicated
+demo host/instance and keep unrelated services off that shared network.
 
-**Consequences for where to host it.** Do not put the demo on a Dokploy server
-that also runs anything you care about. Use a server (or at least a Dokploy
-instance) that hosts only the demo, and keep services on it from listening on
-all interfaces.
+The container still has a read-only root filesystem, no host filesystem or
+Docker-socket mounts, dropped Linux capabilities, and memory, CPU and process
+limits. Its writable places are capped memory-backed filesystems (`/data`,
+`/data/logs`, `/tmp` and Docker's 64 MB `/dev/shm`), counted against the memory
+limit. These deployment properties were reviewed from configuration; this
+change was verified without starting the demo container.
 
 Other limits:
 
@@ -156,8 +154,8 @@ Other limits:
   on the host** (`docker inspect`) and to anyone who can read the Dokploy
   application's environment. Inside the container, the Forge process does not
   carry them, but the init process (`init: true`, there to reap orphaned
-  child processes) keeps the environment it was started with: a visitor who
-  can run commands in the container can read both passwords from it.
+  child processes) keeps the environment it was started with. The demo
+  command refusal does not change host/operator access to those secrets.
 
 A visitor cannot use MCP, cannot use a model provider that the instance owner
 paid for (there is none), and cannot keep anything across a restart.

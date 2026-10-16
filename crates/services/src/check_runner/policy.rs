@@ -161,6 +161,9 @@ pub async fn attest(
     db: &db::SqliteDb,
     project: &BTreeMap<String, String>,
 ) -> Result<ServerCheckExecutionInputs> {
+    // Refuse before reading a cached attestation or mapping a denied probe
+    // to a transient environment outage. Every consumer keeps the typed cause.
+    executors::server_commands::ensure_allowed()?;
     let generation = server_environment_generation().to_owned();
     #[cfg(test)]
     let generation = {

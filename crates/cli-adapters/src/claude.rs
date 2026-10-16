@@ -267,6 +267,8 @@ impl ClaudeCodeAdapter {
 
         let hook_path = install_stop_hook(Path::new(&ctx.worktree_path)).await?;
 
+        executors::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut child = cmd.group_spawn()?;
         let stdin = match child.inner().stdin.take() {
             Some(stdin) => stdin,

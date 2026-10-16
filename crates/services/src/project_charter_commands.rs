@@ -921,6 +921,10 @@ impl ProjectCharterCommandService {
 }
 
 fn validate_revision_command(command: &ProjectCharterRevisionCommand) -> Result<()> {
+    crate::server_commands::validate_configuration(
+        &serde_json::to_value(&command.content)
+            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+    )?;
     if command.expected_charter_version < 0 {
         return Err(ServiceError::invalid_operation(
             "expected_charter_version must not be negative",

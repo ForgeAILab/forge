@@ -302,6 +302,7 @@ pub(crate) mod review_error {
 
 #[derive(Deserialize)]
 pub(super) enum StoredServiceError {
+    ServerCommandsDisabled,
     TaskBusy {
         pending_steps: i64,
         retry_after_ms: u64,
@@ -484,6 +485,7 @@ impl From<StoredServiceError> for ServiceError {
                 failure,
                 error: Box::new((*error).into()),
             },
+            StoredServiceError::ServerCommandsDisabled => Self::ServerCommandsDisabled,
             StoredServiceError::InvalidOperation { message } => Self::InvalidOperation { message },
             StoredServiceError::ExecutionAlreadyRunning {
                 scope,

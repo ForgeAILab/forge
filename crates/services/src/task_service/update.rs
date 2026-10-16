@@ -9,6 +9,9 @@ impl TaskService {
         request: UpdateTaskRequest,
     ) -> Result<Task> {
         let task_id: String = task_id.into();
+        if let Some(config) = &request.task_state_config {
+            crate::server_commands::validate_configuration(config)?;
+        }
         if !db::task_writer::owns_task(&task_id)
             && (request.review_requirement_ids.is_some()
                 || request.parent_task_id.is_some()

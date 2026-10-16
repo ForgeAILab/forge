@@ -95,6 +95,9 @@ fn main() {
 
 async fn run() {
     let cli = Cli::parse();
+    if cli.demo {
+        executors::server_commands::disable();
+    }
     let config = ForgeConfig::load(
         None,
         ConfigOverrides {
@@ -215,7 +218,7 @@ async fn run() {
         api_base_url = %local_url(addr.port(), "/api/v1"),
         healthz_url = %local_url(addr.port(), "/healthz"),
         mcp_enabled = effective_config.server.mcp_enabled,
-        embedded_daemon_enabled = !cli.no_embedded_daemon,
+        embedded_daemon_enabled = !cli.no_embedded_daemon && !cli.demo,
         demo_mode = cli.demo,
         data_dir = %effective_config.forge.data_dir.display(),
         db_path = %db_path.display(),
@@ -290,7 +293,7 @@ async fn run() {
         .set_legacy_temp_dir(std::env::temp_dir());
     runtime.enable_disk_admission();
 
-    let embedded_daemon = if cli.no_embedded_daemon {
+    let embedded_daemon = if cli.no_embedded_daemon || cli.demo {
         None
     } else {
         Some(Arc::new(

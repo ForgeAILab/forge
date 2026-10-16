@@ -412,6 +412,14 @@ pub async fn run_environment_check(
     env: &BTreeMap<String, String>,
     check: &EnvironmentCheck,
 ) -> EnvironmentCheckResult {
+    if let Err(error) = crate::server_commands::ensure_allowed() {
+        return EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: false,
+            output_tail: error.to_string(),
+        };
+    }
     let run_scope =
         crate::sandbox::SandboxEnv::for_command(worktree, crate::sandbox::RunPurpose::Probe);
     let mut command = environment_check_command(worktree, env, check, run_scope.env());

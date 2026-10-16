@@ -1692,6 +1692,13 @@ async fn run_scaffold_command(
     dir_name: &str,
     scaffold: &CharterScaffold,
 ) -> std::result::Result<String, ScaffoldFailure> {
+    if let Err(error) = executors::server_commands::ensure_allowed() {
+        return Err(ScaffoldFailure {
+            code: executors::server_commands::CODE,
+            message: error.to_string(),
+            output_tail: String::new(),
+        });
+    }
     let Some((program, base_args)) = command.split_first() else {
         return Err(ScaffoldFailure {
             code: "scaffold_runtime_unavailable",
