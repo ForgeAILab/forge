@@ -3499,8 +3499,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
-- Verification reruns accept custom workflow review state names, charge the
-  invocation budget, and apply the review state's limits and Project defaults.
+- A custom workflow's renamed review gate (a gate with the `reviewer` role in
+  the `review` phase) is budgeted like `review`: verification reruns run and
+  charge their invocation budget, Project default review configuration
+  applies, gate rejections spend the Task's `review` and `gate:review`
+  budgets instead of `gate:<state>`, and, as for `review`, its entry is not
+  parked by the gate cap. Spending already
+  recorded under `gate:<state>` for such a gate is not carried over. A
+  reviewer-role gate in another phase keeps its own gate budget.
+
 - The Docker image runs Forge under Tini so orphaned verification and CI
   descendants are reaped and process groups can finish stopping.
 

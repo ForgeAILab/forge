@@ -6794,7 +6794,9 @@ JSON output passes these through. The web displays remaining budgets and uses
 server-resolved limits in its editor, rather than reconstructing defaults.
 
 Gate state names remain keys (`planning`, `review`, `merging`, custom gate names).
-The cancelled-review entry cap is exposed as `review_gate`. The web's
+The cancelled-review entry cap is exposed as `review_gate`. A renamed review
+gate (a gate with the `reviewer` role in the `review` phase) is projected like
+`review`: its key carries the review allowance and `review_gate` is present. The web's
 "Remaining budget" panel shows only kinds with an active limit for the Task: it
 omits `report_correction`, `review_gate`, and `automatic_review_recovery` while
 recovery is disabled.
