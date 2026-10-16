@@ -159,6 +159,12 @@ async fn demo_server_paths_and_non_public_remotes_are_refused() {
     support::repository_inputs(true).await;
 }
 
+#[tokio::test]
+async fn demo_environment_assets_are_refused_without_copy() {
+    demo();
+    support::environment_assets(true).await;
+}
+
 /// The demo container's startup under the policy: `--demo` seeding, then
 /// exactly the REST calls of `deploy/demo/forge-demo-entrypoint.sh`.
 #[tokio::test]

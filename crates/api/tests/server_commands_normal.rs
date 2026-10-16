@@ -30,3 +30,7 @@ async fn normal_provider_credentials_and_chat_turns_unchanged() {
 async fn normal_repository_inputs_unchanged() {
     support::repository_inputs(false).await;
 }
+#[tokio::test]
+async fn normal_environment_assets_copy() {
+    support::environment_assets(false).await;
+}

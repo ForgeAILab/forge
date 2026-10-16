@@ -604,6 +604,38 @@ pub async fn repository_inputs(disabled: bool) {
     }
 }
 
+/// Environment assets copy absolute server paths into a worktree.
+pub async fn environment_assets(disabled: bool) {
+    let (root, harness, project, _, _) = fixture("demo-environment-assets").await;
+    let secret = root.path().join("server-secret");
+    std::fs::write(&secret, "server secret").unwrap();
+    let assets = json!([{"source":secret.to_string_lossy(),"target":"copied-secret"}]);
+    let row = db::ProjectRepo::get_by_id(&*harness.state.db, &project)
+        .await
+        .unwrap()
+        .unwrap();
+    let response = send(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project}"),
+        json!({"version":row.version,"settings":{"environment":{"assets":assets}}}),
+    )
+    .await;
+    let worktree = root.path().join("asset-worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let assets: Vec<api_types::EnvironmentAsset> = serde_json::from_value(assets).unwrap();
+    let copied = executors::environment::materialize_assets(&worktree, &assets).await;
+    if disabled {
+        assert_refused(&response, "server_location_refused", "environment assets");
+        assert!(copied.unwrap_err().contains("server_location_refused"));
+        assert!(!worktree.join("copied-secret").exists());
+    } else {
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        copied.unwrap();
+        assert!(worktree.join("copied-secret").exists());
+    }
+}
+
 pub async fn send_with_bearer(
     app: &axum::Router,
     method: Method,

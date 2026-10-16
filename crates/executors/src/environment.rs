@@ -169,6 +169,14 @@ pub async fn materialize_assets(
     worktree: &Path,
     assets: &[EnvironmentAsset],
 ) -> Result<(), String> {
+    // Demo: an asset source is a file on the server's filesystem.
+    if !assets.is_empty() && crate::server_commands::manager_only() {
+        return Err(format!(
+            "{}: {}: environment assets copy files from the server",
+            crate::server_commands::LOCATION_CODE,
+            crate::server_commands::LOCATION_MESSAGE
+        ));
+    }
     let worktree = worktree.to_path_buf();
     let assets = assets.to_vec();
     tokio::task::spawn_blocking(move || {
