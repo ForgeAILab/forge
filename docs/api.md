@@ -6219,31 +6219,43 @@ results (`step_results` and `details.ci_steps`) accept optional
 `failures: string[]` and `failures_truncated: boolean`. Missing fields mean `[]`
 and `false`; empty/false fields are omitted when serialized, including receipts
 from older daemons, with no daemon protocol revision. Signatures identify failing
-cargo, vitest/jest, pytest or Go tests, or failed/errored JUnit cases. They are
-ANSI-free, have durations and absolute checkout and Task-root prefixes removed
+cargo test/nextest, vitest/jest, pytest or Go tests, or failed/errored JUnit
+cases. They are ANSI-free, have durations and absolute checkout and Task-root prefixes removed
 (so they are repository-relative), are redacted before normalisation, and are
 bounded to 200 distinct entries of 300 Unicode characters per step. Stored
 `output_tail` and `stderr_tail` are ANSI-free text, each under its existing
 4096-byte budget. The durable result's 256 KiB aggregate budget can further
 truncate signature lists after shrinking tails; `failures_truncated` reports it.
 Unknown runners retain empty signatures and ordinary step-level failure output.
+The glyphs `×`, `✗` and `●` identify failures only inside recognised vitest/jest
+output blocks, ending at their summary; a jest `FAIL <file>` line opens one for
+any JS/TS file. Nextest signatures include the binary and test name, without
+durations or progress counters, for failed, timed-out and signalled tests (the
+final attempt under retries).
 
 Forge exports `FORGE_CI_REPORT_DIR` to each check command. Write `*.xml` JUnit
 reports there (subdirectories are accepted). The directory is isolated per
 command, inside the reserved Task root when available, and removed after
-collection. Reports are optional; malformed XML is ignored. Collection reads at
-most 200 directory entries, 4 MiB per file and 16 MiB in total, without
+collection. Abandoned report directories with Forge-generated names under
+`.forge-task` are removed at the next check command, without following symbolic
+links or deleting unrelated entries. Reports are optional; malformed XML is
+ignored. Collection reads at most 200 directory entries, 4 MiB per file and 16 MiB in total, without
 following symbolic links.
 CI repair prompts include every failing step, up to 20 signatures per step,
 then `+N more`. Step output follows while the prompt's 8 KiB output allowance
 lasts; later steps show their command and signatures only.
 
 After a coder repair, entering review with the same clean HEAD as the latest
-failed Review in the current budget window starts no checks or reviewer and
-creates no Review. The first occurrence sends the Task back with "No change
-since review N" and spends the persistent `repair_no_change` allowance (fixed
-limit 1); the second parks it as `review_needs_owner` with
-`no change after repair round`. Review and gate-rejection budgets are unchanged.
+Review in the current budget window starts no checks or reviewer and creates no
+Review only if that latest Review failed. A later pass suppresses an older
+failure. An offline entry retry retains the original source state and actor,
+so reconnect still evaluates the repair gate and preserves owner exemptions.
+A reminder clears the resolved infrastructure blocker before returning to the
+coder. Entries already suspended before the gate shipped continue from their
+existing checkpoints without evaluating the gate. The first unchanged occurrence
+sends the Task back with "No change since review N" and spends the persistent
+`repair_no_change` allowance (fixed limit 1); the second parks it as
+`review_needs_owner` with `no change after repair round`. Review and gate-rejection budgets are unchanged.
 Owner-started re-reviews are exempt. A changed commit or dirty worktree takes
 the normal review path; an explicit retry-window reset restores the allowance.
 

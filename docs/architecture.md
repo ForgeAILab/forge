@@ -9013,12 +9013,23 @@ Each command runs through `process-supervisor`, the single process-group
 implementation shared with Git. It continuously drains both pipes, retains
 bounded redacted UTF-8 tails and sets truncation flags. Synchronous byte observers
 feed line extractors before tail truncation; streaming ANSI removal precedes the
-text budget. Cargo test, vitest/jest, pytest and Go failures become normalised
-identities (up to 200 per command, 300 Unicode characters each, deduplicated).
+text budget. Cargo test and nextest, vitest/jest, pytest and Go failures become
+normalised identities (up to 200 per command, 300 Unicode characters each, deduplicated).
+Vitest/jest failure glyphs (`×`, `✗`, `●`) count only within a recognised
+runner block; a summary closes that block. A jest `FAIL <file>` line opens one
+for any JS/TS file (the test-name pattern is configurable), without jest's
+slow-suite run time. Nextest identities combine the binary and test name,
+omitting durations, progress counters and repeated stdout/stderr; failed,
+timed-out and signalled tests count, and under retries only the final attempt.
+They differ from plain `cargo test` identities (no binary), which is safe
+because triage compares runs of the same step command.
 Each command gets an isolated `FORGE_CI_REPORT_DIR` under the reserved Task root
 (or an owner temporary directory when no Task root exists); failed and errored
 JUnit cases in XML reports there contribute identities before the directory is
-removed. Reports never change exit verdicts. Optional `failures` and
+removed. At the next check command in that worktree, abandoned
+`.forge-task/ci-reports-*` directories matching Forge's generated names are
+removed too; unrelated entries and symbolic-link targets are left alone.
+Reports never change exit verdicts. Optional `failures` and
 `failures_truncated` flow through owner receipts, durable results and Review
 steps; default-empty/default-false values are omitted, preserving historical
 JSON and older-daemon receipts. If all step signatures would exceed the durable
@@ -9693,9 +9704,10 @@ this definition, so the policy revision stays `1`.
 #### Review-entry CI on the check runner (3.3 stage D part 2)
 
 Before configurable entry hooks, a persistent no-change guard compares the clean
-workspace HEAD on its placement owner with the latest failed Review's judged
-commit in the current Review budget window. It applies after a completed coder
-repair, and exempts owner-started moves and owner-requested re-reviews. The first
+workspace HEAD on its placement owner with the latest Review's judged commit
+in the current Review budget window, and acts only when that Review failed. A
+later passing Review of the same commit suppresses an earlier failure. It applies
+after a completed coder repair, and exempts owner-started moves and owner-requested re-reviews. The first
 unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate's
 reject target with a brief headed "No change since review N". A second parks
 `review_needs_owner` with `no change after repair round`. Neither creates a
@@ -9703,11 +9715,20 @@ Review, starts checks or a reviewer, nor charges Review or gate-rejection
 budgets. Dirty worktrees and changed commits continue through ordinary review,
 as does an entry whose workspace owner cannot describe the checkout (an away
 daemon): that entry meets the outage with the usual typed review-entry wait.
+An entry retry carries the original source state and actor in its hooks payload,
+so a same-state retry after reconnect still evaluates the repair gate and retains
+owner exemptions. The old step's continue decision does not decide the new step.
+A reminder after reconnect clears the resolved entry barrier and infrastructure
+blocker before returning to the coder, just as a successful normal retry does.
 The reminder is a `recovery` bridge (verb `repair_no_change`), which the cascade
 worker lets out of a gate that requires owner approval.
 The decision and reminder debit share an authority-fenced checkpoint at reserved
 index -1, before Project hook ordinals, so crash resumption cannot debit twice or
-reconsider an entry whose checks already started. Explicit retry-window resets
+reconsider an entry whose checks already started. A suspended entry admitted
+before the guard shipped has no reserved decision: existing entry checkpoints
+(a suspended hook opened its own first) make it record `Continue` without
+inspecting Git. Exit checkpoints, and a wait recorded by an exit hook, do not
+skip the guard. Explicit retry-window resets
 reset this allowance with Review; ordinary review laps do not.
 
 `run_ci_steps` no longer runs commands. In its hooks step it

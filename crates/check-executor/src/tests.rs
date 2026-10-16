@@ -1097,3 +1097,53 @@ async fn a_report_directory_that_cannot_be_made_does_not_fail_the_command() {
     );
     assert_eq!(receipt.commands[0].exit_code, Some(0));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn next_check_removes_abandoned_forge_reports_without_following_symlinks() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    executors::sandbox::TaskRoot::reserve(temp.path()).unwrap();
+    let worktree = temp.path().join("repo");
+    std::fs::create_dir(&worktree).unwrap();
+    let reserved = temp.path().join(".forge-task");
+    let stale = tempfile::Builder::new()
+        .prefix("ci-reports-")
+        .tempdir_in(&reserved)
+        .unwrap()
+        .keep();
+    std::fs::create_dir(stale.join("nested")).unwrap();
+    std::fs::write(
+        stale.join("nested/old.xml"),
+        "<testsuite><testcase name='stale'><failure/></testcase></testsuite>",
+    )
+    .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("keep"), "owner data").unwrap();
+    symlink(outside.path(), stale.join("nested/link")).unwrap();
+    let linked = reserved.join("ci-reports-ABCDEF");
+    symlink(outside.path(), &linked).unwrap();
+    let unrelated = reserved.join("ci-reports-owner-notes");
+    std::fs::create_dir(&unrelated).unwrap();
+    let file = reserved.join("ci-reports-GHIJKL");
+    std::fs::write(&file, "keep").unwrap();
+    let receipt = run(
+        &worktree,
+        &spec(&format!("test ! -e '{}' && test -d \"$FORGE_CI_REPORT_DIR\" && test -z \"$(ls -A \"$FORGE_CI_REPORT_DIR\")\"", stale.display())),
+        &[], Duration::from_secs(10), &CancellationToken::new(),
+    ).await;
+    assert_eq!(
+        receipt.outcome,
+        CheckExecutionOutcome::Passed,
+        "{receipt:?}"
+    );
+    assert!(!stale.exists());
+    assert!(linked.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(unrelated.is_dir());
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "keep");
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+        "owner data"
+    );
+    assert!(receipt.commands[0].failures.is_empty());
+}

@@ -14,6 +14,28 @@ const MAX_REPORT_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 static DURATION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\s*\(?\b\d+(?:\.\d+)?\s*(?:ms|µs|μs|ns|s|seconds?)\)?\s*$").unwrap()
 });
+/// The final status of a nextest test that failed, timed out or died of a
+/// signal (`TRY n` and short statuses such as `ABRT`/`TMT` under retries).
+/// An attempt that will be retried shows `(───)` instead of its counter and
+/// is not matched: a test that passes on a retry did not fail.
+static NEXTEST_FAILURE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:TRY \d+\s+)?(?:FAIL|LEAK-FAIL|TIMEOUT|TMT|ABORT|ABRT|SIG[A-Z]+)\s+\[\s*\d+(?:\.\d+)?s\]\s+(?:\(\d+/\d+\)\s+)?([^\s(]\S*)\s+(.+)$").unwrap()
+});
+/// A JS/TS source path. jest `testRegex`/`testMatch` and vitest `include` are
+/// configurable (NestJS names e2e suites `*.e2e-spec.ts`), so a test-name
+/// convention cannot decide whether a `FAIL <file>` line opens a runner block.
+static JS_SOURCE_FILE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\.[cm]?[jt]sx?(?:\s|$)").unwrap());
+static VITEST_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:RUN|DEV)\s+v\d+\.").unwrap());
+
+#[derive(Default, PartialEq, Eq)]
+enum Runner {
+    #[default]
+    Unknown,
+    JavaScript,
+    Nextest,
+}
 
 /// ANSI parser state survives pipe chunk boundaries, including OSC hyperlinks.
 #[derive(Default)]
@@ -134,6 +156,7 @@ pub(crate) struct Stream<'a> {
     tail: Vec<u8>,
     line: Vec<u8>,
     file: Option<String>,
+    runner: Runner,
     limit: usize,
     roots: &'a [&'a Path],
     env: &'a std::collections::BTreeMap<String, String>,
@@ -151,6 +174,7 @@ impl<'a> Stream<'a> {
             tail: vec![],
             line: vec![],
             file: None,
+            runner: Runner::Unknown,
             limit,
             roots,
             env,
@@ -175,7 +199,35 @@ impl<'a> Stream<'a> {
     fn end_line(&mut self) {
         let line = String::from_utf8_lossy(&self.line);
         let line = line.trim();
-        let identity = if let Some(test) = line
+        // A runner block ends at its summary. A later linter or progress
+        // renderer may print the same glyphs, without reporting any tests.
+        if line.starts_with("Test Suites:")
+            || line.starts_with("Test Files ")
+            || line.starts_with("Summary [")
+            || line.starts_with("SUMMARY [")
+        {
+            self.runner = Runner::Unknown;
+            self.file = None;
+        } else if VITEST_HEADER.is_match(line) {
+            self.runner = Runner::JavaScript;
+            self.file = None;
+        } else if line.starts_with("Nextest run ID ") {
+            self.runner = Runner::Nextest;
+            self.file = None;
+        }
+        let identity = if let Some(failure) = NEXTEST_FAILURE.captures(line) {
+            self.runner = Runner::Nextest;
+            self.file = None;
+            Some(format!("{} > {}", &failure[1], &failure[2]))
+        } else if self.runner == Runner::Nextest {
+            // Both nextest's --- STDOUT:/STDERR: blocks and newer indented
+            // stdout/stderr sections can repeat libtest failures. The binary
+            // plus test on nextest's own FAIL line is the identity, once.
+            if line == "error: test run failed" {
+                self.runner = Runner::Unknown;
+            }
+            None
+        } else if let Some(test) = line
             .strip_prefix("test ")
             .and_then(|s| s.split_once(" ... FAILED").map(|(name, _)| name))
         {
@@ -189,16 +241,24 @@ impl<'a> Stream<'a> {
         } else if let Some(test) = line.strip_prefix("--- FAIL: ") {
             Some(test.to_owned())
         } else if let Some(test) = line.strip_prefix("FAIL ") {
+            let test = test.trim();
             if test.contains(" > ") {
                 Some(test.to_owned())
             } else {
-                self.file = Some(test.to_owned());
+                // Jest appends a slow suite's run time to its FAIL line. It
+                // must not reach the identity, which keeps only a trailing one.
+                let file = DURATION.replace(test, "");
+                if JS_SOURCE_FILE.is_match(&file) {
+                    self.runner = Runner::JavaScript;
+                    self.file = Some(file.into_owned());
+                }
                 None
             }
         } else if let Some(test) = line
             .strip_prefix('×')
             .or_else(|| line.strip_prefix('✗'))
             .or_else(|| line.strip_prefix('●'))
+            .filter(|_| self.runner == Runner::JavaScript)
         {
             let test = test.trim().replace(" › ", " > ");
             if test.contains(" > ") && self.file.is_none() {
@@ -214,7 +274,9 @@ impl<'a> Stream<'a> {
             if let Some(file) = line
                 .strip_prefix('❯')
                 .and_then(|s| s.trim().split_once(" ("))
+                .filter(|(file, summary)| JS_SOURCE_FILE.is_match(file) && summary.contains("test"))
             {
+                self.runner = Runner::JavaScript;
                 self.file = Some(file.0.to_owned());
             }
             None
@@ -554,5 +616,82 @@ mod tests {
     fn unknown_runner_has_no_signature_and_unterminated_failure_is_kept() {
         assert!(extract("compiler: nope\nunknown runner: 9 failed\n").is_empty());
         assert_eq!(extract("test parser::empty ... FAILED"), ["parser::empty"]);
+    }
+
+    #[test]
+    fn linter_and_progress_glyphs_are_not_test_signatures() {
+        assert!(extract("lint starting\n× unused import\n✗ checking dependencies\n● compiling > modules\nFAIL compilation\n● packaging\n").is_empty());
+        // A completed test block cannot lend its context to the next tool.
+        assert!(extract(
+            "RUN v4.1.11 /task\nTest Files  1 passed (1)\n× unused import\n✗ done\n● bundling\n"
+        )
+        .is_empty());
+        assert_eq!(extract("FAIL ./parser.test.js\n● parser › empty input\nTest Suites: 1 failed, 1 total\n× lint error\n✗ progress\n● bundling\n"), ["./parser.test.js > parser > empty input"]);
+        assert_eq!(extract("FAIL [ 0.123s] crate::module test_name\n--- STDOUT: crate::module test_name ---\n× custom progress\n✗ custom lint\n● custom progress\nSUMMARY [ 0.123s] 1 test run: 1 failed\n"), ["crate::module > test_name"]);
+    }
+
+    #[test]
+    fn nextest_extractor_captured_output_has_stable_binary_test_identities() {
+        let captured = include_str!("fixtures/cargo-nextest.txt");
+        let expected = [
+            "guards-nextest-fixture > parser::empty_input",
+            "guards-nextest-fixture > parser::unicode_input",
+        ];
+        assert_eq!(extract(captured), expected);
+        let changed_durations = Regex::new(r"\[\s*\d+\.\d+s\]")
+            .unwrap()
+            .replace_all(captured, "[ 12.345s]");
+        assert_eq!(extract(&changed_durations), expected);
+        assert_eq!(extract("FAIL [ 0.123s] crate::module test_name\n--- STDOUT: crate::module test_name ---\ntest test_name ... FAILED\nSUMMARY [ 0.123s] 1 test run: 1 failed\nFAIL [ 0.123s] crate::module test_name\n"), ["crate::module > test_name"]);
+        assert_eq!(extract("Nextest run ID captured\nSummary [ 0.123s] 1 test run: 1 passed\ntest other_runner::failure ... FAILED\n"), ["other_runner::failure"]);
+    }
+
+    #[test]
+    fn jest_suites_outside_the_default_test_name_pattern_keep_their_failures() {
+        // Captured from jest 30 with `"testRegex": ".e2e-spec.js$"`.
+        let captured = "FAIL test/app.e2e-spec.js\n  \u{25cf} AppController (e2e) \u{203a} / (GET)\n\n    expect(received).toBe(expected) // Object.is equality\n\nTest Suites: 1 failed, 1 total\nTests:       1 failed, 1 total\n";
+        assert_eq!(
+            extract(captured),
+            ["test/app.e2e-spec.js > AppController (e2e) > / (GET)"]
+        );
+        assert_eq!(
+            extract(&captured.replace('\n', "\r\n")),
+            ["test/app.e2e-spec.js > AppController (e2e) > / (GET)"]
+        );
+    }
+
+    #[test]
+    fn a_slow_jest_suite_duration_is_not_part_of_the_identity() {
+        // Captured from jest 30: a suite over the slow threshold prints its
+        // run time, which differs between the candidate run and its re-run.
+        let run = |seconds: &str| {
+            extract(&format!("FAIL test/slow.e2e-spec.js ({seconds} s)\n  \u{25cf} slow \u{203a} waits\n\nTest Suites: 1 failed, 1 total\n"))
+        };
+        assert_eq!(run("5.296"), ["test/slow.e2e-spec.js > slow > waits"]);
+        assert_eq!(run("6.01"), run("5.296"));
+    }
+
+    #[test]
+    fn nextest_timeouts_signals_and_retried_failures_keep_their_identities() {
+        // Captured from cargo-nextest 0.9.144 with a 1 s terminate-after, and
+        // again with `--retries 1`, where statuses shorten and gain `TRY n`.
+        assert_eq!(
+            extract(include_str!("fixtures/cargo-nextest-statuses.txt")),
+            [
+                "nextest-status > parser::fails",
+                "nextest-status > parser::aborts",
+                "nextest-status > parser::hangs"
+            ]
+        );
+        assert_eq!(
+            extract(include_str!("fixtures/cargo-nextest-retries.txt")),
+            [
+                "nextest-status > parser::aborts",
+                "nextest-status > parser::fails",
+                "nextest-status > parser::hangs"
+            ]
+        );
+        // A failed attempt that passes on its retry is flaky, not a failure.
+        assert!(extract("Nextest run ID captured\n  TRY 1 FAIL [   0.008s] (\u{2500}\u{2500}\u{2500}) crate parser::flaky\n  TRY 2 PASS [   0.008s] (1/1) crate parser::flaky\n     Summary [   0.020s] 1 test run: 1 passed (1 flaky), 0 skipped\n").is_empty());
     }
 }

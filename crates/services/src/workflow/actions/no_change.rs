@@ -8,27 +8,36 @@ pub(crate) async fn repair_no_change_gate(
     ctx: &HookContext,
     task: &db::Task,
     step: &db::TaskStep,
+    origin: Option<(&str, &api_types::Actor)>,
 ) -> crate::Result<RepairNoChangeDecision> {
-    let (recorded, _) = ctx
-        .db
-        .start_hook(step, db::budget::REPAIR_NO_CHANGE_CHECKPOINT)
-        .await?;
-    if let Some(recorded) = recorded {
-        return serde_json::from_str(&recorded)
-            .map_err(|error| crate::ServiceError::invalid_operation(error.to_string()));
-    }
-    let unchanged = unchanged_attempt(ctx, task).await?;
-    Ok(db::budget::settle_repair_no_change(&ctx.db, task, step, unchanged).await?)
-}
-
-async fn unchanged_attempt(ctx: &HookContext, task: &db::Task) -> crate::Result<Option<i64>> {
-    let from_role = ctx
+    let first_entry_index = ctx
         .workflow
         .states
         .iter()
         .find(|state| state.name == ctx.from_state)
+        .map_or(0, |state| state.hooks.on_exit.len() as i64);
+    let recorded = db::budget::start_repair_no_change(&ctx.db, step, first_entry_index).await?;
+    if let Some(recorded) = recorded {
+        return Ok(recorded);
+    }
+    let (from, actor) = origin.unwrap_or((&ctx.from_state, &ctx.triggered_by));
+    let unchanged = unchanged_attempt(ctx, task, from, actor).await?;
+    Ok(db::budget::settle_repair_no_change(&ctx.db, task, step, unchanged).await?)
+}
+
+async fn unchanged_attempt(
+    ctx: &HookContext,
+    task: &db::Task,
+    from: &str,
+    actor: &api_types::Actor,
+) -> crate::Result<Option<i64>> {
+    let from_role = ctx
+        .workflow
+        .states
+        .iter()
+        .find(|state| state.name == from)
         .and_then(effective_role);
-    if ctx.triggered_by.is_owner()
+    if actor.is_owner()
         || task.review_passed_at.is_some()
         || !matches!(from_role, Some("coder" | "worker" | "executor"))
     {

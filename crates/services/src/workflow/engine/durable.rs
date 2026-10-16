@@ -9,10 +9,18 @@ pub(crate) struct HookDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct EntryOrigin {
+    pub from: String,
+    pub actor: Actor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HookPayload {
     #[serde(flatten)]
     pub bridge: api_types::TransitionBridge,
     pub from: String,
+    #[serde(default)]
+    pub entry_origin: Option<EntryOrigin>,
     pub to: String,
     pub actor: Actor,
     pub reason: String,
@@ -597,7 +605,13 @@ impl WorkflowExecution<'_> {
             && to_state.canonical_phase == Some(api_types::CanonicalPhase::Review)
         {
             match crate::workflow::actions::no_change::repair_no_change_gate(
-                &enter_ctx, &task, step,
+                &enter_ctx,
+                &task,
+                step,
+                payload
+                    .entry_origin
+                    .as_ref()
+                    .map(|origin| (origin.from.as_str(), &origin.actor)),
             )
             .await?
             {
@@ -863,7 +877,11 @@ impl WorkflowExecution<'_> {
             }
         }
 
-        if payload.skip_on_exit && cascade.is_none() && !skip_target_enter_hooks {
+        // A reminder is a successful retry too: the owner answered, and the
+        // coder must not inherit the old review-CI infrastructure blocker.
+        if payload.skip_on_exit
+            && (no_change_send_back || (cascade.is_none() && !skip_target_enter_hooks))
+        {
             task = self
                 .set_entry_barrier_with_authority(
                     &task_id,

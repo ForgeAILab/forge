@@ -1479,7 +1479,21 @@ impl WorkflowExecution<'_> {
                     }
                 }
             }
+            // A retry changes the transition to review -> review, but the
+            // no-change guard must still see the original repair and actor.
+            let entry_origin = if entry_retry {
+                self.db.current_entry_hook_payload(&task_id).await?
+                    .map(|raw| serde_json::from_str::<durable::HookPayload>(&raw)
+                        .map_err(|e| ServiceError::invalid_operation(e.to_string())))
+                    .transpose()?
+                    .map(|previous| previous.entry_origin.unwrap_or(durable::EntryOrigin {
+                        from: previous.from, actor: previous.actor,
+                    }))
+            } else {
+                None
+            };
             let hook_payload = durable::HookPayload {
+                entry_origin,
                 from: current_status.clone(), to: target_state.clone(), actor: actor.clone(), reason: reason.clone(), bridge: bridge.clone(), transition_log_id: transition_log_id.clone(),
                 workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen), authority: authority.as_ref().map(|a| a.project_version),
                 from_config: exit_ctx.state_config.clone(), to_config: enter_ctx.state_config.clone(), workspace_id: enter_ctx.workspace_id.clone(), execution_id: enter_ctx.execution_id.clone(), agent_id: enter_ctx.agent_id.clone(),

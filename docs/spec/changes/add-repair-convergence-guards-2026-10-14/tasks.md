@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T10:11:28Z
+updated_at: 2026-10-15T22:34:39Z
 completed_at:
 ---
 
@@ -12,7 +12,7 @@ completed_at:
 
 ## 1. Check failure detail
 - [x] 1.1 Signature extractors in `crates/check-executor`:
-  - cargo test, vitest/jest, pytest, go test;
+  - cargo test/nextest, vitest/jest, pytest, go test;
   - JUnit XML under `FORGE_CI_REPORT_DIR`;
   - normalisation, a cap of 200 signatures at 300 characters each, `failures_truncated`.
 - [x] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
@@ -55,7 +55,7 @@ completed_at:
 
 ## 3. No-change gate
 - [x] 3.1 Persistent budget `RepairNoChange` (Review window, limit 1).
-- [x] 3.2 At review entry after a coder repair round: if HEAD equals the latest failed Review's judged commit and the worktree is clean, create no Review. Send back once with the "No change since review N" brief, then park `review_needs_owner` with `no change after repair round`. Owner-started re-reviews are exempt.
+- [x] 3.2 At review entry after a coder repair round: if the latest Review failed and HEAD equals its judged commit with a clean worktree, create no Review. Send back once with the "No change since review N" brief, then park `review_needs_owner` with `no change after repair round`. Owner-started re-reviews are exempt.
 - [x] 3.3 Focused tests: unchanged once sends back without a Review row or review budget; unchanged twice parks; an owner re-review of the same commit runs; a changed commit reviews normally.
 
 ## 4. Reviewer anchoring
@@ -94,3 +94,11 @@ completed_at:
   - the Task is not sent to the coder for either;
   - both attention items appear;
   - an unchanged repair round is caught.
+
+## 7. Review follow-ups for phases 1 and 3
+- [x] 7.1 Select the latest Review before checking its verdict; a later pass suppresses an old failure.
+- [x] 7.2 Resume pre-gate entries as `Continue` from their recorded entry progress, without evaluating the gate.
+- [x] 7.3 Scope failure glyphs to recognised vitest/jest blocks; capture nextest output and extract stable binary/test identities.
+- [x] 7.4 Carry the original entry source and actor through offline same-state retries, and clear the resolved infrastructure blocker on a reminder.
+- [x] 7.5 Remove abandoned Forge report directories at the next check, without following symlinks or deleting unrelated entries.
+- [x] 7.6 Run the requested focused verification and record results under `/Volumes/Data/tmp/refactor/guards-13b/`.

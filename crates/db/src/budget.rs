@@ -92,9 +92,9 @@ pub enum RepairNoChangeDecision {
     Park,
 }
 
-/// The latest failed Review in the current Review budget window and the commit
-/// it judged. Frozen reviewer contracts take precedence over entry CI evidence,
-/// then delivery evidence supports historical rows without either.
+/// The latest Review in the current window, only when it failed, and the commit
+/// it judged. A later pass must not resurrect an earlier failure. Frozen reviewer
+/// contracts take precedence over entry CI evidence, then delivery evidence.
 pub async fn failed_review_for_no_change(
     db: &SqliteDb,
     task: &str,
@@ -110,16 +110,61 @@ pub async fn failed_review_for_no_change(
          FROM review r JOIN execution e ON e.id=r.execution_id
          LEFT JOIN task_budget b ON b.task_id=r.task_id AND b.kind='review'
          LEFT JOIN transition_log boundary ON boundary.id=b.window_id AND boundary.task_id=r.task_id
-         WHERE r.task_id=? AND r.status='failed'
+         WHERE r.task_id=?
            AND (boundary.id IS NULL OR r.created_at >= boundary.created_at)
          ORDER BY r.attempt_number DESC,r.id DESC LIMIT 1",
     ).bind(task).fetch_optional(db.pool()).await?;
     match row {
         Some((id, head)) => Ok(crate::ReviewRepo::get_by_id(db, &id)
             .await?
+            .filter(|review| review.status == ReviewStatus::Failed)
             .map(|review| (review, head))),
         None => Ok(None),
     }
+}
+
+/// Start the guard, retaining the decision of an entry already in progress when
+/// the guard shipped. Exit hooks precede the guard, so only entry checkpoints
+/// prove that it is too late to evaluate it.
+pub async fn start_repair_no_change(
+    db: &SqliteDb,
+    step: &crate::TaskStep,
+    first_entry_index: i64,
+) -> Result<Option<RepairNoChangeDecision>> {
+    let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_hook_in_tx(&mut tx, step).await?;
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT result_json FROM task_hook_checkpoint WHERE step_id=? AND hook_index=?",
+    )
+    .bind(&step.id)
+    .bind(REPAIR_NO_CHANGE_CHECKPOINT)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    let recorded = match recorded {
+        Some(recorded) => Some(recorded),
+        None => {
+            // Every hook, also one that suspended for a check or for disk,
+            // opened its checkpoint first. A recorded wait alone is no proof:
+            // a waking step keeps `awaited_consumer_id`, including after an
+            // exit hook's wait that precedes the guard.
+            let started: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM task_hook_checkpoint WHERE step_id=? AND hook_index>=?)",
+            )
+            .bind(&step.id)
+            .bind(first_entry_index)
+            .fetch_one(&mut *tx)
+            .await?;
+            started.then(|| serde_json::to_string(&RepairNoChangeDecision::Continue).unwrap())
+        }
+    };
+    sqlx::query("INSERT INTO task_hook_checkpoint(step_id,hook_index,started_at,result_json) VALUES(?,?,?,?) ON CONFLICT(step_id,hook_index) DO UPDATE SET result_json=excluded.result_json")
+        .bind(&step.id).bind(REPAIR_NO_CHANGE_CHECKPOINT).bind(crate::now_rfc3339())
+        .bind(&recorded).execute(&mut *tx).await?;
+    tx.commit().await?;
+    recorded
+        .map(|raw| serde_json::from_str(&raw).map_err(|e| DbError::Check(e.to_string())))
+        .transpose()
 }
 
 /// Save the guard's decision and its one allowed reminder charge together.

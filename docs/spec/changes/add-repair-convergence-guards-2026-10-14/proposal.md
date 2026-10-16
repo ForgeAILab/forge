@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T02:22:51Z
+updated_at: 2026-10-15T22:34:39Z
 ---
 
 ## Why
@@ -48,8 +48,12 @@ the repair brief and the round policy).
 
 **1. Per-test check failures.**
 - The check executor extracts failure signatures while a step runs. It
-  supports cargo test, vitest/jest, pytest and go test, plus a JUnit XML file
-  a step declares.
+  supports cargo test/nextest, vitest/jest, pytest and go test, plus a JUnit XML
+  file a step declares.
+- Failure glyphs count only inside recognised vitest/jest output blocks.
+  Nextest identities keep the binary and test, without durations or counters.
+- Abandoned Forge report directories are removed at the next check without
+  following symlinks or deleting unrelated entries.
 - At most 200 signatures are kept per step, normalised and with ANSI codes
   stripped.
 - Each failing test becomes its own `CI-<step>#<hash>` finding, so 28 → 26
@@ -78,12 +82,16 @@ or a merge-queue head check fails:
   today, but the brief and the attention item say so.
 
 **3. No-change gate.**
-- A Task that comes back to review with the exact commit its previous failed
-  review judged starts no CI, verify or reviewer.
+- A Task that comes back to review with a clean tree and the exact commit its
+  latest Review in the window judged starts no CI, verify or reviewer only when
+  that latest Review failed. A later pass suppresses an older failure.
 - It goes back to the coder once with "no change since the last review".
 - The second time, it parks with `review_needs_owner` (`no change after
   repair round`).
 - No review budget is spent.
+- Entries already in progress before the guard shipped resume from their
+  checkpoints without evaluating it. Offline retries retain the original entry
+  source and actor; a reminder clears the resolved infrastructure blocker.
 
 **4. Reviewer anchoring.** Findings gain three optional fields:
 - `requirement_ids`;

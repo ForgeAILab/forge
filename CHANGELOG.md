@@ -1745,6 +1745,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   repair/park system comments name findings once per Review. The Review tab
   displays the current ledger and per-attempt findings. Finding IDs now sort
   naturally before the API's 200-entry cap (`F2` before `F10`).
+- Check failure signatures recognise cargo-nextest binary/test identities,
+  omitting durations, progress counters and repeated stdout or summary output,
+  including timed-out, signalled and retried tests (final attempt only). A jest
+  suite with any JS/TS file name opens a jest block, and jest's slow-suite run
+  time is not part of the identity.
+
 - Stored check output and stderr tails strip ANSI escape codes before applying
   the text budget.
 - CI repair prompts list the signatures and output of every failing step,
@@ -3416,6 +3422,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- Repair convergence compares against the latest Review, so a later pass of the
+  same commit does not resurrect an old failure. Suspended review entries from
+  before the guard shipped resume without evaluating the new gate. Offline entry
+  retries retain the original repair source and owner exemptions, so an
+  unchanged repair is caught after reconnect and clears the resolved
+  infrastructure blocker before returning to the coder.
+- Failure glyphs from linters and progress output no longer become test
+  signatures outside recognised vitest/jest output blocks. Abandoned Forge CI
+  report directories are removed at the next check without following symlinks
+  or deleting unrelated entries.
 
 - Task Review and findings reads no longer return HTTP 500 after an owner's
   manual review pass or a carried review. Readers of persisted details recognize
