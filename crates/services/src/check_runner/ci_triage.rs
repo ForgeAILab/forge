@@ -368,7 +368,8 @@ pub(crate) fn blocks(step: &StepResultEntry) -> bool {
 }
 
 /// Repair messages name only the failures this Task must address. Full raw
-/// output remains in the immutable evidence and Review details.
+/// output remains in the immutable evidence and Review details. Only `full`
+/// waives a flaky or pre-existing class; under `report` it still blocks.
 pub(crate) fn failure_summary(entries: &[StepResultEntry]) -> String {
     entries
         .iter()
@@ -378,8 +379,11 @@ pub(crate) fn failure_summary(entries: &[StepResultEntry]) -> String {
                 .triage
                 .as_ref()
                 .into_iter()
-                .flat_map(|triage| &triage.failures)
-                .filter(|failure| failure.class.blocks())
+                .flat_map(|triage| {
+                    triage.failures.iter().filter(|failure| {
+                        triage.mode != ReviewCiTriage::Full || failure.class.blocks()
+                    })
+                })
                 .take(20)
                 .map(|failure| failure.signature.as_str())
                 .collect();
@@ -623,5 +627,28 @@ mod tests {
         let result = classify(&step(&["old"]), None, None, facts());
         assert!(result.blocking);
         assert_ne!(result.class, Some(CiFailureClass::Flaky));
+    }
+    #[test]
+    fn ci_triage_report_send_back_names_the_classified_failures_that_block() {
+        for mode in [ReviewCiTriage::Full, ReviewCiTriage::Report] {
+            let mut entry = step(&["old", "new", "flake-a"]);
+            entry.triage = Some(classify(
+                &entry,
+                Some(&command(&["old", "new", "flake-b"], 1)),
+                Some(&command(&["old"], 1)),
+                StepCiTriage { mode, ..facts() },
+            ));
+            let summary = failure_summary(&[entry]);
+            assert!(summary.contains("new"), "{summary}");
+            // Under `report` a classified flake or pre-existing failure still
+            // blocks, so the head's send-back names it like any other.
+            for waived in ["old", "flake-a", "flake-b"] {
+                assert_eq!(
+                    summary.contains(waived),
+                    mode == ReviewCiTriage::Report,
+                    "{mode:?}: {summary}"
+                );
+            }
+        }
     }
 }
