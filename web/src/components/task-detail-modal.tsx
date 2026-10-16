@@ -169,7 +169,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
       {
         taskId: task.id,
         body: {
-          description: description.length > 0 ? description : null,
+          description,
           version: task.version,
         },
       },

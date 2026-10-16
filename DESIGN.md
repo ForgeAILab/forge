@@ -181,6 +181,9 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### App shell navigation
 
+- The header brand is a link to `/` named “Forge home”. Home resolves to the
+  first authorized Project's Kanban, or Main Chat when no Project is available.
+  The sidebar's Kanban and Main Agent links remain separate destinations.
 - **Structure:** skip link, compact utility top bar, Project switcher, persistent desktop navigation sidebar, mobile navigation dialog, account utilities, and the main landmark. Sidebar groups are Account (`Main Agent`), Project (`Kanban`, `Project Agent`, `Tasks`, `Overview`, `Project settings`), and Workspace.
 - **Primary hierarchy:** Kanban is the default destination whenever an authorized Project exists. Main Agent is the one account-level chat entry; Project Agent opens only the selected Project's chat. Scope descriptions distinguish them without adding duplicate launchers.
 - **States:** active link, hover, active press, visible focus, disabled Project links when no Project exists, loading Project selection, and open/closed mobile dialog.
@@ -202,6 +205,11 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ### Kanban task card
 
+- Non-default Task types use the existing outline Badge with visible labels
+  “Planning Task”, “Discovery”, or “Sub Task” and a screen-reader “Task type”
+  prefix. The same badge appears in the modal header and full-page Task overview.
+  Standard (`task`) Tasks omit it. Metadata wraps at narrow widths; no new tokens
+  or interaction states are introduced.
 - **Structure:** draggable article, detail-navigation body, status/assignment metadata, dedicated drag handle, and overflow menu.
 - **States:** default, hover, active press, keyboard focus within, dragging, committing/busy, disabled ordering, blocked/error, terminal-muted.
 - **Accessibility:** the card body and drag handle are separate targets; the handle is a visible button-like control with an accessible name and at least a 32px target. Keyboard drag uses the DnD library controls.

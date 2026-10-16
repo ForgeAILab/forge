@@ -1166,6 +1166,11 @@ sidebar puts **Main Agent** under Account and **Project Agent** under the select
 Project. Main Agent opens the account's Main Chat at `/chat` for discovery and
 Project handoffs; Project Agent opens that Project's chat for planning and Task
 management. On small screens, open the same navigation from the top-bar menu.
+The header's **Forge home** brand link opens `/`: the first authorized Project's
+Kanban, or Main Chat if there are no Projects. Non-default Task types (Planning
+Task, Discovery, Sub Task) appear as badges on board cards and Task details;
+standard Tasks have no type badge. Clearing a Task's description and saving
+restores the “Click to add a description…” prompt in both detail views.
 Each Project's **Project
 Agent** workspace keeps its durable conversation beside Project-record editing
 controls; on small screens, use the Conversation/Project segments without losing
