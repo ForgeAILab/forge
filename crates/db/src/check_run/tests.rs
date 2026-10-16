@@ -991,6 +991,11 @@ async fn upgrade_preserves_old_rows_and_never_seeds_cache() {
                 .file_name()
                 .to_string_lossy()
                 .ends_with("__check_consumer_answered_index.sql")
+            // Rebuilds `check_consumer` and its triggers.
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with("__review_verify_purpose.sql")
         {
             continue;
         }
@@ -1545,10 +1550,11 @@ async fn identity_migration_carries_stage_a_rows_and_their_result_links() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
     for entry in std::fs::read_dir(&source).unwrap() {
         let entry = entry.unwrap();
-        if !entry
-            .file_name()
-            .to_string_lossy()
-            .ends_with("__check_run_identity.sql")
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // The verify purpose rebuild needs the identity migration's
+        // `purpose` column, so it follows it in the upgrade.
+        if !name.ends_with("__check_run_identity.sql")
+            && !name.ends_with("__review_verify_purpose.sql")
         {
             std::fs::copy(entry.path(), migrations.join(entry.file_name())).unwrap();
         }
