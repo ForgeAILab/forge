@@ -296,13 +296,19 @@ async fn read_results(
             "app.log reached its 16 MiB cap; later app output was discarded, so the tail shows output from before the cap".into(),
         );
     }
-    if let Some(port) = read_file(directory, "port", 8)?
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.trim().parse().ok())
-    {
-        if let Some(warning) = review::verify::port_warning(port) {
-            details.notes.push(warning);
+    // The port record sits in the candidate's directory. The probe is only a
+    // diagnostic: an unreadable record skips it and never refuses verify.
+    match read_file(directory, "port", 8) {
+        Ok(record) => {
+            if let Some(warning) = record
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| text.trim().parse().ok())
+                .and_then(review::verify::port_warning)
+            {
+                details.notes.push(warning);
+            }
         }
+        Err(error) => details.notes.push(format!("port probe skipped: {error}")),
     }
     let mut evidence_bytes = 0;
     let mut start_or_ready_failed = false;

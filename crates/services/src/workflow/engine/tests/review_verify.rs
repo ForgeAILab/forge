@@ -955,6 +955,28 @@ PY"#, "ready_command":r#"test -s "$FORGE_VERIFY_DIR/escaped.pid""#, "ready_timeo
 }
 
 #[tokio::test]
+async fn review_verify_unreadable_port_record_skips_the_probe_without_refusing() {
+    // The candidate owns its verify directory and can replace Forge's port
+    // record; a diagnostic must not turn that into a refused verify.
+    let f = fixture(
+        &[],
+        json!({"checks":[{"name":"smoke","command":r#"printf '123456789' > "$FORGE_VERIFY_DIR/port""#}]}),
+    )
+    .await;
+    let (_, review, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "pass", "{details}");
+    assert_eq!(review.status, db::ReviewStatus::Passed);
+    assert!(
+        details["verify"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().starts_with("port probe skipped")),
+        "{details}"
+    );
+}
+
+#[tokio::test]
 async fn review_verify_stopped_run_removes_pgid_record() {
     let f = fixture(
         &[],
