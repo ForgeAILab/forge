@@ -380,3 +380,87 @@ pub async fn stored_ci_review_entry(disabled: bool) {
         );
     }
 }
+
+pub async fn send(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = common::raw_json_request(app, method, uri, body).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn assert_refused(response: &(StatusCode, Value), code: &str, what: &str) {
+    assert_eq!(
+        response.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{what}: {}",
+        response.1
+    );
+    assert_eq!(response.1["code"], code, "{what}: {}", response.1);
+}
+
+/// Provider credentials (API key and OAuth) are what a server-side agent turn
+/// would use; Chat turn admission runs one.
+pub async fn provider_and_chat_turns(disabled: bool) {
+    let (_root, harness, project, _, _) = fixture("demo-agent-turns").await;
+    let provider = send(
+        &harness.app,
+        Method::POST,
+        "/api/v1/providers",
+        json!({"provider":"openai_compatible","label":"visitor key",
+            "credential":"sk-visitor","base_url":"https://8.8.8.8"}),
+    )
+    .await;
+    let chat = harness
+        .state
+        .agent_chat_service
+        .ensure_project_chat(&project)
+        .await
+        .unwrap();
+    let message = send(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/agent-chats/{}/messages", chat.id),
+        json!({"content":"hello"}),
+    )
+    .await;
+    if disabled {
+        assert_refused(&provider, "server_agents_disabled", "provider entry");
+        assert_eq!(
+            provider.1["message"],
+            "This demo does not run agents or connect model providers"
+        );
+        // No provider is contacted: the refusal precedes the OAuth flow.
+        let authorization = send(
+            &harness.app,
+            Method::POST,
+            "/api/v1/provider-authorizations",
+            json!({"provider":"openai","method":"device_oauth",
+                "redirect_origin":"http://localhost","credential_label":"visitor"}),
+        )
+        .await;
+        assert_refused(
+            &authorization,
+            "server_agents_disabled",
+            "provider authorization",
+        );
+        assert_refused(&message, "server_agents_disabled", "chat message");
+        let turns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_turn_job")
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(turns, 0, "no turn is queued");
+    } else {
+        assert_eq!(provider.0, StatusCode::OK, "{}", provider.1);
+        assert_ne!(message.1["code"], "server_agents_disabled", "{}", message.1);
+    }
+}

@@ -394,6 +394,10 @@ impl WakeTurns for WakeTurnConsumer {
         let Some(chat) = chat else {
             return Ok(None);
         };
+        // Demo: no agent turn can run, so a wake has no responder to admit.
+        if executors::server_commands::manager_only() {
+            return Ok(None);
+        }
         let service = AgentTurnAdmissionService::new(Arc::clone(&self.db));
         if service.resolve(&chat).await?.readiness != AgentTurnReadiness::Ready {
             return Ok(None);

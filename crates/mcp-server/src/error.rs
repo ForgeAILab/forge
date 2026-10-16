@@ -448,6 +448,8 @@ impl From<ServiceError> for McpToolError {
             }
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
             ServiceError::ServerCommandsDisabled => Self::new(-32602, executors::server_commands::MESSAGE).with_data(json!({"code": executors::server_commands::CODE})),
+            ServiceError::ServerAgentsDisabled => Self::new(-32602, executors::server_commands::AGENTS_MESSAGE).with_data(json!({"code": executors::server_commands::AGENTS_CODE})),
+            ServiceError::ServerLocationRefused { message } => Self::new(-32602, message).with_data(json!({"code": executors::server_commands::LOCATION_CODE})),
             ServiceError::InvalidOperation { message } => Self::new(-32602, message),
             ServiceError::AuthorizationDenied { message } => {
                 Self::new(-32003, message).with_data(json!({ "code": "authorization.invalid" }))

@@ -1139,6 +1139,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         request: AgentTurnRequest,
         sink: Arc<dyn TurnEventSink>,
     ) -> Result<AgentTurnOutput, AgentHostError> {
+        // Demo: no agent runs inside the server process.
+        executors::server_commands::ensure_agents_allowed()
+            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
         }
@@ -1553,6 +1556,8 @@ impl NativeAgentRuntimeBackend {
         intent_id: &str,
         successor: &str,
     ) -> Result<(), AgentHostError> {
+        executors::server_commands::ensure_agents_allowed()
+            .map_err(|error| AgentHostError::Authority(error.to_string()))?;
         use agent_runtime::{
             core::store::SessionStore, lcm::LcmSummaryModel, prelude::CheckpointStore,
         };

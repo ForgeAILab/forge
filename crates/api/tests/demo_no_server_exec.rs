@@ -146,3 +146,9 @@ async fn demo_check_executor_refuses_probe_commands_and_receipt() {
     assert!(receipt.commands.is_empty());
     assert!(!root.path().join("check-marker").exists());
 }
+
+#[tokio::test]
+async fn demo_provider_credentials_and_chat_turns_are_422() {
+    demo();
+    support::provider_and_chat_turns(true).await;
+}

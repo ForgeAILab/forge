@@ -365,6 +365,8 @@ where
         &self,
         request: AgentTurnPrepareInput<'_>,
     ) -> Result<PreparedAgentTurnAdmission> {
+        // Demo: Chat turns run an agent in the server process.
+        executors::server_commands::ensure_agents_allowed()?;
         let responder = self.resolve(request.chat).await?;
         responder.require_frozen()?;
         let admission_digest = {

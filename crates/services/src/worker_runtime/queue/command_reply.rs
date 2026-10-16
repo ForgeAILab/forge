@@ -303,6 +303,10 @@ pub(crate) mod review_error {
 #[derive(Deserialize)]
 pub(super) enum StoredServiceError {
     ServerCommandsDisabled,
+    ServerAgentsDisabled,
+    ServerLocationRefused {
+        message: String,
+    },
     TaskBusy {
         pending_steps: i64,
         retry_after_ms: u64,
@@ -486,6 +490,10 @@ impl From<StoredServiceError> for ServiceError {
                 error: Box::new((*error).into()),
             },
             StoredServiceError::ServerCommandsDisabled => Self::ServerCommandsDisabled,
+            StoredServiceError::ServerAgentsDisabled => Self::ServerAgentsDisabled,
+            StoredServiceError::ServerLocationRefused { message } => {
+                Self::ServerLocationRefused { message }
+            }
             StoredServiceError::InvalidOperation { message } => Self::InvalidOperation { message },
             StoredServiceError::ExecutionAlreadyRunning {
                 scope,

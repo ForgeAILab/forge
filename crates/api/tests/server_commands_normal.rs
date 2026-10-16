@@ -22,3 +22,7 @@ async fn normal_stored_ci_review_entry_runs() {
 async fn normal_environment_setup_and_probe_run() {
     support::environment_setup(false).await;
 }
+#[tokio::test]
+async fn normal_provider_credentials_and_chat_turns_unchanged() {
+    support::provider_and_chat_turns(false).await;
+}
