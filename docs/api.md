@@ -6199,7 +6199,8 @@ resolution and comments/briefs say “re-broken: resolved in round N”. It coun
 as open with a fresh streak. Only blocking appearances advance a streak: minor
 appearances count zero, and raising a minor to blocking starts at one.
 
-From review 2 in the window, a new blocking reviewer finding becomes minor unless
+After the reviewer's first assessment in the window (Reviews that stopped
+before a reviewer ran do not count), a new blocking reviewer finding becomes minor unless
 it is a regression, cites a known requirement, or its first repository-relative
 `where` path (without `:line`) is in the candidate diff. Such a downgrade carries
 `anchoring_note: "outside requirements and Task files"`. Continued IDs keep their

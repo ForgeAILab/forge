@@ -8263,7 +8263,9 @@ open/reopened ids and retains the 8 KiB report slice. Both the response instruct
 and re-review section list frozen requirement IDs and explain `requirement_ids`,
 `kind` (`regression`, `missed`, `out_of_scope`) and `same_cause_as`. Parsing stays
 lenient; unknown requirement IDs are dropped before freezing, and empty optional
-fields are omitted. From review 2, a new blocking finding without a regression,
+fields are omitted. After the reviewer's first assessment in the window (a
+Review whose CI failed before the reviewer ran, or that was cancelled, does not
+count), a new blocking finding without a regression,
 known requirement citation, or candidate-diff file becomes minor with the note
 “outside requirements and Task files”. Continued IDs keep their identity; a
 continued downgraded finding stays minor until it qualifies.

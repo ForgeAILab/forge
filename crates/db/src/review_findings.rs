@@ -27,7 +27,11 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
     let mut ledger = BTreeMap::<String, ReviewFindingEntry>::new();
     let mut next_id = 1;
     let mut observed_contracts = BTreeSet::new();
-    for (round, review) in reviews.into_iter().enumerate() {
+    // Anchoring starts after the reviewer's first assessment in the window,
+    // not after the first Review row: CI can fail, or a Review be cancelled,
+    // before any reviewer has set the goalposts.
+    let mut assessed = false;
+    for review in reviews {
         let details: Value = serde_json::from_str(&review.step_results_json)
             .map_err(|error| format!("invalid Review {} details: {error}", review.id))?;
         // An owner's manual pass copies the failed Review's details verbatim;
@@ -318,6 +322,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         // An assessment is evidence that the reviewer ran. A bound execution
         // alone is not: CI can stop the attempt before it is dispatched.
         if let Some(assessment) = conformance.assessment {
+            let later_review = std::mem::replace(&mut assessed, true);
             let prior = ledger.clone();
             let known: BTreeSet<_> = prior
                 .values()
@@ -398,7 +403,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 let anchored_before = prior
                     .get(&id)
                     .is_some_and(|previous| previous.anchoring_note.is_some());
-                let downgraded = round > 0
+                let downgraded = later_review
                     && (!known.contains(&id) || anchored_before)
                     && finding.severity == ReviewFindingSeverity::Blocking
                     && !outside_scope
@@ -1496,5 +1501,28 @@ mod tests {
             (ReviewFindingSeverity::Blocking, 1)
         );
         assert!(finding.anchoring_note.is_none());
+    }
+
+    #[test]
+    fn finding_ledger_first_reviewer_assessment_is_not_anchored_by_earlier_rows() {
+        // Review CI can fail, or a Review can be cancelled, before any reviewer
+        // runs. The first assessment in the window still sets the goalposts.
+        let ci_only = review(
+            1,
+            json!({"ci_steps":[{"index":0,"command":"tests","exit_code":1,"stderr_tail":"boom"}]}),
+        );
+        let mut cancelled = review(1, json!({}));
+        cancelled.status = crate::ReviewStatus::Cancelled;
+        for earlier in [ci_only, cancelled] {
+            let first_assessment = anchored_review(
+                2,
+                json!([{"summary":"real bug", "where":"src/other.rs:1"}]),
+                json!([]),
+            );
+            let ledger = finding_ledger(&[earlier, first_assessment]).unwrap();
+            let finding = entry(&ledger, "F1");
+            assert_eq!(finding.severity, ReviewFindingSeverity::Blocking);
+            assert!(finding.anchoring_note.is_none());
+        }
     }
 }
