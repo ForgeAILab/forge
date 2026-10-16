@@ -3062,7 +3062,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
-- Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures.
+- Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 
 
 - Project `review_ci_triage` (`full`, `report`, `off`), a durable rerun and exact-commit base comparison, queue-head CI triage, and Project Attention categories `flaky_check` and `base_check_failing` with Mission Control warnings.

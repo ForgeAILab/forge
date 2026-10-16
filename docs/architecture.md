@@ -8996,7 +8996,8 @@ normalised identities (up to 200 per command, 300 Unicode characters each, dedup
 Vitest/jest failure glyphs (`×`, `✗`, `●`) count only within a recognised
 runner block; a summary closes that block. Recursive pnpm (`pkg test: `) and turbo
 (`pkg:test: `) test-task decorators are stripped before extraction, while tails
-retain them. Parallel package/task producers keep independent runner/file state;
+retain them; the identity is qualified with the package (`pkg > <identity>`), since
+paths a package's runner reports are often package-relative. Parallel package/task producers keep independent runner/file state;
 producer-state overflow marks evidence incomplete rather than waiving failures. A jest `FAIL <file>` line opens one
 for any JS/TS file (the test-name pattern is configurable), without jest's
 slow-suite run time. Nextest identities combine the binary and test name,
