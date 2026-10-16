@@ -165,6 +165,27 @@ async fn demo_environment_assets_are_refused_without_copy() {
     support::environment_assets(true).await;
 }
 
+#[tokio::test]
+async fn demo_integrations_and_agent_config_writes_are_422() {
+    demo();
+    support::integrations(true).await;
+    let (_root, harness, project, _, _) = support::fixture("demo-mcp-config").await;
+    let response = support::send(
+        &harness.app,
+        Method::POST,
+        "/api/v1/config/mcp",
+        json!({"agent":"codex","scope":"user","action":"install","project_id":project}),
+    )
+    .await;
+    assert_eq!(
+        response.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        response.1
+    );
+    assert_eq!(response.1["code"], "server_location_refused");
+}
+
 /// The demo container's startup under the policy: `--demo` seeding, then
 /// exactly the REST calls of `deploy/demo/forge-demo-entrypoint.sh`.
 #[tokio::test]

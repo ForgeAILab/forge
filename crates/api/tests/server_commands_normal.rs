@@ -34,3 +34,7 @@ async fn normal_repository_inputs_unchanged() {
 async fn normal_environment_assets_copy() {
     support::environment_assets(false).await;
 }
+#[tokio::test]
+async fn normal_integrations_unchanged() {
+    support::integrations(false).await;
+}

@@ -636,6 +636,25 @@ pub async fn environment_assets(disabled: bool) {
     }
 }
 
+/// Issue-tracker integrations send a server environment variable, named by
+/// the caller, to the caller's URL.
+pub async fn integrations(disabled: bool) {
+    let (_root, harness, project, _, _) = fixture("demo-integrations").await;
+    let response = send(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/integration"),
+        json!({"platform":"gitea","base_url":"https://93.184.215.14","owner":"o",
+            "repo":"r","token_secret_ref":"FORGE_DEMO_TEST_TOKEN"}),
+    )
+    .await;
+    if disabled {
+        assert_refused(&response, "server_location_refused", "integration");
+    } else {
+        assert_eq!(response.0, StatusCode::CREATED, "{}", response.1);
+    }
+}
+
 pub async fn send_with_bearer(
     app: &axum::Router,
     method: Method,

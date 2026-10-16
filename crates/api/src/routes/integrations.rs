@@ -52,6 +52,10 @@ pub async fn create_integration(
         crate::routes::authorization::ProjectAccess::Admin,
     )
     .await?;
+    // Demo: a token reference names a variable of the server's environment.
+    services::server_commands::ensure_server_files_allowed(
+        "integrations read their token from the server's environment",
+    )?;
     let platform = body
         .platform
         .parse::<db::IntegrationPlatform>()
@@ -118,6 +122,9 @@ pub async fn update_integration(
         crate::routes::authorization::ProjectAccess::Admin,
     )
     .await?;
+    services::server_commands::ensure_server_files_allowed(
+        "integrations read their token from the server's environment",
+    )?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id.clone()))?;
