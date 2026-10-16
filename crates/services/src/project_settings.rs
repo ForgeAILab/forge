@@ -187,6 +187,42 @@ pub async fn validate_project_settings(
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn review_ci_triage_defaults_full_and_validates_values() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = SqliteDb::new(pool);
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        assert_eq!(
+            ProjectSettings::default().review_ci_triage,
+            api_types::ReviewCiTriage::Full
+        );
+        for value in ["full", "report", "off"] {
+            validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for value in [
+            serde_json::json!("unknown"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert!(validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None
+            )
+            .await
+            .is_err());
+        }
+    }
+    #[tokio::test]
     async fn provision_timeout_defaults_to_thirty_minutes_and_is_bounded() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         let db = SqliteDb::new(pool);

@@ -1,16 +1,24 @@
 ## ADDED Requirements
 
 ### Requirement: An unchanged candidate is not reviewed again
-Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round ends with a commit (and clean worktree) equal to the one the latest Review in the window judged, only when that latest Review failed. In that case it creates no Review row.
+Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round ends with a commit (and clean worktree) equal to the one the latest settled Review in the window judged, only when that latest settled Review failed. In that case it creates no Review row.
 
 - **First time:** Forge sends the Task back to the coder with a brief headed "No change since review N". This is charged to the persistent `repair_no_change` budget (Review window, limit 1).
 - **Second time:** the Task parks with `review_needs_owner` and the message `no change after repair round`.
 
-Neither case charges the review budget. A re-review the owner starts is exempt.
+Neither case charges the review budget. A re-review the owner starts, and an explicit owner Retry of a blocked review entry, are exempt. Cancelled, running and awaiting-human Reviews do not replace the latest settled (passed/failed) Review.
 
 #### Scenario: Coder changes nothing
 - **WHEN** after failed review 2 at commit `c2`, the coder's repair round ends with HEAD still `c2`
 - **THEN** no CI or reviewer runs, the coder is sent back once with "No change since review 2", and the review budget is unchanged
+
+#### Scenario: Cancelled Review after a failure
+- **WHEN** a failed Review is followed by a cancelled Review of the same commit
+- **THEN** the cancelled row does not hide the failed settled Review from the no-change gate
+
+#### Scenario: Owner retries an offline coder entry
+- **WHEN** a coder repair entry waits for its offline owner and the owner explicitly presses Retry with an unchanged commit
+- **THEN** ordinary review runs without a no-change reminder or park, and the resolved infrastructure barrier and annotation clear consistently
 
 #### Scenario: Later pass
 - **WHEN** a failed Review is followed by a passed Review of the same commit, and a repair entry is unchanged

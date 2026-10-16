@@ -6,8 +6,13 @@ import type { LifecycleHookDef } from "./LifecycleHookDef";
 import type { ProjectEnvironment } from "./ProjectEnvironment";
 import type { ProjectPlacementSettings } from "./ProjectPlacementSettings";
 import type { RetryBudgets } from "./RetryBudgets";
+import type { ReviewCiTriage } from "./ReviewCiTriage";
 
 export type ProjectSettings = { 
+/**
+ * How failed review and queue-head CI is triaged. Existing Projects default to full.
+ */
+review_ci_triage: ReviewCiTriage, 
 /**
  * Maximum unparked Tasks in active/gate states; 0 disables the limit.
  */

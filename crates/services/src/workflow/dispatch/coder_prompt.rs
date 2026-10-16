@@ -419,6 +419,10 @@ pub(super) fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
             step.get("exit_code")
                 .and_then(serde_json::Value::as_i64)
                 .is_some_and(|code| code != 0)
+                && step
+                    .pointer("/triage/blocking")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
         })
         .map(|failed| {
             let command = failed
@@ -435,8 +439,38 @@ pub(super) fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
                         .and_then(serde_json::Value::as_str)
                 })
                 .unwrap_or("");
-            let failures = failed.get("failures").and_then(serde_json::Value::as_array);
+            let triaged = failed
+                .pointer("/triage/failures")
+                .and_then(serde_json::Value::as_array)
+                .map(|classes| {
+                    failed
+                        .get("failures")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|signature| {
+                            !classes.iter().any(|failure| {
+                                failure["signature"] == **signature
+                                    && matches!(
+                                        failure["class"].as_str(),
+                                        Some("flaky" | "pre_existing")
+                                    )
+                            })
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+            let failures = triaged
+                .as_ref()
+                .or_else(|| failed.get("failures").and_then(serde_json::Value::as_array));
             let mut reason = format!("CI failed: {command}\n");
+            if let Some(note) = failed
+                .pointer("/triage/reason")
+                .and_then(serde_json::Value::as_str)
+            {
+                reason.push_str(note);
+                reason.push('\n');
+            }
             if let Some(failures) = failures {
                 for signature in failures
                     .iter()

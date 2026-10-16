@@ -244,6 +244,9 @@ pub enum CheckoutTarget<'a> {
         repository: &'a Path,
         build_area: &'a Path,
         commit: &'a str,
+        /// The candidate workspace supplies per-run build/temp policy.
+        environment_workspace: Option<&'a Path>,
+        assets: &'a [api_types::EnvironmentAsset],
     },
 }
 /// Declared cleanup is owner policy, pinned by the spec's execution_policy.
@@ -424,9 +427,18 @@ pub async fn run_command(
     cancel: &CancellationToken,
     limit: usize,
 ) -> Result<CheckCommandReceipt, String> {
-    run_command_group(path, spec, environment, policy, deadline, cancel, limit)
-        .await
-        .map(|(receipt, _)| receipt)
+    run_command_group(
+        path,
+        path,
+        spec,
+        environment,
+        policy,
+        deadline,
+        cancel,
+        limit,
+    )
+    .await
+    .map(|(receipt, _)| receipt)
 }
 
 /// Only Forge's tempfile names inside its reserved Task directory are eligible.
@@ -457,8 +469,10 @@ fn remove_abandoned_reports(root: &executors::sandbox::TaskRoot) {
 }
 
 /// Also returns the command's process group, when one was started.
+#[allow(clippy::too_many_arguments)]
 async fn run_command_group(
     path: &Path,
+    environment_workspace: &Path,
     spec: &CheckCommandSpec,
     environment: &BTreeMap<String, String>,
     policy: &str,
@@ -468,10 +482,12 @@ async fn run_command_group(
 ) -> Result<(CheckCommandReceipt, Option<u32>), String> {
     let started_at = now();
     let start = Instant::now();
-    executors::sandbox::start_compiler_cache(path).await;
+    executors::sandbox::start_compiler_cache(environment_workspace).await;
     // Removed when this command returns: pass, fail, timeout or cancel.
-    let run_scope =
-        executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);
+    let run_scope = executors::sandbox::SandboxEnv::for_command(
+        environment_workspace,
+        executors::sandbox::RunPurpose::Check,
+    );
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
     // An isolated directory prevents one step from inheriting another's reports.
     // Reports are optional evidence: a directory that cannot be made leaves the
@@ -668,6 +684,8 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                 repository,
                 build_area,
                 commit,
+                assets,
+                ..
             } => {
                 if !matches!(input.spec.scope, CheckScope::Commit) {
                     return Err("exact checkout requires commit scope".into());
@@ -722,6 +740,7 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                 {
                     return Err("managed checkout witness mismatch".into());
                 }
+                executors::environment::materialize_assets(&checkout, assets).await?;
                 checkout
             }
         };
@@ -773,6 +792,13 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             while let Some((_, spec)) = sequence.next_command() {
                 match run_command_group(
                     path,
+                    match &input.target {
+                        CheckoutTarget::ExactCommit {
+                            environment_workspace: Some(workspace),
+                            ..
+                        } => workspace,
+                        _ => path,
+                    },
                     spec,
                     input.environment,
                     &input.spec.execution_policy,

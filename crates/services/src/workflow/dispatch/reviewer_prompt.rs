@@ -159,6 +159,19 @@ fn current_ci_results(ctx: &AgentDispatchContext) -> Option<String> {
             .and_then(serde_json::Value::as_i64)
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
         rendered.push_str(&format!("- `{command}` exited {exit_code}\n"));
+        if let Some(triage) = step.get("triage") {
+            let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+            for failure in triage["failures"].as_array().into_iter().flatten() {
+                if let Some(class) = failure["class"].as_str() {
+                    *counts.entry(class).or_default() += 1;
+                }
+            }
+            let summary = serde_json::json!({"mode":triage["mode"],"base_status":triage["base_status"],"class":triage["class"],"blocking":triage["blocking"],"counts":counts,"reason":triage["reason"]});
+            rendered.push_str(&format!("  Forge CI triage: {summary}.\n"));
+            if triage["blocking"] == false {
+                rendered.push_str("  These flaky/pre-existing failures are non-blocking. Assess the Task's own changes; do not require it to repair these Project CI incidents.\n");
+            }
+        }
         let output = step
             .get("output_tail")
             .and_then(|v| v.as_str())

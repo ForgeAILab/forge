@@ -715,3 +715,142 @@ async fn no_change_offline_owner_entry_retry_retains_the_owner_exemption() {
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await.2, 0);
 }
+
+#[tokio::test]
+async fn no_change_cancelled_review_does_not_hide_latest_settled_failure() {
+    let f = red_fixture().await;
+    let failed = reviews(&f).await.remove(0);
+    let now = now_rfc3339();
+    db::ReviewRepo::create(
+        &*f.db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: f.task.id.clone(),
+            execution_id: failed.execution_id,
+            attempt_number: 2,
+            status: db::ReviewStatus::Cancelled,
+            step_results_json: failed.step_results_json,
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    repair(&f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "in_progress");
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn no_change_owner_retry_of_offline_coder_entry_is_exempt() {
+    let mut f = red_fixture().await;
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert!(task.entry_barrier_json.is_some());
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    // A successful check proves that the normal entry completes and clears
+    // the infrastructure annotation and barrier, without a no-change park.
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(json!({"retry_budgets":{"review":3},"review":{"ci_steps":["true"]}}).to_string())
+        .bind(&f.task.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = f
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &task.id,
+            task.version,
+            &f.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            "owner presses Retry",
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let task = drain_result(f.engine.clone(), result).await.task;
+    assert!(
+        task.entry_barrier_json.is_none(),
+        "{:?}",
+        task.entry_barrier_json
+    );
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none(), "{:?}", task.blocked_json);
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await, (1, 1, 0));
+}
+
+#[tokio::test]
+async fn no_change_owner_retry_exemption_survives_another_offline_retry() {
+    let mut f = red_fixture().await;
+    let gate = f
+        .workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap();
+    gate.reject_target = None;
+    gate.requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert!(task.entry_barrier_json.is_some());
+    let result = f
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &task.id,
+            task.version,
+            &f.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            "owner retries while still offline",
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let waiting = drain_result(f.engine.clone(), result).await.task;
+    assert!(waiting.entry_barrier_json.is_some());
+    assert_eq!(spending(&f).await.2, 0);
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(json!({"retry_budgets":{"review":3},"review":{"ci_steps":["true"]}}).to_string())
+        .bind(&f.task.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    let task = retry_offline_entry(&f).await;
+    assert!(task.entry_barrier_json.is_none());
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none());
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await.2, 0);
+}

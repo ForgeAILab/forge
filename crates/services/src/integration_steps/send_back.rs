@@ -197,8 +197,10 @@ impl IntegrationSteps {
                 merge_failure_result(&ctx, &task, detail.clone(), FailureKind::DirtyWorktree).await,
             )
         } else if attempt.failure_kind == Some(IntegrationFailureKind::CandidateCheckFailed) {
-            // The rebased commit is red: a merge failure the coder fixes
-            // under the merge-fix budget, as any failed integration is.
+            // Settle triaged this exact head against its target tip before
+            // authorising CandidateCheckFailed. Under full, flaky/pre-existing
+            // failures never reach this send-back; its message names only the
+            // remaining blocking failures and base-comparison limitations.
             let details = format!("checks failed after the rebase onto {target_branch}: {detail}");
             task = record_integration_failure(
                 &ctx,

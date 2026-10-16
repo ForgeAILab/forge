@@ -20,7 +20,14 @@ pub(crate) async fn repair_no_change_gate(
     if let Some(recorded) = recorded {
         return Ok(recorded);
     }
-    let (from, actor) = origin.unwrap_or((&ctx.from_state, &ctx.triggered_by));
+    let (from, original_actor) = origin.unwrap_or((&ctx.from_state, &ctx.triggered_by));
+    // Reconnect retries retain the original actor; an explicit owner Retry is
+    // itself owner-initiated, even when the blocked entry came from a coder.
+    let actor = if ctx.triggered_by.is_owner() {
+        &ctx.triggered_by
+    } else {
+        original_actor
+    };
     let unchanged = unchanged_attempt(ctx, task, from, actor).await?;
     Ok(db::budget::settle_repair_no_change(&ctx.db, task, step, unchanged).await?)
 }

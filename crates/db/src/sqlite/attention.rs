@@ -1011,3 +1011,51 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    /// Merge occurrence/task sets transactionally; hook redelivery counts once.
+    pub async fn record_ci_triage_attention(
+        &self,
+        mut input: CreateAttentionProjection,
+        occurrence: &str,
+        task: &str,
+    ) -> Result<()> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let old: Option<String> =
+            sqlx::query_scalar("SELECT details_json FROM attention_projection WHERE dedupe_key=?")
+                .bind(&input.dedupe_key)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let old: serde_json::Value = old
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let mut occurrences: std::collections::BTreeSet<String> =
+            serde_json::from_value(old["occurrences"].clone()).unwrap_or_default();
+        if !occurrences.insert(occurrence.to_owned()) {
+            return Ok(());
+        }
+        let mut tasks: std::collections::BTreeSet<String> =
+            serde_json::from_value(old["task_ids"].clone()).unwrap_or_default();
+        tasks.insert(task.to_owned());
+        let mut details: serde_json::Value =
+            serde_json::from_str(&input.details_json).map_err(|e| DbError::Check(e.to_string()))?;
+        details["count"] = serde_json::json!(occurrences.len());
+        details["occurrences"] = serde_json::json!(occurrences);
+        details["task_ids"] = serde_json::json!(tasks);
+        input.details_json = details.to_string();
+        self.insert_attention_in_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn resolve_passing_base_attention(
+        &self,
+        project: &str,
+        command: &str,
+        observed_at: &str,
+        event: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE attention_projection SET status='resolved',resolved_at=?,updated_at=?,source_event_id=?,version=version+1 WHERE scope_type='project' AND scope_id=? AND attention_type='base_check_failing' AND status<>'resolved' AND json_extract(details_json,'$.command')=? AND occurred_at<=?")
+            .bind(observed_at).bind(observed_at).bind(event).bind(project).bind(command).bind(observed_at).execute(self.pool()).await?;
+        Ok(())
+    }
+}

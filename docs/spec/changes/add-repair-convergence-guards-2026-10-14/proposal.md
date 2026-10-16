@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T22:34:39Z
+updated_at: 2026-10-16T01:49:32Z
 ---
 
 ## Why
@@ -72,8 +72,9 @@ or a merge-queue head check fails:
   the same base shares it. Signatures that also fail there are
   **pre-existing**.
 - With no `setup_steps`, on daemon placements, or when the base run itself
-  breaks, nothing is classified, and failures block as today, with a note
-  saying why.
+  breaks, remaining consistent failures stay unclassified and block as today,
+  with a note saying why. Flakes already proved by the rerun remain non-blocking
+  under `full`.
 - Only consistent, introduced failures reach the coder.
 - Flaky and pre-existing failures go to new Project attention items
   `flaky_check` and `base_check_failing`. They do not block the Task when the
@@ -83,15 +84,15 @@ or a merge-queue head check fails:
 
 **3. No-change gate.**
 - A Task that comes back to review with a clean tree and the exact commit its
-  latest Review in the window judged starts no CI, verify or reviewer only when
-  that latest Review failed. A later pass suppresses an older failure.
+  latest settled Review in the window judged starts no CI, verify or reviewer only when
+  that latest settled Review failed. A later pass suppresses an older failure.
 - It goes back to the coder once with "no change since the last review".
 - The second time, it parks with `review_needs_owner` (`no change after
   repair round`).
 - No review budget is spent.
 - Entries already in progress before the guard shipped resume from their
-  checkpoints without evaluating it. Offline retries retain the original entry
-  source and actor; a reminder clears the resolved infrastructure blocker.
+  checkpoints without evaluating it. Automatic reconnect retries retain the original entry
+  source and actor; explicit owner Retry is owner-initiated and exempt; a reminder clears the resolved infrastructure blocker.
 
 **4. Reviewer anchoring.** Findings gain three optional fields:
 - `requirement_ids`;

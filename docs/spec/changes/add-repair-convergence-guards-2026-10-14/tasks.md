@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T22:34:39Z
+updated_at: 2026-10-16T01:49:32Z
 completed_at:
 ---
 
@@ -17,7 +17,7 @@ completed_at:
   - normalisation, a cap of 200 signatures at 300 characters each, `failures_truncated`.
 - [x] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
 - [x] 1.3 Add `CheckCommandOutcome.failures` and `StepResultEntry.failures` (optional, `serde(default)`). Wire them through the durable runner, daemon receipts (an absent field is an empty list), generated TS and `docs/api.md`.
-- [x] 1.4 **Pre-ledger half complete.** Until the ledger lands, the CI repair prompt (`ci_failure_reason`) lists signatures for every failing step, not only the first. Once the ledger exists, add `CI-<step>#<hash>` findings in `finding_ledger`.
+- [x] 1.4 CI repair prompts list blocking signatures for every failing step (up to 20 per step). The ledger derives `CI-<step>#<hash>` findings and retains all signatures, including non-blocking triage classes.
 - [x] 1.5 Focused tests:
   - extractor unit tests per runner, using real captured output from the `world` and NovelKit logs;
   - JUnit parse;
@@ -25,10 +25,10 @@ completed_at:
   - an older-daemon receipt without `failures`.
 
 ## 2. CI triage
-- [ ] 2.1 Project setting `review_ci_triage` (`full` default, `report`, `off`): validation, api-types, TS, `docs/api.md`, web settings.
-- [ ] 2.2 Volatile budget `ReviewCiTriage` (limit 1) in `crates/db/src/budget.rs`.
-- [ ] 2.3 Re-run the failing steps once in `RunCiSteps` (`workflow/actions/review.rs`), then classify flaky signatures and steps.
-- [ ] 2.4 Base run:
+- [x] 2.1 Project setting `review_ci_triage` (`full` default, `report`, `off`): validation, api-types, TS, `docs/api.md`, web settings.
+- [x] 2.2 Volatile budget `ReviewCiTriage` (limit 1) in `crates/db/src/budget.rs`.
+- [x] 2.3 Re-run the failing steps once in `RunCiSteps` (`workflow/actions/review.rs`), then classify flaky signatures and steps.
+- [x] 2.4 Base run:
   - same owner, Project env, assets and build environment as the candidate run;
   - `ExactCommit` checkout, running `setup_steps` and then the CI steps up to the last failing one;
   - `canonical-ci/1`, with its own identity so it is reused per base commit;
@@ -36,10 +36,10 @@ completed_at:
   - report `base_unavailable` when there are no `setup_steps` or the Task is on a daemon;
   - report `base_run_invalid` when setup fails, or when the base has no signatures but the candidate has some.
   - Triage never changes the stored `check_result` outcome, and never certifies a pass.
-- [ ] 2.5 Routing under `full`: no blocking failures left means the step counts as passed. Record the triage in the Review details (`ci_steps[].triage`). `report` and `off` keep today's routing.
-- [ ] 2.6 Queue-head triage against the target tip in `integration_steps/settle.rs` and `send_back.rs`. Under `full`, no send-back for flaky or pre-existing failures.
-- [ ] 2.7 `AttentionCategory::{FlakyCheck, BaseCheckFailing}`: dedupe keys, resolution on a passing base run, Mission Control rendering, `docs/api.md`.
-- [ ] 2.8 Focused tests:
+- [x] 2.5 Routing under `full`: no blocking failures left means the step counts as passed. Record the triage in the Review details (`ci_steps[].triage`). `report` and `off` keep today's routing.
+- [x] 2.6 Queue-head triage against the target tip in `integration_steps/settle.rs` and `send_back.rs`. Under `full`, no send-back for flaky or pre-existing failures.
+- [x] 2.7 `AttentionCategory::{FlakyCheck, BaseCheckFailing}`: dedupe keys, resolution on a passing base run, Mission Control rendering, `docs/api.md`.
+- [x] 2.8 Focused tests:
   - flaky step passes on re-run;
   - consistent failures go to the base;
   - red base under `full` continues to the reviewer;
@@ -102,3 +102,8 @@ completed_at:
 - [x] 7.4 Carry the original entry source and actor through offline same-state retries, and clear the resolved infrastructure blocker on a reminder.
 - [x] 7.5 Remove abandoned Forge report directories at the next check, without following symlinks or deleting unrelated entries.
 - [x] 7.6 Run the requested focused verification and record results under `/Volumes/Data/tmp/refactor/guards-13b/`.
+
+## 8. Phase 2 entry-guard corrections
+- [x] 0a Select the latest settled (`passed`/`failed`) Review; cancelled/running/awaiting-human rows do not hide it.
+- [x] 0b Exempt explicit owner Retry of a blocked coder entry and retain that intent across another offline interruption.
+- [x] 0c Optional: strip monorepo runner prefixes before extraction, with captured pnpm/turbo fixtures.

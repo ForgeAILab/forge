@@ -594,6 +594,84 @@ impl IntegrationSteps {
             return self.answer_task_left(step, request, states).await;
         };
 
+        // Every candidate failure is triaged before an ejection/send-back can
+        // be authorised. Subcheck deliveries retain the head's authority.
+        let mut triaged_steps = None;
+        let check = if matches!(check, CheckInput::Failed(..)) {
+            if let Some(application) = evidence {
+                let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                let workflow = WorkflowEngine::resolve_workflow_for_task(
+                    &task,
+                    &project.workflow_definition,
+                    &crate::worker_runtime::queue::cascade_actor(),
+                );
+                let config = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == default_states::REVIEW)
+                    .map(|state| {
+                        crate::workflow::engine::effective_state_config(
+                            state,
+                            Some(&project),
+                            task.task_state_config.as_deref(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let consumers = self.task_service.check_consumers().ok_or_else(|| {
+                    ServiceError::invalid_operation("check consumers are not composed")
+                })?;
+                match crate::check_runner::ci_triage::triage(
+                    &self.db,
+                    &consumers,
+                    &task,
+                    application,
+                    &config,
+                    attempt.target_tip_sha.as_deref(),
+                )
+                .await?
+                {
+                    crate::check_runner::ci_triage::Progress::Pending(_) => {
+                        if let Some(step) = step {
+                            let mut tx = db::begin_immediate(self.db.pool()).await?;
+                            self.db
+                                .finish_step_in_tx(&mut tx, step, "done", None)
+                                .await?;
+                            tx.commit().await?;
+                        }
+                        return Ok(StepOutcome::Settled);
+                    }
+                    crate::check_runner::ci_triage::Progress::Complete(entries) => {
+                        let blocking = entries.iter().any(crate::check_runner::ci_triage::blocks);
+                        let summary = entries
+                            .iter()
+                            .any(|entry| entry.triage.is_some())
+                            .then(|| crate::check_runner::ci_triage::failure_summary(&entries));
+                        triaged_steps = Some(entries);
+                        match check {
+                            CheckInput::Failed(timing, _) if !blocking => {
+                                CheckInput::Passed(timing)
+                            }
+                            CheckInput::Failed(timing, _)
+                                if summary.as_ref().is_some_and(|summary| !summary.is_empty()) =>
+                            {
+                                CheckInput::Failed(
+                                    timing,
+                                    bounded(summary.as_deref().unwrap_or_default()),
+                                )
+                            }
+                            other => other,
+                        }
+                    }
+                }
+            } else {
+                check
+            }
+        } else {
+            check
+        };
+
         // Everything that reads Git or the workflow is decided before the
         // write transaction; the transaction re-reads what it depends on.
         let authority = {
@@ -754,7 +832,7 @@ impl IntegrationSteps {
             }
         };
         if let Some(application) = evidence {
-            self.record_head_review_in_tx(&mut tx, &attempt, application)
+            self.record_head_review_in_tx(&mut tx, &attempt, application, triaged_steps.as_deref())
                 .await?;
         }
         let written = db::acknowledge_integration_step_in_tx(
@@ -833,6 +911,34 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
         else {
             return Ok(());
         };
+        let subcheck = application
+            .run
+            .identity
+            .inputs
+            .spec
+            .commands
+            .first()
+            .is_some_and(|command| {
+                command.id.starts_with("triage-rerun:") || command.id.starts_with("triage-base:")
+            });
+        let original = if subcheck {
+            let task = TaskRepo::get_by_id(&*self.steps.db, &application.task_id, false)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            Some(
+                crate::check_runner::ci_triage::original_application(
+                    &self.steps.db,
+                    &task,
+                    application.status_epoch,
+                    CheckConsumerOrigin::Integration,
+                    &application.authority,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let application = original.as_ref().unwrap_or(application);
         // The answer is for the worker that waits now: its `effect_seq` and
         // generation, whichever step first asked for this commit.
         let request = crate::integration_worker::IntegrationQueueWorker::step_request(
@@ -1039,6 +1145,7 @@ impl IntegrationSteps {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         attempt: &IntegrationAttempt,
         application: &CheckApplication,
+        triaged_steps: Option<&[api_types::StepResultEntry]>,
     ) -> Result<()> {
         let CheckVerdict::Result(result) = &application.verdict else {
             return Ok(());
@@ -1114,8 +1221,10 @@ impl IntegrationSteps {
         } else {
             "cache_hit"
         };
-        let ci_steps: Vec<serde_json::Value> = result
-            .commands
+        let steps = triaged_steps
+            .map(<[_]>::to_vec)
+            .unwrap_or_else(|| crate::check_runner::ci_triage::steps(result));
+        let ci_steps: Vec<serde_json::Value> = steps
             .iter()
             .map(|command| {
                 let mut value = serde_json::to_value(command).expect("command facts serialize");

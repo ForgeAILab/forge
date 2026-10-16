@@ -1489,6 +1489,13 @@ impl WorkflowExecution<'_> {
                     .map(|previous| previous.entry_origin.unwrap_or(durable::EntryOrigin {
                         from: previous.from, actor: previous.actor,
                     }))
+                    .map(|mut origin| {
+                        // The owner taking over a blocked entry also owns its
+                        // later automatic reconnect retries. Keep the source
+                        // state, while retaining that explicit owner intent.
+                        if actor.is_owner() { origin.actor = actor.clone(); }
+                        origin
+                    })
             } else {
                 None
             };

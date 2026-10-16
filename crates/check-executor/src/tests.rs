@@ -245,6 +245,8 @@ async fn managed_checkout_is_exact_root_scoped_and_removed_without_touching_sour
         operation_id: "managed",
         spec: &bundle,
         target: CheckoutTarget::ExactCommit {
+            environment_workspace: None,
+            assets: &[],
             repository: &source,
             build_area: &build,
             commit: &commit,

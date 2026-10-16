@@ -116,7 +116,8 @@ Non-Goals:
      re-run step only, and the base comparison is `base_unavailable` in
      version 1.
 4. That base run has its own identity. It is reused by every Task and attempt
-   on the same base commit, setup steps and CI steps.
+   on the same base commit, setup steps and CI steps. Completed red evidence is
+   shared only for base comparison, never as a certified candidate/head pass.
 5. **An invalid base run classifies nothing.** The base run is
    `base_run_invalid` when either of these holds:
    - its setup steps fail;
@@ -144,6 +145,8 @@ Non-Goals:
 | `report` | yes | everything, as today; the triage is still recorded and reported |
 | `off` | no | everything, as today |
 
+- Under `full`, candidate CI collects all configured steps so waiving an early
+  failure cannot omit later validation. `report` and `off` retain stop-at-first-failure.
 - **Under `full`, with no blocking failures left**, the step counts as passed
   for this review. The Review details keep the triage, and review continues
   to verify and the reviewer. At the queue head, the head is not sent back.
@@ -162,7 +165,7 @@ Non-Goals:
 
 **D4 — No-change gate.**
 - When a coder repair round ends and the commit about to enter review equals
-  the commit judged by the latest Review in the window, and that Review failed
+  the commit judged by the latest settled Review in the window, and that Review failed
   (with a clean worktree), Forge starts no CI, verify or reviewer, and creates
   no Review row.
 - **First time:** it sends the Task back to the coder with a brief headed
@@ -171,14 +174,15 @@ Non-Goals:
 - **Second time:** it parks with `review_needs_owner` and the message
   `no change after repair round`.
 - A later passing Review of the same commit means no reminder is due.
-- Owner-initiated re-reviews are exempt.
+- Owner-initiated re-reviews and explicit owner Retry of a blocked entry are exempt. Only passed/failed Reviews participate in the latest settled Review comparison.
 - Entries already past the guard when it ships continue: entry checkpoints
   without a guard decision record `Continue`. A recorded `awaited_consumer_id`
   is no proof (an exit hook's wait keeps it too); a suspended entry hook has
   its own open checkpoint.
-- Same-state retries after an offline entry carry the original source state and
+- Automatic same-state retries after an offline entry carry the original source state and
   actor in the hooks payload, so reconnect still evaluates a repair entry as a
-  repair and retains owner exemptions. A reminder clears the resolved entry's
+  repair and retains owner exemptions. An explicit owner Retry is exempt even
+  when that original actor was the coder. A reminder clears the resolved entry's
   infrastructure blocker before returning to the coder. No schema migration is
   needed.
 

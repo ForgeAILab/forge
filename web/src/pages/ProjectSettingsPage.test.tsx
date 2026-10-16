@@ -79,6 +79,33 @@ beforeEach(() => {
 })
 
 describe('Project flow control settings', () => {
+  it('defaults CI triage to full and saves off while preserving setup steps', async () => {
+    query.data = {
+      ...project,
+      default_review_config: { ci_steps: ['cargo test'], setup_steps: ['cargo fetch'] },
+    }
+    renderSettings('general')
+    await waitFor(() =>
+      expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+    )
+    expect(screen.getByLabelText('Triage policy').textContent).toContain('Full')
+    expect(screen.getByLabelText('Triage policy').getAttribute('aria-describedby')).toBe(
+      'review-ci-triage-help',
+    )
+    fireEvent.click(screen.getByLabelText('Triage policy'))
+    fireEvent.click(screen.getByRole('option', { name: 'Off — block all failures without triage' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          settings: expect.objectContaining({ review_ci_triage: 'off' }),
+          default_review_config: expect.objectContaining({ setup_steps: ['cargo fetch'] }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+
   it('preserves the provision timeout when saving environment controls', async () => {
     query.data = {
       ...project,

@@ -1638,6 +1638,20 @@ fn application(
 async fn the_check_verdict_is_the_settle_answer_with_timing_for_the_waiting_worker() {
     use crate::check_runner::consumer::CheckConsumerFamily;
     let world = World::new().await;
+    // This seam deliberately supplies scripted receipts, not runnable checks.
+    // Exercise the raw verdict mapping under off; full triage uses real owners.
+    sqlx::query(
+        "UPDATE project SET settings=json_set(settings,'$.review_ci_triage','off') WHERE id='p'",
+    )
+    .execute(world.db.pool())
+    .await
+    .unwrap();
+    world.service.compose_checks(
+        Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers()),
+        Duration::from_secs(60),
+        &crate::integration_worker::IntegrationWorkerConfig::default(),
+    );
+
     let family =
         IntegrationCheckFamily::new(Arc::new(IntegrationSteps::new(world.service.clone())));
     for (task, outcome, exit_code, expected) in [
@@ -2243,8 +2257,8 @@ async fn real_ci_steps_decide_the_head_through_the_production_ports() {
             "{file}"
         );
     }
-    // The checks really ran: one run per rebased commit, with the commands'
-    // own exit codes, and none for the Task that merged as reviewed.
+    // One primary run per rebased commit, plus the default-full rerun of
+    // the red step. No check runs for the Task that merged as reviewed.
     let runs: Vec<(String, String)> = sqlx::query_as(
         "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
     )
@@ -2255,6 +2269,7 @@ async fn real_ci_steps_decide_the_head_through_the_production_ports() {
         runs,
         vec![
             (two.candidate_sha.clone().unwrap(), "pass".to_owned()),
+            (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
             (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
         ],
         "{runs:?}"
@@ -4714,4 +4729,188 @@ async fn runtime_crash_boundaries_recover_through_real_ports_without_duplicate_f
         .status
         .success());
     }
+}
+
+/// Red results are shared only by the base-comparison identity, and never
+/// certify the candidate. Both heads remain eligible to merge under full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_two_tasks_share_red_base_and_no_pre_existing_send_back() {
+    let world = World::new().await;
+    sqlx::query("UPDATE project SET settings=json_set(settings,'$.review_ci_triage','full','$.default_review_config',json(?)) WHERE id='p'")
+        .bind(json!({"setup_steps":["true"]}).to_string()).execute(world.db.pool()).await.unwrap();
+    let production = Production::new(&world);
+    for task in ["triage-one", "triage-two"] {
+        let a = world.add_task(task, task, "one\n").await;
+        review_ci(
+            &world,
+            task,
+            &["printf 'test suite::base ... FAILED\\n'; exit 1"],
+        )
+        .await;
+        let asked = world.place(&a.id, "checking", 1).await;
+        world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+        eventually("triaged red head has a permit", || async {
+            world.attempt(&a.id).await.permit_json.is_some()
+        })
+        .await;
+        assert_eq!(world.task(task).await.status, "merging");
+        assert!(world
+            .step(task, IntegrationStepAction::SendBack)
+            .await
+            .is_empty());
+    }
+    let bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE json_extract(input_json,'$.spec.commands[0].id')='triage-base:setup:0'").fetch_one(world.db.pool()).await.unwrap();
+    assert_eq!(bases, 1);
+    let candidate_passes: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM check_result WHERE certified=1")
+            .fetch_one(world.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        candidate_passes, 0,
+        "all candidate, rerun and base results really failed"
+    );
+    let item: String = sqlx::query_scalar(
+        "SELECT details_json FROM attention_projection WHERE attention_type='base_check_failing'",
+    )
+    .fetch_one(world.db.pool())
+    .await
+    .unwrap();
+    let item: Value = serde_json::from_str(&item).unwrap();
+    assert_eq!(item["count"], 2);
+    assert_eq!(item["task_ids"].as_array().unwrap().len(), 2);
+    drop(production);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_flaky_queue_head_does_not_send_back() {
+    let world = World::new().await;
+    let a = world.add_task("flake-head", "candidate", "one\n").await;
+    review_ci(
+        &world,
+        "flake-head",
+        &["if [ ! -f .flake ]; then touch .flake; printf 'test flaky ... FAILED\\n'; exit 1; fi"],
+    )
+    .await;
+    let production = Production::new(&world);
+    let asked = world.place(&a.id, "checking", 1).await;
+    world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+    eventually("flaky head has a permit", || async {
+        world.attempt(&a.id).await.permit_json.is_some()
+    })
+    .await;
+    assert!(world
+        .step("flake-head", IntegrationStepAction::SendBack)
+        .await
+        .is_empty());
+    assert_eq!(world.task("flake-head").await.status, "merging");
+    drop(production);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_pass_is_not_reused_by_unchanged_queue_head() {
+    let mut world = World::new().await;
+    world.stop_steps().await;
+    sqlx::query("UPDATE project SET primary_repo_id='r',settings=json_set(settings,'$.review_ci_triage','full','$.default_review_config',json(?)) WHERE id='p'")
+        .bind(json!({"setup_steps":["true"]}).to_string()).execute(world.db.pool()).await.unwrap();
+    world
+        .legacy_task("triaged-review", "candidate", "review")
+        .await;
+    let execution = world
+        .seed_execution("triaged-review", "executor", None)
+        .await;
+    review_ci(
+        &world,
+        "triaged-review",
+        &["printf 'test suite::base ... FAILED\\n'; exit 1"],
+    )
+    .await;
+    let production = Production::new(&world);
+    let project = db::ProjectRepo::get_by_id(&*world.db, "p")
+        .await
+        .unwrap()
+        .unwrap();
+    let task = world.task("triaged-review").await;
+    let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+        &task,
+        &project.workflow_definition,
+        &crate::worker_runtime::queue::cascade_actor(),
+    );
+    let state = workflow
+        .states
+        .iter()
+        .find(|state| state.name == "review")
+        .unwrap();
+    let ctx = crate::workflow::HookContext {
+        task_id: task.id.clone(),
+        project_id: "p".into(),
+        from_state: "in_progress".into(),
+        to_state: "review".into(),
+        db: world.db.clone(),
+        event_bus: world.bus.clone(),
+        gate_config: state.gate_config.clone(),
+        state_config: crate::workflow::engine::effective_state_config(
+            state,
+            Some(&project),
+            task.task_state_config.as_deref(),
+        ),
+        workflow: Arc::new(workflow),
+        project_version: Some(project.version),
+        project_workflow_definition: Some(project.workflow_definition),
+        triggered_by: crate::worker_runtime::queue::cascade_actor(),
+        merge_service: world.service.merge_service.clone(),
+        cleanup_scheduler: None,
+        task_service: world.service.clone(),
+        daemon_connections: None,
+        workspace_exec_locks: None,
+        terminal_activity: None,
+        workspace_root: world.temp.path().join("workspaces"),
+        repo_cache_locks: None,
+        workspace_backend_router: world.service.workspace_backend_router.clone(),
+        workspace_id: Some("w-triaged-review".into()),
+        agent_id: None,
+        execution_id: Some(execution),
+    };
+    let ci = crate::workflow::actions::run_ci_steps_in_step(
+        &ctx,
+        &world.service.check_worker_or_embedded(),
+    )
+    .await;
+    assert!(matches!(ci, crate::workflow::HookResult::Ok), "{ci:?}");
+    assert!(world.db.review_ci_passed_by_triage(&task.id).await.unwrap());
+    let runs_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs_before, 3);
+    sqlx::query("UPDATE task SET status='merging',status_epoch=status_epoch+1,version=version+1 WHERE id='triaged-review'").execute(world.db.pool()).await.unwrap();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    world.stop = stop;
+    world.step_worker = Some(world.service.task_step_worker().start(stopped));
+    let admitted = world
+        .service
+        .admit_to_integration_queue("triaged-review")
+        .await
+        .unwrap();
+    let running = production.run();
+    eventually("the triaged unchanged candidate merges", || async {
+        world.task("triaged-review").await.status == "done"
+    })
+    .await;
+    let _ = production.stop.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let runs_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run")
+        .fetch_one(world.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        runs_after,
+        runs_before + 2,
+        "head must run its own candidate and rerun; only the red base is shared"
+    );
+    assert_eq!(world.attempt(&admitted.id).await.state, S::Completed);
+    assert!(world
+        .step("triaged-review", IntegrationStepAction::SendBack)
+        .await
+        .is_empty());
 }

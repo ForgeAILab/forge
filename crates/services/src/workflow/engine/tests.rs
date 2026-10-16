@@ -2353,7 +2353,7 @@ async fn failed_ci_fixture(budget: i32, policy: FailurePolicy) -> FailedCiFixtur
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+    sqlx::query("UPDATE project SET workflow_definition = ?,settings=json_set(settings,'$.review_ci_triage','off') WHERE id = ?")
         .bind(serde_json::to_string(&workflow).unwrap())
         .bind(&task.project_id)
         .execute(db.pool())
@@ -5268,4 +5268,5 @@ async fn cancelled_review_entry_cap_exhaustion_parks() {
     assert_eq!(outcomes, vec!["bounce", "bounce", "block"]);
 }
 
+mod ci_triage;
 mod no_change;

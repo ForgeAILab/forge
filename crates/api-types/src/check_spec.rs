@@ -338,3 +338,14 @@ pub struct CheckCommandOutcome {
 
 #[cfg(test)]
 mod tests;
+
+/// Internal base-comparison bundle, deliberately distinct from candidate CI.
+/// Only this commit-scoped canonical bundle may share red comparison evidence.
+pub fn is_ci_triage_base(spec: &CheckSpec) -> bool {
+    spec.execution_policy == CANONICAL_CI_POLICY
+        && spec.scope == CheckScope::Commit
+        && spec
+            .commands
+            .first()
+            .is_some_and(|command| command.id == "triage-base:setup:0")
+}

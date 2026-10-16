@@ -18,6 +18,7 @@ type SelectProps = {
   disabled?: boolean
   className?: string
   'aria-label'?: string
+  'aria-describedby'?: string
   title?: string
 }
 
@@ -35,6 +36,7 @@ export function Select({
   disabled,
   className,
   'aria-label': ariaLabel,
+  'aria-describedby': ariaDescribedBy,
   title,
 }: SelectProps) {
   const [open, setOpen] = useState(false)
@@ -194,6 +196,7 @@ export function Select({
         type="button"
         disabled={disabled}
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-haspopup="listbox"
         aria-controls={listboxId}
         aria-expanded={open}

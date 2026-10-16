@@ -92,6 +92,7 @@ const SETTINGS_TABS: Array<{
 
 interface ProjectFormState {
   name: string
+  reviewCiTriage: 'full' | 'report' | 'off'
   ciSteps: string[]
   lifecycleHooks: LifecycleHooks
   defaultRoleSelections: Record<string, string>
@@ -104,6 +105,7 @@ interface ProjectFormState {
 const EMPTY_PROJECT_FORM: ProjectFormState = {
   name: '',
   ciSteps: [],
+  reviewCiTriage: 'full',
   lifecycleHooks: {},
   defaultRoleSelections: {},
   automaticRecoveryEnabled: false,
@@ -144,6 +146,7 @@ export function ProjectSettingsPage({
   const {
     name,
     ciSteps,
+    reviewCiTriage,
     lifecycleHooks,
     defaultRoleSelections,
     automaticRecoveryEnabled,
@@ -201,6 +204,12 @@ export function ProjectSettingsPage({
       updateForm({
         name: project.name,
         ciSteps: ciStepsFromReviewConfig(project.default_review_config),
+        reviewCiTriage:
+          project.settings?.review_ci_triage === 'off'
+            ? 'off'
+            : project.settings?.review_ci_triage === 'report'
+              ? 'report'
+              : 'full',
         lifecycleHooks: lifecycleHooksFromSettings(project.settings),
         defaultRoleSelections: selections,
         automaticRecoveryEnabled: rawRecovery.enabled === true,
@@ -271,6 +280,7 @@ export function ProjectSettingsPage({
     const nextSettings: Record<string, unknown> = {
       ...settingsWithoutRolePrompts,
       max_active_tasks: activeLimit,
+      review_ci_triage: reviewCiTriage,
       default_role_assignments: defaultRoleAssignmentsList,
       lifecycle_hooks: lifecycleHooks,
       automatic_recovery: {
@@ -287,6 +297,7 @@ export function ProjectSettingsPage({
           name: nextName,
           settings: nextSettings,
           default_review_config: {
+            ...(isRecord(project.default_review_config) ? project.default_review_config : {}),
             ci_steps: normalizeCiSteps(ciSteps),
             review_prompt: null,
           },
@@ -319,7 +330,10 @@ export function ProjectSettingsPage({
           version: project.version,
           settings: {
             ...(isRecord(project.settings) ? project.settings : {}),
-            placement: { ...(isRecord(project.settings?.placement) ? project.settings.placement : {}), provision },
+            placement: {
+              ...(isRecord(project.settings?.placement) ? project.settings.placement : {}),
+              provision,
+            },
             environment: {
               ...(environment.value ?? { env: {}, assets: [], checks: [] }),
               recheck_interval_seconds: Math.round(recheckMinutes * 60),
@@ -418,6 +432,8 @@ export function ProjectSettingsPage({
               pausePending={pauseProject.isPending || resumeProject.isPending}
               name={name}
               ciSteps={ciSteps}
+              reviewCiTriage={reviewCiTriage}
+              onReviewCiTriageChange={(reviewCiTriage) => updateForm({ reviewCiTriage })}
               defaultRoleSelections={defaultRoleSelections}
               roles={roles}
               workflowIsLoading={workflowQuery.isLoading}

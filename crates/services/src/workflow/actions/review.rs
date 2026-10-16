@@ -451,13 +451,71 @@ impl HookAction for RunCiSteps {
                         reason: reason.to_owned(),
                     };
                 }
+                let entries = if result.outcome == db::CheckResultOutcome::Fail {
+                    let triaged = async {
+                        let state =
+                            db::CheckDeliveryRepo::check_consumer_delivery(&*ctx.db, &consumer_id)
+                                .await?
+                                .ok_or(db::DbError::NotFound)?;
+                        let run = db::CheckRunRepo::check_run(&*ctx.db, &result.run_id)
+                            .await?
+                            .ok_or(db::DbError::NotFound)?;
+                        let application = crate::check_runner::consumer::CheckApplication {
+                            task_id: task.id.clone(),
+                            status_epoch: state.consumer.status_epoch,
+                            authority: review.id.clone(),
+                            consumer_id: consumer_id.clone(),
+                            run,
+                            verdict: crate::check_runner::consumer::CheckVerdict::Result(
+                                result.clone(),
+                            ),
+                        };
+                        crate::check_runner::ci_triage::triage(
+                            &ctx.db,
+                            &consumers,
+                            &task,
+                            &application,
+                            &ctx.state_config,
+                            None,
+                        )
+                        .await
+                    }
+                    .await;
+                    match triaged {
+                        Ok(crate::check_runner::ci_triage::Progress::Complete(entries)) => entries,
+                        Ok(crate::check_runner::ci_triage::Progress::Pending(consumer)) => {
+                            let until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(entry_check_wake_seconds(
+                                    &ctx.task_id,
+                                )))
+                            .to_rfc3339();
+                            if !crate::workflow::engine::durable::suspend_hook(
+                                &ctx.task_id,
+                                &consumer,
+                                until,
+                            ) {
+                                return HookResult::Failed {
+                                    reason: "CI triage requires the Task hooks step".into(),
+                                };
+                            }
+                            return HookResult::Ok;
+                        }
+                        Err(error) => {
+                            return HookResult::Failed {
+                                reason: error.to_string(),
+                            }
+                        }
+                    }
+                } else {
+                    crate::check_runner::ci_triage::steps(&result)
+                };
+                let failed = entries
+                    .iter()
+                    .position(crate::check_runner::ci_triage::blocks);
                 (
-                    result
-                        .commands
+                    entries
                         .into_iter()
-                        .map(|command| {
-                            serde_json::to_value(command).expect("CI command facts serialize")
-                        })
+                        .map(|entry| serde_json::to_value(entry).expect("CI step serializes"))
                         .collect::<Vec<_>>(),
                     failed,
                 )

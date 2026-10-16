@@ -296,6 +296,38 @@ describe('MissionControlPage', () => {
       resolveAttention.mockClear()
     }
   })
+  it('renders CI incidents with their count, base failures and task links', () => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'base_check_failing',
+        summary: 'Base CI needs attention',
+        scope_type: 'project',
+        recommended_action: 'inspect_ci',
+        details: {
+          command: 'pnpm test',
+          count: 2,
+          task_ids: ['task-a', 'task-b'],
+          base_commit: 'abc123',
+          base_failures: ['suite > base'],
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      const card = screen.getByText('Base CI needs attention').closest('article')
+      expect(card?.className).toContain('bg-warning/5')
+      expect(card?.textContent).toContain('2 occurrences · 2 tasks')
+      expect(screen.getByText('pnpm test')).toBeTruthy()
+      expect(screen.getByText('suite > base')).toBeTruthy()
+      expect(screen.getByLabelText('Inspect CI for task task-a')).toBeTruthy()
+      expect(screen.getByLabelText('Inspect CI for task task-b')).toBeTruthy()
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
   it('renders conflict hot spots with the existing attention warning treatment', () => {
     const previous = data.needs_attention
     data.needs_attention = [

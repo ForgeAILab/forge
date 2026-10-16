@@ -272,6 +272,9 @@ pub type LifecycleHooks = std::collections::HashMap<LifecycleEvent, Vec<Lifecycl
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub struct ProjectSettings {
+    /// How failed review and queue-head CI is triaged. Existing Projects default to full.
+    #[serde(default)]
+    pub review_ci_triage: ReviewCiTriage,
     /// Maximum unparked Tasks in active/gate states; 0 disables the limit.
     #[serde(default = "default_max_active_tasks")]
     pub max_active_tasks: u32,
@@ -287,6 +290,16 @@ pub struct ProjectSettings {
     pub environment: ProjectEnvironment,
     #[serde(default)]
     pub placement: ProjectPlacementSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReviewCiTriage {
+    #[default]
+    Full,
+    Report,
+    Off,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -437,6 +450,7 @@ pub struct LifecycleHookTestResponse {
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
+            review_ci_triage: ReviewCiTriage::default(),
             max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),

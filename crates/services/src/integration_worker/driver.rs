@@ -1181,7 +1181,9 @@ impl HeadDriver {
         // Retry admitted: a successor of that attempt has no more proof of
         // its candidate than it had.
         let retried_incomplete_import = self.w.db.retried_quarantined_import(&a.task_ref).await?;
+        let triaged_review = self.w.db.review_ci_passed_by_triage(&a.task_ref).await?;
         let skip_check = facts.target_in_candidate
+            && (!triaged_review || checked)
             && (!rebased_by_queue || checked)
             && (!retried_incomplete_import || checked);
         let lost = !facts.target_in_candidate;

@@ -295,6 +295,8 @@ impl DaemonWorkspaceBackend {
             spec: &params.spec,
             target: match &exact {
                 Some(commit) => check_executor::CheckoutTarget::ExactCommit {
+                    environment_workspace: None,
+                    assets: &[],
                     repository: &path,
                     build_area: &build,
                     commit,

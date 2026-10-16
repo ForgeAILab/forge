@@ -145,6 +145,12 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     AutomaticRecoverySettings::export().expect("export AutomaticRecoverySettings");
     LifecycleEvent::export().expect("export LifecycleEvent");
     LifecycleHookDef::export().expect("export LifecycleHookDef");
+    ReviewCiTriage::export().expect("export ReviewCiTriage");
+    StepCiTriage::export().expect("export StepCiTriage");
+    CiFailureClass::export().expect("export CiFailureClass");
+    CiFailureTriage::export().expect("export CiFailureTriage");
+    CiBaseStatus::export().expect("export CiBaseStatus");
+    StepResultEntry::export().expect("export StepResultEntry");
     ProjectSettings::export().expect("export ProjectSettings");
     ProjectEnvironment::export().expect("export ProjectEnvironment");
     TaskPlacementDiagnostic::export().expect("export TaskPlacementDiagnostic");

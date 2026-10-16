@@ -700,6 +700,7 @@ async fn completed_ci_check_results(
         .map_err(|error| format!("invalid stored review check results: {error}"))?;
     let stored = parse_stored_ci_steps(details)?;
     let mut results = Vec::with_capacity(stored.len());
+    let mut triage_signature_budget = 20;
     let mut seen_indices = BTreeSet::new();
     for result in stored {
         let index = result.index;
@@ -729,6 +730,7 @@ async fn completed_ci_check_results(
             result.output_tail.clone()
         };
         results.push(ConformanceCheckResult {
+            triage: compact_ci_triage(result.triage, &mut triage_signature_budget),
             check_id,
             command: result.command,
             exit_code: result.exit_code,
@@ -749,6 +751,28 @@ async fn completed_ci_check_results(
         ));
     }
     Ok(results)
+}
+
+/// Frozen reviewer input is a bounded view. Full classifications remain on
+/// the Review/ledger; settlement only needs each exact check's blocking flag.
+fn compact_ci_triage(
+    mut triage: Option<StepCiTriage>,
+    remaining: &mut usize,
+) -> Option<StepCiTriage> {
+    if let Some(triage) = &mut triage {
+        let total = triage.failures.len();
+        let keep = total.min(*remaining);
+        *remaining -= keep;
+        if keep < total {
+            let reason = triage.reason.get_or_insert_with(String::new);
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!("Showing {keep} of {total} classified signatures; full evidence remains on the Review"));
+            triage.failures.truncate(keep);
+        }
+    }
+    triage
 }
 
 /// Resolve the Review attempt that supplied pre-review checks for this
@@ -1521,6 +1545,7 @@ async fn evaluate_inner(
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         let exit_code = output.exit_code.unwrap_or(-1);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: format!("setup:{index}"),
             command: setup.clone(),
             exit_code,
@@ -1537,12 +1562,27 @@ async fn evaluate_inner(
         .iter()
         .take_while(|_| !setup_failed)
     {
+        // Entry triage already established that these exact CI failures are
+        // non-blocking. Keep their real verdict and frozen classification;
+        // do not turn conformance into another untriaged run of that command.
+        if let Some(previous) = contract.check_results.iter().find(|previous| {
+            previous.check_id == check.id
+                && previous.command == check.command
+                && previous
+                    .triage
+                    .as_ref()
+                    .is_some_and(|triage| !triage.blocking)
+        }) {
+            result.checks.push(previous.clone());
+            continue;
+        }
         let output =
             check_workspace_output(checkout, &check.command, &environment.env, timeout).await?;
         let mut text = output.stdout;
         text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: check.id.clone(),
             command: check.command.clone(),
             exit_code: output.exit_code.unwrap_or(-1),
@@ -1589,7 +1629,9 @@ async fn evaluate_inner(
         result.reason = Some(reason);
         return Ok(());
     }
-    let failed_check = result.checks.iter().any(|check| check.exit_code != 0);
+    let failed_check = result.checks.iter().any(|check| {
+        check.exit_code != 0 && check.triage.as_ref().is_none_or(|triage| triage.blocking)
+    });
     // A failing required check is a defect in the candidate whatever the
     // reviewer concluded. Otherwise the reviewer's result stands: a pass is
     // only as strong as the checks Forge ran, which is why projects should
@@ -1626,6 +1668,38 @@ mod tests {
             "documents":[], "workflow":{}, "project_settings":{}})
     }
 
+    #[test]
+    fn ci_triage_reviewer_input_bounds_signature_lists_without_changing_routing() {
+        let triage = StepCiTriage {
+            mode: ReviewCiTriage::Full,
+            base_status: CiBaseStatus::Available,
+            base_commit: None,
+            rerun_run_id: None,
+            base_run_id: None,
+            reason: None,
+            class: None,
+            blocking: false,
+            failures: (0..200)
+                .map(|index| CiFailureTriage {
+                    signature: format!("test-{index}"),
+                    class: CiFailureClass::PreExisting,
+                })
+                .collect(),
+        };
+        let mut budget = 20;
+        let first = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        let second = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        assert_eq!(first.failures.len(), 20);
+        assert!(second.failures.is_empty());
+        assert!(!first.blocking && !second.blocking);
+        assert_eq!(
+            triage.failures.len(),
+            200,
+            "source evidence remains complete"
+        );
+        assert!(first.reason.unwrap().contains("20 of 200"));
+        assert!(second.reason.unwrap().contains("0 of 200"));
+    }
     #[tokio::test]
     async fn project_environment_fails_closed_without_task_authority() {
         let pool = db::create_sqlite_pool("sqlite::memory:")

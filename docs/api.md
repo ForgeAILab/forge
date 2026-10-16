@@ -2488,6 +2488,46 @@ the rules in `project.project_hooks_json`; saving rules does not run hook
 actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
 empty array clears all rules.
 
+### Project CI triage
+
+`settings.review_ci_triage` accepts `full` (default when omitted), `report`, or
+`off` through Project create/update (REST and MCP) and the Project settings form.
+Other values are rejected. `full` reruns failed review/queue-head CI commands once
+and compares consistent failures with an exact base checkout. Flaky and confirmed
+pre-existing failures do not block; `introduced` and `pre_existing_unverified`
+failures do. `report` records classification but blocks all original failures;
+`off` does no rerun or base comparison and preserves the previous gate.
+Base comparison requires effective review `setup_steps` and a server placement.
+
+`StepResultEntry.triage` (also on Review step responses and integration-head
+`ci_steps`) is optional. It contains:
+
+- `mode`: `full | report`;
+- `base_status`: `not_needed | available | base_unavailable | base_run_invalid`;
+- nullable `base_commit`, `rerun_run_id`, `base_run_id`, and explanatory `reason`;
+- nullable whole-step `class`: `flaky | pre_existing | introduced | pre_existing_unverified`;
+- `failures`: classified `{ signature, class }[]`, with the same class values;
+  unclassified failures remain in the step's original `failures` and still block;
+- `blocking`: whether this step still blocks under the selected mode.
+
+The real `exit_code` and immutable `check_result.outcome` remain failed. Triage
+cannot certify a pass or satisfy queue-head pass reuse. The frozen conformance
+check carries optional `triage` for the exact CI command; its frozen display view
+shares a 20-signature budget and explains any omitted signatures in `reason`.
+The original Review `ci_steps[].triage` retains the full classifications. Derived CI ledger
+entries carry optional `ci_triage`; `flaky` and `pre_existing` ledger statuses
+are minor and do not count as open blocking findings.
+
+`AttentionCategory` also includes `flaky_check` and `base_check_failing`.
+Both use Project scope and `recommended_action: inspect_ci`. Flaky items are
+deduplicated by command/signature; base items by command/base commit. Details
+include `command`, `count`, `task_ids`, run references and triage facts (including
+why the base is unavailable or invalid). A later passing base observation resolves
+older base incidents for its command. These items remain visible in Mission Control
+without blocking the Task. The durable `check.ci_triaged` source event carries
+Task/run references and bounded per-step routing and base/rerun references; full
+signatures and tails stay in Review/check evidence.
+
 ### Project environment
 
 `settings.environment` declares what every Task execution in the Project needs

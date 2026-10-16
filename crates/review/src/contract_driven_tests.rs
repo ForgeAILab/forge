@@ -31,6 +31,7 @@ const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 /// What a test asks the driver for: where the reviewer logs, and which Agent
 /// reviews.
 struct DrivenReview {
+    entry_triage: Option<api_types::StepCiTriage>,
     task_id: Uuid,
     executor_execution_id: Uuid,
     workspace_path: std::path::PathBuf,
@@ -133,7 +134,9 @@ impl ContractDriver {
                 .await
                 .expect("the entry check runs");
             let exit_code = output.exit_code.unwrap_or(1);
-            assert_eq!(exit_code, 0, "entry check `{step}` passes before a review");
+            if req.entry_triage.is_none() {
+                assert_eq!(exit_code, 0, "entry check `{step}` passes before a review");
+            }
             ci_results.push(json!({
                 "index": index,
                 "command": step,
@@ -143,6 +146,9 @@ impl ContractDriver {
                 "started_at": started_at,
                 "finished_at": now_rfc3339(),
             }));
+            if let Some(triage) = &req.entry_triage {
+                ci_results.last_mut().unwrap()["triage"] = serde_json::to_value(triage).unwrap();
+            }
         }
         sqlx::query("UPDATE review SET step_results_json = ?, updated_at = ? WHERE id = ?")
             .bind(json!({ "ci_steps": ci_results }).to_string())
@@ -702,6 +708,7 @@ async fn unbound_reviewer_contract_cannot_use_empty_or_legacy_ci_results() {
 
 fn request(seed: &SeededReview) -> DrivenReview {
     DrivenReview {
+        entry_triage: None,
         task_id: seed.task_id,
         executor_execution_id: seed.executor_execution_id,
         workspace_path: seed.workspace.path().to_path_buf(),
@@ -1647,5 +1654,53 @@ async fn review_source_excludes_evidence_recorded_after_the_reviewer_started() {
             .as_array()
             .map(Vec::len),
         Some(1)
+    );
+}
+
+#[tokio::test]
+async fn ci_triage_frozen_entry_failure_stays_nonblocking_during_conformance() {
+    let seed = seeded_review(vec!["exit 1"]).await;
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    req.entry_triage = Some(api_types::StepCiTriage {
+        mode: api_types::ReviewCiTriage::Full,
+        base_status: api_types::CiBaseStatus::NotNeeded,
+        base_commit: None,
+        rerun_run_id: None,
+        base_run_id: None,
+        reason: None,
+        class: Some(api_types::CiFailureClass::Flaky),
+        failures: Vec::new(),
+        blocking: false,
+    });
+    let driver = ContractDriver::new(
+        seed.db.clone(),
+        seed.event_bus.clone(),
+        Arc::new(PassingAuditor),
+    );
+    let (review, outcome) = driver.run(req).await.unwrap();
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.conformance.status,
+        api_types::ConformanceStatus::Passed
+    );
+    assert_eq!(details.conformance.checks[0].exit_code, 1);
+    assert!(
+        !details.conformance.checks[0]
+            .triage
+            .as_ref()
+            .unwrap()
+            .blocking
     );
 }

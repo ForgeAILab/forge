@@ -24,6 +24,8 @@ pub enum Kind {
     ReviewCiInfrastructure,
     /// Clean-checkout review checks re-run after a timeout, per evaluation.
     ReviewCheckRerun,
+    /// One candidate flake rerun plus base comparison per review/head check.
+    ReviewCiTriage,
     /// A coordination root's entries into its planning state after kickoff:
     /// one per rejected aggregate review and one per parked subtask. Charged
     /// only on a root that has a lead, so it is not in [`Kind::PERSISTED`]:
@@ -60,13 +62,17 @@ impl Kind {
             Self::ReportCorrection => "report_correction",
             Self::ReviewCiInfrastructure => "review_ci_infrastructure",
             Self::ReviewCheckRerun => "review_check_rerun",
+            Self::ReviewCiTriage => "review_ci_triage",
             Self::Replan => "replan",
         }
     }
     pub const fn default_limit(self) -> i32 {
         match self {
             Self::Review | Self::Execution | Self::WorkflowGuard => 3,
-            Self::MergeFix | Self::AutomaticReviewRecovery | Self::RepairNoChange => 1,
+            Self::MergeFix
+            | Self::AutomaticReviewRecovery
+            | Self::RepairNoChange
+            | Self::ReviewCiTriage => 1,
             Self::GateRejection => i32::MAX,
             Self::TargetMovedRebase
             | Self::ConflictHandoff
@@ -78,7 +84,10 @@ impl Kind {
     }
     /// Per-invocation counters live in memory and never reach the ledger.
     pub const fn is_volatile(self) -> bool {
-        matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
+        matches!(
+            self,
+            Self::ReportCorrection | Self::ReviewCheckRerun | Self::ReviewCiTriage
+        )
     }
 }
 /// Reserved checkpoint before configurable review-entry hooks. Negative keeps
@@ -92,7 +101,7 @@ pub enum RepairNoChangeDecision {
     Park,
 }
 
-/// The latest Review in the current window, only when it failed, and the commit
+/// The latest settled Review in the current window, only when it failed, and the commit
 /// it judged. A later pass must not resurrect an earlier failure. Frozen reviewer
 /// contracts take precedence over entry CI evidence, then delivery evidence.
 pub async fn failed_review_for_no_change(
@@ -110,7 +119,7 @@ pub async fn failed_review_for_no_change(
          FROM review r JOIN execution e ON e.id=r.execution_id
          LEFT JOIN task_budget b ON b.task_id=r.task_id AND b.kind='review'
          LEFT JOIN transition_log boundary ON boundary.id=b.window_id AND boundary.task_id=r.task_id
-         WHERE r.task_id=?
+         WHERE r.task_id=? AND r.status IN ('passed','failed')
            AND (boundary.id IS NULL OR r.created_at >= boundary.created_at)
          ORDER BY r.attempt_number DESC,r.id DESC LIMIT 1",
     ).bind(task).fetch_optional(db.pool()).await?;
@@ -1710,6 +1719,16 @@ mod tests {
             1
         );
         assert_eq!(limit(&task, Kind::Review, None, Some(&gate)).unwrap(), 1);
+    }
+
+    #[test]
+    fn ci_triage_invocation_is_volatile_and_allows_one_bundle() {
+        assert!(Kind::ReviewCiTriage.is_volatile());
+        assert!(!Kind::PERSISTED.contains(&Kind::ReviewCiTriage));
+        let mut invocation = Invocation::new(Kind::ReviewCiTriage);
+        assert!(invocation.consume());
+        assert!(!invocation.consume());
+        assert_eq!(Invocation::new(Kind::ReviewCiTriage).remaining(), 1);
     }
 
     #[test]

@@ -24,6 +24,8 @@ interface GeneralTabProps {
   systemPauseReason?: string | null
   pausePending: boolean
   name: string
+  reviewCiTriage: 'full' | 'report' | 'off'
+  onReviewCiTriageChange: (value: 'full' | 'report' | 'off') => void
   ciSteps: string[]
   defaultRoleSelections: Record<string, string>
   roles: RoleDefinition[]
@@ -56,6 +58,8 @@ export function GeneralTab({
   pausePending,
   name,
   ciSteps,
+  reviewCiTriage,
+  onReviewCiTriageChange,
   defaultRoleSelections,
   roles,
   workflowIsLoading,
@@ -152,6 +156,33 @@ export function GeneralTab({
             description="Shell commands run during review. Applied to all tasks in this project by default."
           >
             <CiStepsEditor steps={ciSteps} onChange={onCiStepsChange} />
+          </SettingsSection>
+          <SettingsSection
+            title="CI failure triage"
+            description="Recheck failures and compare with the base before sending work back."
+          >
+            <div className="space-y-2">
+              <Label htmlFor="review-ci-triage">Triage policy</Label>
+              <Select
+                id="review-ci-triage"
+                value={reviewCiTriage}
+                disabled={!canSave || isSaving}
+                aria-describedby="review-ci-triage-help"
+                options={[
+                  { value: 'full', label: 'Full — block introduced failures (default)' },
+                  { value: 'report', label: 'Report — classify and block all failures' },
+                  { value: 'off', label: 'Off — block all failures without triage' },
+                ]}
+                onChange={(value) => {
+                  if (value === 'full' || value === 'report' || value === 'off')
+                    onReviewCiTriageChange(value)
+                }}
+              />
+              <p id="review-ci-triage-help" className="text-xs text-muted-foreground">
+                Full lets flaky and confirmed pre-existing failures continue. Base comparison
+                requires review setup steps and a server workspace.
+              </p>
+            </div>
           </SettingsSection>
           <SettingsSection
             title="Active task limit"

@@ -9,6 +9,10 @@ The check executor SHALL extract failure signatures from each step's full output
 - go test (`--- FAIL: <Test>`);
 - failed and errored cases in JUnit XML files a step writes under `FORGE_CI_REPORT_DIR`.
 
+Recursive pnpm (`pkg test: `) and turbo (`pkg:test: `) test-task prefixes are
+removed before extraction. Parallel package/task runner blocks remain independent;
+unknown glyphs outside those blocks still produce no signature.
+
 Signatures are normalised as follows:
 - durations, absolute Task-root prefixes and ANSI codes are removed;
 - each is cut to 300 characters;

@@ -7572,6 +7572,7 @@ and are not budget counters.
 | AutomaticReviewRecovery | Disabled normally; configured default 1 | Review-budget exhaustion episode; execution admission |
 | ReportCorrection | 2 native correction turns | Volatile counter per invocation; provider-turn intent |
 | ReviewCheckRerun | 2 check re-runs after a timeout (3 runs) | Volatile counter per review evaluation |
+| ReviewCiTriage | 1 failed-step rerun and base comparison | Volatile allowance per Review attempt or queue-head check; durable subcheck keys prevent replay |
 | ReviewCiInfrastructure | 5 connected failures, 4 automatic retries | Interruption episode (each fresh review entry); connected retryable CI failure |
 
 A typed `RetryWindowReset` additionally resets every persisted kind. Successful
@@ -8686,7 +8687,7 @@ unchanged tracked candidate and confirmed process-tree settlement.
 
 | Execution family | Characterized bundle, cwd, environment and timeout |
 |---|---|
-| Review-entry CI | Effective workflow/Project/Task CI in order; Task root; Project keys; no per-command limit; stop at first failure. |
+| Review-entry CI | Effective workflow/Project/Task CI in order; Task root; Project keys; no per-command limit; collect all under full triage, otherwise stop at first failure. |
 | Manual review re-run CI | Characterized as the same effective CI resolution and command semantics as review-entry CI under the `review_ci` purpose. Since the re-run re-enters the review entry (3.3 stage E), it is review-entry CI and no producer asks with `review_ci`. |
 | Conformance | Effective setup followed by CI-derived and requirement-linked checks, using the admitted governing context; Task root; Project keys; configured 1–14,400-second per-command limit, default 1800. Setup failure stops the bundle; required-check failure does not stop later checks. |
 | Blocking before-work | Selected event's blocking scripts only, original hook indices; Task root or existing lifecycle fallback; Project keys plus the eleven `FORGE_*` context keys; configured limit or legacy 30-second zero fallback; stop at failure. |
@@ -8983,8 +8984,8 @@ are captured before removal; a changed managed candidate cannot pass. The
 managed directory is removed even after failure, timeout, cancellation or failed
 preparation. Removal has a separate settlement bound; unconfirmed removal is
 `uncertain` cleanup. Review-entry and queue-head CI run in the Task worktree under the canonical
-or frozen policy. No managed-checkout cutover is enabled for those producers;
-the primitive still supports exact detached checkouts for commit-scoped callers.
+or frozen policy. Their base-comparison subchecks use exact detached checkouts with commit scope;
+the candidate and rerun continue in their original workspace.
 
 Each command runs through `process-supervisor`, the single process-group
 implementation shared with Git. It continuously drains both pipes, retains
@@ -8993,7 +8994,10 @@ feed line extractors before tail truncation; streaming ANSI removal precedes the
 text budget. Cargo test and nextest, vitest/jest, pytest and Go failures become
 normalised identities (up to 200 per command, 300 Unicode characters each, deduplicated).
 Vitest/jest failure glyphs (`×`, `✗`, `●`) count only within a recognised
-runner block; a summary closes that block. A jest `FAIL <file>` line opens one
+runner block; a summary closes that block. Recursive pnpm (`pkg test: `) and turbo
+(`pkg:test: `) test-task decorators are stripped before extraction, while tails
+retain them. Parallel package/task producers keep independent runner/file state;
+producer-state overflow marks evidence incomplete rather than waiving failures. A jest `FAIL <file>` line opens one
 for any JS/TS file (the test-name pattern is configurable), without jest's
 slow-suite run time. Nextest identities combine the binary and test name,
 omitting durations, progress counters and repeated stdout/stderr; failed,
@@ -9107,7 +9111,8 @@ compatible when they retain those capabilities.
 The inline `integration_effects::check::CheckRun` adapter is deleted with the
 review-entry cutover. Review-entry CI (now one check run per entry, which a
 manual review re-run also is) retains command order, cwd, inherited env,
-verdicts and comments/events. No extra setup or managed checkout is enabled. Required
+verdicts and comments/events. With CI triage enabled, its separate base subcheck
+runs setup in an exact managed checkout, as described below. Required
 conformance/setup, lifecycle/before-work, readiness/preflight/environment helper
 and agent-selected families retain their existing orchestration and check policy.
 
@@ -9681,10 +9686,10 @@ this definition, so the policy revision stays `1`.
 #### Review-entry CI on the check runner (3.3 stage D part 2)
 
 Before configurable entry hooks, a persistent no-change guard compares the clean
-workspace HEAD on its placement owner with the latest Review's judged commit
-in the current Review budget window, and acts only when that Review failed. A
+workspace HEAD on its placement owner with the latest settled Review's judged commit
+in the current Review budget window (passed/failed only; cancelled, running and awaiting-human rows are ignored), and acts only when that Review failed. A
 later passing Review of the same commit suppresses an earlier failure. It applies
-after a completed coder repair, and exempts owner-started moves and owner-requested re-reviews. The first
+after a completed coder repair, and exempts owner-started moves, explicit owner Retry of a blocked entry, and owner-requested re-reviews. The first
 unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate's
 reject target with a brief headed "No change since review N". A second parks
 `review_needs_owner` with `no change after repair round`. Neither creates a
@@ -9694,7 +9699,9 @@ as does an entry whose workspace owner cannot describe the checkout (an away
 daemon): that entry meets the outage with the usual typed review-entry wait.
 An entry retry carries the original source state and actor in its hooks payload,
 so a same-state retry after reconnect still evaluates the repair gate and retains
-owner exemptions. The old step's continue decision does not decide the new step.
+owner exemptions. An explicit owner Retry retains that owner intent through a
+subsequent offline interruption and automatic reconnect. The old step's continue
+decision does not decide the new step.
 A reminder after reconnect clears the resolved entry barrier and infrastructure
 blocker before returning to the coder, just as a successful normal retry does.
 The reminder is a `recovery` bridge (verb `repair_no_change`), which the cascade
@@ -9947,6 +9954,59 @@ The owner supervision guarantees tested here cover normal cancellation, dropped
 futures, retained receipts and restart reconciliation. Abrupt process death
 between OS spawn and durable process-tree evidence, and escaped descendants,
 are not proven by the runner; the stage-B process-supervisor limits still apply.
+
+#### CI failure triage
+
+Project `settings.review_ci_triage` defaults to `full`. `report` records the same
+triage but preserves blocking routing; `off` runs neither extra check and preserves
+the original stop-at-first-failure gate. Under `full`, candidate bundles collect
+all CI steps, so a non-blocking early failure cannot hide a later failure. Each
+failed command is rerun once in its candidate workspace; the rerun bundle is
+uncacheable. Signatures absent from either complete run are `flaky`; a command
+passing on rerun is wholly flaky. Incomplete signature lists never prove a pass.
+
+Consistent failures are compared with the candidate/target merge base, or the
+exact target tip at the queue head. The base bundle has commit scope, distinct
+`triage-base:*` command identities and `canonical-ci/1` policy. The same server
+owner executes an `ExactCommit` checkout, copies Project assets, and uses the
+candidate's Project and per-run build environment. It runs effective `setup_steps`
+then CI through the last candidate failure. Commit, setup/CI commands, Project,
+repository and attested environment determine sharing across Tasks. A completed
+red base can be shared as comparison evidence only when its owner witnesses and
+process settlement agree; it is never a certified or reusable candidate pass.
+Daemon placements and missing setup yield `base_unavailable`. Failed setup,
+incomplete base CI, mismatched owner input receipts, or missing base signatures
+for a signature-bearing red candidate yield `base_run_invalid`; consistent
+failures remain unclassified and still block. A base step passing
+makes consistent candidate signatures `introduced`; matching red-base signatures
+are `pre_existing`. Signatureless failures on both sides are
+`pre_existing_unverified` and still block.
+
+Review details keep `ci_steps[].triage`, original nonzero exits and rerun/base run
+references. Under `full`, only blocking steps route to repair; verify and reviewer
+entry continue when every failure is flaky or pre-existing. Frozen conformance
+keeps and honors non-blocking triage for the same CI id and command, rather than
+running that command again without triage. Reviewer prose summarizes classification
+counts, and the frozen check-input view shares a 20-signature display budget;
+full classifications remain in the original Review and ledger. The ledger retains per-signature
+`CI-<step>#<sha256-prefix>` findings with `ci_triage`; `flaky`/`pre_existing`
+findings are minor with zero streak. Original check results are immutable failures.
+An unchanged queue head whose Review passed by triage runs its own CI; the ordinary
+certified-pass reuse path cannot consume a triaged failure. Queue settlement
+triages against the target tip before granting a permit or authorizing send-back.
+
+Both subcheck stages retain the original consumer family, status epoch and Review
+or integration authority, with `ci-triage:rerun:` / `ci-triage:base:` authority
+prefixes giving distinct idempotency keys. Delivery wakes the same suspended entry
+or settles the same checking head. Cancellation and configuration replacement
+withdraw the current subcheck; original failed evidence is never overwritten.
+
+Project Attention exposes `flaky_check` (command/signature, occurrence count and
+Task ids) and `base_check_failing` (command/base commit, signatures or reason and
+run id). Replayed observations count once. A newer passing base observation
+resolves older incidents for that command; a cached older pass cannot resolve a
+newer incident. Mission Control renders both as warnings. Neither incident is a
+Task blocker or a certification of CI success.
 
 #### Manual review re-run through the review entry (3.3 stage E)
 

@@ -1738,6 +1738,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Pre-existing and flaky check failures no longer block review or merge under the default `review_ci_triage: full`; set `review_ci_triage: off` to retain the previous gate.
+
+
 - Check failure signatures recognise cargo-nextest binary/test identities,
   omitting durations, progress counters and repeated stdout or summary output,
   including timed-out, signalled and retried tests (final attempt only). A jest
@@ -3058,6 +3061,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures.
+
+
+- Project `review_ci_triage` (`full`, `report`, `off`), a durable rerun and exact-commit base comparison, queue-head CI triage, and Project Attention categories `flaky_check` and `base_check_failing` with Mission Control warnings.
+
 
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with

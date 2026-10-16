@@ -34,7 +34,9 @@ The base check:
 - runs the effective review config's `setup_steps` first, then the review CI steps up to the last failing one;
 - is reused by every request for the same base commit, setup steps and CI steps.
 
-When the effective review config has no `setup_steps`, or the Task is on a daemon placement, the base comparison SHALL be `base_unavailable`. Failures then block as under `report`, and the brief and attention say why.
+When the effective review config has no `setup_steps`, or the Task is on a daemon placement, the base comparison SHALL be `base_unavailable`. Consistent failures then stay unclassified and block as under `report`, and the
+brief and attention say why. Independently proved rerun flakes remain non-blocking
+under `full`.
 
 The base run SHALL be `base_run_invalid`, and classify nothing, when either of these holds:
 - its setup steps fail;

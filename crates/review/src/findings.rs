@@ -8,6 +8,7 @@ use api_types::{
 };
 use db::Review;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Derive every finding, ordered lexically by id. The API's 200-item limit is
 /// applied only after derivation, so hidden entries still reserve their ids.
@@ -59,15 +60,86 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         // A source can occur in both pre-review CI and the frozen conformance.
         // Count it once per attempt, preferring the check's final observation.
         let mut observations = BTreeMap::new();
+        let mut detailed_ci = BTreeSet::new();
         for step in steps {
+            let prefix = format!("CI-{}", step.index);
             let output = if step.output_tail.is_empty() {
-                step.stderr_tail
+                step.stderr_tail.clone()
             } else {
-                step.output_tail
+                step.output_tail.clone()
             };
+            let classes: BTreeMap<_, _> = step
+                .triage
+                .as_ref()
+                .into_iter()
+                .flat_map(|triage| &triage.failures)
+                .map(|failure| (failure.signature.clone(), failure.class))
+                .collect();
+            let signatures: BTreeSet<_> = step
+                .failures
+                .iter()
+                .cloned()
+                .chain(classes.keys().cloned())
+                .collect();
+            if step.exit_code == 0 || !signatures.is_empty() {
+                // A completed signature list proves earlier test findings absent.
+                if !step.failures_truncated {
+                    for (id, entry) in &ledger {
+                        if entry.source == Source::Ci && id.starts_with(&format!("{prefix}#")) {
+                            observations.insert(
+                                id.clone(),
+                                (Source::Ci, step.command.clone(), true, String::new(), None),
+                            );
+                        }
+                    }
+                }
+                if !signatures.is_empty() {
+                    detailed_ci.insert(prefix.clone());
+                    for signature in signatures {
+                        let hash = format!("{:x}", Sha256::digest(signature.as_bytes()));
+                        let class = classes
+                            .get(&signature)
+                            .copied()
+                            .or_else(|| step.triage.as_ref().and_then(|triage| triage.class));
+                        observations.insert(
+                            format!("{prefix}#{}", &hash[..8]),
+                            (
+                                Source::Ci,
+                                step.command.clone(),
+                                step.exit_code == 0,
+                                signature,
+                                class,
+                            ),
+                        );
+                    }
+                    // Replace an older step-only failure once precise evidence exists.
+                    observations.insert(
+                        prefix.clone(),
+                        (Source::Ci, step.command.clone(), true, String::new(), None),
+                    );
+                    if step.triage.as_ref().is_some_and(|triage| {
+                        triage.blocking && triage.mode == api_types::ReviewCiTriage::Full
+                    }) && !classes.is_empty()
+                        && classes.values().all(|class| !class.blocks())
+                    {
+                        observations.insert(
+                            prefix,
+                            (
+                                Source::Ci,
+                                step.command,
+                                false,
+                                "Failure evidence is incomplete".into(),
+                                None,
+                            ),
+                        );
+                    }
+                    continue;
+                }
+            }
+            let class = step.triage.as_ref().and_then(|triage| triage.class);
             observations.insert(
-                format!("CI-{}", step.index),
-                (Source::Ci, step.command, step.exit_code == 0, output),
+                prefix,
+                (Source::Ci, step.command, step.exit_code == 0, output, class),
             );
         }
         for check in conformance.checks {
@@ -77,10 +149,19 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 }
                 _ => (format!("CHK-{}", check.check_id), Source::Check),
             };
-            observations.insert(
-                id,
-                (source, check.command, check.exit_code == 0, check.output),
-            );
+            if !detailed_ci.contains(&id) {
+                let class = check.triage.as_ref().and_then(|triage| triage.class);
+                observations.insert(
+                    id,
+                    (
+                        source,
+                        check.command,
+                        check.exit_code == 0,
+                        check.output,
+                        class,
+                    ),
+                );
+            }
         }
         // Verify's recorded check shape is independent of its execution path.
         // A not-run or inconclusive bundle provides no pass/fail observation.
@@ -114,11 +195,12 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                         check["command"].as_str().unwrap_or(name).to_owned(),
                         passed,
                         observed,
+                        None,
                     ),
                 );
             }
         }
-        for (id, (source, command, passed, observed)) in observations {
+        for (id, (source, command, passed, observed, class)) in observations {
             if passed {
                 if let Some(entry) = ledger.get_mut(&id) {
                     entry.status = Status::Resolved;
@@ -134,7 +216,17 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                     expected: Some("Pass".into()),
                     observed: Some(output_tail(&observed)),
                 };
-                open(&mut ledger, id, source, &finding, attempt);
+                open(&mut ledger, id.clone(), source, &finding, attempt);
+                let entry = ledger.get_mut(&id).expect("opened finding");
+                entry.ci_triage = class;
+                if let Some(class) = class.filter(|class| !class.blocks()) {
+                    entry.status = match class {
+                        api_types::CiFailureClass::Flaky => Status::Flaky,
+                        _ => Status::PreExisting,
+                    };
+                    entry.severity = ReviewFindingSeverity::Minor;
+                    entry.streak = 0;
+                }
             }
         }
         // An assessment is evidence that the reviewer ran. A bound execution
@@ -194,6 +286,7 @@ fn open(
 ) {
     let previous = ledger.get(&id);
     let entry = ReviewFindingEntry {
+        ci_triage: None,
         id: id.clone(),
         source,
         severity: finding.severity,
@@ -249,6 +342,44 @@ mod tests {
     }
     fn entry<'a>(ledger: &'a [ReviewFindingEntry], id: &str) -> &'a ReviewFindingEntry {
         ledger.iter().find(|entry| entry.id == id).unwrap()
+    }
+    #[test]
+    fn finding_ledger_resolves_test_signatures_and_excludes_triaged_noise() {
+        let first = review(
+            1,
+            json!({"ci_steps":[{"index":0,"command":"test","exit_code":1,"stderr_tail":"","failures":["fixed","base","flake"]}]}),
+        );
+        let second = review(
+            2,
+            json!({"ci_steps":[{"index":0,"command":"test","exit_code":1,"stderr_tail":"","failures":["base","flake"],"triage":{
+                "mode":"full","base_status":"available","base_commit":null,"rerun_run_id":null,"base_run_id":null,"reason":null,"class":null,"blocking":false,
+                "failures":[{"signature":"base","class":"pre_existing"},{"signature":"flake","class":"flaky"}]
+            }}]}),
+        );
+        let ledger = finding_ledger(&[first, second]).unwrap();
+        assert_eq!(ledger.len(), 3);
+        let fixed = ledger
+            .iter()
+            .find(|entry| entry.observed.as_deref() == Some("fixed"))
+            .unwrap();
+        assert_eq!(fixed.status, Status::Resolved);
+        let base = ledger
+            .iter()
+            .find(|entry| entry.observed.as_deref() == Some("base"))
+            .unwrap();
+        assert_eq!(
+            (base.status, base.streak, base.severity),
+            (Status::PreExisting, 0, ReviewFindingSeverity::Minor)
+        );
+        let flake = ledger
+            .iter()
+            .find(|entry| entry.observed.as_deref() == Some("flake"))
+            .unwrap();
+        assert_eq!(
+            (flake.status, flake.ci_triage),
+            (Status::Flaky, Some(api_types::CiFailureClass::Flaky))
+        );
+        assert!(ledger.iter().all(|entry| entry.status != Status::Open));
     }
     #[test]
     fn finding_ledger_continues_resolves_and_assigns_new_ids() {

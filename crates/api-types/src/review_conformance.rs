@@ -164,7 +164,7 @@ pub struct ReviewContract {
     pub context: ReviewGoverningContext,
     /// Results Forge recorded before dispatching the reviewer. These are
     /// immutable reviewer inputs; conformance admission reruns required checks
-    /// before accepting the assessment.
+    /// except exact CI results already classified non-blocking by entry triage.
     #[serde(default)]
     pub check_results: Vec<ConformanceCheckResult>,
     pub digest: String,
@@ -251,12 +251,17 @@ pub enum ReviewFindingStatus {
     Open,
     Resolved,
     Unconfirmed,
+    Flaky,
+    PreExisting,
 }
 
 /// Derived state of one finding in the current review-budget window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ReviewFindingEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ci_triage: Option<crate::CiFailureClass>,
     pub id: String,
     pub source: ReviewFindingSource,
     pub severity: ReviewFindingSeverity,
@@ -332,6 +337,9 @@ pub enum ConformanceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ConformanceCheckResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub triage: Option<crate::StepCiTriage>,
     pub check_id: String,
     pub command: String,
     pub exit_code: i32,

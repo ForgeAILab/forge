@@ -1531,6 +1531,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
 
 fn step_result_response(step: &StepResultEntry) -> StepResultResponse {
     StepResultResponse {
+        triage: step.triage.clone(),
         index: step.index,
         command: step.command.clone(),
         exit_code: step.exit_code,

@@ -143,6 +143,14 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - Cancel restores focus; pending disables both actions; a racing conflict stays visible in the dialog and refreshes machine status.
 - The registration owner and administrators see the action.
 
+### CI triage settings and incidents
+
+Project General settings use the existing SettingsSection, Label and native Select
+for Full, Report and Off, with a short explanation of which failures block and
+why setup steps are needed. Mission Control uses its existing warning tokens for
+flaky/base CI incidents, preserving summary, command, count, Task links and
+inspect controls. No new colors, fonts, motion or layout primitives are needed.
+
 ### Form controls
 
 - **Structure:** label plus input/select/textarea/checkbox/switch, supporting help and error text.
