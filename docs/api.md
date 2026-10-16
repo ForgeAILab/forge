@@ -6,14 +6,16 @@ and reuses it on later starts.
 
 ## Authentication
 
-Authentication is required on all non-exempt routes. REST accepts an
-`Authorization: Bearer` token first, then the `forge_session` cookie. Both
-use the same token validation and authentication errors (`401 missing_token`,
-`invalid_token`, or `token_expired`). A Bearer token can be a session JWT
-obtained via `POST /api/v1/auth/login` or a personal access token (PAT)
-prefixed `fg_` issued at `POST /api/v1/auth/tokens`. The existing `?token=`
-fallback still supports clients such as EventSource; cookie-only EventSource
-connections can use `/api/v1/events` without a query credential.
+Authentication is required on all non-exempt routes. REST takes an explicit
+credential first: an `Authorization: Bearer` token, else the `?token=` query
+fallback (for clients such as EventSource). Only a request with neither, and
+with no `Authorization` header at all, is authenticated by the `forge_session`
+cookie; an invalid or non-Bearer explicit credential is never rescued by the
+cookie. All use the same token validation and authentication errors
+(`401 missing_token`, `invalid_token`, or `token_expired`). A Bearer token can
+be a session JWT obtained via `POST /api/v1/auth/login` or a personal access
+token (PAT) prefixed `fg_` issued at `POST /api/v1/auth/tokens`. Cookie-only
+EventSource connections can use `/api/v1/events` without a query credential.
 MCP keeps explicit token authentication, including OAuth 2.1 access tokens
 (see `/.well-known/oauth-authorization-server`); it does not accept session
 cookies. The `register`, `login`, `refresh`, and `logout` auth routes are

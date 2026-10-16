@@ -125,12 +125,20 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let bearer = extract_bearer_token(req.headers());
-    let session = crate::session::cookie(req.headers(), crate::session::SESSION_COOKIE);
-    let cookie_only = bearer.is_none() && session.is_some();
-    let token = bearer
-        .or_else(|| session.map(str::to_owned))
-        .or_else(|| extract_query_token(req.uri()));
+    // An explicit credential (any Authorization header, or `?token=`) always
+    // decides the request; the ambient cookie only stands in when there is none.
+    let explicit = extract_bearer_token(req.headers()).or_else(|| extract_query_token(req.uri()));
+    let session = if explicit.is_none()
+        && !req
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+    {
+        crate::session::cookie(req.headers(), crate::session::SESSION_COOKIE)
+    } else {
+        None
+    };
+    let cookie_only = session.is_some();
+    let token = explicit.or_else(|| session.map(str::to_owned));
 
     let Some(token) = token else {
         return unauthorized_response("missing_token", "Authentication required");

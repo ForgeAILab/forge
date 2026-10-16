@@ -844,3 +844,63 @@ async fn cookie_session_empty_refresh_and_logout_bodies_use_cookies() {
         );
     }
 }
+
+async fn me_email(app: &axum::Router, request: Request<Body>) -> Result<String, StatusCode> {
+    let response = app.clone().oneshot(request).await.unwrap();
+    if response.status() != StatusCode::OK {
+        return Err(response.status());
+    }
+    let user: UserResponse = parse_body(response, StatusCode::OK).await;
+    Ok(user.email)
+}
+
+#[tokio::test]
+async fn cookie_session_explicit_credentials_beat_the_cookie() {
+    let workspace = common::TestDir::new("cookie-precedence");
+    let harness = common::test_app(workspace.path(), "cookie-precedence").await;
+    let app = &harness.app;
+    let a = register_and_login(app, "cookie-a@example.com", "Password123!").await;
+    let b = register_and_login(app, "cookie-b@example.com", "Password123!").await;
+    let cookie_a = format!("forge_session={}", a.access_token);
+
+    // Cookie of user A, Bearer of user B: the request is user B.
+    let request = session_request(Method::GET, "/api/v1/auth/me", &cookie_a)
+        .header(header::AUTHORIZATION, format!("Bearer {}", b.access_token))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        me_email(app, request).await,
+        Ok("cookie-b@example.com".into())
+    );
+
+    // EventSource sends its explicit `?token=` and the ambient cookie together:
+    // the query credential wins, whether the cookie is another user's or stale.
+    for cookie in [cookie_a.as_str(), "forge_session=stale"] {
+        let request = session_request(
+            Method::GET,
+            &format!("/api/v1/auth/me?token={}", b.access_token),
+            cookie,
+        )
+        .body(Body::empty())
+        .unwrap();
+        assert_eq!(
+            me_email(app, request).await,
+            Ok("cookie-b@example.com".into()),
+            "{cookie}"
+        );
+    }
+
+    // An Authorization header that is not a usable Bearer token never falls
+    // back to the cookie.
+    for authorization in ["bearer invalid", "Basic Zm9yZ2U6Zm9yZ2U="] {
+        let request = session_request(Method::GET, "/api/v1/auth/me", &cookie_a)
+            .header(header::AUTHORIZATION, authorization)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            me_email(app, request).await,
+            Err(StatusCode::UNAUTHORIZED),
+            "{authorization}"
+        );
+    }
+}

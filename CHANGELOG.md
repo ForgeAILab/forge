@@ -11,6 +11,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Cookie-authenticated unsafe REST requests, including cookie-based refresh
   and logout, require same-origin Fetch Metadata or Origin evidence and reject
   failures with `403 csrf_rejected`. Explicit Bearer requests are unaffected.
+  An explicit credential (any `Authorization` header, or `?token=`) always
+  decides the request: the session cookie never overrides it or stands in for
+  an invalid one.
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
   memory and coordination records, to the authenticated caller. Any signed-in
