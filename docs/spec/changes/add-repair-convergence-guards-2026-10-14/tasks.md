@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-15T22:34:39Z
+updated_at: 2026-10-16T01:23:30Z
 completed_at:
 ---
 
@@ -17,7 +17,7 @@ completed_at:
   - normalisation, a cap of 200 signatures at 300 characters each, `failures_truncated`.
 - [x] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
 - [x] 1.3 Add `CheckCommandOutcome.failures` and `StepResultEntry.failures` (optional, `serde(default)`). Wire them through the durable runner, daemon receipts (an absent field is an empty list), generated TS and `docs/api.md`.
-- [x] 1.4 **Pre-ledger half complete.** Until the ledger lands, the CI repair prompt (`ci_failure_reason`) lists signatures for every failing step, not only the first. Once the ledger exists, add `CI-<step>#<hash>` findings in `finding_ledger`.
+- [x] 1.4 The shared repair brief lists signatures for every failing step. `finding_ledger` emits stable `CI-<step>#<first 8 hex of sha256(signature)>` findings, with step-level fallback when signatures are absent; briefs and comments display at most 20 test findings per step.
 - [x] 1.5 Focused tests:
   - extractor unit tests per runner, using real captured output from the `world` and NovelKit logs;
   - JUnit parse;

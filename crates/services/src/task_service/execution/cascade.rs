@@ -2450,7 +2450,17 @@ impl TaskService {
         // A comment never decides routing: a Review in the window the ledger
         // cannot read (an older details shape) leaves the list out of the
         // comment instead of stopping the cascade that posts it.
-        Ok(::review::finding_ledger(&reviews).unwrap_or_else(|error| {
+        let result = (|| {
+            let ledger = ::review::finding_ledger(&reviews)?;
+            let prior: Vec<_> = reviews
+                .iter()
+                .filter(|row| row.attempt_number < review.attempt_number)
+                .cloned()
+                .collect();
+            let previous = ::review::finding_ledger(&prior)?;
+            Ok::<_, String>(current_comment_findings(ledger, &previous))
+        })();
+        Ok(result.unwrap_or_else(|error| {
             tracing::warn!(task_id = %review.task_id, review_id = %review.id, %error,
                 "review comment posted without its finding ledger");
             Vec::new()
@@ -2847,12 +2857,34 @@ impl TaskService {
             None => Vec::new(),
         };
 
-        let prompt = render_automatic_review_recovery_prompt(
+        let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
             task,
+            &project.workflow_definition,
+            &crate::worker_runtime::queue::cascade_actor(),
+        );
+        let mut context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
+            crate::workflow::dispatch::loader::DispatchContextParams {
+                db: Arc::clone(&self.db),
+                router: &self.workspace_backend_router,
+                task_id: &task.id,
+                role: crate::workflow::default_roles::CODER,
+                state_name: &task.status,
+                state_config: json!({}),
+                execution_policy: Some(
+                    crate::workflow::dispatch::EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD,
+                ),
+                workflow: &workflow,
+            },
+        )
+        .await?;
+        context.repair_budget = Some(crate::workflow::dispatch::repair_brief::RepairBudget {
+            name: "review".into(),
+            spent: existing_rejections,
+            limit: i64::from(budget),
+        });
+        let prompt = render_automatic_review_recovery_prompt(
+            &context,
             failure_reason,
-            existing_rejections,
-            budget,
-            parent_execution_id,
             recovery_attempts + 1,
             max_attempts,
         );
@@ -3092,28 +3124,26 @@ fn task_blocked_by_execution(task: &Task, execution_id: &str) -> bool {
 }
 
 fn render_automatic_review_recovery_prompt(
-    task: &Task,
+    ctx: &crate::workflow::dispatch::AgentDispatchContext,
     failure_reason: &str,
-    existing_rejections: i64,
-    budget: i32,
-    review_execution_id: &str,
     attempt: usize,
     max_attempts: usize,
 ) -> String {
-    format!(
-        "Forge automatic review recovery\n\n\
-         The normal review retry flow is about to block this task, so this is the final automatic recovery attempt.\n\n\
-         Task: {title}\n\
-         Current status: {status}\n\
-         Review failure: {failure_reason}\n\
-         Review execution: {review_execution_id}\n\
-         Rejections in current window: {rejections}/{budget}\n\
-         Automatic recovery attempt: {attempt}/{max_attempts}\n\n\
-         Inspect the workspace and the review failure context. Make the smallest useful change that addresses the failing review, then leave the task ready for the normal workflow to review again.",
-        title = task.title,
-        status = task.status,
-        rejections = existing_rejections + 1,
-    )
+    use crate::workflow::dispatch::repair_brief::{RepairBrief, RepairBudget};
+    let body = RepairBrief::review(ctx)
+        .automatic_recovery(
+            RepairBudget {
+                name: "automatic_review_recovery".into(),
+                spent: attempt as i64,
+                limit: max_attempts as i64,
+            },
+            failure_reason,
+        )
+        .render();
+    match crate::workflow::dispatch::coder_prompt::no_change_brief(ctx) {
+        Some(reminder) => format!("{reminder}\n\n{body}"),
+        None => body,
+    }
 }
 
 pub(super) async fn reviewer_final_message(execution: &Execution) -> Result<String> {
@@ -3235,6 +3265,25 @@ fn execution_failure_reason(execution: &Execution) -> String {
 
 /// Upper bound on the reviewer's Markdown carried into its Task comment.
 const REVIEW_COMMENT_REPORT_LIMIT: usize = 2 * 1024;
+/// Keep the complete open/unconfirmed view, but only resolutions this review
+/// introduced. last_checked_attempt remains the last source check, including
+/// repeated passes; it is not a resolution timestamp.
+fn current_comment_findings(
+    ledger: Vec<api_types::ReviewFindingEntry>,
+    previous: &[api_types::ReviewFindingEntry],
+) -> Vec<api_types::ReviewFindingEntry> {
+    use api_types::ReviewFindingStatus as Status;
+    ledger
+        .into_iter()
+        .filter(|entry| {
+            entry.status != Status::Resolved
+                || !previous
+                    .iter()
+                    .any(|prior| prior.id == entry.id && prior.status == Status::Resolved)
+        })
+        .collect()
+}
+
 /// Upper bound on the comment's checklist lines; later findings are named
 /// by id only. Comments are read back into agent prompts.
 const REVIEW_COMMENT_FINDINGS_LIMIT: usize = 8 * 1024;
@@ -3276,7 +3325,12 @@ fn reviewer_comment(
     use api_types::{ReviewFindingSource as Source, ReviewFindingStatus as Status};
     // Open findings first, then resolved, then unconfirmed, each in id order,
     // so the size limit drops the least actionable lines.
-    let mut entries: Vec<_> = ledger.iter().collect();
+    let mut entries: Vec<_> = ledger
+        .iter()
+        .filter(|entry| {
+            entry.status != Status::Resolved || entry.last_checked_attempt == attempt_number
+        })
+        .collect();
     entries.sort_by_key(|entry| match entry.status {
         Status::Open => 0,
         Status::Resolved => 1,
@@ -3284,7 +3338,18 @@ fn reviewer_comment(
     });
     let mut listed = 0;
     let mut overflow = Vec::new();
+    let mut ci_counts = std::collections::BTreeMap::new();
+    let mut ci_omitted = std::collections::BTreeMap::new();
     for entry in entries {
+        if entry.source == Source::Ci && entry.id.contains('#') {
+            let step = entry.id.split('#').next().unwrap_or(&entry.id);
+            let count = ci_counts.entry(step).or_insert(0);
+            if *count == 20 {
+                *ci_omitted.entry(step).or_insert(0) += 1;
+                continue;
+            }
+            *count += 1;
+        }
         // A line ending inside finding text would start a forged list item.
         let id = one_line(&entry.id);
         let summary = clip_chars(&one_line(&entry.summary), REVIEW_COMMENT_SUMMARY_CHARS);
@@ -3314,6 +3379,9 @@ fn reviewer_comment(
         } else {
             overflow.push(id);
         }
+    }
+    for (step, count) in ci_omitted {
+        out.push_str(&format!("\n{step}: +{count} more (see the Review tab)"));
     }
     if !overflow.is_empty() {
         out.push_str(&format!(
@@ -3648,9 +3716,12 @@ mod reviewer_message_tests {
             comment_finding("F3", Status::Unconfirmed),
             comment_finding("F4", Status::Open),
             comment_finding("CI-1", Status::Resolved),
+            comment_finding("F5", Status::Resolved),
         ];
         ledger[3].first_attempt = 2;
         ledger[4].source = api_types::ReviewFindingSource::Ci;
+        let previous = [comment_finding("F5", Status::Resolved)];
+        let ledger = current_comment_findings(ledger, &previous);
         let mut result = conformance(None);
         result.assessment = Some(api_types::ReviewAssessment {
             result: api_types::ReviewResult::Fail,
@@ -3851,5 +3922,55 @@ mod reviewer_message_tests {
         }
         assert!(text.contains("Also in the ledger (see the Review tab): "));
         assert!(text.ends_with("Full review: Review tab, attempt 2"));
+    }
+    #[test]
+    fn reviewer_comment_does_not_repeat_resolutions_on_later_passing_checks() {
+        let review = |attempt, exit| {
+            db::Review {
+            id: format!("r{attempt}"), task_id: "task".into(), execution_id: "candidate".into(),
+            reviewer_execution_id: None, auditor_execution_id: None, attempt_number: attempt,
+            status: ReviewStatus::Failed,
+            step_results_json: json!({"ci_steps":[{"index":0,"command":"test","exit_code":exit,"stderr_tail":"failure"}]}).to_string(),
+            started_at: "now".into(), finished_at: None, created_at: "now".into(), updated_at: "now".into(),
+        }
+        };
+        let prior = ::review::finding_ledger(&[review(1, 1)]).unwrap();
+        let ledger = ::review::finding_ledger(&[review(1, 1), review(2, 0)]).unwrap();
+        let second = reviewer_comment(
+            ReviewStatus::Passed,
+            2,
+            &conformance(None),
+            &current_comment_findings(ledger.clone(), &prior),
+            None,
+        );
+        assert!(second.contains("- [x] CI-0"));
+        let third_ledger =
+            ::review::finding_ledger(&[review(1, 1), review(2, 0), review(3, 0)]).unwrap();
+        assert_eq!(third_ledger[0].last_checked_attempt, 3);
+        let third = reviewer_comment(
+            ReviewStatus::Passed,
+            3,
+            &conformance(None),
+            &current_comment_findings(third_ledger, &ledger),
+            None,
+        );
+        assert!(!third.contains("CI-0"), "{third}");
+    }
+    #[test]
+    fn reviewer_comment_limits_test_findings_per_step() {
+        let ledger: Vec<_> = (0..30)
+            .map(|index| {
+                let mut entry = comment_finding(
+                    &format!("CI-0#{index:08x}"),
+                    api_types::ReviewFindingStatus::Open,
+                );
+                entry.source = api_types::ReviewFindingSource::Ci;
+                entry
+            })
+            .collect();
+        let text = reviewer_comment(ReviewStatus::Failed, 2, &conformance(None), &ledger, None);
+        assert_eq!(text.matches("- [ ] CI-0#").count(), 20);
+        assert!(text.contains("CI-0: +10 more"));
+        assert_eq!(ledger.len(), 30);
     }
 }

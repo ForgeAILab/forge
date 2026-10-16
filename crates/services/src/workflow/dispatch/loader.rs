@@ -78,6 +78,7 @@ pub async fn load_agent_dispatch_context(
     let continuation_logs_path = continuation_execution
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
+    let review_window = db.review_window(task_id).await?.reviews;
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
     let plan = if matches!(
         role,
@@ -132,6 +133,42 @@ pub async fn load_agent_dispatch_context(
         _ => None,
     };
 
+    let previous_coder = match review_window
+        .iter()
+        .max_by_key(|review| review.attempt_number)
+    {
+        Some(review) => ExecutionRepo::get_by_id(&*db, &review.execution_id)
+            .await?
+            .filter(|execution| {
+                execution.task_id == task.id
+                    && matches!(execution.role.as_str(), "coder" | "worker" | "executor")
+            }),
+        None => None,
+    };
+    let previous_coder = match previous_coder {
+        Some(execution) => Some(execution),
+        None => latest_terminal_execution_for_role(&db, task_id, role).await?,
+    };
+    let previous_coder_summary = previous_coder.and_then(|execution| execution.summary);
+    let (budget_kind, gate_state) = repair_budget_source(workflow, state_name, &transition_log);
+    let budget_config = gate_state.map(|state| {
+        crate::workflow::engine::effective_state_config(
+            state,
+            project.as_ref(),
+            task.task_state_config.as_deref(),
+        )
+    });
+    let repair_budget = Some(super::repair_brief::RepairBudget {
+        name: budget_kind.key().to_owned(),
+        spent: db::budget::spent(db.pool(), task_id, budget_kind.key()).await?,
+        limit: i64::from(db::budget::limit(
+            &task,
+            budget_kind,
+            budget_config.as_ref(),
+            gate_state.and_then(|state| state.gate_config.as_ref()),
+        )?),
+    });
+
     Ok(AgentDispatchContext {
         task,
         role: role.to_string(),
@@ -141,6 +178,9 @@ pub async fn load_agent_dispatch_context(
         comments,
         plan,
         prior_reviews,
+        review_window: Some(review_window),
+        previous_coder_summary,
+        repair_budget,
         parent_task,
         sub_tasks,
         last_manual_bounce_reason,
@@ -154,6 +194,69 @@ pub async fn load_agent_dispatch_context(
         review_ci_steps,
         step_diff,
     })
+}
+
+/// Follow the gate that actually sent this role back, including workflows
+/// that renamed their review, integration and repair states.
+fn repair_budget_source<'a>(
+    workflow: &'a WorkflowDefinition,
+    state_name: &str,
+    transition_log: &[db::TransitionLog],
+) -> (db::budget::Kind, Option<&'a api_types::StateDefinition>) {
+    let entry = transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == state_name);
+    let source = entry.and_then(|entry| {
+        workflow
+            .states
+            .iter()
+            .find(|state| state.name == entry.from_state && state.kind == StateKind::Gate)
+    });
+    let current = workflow
+        .states
+        .iter()
+        .find(|state| state.name == state_name);
+    let is_merge = |state: &api_types::StateDefinition| {
+        state
+            .hooks
+            .on_enter
+            .iter()
+            .any(|hook| hook.action == "run_merge")
+    };
+    let merge_repair = source.is_some_and(is_merge)
+        || current.is_some_and(|state| {
+            state.name == crate::workflow::default_states::MERGE_FAILED
+                || state
+                    .hooks
+                    .before_exit
+                    .iter()
+                    .any(|hook| hook.action == "require_conflict_markers_resolved")
+        });
+    let kind = if entry.is_some_and(|entry| entry.bridge.is_repair_no_change()) {
+        db::budget::Kind::RepairNoChange
+    } else if entry.is_some_and(|entry| {
+        entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
+    }) {
+        db::budget::Kind::ConflictHandoff
+    } else if merge_repair {
+        db::budget::Kind::MergeFix
+    } else {
+        db::budget::Kind::Review
+    };
+    let gate = source
+        .or_else(|| current.filter(|state| state.kind == StateKind::Gate))
+        .or_else(|| {
+            workflow.states.iter().find(|state| {
+                if merge_repair {
+                    is_merge(state)
+                } else {
+                    state.name == crate::workflow::default_states::REVIEW
+                        || state.role.as_deref() == Some(crate::workflow::default_roles::REVIEWER)
+                }
+            })
+        });
+    (kind, gate)
 }
 
 /// The diff of a finished step for its step check: the shared root workspace
@@ -759,5 +862,52 @@ mod tests {
             loaded[0].parent_task_id.as_deref(),
             Some(parent.id.as_str())
         );
+    }
+    #[test]
+    fn repair_budget_follows_renamed_source_gates_and_reminders() {
+        let mut workflow = crate::workflow::default_workflow::default_workflow();
+        for state in &mut workflow.states {
+            state.name = match state.name.as_str() {
+                "review" => "audit",
+                "merging" => "integrate",
+                "merge_failed" => "repair",
+                name => name,
+            }
+            .to_owned();
+        }
+        let mut entry = db::TransitionLog {
+            id: "entry".into(),
+            task_id: "task".into(),
+            from_state: "integrate".into(),
+            to_state: "repair".into(),
+            trigger_name: None,
+            triggered_by: "system:workflow".into(),
+            bridge: Default::default(),
+            trigger_reason: "checks failed".into(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "now".into(),
+        };
+        let entries = [entry.clone()];
+        let (kind, gate) = repair_budget_source(&workflow, "repair", &entries);
+        assert!(matches!(kind, db::budget::Kind::MergeFix));
+        assert_eq!(gate.unwrap().name, "integrate");
+        entry.from_state = "audit".into();
+        entry.to_state = "in_progress".into();
+        let entries = [entry.clone()];
+        let (kind, gate) = repair_budget_source(&workflow, "in_progress", &entries);
+        assert!(matches!(kind, db::budget::Kind::Review));
+        assert_eq!(gate.unwrap().name, "audit");
+        entry.bridge = api_types::TransitionBridge::recovery("repair_no_change", false);
+        assert!(matches!(
+            repair_budget_source(&workflow, "in_progress", &[entry.clone()]).0,
+            db::budget::Kind::RepairNoChange
+        ));
+        entry.bridge =
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff);
+        assert!(matches!(
+            repair_budget_source(&workflow, "in_progress", &[entry]).0,
+            db::budget::Kind::ConflictHandoff
+        ));
     }
 }

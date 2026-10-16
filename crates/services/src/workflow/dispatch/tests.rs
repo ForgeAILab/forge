@@ -112,6 +112,9 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         comments: Vec::new(),
         plan: Some("1. Load context\n2. Build prompt".to_string()),
         prior_reviews: Vec::new(),
+        review_window: None,
+        previous_coder_summary: None,
+        repair_budget: None,
         parent_task: None,
         sub_tasks: Vec::new(),
         last_manual_bounce_reason: None,
@@ -508,6 +511,9 @@ fn coder_prompt_review_follow_up_is_self_contained() {
 
     assert!(prompt.user.contains("Task: Add dispatch context"));
     assert!(prompt.user.contains("Description:"));
+    assert!(prompt.user.contains("Round:"));
+    assert!(prompt.user.contains("Open findings:"));
+    assert!(prompt.user.contains("Reviewer report:"));
     assert!(prompt.user.contains("Original plan:"));
     assert!(prompt
         .user
@@ -547,13 +553,17 @@ fn coder_prompt_ci_follow_up_is_focused_on_failing_check() {
 
     let prompt = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2).build(&ctx);
 
-    assert!(prompt.user.contains("CI failed during review"));
+    assert!(prompt.user.contains("Failing check output:"));
     assert!(prompt.user.contains("./scripts/ci-forge-review.sh"));
     assert!(prompt
         .user
         .contains("Diff in crates/mcp-server/src/tests.rs"));
-    assert!(!prompt.user.contains("Description:"));
-    assert!(!prompt.user.contains("Original plan:"));
+    assert!(prompt.user.contains("Description:"));
+    assert!(prompt
+        .user
+        .contains("Build prompt context for workflow agents."));
+    assert!(prompt.user.contains("Original plan:"));
+    assert!(prompt.user.contains("1. Load context"));
     assert!(!prompt.user.contains("Long previous coder response"));
     assert!(!prompt.user.contains("The reviewer agent flagged"));
 }
@@ -1457,5 +1467,183 @@ fn coder_prompt_ci_follow_up_stays_bounded_with_many_failing_steps() {
             assert!(prompt.user.contains(&format!("signature-{n}")));
         }
         assert!(prompt.user.len() < 16 * 1024, "{}", prompt.user.len());
+    }
+}
+
+#[test]
+fn repair_brief_two_rounds_lists_open_resolved_and_previous_summary() {
+    let mut ctx = fake_context(default_roles::CODER);
+    let first = db::Review {
+        step_results_json: json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"issues","findings":[{"summary":"carried","expected":"safe","observed":"crash"},{"summary":"fixed"},{"summary":"forgotten"}]}}}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    };
+    let second = db::Review {
+        step_results_json: json!({"ci_steps":[
+            {"index":0,"command":"cargo test","exit_code":1,"stderr_tail":"","output_tail":"first tail","failures":["parser::empty"]},
+            {"index":2,"command":"pnpm test","exit_code":1,"stderr_tail":"second tail"}],
+            "conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"still issues","report":"report detail","findings":[{"id":"F1","summary":"carried","expected":"safe","observed":"crash"},{"summary":"new"}],"resolved":["F2"]}},
+            "verify":{"status":"fail","checks":[{"name":"smoke","result":"fail","summary":"button broke","evidence":["screenshots/button.png"]}]}}).to_string(),
+        ..fake_review(2, db::ReviewStatus::Failed)
+    };
+    ctx.prior_reviews = vec![first, second];
+    ctx.previous_coder_summary = Some("Implemented the first correction".into());
+    ctx.repair_budget = Some(super::repair_brief::RepairBudget {
+        name: "review".into(),
+        spent: 2,
+        limit: 3,
+    });
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        for expected in [
+            "F1",
+            "F4",
+            "survived 1 repair round",
+            "F2: resolved",
+            "F3: not re-checked",
+            "CI-0#",
+            "parser::empty",
+            "first tail",
+            "second tail",
+            "button broke",
+            "screenshots/button.png",
+            "Implemented the first correction",
+            "review budget: 2 of 3 spent; 1 remaining",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let positions: Vec<_> = [
+            "Task:",
+            "Round:",
+            "Open findings:",
+            "Resolved and unconfirmed since the last round:",
+            "Failing check output:",
+            "Verify results and evidence:",
+            "Reviewer report:",
+            "Previous round:",
+        ]
+        .iter()
+        .map(|section| text.find(section).unwrap())
+        .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
+
+#[test]
+fn repair_brief_budget_trims_report_before_other_sections() {
+    let mut ctx = fake_context(default_roles::CODER);
+    let finding = json!({"summary":"keep this finding", "expected":"E".repeat(1000), "observed":"O".repeat(1000)});
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":1,"stderr_tail":"","output_tail":"TAIL".repeat(1024)}],
+            "conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"issue","report":"界".repeat(14000),"findings":[finding]}}}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    ctx.previous_coder_summary = Some("keep previous summary".into());
+    let text = super::repair_brief::RepairBrief::review(&ctx).render();
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    assert!(text.contains(&"E".repeat(1000)));
+    assert!(text.contains(&"O".repeat(1000)));
+    assert!(text.contains(&"TAIL".repeat(1024)));
+    assert!(text.contains("keep previous summary"));
+    let report = text
+        .split("Reviewer report:\n")
+        .nth(1)
+        .unwrap()
+        .split("\n\nPrevious round:")
+        .next()
+        .unwrap();
+    assert!(report.len() <= 2 * 1024);
+}
+
+#[test]
+fn merge_time_ci_failed_brief_carries_target_command_and_tail() {
+    for (builder, role) in [
+        (BUILDER_ID_CODER_MERGE_FIX_V2, default_roles::CODER),
+        (BUILDER_ID_WORKER_MERGE_FIX_V1, default_roles::WORKER),
+    ] {
+        let mut ctx = fake_context(role);
+        ctx.state_name = default_states::MERGE_FAILED.into();
+        ctx.task.error_annotation = Some(json!({"type":"ci_failed", "message":"checks failed after the rebase onto main: `cargo test` exited 101: parser::empty FAILED"}).to_string());
+        ctx.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&ctx.task));
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        for expected in [
+            "MERGE-CI",
+            "main",
+            "cargo test",
+            "parser::empty FAILED",
+            "Description:",
+            "Original plan:",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("manual task-worktree repair"));
+        assert!(review::finding_ledger(&ctx.prior_reviews)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn repair_brief_uses_the_current_window_and_automatic_recovery_budget() {
+    use super::repair_brief::{RepairBrief, RepairBudget};
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"old","findings":[{"summary":"old-window finding"}]}}}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    ctx.review_window = Some(vec![]);
+    ctx.latest_review_feedback = Some("old-window feedback".into());
+    ctx.latest_review_logs_path = Some("old-window log".into());
+    let text = RepairBrief::review(&ctx)
+        .automatic_recovery(
+            RepairBudget {
+                name: "automatic_review_recovery".into(),
+                spent: 1,
+                limit: 2,
+            },
+            "budget exhausted",
+        )
+        .render();
+    assert!(!text.contains("old-window"));
+    assert!(text.contains("automatic_review_recovery budget: 1 of 2 spent; 1 remaining"));
+    assert!(text.contains("Original plan:"));
+}
+
+#[test]
+fn repair_brief_limits_ci_findings_across_open_and_resolved_sections() {
+    let signatures: Vec<_> = (0..28).map(|index| format!("test-{index:03}")).collect();
+    let ci = |attempt, exit, failures: &[String]| {
+        db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"test","exit_code":exit,"stderr_tail":"","failures":failures}]}).to_string(),
+        ..fake_review(attempt, db::ReviewStatus::Failed)
+    }
+    };
+    for passed in [false, true] {
+        let mut ctx = fake_context(default_roles::CODER);
+        let remaining = if passed {
+            &signatures[..0]
+        } else {
+            &signatures[..26]
+        };
+        ctx.prior_reviews = vec![
+            ci(1, 1, &signatures),
+            ci(2, if passed { 0 } else { 1 }, remaining),
+        ];
+        for builder in [
+            BUILDER_ID_CODER_REVIEW_FIX_V2,
+            BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        ] {
+            let text = resolve_prompt_builder(builder).build(&ctx).user;
+            assert_eq!(text.matches("\n- CI-0#").count(), 20, "{text}");
+            assert!(text.contains("Resolved and unconfirmed since the last round:"));
+            if passed {
+                assert!(text.contains("CI-0: +8 more"), "{text}");
+            } else {
+                assert!(text.contains("CI-0: +6 more"), "{text}");
+                assert!(text.contains("CI-0: +2 more"), "{text}");
+            }
+        }
     }
 }

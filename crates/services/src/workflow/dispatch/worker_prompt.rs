@@ -150,51 +150,23 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
-    let body = review_fix_body(ctx);
+    let body = super::repair_brief::RepairBrief::review(ctx).render();
     match super::coder_prompt::no_change_brief(ctx) {
         Some(brief) => format!("{brief}\n\n{body}"),
         None => body,
     }
 }
 
-fn review_fix_body(ctx: &AgentDispatchContext) -> String {
-    let mut user = format!(
-        "Task: {}\n\nThe delivery was sent back for changes. Inspect the current worktree and address all review and validation findings, then run the relevant checks and resubmit with updated evidence.\n",
-        ctx.task.title
-    );
-    append_task_context(ctx, &mut user);
-
-    if let Some(reason) = latest_ci_failure_reason(ctx) {
-        user.push_str("\nLatest validation failure:\n");
-        user.push_str(&reason);
-        user.push('\n');
-    }
-    if let Some(feedback) = review_feedback(ctx) {
-        user.push_str("\nReview feedback:\n");
-        user.push_str(&feedback);
-        user.push('\n');
-    }
-    append_continuation_context(ctx, &mut user);
-    user
-}
-
 fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
+    if let Some(brief) = super::repair_brief::RepairBrief::merge(ctx) {
+        return brief.render();
+    }
     let mut user = format!("Task: {}\n\n", ctx.task.title);
     if matches!(
         merge_failure_kind(ctx),
         Some(api_types::FailureKind::DirtyWorktree)
     ) {
         user.push_str("Integration found unfinished or uncommitted changes in the Task worktree. Preserve the existing work, finish only the intended implementation, run validation, and complete delivery according to the execution harness contract. Do not rebase or discard changes.\n");
-    } else if ctx
-        .transition_log
-        .iter()
-        .rev()
-        .find(|entry| entry.to_state == default_states::MERGE_FAILED)
-        .is_some_and(|entry| {
-            entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
-        })
-    {
-        user.push_str("Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nForge will run the project's checks on the reconciled commit and integrate it, so keep your change limited to reconciling the files listed above, and run the relevant checks yourself before you commit.\n");
     } else {
         user.push_str("Integration found a real branch conflict. Do not rebase or attempt integration from this managed sandbox. Report that manual task-worktree repair is required and stop without changing unrelated files.\n");
     }
@@ -270,43 +242,6 @@ fn append_continuation_context(ctx: &AgentDispatchContext, user: &mut String) {
         user.push_str(logs_path);
         user.push('\n');
     }
-}
-
-fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| {
-            let value =
-                serde_json::from_str::<serde_json::Value>(&review.step_results_json).ok()?;
-            if value
-                .get("auditor")
-                .is_some_and(|auditor| !auditor.is_null())
-            {
-                return None;
-            }
-            super::coder_prompt::ci_failure_reason(&value)
-        })
-}
-
-fn review_feedback(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.latest_review_feedback
-        .as_deref()
-        .map(str::trim)
-        .filter(|feedback| !feedback.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            ctx.transition_log
-                .iter()
-                .rev()
-                .find(|entry| {
-                    entry.from_state == default_states::REVIEW
-                        && entry.to_state == ctx.state_name
-                        && entry.rejection
-                })
-                .map(|entry| entry.trigger_reason.clone())
-        })
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {

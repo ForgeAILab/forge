@@ -8,6 +8,16 @@ use api_types::{
 };
 use db::Review;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+/// Stable across processes and owners; signatures are normalised by check-executor.
+pub fn ci_finding_id(step: usize, signature: &str) -> String {
+    let digest = Sha256::digest(signature.as_bytes());
+    format!(
+        "CI-{step}#{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
 
 /// Derive every finding, ordered naturally by id. The API's 200-item limit is
 /// applied only after derivation, so hidden entries still reserve their ids.
@@ -59,7 +69,12 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         // A source can occur in both pre-review CI and the frozen conformance.
         // Count it once per attempt, preferring the check's final observation.
         let mut observations = BTreeMap::new();
+        let mut signatures = BTreeMap::new();
         for step in steps {
+            signatures.insert(
+                format!("CI-{}", step.index),
+                (step.index, step.failures, step.failures_truncated),
+            );
             let output = if step.output_tail.is_empty() {
                 step.stderr_tail
             } else {
@@ -119,6 +134,48 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             }
         }
         for (id, (source, command, passed, observed)) in observations {
+            if source == Source::Ci {
+                let signature_info = signatures.get(&id);
+                let current: BTreeMap<_, _> = signature_info
+                    .into_iter()
+                    .flat_map(|(index, failures, _)| {
+                        failures
+                            .iter()
+                            .map(move |signature| (ci_finding_id(*index, signature), signature))
+                    })
+                    .collect();
+                // A passing step settles all its identities. A complete signature
+                // set settles just those no longer failing. Older owners and
+                // truncated sets cannot prove an omitted test passed.
+                for entry in ledger.values_mut().filter(|entry| {
+                    entry.source == Source::Ci
+                        && (entry.id == id || entry.id.starts_with(&format!("{id}#")))
+                }) {
+                    if passed
+                        || (!current.is_empty()
+                            && !signature_info.is_some_and(|(_, _, truncated)| *truncated)
+                            && !current.contains_key(&entry.id))
+                    {
+                        entry.status = Status::Resolved;
+                        entry.last_checked_attempt = attempt;
+                        entry.streak = 0;
+                    }
+                }
+                if !passed && !current.is_empty() {
+                    for (id, signature) in current {
+                        let finding = ReviewFinding {
+                            id: None,
+                            summary: signature.clone(),
+                            severity: ReviewFindingSeverity::Blocking,
+                            r#where: Some(command.clone()),
+                            expected: Some("Pass".into()),
+                            observed: Some(signature.clone()),
+                        };
+                        open(&mut ledger, id, source, &finding, attempt);
+                    }
+                    continue;
+                }
+            }
             if passed {
                 if let Some(entry) = ledger.get_mut(&id) {
                     entry.status = Status::Resolved;
@@ -539,5 +596,71 @@ mod tests {
                 "V-case10"
             ]
         );
+    }
+    #[test]
+    fn finding_ledger_signature_ids_are_stable_and_track_each_test() {
+        let ci = |attempt, exit, failures: Value, truncated| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":2,"command":"cargo test","exit_code":exit,"stderr_tail":"tail",
+            "failures":failures,"failures_truncated":truncated}],
+            "conformance":{"status":"failed","contract":null,"assessment":null,"reason":null,"checks":[{"check_id":"ci:2","command":"cargo test","exit_code":exit,"output":"final tail"}]}}),
+            )
+        };
+        // Golden digest pins SHA-256, rather than a process-seeded hasher.
+        assert_eq!(ci_finding_id(2, "abc"), "CI-2#ba7816bf");
+        let a = ci_finding_id(2, "parser::empty");
+        let b = ci_finding_id(2, "parser::unicode");
+        let reviews = [
+            ci(1, 1, json!(["parser::empty", "parser::unicode"]), false),
+            ci(2, 1, json!(["parser::empty"]), false),
+        ];
+        let ledger = finding_ledger(&reviews).unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            (entry(&ledger, &a).status, entry(&ledger, &a).streak),
+            (Status::Open, 2)
+        );
+        assert_eq!(
+            (
+                entry(&ledger, &b).status,
+                entry(&ledger, &b).last_checked_attempt
+            ),
+            (Status::Resolved, 2)
+        );
+        assert_eq!(ledger, finding_ledger(&reviews).unwrap());
+        let third = ci(3, 0, json!([]), false);
+        let fourth = ci(4, 0, json!([]), false);
+        let ledger =
+            finding_ledger(&[reviews[0].clone(), reviews[1].clone(), third, fourth]).unwrap();
+        assert_eq!(entry(&ledger, &a).last_checked_attempt, 4);
+        assert_eq!(entry(&ledger, &b).last_checked_attempt, 4);
+        assert!(ledger.iter().all(|entry| entry.status == Status::Resolved));
+    }
+
+    #[test]
+    fn finding_ledger_missing_or_truncated_signatures_cannot_resolve_tests() {
+        let ci = |attempt, failures: Value, truncated| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":0,"command":"test","exit_code":1,"stderr_tail":"tail","failures":failures,"failures_truncated":truncated}]}),
+            )
+        };
+        let a = ci_finding_id(0, "a");
+        let b = ci_finding_id(0, "b");
+        let ledger = finding_ledger(&[
+            ci(1, json!(["a", "b"]), false),
+            ci(2, json!(["a"]), true),
+            ci(3, json!([]), false),
+        ])
+        .unwrap();
+        assert_eq!(entry(&ledger, &a).status, Status::Open);
+        assert_eq!(entry(&ledger, &b).status, Status::Open);
+        assert_eq!(entry(&ledger, "CI-0").status, Status::Open);
+        let full = finding_ledger(&[ci(1, json!([]), false), ci(2, json!(["a"]), false)]).unwrap();
+        assert_eq!(entry(&full, "CI-0").status, Status::Resolved);
+        assert_eq!(entry(&full, &a).status, Status::Open);
     }
 }

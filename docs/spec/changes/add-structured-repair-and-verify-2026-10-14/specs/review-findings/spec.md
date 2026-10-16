@@ -57,11 +57,12 @@ continues that finding. An unknown id is treated as a new finding.
 
 Forge-owned failures recorded on a Review SHALL be findings with ids taken
 from their source:
-- `CI-<step index>` for a failed review CI step;
+- `CI-<step index>#<first 8 hex of sha256(normalised signature)>` per failing
+  review CI test, or `CI-<step index>` for a failed step without signatures;
 - `CHK-<check id>` for a failed required conformance check;
 - `V-<check name>`, `V-start` and `V-ready` for verify.
 
-Their `observed` text is the bounded output tail. The same source failing
+Their `observed` text is the normalised test signature or bounded output tail. The same source failing
 again carries the same id. Merge-queue failures create no Review and are not
 part of the ledger; the repair brief covers them.
 
@@ -70,7 +71,7 @@ part of the ledger; the repair brief covers them.
 - **THEN** after review 2, F1 is open, F2 is resolved, and the new finding is F3
 
 #### Scenario: CI failure is a finding
-- **WHEN** review CI step 2 (`cargo test`) exits 101
+- **WHEN** review CI step 2 (`cargo test`) exits 101 without failure signatures
 - **THEN** the ledger has an open finding `CI-2` whose `where` is `cargo test` and whose `observed` is the step's output tail
 
 ### Requirement: The finding ledger is derived from the window's Reviews

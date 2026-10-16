@@ -6131,7 +6131,14 @@ Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 findings; unknown ids become new findings. A known id repeated within one
 review is one finding: its first occurrence continues it and later duplicates
 are dropped. Forge sources use the stored,
-zero-based `CI-<step index>`, `CHK-<check id>` and `V-<check name>` ids.
+zero-based `CI-<step index>#<first 8 hex of sha256(normalised failure signature)>`
+for steps with test signatures, `CI-<step index>` for failed steps without
+signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
+same test keeps its id across review rounds and server/daemon owners. A
+complete signature list resolves tests that stop failing; missing/truncated
+signatures do not resolve omitted tests, while a passing step resolves all its
+findings. The ledger retains all signatures; briefs and comments display at
+most 20 test findings per step followed by `+N more`.
 `source: merge` is reserved in the wire type and is not emitted in the ledger.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
@@ -6141,7 +6148,8 @@ and restarts reviewer numbering. Findings are informational in this phase;
 existing verdict routing and retry budgets remain authoritative.
 
 Finished review comments show the headline, the ledger as a Markdown checklist
-(open unchecked, resolved checked, unconfirmed labelled "not re-checked"), and
+(open unchecked, resolved in this review checked, unconfirmed labelled
+"not re-checked"), omitting earlier-resolved findings, and
 `Full review: Review tab, attempt N`. The full report stays in the Review API and
 Review tab. Reviews without findings retain at most the first 2 KiB of their
 report, truncated on a UTF-8 boundary. CI-only failures get the same checklist.

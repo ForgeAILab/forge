@@ -1738,6 +1738,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Coder and autonomous-worker repair prompts now use a structured brief with
+  Task description and plan, finding history, all failing check output,
+  recorded verify evidence, the reviewer report and prior completion summary.
+  Automatic review recovery uses the same brief; no-change reminders still lead.
+- Merge-time check failures give the coder the target branch, failing command
+  and output in a `MERGE-CI` finding. Committed conflict handoffs use
+  `MERGE-CONFLICT`; both stay out of the review ledger.
+- Review CI findings use stable per-test signature ids (`CI-<step>#<hash>`),
+  with step-level ids when signatures are unavailable. Review checklists show
+  checked findings only when resolved by that review, omitting older resolutions.
+
+
 - Review comments show the finding checklist and drop the full report. Read the
   full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
   findings retain a 2 KiB excerpt. The checklist lists open findings first and

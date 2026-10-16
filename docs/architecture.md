@@ -8243,7 +8243,12 @@ Forge assigns ids and derives open/resolved/unconfirmed status and streaks with
 budget window and its Reviews together. A retry-window reset starts a fresh
 ledger; a source that did not run leaves its findings unchanged. A reviewer
 that omits an open finding makes it unconfirmed, while passing Forge checks
-resolve their own findings. The re-review prompt carries the prior ledger's
+resolve their own findings. Review CI uses one `CI-<zero-based step>#<first 8
+hex digits of SHA-256(normalised signature)>` finding per failing test. The
+same identity carries across owners and server restarts. A failing step with
+no signatures uses `CI-<step>`. A complete signature list resolves tests no
+longer failing; missing or truncated lists do not prove omitted tests passed.
+A passing step resolves all its findings. The re-review prompt carries the prior ledger's
 open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. This projection does not
 change verdict routing or budgets. Findings are naturally ordered by id before
@@ -8251,7 +8256,8 @@ any API cap (`F2` before `F10`); the complete projection still reserves all ids.
 
 Task review comments now use this same projection after the settled attempt:
 headline, GFM checklist, optional recorded verify summary, then a Review-tab
-pointer. Open findings are unchecked, resolved findings checked, and unconfirmed
+pointer. Open findings are unchecked, findings resolved by this review are
+checked (earlier resolutions are omitted), and unconfirmed
 findings say "not re-checked" without a checkbox, listed in that order. Each line
 is one line of text (summary clipped to 200 characters); the lines stop at 8 KiB
 and the remaining ids follow on one "Also in the ledger" line, because comments
@@ -8268,9 +8274,37 @@ above the latest attempt and keeps per-attempt findings and the full report in
 history. Verify rendering is conditional on recorded data; verify execution and
 progress-round policy are later phases.
 
+Coder and autonomous-worker repair requests use one `RepairBrief` in
+`workflow/dispatch`; automatic review recovery uses the same builder. It reads
+the persisted Review-budget window, the complete finding ledger, all failing
+Review CI steps with their failure signatures and tails, optional recorded
+verify results/evidence, the reviewer report, and the reviewed coder's completion
+summary. The ordered sections are Task (description and canonical plan), Round
+(charged budget and remaining allowance), Open findings (including survived
+repair rounds), Resolved/unconfirmed changes, Failing check output, Verify,
+Reviewer report, Previous round, and Logs. Empty optional sections are omitted.
+At most 20 signature findings per step are displayed, followed by `+N more`;
+the ledger itself retains every finding. A no-change reminder still leads the
+request and names its `repair_no_change` allowance.
+
+The brief targets 24 KiB. It trims the report to 2 KiB, then drops it; drops
+the previous summary; reduces each check tail to 1 KiB; and reduces the
+resolved/unconfirmed section to ids. Task and open findings stay present; if
+necessary their expected/observed fields are reduced to 300 characters. D7's
+protected content can itself exceed 24 KiB (for example an oversized Task plan),
+so that irreducible case preserves content rather than silently losing Task or
+finding context. Attempts/Pattern history and verify execution are later phases.
+
+Actionable merge send-backs use brief-only `MERGE-CI` or `MERGE-CONFLICT`
+findings. `MERGE-CI` quotes the send-back's target, failing command and output;
+`MERGE-CONFLICT` gives the committed-marker paths and reconciliation instructions.
+Neither enters the Review ledger. Dirty-worktree and owner-only repair messages
+retain their existing behavior; prompt builder ids and thread-resume policy are
+unchanged.
+
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
-follows the review-remediation budget, with the reason and Markdown review as the
+follows the review-remediation budget, with the structured repair brief as the
 coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
 with a `review_blocked` blocking annotation for its owner, because neither the

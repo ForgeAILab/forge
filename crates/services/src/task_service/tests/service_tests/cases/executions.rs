@@ -9817,12 +9817,44 @@ async fn review_comments_cascade_replay_posts_one_result_and_repair() {
     let (db, service, task, execution, _repo_dir) = seed_admitted_review().await;
     complete_review_with(&db, &service, &execution,
         "Full report stays in the Review tab.\n{\"result\":\"fail\",\"reason\":\"empty input crashes\",\"findings\":[{\"summary\":\"Empty input crashes\"}]}").await;
-    for _ in 0..2 {
-        service
-            .maybe_cascade_executor_completion(&execution.id)
+    assert_ne!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
             .await
-            .unwrap();
-    }
+            .unwrap()
+            .unwrap()
+            .status,
+        "review"
+    );
+    // Re-enter the pre-cascade state without a new Review or entry hooks. This
+    // models redelivery after the result/repair writes, so the second call
+    // must execute the settled-review reconciliation instead of its status guard.
+    sqlx::query("UPDATE task SET status = 'review', blocked_json = NULL, error_annotation = NULL, failed_json = NULL, version = version + 1 WHERE id = ?")
+        .bind(&task.id).execute(db.pool()).await.unwrap();
+    service
+        .maybe_cascade_executor_completion(&execution.id)
+        .await
+        .unwrap();
+    assert_ne!(
+        TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "review"
+    );
+    assert_eq!(
+        ReviewRepo::list_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, db::budget::Kind::Review.key())
+            .await
+            .unwrap(),
+        1
+    );
     let comments = review_comment_contents(&db, &task.id).await;
     let results: Vec<_> = comments
         .iter()

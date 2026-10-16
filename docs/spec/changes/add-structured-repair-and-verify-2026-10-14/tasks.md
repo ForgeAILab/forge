@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-15T21:23:01Z
+updated_at: 2026-10-16T01:23:30Z
 completed_at:
 ---
 
@@ -18,7 +18,7 @@ suite.
 - [x] 1.3 Update `RESPONSE_INSTRUCTION` and the correction prompt (`review_correction.rs`). Refresh the snapshot `crates/services/tests/fixtures/server_workspace_reviewer.prompt.snap`.
 - [x] 1.4 `prior_review_section` lists the prior ledger's open findings with their ids and asks for `id` / `resolved`. Keep the existing 8 KiB report slice.
 - [x] 1.5 Write `finding_ledger(window_reviews)`, a pure function in the `review` crate or `services`. It covers:
-  - Forge ids (`F<n>`, `CI-<i>`, `CHK-<id>`, `V-*`). `MERGE-*` stays out of the ledger and is brief-only;
+  - Forge ids (`F<n>`, `CI-<i>` / `CI-<i>#<signature hash>`, `CHK-<id>`, `V-*`). `MERGE-*` stays out of the ledger and is brief-only;
   - the review window boundary;
   - checked versus not-run sources;
   - `unconfirmed`;
@@ -45,9 +45,10 @@ suite.
   - sections in the D7 order;
   - a 24 KiB budget with the D7 drop order;
   - sources from the ledger, Review `ci_steps` (all failing steps), `details.verify`, and the previous coder completion summary.
-- [ ] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
-- [ ] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
-- [ ] 3.4 Focused tests in `workflow/dispatch/tests.rs`:
+  - Implementation and prescribed drop order are complete. **NOT MET:** an absolute 24 KiB cap is incompatible with D7's unbounded protected Task/open findings (and unspecified Verify/Logs reductions). Protected content remains present after every permitted reduction; the report-first budget scenario passes.
+- [x] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
+- [x] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
+- [x] 3.4 Focused tests in `workflow/dispatch/tests.rs`:
   - update `coder_prompt_review_follow_up_is_self_contained` and `coder_prompt_ci_follow_up_is_focused_on_failing_check`;
   - keep `review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one` and `merge_fix_prompts_hand_a_committed_conflict_to_the_worker` green;
   - new: a two-round brief lists resolved and open findings;

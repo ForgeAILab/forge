@@ -4715,3 +4715,53 @@ async fn runtime_crash_boundaries_recover_through_real_ports_without_duplicate_f
         .success());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_back_merge_fix_brief_carries_command_and_output() {
+    use crate::workflow::dispatch::{
+        loader, resolve_prompt_builder, BUILDER_ID_CODER_MERGE_FIX_V2,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    };
+    let world = World::new().await;
+    let attempt = world.add_task("brief-red", "f", "one\n").await;
+    let asked = world.place(&attempt.id, "checking", 2).await;
+    world.set(&attempt.id, "state='ejected',failure_kind='candidate_check_failed',failure_message='`cargo test` exited 101: parser::empty FAILED'").await;
+    world.ask(&asked, IntegrationStepAction::SendBack).await;
+    eventually("red check reaches repair", || async {
+        world.task("brief-red").await.status == "merge_failed"
+    })
+    .await;
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    for (builder, role) in [
+        (BUILDER_ID_CODER_MERGE_FIX_V2, "coder"),
+        (BUILDER_ID_WORKER_MERGE_FIX_V1, "worker"),
+    ] {
+        let context = loader::load_agent_dispatch_context(loader::DispatchContextParams {
+            db: world.db.clone(),
+            router: &world.service.workspace_backend_router,
+            task_id: "brief-red",
+            role,
+            state_name: "merge_failed",
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &workflow,
+        })
+        .await
+        .unwrap();
+        let text = resolve_prompt_builder(builder).build(&context).user;
+        for expected in [
+            "MERGE-CI",
+            "main",
+            "cargo test",
+            "parser::empty FAILED",
+            "merge_fix budget: 1 of 1 spent; 0 remaining",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("manual task-worktree repair"), "{text}");
+        let window = world.db.review_window("brief-red").await.unwrap();
+        assert!(::review::finding_ledger(&window.reviews)
+            .unwrap()
+            .is_empty());
+    }
+}
