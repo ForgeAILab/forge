@@ -717,3 +717,32 @@ async fn review_verify_app_log_report_and_text_evidence_are_ansi_free_and_redact
     assert!(text.contains("boot with [REDACTED]") && !text.contains(SECRET));
     assert_stopped(&f).await;
 }
+
+#[tokio::test]
+async fn review_verify_unusable_report_or_unknown_verdict_is_inconclusive_not_pass() {
+    for command in [
+        r#"printf 'not json' > "$FORGE_VERIFY_REPORT""#,
+        r#"printf '%s' '["pass"]' > "$FORGE_VERIFY_REPORT""#,
+        r#"printf '%s' '{"verdict":"maybe","summary":"unsure"}' > "$FORGE_VERIFY_REPORT""#,
+        r#"ln -s /etc/hosts "$FORGE_VERIFY_REPORT""#,
+    ] {
+        let f = fixture(&[], json!({"checks":[{"name":"smoke","command":command}]})).await;
+        let (task, review, details) = enter(&f).await;
+        assert_eq!(
+            details["verify"]["status"], "inconclusive",
+            "{command}: {details}"
+        );
+        assert_eq!(review.status, db::ReviewStatus::Failed, "{command}");
+        assert_eq!(verify_count(&f).await, 2, "{command}: re-runs once");
+        let blocked: serde_json::Value =
+            serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
+        assert_eq!(blocked["source"], "verify", "{command}");
+    }
+    let f = fixture(
+        &[],
+        json!({"checks":[{"name":"smoke","command":r#"printf '%s' '{"verdict":"PASSED","summary":"fine"}' > "$FORGE_VERIFY_REPORT""#}]}),
+    )
+    .await;
+    let (_, _, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "pass", "{details}");
+}

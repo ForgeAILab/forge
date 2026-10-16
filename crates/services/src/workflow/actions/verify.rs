@@ -286,37 +286,54 @@ async fn read_results(
             evidence_paths: vec![],
             observed: None,
         };
+        // A report that is there but cannot be used is no verdict: a check
+        // that exits 0 with it is inconclusive, never a pass.
+        let mut unusable = None;
         let report = if command_id.contains(":check:") {
             match read_file(directory, &format!("{name}.report.json"), 256 * 1024) {
                 Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
                     Ok(value) if value.is_object() => Some(value),
                     _ => {
-                        details
-                            .notes
-                            .push(format!("{name}: malformed report ignored"));
+                        unusable = Some("malformed report".to_owned());
                         None
                     }
                 },
                 Ok(None) => None,
                 Err(error) => {
-                    details
-                        .notes
-                        .push(format!("{name}: report skipped: {error}"));
+                    unusable = Some(format!("report skipped: {error}"));
                     None
                 }
             }
         } else {
             None
         };
+        if let Some(reason) = &unusable {
+            details.notes.push(format!("{name}: {reason}"));
+            if command.exit_code == 0 {
+                entry.result = Status::Inconclusive;
+                entry.summary = format!("{name} exited 0 with an unusable report: {reason}");
+            }
+        }
         if let Some(report) = &report {
             if let Some(summary) = report["summary"].as_str().filter(|s| !s.trim().is_empty()) {
                 entry.summary = clean(summary).chars().take(1000).collect();
             }
             if command.exit_code == 0 {
-                entry.result = match report["verdict"].as_str() {
-                    Some("fail" | "failed") => Status::Fail,
-                    Some("inconclusive") => Status::Inconclusive,
-                    _ => Status::Pass,
+                // No verdict: the exit code decides. A verdict that is not
+                // one of the known words is no verdict either way.
+                entry.result = match &report["verdict"] {
+                    Value::Null => Status::Pass,
+                    verdict => match verdict.as_str().map(str::to_ascii_lowercase).as_deref() {
+                        Some("pass" | "passed") => Status::Pass,
+                        Some("fail" | "failed") => Status::Fail,
+                        Some("inconclusive") => Status::Inconclusive,
+                        _ => {
+                            details
+                                .notes
+                                .push(format!("{name}: unrecognized report verdict"));
+                            Status::Inconclusive
+                        }
+                    },
                 };
             }
             let findings: Vec<_> = report["findings"]
