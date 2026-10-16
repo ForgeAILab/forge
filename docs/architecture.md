@@ -8793,7 +8793,12 @@ a loopback port under its existing admitted checkout lock and supplies
 requirements, merge-base/candidate, changed files and open ledger findings.
 There is no new process-spawn path: check-executor and process-supervisor
 execute and settle every group, including the background server, on pass,
-fail, timeout, cancellation and dropped execution.
+fail, timeout, cancellation and dropped execution. The start step records its
+group in `start.pgid`; before any verify starts, the owner stops a recorded
+group whose leader is gone but whose members still run (left by a server
+crash or restart), in every verify directory of the Task root. Ports handed
+to verify runs are held by the server for the longest wall limit. A process
+that leaves its group (`setsid`) is outside `canonical-ci/1`'s stop.
 
 The review hook keeps its asking-time authority through both CI and verify
 suspensions, and writes combined Review details at settlement. A verify fail

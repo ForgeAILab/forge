@@ -6393,7 +6393,8 @@ No verify runs at the integration queue head. Daemon placements record
 `details.verify = {"status":"not_run","reason":"placement_unsupported",...}`
 and continue to their reviewer.
 
-At execution start Forge picks a free loopback port and supplies every step
+At execution start Forge picks a free loopback port (never one another
+verify of this server holds, nor one already served on `::1`) and supplies every step
 with `FORGE_VERIFY_PORT`, `FORGE_VERIFY_URL` (`http://127.0.0.1:<port>`),
 `FORGE_VERIFY_DIR` (`<task root>/.forge-task/verify/<review attempt>/`),
 `FORGE_VERIFY_REQUEST` (`<dir>/request.json`), and `FORGE_VERIFY_REPORT`
@@ -6404,11 +6405,18 @@ runs in the background with output in `app.log`. Forge polls the readiness
 path until an HTTP status below 500, or repeats the readiness command until
 exit 0. Then checks run in order. Every process group started by the run is
 stopped and verified stopped on every outcome, using the same check executor
-and supervisor as CI.
+and supervisor as CI. The start step records its process group in
+`start.pgid`; before a verify starts anything, Forge stops a recorded group
+that a crashed or restarted server left running in any verify directory of
+the Task root. A process that leaves its group (`setsid`, a daemonizing
+start) is outside that stop.
 
 A check fails on non-zero exit, timeout, or an optional JSON report's
 `verdict: "fail"`/`"failed"`; it is inconclusive on exit 0 with
-`verdict: "inconclusive"`, and otherwise passes. Reports may contain
+`verdict: "inconclusive"`, an unrecognized `verdict`, or a report that is
+present but unusable (invalid JSON, not an object, over 256 KiB, not a regular
+file); otherwise it passes. Verdict words are matched case-insensitively and a
+report without `verdict` leaves the exit code to decide. Reports may contain
 `summary`, `findings: [{summary, where, expected, observed}]`, and
 `evidence: [{path, kind, caption}]`. A failed check creates `V-<name>` before
 any reviewer execution. Start exits and readiness timeouts create `V-start`
@@ -6433,7 +6441,10 @@ Evidence uses the existing Task evidence store. The allowed Review detail key
 inside the Task root for the reviewer's **Verify results** prompt section.
 Reports are bounded to 256 KiB, findings to 50 per check with bounded text,
 and evidence lists to 50 entries per check. Malformed optional reports are
-noted; they cannot turn a non-zero command into a pass.
+noted; they cannot turn a non-zero command into a pass. The `app.log` tail,
+report summaries/findings/captions and UTF-8 evidence files are stored with
+ANSI sequences stripped (text fields) and Project environment values
+replaced by `[REDACTED]`, as command output tails are.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. Forge re-runs them in the Task's worktree at the reviewed commit
