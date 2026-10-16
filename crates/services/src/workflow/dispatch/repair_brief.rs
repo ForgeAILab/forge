@@ -152,10 +152,23 @@ impl RepairBrief {
                     .or_else(|| details["auditor"]["reason"].as_str().map(str::to_owned))
                     .unwrap_or_default(),
             }
-        } else if checks.is_empty() && (latest.is_some() || ctx.review_window.is_none()) {
+        } else if checks.is_empty() {
+            // The rejection that sent this role back is current by
+            // construction; it is the only cause when review failed before
+            // a Review row was written.
+            let rejection = ctx
+                .transition_log
+                .iter()
+                .rev()
+                .filter(|entry| !entry.bridge.is_repair_no_change())
+                .find(|entry| entry.to_state == ctx.state_name)
+                .filter(|entry| entry.rejection)
+                .map(|entry| entry.trigger_reason.clone());
             ctx.latest_review_feedback
                 .clone()
+                .filter(|_| latest.is_some() || ctx.review_window.is_none())
                 .or_else(|| ctx.last_manual_bounce_reason.clone())
+                .or(rejection)
                 .unwrap_or_default()
         } else {
             String::new()

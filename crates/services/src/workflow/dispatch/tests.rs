@@ -1731,3 +1731,32 @@ fn repair_brief_hard_cap_bounds_every_failing_step_and_the_verify_dump() {
     assert!(text.contains("… (truncated; see the Review tab)"));
     assert!(!text.contains("T…"));
 }
+
+#[test]
+fn repair_brief_keeps_the_rejection_reason_when_review_wrote_no_row() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.review_window = Some(Vec::new());
+    ctx.transition_log.push(db::TransitionLog {
+        id: "rejected".into(),
+        task_id: ctx.task.id.clone(),
+        from_state: "review".into(),
+        to_state: ctx.state_name.clone(),
+        triggered_by: "system:workflow".into(),
+        trigger_name: None,
+        bridge: Default::default(),
+        trigger_reason: "review entry failed: the checkout has no commits".into(),
+        rejection: true,
+        created_at: db::now_rfc3339(),
+        hook_results_json: None,
+    });
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        assert!(
+            text.contains("review entry failed: the checkout has no commits"),
+            "{text}"
+        );
+    }
+}
