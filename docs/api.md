@@ -200,7 +200,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/relations` | Read direct subtask, dependency, and dependent summaries without scanning the Project task list |
 | GET    | `/api/v1/tasks/{id}/findings` | Current review-window findings (same Project read authority as Task reviews) |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
-| PATCH  | `/api/v1/tasks/{id}` | Update task |
+| PATCH  | `/api/v1/tasks/{id}` | Update task; send `description: ""` to clear it (omitted or `null` leaves it unchanged) |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |

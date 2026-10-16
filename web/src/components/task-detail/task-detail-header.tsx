@@ -3,6 +3,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TaskCapacityNotice } from '@/components/task-capacity-notice'
+import { TaskTypeBadge } from '@/components/task-type-badge'
 import { taskStatusColors } from '@/components/task-controls'
 import { cn } from '@/lib/cn'
 import type { KeyboardEvent } from 'react'
@@ -42,7 +43,7 @@ export function TaskDetailHeader({
   return (
     <header className="flex shrink-0 items-center justify-between border-b px-6 py-4">
       <div className="min-w-0 flex-1 space-y-2 pr-4">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           {task ? (
             <span
               className={cn(
@@ -59,6 +60,7 @@ export function TaskDetailHeader({
           )}
           {task ? (
             <>
+              <TaskTypeBadge taskType={task.task_type} />
               {task.review_passed_at ? (
                 <span className="inline-flex items-center rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-300">
                   review passed

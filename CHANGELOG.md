@@ -6,6 +6,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Clearing a Task description now persists an empty value from both the board
+  detail dialog and the full-page detail view, restoring the empty-description prompt.
+- Non-default Task types are visible on Kanban cards and Task detail headers.
+- The header brand is a consistently labelled Forge home link to `/`, using the
+  existing home routing for accounts with and without Projects.
+
 ### Security
 
 - Scope Project and Task REST reads and mutations, including indirect comments,
