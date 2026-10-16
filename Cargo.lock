@@ -3127,6 +3127,7 @@ dependencies = [
  "events",
  "executors",
  "git",
+ "libc",
  "process-supervisor",
  "serde_json",
  "sqlx",

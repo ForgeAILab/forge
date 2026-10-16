@@ -8850,8 +8850,12 @@ evidence paths, app-log tail and skipped-evidence notes. The same Task evidence
 store captures confined regular files under the 25 MiB per-file and kind limits,
 with a shared 64 MiB byte allowance across all checks in one verify evaluation.
 Further files that exceed the remaining allowance are refused with a note.
-`app.log` currently has no on-disk byte cap; only its retained Review tail is
-bounded. A streaming disk cap remains an open release follow-up. Reports cannot
+The app appends to `app.log` directly, so short startup lines are visible at
+once; the owner keeps the first 16 MiB by cutting the file back every 200 ms
+during the run and once after settlement, before the receipt is recorded.
+A symlinked, hard-linked or replaced `app.log` is never truncated. A process
+that escaped its group can still grow the file until the next prepare of that
+Review deletes it. Reports cannot
 escape the verify directory. Project values are redacted from output, report text and UTF-8
 evidence; public `FORGE_VERIFY_*` port, URL and directory values are excluded
 from redaction, including matching digits. Reviewer prompts include the

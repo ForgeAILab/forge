@@ -60,7 +60,7 @@ pub fn build_bundle(
             "start",
             format!(
                 r#"printf '%s\n' "$$" > "$FORGE_VERIFY_DIR/start.pgid"
-( bash -lc {}; code=$?; printf '%s\n' "$code" > "$FORGE_VERIFY_DIR/start.exit" ) > "$FORGE_VERIFY_DIR/app.log" 2>&1 < /dev/null &
+( bash -lc {}; code=$?; printf '%s\n' "$code" > "$FORGE_VERIFY_DIR/start.exit" ) >> "$FORGE_VERIFY_DIR/app.log" 2>&1 < /dev/null &
 printf '%s\n' "$!" > "$FORGE_VERIFY_DIR/start.pid"
 sleep 0.05
 [ ! -f "$FORGE_VERIFY_DIR/start.exit" ]"#,
@@ -279,19 +279,82 @@ fn is_live(review_id: &str) -> bool {
         .contains_key(review_id)
 }
 
+/// On-disk bound of `app.log`: output past it is discarded.
+pub const APP_LOG_CAP: u64 = 16 * 1024 * 1024;
+/// While a run lasts, `app.log` exceeds [`APP_LOG_CAP`] by at most what the app
+/// writes within one interval before it is cut back.
+const APP_LOG_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Run an admitted bundle after [`prepare_environment`]. A verify run is
 /// marked live for its whole execution (a dropped execution unmarks it, as a
-/// crash does), and its group record is removed once settlement is confirmed.
+/// crash does). The app writes `app.log` itself, appending, so short lines
+/// land at once; this owner cuts the file back to [`APP_LOG_CAP`] while the
+/// run lasts and once more after settlement, before the receipt is recorded.
+/// The group record is removed once settlement is confirmed.
 pub async fn run_admitted<E>(
     spec: &CheckSpec,
     worktree: &Path,
     execution: impl std::future::Future<Output = Result<CheckReceipt, E>>,
 ) -> Result<CheckReceipt, E> {
-    let _live = LiveRun::enter(spec);
-    let receipt = execution.await?;
+    let live = LiveRun::enter(spec);
+    let verify = live
+        .0
+        .as_deref()
+        .and_then(|review_id| directory(worktree, review_id).ok());
+    let mut execution = std::pin::pin!(execution);
+    let receipt = match &verify {
+        None => execution.await,
+        Some(directory) => {
+            let mut trim = tokio::time::interval(APP_LOG_TRIM_INTERVAL);
+            let receipt = loop {
+                tokio::select! {
+                    receipt = &mut execution => break receipt,
+                    _ = trim.tick() => cap_app_log(directory, worktree),
+                }
+            };
+            cap_app_log(directory, worktree);
+            receipt
+        }
+    }?;
     finish_run(spec, worktree, &receipt);
     Ok(receipt)
 }
+
+/// Keep the first [`APP_LOG_CAP`] bytes of a regular, singly linked `app.log`.
+/// The candidate controls the directory's contents: a symlink, hard link,
+/// FIFO or replaced file is left alone, and opening never blocks.
+#[cfg(unix)]
+fn cap_app_log(directory: &Path, worktree: &Path) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = directory.join("app.log");
+    let Ok(before) = std::fs::symlink_metadata(&path) else {
+        return;
+    };
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || before.len() <= APP_LOG_CAP
+        || ensure_directory(directory, worktree).is_err()
+    {
+        return;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    else {
+        return;
+    };
+    if file.metadata().is_ok_and(|opened| {
+        opened.file_type().is_file()
+            && opened.nlink() == 1
+            && opened.dev() == before.dev()
+            && opened.ino() == before.ino()
+    }) {
+        let _ = file.set_len(APP_LOG_CAP);
+    }
+}
+#[cfg(not(unix))]
+fn cap_app_log(_directory: &Path, _worktree: &Path) {}
 
 /// A stopped group no longer needs a crash-recovery record. Retaining it could
 /// later target an unrelated process group after the OS reuses its id.

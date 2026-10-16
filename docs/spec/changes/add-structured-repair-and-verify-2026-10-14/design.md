@@ -471,8 +471,9 @@ The approved release follow-ups key runtime directories and command identities
 by Review id; remove `start.pgid` on confirmed group settlement; exclude public
 `FORGE_VERIFY_*` values from redaction; and charge inconclusive reruns through
 the budget ledger per Review invocation, honoring Task/Project overrides.
-Evidence shares 64 MiB per evaluation. The approved 16 MiB on-disk app-log cap
-remains NOT MET after two buffering regressions; the original streaming writer
-is retained, and the explicit ignored regression records the gap. App exit during readiness creates only `V-ready`.
+Evidence shares 64 MiB per evaluation. The app still appends to `app.log`
+directly (no buffering sink); the server owner that runs the bundle keeps the
+first 16 MiB by cutting the file back every 200 ms and once after settlement,
+so the slack during a run is what the app writes in one interval. App exit during readiness creates only `V-ready`.
 A post-run occupied-port warning appears in verify notes and reviewer prompts;
 processes escaping owned groups are outside containment and are not killed by port.

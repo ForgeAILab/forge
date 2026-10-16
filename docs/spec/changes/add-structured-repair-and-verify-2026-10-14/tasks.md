@@ -102,8 +102,8 @@ Prerequisites accepted for this phase:
 - [x] A2 Remove `start.pgid` after the receipt confirms tree settlement.
 - [x] A3 Keep public `FORGE_VERIFY_*` values readable while redacting Project values.
 - [x] A4 Charge `review_verify_rerun` through the ledger with Task/Project overrides.
-- [ ] A5 Cap evidence at 64 MiB per evaluation and app.log at 16 MiB while draining excess.
-  - Evidence cap implemented and regression passes. **NOT MET:** on-disk app.log cap; two writer approaches buffered short startup logs and failed existing readiness/tail tests. Original streaming writer restored. The named cap regression is ignored with this reason; its explicit run demonstrates the remaining gap.
+- [x] A5 Cap evidence at 64 MiB per evaluation and app.log at 16 MiB while draining excess.
+  - The app appends to `app.log` directly; the owner cuts it back to 16 MiB every 200 ms during the run and once after settlement (bounded slack: one interval of app output).
 - [x] A6 Emit only `V-ready` when the app exits during readiness.
 - [x] A7 Warn in verify details and reviewer prompts when the port remains occupied; document containment limits.
 

@@ -856,7 +856,6 @@ PY"#},
 }
 
 #[tokio::test]
-#[ignore = "NOT MET: two capped writers buffered short startup logs; streaming app.log cap remains open"]
 async fn review_verify_app_log_stops_at_16_mib_and_keeps_readable_tail() {
     let f = fixture(&[], json!({"start":r#"python3 -u - <<'PY'
 import os,sys,time
@@ -865,7 +864,9 @@ sys.stdout.write('x'*(16*1024*1024-len(marker))+marker+'discarded-after-cap\n'*1
 sys.stdout.flush()
 open(os.environ['FORGE_VERIFY_DIR']+'/emitted','w').close()
 time.sleep(300)
-PY"#, "ready_command":r#"test -f "$FORGE_VERIFY_DIR/emitted""#, "ready_timeout_seconds":10, "checks":[{"name":"smoke","command":"true"}]})).await;
+PY"#, "ready_command":r#"test -f "$FORGE_VERIFY_DIR/emitted""#, "ready_timeout_seconds":10,
+        // The app is still running: the cap holds during the run, not only after it.
+        "checks":[{"name":"smoke","command":r#"for _ in $(seq 50); do [ "$(wc -c < "$FORGE_VERIFY_DIR/app.log")" -le 16777216 ] && exit 0; sleep 0.1; done; exit 1"#}]})).await;
     let (_, review, details) = enter(&f).await;
     assert_eq!(details["verify"]["status"], "pass", "{details}");
     let path = std::path::PathBuf::from(f.workspace.embedded_worktree_path_for_backend());
@@ -877,6 +878,14 @@ PY"#, "ready_command":r#"test -f "$FORGE_VERIFY_DIR/emitted""#, "ready_timeout_s
     let tail = details["verify"]["app_log_tail"].as_str().unwrap();
     assert!(tail.ends_with("cap-tail-readable\n"), "{tail}");
     assert!(!tail.contains("discarded-after-cap"));
+    assert!(
+        details["verify"]["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("16 MiB cap")),
+        "{details}"
+    );
     assert_stopped(&f).await;
 }
 

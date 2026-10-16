@@ -289,6 +289,13 @@ async fn read_results(
         details.notes.push(format!("app.log: {error}"));
         String::new()
     });
+    if std::fs::symlink_metadata(directory.join("app.log"))
+        .is_ok_and(|m| m.is_file() && m.len() >= review::verify::APP_LOG_CAP)
+    {
+        details.notes.push(
+            "app.log reached its 16 MiB cap; later app output was discarded, so the tail shows output from before the cap".into(),
+        );
+    }
     if let Some(port) = read_file(directory, "port", 8)?
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| text.trim().parse().ok())

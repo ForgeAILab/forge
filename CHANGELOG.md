@@ -3135,8 +3135,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and Task remaining/limit projections for extra repair rounds on progress.
 - Additive `superseded` finding status for step-level CI findings replaced by
   per-test findings, exposed in the findings API and web ledger.
-- Verify limits captured evidence to 64 MiB per evaluation across all checks.
-  Completed group
+- Verify limits captured evidence to 64 MiB per evaluation across all checks,
+  and `app.log` to its first 16 MiB on disk (the app appends directly; the
+  owner cuts the file back during and after the run). Completed group
   cleanup removes `start.pgid`. Public verify ports, URLs and paths stay readable
   while Project secrets remain redacted. An app exit during readiness creates
   only `V-ready`; a port still in use after cleanup produces a non-blocking

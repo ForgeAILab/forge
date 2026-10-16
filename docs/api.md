@@ -6401,8 +6401,13 @@ with `FORGE_VERIFY_PORT`, `FORGE_VERIFY_URL` (`http://127.0.0.1:<port>`),
 (`<dir>/<check name>.report.json`, set per check). `request.json` contains
 `task_id`, `title`, `description`, requirement texts, `base_sha`, `commit_sha`,
 `changed_files`, and the ledger's open `findings`. The optional start command
-runs in the background with output in `app.log`. Its stored Review tail is
-bounded, but the file currently has no on-disk byte cap. Directories are keyed by Review id even when coordination children share a Task
+runs in the background with output appended to `app.log` as it is written.
+The file keeps the first 16 MiB of output: while the run lasts Forge cuts it
+back to 16 MiB every 200 ms (so it exceeds the cap by at most what the app
+writes in that interval), and once more after the run, so the recorded file
+is never above 16 MiB. Later output is discarded, the stored tail is the end
+of what was kept, and `details.verify.notes` says the cap was reached.
+Directories are keyed by Review id even when coordination children share a Task
 root. Forge polls the readiness
 path until an HTTP status below 500, or repeats the readiness command until
 exit 0. Then checks run in order. Every process group started by the run is
