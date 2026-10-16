@@ -558,6 +558,18 @@ pub async fn repository_inputs(disabled: bool) {
             assert_ne!(response.1["code"], "server_location_refused");
         }
     }
+    let task = send(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{second}/tasks"),
+        json!({"title":"merge target","merge_config":{"target_branch":"--merge-target"}}),
+    )
+    .await;
+    if disabled {
+        assert_refused(&task, "server_location_refused", "merge target branch");
+    } else {
+        assert_eq!(task.0, StatusCode::OK, "{}", task.1);
+    }
     let update = send(
         &harness.app,
         Method::PATCH,

@@ -549,7 +549,7 @@ impl TaskService {
             board_position: 0.0,
             subtask_order: None,
             task_state_config: task_state_config.clone(),
-            merge_config: super::validation::serialize_config(payload.merge_config.clone())?,
+            merge_config: super::validation::serialize_merge_config(payload.merge_config.clone())?,
             metadata_json: metadata_json.clone(),
             plan: None,
             error_annotation: None,
