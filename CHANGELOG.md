@@ -1746,7 +1746,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   check tails are cut, finding text is clipped and, past a line budget, the
   remaining open findings are listed by id.
 - Merge-time check failures give the coder the target branch, failing command
-  and output in a `MERGE-CI` finding. Committed conflict handoffs use
+  and the end of its combined output (where the failure is printed, not the
+  oldest lines of the stderr tail) in a `MERGE-CI` finding. Committed conflict handoffs use
   `MERGE-CONFLICT`; both stay out of the review ledger.
 - Review CI findings use stable per-test signature ids (`CI-<step>#<hash>`),
   with step-level ids when signatures are unavailable. Review checklists show
