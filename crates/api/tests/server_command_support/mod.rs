@@ -667,6 +667,8 @@ pub async fn integrations(disabled: bool) {
     }
 }
 
+/// Used by the demo binary only (the entrypoint's calls as other accounts).
+#[allow(dead_code)]
 pub async fn send_with_bearer(
     app: &axum::Router,
     method: Method,
