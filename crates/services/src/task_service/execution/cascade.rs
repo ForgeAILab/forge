@@ -2494,6 +2494,23 @@ impl TaskService {
             .await
     }
 
+    pub(crate) async fn publish_review_no_change_comment(&self, review: &Review) -> Result<()> {
+        let kind = db::budget::Kind::RepairNoChange;
+        let spent = db::budget::spent(self.db.pool(), &review.task_id, kind.key()).await?;
+        let limit = i64::from(kind.default_limit());
+        self.create_review_comment(
+            review,
+            kind.key(),
+            None,
+            format!(
+                "No change since review {}: HEAD still matches the failed candidate and the worktree is clean. Sent back to the coder (repair_no_change budget {spent} of {limit} spent; {} remaining). See the Review tab.",
+                review.attempt_number,
+                (limit - spent).max(0),
+            ),
+        )
+        .await
+    }
+
     async fn publish_review_progress_comment(
         &self,
         review: &Review,

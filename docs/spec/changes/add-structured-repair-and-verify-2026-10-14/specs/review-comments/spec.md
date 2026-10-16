@@ -52,6 +52,12 @@ parked it.
 Both comments SHALL be idempotent per Review, so a replayed step does not
 post them twice.
 
+The no-change gate SHALL also post these Forge comments without creating a new
+Review: a send-back comment states that HEAD still matches the failed candidate
+and names the `repair_no_change` budget spent and remaining; a park comment
+names the open findings, the no-change rule, and owner actions. These are
+idempotent per failed Review and comment kind.
+
 #### Scenario: Progress round comment
 - **WHEN** Forge grants a progress round after review 2
 - **THEN** one comment reads like `Repair round 2 (progress round 1 of 2): F1, F4 open; F2, CI-1 resolved since round 1.`

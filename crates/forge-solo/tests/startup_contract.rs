@@ -36,6 +36,42 @@ async fn noninteractive_preflight_has_no_startup_side_effects() {
     assert!(!state.exists(), "preflight must precede data-root mutation");
 }
 
+#[tokio::test]
+async fn solo_data_dir_config_is_validated_before_repository_mutation() {
+    let workspace = TempDir::new().unwrap();
+    let checkout = workspace.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let output = std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let state = workspace.path().join("solo-state");
+    std::fs::create_dir(&state).unwrap();
+    let config_path = state.join("forge.yaml");
+    std::fs::write(&config_path, "invalid: [yaml").unwrap();
+    let result = SoloStartup::initialize_with_preflight(
+        Cli {
+            path: checkout.clone(),
+            data_dir: Some(state.clone()),
+            agent: Some(AgentExecutor::Codex),
+        },
+        TerminalPreflight {
+            stdin_is_terminal: true,
+            stdout_is_terminal: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(StartupError::Config(config::ConfigError::Parse { path, .. }))
+            if path == config_path
+    ));
+    assert!(!checkout.join(".git/forge-solo-id").exists());
+    assert!(!state.join("forge.db").exists());
+}
+
 #[test]
 fn default_root_is_exactly_repo_scoped_and_outside_checkout() {
     let workspace = TempDir::new().expect("temporary workspace");

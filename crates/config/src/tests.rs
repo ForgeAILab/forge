@@ -54,6 +54,104 @@ fn defaults_are_usable_without_a_config_file() {
 }
 
 #[test]
+fn config_lookup_cli_data_dir_does_not_read_default_config() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let directory = tempdir().unwrap();
+    let home = directory.path().join("home");
+    fs::create_dir_all(home.join(".forge")).unwrap();
+    fs::write(home.join(".forge/forge.yaml"), "invalid: [yaml").unwrap();
+    let previous_home = env::var_os("HOME");
+    env::set_var("HOME", &home);
+    let data_dir = directory.path().join("isolated");
+    let loaded = std::panic::catch_unwind(|| ForgeConfig::load(None, test_overrides(&data_dir)));
+    match previous_home {
+        Some(value) => env::set_var("HOME", value),
+        None => env::remove_var("HOME"),
+    }
+    let config = loaded.unwrap().unwrap();
+    assert_eq!(config.forge.data_dir, data_dir);
+    assert_eq!(config.workspace.root, data_dir.join("worktrees"));
+    assert_eq!(config.server.bind, DEFAULT_SERVER_BIND);
+    assert!(config.providers.entries.is_empty());
+    assert!(config.commands.allow.is_empty());
+}
+
+#[test]
+fn config_lookup_cli_data_dir_reads_its_config_before_env_data_dir() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let directory = tempdir().unwrap();
+    let cli_dir = directory.path().join("cli");
+    let env_dir = directory.path().join("env");
+    fs::create_dir_all(&cli_dir).unwrap();
+    fs::create_dir_all(&env_dir).unwrap();
+    fs::write(env_dir.join("forge.yaml"), "invalid: [yaml").unwrap();
+    fs::write(
+        cli_dir.join("forge.yaml"),
+        "server:\n  bind: 127.0.0.1:9101\ncommands:\n  allow: [isolated-tool]\nproviders:\n  isolated:\n    kind: openai\n    api_key_env: ISOLATED_KEY\n",
+    )
+    .unwrap();
+    env::set_var("FORGE_DATA_DIR", &env_dir);
+    let loaded = std::panic::catch_unwind(|| ForgeConfig::load(None, test_overrides(&cli_dir)));
+    clear_forge_env();
+    let config = loaded.unwrap().unwrap();
+    assert_eq!(config.forge.data_dir, cli_dir);
+    assert_eq!(config.workspace.root, cli_dir.join("worktrees"));
+    assert_eq!(config.server.bind, "127.0.0.1:9101");
+    assert_eq!(config.commands.allow, ["isolated-tool"]);
+    assert!(config.providers.entries.contains_key("isolated"));
+}
+
+#[test]
+fn config_lookup_env_data_dir_reads_its_config() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let directory = tempdir().unwrap();
+    fs::write(
+        directory.path().join("forge.yaml"),
+        "server:\n  bind: 127.0.0.1:9102\n",
+    )
+    .unwrap();
+    env::set_var("FORGE_DATA_DIR", directory.path());
+    let loaded = std::panic::catch_unwind(|| ForgeConfig::load(None, ConfigOverrides::default()));
+    clear_forge_env();
+    let config = loaded.unwrap().unwrap();
+    assert_eq!(config.forge.data_dir, directory.path());
+    assert_eq!(config.server.bind, "127.0.0.1:9102");
+}
+
+#[test]
+fn config_lookup_explicit_path_wins_and_file_data_dir_does_not_relocate_config() {
+    let _guard = env_lock().lock().unwrap();
+    clear_forge_env();
+    let directory = tempdir().unwrap();
+    let config_path = directory.path().join("explicit.yaml");
+    let file_dir = directory.path().join("file");
+    fs::create_dir_all(&file_dir).unwrap();
+    fs::write(file_dir.join("forge.yaml"), "invalid: [yaml").unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "forge:\n  data_dir: {}\nserver:\n  bind: 127.0.0.1:9103\n",
+            file_dir.display()
+        ),
+    )
+    .unwrap();
+    let config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default()).unwrap();
+    assert_eq!(config.forge.data_dir, file_dir);
+    assert_eq!(config.workspace.root, file_dir.join("worktrees"));
+    assert_eq!(config.server.bind, "127.0.0.1:9103");
+
+    let cli_dir = directory.path().join("cli");
+    fs::create_dir_all(&cli_dir).unwrap();
+    fs::write(cli_dir.join("forge.yaml"), "invalid: [yaml").unwrap();
+    let config = ForgeConfig::load(Some(&config_path), test_overrides(&cli_dir)).unwrap();
+    assert_eq!(config.forge.data_dir, cli_dir);
+    assert_eq!(config.server.bind, "127.0.0.1:9103");
+}
+
+#[test]
 fn terminal_config_default_values_match_spec() {
     let terminal = TerminalConfig::default();
 

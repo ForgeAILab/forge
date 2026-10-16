@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-16T12:44:01Z
+updated_at: 2026-10-16T23:31:14Z
 ---
 
 ## Why
@@ -79,8 +79,9 @@ or a merge-queue head check fails:
 - Flaky and pre-existing failures go to new Project attention items
   `flaky_check` and `base_check_failing`. They do not block the Task when the
   Project's `review_ci_triage` is `full` (the default).
-- Without signatures, a step that also fails on the base still blocks as
-  today, but the brief and the attention item say so.
+- A signatureless candidate failure is introduced when the red base has test
+  signatures; only a red base without comparable signatures can support
+  `pre_existing_unverified`. Both classes still block.
 
 **3. No-change gate.**
 - A Task that comes back to review with a clean tree and the exact commit its
@@ -90,6 +91,8 @@ or a merge-queue head check fails:
 - The second time, it parks with `review_needs_owner` (`no change after
   repair round`).
 - No review budget is spent.
+- Forge comments explain both the unchanged-HEAD send-back and its budget,
+  and the park's open findings and owner actions.
 - Entries already in progress before the guard shipped resume from their
   checkpoints without evaluating it. Automatic reconnect retries retain the original entry
   source and actor; explicit owner Retry is owner-initiated and exempt; a reminder clears the resolved infrastructure blocker.

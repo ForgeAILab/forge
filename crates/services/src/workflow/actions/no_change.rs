@@ -98,6 +98,9 @@ async fn unchanged_attempt(
 
 pub(crate) async fn park_no_change(ctx: &HookContext, task: &db::Task) -> crate::Result<()> {
     let message = "no change after repair round";
+    let (review, _) = db::budget::failed_review_for_no_change(&ctx.db, &task.id)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
     let kind = api_types::FailureKind::ReviewNeedsOwner;
     let annotation = json!({
         "type": kind, "blocking_reason": kind, "message": message,
@@ -105,5 +108,7 @@ pub(crate) async fn park_no_change(ctx: &HookContext, task: &db::Task) -> crate:
     });
     block_task_with_annotation(ctx, task, message, kind, None, Some(annotation.to_string()))
         .await?;
-    Ok(())
+    ctx.task_service
+        .publish_review_park_comment(&review, message)
+        .await
 }

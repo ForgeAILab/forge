@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-16T20:37:44Z
-completed_at:
+updated_at: 2026-10-16T23:31:14Z
+completed_at: 2026-10-16T23:31:14Z
 ---
 
 Each phase lands as its own commit on the implementation branch with its
@@ -113,7 +113,8 @@ Prerequisites accepted for this phase:
   - `### Added`: findings, the ledger route and CLI, verify, the progress budget.
   - `### Changed`: review comments drop the full report; extra repair rounds on progress; the merge-time check failure brief.
 - [x] 6.3 `crates/api/tests/suite/happy_path.rs`: a named case where the review fails with findings, the coder repairs, the re-review resolves them, and the Task passes and merges. Extend `forge_happy_path_end_to_end` only if a separate case cannot reach that path.
-- [ ] 6.4 Live check on a `./test` data dir with a small web Project:
+- [x] 6.4 Live check on a `./test` data dir with a small web Project:
   - verify catches a broken button and the coder fixes it;
   - a two-round repair shows the ledger in comments;
   - a repeated finding parks with the right message.
+  - 2026-10-16: live check passed; fixed data-dir config isolation, candidate CI misclassification, and missing no-change send-back/park comments.

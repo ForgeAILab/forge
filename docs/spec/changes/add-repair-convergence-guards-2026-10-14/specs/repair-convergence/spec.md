@@ -3,14 +3,16 @@
 ### Requirement: An unchanged candidate is not reviewed again
 Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round ends with a commit (and clean worktree) equal to the one the latest settled Review in the window judged, only when that latest settled Review failed. In that case it creates no Review row.
 
-- **First time:** Forge sends the Task back to the coder with a brief headed "No change since review N". This is charged to the persistent `repair_no_change` budget (Review window, limit 1).
-- **Second time:** the Task parks with `review_needs_owner` and the message `no change after repair round`.
+- **First time:** Forge sends the Task back to the coder with a brief headed "No change since review N". This is charged to the persistent `repair_no_change` budget (Review window, limit 1). A Forge comment SHALL state that HEAD still matches the failed candidate and name the budget spent and remaining.
+- **Second time:** the Task parks with `review_needs_owner` and the message `no change after repair round`. A Forge comment SHALL name the open findings and owner actions: re-run review, mark reviewed with a reason, or cancel the Task.
+
+Both comments SHALL be idempotent per failed Review and comment kind.
 
 Neither case charges the review budget. A re-review the owner starts, and an explicit owner Retry of a blocked review entry, are exempt. Cancelled, running and awaiting-human Reviews do not replace the latest settled (passed/failed) Review.
 
 #### Scenario: Coder changes nothing
 - **WHEN** after failed review 2 at commit `c2`, the coder's repair round ends with HEAD still `c2`
-- **THEN** no CI or reviewer runs, the coder is sent back once with "No change since review 2", and the review budget is unchanged
+- **THEN** no CI or reviewer runs, the coder is sent back once with "No change since review 2", the review budget is unchanged, and one Forge comment states the unchanged HEAD and `repair_no_change` budget
 
 #### Scenario: Cancelled Review after a failure
 - **WHEN** a failed Review is followed by a cancelled Review of the same commit
@@ -34,7 +36,7 @@ Neither case charges the review budget. A re-review the owner starts, and an exp
 
 #### Scenario: Still nothing
 - **WHEN** the next repair round also ends at `c2`
-- **THEN** the Task parks with `review_needs_owner` and the message `no change after repair round`
+- **THEN** the Task parks with `review_needs_owner` and the message `no change after repair round`, and one Forge comment lists the open findings and owner actions
 
 ### Requirement: The repair brief carries attempt memory
 The repair brief SHALL replace its "Previous round" section with an "Attempts" section. For each of the last three repair rounds in the window it SHALL list:

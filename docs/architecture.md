@@ -169,6 +169,11 @@ commitment, and Attention-facing services; it does not own a second copy of
 the background worker lifecycle. `AppState` is `Clone` (shared fields are
 `Arc`) and used as Axum state.
 
+Server and Solo config lookup uses the launch data directory (`--data-dir` >
+`FORGE_DATA_DIR` > `~/.forge`) plus `forge.yaml`. They retain that exact path
+for runtime settings reads and writes. A file's `forge.data_dir` can change
+the runtime data root, but cannot redirect config lookup.
+
 ### Shared runtime composition and Forge Solo
 
 `services_agents::ForgeRuntimeBuilder` is the composition boundary shared by the
@@ -287,6 +292,8 @@ checks, so equivalent platform ACLs are required. An explicit data directory
 is used exactly as given only after its recorded repository binding matches the
 marker. Malformed, replaced, symlinked, or insecure markers and mismatched data
 roots fail closed before Project data is exposed or changed.
+An unbound root containing only a regular `forge.yaml` is admitted as a new
+Solo store; any existing runtime files still require the matching binding.
 
 Bootstrap is an idempotent typed service operation, not a TUI database path.
 It creates or resumes one isolated local owner, owner membership, Project,
@@ -9939,7 +9946,11 @@ unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate
 reject target with a brief headed "No change since review N". A second parks
 `review_needs_owner` with `no change after repair round`. Neither creates a
 Review, starts checks or a reviewer, nor charges Review or gate-rejection
-budgets. Dirty worktrees and changed commits continue through ordinary review,
+budgets. Both post idempotent Forge comments tied to the failed Review: the
+send-back states that HEAD still matches the failed candidate and names the
+`repair_no_change` budget spent and remaining; the park names the open findings
+and the owner's re-run review, mark reviewed with a reason, and cancel actions.
+Dirty worktrees and changed commits continue through ordinary review,
 as does an entry whose workspace owner cannot describe the checkout (an away
 daemon): that entry meets the outage with the usual typed review-entry wait.
 An entry retry carries the original source state and actor in its hooks payload,
@@ -10229,8 +10240,12 @@ incomplete base CI, mismatched owner input receipts, or missing base signatures
 for a signature-bearing red candidate yield `base_run_invalid`; consistent
 failures remain unclassified and still block. A base step passing
 makes consistent candidate signatures `introduced`; matching red-base signatures
-are `pre_existing`. Signatureless failures on both sides are
-`pre_existing_unverified` and still block.
+are `pre_existing`. A signatureless candidate failure against a red base with
+test signatures is `introduced` and blocks: the base reached test failures
+while the candidate failed without comparable signatures. Candidate failures
+with no signatures in common with a signature-bearing base are also introduced.
+Only a red base without comparable signatures supports
+`pre_existing_unverified`, which still blocks.
 
 Review details keep `ci_steps[].triage`, original nonzero exits and rerun/base run
 references. Under `full`, only blocking steps route to repair; verify and reviewer

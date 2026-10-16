@@ -44,7 +44,7 @@ struct Cli {
     no_mcp: bool,
     #[arg(long = "no-embedded-daemon")]
     no_embedded_daemon: bool,
-    /// Override the data directory (database, credentials, workflows).
+    /// Override the data directory (forge.yaml, database, credentials, workflows).
     /// Defaults to ~/.forge. Use --data-dir ./test for local testing.
     #[arg(long)]
     data_dir: Option<PathBuf>,
@@ -95,8 +95,9 @@ fn main() {
 
 async fn run() {
     let cli = Cli::parse();
+    let config_path = config::default_config_path(cli.data_dir.as_deref());
     let config = ForgeConfig::load(
-        None,
+        Some(&config_path),
         ConfigOverrides {
             server_max_concurrent_runs: cli.max_concurrent_runs,
             server_build_jobs_per_run: cli.build_jobs_per_run,
@@ -256,14 +257,18 @@ async fn run() {
     let mut runtime_config = effective_config.clone();
     runtime_config.workspace.root = workspace_root.clone();
     let runtime = Arc::new(
-        services_agents::ForgeRuntimeBuilder::new(Arc::clone(&db), Arc::clone(&event_bus))
-            .with_adapter_registry(Arc::clone(&adapter_registry))
-            .with_config(runtime_config)
-            .with_workspace_root(workspace_root.clone())
-            .with_workflows_dir(config.workflows_dir())
-            .with_jwt_secret(jwt_secret)
-            .with_bcrypt_cost(effective_config.server.bcrypt_cost)
-            .build(),
+        services_agents::ForgeRuntimeBuilder::from_config(
+            Arc::clone(&db),
+            Arc::clone(&event_bus),
+            runtime_config,
+        )
+        .with_adapter_registry(Arc::clone(&adapter_registry))
+        .with_config_path(config_path)
+        .with_workspace_root(workspace_root.clone())
+        .with_workflows_dir(config.workflows_dir())
+        .with_jwt_secret(jwt_secret)
+        .with_bcrypt_cost(effective_config.server.bcrypt_cost)
+        .build(),
     );
     // Only a running server adopts its workspace root, and only an adopted
     // root is ever garbage-collected: nothing built for a test does this.

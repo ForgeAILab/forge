@@ -1,6 +1,6 @@
 .PHONY: dev dev-demo dev-no-daemon frontend types test build install-local install-ctl ci ci-rust ci-web clean-test
 
-# Start the server using ./test as the data directory (safe for manual/agent testing)
+# Start the server with ./test data and ./test/forge.yaml config (manual/agent testing)
 dev:
 	cargo run -p forge-cli -- --data-dir ./test
 

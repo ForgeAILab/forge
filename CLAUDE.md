@@ -66,7 +66,7 @@ The happy-path test (`crates/api/tests/suite/happy_path.rs`) is the canonical en
 
 ### Running the server
 
-Use the Makefile targets for local dev and manual/agent testing — they all point data at `./test/` (gitignored) instead of `~/.forge/`, so test state never pollutes real user data:
+Use the Makefile targets for local dev and manual/agent testing — they all point data at `./test/` (gitignored) and load `./test/forge.yaml`, so test state and config are isolated from the default install:
 
 ```bash
 make dev               # start server → ./test data dir (default for testing)
@@ -129,7 +129,7 @@ forge-solo owns its Solo bootstrap and session services
 - **Review** — workflow entry hooks run configured checks on the durable check runner and dispatch ordinary reviewers; an explicit review re-run re-enters that same entry (`TaskService::rerun_review`). There is no separate review runner.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
 - **Workspace** — no lock files: keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes. The `workspace` crate owns Task-root reclamation (permission repair, exact worktree removal, delivered-branch deletion) for the server and the daemon.
-- **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
+- **Config precedence** — CLI flags > env vars > config file > defaults. Config lookup uses `<data dir>/forge.yaml`, with the directory chosen by CLI `--data-dir` > `FORGE_DATA_DIR` > `~/.forge`; a file's `forge.data_dir` does not relocate that lookup. Default bind `127.0.0.1:8080`.
 
 ## Database
 

@@ -623,6 +623,13 @@ impl WorkflowExecution<'_> {
                         .and_then(|gate| gate.reject_target.clone())
                         .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
                     if WorkflowEngine::find_state(workflow, &target).is_some() {
+                        let (review, _) =
+                            db::budget::failed_review_for_no_change(&self.db, &task.id)
+                                .await?
+                                .ok_or(db::DbError::NotFound)?;
+                        self.task_service
+                            .publish_review_no_change_comment(&review)
+                            .await?;
                         let reason = format!("No change since review {attempt}\nHEAD still matches the failed candidate and the worktree is clean. Address the review feedback, run the required checks, and commit the repair before resubmitting.");
                         cascade = Some((
                             target,

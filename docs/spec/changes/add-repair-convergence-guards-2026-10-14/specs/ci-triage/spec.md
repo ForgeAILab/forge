@@ -56,7 +56,20 @@ Consistent signatures:
 - that also fail on a valid base run SHALL be `pre_existing`;
 - that do not SHALL be `introduced`.
 
-A failing step without signatures that also fails on a valid base run SHALL be `pre_existing_unverified`. It keeps blocking, and the brief names the base failure.
+A failing step without signatures SHALL be `introduced` and blocking when the
+valid red base has test signatures. Its reason SHALL state that the candidate
+failed without signatures while the base failed with signatures. Candidate
+failures with no signatures in common with a signature-bearing base SHALL
+also be introduced. `pre_existing_unverified` SHALL be reserved for a red base
+without comparable signatures; it keeps blocking and the brief names the base failure.
+
+#### Scenario: Candidate breaks the build on a red base
+- **WHEN** the candidate and rerun fail to compile with no test signatures, while the valid base fails `TestSumCSVLegacy` and `TestClockSkew`
+- **THEN** the candidate failure is `introduced` and blocking, with a reason distinguishing the signatureless candidate failure from the signature-bearing base failure
+
+#### Scenario: Neither side reports test signatures
+- **WHEN** the candidate, rerun and valid base fail without test signatures
+- **THEN** the candidate failure remains `pre_existing_unverified` and blocking
 
 #### Scenario: Red base
 - **WHEN** 26 tests fail consistently on the candidate and 26 of the same signatures fail on the base

@@ -1,7 +1,7 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-16T20:13:57Z
-completed_at:
+updated_at: 2026-10-16T23:31:14Z
+completed_at: 2026-10-16T23:31:14Z
 ---
 
 ## Ordering
@@ -90,10 +90,11 @@ completed_at:
   - `### Changed`: pre-existing and flaky failures no longer block under the default `review_ci_triage: full`; opt out with `off`.
   - `### Added`: everything else.
 - [x] 6.3 A named `crates/api/tests/suite/happy_path.rs` case: on a base with one failing test, a Task's review passes CI triage, the reviewer passes it, and the Task merges.
-- [ ] 6.4 Live check on a `./test` Project seeded with one flaky test and one base-failing test:
+- [x] 6.4 Live check on a `./test` Project seeded with one flaky test and one base-failing test:
   - the Task is not sent to the coder for either;
   - both attention items appear;
   - an unchanged repair round is caught.
+  - 2026-10-16: live check passed; fixed data-dir config isolation, candidate CI misclassification, and missing no-change send-back/park comments.
 
 ## 7. Review follow-ups for phases 1 and 3
 - [x] 7.1 Select the latest Review before checking its verdict; a later pass suppresses an old failure.
@@ -127,3 +128,8 @@ completed_at:
 - [x] 10.3 Preserve an unset Project `review_progress` setting on unrelated web saves, and allow clearing an override.
 - [x] 10.4 Share review-window SQL, remove the dead superseded check, and resolve signatures after a passing conformance `ci:N` flaky rerun.
 - [x] 10.5 Share workflow planning-role resolution between coordination routing and transactional review charging.
+
+## 11. Live-check findings (2026-10-16)
+- [x] 11.1 Isolate config lookup by CLI/environment data directory, including a fresh Solo root containing only `forge.yaml`, with regression coverage and a breaking-change note.
+- [x] 11.2 Classify a signatureless candidate failure against a signature-bearing red base as introduced and blocking; retain unverified classification only for a signatureless red base.
+- [x] 11.3 Post idempotent Forge comments for no-change send-back and park, naming the budget or open findings and owner actions.

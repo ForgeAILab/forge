@@ -81,11 +81,15 @@ JSONL logs, media, generated worktrees, and `runtime.lock`; nothing except the
 small marker is written into the tracked checkout. A malformed marker, a
 repository/data-root mismatch, or an active lock fails closed. Solo starts
 ordinary crash recovery before enabling the composer.
+An unbound root may contain only a regular `forge.yaml` before its first launch;
+existing runtime state still requires a matching repository binding.
 
 ### Model providers in the config file
 
 Solo can run without any local CLI harness login by reading provider
-declarations from the user-owned Forge config file (`~/.forge/forge.yaml`).
+declarations from the user-owned Forge config file. An explicit `--data-dir X`
+reads `X/forge.yaml`; otherwise `FORGE_DATA_DIR` or the default `~/.forge`
+selects the config directory. A missing file uses defaults without a fallback.
 Each provider sets a supported `kind` (`openai`, `openai_compatible`,
 `openrouter`, `xai`, or `gemini`), exactly one of `api_key` / `api_key_env`,
 an optional `base_url` (required for `openai_compatible`), and a list of
@@ -95,6 +99,14 @@ offers them in the Agent picker alongside CLI harnesses. A provider that
 cannot be connected is skipped with a log line; it never blocks startup. See
 [getting-started.md](getting-started.md#config-declared-model-providers) for
 the full schema and an example.
+
+The server uses the same lookup: `forge --data-dir X` reads `X/forge.yaml`.
+Move any configuration previously kept in `~/.forge/forge.yaml` to that file.
+The file's `forge.data_dir` can set the runtime data directory when no flag or
+environment override exists, but never changes where configuration is read.
+`forge-ctl` reads server/login state rather than `ForgeConfig`; its
+`FORGE_DATA_DIR` selection is unchanged. Standalone daemons read their own
+`daemon.yaml` beside their credentials.
 
 ### Solo key bindings
 

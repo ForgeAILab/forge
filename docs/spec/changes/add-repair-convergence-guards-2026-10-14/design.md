@@ -133,7 +133,11 @@ Non-Goals:
    `pre_existing`. The rest are `introduced`.
 7. **Without signatures:**
    - a step that passes on the re-run is flaky;
-   - a step that fails on both the candidate and the base is
+   - a signatureless candidate failure against a red base with signatures is
+     `introduced` and blocking, with a reason distinguishing the two failures;
+   - failures with no signatures in common with a signature-bearing base are
+     also `introduced`;
+   - a step that fails on both the candidate and a signatureless base is
      `pre_existing_unverified`. It still blocks, because new failures may hide
      inside it, but the brief and attention say the base fails too.
 8. **At the merge-queue head**, the same triage runs against the target tip,
@@ -176,6 +180,10 @@ Non-Goals:
   `RepairNoChange` budget (Review window, limit 1).
 - **Second time:** it parks with `review_needs_owner` and the message
   `no change after repair round`.
+- Each outcome posts a Forge comment, idempotent per failed Review and kind.
+  The send-back states the unchanged HEAD and `repair_no_change` budget spent
+  and remaining; the park lists open findings and owner actions, using the
+  repeated-finding park comment.
 - A later passing Review of the same commit means no reminder is due.
 - Owner-initiated re-reviews and explicit owner Retry of a blocked entry are exempt. Only passed/failed Reviews participate in the latest settled Review comparison.
 - Entries already past the guard when it ships continue: entry checkpoints

@@ -31,6 +31,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- `forge --data-dir X` and `forge-solo --data-dir X` now read configuration
+  from `X/forge.yaml`, without falling back to `~/.forge/forge.yaml`.
+  `FORGE_DATA_DIR` likewise selects the config directory when no flag is set.
+  Users who kept their configuration in `~/.forge/forge.yaml` while running
+  with `--data-dir X` must move it to `X/forge.yaml`.
 - Later reviews anchor new blocking findings to frozen requirements, regressions,
   or candidate-diff files. Other new findings become minor; out-of-scope findings
   never block. Structured failed reviews with no blocking findings park for the
@@ -3511,6 +3516,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - The Docker image runs Forge under Tini so orphaned verification and CI
   descendants are reaped and process groups can finish stopping.
 
+- CI triage classifies a candidate build failure without test signatures as
+  introduced when the red base has test signatures, with a reason distinguishing
+  the failures. No-change repair send-backs and parks now post idempotent Forge
+  comments explaining the budget or open findings and owner actions.
 - Review streaks count only blocking appearances. Progress-round entry failures
   use infrastructure retries, and custom workflow planning roles agree between
   review routing and charging. A passing conformance CI rerun resolves prior test

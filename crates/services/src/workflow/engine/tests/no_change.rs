@@ -112,6 +112,109 @@ async fn no_change_twice_parks_without_another_review_or_check() {
     assert_eq!(blocked["reason"], "no change after repair round");
 }
 
+async fn forge_comments(f: &FailedCiFixture) -> Vec<db::TaskComment> {
+    db::TaskCommentRepo::list_comments(
+        &*f.db,
+        &f.task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Asc,
+            include_total: false,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+    .into_iter()
+    .filter(|comment| comment.author_name == "Forge")
+    .collect()
+}
+
+#[tokio::test]
+async fn no_change_send_back_posts_forge_comment_with_head_and_budget() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "in_progress");
+    let comments = forge_comments(&f).await;
+    let reminders: Vec<_> = comments
+        .iter()
+        .filter(|comment| comment.content.starts_with("No change since review 1"))
+        .collect();
+    assert_eq!(reminders.len(), 1, "{comments:?}");
+    let reminder = reminders[0];
+    assert_eq!(reminder.author_type, db::CommentAuthorType::System);
+    assert!(reminder
+        .content
+        .contains("HEAD still matches the failed candidate"));
+    assert!(reminder
+        .content
+        .contains("repair_no_change budget 1 of 1 spent; 0 remaining"));
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+    let review = reviews(&f).await.remove(0);
+    for _ in 0..2 {
+        f.engine
+            .publish_review_no_change_comment(&review)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        forge_comments(&f)
+            .await
+            .iter()
+            .filter(|comment| comment.content.starts_with("No change since review 1"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn no_change_park_posts_forge_comment_with_findings_and_owner_actions() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "review");
+    let comments = forge_comments(&f).await;
+    let parks: Vec<_> = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .content
+                .starts_with("Task parked after review attempt 1")
+        })
+        .collect();
+    assert_eq!(parks.len(), 1, "{comments:?}");
+    let park = parks[0];
+    assert_eq!(park.author_type, db::CommentAuthorType::System);
+    assert!(park.content.contains("no change after repair round"));
+    assert!(park.content.contains("Open findings: CI-0"));
+    assert!(park
+        .content
+        .contains("Owner actions: re-run review, mark reviewed with a reason, or cancel the Task"));
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+    let review = reviews(&f).await.remove(0);
+    for _ in 0..2 {
+        f.engine
+            .publish_review_park_comment(&review, "no change after repair round")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        forge_comments(&f)
+            .await
+            .iter()
+            .filter(|comment| comment
+                .content
+                .starts_with("Task parked after review attempt 1"))
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn no_change_owner_rereview_of_same_commit_runs() {
     let f = red_fixture().await;
