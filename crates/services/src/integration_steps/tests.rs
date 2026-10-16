@@ -5165,3 +5165,36 @@ async fn settle_ci_triage_project_assets_do_not_prevent_shared_red_base() {
     );
     drop(production);
 }
+
+/// A triaged red head names its blocking failures and keeps the end of the
+/// failing output, as an untriaged one does: the head's send-back message is
+/// the only evidence a MERGE-CI brief carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_red_head_message_keeps_the_end_of_the_failing_output() {
+    let world = World::new().await;
+    let a = world.add_task("red-head", "candidate", "one\n").await;
+    review_ci(
+        &world,
+        "red-head",
+        &["for i in $(seq 1 80); do echo \"   Compiling noise-$i v0.1.0\"; done; printf 'test suite::introduced ... FAILED\\n'; echo \"assertion END-OF-OUTPUT-$((40+2))\"; exit 1"],
+    )
+    .await;
+    let production = Production::new(&world);
+    let asked = world.place(&a.id, "checking", 1).await;
+    world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+    eventually("triaged red head is answered", || async {
+        ack(&world.attempt(&a.id).await, IntegrationStepAction::Settle).is_some()
+    })
+    .await;
+    let answer = ack(&world.attempt(&a.id).await, IntegrationStepAction::Settle).unwrap();
+    assert_eq!(
+        answer.outcome,
+        IntegrationStepOutcome::CandidateCheckFailed,
+        "{answer:?}"
+    );
+    let message = answer.message.unwrap();
+    assert!(message.contains("set `setup_steps`"), "{message}");
+    assert!(message.contains("assertion END-OF-OUTPUT-42"), "{message}");
+    assert!(message.len() <= 1000, "{}", message.len());
+    drop(production);
+}

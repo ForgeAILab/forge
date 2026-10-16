@@ -10061,7 +10061,10 @@ An unchanged queue head whose Review passed by triage runs its own CI; the ordin
 certified-pass reuse path cannot consume a triaged failure. Queue settlement
 triages against the target tip before granting a permit or authorizing send-back;
 only a red result whose failing steps triage classified non-blocking becomes a
-permit, so a timed-out or untriaged red result stays a check failure.
+permit, so a timed-out or untriaged red result stays a check failure. A triaged
+send-back message names the failures that block (under `report`, flaky and
+pre-existing signatures too) and keeps the end of the first blocking step's
+output, which is all its `MERGE-CI` brief shows of the failure.
 
 Both subcheck stages retain the original consumer family, status epoch and Review
 or integration authority, with `ci-triage:rerun:` / `ci-triage:base:` authority

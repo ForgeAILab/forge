@@ -222,19 +222,51 @@ pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
 /// end rather than the oldest lines of the tail.
 fn failed_command_message(commands: &[api_types::CheckCommandOutcome]) -> Option<String> {
     let command = commands.iter().find(|command| command.exit_code != 0)?;
-    let output = if command.output_tail.trim().is_empty() {
-        command.stderr_tail.trim()
-    } else {
-        command.output_tail.trim()
-    };
     let head = format!("`{}` exited {}: ", command.command, command.exit_code);
-    let mut start = output
-        .len()
-        .saturating_sub(super::TEXT_LIMIT.saturating_sub(head.len()));
+    let output = output_end(
+        &command.output_tail,
+        &command.stderr_tail,
+        super::TEXT_LIMIT.saturating_sub(head.len()),
+    );
+    Some(format!("{head}{output}"))
+}
+
+/// A triaged red check names only the failures that block, and still keeps
+/// the end of the first blocking step's output: the head's message is the
+/// only failure evidence its MERGE-CI repair brief carries. The summary
+/// takes at most half of the bound.
+fn triaged_failure_message(entries: &[api_types::StepResultEntry], summary: &str) -> String {
+    let Some(step) = entries
+        .iter()
+        .find(|entry| crate::check_runner::ci_triage::blocks(entry))
+    else {
+        return bounded(summary);
+    };
+    let mut end = summary.len().min(super::TEXT_LIMIT / 2);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = format!("{}\n", &summary[..end]);
+    let output = output_end(
+        &step.output_tail,
+        &step.stderr_tail,
+        super::TEXT_LIMIT.saturating_sub(head.len()),
+    );
+    format!("{head}{output}")
+}
+
+/// The end of a step's combined output (stderr only when it is empty).
+fn output_end<'a>(output_tail: &'a str, stderr_tail: &'a str, bytes: usize) -> &'a str {
+    let output = if output_tail.trim().is_empty() {
+        stderr_tail.trim()
+    } else {
+        output_tail.trim()
+    };
+    let mut start = output.len().saturating_sub(bytes);
     while !output.is_char_boundary(start) {
         start += 1;
     }
-    Some(format!("{head}{}", &output[start..]))
+    &output[start..]
 }
 
 /// What `settle` decided before its transaction.
@@ -672,7 +704,10 @@ impl IntegrationSteps {
                             {
                                 CheckInput::Failed(
                                     timing,
-                                    bounded(summary.as_deref().unwrap_or_default()),
+                                    triaged_failure_message(
+                                        triaged_steps.as_deref().unwrap_or_default(),
+                                        summary.as_deref().unwrap_or_default(),
+                                    ),
                                 )
                             }
                             other => other,
