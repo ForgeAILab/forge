@@ -5056,7 +5056,8 @@ The same demo switch refuses two more things, also with HTTP **422**:
   server and accepts only https:// repositories at a public address", followed
   by the reason): repository create/update (`local_path`, a `file://` or other
   non-`https` `remote_url`, a local/private host or one that resolves to a
-  private address, a `default_branch` that is not a valid Git branch name),
+  private address, a `default_branch` that is not a valid Git branch name), a Task
+  `merge_config.target_branch` that is not a valid Git branch name,
   repository sync of a stored local path, registering a server-owned or
   `shared_mount` repository location, Project settings with
   `environment.assets`, `POST`/`PATCH /api/v1/projects/{id}/integration` and
