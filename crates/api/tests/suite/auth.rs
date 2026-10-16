@@ -904,3 +904,71 @@ async fn cookie_session_explicit_credentials_beat_the_cookie() {
         );
     }
 }
+
+#[tokio::test]
+async fn cookie_session_refuses_cross_origin_fetch_metadata_on_every_method() {
+    let workspace = common::TestDir::new("cookie-fetch-site");
+    let harness = common::test_app(workspace.path(), "cookie-fetch-site").await;
+    let app = &harness.app;
+    let auth = register_and_login(app, "cookie-site@example.com", "Password123!").await;
+    let cookie = format!("forge_session={}", auth.access_token);
+
+    // SameSite=Strict still sends the cookie from another port on the same host
+    // or from a sibling subdomain, e.g. as an <img> or no-cors read.
+    for site in ["same-site", "cross-site"] {
+        for path in ["/api/v1/auth/me", "/api/v1/events"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    session_request(Method::GET, path, &cookie)
+                        .header("sec-fetch-site", site)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let error: serde_json::Value = parse_body(response, StatusCode::FORBIDDEN).await;
+            assert_eq!(error["code"], "csrf_rejected", "{site} {path}");
+        }
+    }
+    // The app's own reads, direct navigation and clients without Fetch
+    // Metadata keep working; explicit Bearer requests are unaffected.
+    for site in [Some("same-origin"), Some("none"), None] {
+        let mut request = session_request(Method::GET, "/api/v1/auth/me", &cookie);
+        if let Some(site) = site {
+            request = request.header("sec-fetch-site", site);
+        }
+        assert_eq!(
+            me_email(app, request.body(Body::empty()).unwrap()).await,
+            Ok("cookie-site@example.com".into()),
+            "{site:?}"
+        );
+    }
+    let request = session_request(Method::GET, "/api/v1/auth/me", &cookie)
+        .header("sec-fetch-site", "same-site")
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", auth.access_token),
+        )
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        me_email(app, request).await,
+        Ok("cookie-site@example.com".into())
+    );
+
+    // MCP never reads the session cookie.
+    let response = app
+        .clone()
+        .oneshot(
+            session_request(Method::POST, "/mcp", &cookie)
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::from(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

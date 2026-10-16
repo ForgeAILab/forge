@@ -47,14 +47,19 @@ selected refresh token, and clears both cookies with `Max-Age=0` and the same
 paths and attributes. Access JWTs already copied by a client remain valid
 until their normal expiry.
 
-**CSRF:** unsafe requests (`POST`, `PUT`, `PATCH`, `DELETE`, and other
-non-safe methods) authenticated only by a cookie require same-origin
-evidence. `Sec-Fetch-Site` must be `same-origin` or `none`. Only when that
-header is absent may `Origin` supply the evidence: its scheme, host and port
-must match the configured public origin, or the request's own serving origin
-when no public URL is configured. Cross-site, same-site, foreign/null Origin,
-and missing evidence are refused with `403 csrf_rejected`. A matching Origin
-does not override a rejected `Sec-Fetch-Site`. Cookie-based refresh and logout
+**CSRF:** a request authenticated only by the cookie that carries
+`Sec-Fetch-Site` is refused with `403 csrf_rejected` unless the value is
+`same-origin` or `none`, whatever its method. `SameSite=Strict` does not
+separate ports on one host or sibling subdomains, so a `same-site` page could
+otherwise embed cookie-authenticated reads. Unsafe requests (`POST`, `PUT`,
+`PATCH`, `DELETE`, and other non-safe methods) authenticated only by a cookie
+always require same-origin evidence: only when `Sec-Fetch-Site` is absent may
+`Origin` supply it, and its scheme, host and port must match the configured
+public origin, or the request's own serving origin when no public URL is
+configured. Cross-site, same-site, foreign/null Origin, and missing evidence
+are refused with `403 csrf_rejected`. A matching Origin does not override a
+rejected `Sec-Fetch-Site`. Safe-method requests without Fetch Metadata (older
+or non-browser clients) are accepted. Cookie-based refresh and logout
 follow this rule even without an access cookie. Credential-free logout also
 requires this evidence before clearing cookies, even if SameSite withheld
 them. Explicit Bearer requests and

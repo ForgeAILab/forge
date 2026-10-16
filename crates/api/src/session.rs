@@ -87,14 +87,16 @@ impl SessionContext {
     }
 
     pub(crate) fn check_csrf(&self, headers: &HeaderMap, method: &Method) -> Result<(), ApiError> {
-        if matches!(
+        let safe = matches!(
             *method,
             Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
-        ) {
-            return Ok(());
-        }
+        );
         let same_origin = match headers.get("sec-fetch-site") {
+            // The browser's verdict binds every method: SameSite=Strict still
+            // sends the cookie from another port on the same host or from a
+            // sibling subdomain, e.g. for an <img> or a no-cors read.
             Some(value) => matches!(value.to_str(), Ok("same-origin" | "none")),
+            None if safe => true,
             None => headers
                 .get(header::ORIGIN)
                 .and_then(|value| value.to_str().ok())
