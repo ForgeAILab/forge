@@ -1647,3 +1647,87 @@ fn repair_brief_limits_ci_findings_across_open_and_resolved_sections() {
         }
     }
 }
+
+#[test]
+fn repair_brief_hard_cap_clips_fifty_long_findings_and_lists_the_rest_by_id() {
+    let long = |tag: &str, index: usize| format!("{tag}{index:02}{}", "x".repeat(998));
+    let findings: Vec<_> = (0..50)
+        .map(|index| {
+            json!({"summary": long("S", index), "where": long("W", index),
+                   "expected": long("E", index), "observed": long("O", index)})
+        })
+        .collect();
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,
+            "assessment":{"result":"fail","reason":"many","report":"r".repeat(8 * 1024),"findings":findings}}}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        assert!(text.len() <= 24 * 1024, "{}", text.len());
+        assert!(text.contains("Description:") && text.contains("Original plan:"));
+        // Every open finding is still named, in full or by id.
+        let bare: Vec<_> = text
+            .split("Also open (details in the finding ledger): ")
+            .nth(1)
+            .expect("bare ids")
+            .lines()
+            .next()
+            .unwrap()
+            .split(", ")
+            .collect();
+        for index in 1..=50 {
+            let id = format!("F{index}");
+            assert!(
+                text.contains(&format!("- {id} [")) || bare.contains(&id.as_str()),
+                "{id} missing"
+            );
+        }
+        // Detailed findings are clipped like the review comment.
+        assert!(text.contains(&format!("{}…", &long("S", 0)[..200])));
+        assert!(!text.contains(&long("S", 0)[..201]));
+    }
+}
+
+#[test]
+fn repair_brief_hard_cap_bounds_every_failing_step_and_the_verify_dump() {
+    let steps = |count: usize| -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|index| {
+                json!({"index": index, "command": format!("step-{index}"), "exit_code": 1,
+                                "stderr_tail": "", "output_tail": "T".repeat(4 * 1024)})
+            })
+            .collect()
+    };
+    let context = |count| {
+        let mut ctx = fake_context(default_roles::CODER);
+        ctx.prior_reviews = vec![db::Review {
+            step_results_json: json!({"ci_steps": steps(count),
+                "verify":{"status":"fail","app_log_tail":"L".repeat(40 * 1024),"checks":[]}})
+            .to_string(),
+            ..fake_review(1, db::ReviewStatus::Failed)
+        }];
+        ctx
+    };
+    let text = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2)
+        .build(&context(20))
+        .user;
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    for index in 0..20 {
+        assert!(text.contains(&format!("CI-{index}: step-{index} (exit 1)")));
+    }
+    assert!(text.contains("(output omitted; see the Review's CI step results)"));
+    // Unprotected sections are cut before any finding text: three failing
+    // steps keep every step finding's full observed tail.
+    let text = resolve_prompt_builder(BUILDER_ID_CODER_REVIEW_FIX_V2)
+        .build(&context(3))
+        .user;
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    assert!(text.contains(&format!("observed: {}", "T".repeat(4 * 1024))));
+    assert!(text.contains("… (truncated; see the Review tab)"));
+    assert!(!text.contains("T…"));
+}

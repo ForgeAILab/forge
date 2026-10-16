@@ -1742,6 +1742,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Task description and plan, finding history, all failing check output,
   recorded verify evidence, the reviewer report and prior completion summary.
   Automatic review recovery uses the same brief; no-change reminders still lead.
+  The brief body is capped at 24 KiB: after the report, previous summary and
+  check tails are cut, finding text is clipped and, past a line budget, the
+  remaining open findings are listed by id.
 - Merge-time check failures give the coder the target branch, failing command
   and output in a `MERGE-CI` finding. Committed conflict handoffs use
   `MERGE-CONFLICT`; both stay out of the review ledger.

@@ -41,11 +41,11 @@ suite.
 - [x] 2.4 Focused tests: comment text for failed with findings, failed without findings, and passed with minor findings. Assert that a replayed cascade posts no duplicate comment.
 
 ## 3. Repair brief
-- [ ] 3.1 Add a `RepairBrief` builder in `crates/services/src/workflow/dispatch/`:
+- [x] 3.1 Add a `RepairBrief` builder in `crates/services/src/workflow/dispatch/`:
   - sections in the D7 order;
   - a 24 KiB budget with the D7 drop order;
   - sources from the ledger, Review `ci_steps` (all failing steps), `details.verify`, and the previous coder completion summary.
-  - Implementation and prescribed drop order are complete. **NOT MET:** an absolute 24 KiB cap is incompatible with D7's unbounded protected Task/open findings (and unspecified Verify/Logs reductions). Protected content remains present after every permitted reduction; the report-first budget scenario passes.
+  - The cap is hard (owner decision 10/16): after the D7 drops, check tails share 4 KiB and verify keeps 2 KiB; then finding text is clipped (summary 200, where 120, expected/observed 300 characters) and, past a line budget, the remaining open findings are listed by id. Only an oversized Task description or plan can still exceed it (logged).
 - [x] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
 - [x] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
 - [x] 3.4 Focused tests in `workflow/dispatch/tests.rs`:

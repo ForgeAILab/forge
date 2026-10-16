@@ -8287,13 +8287,15 @@ At most 20 signature findings per step are displayed, followed by `+N more`;
 the ledger itself retains every finding. A no-change reminder still leads the
 request and names its `repair_no_change` allowance.
 
-The brief targets 24 KiB. It trims the report to 2 KiB, then drops it; drops
-the previous summary; reduces each check tail to 1 KiB; and reduces the
-resolved/unconfirmed section to ids. Task and open findings stay present; if
-necessary their expected/observed fields are reduced to 300 characters. D7's
-protected content can itself exceed 24 KiB (for example an oversized Task plan),
-so that irreducible case preserves content rather than silently losing Task or
-finding context. Attempts/Pattern history and verify execution are later phases.
+The brief body is capped at 24 KiB. It trims the report to 2 KiB, then drops
+it; drops the previous summary; reduces each check tail to 1 KiB; and reduces
+the resolved/unconfirmed section to ids. Next, all check tails share 4 KiB
+(later steps keep their command and signatures) and the verify section keeps
+2 KiB. Only then is finding text clipped: summary 200, where 120, expected and
+observed 300 characters; past a line budget, the remaining open findings are
+listed by id. Every open finding is always named. Only an oversized Task
+description or plan can still exceed the cap; that case is logged.
+Attempts/Pattern history and verify execution are later phases.
 
 Actionable merge send-backs use brief-only `MERGE-CI` or `MERGE-CONFLICT`
 findings. `MERGE-CI` quotes the send-back's target, failing command and output;

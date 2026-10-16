@@ -202,9 +202,10 @@ impl RepairBrief {
 
     pub fn automatic_recovery(mut self, budget: RepairBudget, failure_reason: &str) -> Self {
         self.round = format!(
-            "{}\nAutomatic recovery\n{}\nReview failure: {failure_reason}",
+            "{}\nAutomatic recovery\n{}\nReview failure: {}",
             self.round,
-            budget.render()
+            budget.render(),
+            clip(failure_reason, 2000, true)
         );
         self
     }
@@ -285,49 +286,67 @@ impl RepairBrief {
     }
 
     pub fn render(self) -> String {
-        let mut report_limit = self.report.len();
-        let mut previous = true;
-        let mut tail_limit = usize::MAX;
-        let mut ids_only = false;
-        let mut compact = false;
-        // D7's ordered degradation. Protected Task/open data is never dropped.
-        for stage in 0..=6 {
+        let mut limits = Limits {
+            report: self.report.len(),
+            previous: true,
+            tail: usize::MAX,
+            tails_total: usize::MAX,
+            ids_only: false,
+            verify: usize::MAX,
+            compact: false,
+            detailed: usize::MAX,
+        };
+        // D7's ordered degradation first; then the hard-cap reductions of the
+        // remaining unprotected sections, and only then finding text.
+        for stage in 0..=7 {
             match stage {
-                1 => report_limit = report_limit.min(2 * 1024),
-                2 => report_limit = 0,
-                3 => previous = false,
-                4 => tail_limit = 1024,
-                5 => ids_only = true,
+                1 => limits.report = limits.report.min(2 * 1024),
+                2 => limits.report = 0,
+                3 => limits.previous = false,
+                4 => limits.tail = 1024,
+                5 => limits.ids_only = true,
                 6 => {
-                    compact = self.task.len()
-                        + "\n\nOpen findings:\n".len()
-                        + self.open_findings(false).0.len()
-                        > BRIEF_BYTES;
+                    limits.tails_total = 4 * 1024;
+                    limits.verify = 2 * 1024;
                 }
+                7 => limits.compact = true,
                 _ => {}
             }
-            let body = self.render_sections(report_limit, previous, tail_limit, ids_only, compact);
+            let body = self.render_sections(&limits);
             if body.len() <= BRIEF_BYTES {
                 return body;
             }
-            if stage == 6 {
-                // D7 forbids further cuts to protected content and specifies
-                // no fallback for an irreducible oversize brief.
-                tracing::warn!(
-                    bytes = body.len(),
-                    budget = BRIEF_BYTES,
-                    "repair brief exceeds budget after every permitted reduction"
-                );
-                return body;
+        }
+        // Past a line budget, the remaining open findings are listed by id.
+        let (mut low, mut high) = (0, self.open.len());
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            limits.detailed = mid;
+            if self.render_sections(&limits).len() <= BRIEF_BYTES {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
         }
-        unreachable!()
+        limits.detailed = low;
+        let body = self.render_sections(&limits);
+        if body.len() > BRIEF_BYTES {
+            // Only the Task's own description and plan remain uncut.
+            tracing::warn!(
+                bytes = body.len(),
+                budget = BRIEF_BYTES,
+                "repair brief exceeds budget after every permitted reduction"
+            );
+        }
+        body
     }
 
-    fn open_findings(&self, compact: bool) -> (String, BTreeMap<&str, usize>) {
+    fn open_findings(&self, compact: bool, detailed: usize) -> (String, BTreeMap<&str, usize>) {
         let mut open = String::new();
         let mut counts = BTreeMap::<&str, usize>::new();
         let mut omitted = BTreeMap::<&str, usize>::new();
+        let mut bare = Vec::new();
+        let mut shown = 0;
         for entry in &self.open {
             if entry.source == Source::Ci && entry.id.contains('#') {
                 let step = entry.id.split('#').next().unwrap_or(&entry.id);
@@ -343,28 +362,34 @@ impl RepairBrief {
                 }
                 *count += 1;
             }
+            if shown >= detailed {
+                bare.push(clip(&entry.id, 120, compact));
+                continue;
+            }
+            shown += 1;
             open.push_str(&format!(
                 "- {} [{}, {}]: {} — survived {} repair round(s)\n",
-                entry.id,
+                clip(&entry.id, 120, compact),
                 format!("{:?}", entry.source).to_lowercase(),
                 format!("{:?}", entry.severity).to_lowercase(),
-                entry.summary,
+                clip(&entry.summary, 200, compact),
                 entry.streak.saturating_sub(1)
             ));
-            for (label, value) in [
-                ("where", &entry.r#where),
-                ("expected", &entry.expected),
-                ("observed", &entry.observed),
+            for (label, value, chars) in [
+                ("where", &entry.r#where, 120),
+                ("expected", &entry.expected, 300),
+                ("observed", &entry.observed, 300),
             ] {
                 if let Some(value) = value {
-                    let value = if compact && label != "where" {
-                        value.chars().take(300).collect()
-                    } else {
-                        value.clone()
-                    };
-                    open.push_str(&format!("  {label}: {value}\n"));
+                    open.push_str(&format!("  {label}: {}\n", clip(value, chars, compact)));
                 }
             }
+        }
+        if !bare.is_empty() {
+            open.push_str(&format!(
+                "Also open (details in the finding ledger): {}\n",
+                bare.join(", ")
+            ));
         }
         for (step, count) in omitted {
             open.push_str(&format!("{step}: +{count} more (see the finding ledger)\n"));
@@ -375,21 +400,14 @@ impl RepairBrief {
         (open, counts)
     }
 
-    fn render_sections(
-        &self,
-        report_limit: usize,
-        previous: bool,
-        tail_limit: usize,
-        ids_only: bool,
-        compact: bool,
-    ) -> String {
+    fn render_sections(&self, limits: &Limits) -> String {
         let mut out = self.task.clone();
         section(
             &mut out,
             "Round",
             &format!("{}\n\n{}", self.round, self.instructions),
         );
-        let (open, mut ci_counts) = self.open_findings(compact);
+        let (open, mut ci_counts) = self.open_findings(limits.compact, limits.detailed);
         section(
             &mut out,
             "Open findings",
@@ -418,8 +436,8 @@ impl RepairBrief {
             };
             updates.push_str(&format!(
                 "- {}: {status}{}\n",
-                entry.id,
-                if ids_only {
+                clip(&entry.id, 120, limits.compact),
+                if limits.ids_only {
                     String::new()
                 } else {
                     format!(" — {}", entry.summary)
@@ -435,18 +453,19 @@ impl RepairBrief {
             &updates,
         );
         let mut checks = String::new();
+        let mut tails_left = limits.tails_total;
+        // The ledger already names these tests above. Legacy unreadable
+        // rows still expose their signatures with their check output.
+        let signatures_in_ledger = self
+            .open
+            .iter()
+            .chain(&self.updates)
+            .any(|entry| entry.source == Source::Ci);
         for check in &self.checks {
-            checks.push_str(&format!("{}\n", check.label));
-            // The ledger already names these tests above. Legacy unreadable
-            // rows still expose their signatures with their check output.
-            let signatures_in_ledger = self
-                .open
-                .iter()
-                .chain(&self.updates)
-                .any(|entry| entry.source == Source::Ci);
+            checks.push_str(&format!("{}\n", clip(&check.label, 300, limits.compact)));
             if !signatures_in_ledger {
                 for signature in check.failures.iter().take(20) {
-                    checks.push_str(&format!("- {signature}\n"));
+                    checks.push_str(&format!("- {}\n", clip(signature, 120, limits.compact)));
                 }
             }
             if !signatures_in_ledger && check.failures.len() > 20 {
@@ -455,21 +474,56 @@ impl RepairBrief {
             if check.truncated {
                 checks.push_str("Additional failure signatures were truncated.\n");
             }
-            checks.push_str(tail(&check.tail, tail_limit));
+            let output = tail(&check.tail, limits.tail);
+            if output.len() <= tails_left {
+                tails_left -= output.len();
+                checks.push_str(output);
+            } else {
+                tails_left = 0;
+                checks.push_str("(output omitted; see the Review's CI step results)");
+            }
             checks.push('\n');
         }
         section(&mut out, "Failing check output", &checks);
-        section(&mut out, "Verify results and evidence", &self.verify);
+        let verify = prefix(&self.verify, limits.verify);
+        if verify.len() < self.verify.len() {
+            section(
+                &mut out,
+                "Verify results and evidence",
+                &format!("{verify}\n… (truncated; see the Review tab)"),
+            );
+        } else {
+            section(&mut out, "Verify results and evidence", verify);
+        }
         section(
             &mut out,
             "Reviewer report",
-            prefix(&self.report, report_limit),
+            prefix(&self.report, limits.report),
         );
-        if previous {
+        if limits.previous {
             section(&mut out, "Previous round", &self.previous);
         }
         section(&mut out, "Logs", &self.logs);
         out
+    }
+}
+
+struct Limits {
+    report: usize,
+    previous: bool,
+    tail: usize,
+    tails_total: usize,
+    ids_only: bool,
+    verify: usize,
+    compact: bool,
+    detailed: usize,
+}
+
+/// Finding text clipped like the review comment once the brief is compacted.
+fn clip(value: &str, chars: usize, compact: bool) -> String {
+    match value.char_indices().nth(chars).filter(|_| compact) {
+        Some((end, _)) => format!("{}…", &value[..end]),
+        None => value.to_owned(),
     }
 }
 

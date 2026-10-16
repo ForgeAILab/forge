@@ -37,9 +37,15 @@ sections in this order until it fits:
 3. each check tail, down to 1 KiB;
 4. the resolved and unconfirmed list, down to ids only.
 
-The Task section and the open findings are never dropped. When they alone are
-over 24 KiB, each finding's `expected` and `observed` are cut to 300
-characters.
+The Task section and the open findings are never dropped. When the brief is
+still over 24 KiB, Forge SHALL next share 4 KiB among the check tails and keep
+2 KiB of the verify section. If it is still over, each finding's summary is cut
+to 200 characters, `where` to 120, and `expected` and `observed` to 300; past a
+line budget the remaining open findings are listed by id only.
+
+#### Scenario: Fifty long findings
+- **WHEN** a review fails with 50 findings whose texts are 1,000 characters each
+- **THEN** the brief is at most 24 KiB and names every open finding, in full-clipped form or by id
 
 #### Scenario: Large report is trimmed first
 - **WHEN** the reviewer report is 40 KiB and the rest of the brief is 6 KiB
