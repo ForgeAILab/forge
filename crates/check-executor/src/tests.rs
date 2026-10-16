@@ -297,11 +297,25 @@ fn alive(pid: &str) -> bool {
         .status()
         .unwrap()
         .success();
-    let zombie = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|s| {
-        s.rsplit_once(") ")
-            .is_some_and(|(_, tail)| tail.starts_with('Z'))
-    });
-    exists && !zombie
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, tail)| tail.starts_with("Z "))
+    }) {
+        return false;
+    }
+    exists
+}
+#[cfg(unix)]
+async fn wait_until_dead(pid: &str) {
+    // SIGKILL and reaping need not finish before the stop call returns.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while alive(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {} is still running after stop", pid.trim()));
 }
 #[cfg(unix)]
 #[tokio::test]
@@ -342,13 +356,7 @@ async fn grandchild_ignoring_term_is_gone_after_timeout_and_cancel() {
             "{receipt:?}"
         );
         let pid = std::fs::read_to_string(temp.path().join("grandchild.pid")).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while alive(&pid) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_dead(&pid).await;
         assert!(receipt.commands[0].process_tree_stopped);
     }
 }
@@ -428,13 +436,7 @@ async fn descendants_are_stopped_even_when_the_leader_exits_successfully() {
     .await;
     assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
     let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while alive(&pid) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_until_dead(&pid).await;
 }
 
 #[tokio::test]
@@ -828,7 +830,7 @@ async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end
     assert_eq!(receipt.commands.len(), 2);
     assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
     let service = std::fs::read_to_string(&pid).unwrap();
-    assert!(!alive(service.trim()), "the run ended: its tree is stopped");
+    wait_until_dead(&service).await;
     assert_eq!(receipt.tracked_changes, Some(false));
 
     // The same at a failed and at a timed-out end.
@@ -847,7 +849,7 @@ async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end
         assert_eq!(receipt.outcome, outcome);
         assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
         let service = std::fs::read_to_string(&pid).unwrap();
-        assert!(!alive(service.trim()));
+        wait_until_dead(&service).await;
     }
 }
 #[tokio::test]
@@ -1230,7 +1232,7 @@ async fn review_verify_background_tree_is_stopped_on_cancellation_and_dropped_ru
     let receipt = run.await;
     assert_eq!(receipt.outcome, CheckExecutionOutcome::Cancelled);
     assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
-    assert!(!alive(std::fs::read_to_string(&pid).unwrap().trim()));
+    wait_until_dead(&std::fs::read_to_string(&pid).unwrap()).await;
     std::fs::remove_file(&pid).unwrap();
     let cancel = CancellationToken::new();
     let mut run = Box::pin(execute(CheckExecution {
@@ -1260,12 +1262,5 @@ async fn review_verify_background_tree_is_stopped_on_cancellation_and_dropped_ru
     tokio::select! {result=&mut run=>panic!("run ended before drop: {result:?}"),_=ready=>{} }
     drop(run);
     let service = std::fs::read_to_string(&pid).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
-    while alive(service.trim()) {
-        assert!(
-            Instant::now() < until,
-            "dropped run left its background server"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until_dead(&service).await;
 }

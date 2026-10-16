@@ -144,7 +144,10 @@ pub fn stop_group(id: u32) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     signal("KILL", id);
-    // A killed member is gone once its parent (or init) has reaped it.
+    // Group existence is deliberately stricter than process death. On Linux
+    // kill -0 also sees zombies: their parent (or init) must reap them before
+    // this can certify that no member remains. A zombie can cause a bounded
+    // false result, never a false proof that a running member is gone.
     let until = Instant::now() + Duration::from_secs(2);
     loop {
         match group_alive(id) {

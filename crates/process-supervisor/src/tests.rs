@@ -7,13 +7,38 @@ fn shell(text: &str) -> Command {
 }
 
 fn alive(pid: &str) -> bool {
-    std::process::Command::new("kill")
+    let exists = std::process::Command::new("kill")
         .args(["-0", pid.trim()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .unwrap()
-        .success()
+        .success();
+    // Linux keeps an unreaped zombie visible to kill -0 even though it can
+    // no longer execute. Other Unix platforms need only the bounded poll.
+    #[cfg(target_os = "linux")]
+    if zombie(pid) {
+        return false;
+    }
+    exists
+}
+
+#[cfg(target_os = "linux")]
+fn zombie(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, tail)| tail.starts_with("Z "))
+    })
+}
+
+async fn wait_until_dead(pid: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while alive(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {} is still running after stop", pid.trim()));
 }
 
 /// A descendant that left the group (`setsid`) cannot be signalled through it.
@@ -86,24 +111,62 @@ async fn completion_policy_decides_what_outlives_a_normal_exit() {
         .unwrap();
         assert!(output.status.success());
         let pid = std::fs::read_to_string(dir.path().join("child.pid")).unwrap();
-        let survived = alive(&pid);
-        if survived {
+        if survives {
+            assert!(alive(&pid), "{policy:?} must leave the descendant running");
             // What a caller does at the end of its run: the group is stopped
             // and verified gone, including the member that ignores SIGTERM.
             let group = output.group.expect("a started command has a group");
             assert!(tokio::task::spawn_blocking(move || stop_group(group))
                 .await
                 .unwrap());
-            assert!(!alive(&pid));
+            wait_until_dead(&pid).await;
             // Stopping a group that is already gone is still "stopped".
             assert!(stop_group(group));
+        } else {
+            // Observe the supervisor's stop before any test cleanup could
+            // hide a missed SIGKILL. The child ignores TERM and has no limit.
+            wait_until_dead(&pid).await;
         }
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", pid.trim()])
-            .status();
-        assert_eq!(survived, survives, "{policy:?}");
         assert_eq!(output.descendants_stopped, !survives);
     }
+}
+
+/// Process death and the disappearance of a process group are distinct:
+/// Linux retains an unreaped zombie in kill -0's group-existence check.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_zombie_is_dead_but_its_group_is_not_verified_gone_until_reaped() {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = std::process::Command::new("bash")
+        .args(["-c", "exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let group = child.id();
+    let pid = group.to_string();
+    // Do not wait/try_wait yet: this parent deliberately retains the zombie.
+    let became_zombie = tokio::time::timeout(Duration::from_secs(5), async {
+        while !zombie(&pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if became_zombie.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child did not become a zombie");
+    }
+    let running = alive(&pid);
+    let present = group_alive(group);
+    let stopped = tokio::task::spawn_blocking(move || stop_group(group))
+        .await
+        .unwrap();
+    child.wait().unwrap();
+    assert!(!running);
+    assert_eq!(present, Some(true));
+    assert!(!stopped, "an unreaped member still reserves the group");
+    assert!(stop_group(group));
 }
 
 /// A drain bound is wall-clock. Bytes the finished command wrote before the
