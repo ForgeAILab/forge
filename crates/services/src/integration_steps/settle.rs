@@ -644,13 +644,15 @@ impl IntegrationSteps {
                     }
                     crate::check_runner::ci_triage::Progress::Complete(entries) => {
                         let blocking = entries.iter().any(crate::check_runner::ci_triage::blocks);
-                        let summary = entries
-                            .iter()
-                            .any(|entry| entry.triage.is_some())
+                        let triaged = entries.iter().any(|entry| entry.triage.is_some());
+                        let summary = triaged
                             .then(|| crate::check_runner::ci_triage::failure_summary(&entries));
                         triaged_steps = Some(entries);
                         match check {
-                            CheckInput::Failed(timing, _) if !blocking => {
+                            // Only failures triage classified may pass. A red
+                            // result it never looked at (timed out, `off`, or
+                            // no failing step recorded) stays red.
+                            CheckInput::Failed(timing, _) if triaged && !blocking => {
                                 CheckInput::Passed(timing)
                             }
                             CheckInput::Failed(timing, _)

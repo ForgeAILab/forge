@@ -1673,6 +1673,14 @@ async fn the_check_verdict_is_the_settle_answer_with_timing_for_the_waiting_work
             124,
             IntegrationStepOutcome::CandidateCheckFailed,
         ),
+        // The run timed out after its last recorded step passed: no failing
+        // step for triage to classify, and still no pass.
+        (
+            "silent",
+            db::CheckResultOutcome::TimedOut,
+            0,
+            IntegrationStepOutcome::CandidateCheckFailed,
+        ),
         (
             "lost",
             db::CheckResultOutcome::InfrastructureFailed,
@@ -1726,7 +1734,11 @@ async fn the_check_verdict_is_the_settle_answer_with_timing_for_the_waiting_work
             ),
         }
         if expected == IntegrationStepOutcome::CandidateCheckFailed {
-            assert!(answer.message.unwrap().contains("`make test` exited"));
+            assert!(answer.message.unwrap().contains(if exit_code == 0 {
+                "the check ended timed_out"
+            } else {
+                "`make test` exited"
+            }));
         }
         assert_eq!(world.task(task).await.status, "merging");
     }

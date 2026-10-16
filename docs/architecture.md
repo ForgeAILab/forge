@@ -9999,7 +9999,9 @@ full classifications remain in the original Review and ledger. The ledger retain
 findings are minor with zero streak. Original check results are immutable failures.
 An unchanged queue head whose Review passed by triage runs its own CI; the ordinary
 certified-pass reuse path cannot consume a triaged failure. Queue settlement
-triages against the target tip before granting a permit or authorizing send-back.
+triages against the target tip before granting a permit or authorizing send-back;
+only a red result whose failing steps triage classified non-blocking becomes a
+permit, so a timed-out or untriaged red result stays a check failure.
 
 Both subcheck stages retain the original consumer family, status epoch and Review
 or integration authority, with `ci-triage:rerun:` / `ci-triage:base:` authority
