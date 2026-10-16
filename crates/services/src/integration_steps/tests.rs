@@ -4907,8 +4907,11 @@ async fn settle_ci_triage_pass_is_not_reused_by_unchanged_queue_head() {
         .await
         .unwrap();
     let running = production.run();
+    // The Task is done in the result step, before the worker completes
+    // the attempt: wait for both before production stops.
     eventually("the triaged unchanged candidate merges", || async {
         world.task("triaged-review").await.status == "done"
+            && world.attempt(&admitted.id).await.state == S::Completed
     })
     .await;
     let _ = production.stop.send(true);
