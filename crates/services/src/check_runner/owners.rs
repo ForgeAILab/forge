@@ -193,7 +193,17 @@ impl WorkspaceCheckOwners {
                     environment_workspace: Some(Path::new(path)), assets: &project_environment.assets,
                 }
             } else { check_executor::CheckoutTarget::Workspace(Path::new(path)) };
-            environment.extend(review::verify::prepare_environment(&record.run.identity.inputs.spec, Path::new(path)).map_err(ServiceError::invalid_operation)?);
+            // Off the runtime: preparing may first stop an app that a crashed
+            // owner left running, which blocks for up to a few seconds.
+            let verify_environment = {
+                let spec = record.run.identity.inputs.spec.clone();
+                let worktree = Path::new(path).to_owned();
+                tokio::task::spawn_blocking(move || review::verify::prepare_environment(&spec, &worktree))
+                    .await
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+                    .map_err(ServiceError::invalid_operation)?
+            };
+            environment.extend(verify_environment);
             crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
                 operation_id:&id,spec:&record.run.identity.inputs.spec,target,owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
             }).await

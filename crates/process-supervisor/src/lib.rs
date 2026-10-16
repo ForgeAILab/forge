@@ -159,6 +159,36 @@ pub fn stop_group(id: u32) -> bool {
 pub fn stop_group(_id: u32) -> bool {
     false
 }
+/// Stop what is left of a recorded process group whose owner died without
+/// stopping it (a server crash or restart mid-run), and say whether nothing
+/// of it is left. Its leader is long gone; its members keep the group id
+/// reserved, so a group without a live leader is still the recorded one.
+/// A live process with that id means the recorded group is gone and the id
+/// now names somebody else: nothing is signalled then (`true`). Blocking,
+/// like [`stop_group`].
+#[cfg(unix)]
+pub fn stop_orphaned_group(id: u32) -> bool {
+    if id <= 1 {
+        return false;
+    }
+    let leader = std::process::Command::new("kill")
+        .args(["-0", "--", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success());
+    match leader {
+        None => false,
+        Some(true) => true,
+        Some(false) => stop_group(id),
+    }
+}
+#[cfg(not(unix))]
+pub fn stop_orphaned_group(_id: u32) -> bool {
+    false
+}
 /// A synchronous, bounded observer of each drained output chunk.
 pub type OutputObserver<'a> = &'a mut (dyn FnMut(&[u8]) + Send + 'a);
 

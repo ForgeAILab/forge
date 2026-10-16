@@ -61,7 +61,8 @@ pub fn build_bundle(
         add(
             "start",
             format!(
-                r#"( bash -lc {}; code=$?; printf '%s\n' "$code" > "$FORGE_VERIFY_DIR/start.exit" ) > "$FORGE_VERIFY_DIR/app.log" 2>&1 < /dev/null &
+                r#"printf '%s\n' "$$" > "$FORGE_VERIFY_DIR/start.pgid"
+( bash -lc {}; code=$?; printf '%s\n' "$code" > "$FORGE_VERIFY_DIR/start.exit" ) > "$FORGE_VERIFY_DIR/app.log" 2>&1 < /dev/null &
 printf '%s\n' "$!" > "$FORGE_VERIFY_DIR/start.pid"
 sleep 0.05
 [ ! -f "$FORGE_VERIFY_DIR/start.exit" ]"#,
@@ -189,7 +190,10 @@ pub fn prepare_environment(
     };
     let directory = directory(worktree, attempt)?;
     ensure_directory(&directory, worktree)?;
-    for file in ["start.exit", "start.pid", "app.log"]
+    if let Some(verify) = directory.parent() {
+        stop_orphaned_starts(verify);
+    }
+    for file in ["start.exit", "start.pid", "start.pgid", "app.log"]
         .into_iter()
         .map(str::to_owned)
         .chain(spec.commands.iter().filter_map(|c| {
@@ -227,6 +231,40 @@ pub fn prepare_environment(
             directory.join("report.json").to_string_lossy().into_owned(),
         ),
     ]))
+}
+
+/// The start step records its process group (`start.pgid`, written before
+/// the app is started). A run's end stops that group; an owner that died
+/// mid-run (a server crash or restart) never did, and its app keeps running
+/// with its port. Before a verify starts anything, every attempt directory of
+/// this Task root is looked at, so neither the re-run of an attempt nor a
+/// later attempt starts beside such an orphan. Only real directories and
+/// regular files are read; a record whose group is gone is removed.
+fn stop_orphaned_starts(verify: &Path) {
+    let Ok(entries) = std::fs::read_dir(verify) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let record = entry.path().join("start.pgid");
+        if !std::fs::symlink_metadata(&record)
+            .is_ok_and(|m| m.file_type().is_file() && m.len() <= 32)
+        {
+            continue;
+        }
+        let Some(group) = std::fs::read_to_string(&record)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            let _ = std::fs::remove_file(&record);
+            continue;
+        };
+        if process_supervisor::stop_orphaned_group(group) {
+            let _ = std::fs::remove_file(&record);
+        }
+    }
 }
 
 /// Refuse symlinked reserved directories before writing or reading any inputs.
@@ -322,6 +360,86 @@ mod tests {
             build_bundle(&config, "workspace", 3, 7, 1, std::iter::empty()).unwrap()
         );
     }
+    #[cfg(unix)]
+    fn alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// A Forge that dies mid-verify runs no stop: the app keeps running, and
+    /// keeps its port. The restarted owner prepares the next evaluation (or
+    /// attempt) and must stop that app before anything new starts.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_verify_restart_stops_the_app_a_crashed_owner_left_running() {
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("task/repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let config: ReviewVerifyConfig = serde_json::from_value(json!({
+            "start": r#"sleep 300 & printf '%s\n' "$!" > "$FORGE_VERIFY_DIR/app.pidfile"; wait"#,
+            "checks": [{"name": "smoke", "command": r#"sleep 300 & printf '%s\n%s\n' "$!" "$$" > "$FORGE_VERIFY_DIR/check.pids"; wait"#}]
+        }))
+        .unwrap();
+        let spec = build_bundle(&config, "workspace", 1, 1, 0, std::iter::empty()).unwrap();
+        let environment = prepare_environment(&spec, &worktree).unwrap();
+        let dir = directory(&worktree, 1).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let permit = check_executor::CheckPermit::already_admitted();
+        let mut run = Box::pin(check_executor::execute(check_executor::CheckExecution {
+            operation_id: "verify-crash",
+            spec: &spec,
+            target: check_executor::CheckoutTarget::Workspace(&worktree),
+            owner: CheckOwnerIdentity {
+                owner_kind: "server".into(),
+                machine_id: None,
+                runtime_id: "test".into(),
+            },
+            input_revisions: None,
+            environment: &environment,
+            deadline: Some(Instant::now() + Duration::from_secs(60)),
+            cancel: &cancel,
+            permit: &permit,
+            cleanup: check_executor::CleanupPlan {
+                commands: &[],
+                timeout: check_executor::CLEANUP_TIMEOUT,
+            },
+            output_limit: 512,
+        }));
+        let checking = async {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !dir.join("check.pids").is_file() || !dir.join("app.pidfile").is_file() {
+                assert!(Instant::now() < until, "verify did not reach its check");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        tokio::select! { result = &mut run => panic!("run ended: {result:?}"), _ = checking => {} }
+        // The owner dies: nothing of the run is dropped, stopped or settled.
+        std::mem::forget(run);
+        let app = std::fs::read_to_string(dir.join("app.pidfile")).unwrap();
+        let checks = std::fs::read_to_string(dir.join("check.pids")).unwrap();
+        assert!(alive(&app));
+        let next = build_bundle(&config, "workspace", 1, 1, 1, std::iter::empty()).unwrap();
+        prepare_environment(&next, &worktree).unwrap();
+        let survived = alive(&app);
+        for pid in app.lines().chain(checks.lines()) {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        assert!(
+            !survived,
+            "the restarted owner started beside the orphaned app"
+        );
+    }
+
     #[test]
     fn review_verify_directory_refuses_symlinked_reserved_components() {
         let temp = tempfile::tempdir().unwrap();
