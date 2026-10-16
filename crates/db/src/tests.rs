@@ -12409,6 +12409,9 @@ async fn review_frozen_long_form_assessment_refuses_changed_content() {
             "reason" => report.reason = "different reason".into(),
             "report" => report.report = "different report".into(),
             "finding" => report.findings.push(api_types::ReviewFinding {
+                requirement_ids: Vec::new(),
+                kind: None,
+                same_cause_as: None,
                 id: None,
                 summary: "different finding".into(),
                 severity: api_types::ReviewFindingSeverity::Blocking,

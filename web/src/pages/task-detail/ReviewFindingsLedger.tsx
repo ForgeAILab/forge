@@ -96,6 +96,22 @@ export function ReviewFindingsLedger({ taskId }: { taskId: string }) {
                       First seen: attempt {entry.first_attempt} · Last checked: attempt{' '}
                       {entry.last_checked_attempt}
                     </p>
+                    {entry.status === 'reopened' && (
+                      <p className="mt-1 text-muted-foreground">
+                        Re-broken: resolved in round {entry.resolved_attempt}
+                      </p>
+                    )}
+                    {entry.status === 'out_of_scope' && (
+                      <p className="mt-1 text-muted-foreground">Follow-up candidate</p>
+                    )}
+                    {entry.anchoring_note && (
+                      <p className="mt-1 text-muted-foreground">{entry.anchoring_note}</p>
+                    )}
+                    {entry.requirement_ids?.length ? (
+                      <p className="mt-1 text-muted-foreground">
+                        Requirements: {entry.requirement_ids.join(', ')}
+                      </p>
+                    ) : null}
                     <FindingDetails finding={entry} />
                   </td>
                 </tr>

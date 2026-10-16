@@ -1,3 +1,6 @@
+/// Planning role of the built-in workflow, including legacy empty workflow settings.
+pub const DEFAULT_WORKFLOW_PLANNING_ROLE: &str = "planner";
+
 /// Durable classification of a mechanical transition or accepted gate action.
 /// Human reason text is never an input to this classification.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
@@ -278,6 +281,10 @@ pub struct ProjectSettings {
     /// How failed review and queue-head CI is triaged. Existing Projects default to full.
     #[serde(default)]
     pub review_ci_triage: ReviewCiTriage,
+    /// Use the next configured fallback for a carried-finding repair only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub repair_switch_model_when_stuck: bool,
     /// Maximum unparked Tasks in active/gate states; 0 disables the limit.
     #[serde(default = "default_max_active_tasks")]
     pub max_active_tasks: u32,
@@ -454,6 +461,7 @@ impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
             review_ci_triage: ReviewCiTriage::default(),
+            repair_switch_model_when_stuck: false,
             max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
@@ -796,6 +804,81 @@ pub struct WorkflowDefinition {
 }
 
 impl WorkflowDefinition {
+    /// Match the service workflow resolver: empty or unreadable Project JSON
+    /// selects the built-in workflow; valid custom definitions keep their roles.
+    pub fn coordination_planning_role_from_json(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "{}" {
+            return Some(DEFAULT_WORKFLOW_PLANNING_ROLE.to_owned());
+        }
+        match serde_json::from_str::<Self>(raw) {
+            Ok(workflow) => workflow
+                .coordination_planning_state()
+                .and_then(|state| state.role.clone()),
+            Err(_) => Some(DEFAULT_WORKFLOW_PLANNING_ROLE.to_owned()),
+        }
+    }
+
+    /// First planning gate before implementation, shared by routing and charging.
+    pub fn planning_state(&self) -> Option<&StateDefinition> {
+        for initial in self
+            .states
+            .iter()
+            .filter(|state| state.kind == StateKind::Initial)
+        {
+            let mut cursor = initial.name.as_str();
+            for _ in 0..self.states.len() {
+                let Some(next) = self
+                    .outgoing_trigger_targets(cursor)
+                    .filter(|(trigger, _)| !trigger.system_only())
+                    .find_map(|(_, target)| {
+                        self.states.iter().find(|state| {
+                            state.name == target
+                                && matches!(state.kind, StateKind::Active | StateKind::Gate)
+                        })
+                    })
+                else {
+                    break;
+                };
+                if next.kind == StateKind::Active {
+                    break;
+                }
+                if next.canonical_phase != Some(CanonicalPhase::Review) && next.role.is_some() {
+                    return Some(next);
+                }
+                cursor = next.name.as_str();
+            }
+        }
+        None
+    }
+
+    /// Implementation roles cannot lead coordination roots.
+    pub fn coordination_planning_state(&self) -> Option<&StateDefinition> {
+        fn role(state: &StateDefinition) -> Option<&str> {
+            state
+                .role
+                .as_deref()
+                .or((state.kind == StateKind::Active).then_some("assignee"))
+        }
+        let implementation = self
+            .states
+            .iter()
+            .find(|state| state.name == "in_progress")
+            .and_then(role)
+            .or_else(|| {
+                self.states
+                    .iter()
+                    .find(|state| state.kind == StateKind::Active)
+                    .and_then(role)
+            });
+        self.planning_state().filter(|state| {
+            state
+                .role
+                .as_deref()
+                .is_some_and(|role| role != "coder" && implementation != Some(role))
+        })
+    }
+
     fn state_index(&self, status: &str) -> Option<usize> {
         self.states.iter().position(|state| state.name == status)
     }

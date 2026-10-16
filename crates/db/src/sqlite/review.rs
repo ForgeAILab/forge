@@ -5,6 +5,15 @@ impl SqliteDb {
     /// any state. Do not infer a reset from a reviewer verdict or Task status.
     pub async fn review_window(&self, task_id: &str) -> Result<crate::ReviewWindow> {
         let mut tx = self.pool().begin().await?;
+        let window = Self::review_window_in_tx(&mut tx, task_id).await?;
+        tx.commit().await?;
+        Ok(window)
+    }
+
+    pub(crate) async fn review_window_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+    ) -> Result<crate::ReviewWindow> {
         let window_started_at: String = sqlx::query_scalar(
             "SELECT COALESCE(l.created_at,t.created_at) FROM task t
              LEFT JOIN task_budget b ON b.task_id=t.id AND b.kind='review'
@@ -12,7 +21,7 @@ impl SqliteDb {
              WHERE t.id=?",
         )
         .bind(task_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(DbError::NotFound)?;
         let rows = sqlx::query(
@@ -21,13 +30,12 @@ impl SqliteDb {
         )
         .bind(task_id)
         .bind(&window_started_at)
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut **tx)
         .await?;
         let reviews = rows
             .into_iter()
             .map(map_review)
             .collect::<Result<Vec<_>>>()?;
-        tx.commit().await?;
         Ok(crate::ReviewWindow {
             window_started_at,
             reviews,

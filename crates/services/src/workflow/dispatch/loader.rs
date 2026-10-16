@@ -72,7 +72,7 @@ pub async fn load_agent_dispatch_context(
     } else {
         None
     };
-    let continuation_of_execution_id = continuation_execution
+    let mut continuation_of_execution_id = continuation_execution
         .as_ref()
         .map(|execution| execution.id.clone());
     let continuation_logs_path = continuation_execution
@@ -183,6 +183,25 @@ pub async fn load_agent_dispatch_context(
         )?),
     });
 
+    let carried_repair = matches!(
+        budget_kind,
+        db::budget::Kind::Review | db::budget::Kind::ReviewProgress
+    ) && workflow
+        .states
+        .iter()
+        .any(|state| state.name == state_name && state.kind == StateKind::Active)
+        && (task.parent_task_id.is_some() || sub_tasks.is_empty())
+        && db::review_findings::has_carried_finding(&review_window);
+    let reset_model_after_repair = continuation_execution
+        .as_ref()
+        .and_then(|execution| execution.executor_config_snapshot_json.as_deref())
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .is_some_and(|snapshot| snapshot["repair_model_switched"] == true);
+    if carried_repair || reset_model_after_repair {
+        continuation_of_execution_id = None;
+    }
+    let repair_attempts = load_repair_attempts(&db, router, &task, &review_window).await?;
+
     Ok(AgentDispatchContext {
         task,
         role: role.to_string(),
@@ -194,6 +213,9 @@ pub async fn load_agent_dispatch_context(
         prior_reviews,
         review_window: Some(review_window),
         previous_coder_summary,
+        repair_attempts,
+        carried_repair,
+        reset_model_after_repair,
         repair_budget,
         parent_task,
         sub_tasks,
@@ -208,6 +230,109 @@ pub async fn load_agent_dispatch_context(
         review_ci_steps,
         step_diff,
     })
+}
+
+/// Evidence is read through the placement owner, including daemon workspaces.
+/// A missing historical Git object leaves the memory useful, with an explicit
+/// unavailable marker rather than invented file names.
+async fn load_repair_attempts(
+    db: &db::SqliteDb,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    task: &db::Task,
+    reviews: &[db::Review],
+) -> Result<Vec<super::repair_brief::RepairAttempt>> {
+    let settled = super::repair_brief::repair_rounds(reviews);
+    let workspace =
+        WorkspaceRepo::get_by_task_id(db, task.parent_task_id.as_deref().unwrap_or(&task.id))
+            .await?;
+    let owner = match workspace.as_ref() {
+        Some(workspace) => router.resolve(db, workspace).await.ok(),
+        None => None,
+    };
+    let mut memories = Vec::new();
+    for (index, review) in settled
+        .iter()
+        .enumerate()
+        .skip(settled.len().saturating_sub(3))
+    {
+        let execution = ExecutionRepo::get_by_id(db, &review.execution_id)
+            .await?
+            .filter(|execution| execution.task_id == task.id);
+        let commit = |review: &db::Review| {
+            serde_json::from_str::<Value>(&review.step_results_json)
+                .ok()
+                .and_then(|details| {
+                    details["conformance"]["contract"]["commit_sha"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+        };
+        let mut previous_commit = index
+            .checked_sub(1)
+            .and_then(|prior| commit(settled[prior]));
+        if previous_commit.is_none() {
+            if let Some(prior) = index.checked_sub(1) {
+                previous_commit = ExecutionRepo::get_by_id(db, &settled[prior].execution_id)
+                    .await?
+                    .filter(|execution| execution.task_id == task.id)
+                    .and_then(|execution| execution.after_sha);
+            }
+        }
+        let from_sha = previous_commit.or_else(|| {
+            execution
+                .as_ref()
+                .and_then(|execution| execution.before_sha.clone())
+        });
+        let to_sha = commit(review).or_else(|| {
+            execution
+                .as_ref()
+                .and_then(|execution| execution.after_sha.clone())
+        });
+        let mut files = Vec::new();
+        let mut files_unavailable = true;
+        if let (Some(owner), Some(from), Some(to)) = (&owner, &from_sha, &to_sha) {
+            match owner
+                .backend
+                .diff(
+                    &owner.placement,
+                    &crate::workspace_backend::DiffSpec {
+                        base_ref: from.clone(),
+                        head_ref: Some(to.clone()),
+                        max_bytes: 1024,
+                    },
+                )
+                .await
+            {
+                Ok(diff) => {
+                    files = diff
+                        .response
+                        .files
+                        .iter()
+                        .take(20)
+                        .map(|file| {
+                            format!("{} (+{}, -{})", file.path, file.additions, file.deletions)
+                        })
+                        .collect();
+                    if diff.response.files.len() > 20 {
+                        files.push(format!("+{} more files", diff.response.files.len() - 20));
+                    }
+                    files_unavailable = false;
+                }
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, %error, "repair attempt file history unavailable")
+                }
+            }
+        }
+        memories.push(super::repair_brief::RepairAttempt {
+            attempt: review.attempt_number,
+            from_sha,
+            to_sha,
+            files,
+            files_unavailable,
+            summary: execution.and_then(|execution| execution.summary),
+        });
+    }
+    Ok(memories)
 }
 
 /// Follow the gate that actually sent this role back, including workflows

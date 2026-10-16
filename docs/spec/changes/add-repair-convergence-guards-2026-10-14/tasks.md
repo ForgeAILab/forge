@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-16T10:49:03Z
+updated_at: 2026-10-16T15:24:46Z
 completed_at:
 ---
 
@@ -59,24 +59,24 @@ completed_at:
 - [x] 3.3 Focused tests: unchanged once sends back without a Review row or review budget; unchanged twice parks; an owner re-review of the same commit runs; a changed commit reviews normally.
 
 ## 4. Reviewer anchoring
-- [ ] 4.1 Finding fields `requirement_ids`, `kind`, `same_cause_as`: lenient parsing, omitted when empty, TS, `docs/api.md`.
-- [ ] 4.2 `RESPONSE_INSTRUCTION` and the re-review section list the frozen requirement ids and the later-review rule. Refresh the reviewer prompt snapshot.
-- [ ] 4.3 Ledger rules:
+- [x] 4.1 Finding fields `requirement_ids`, `kind`, `same_cause_as`: lenient parsing, omitted when empty, TS, `docs/api.md`.
+- [x] 4.2 `RESPONSE_INSTRUCTION` and the re-review section list the frozen requirement ids and the later-review rule. Refresh the reviewer prompt snapshot.
+- [x] 4.3 Ledger rules:
   - from review 2, downgrade to `minor` unless the finding is a regression, cites a requirement, or is in a candidate-diff file;
   - `out_of_scope` never blocks;
   - `reopened`.
-- [ ] 4.4 Park with `only non-blocking findings remain` when nothing blocking is left after anchoring.
-- [ ] 4.5 Focused tests: an untouched-file nit is downgraded; a cited `missed` finding stays blocking; out-of-scope only parks; an unknown requirement id is dropped; a re-broken test is `reopened`.
+- [x] 4.4 Park with `only non-blocking findings remain` when nothing blocking is left after anchoring.
+- [x] 4.5 Focused tests: an untouched-file nit is downgraded; a cited `missed` finding stays blocking; out-of-scope only parks; an unknown requirement id is dropped; a re-broken test is `reopened`.
 
 ## 5. Converging repair brief
-- [ ] 5.1 The Attempts section (last three rounds) replaces Previous round, with its drop-order position.
-- [ ] 5.2 Requirement status line and Pattern section.
-- [ ] 5.3 Carried-finding round:
+- [x] 5.1 The Attempts section (last three rounds) replaces Previous round, with its drop-order position.
+- [x] 5.2 Requirement status line and Pattern section.
+- [x] 5.3 Carried-finding round:
   - fresh execution instead of `ResumeLatestTargetRoleThread`;
   - the root-cause opening line;
   - `repair_switch_model_when_stuck` (Project setting, api-types, TS, docs, web) selects the next fallback candidate for that round only.
-- [ ] 5.4 Exclude `flaky`, `pre_existing`, `minor` and `out_of_scope` from the round policy's open count.
-- [ ] 5.5 Focused tests:
+- [x] 5.4 Exclude `flaky`, `pre_existing`, `minor` and `out_of_scope` from the round policy's open count.
+- [x] 5.5 Focused tests:
   - a round-3 brief lists both earlier attempts;
   - the Pattern section appears for a `same_cause_as` family;
   - a carried finding starts a fresh execution;
@@ -85,8 +85,8 @@ completed_at:
   - Keep `auditor_failure_dispatches_follow_up_executor_with_thread_reuse` green for non-carried rounds.
 
 ## 6. Release
-- [ ] 6.1 `docs/architecture.md`: review CI triage, merge-queue head triage, Retry budgets (`repair_no_change`), Attention categories, repair brief.
-- [ ] 6.2 `CHANGELOG.md` `Unreleased`:
+- [x] 6.1 `docs/architecture.md`: review CI triage, merge-queue head triage, Retry budgets (`repair_no_change`), Attention categories, repair brief.
+- [x] 6.2 `CHANGELOG.md` `Unreleased`:
   - `### Changed`: pre-existing and flaky failures no longer block under the default `review_ci_triage: full`; opt out with `off`.
   - `### Added`: everything else.
 - [ ] 6.3 A named `crates/api/tests/suite/happy_path.rs` case: on a base with one failing test, a Task's review passes CI triage, the reviewer passes it, and the Task merges.
@@ -119,3 +119,11 @@ completed_at:
 - [x] 9.7 Remove the inert volatile triage budget; retain the public triage mode.
 - [x] 9.8 Document full entry CI's new check identity and one-time cached-pass miss.
 - [x] 9.9 Run the requested focused verification and record the final report.
+
+
+## 10. Phase-4 follow-ups (guards 4–5 implementation)
+- [x] 10.1 Count only blocking appearances in finding streaks; raising a minor starts at one, with a no-false-repeat regression test.
+- [x] 10.2 Use infrastructure retry/park for a failed progress-round review entry with no new verdict, without spending review or progress budget.
+- [x] 10.3 Preserve an unset Project `review_progress` setting on unrelated web saves, and allow clearing an override.
+- [x] 10.4 Share review-window SQL, remove the dead superseded check, and resolve signatures after a passing conformance `ci:N` flaky rerun.
+- [x] 10.5 Share workflow planning-role resolution between coordination routing and transactional review charging.

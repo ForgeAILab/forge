@@ -31,6 +31,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Later reviews anchor new blocking findings to frozen requirements, regressions,
+  or candidate-diff files. Other new findings become minor; out-of-scope findings
+  never block. Structured failed reviews with no blocking findings park for the
+  owner with `only non-blocking findings remain`. The findings API adds
+  `reopened` and `out_of_scope` statuses; clients matching statuses exhaustively
+  must handle them.
+
 - **Project access and mutation roles are now enforced across REST, MCP and
   SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its
   subroutes, `/tasks/{id}` and its subroutes, `/repos/{id}`, `/executions/{id}`,
@@ -3097,6 +3104,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Reviewer findings accept optional `requirement_ids`, `kind`, and `same_cause_as`.
+  Repair briefs carry the last three attempts, frozen requirement status and
+  shared-cause families within the 24 KiB cap. Re-broken findings name their
+  resolution round. Carried findings start fresh repair sessions with a root-cause
+  instruction; opt-in Project setting `repair_switch_model_when_stuck` prefers the
+  next fallback for that round only, then returns to the primary.
+
 - `retry_budgets.review_progress` (default 2, 0 disables), Task/Project editors,
   and Task remaining/limit projections for extra repair rounds on progress.
 - Additive `superseded` finding status for step-level CI findings replaced by
@@ -3466,6 +3480,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- Review streaks count only blocking appearances. Progress-round entry failures
+  use infrastructure retries, and custom workflow planning roles agree between
+  review routing and charging. A passing conformance CI rerun resolves prior test
+  findings just like entry CI. Project settings preserve an unset progress-round
+  allowance on unrelated saves and allow clearing an override back to default.
+  Stranded lead-root Reviews honor the same owner/non-blocking parks as initial
+  completion.
 
 - Repair convergence compares against the latest Review, so a later pass of the
   same commit does not resurrect an old failure. Suspended review entries from

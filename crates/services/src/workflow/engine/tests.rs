@@ -5338,3 +5338,103 @@ async fn review_comments_ci_only_failure_and_routing_replay_are_idempotent() {
 }
 
 mod no_change;
+
+#[tokio::test]
+async fn review_progress_entry_hook_failure_uses_infrastructure_retry_not_review_park() {
+    let db = Arc::new(sqlite_db().await);
+    let event_bus = Arc::new(EventBus::new(64));
+    let task_id = new_uuid_v4();
+    let workflow =
+        user_approval_review_workflow(hook("run_ci_steps", FailurePolicy::Block), Vec::new());
+    seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(
+            json!({"retry_budgets":{"review":2}, "review":{"ci_steps":"not-an-array"}}).to_string(),
+        )
+        .bind(&task_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // A granted progress round returns after the ordinary budget is spent.
+    let reviewed_at = now_rfc3339();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('prior-coder',?,'coder','completed',?,?)")
+        .bind(&task_id).bind(&reviewed_at).bind(&reviewed_at).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('progress-review',?,'prior-coder',2,'failed','{}',?,?,?)")
+        .bind(&task_id).bind(&reviewed_at).bind(&reviewed_at).bind(&reviewed_at).execute(db.pool()).await.unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    for identity in ["review:one", "review:progress-review"] {
+        db::budget::charge(&mut tx, &task_id, "review", 2, identity)
+            .await
+            .unwrap();
+    }
+    db::budget::charge(
+        &mut tx,
+        &task_id,
+        "review_progress",
+        2,
+        "progress:progress-review",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let task = TaskRepo::get_by_id(&*db, &task_id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let service = engine(Arc::clone(&db), Arc::clone(&event_bus));
+    let transition = service
+        .workflow_execution()
+        .transition(
+            &task_id,
+            "review",
+            task.version,
+            &workflow,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            "progress repair completed",
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let result = drain_result(service, transition).await;
+    assert_eq!(result.task.status, "review");
+    let annotation: serde_json::Value = serde_json::from_str(
+        result
+            .task
+            .error_annotation
+            .as_deref()
+            .expect("infrastructure annotation"),
+    )
+    .unwrap();
+    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
+    assert!(annotation["message"].as_str().unwrap().contains("ci_steps"));
+    assert!(
+        result.task.blocked_json.is_none(),
+        "the existing infrastructure backoff owns this retry"
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task_id, "review")
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task_id, "review_progress")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db::budget::spent(db.pool(), &task_id, "review_ci_infrastructure")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db::ReviewRepo::list_by_task(&*db, &task_id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}

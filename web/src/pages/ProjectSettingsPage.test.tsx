@@ -164,7 +164,7 @@ describe('Project flow control settings', () => {
             version: 7,
             settings: expect.objectContaining({
               max_active_tasks: Number(value),
-              retry_budgets: { review: 3, review_progress: 2 },
+              retry_budgets: { review: 3 },
               environment: project.settings.environment,
               command_allowlist: project.settings.command_allowlist,
             }),
@@ -288,7 +288,7 @@ describe('Project flow control settings', () => {
 it.each(['0', '4'])('saves the Project progress round allowance %s', async (value) => {
   renderSettings('general')
   await waitFor(() =>
-    expect((screen.getByLabelText('Progress round allowance') as HTMLInputElement).value).toBe('2'),
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
   )
   fireEvent.change(screen.getByLabelText('Progress round allowance'), { target: { value } })
   fireEvent.click(screen.getByRole('button', { name: 'Save' }))
@@ -302,4 +302,45 @@ it.each(['0', '4'])('saves the Project progress round allowance %s', async (valu
     }),
     expect.any(Object),
   )
+})
+
+it('leaves an unset progress allowance unset when saving unrelated settings', async () => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+  )
+  const allowance = screen.getByLabelText('Progress round allowance') as HTMLInputElement
+  expect(allowance.value).toBe('')
+  expect(allowance.placeholder).toBe('Default (2)')
+  fireEvent.change(screen.getByLabelText('Active task limit'), { target: { value: '7' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.retry_budgets).toEqual({ review: 3 })
+})
+
+it('can clear a stored progress allowance back to the default', async () => {
+  query.data = {
+    ...project,
+    settings: { ...project.settings, retry_budgets: { review: 3, review_progress: 4 } },
+  }
+  renderSettings('general')
+  await waitFor(() =>
+    expect((screen.getByLabelText('Progress round allowance') as HTMLInputElement).value).toBe('4'),
+  )
+  fireEvent.change(screen.getByLabelText('Progress round allowance'), { target: { value: '' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.retry_budgets).toEqual({ review: 3 })
+})
+
+it('keeps model switching opt-in and saves the explicit choice', async () => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+  )
+  const toggle = screen.getByRole('checkbox', {
+    name: 'Switch model when stuck',
+  }) as HTMLInputElement
+  expect(toggle.checked).toBe(false)
+  fireEvent.click(toggle)
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.repair_switch_model_when_stuck).toBe(true)
 })

@@ -143,6 +143,9 @@ pub struct AgentDispatchContext {
     /// Exact accounting window for repair; None only in synthetic contexts.
     pub review_window: Option<Vec<db::Review>>,
     pub previous_coder_summary: Option<String>,
+    pub repair_attempts: Vec<repair_brief::RepairAttempt>,
+    pub carried_repair: bool,
+    pub reset_model_after_repair: bool,
     pub repair_budget: Option<repair_brief::RepairBudget>,
     pub parent_task: Option<db::Task>,
     pub sub_tasks: Vec<db::Task>,
@@ -477,6 +480,9 @@ pub fn build_effective_prompt(
 ) -> (AgentPrompt, EffectivePromptSelection) {
     let mut selection =
         effective_prompt_selection(&dispatch_ctx.role, trigger_dispatch, state_dispatch);
+    if dispatch_ctx.carried_repair || dispatch_ctx.reset_model_after_repair {
+        selection.execution_policy = EXECUTION_POLICY_NEW_EXECUTION.to_owned();
+    }
     let read_only_worker = dispatch_ctx.read_only_task
         && matches!(
             dispatch_ctx.role.as_str(),

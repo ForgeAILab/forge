@@ -981,6 +981,7 @@ impl TaskDispatcher {
             "target_role": role_name,
             "builder_id": selection.builder_id,
             "execution_policy": selection.execution_policy,
+                    "carried_finding": dispatch_ctx.carried_repair,
         });
         if self.is_stopped() {
             return Ok(false);
@@ -1187,6 +1188,7 @@ impl TaskDispatcher {
             "target_role": role_name,
             "builder_id": selection.builder_id,
             "execution_policy": selection.execution_policy,
+                    "carried_finding": dispatch_ctx.carried_repair,
         });
         if self.is_stopped() {
             return Ok(false);

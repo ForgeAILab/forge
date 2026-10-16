@@ -131,6 +131,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
     ReviewResult::export().expect("export ReviewResult");
     FixableBy::export().expect("export FixableBy");
     ReviewFinding::export().expect("export ReviewFinding");
+    ReviewFindingKind::export().expect("export ReviewFindingKind");
     ReviewFindingSeverity::export().expect("export ReviewFindingSeverity");
     ReviewFindingSource::export().expect("export ReviewFindingSource");
     ReviewFindingStatus::export().expect("export ReviewFindingStatus");

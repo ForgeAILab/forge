@@ -248,3 +248,28 @@ async fn review_round_routing_progress_setting_is_validated_and_resolved() {
     .unwrap_err();
     assert!(error.to_string().contains("retry_budgets.review_progress"));
 }
+
+#[tokio::test]
+async fn executions_repair_model_switch_setting_is_opt_in_and_validated() {
+    let db = fixture().await;
+    assert!(!api_types::ProjectSettings::default().repair_switch_model_when_stuck);
+    for enabled in [false, true] {
+        let settings = json!({"repair_switch_model_when_stuck":enabled});
+        validate_project_settings(&db, &settings, &workflow(), Some(PROJECT), None)
+            .await
+            .unwrap();
+        let parsed: api_types::ProjectSettings = serde_json::from_value(settings).unwrap();
+        assert_eq!(parsed.repair_switch_model_when_stuck, enabled);
+    }
+    for value in [json!(null), json!("true"), json!(1), json!({})] {
+        assert!(validate_project_settings(
+            &db,
+            &json!({"repair_switch_model_when_stuck":value}),
+            &workflow(),
+            Some(PROJECT),
+            None
+        )
+        .await
+        .is_err());
+    }
+}

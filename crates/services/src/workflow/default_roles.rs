@@ -1,4 +1,4 @@
-pub const PLANNER: &str = "planner";
+pub const PLANNER: &str = api_types::DEFAULT_WORKFLOW_PLANNING_ROLE;
 pub const CODER: &str = "coder";
 pub const WORKER: &str = "worker";
 pub const REVIEWER: &str = "reviewer";

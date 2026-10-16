@@ -10004,8 +10004,9 @@ async fn review_round_progress_granted_and_self_reported_repeat_ignored() {
     let (db, service, task, execution, _dir) =
         seed_admitted_review_with(r#"{"retry_budgets":{"review":2}}"#).await;
     structured_round_previous(&db, &task.id, 3).await;
+    // Anchor the new finding so this case continues to exercise round accounting.
     complete_review_with(&db, &service, &execution,
-        r#"{"result":"fail","reason":"one left","repeat":true,"findings":[{"summary":"new issue"}],"resolved":["F1","F2","F3"]}"#).await;
+        r#"{"result":"fail","reason":"one left","repeat":true,"findings":[{"summary":"new issue","kind":"regression"}],"resolved":["F1","F2","F3"]}"#).await;
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .unwrap()
@@ -10037,8 +10038,9 @@ async fn review_round_no_progress_with_new_findings_exhausts_review() {
     let (db, service, task, execution, _dir) =
         seed_admitted_review_with(r#"{"retry_budgets":{"review":2}}"#).await;
     structured_round_previous(&db, &task.id, 1).await;
+    // Anchor the new finding so this case continues to exercise round accounting.
     complete_review_with(&db, &service, &execution,
-        r#"{"result":"fail","reason":"new issue","findings":[{"summary":"new issue"}],"resolved":["F1"]}"#).await;
+        r#"{"result":"fail","reason":"new issue","findings":[{"summary":"new issue","kind":"regression"}],"resolved":["F1"]}"#).await;
     let task = TaskRepo::get_by_id(&*db, &task.id, false)
         .await
         .unwrap()
@@ -10256,4 +10258,116 @@ async fn review_round_owner_rerun_never_exceeds_the_progress_limit() {
         assert_eq!(annotation["type"], "review_budget_exhausted", "{config}");
         assert_eq!(round_spending(&db, &task.id).await, (1, spent), "{config}");
     }
+}
+
+#[tokio::test]
+async fn review_anchoring_nonblocking_only_parks_without_spending_or_dispatching() {
+    for finding in [
+        json!({"summary":"naming in untouched code", "where":"src/untouched.rs:42", "requirement_ids":["R99"]}),
+        json!({"summary":"later project feature", "kind":"out_of_scope"}),
+    ] {
+        let (db, service, task, execution, _dir) =
+            seed_admitted_review_with(r#"{"retry_budgets":{"review":3}}"#).await;
+        structured_round_previous(&db, &task.id, 1).await;
+        let before = round_spending(&db, &task.id).await;
+        let execution_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+                .bind(&task.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        complete_review_with(&db, &service, &execution,
+            &json!({"result":"fail","reason":"one remaining nit","findings":[finding],"resolved":["F1"]}).to_string()).await;
+        assert_owner_review_park(&db, &task.id, "only non-blocking findings remain").await;
+        assert_eq!(round_spending(&db, &task.id).await, before);
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            after, execution_count,
+            "a non-blocking-only fail dispatched a coder"
+        );
+        let comments = review_comment_contents(&db, &task.id).await.join("\n");
+        assert!(comments.contains("only non-blocking findings remain"));
+        assert!(
+            comments.contains("follow-up candidate")
+                || comments.contains("outside requirements and Task files")
+        );
+        let conformance = db::ReviewConformanceRepo::review_conformance(&*db, &execution.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(conformance
+            .assessment
+            .unwrap()
+            .findings
+            .iter()
+            .all(|finding| !finding.requirement_ids.contains(&"R99".to_owned())));
+    }
+}
+
+#[tokio::test]
+async fn review_anchoring_stranded_lead_root_keeps_the_nonblocking_owner_park() {
+    let (db, service, task, execution, repo_dir) = seed_admitted_review().await;
+    let reply = r#"{"result":"fail","reason":"separate scope","findings":[{"summary":"later project feature","kind":"out_of_scope"}]}"#;
+    let conformance = ::review::contract::evaluate(&db, &execution.id, repo_dir.path(), reply)
+        .await
+        .unwrap();
+    let review = ReviewRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .remove(0);
+    let now = now_rfc3339();
+    ReviewRepo::update_status(
+        &*db,
+        &review.id,
+        ReviewStatus::Failed,
+        json!({"ci_steps":[], "conformance":conformance}).to_string(),
+        Some(now.clone()),
+        &now,
+    )
+    .await
+    .unwrap();
+    // A settled verdict can be recovered after its completion delivery stopped.
+    sqlx::query("UPDATE execution SET status='completed',summary=?,updated_at=? WHERE id=?")
+        .bind(reply)
+        .bind(&now)
+        .bind(&execution.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO task(id,project_id,title,status,task_type,parent_task_id,created_at,updated_at) VALUES(?,?,'Finished step','done','sub_task',?,?,?)")
+        .bind(new_uuid_v4()).bind(&task.project_id).bind(&task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let lead = crate::test_support::seed_native_agent(&db).await;
+    seed_role_assignment(
+        &db,
+        &task.id,
+        crate::workflow::default_roles::PLANNER,
+        Some(&lead),
+    )
+    .await;
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let before = round_spending(&db, &task.id).await;
+    let (_, target, reason) = service
+        .review_failure_target(&current, Some(&execution.id))
+        .await
+        .unwrap();
+    assert!(
+        target.is_none(),
+        "non-blocking findings dispatched the lead"
+    );
+    assert_eq!(reason, "only non-blocking findings remain");
+    assert_owner_review_park(&db, &task.id, "only non-blocking findings remain").await;
+    assert_eq!(round_spending(&db, &task.id).await, before);
+    assert_eq!(
+        db::budget::spent(db.pool(), &task.id, "replan")
+            .await
+            .unwrap(),
+        0
+    );
 }

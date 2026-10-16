@@ -2521,9 +2521,7 @@ impl TaskService {
         rule: &str,
     ) -> Result<()> {
         let ledger = self.review_comment_ledger(review).await?;
-        let ids = finding_ids(&ledger, |entry| {
-            entry.status == api_types::ReviewFindingStatus::Open
-        });
+        let ids = finding_ids(&ledger, |entry| entry.status.is_open());
         self.create_review_comment(review, "park", None, format!(
             "Task parked after review attempt {}: {rule}. Open findings: {ids}. Owner actions: re-run review, mark reviewed with a reason, or cancel the Task. See the Review tab.", review.attempt_number
         )).await
@@ -2624,7 +2622,7 @@ impl TaskService {
             }
             _ => db::review_findings::RoundPolicy::default(),
         };
-        if let Some(review) = latest_review.as_ref().filter(|_| !lead_assigned) {
+        if let Some(review) = latest_review.as_ref() {
             let details: Value =
                 serde_json::from_str(&review.step_results_json).unwrap_or_default();
             if let Ok(conformance) = serde_json::from_value::<api_types::ReviewConformance>(
@@ -2636,7 +2634,7 @@ impl TaskService {
                     review,
                     &ReviewRepo::list_by_task(&*self.db, &task.id).await?,
                     &window.reviews,
-                    true,
+                    !lead_assigned,
                 ) {
                     let id = review
                         .reviewer_execution_id
@@ -3426,10 +3424,9 @@ fn current_comment_findings(
         .filter(|entry| {
             entry.status != Status::Superseded
                 && (entry.status != Status::Resolved
-                    || (entry.status != Status::Superseded
-                        && !previous
-                            .iter()
-                            .any(|prior| prior.id == entry.id && prior.status == Status::Resolved)))
+                    || !previous
+                        .iter()
+                        .any(|prior| prior.id == entry.id && prior.status == Status::Resolved))
         })
         .cloned()
         .collect()
@@ -3483,10 +3480,10 @@ fn reviewer_comment(
         })
         .collect();
     entries.sort_by_key(|entry| match entry.status {
-        Status::Open => 0,
+        Status::Open | Status::Reopened => 0,
         Status::Resolved => 1,
         Status::Unconfirmed => 2,
-        Status::Flaky | Status::PreExisting | Status::Superseded => 3,
+        Status::Flaky | Status::PreExisting | Status::Superseded | Status::OutOfScope => 3,
     });
     let mut listed = 0;
     let mut overflow = Vec::new();
@@ -3505,7 +3502,7 @@ fn reviewer_comment(
         // A line ending inside finding text would start a forged list item.
         let id = one_line(&entry.id);
         let summary = clip_chars(&one_line(&entry.summary), REVIEW_COMMENT_SUMMARY_CHARS);
-        let line = match entry.status {
+        let mut line = match entry.status {
             Status::Open if entry.first_attempt == attempt_number => format!(
                 "- [ ] {id} New: {summary} — open since attempt {}",
                 entry.first_attempt
@@ -3514,6 +3511,11 @@ fn reviewer_comment(
                 "- [ ] {id} {summary} — open since attempt {}",
                 entry.first_attempt
             ),
+            Status::Reopened => format!(
+                "- [ ] {id} {summary} — re-broken: resolved in round {}",
+                entry.resolved_attempt.unwrap_or_default()
+            ),
+            Status::OutOfScope => format!("- {id} {summary} — out_of_scope (follow-up candidate)"),
             Status::Resolved => format!(
                 "- [x] {id} {summary} — {}",
                 if entry.source == Source::Reviewer {
@@ -3527,6 +3529,9 @@ fn reviewer_comment(
             Status::Flaky => format!("- {id} {summary} — flaky (non-blocking)"),
             Status::PreExisting => format!("- {id} {summary} — pre-existing (non-blocking)"),
         };
+        if let Some(note) = &entry.anchoring_note {
+            line.push_str(&format!(" — minor: {}", one_line(note)));
+        }
         if overflow.is_empty() && listed + line.len() < REVIEW_COMMENT_FINDINGS_LIMIT {
             listed += line.len() + 1;
             out.push('\n');
@@ -3636,7 +3641,7 @@ fn repair_round_comment(
     budget: &str,
 ) -> String {
     use api_types::ReviewFindingStatus as Status;
-    let open = finding_ids(ledger, |entry| entry.status == Status::Open);
+    let open = finding_ids(ledger, |entry| entry.status.is_open());
     let resolved = finding_ids(ledger, |entry| {
         entry.status == Status::Resolved && entry.last_checked_attempt == attempt
     });
@@ -3859,6 +3864,11 @@ mod reviewer_message_tests {
         status: api_types::ReviewFindingStatus,
     ) -> api_types::ReviewFindingEntry {
         api_types::ReviewFindingEntry {
+            requirement_ids: Vec::new(),
+            kind: None,
+            same_cause_as: None,
+            anchoring_note: None,
+            resolved_attempt: None,
             ci_triage: None,
             id: id.into(),
             source: api_types::ReviewFindingSource::Reviewer,
@@ -3920,6 +3930,9 @@ mod reviewer_message_tests {
             fixable_by: api_types::FixableBy::Coder,
             repeat: false,
             findings: vec![api_types::ReviewFinding {
+                requirement_ids: Vec::new(),
+                kind: None,
+                same_cause_as: None,
                 id: Some("F1".into()),
                 summary: "Issue F1".into(),
                 severity: api_types::ReviewFindingSeverity::Blocking,
@@ -4198,9 +4211,7 @@ mod reviewer_message_tests {
         assert_eq!(text.matches("CI-0#").count(), 20, "{text}");
         assert!(text.contains("CI-0 +10 more"), "{text}");
         assert!(text.contains("F1"), "{text}");
-        let open = finding_ids(&ledger, |entry| {
-            entry.status == api_types::ReviewFindingStatus::Open
-        });
+        let open = finding_ids(&ledger, |entry| entry.status.is_open());
         assert_eq!(open.matches("CI-0#").count(), 20, "{open}");
     }
     #[test]

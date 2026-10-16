@@ -12,6 +12,7 @@ use crate::workflow::{
         BUILDER_ID_PLANNER_DEFAULT_V2, BUILDER_ID_READ_ONLY_TASK_V1,
         BUILDER_ID_REVIEWER_CONFORMANCE_V1, BUILDER_ID_WORKER_AUTONOMOUS_V1,
         BUILDER_ID_WORKER_MERGE_FIX_V1, BUILDER_ID_WORKER_REVIEW_FIX_V1,
+        EXECUTION_POLICY_NEW_EXECUTION, EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD,
     },
 };
 
@@ -114,6 +115,9 @@ fn fake_context(role: &str) -> AgentDispatchContext {
         prior_reviews: Vec::new(),
         review_window: None,
         previous_coder_summary: None,
+        repair_attempts: Vec::new(),
+        carried_repair: false,
+        reset_model_after_repair: false,
         repair_budget: None,
         parent_task: None,
         sub_tasks: Vec::new(),
@@ -1522,7 +1526,7 @@ fn repair_brief_two_rounds_lists_open_resolved_and_previous_summary() {
             "Failing check output:",
             "Verify results and evidence:",
             "Reviewer report:",
-            "Previous round:",
+            "Attempts:",
         ]
         .iter()
         .map(|section| text.find(section).unwrap())
@@ -1551,7 +1555,7 @@ fn repair_brief_budget_trims_report_before_other_sections() {
         .split("Reviewer report:\n")
         .nth(1)
         .unwrap()
-        .split("\n\nPrevious round:")
+        .split("\n\nAttempts:")
         .next()
         .unwrap();
     assert!(report.len() <= 2 * 1024);
@@ -1987,4 +1991,146 @@ fn repair_brief_hard_cap_with_long_task_and_forty_waived_steps() {
         assert!(text.contains("truncated"));
         assert!(text.contains("flaky (non-blocking)"));
     }
+}
+
+fn convergence_contract(attempt: i64) -> serde_json::Value {
+    json!({"execution_id":format!("reviewer-{attempt}"),"policy":"p","commit_sha":format!("c{attempt}"),"base_sha":"base",
+    "candidate_changed_paths":["src/a.rs", "src/b.rs"],"check_results":[],"digest":"d", "context":{
+        "project_id":"p","task_id":"task-1","repo_id":null,"charter_revision_id":null,"charter_digest":null,"charter":null,
+        "task_scope":{},"linked_documents":[],"requirements":[
+            {"id":"R1","source":"task","text":"No stale apply","universal":false,"allocated_task_id":null},
+            {"id":"R2","source":"task","text":"Save drafts","universal":false,"allocated_task_id":null},
+            {"id":"R3","source":"task","text":"Other","universal":false,"allocated_task_id":null}
+        ],"required_checks":[],"source_digest":"d"
+    }})
+}
+
+#[test]
+fn repair_brief_round_three_has_attempt_memory_requirements_patterns_and_rebroken_findings() {
+    use super::repair_brief::{RepairAttempt, RepairBrief};
+    let mut ctx = fake_context(default_roles::CODER);
+    let first = db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"tests","exit_code":1,"stderr_tail":"","failures":["broken::again"]}],
+            "conformance":{"status":"failed","contract":convergence_contract(1), "checks":[],"assessment":{"result":"fail","reason":"issues","findings":[
+                {"summary":"stale apply", "where":"src/a.rs:4", "requirement_ids":["R1"]},
+                {"summary":"save drafts", "requirement_ids":["R2"]},
+                {"summary":"carried problem"}
+            ]}}}).to_string(), ..fake_review(1, db::ReviewStatus::Failed)
+    };
+    let second = db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"tests","exit_code":0,"stderr_tail":""}],
+            "conformance":{"status":"failed","contract":convergence_contract(2), "checks":[],"assessment":{"result":"fail","reason":"two left", "resolved":["F1", "F2"],"findings":[
+                {"id":"F3", "summary":"carried problem"},
+                {"summary":"another stale apply", "where":"src/b.rs:8", "same_cause_as":"F1", "requirement_ids":["R1"]}
+            ]}}}).to_string(), ..fake_review(2, db::ReviewStatus::Failed)
+    };
+    let third = db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"tests","exit_code":1,"stderr_tail":"","failures":["broken::again"]}],
+            "conformance":{"status":"failed","contract":convergence_contract(3), "checks":[],"assessment":{"result":"fail","reason":"one left", "resolved":["F3"],"findings":[
+                {"id":"F4", "summary":"another stale apply", "where":"src/b.rs:8", "same_cause_as":"F1", "requirement_ids":["R1"]}
+            ]}}}).to_string(), ..fake_review(3, db::ReviewStatus::Failed)
+    };
+    ctx.prior_reviews = vec![first, second, third];
+    ctx.repair_attempts = (1..=3)
+        .map(|attempt| RepairAttempt {
+            attempt,
+            from_sha: Some(format!("c{}", attempt - 1)),
+            to_sha: Some(format!("c{attempt}")),
+            files: vec![format!("src/round{attempt}.rs (+2, -1)")],
+            files_unavailable: false,
+            summary: Some(format!("Approach {attempt}: {}", "s".repeat(2000))),
+        })
+        .collect();
+    let text = RepairBrief::review(&ctx).render();
+    assert!(
+        text.starts_with("Before editing, write a short root-cause note for each carried finding."),
+        "{text}"
+    );
+    for expected in [
+        "Attempts:",
+        "Round 1: c0..c1",
+        "Round 2: c1..c2",
+        "src/round1.rs",
+        "src/round2.rs",
+        "Approach 1",
+        "Approach 2",
+        "F1, F2",
+        "Left open: F3",
+        "Opened: F4",
+        "Do not repeat an approach",
+        "Requirement status:",
+        "R1: unmet",
+        "R2: addressed",
+        "R3: no open finding",
+        "Pattern:",
+        "F1: src/a.rs:4",
+        "F4: src/b.rs:8",
+        "These share a cause. Fix it at every call site and list the sites you changed.",
+        "re-broken: resolved in round 2",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+    assert!(!text.contains(&"s".repeat(1025)));
+    assert!(text.len() <= 24 * 1024);
+}
+
+#[test]
+fn repair_brief_attempts_cut_oldest_after_report_and_pattern_is_protected_under_cap() {
+    use super::repair_brief::{RepairAttempt, RepairBrief};
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.task.description = Some("界".repeat(10 * 1024));
+    ctx.plan = Some("計".repeat(10 * 1024));
+    for attempt in 1..=3 {
+        let findings = if attempt == 1 {
+            json!([{"summary":"first instance", "where":"src/a.rs:1", "requirement_ids":["R1"]}])
+        } else {
+            json!([{"id":"F1","summary":"first instance", "where":"src/a.rs:1", "requirement_ids":["R1"]},
+                {"summary":"same cause", "where":"src/b.rs:2", "kind":"regression", "same_cause_as":"F1", "observed":"o".repeat(1000)}])
+        };
+        let steps: Vec<_> = (0..40).map(|index| json!({"index":index,"command":format!("step-{index}"),"exit_code":1,"stderr_tail":"tail".repeat(1024), "failures":[format!("case-{index}")]})).collect();
+        ctx.prior_reviews.push(db::Review { step_results_json:json!({"ci_steps":steps,"conformance":{"status":"failed", "contract":convergence_contract(attempt), "checks":[], "assessment":{"result":"fail","reason":"problems", "report":"r".repeat(30000),"findings":findings}}}).to_string(), ..fake_review(attempt, db::ReviewStatus::Failed) });
+        ctx.repair_attempts.push(RepairAttempt {
+            attempt,
+            from_sha: Some(format!("c{}", attempt - 1)),
+            to_sha: Some(format!("c{attempt}")),
+            files: vec!["path".repeat(1000); 20],
+            files_unavailable: false,
+            summary: Some("summary".repeat(300)),
+        });
+    }
+    let text = RepairBrief::review(&ctx).render();
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    for expected in [
+        "Requirement status:",
+        "R1: unmet",
+        "Pattern:",
+        "F1: src/a.rs:1",
+        "src/b.rs:2",
+        "These share a cause.",
+        "Open findings:",
+        "Description:",
+        "Original plan:",
+    ] {
+        assert!(text.contains(expected), "{expected} missing: {text}");
+    }
+    assert!(!text.contains("Reviewer report:"));
+    assert!(!text.contains("Attempts:"));
+}
+
+#[test]
+fn carried_repair_selection_is_fresh_and_noncarried_keeps_thread_reuse() {
+    let mut ctx = fake_context(default_roles::CODER);
+    let intent = DispatchIntent {
+        builder_id: Some(BUILDER_ID_CODER_REVIEW_FIX_V2.into()),
+        execution_policy: Some(EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD.into()),
+        prompt_config: json!({}),
+    };
+    let (_, selection) = build_effective_prompt(&ctx, Some(&intent), None);
+    assert_eq!(
+        selection.execution_policy,
+        EXECUTION_POLICY_RESUME_LATEST_TARGET_ROLE_THREAD
+    );
+    ctx.carried_repair = true;
+    let (_, selection) = build_effective_prompt(&ctx, Some(&intent), None);
+    assert_eq!(selection.execution_policy, EXECUTION_POLICY_NEW_EXECUTION);
 }

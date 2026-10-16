@@ -261,7 +261,8 @@ pub(crate) async fn execution_admission_for_task(
 use self::{
     config::{
         build_executor_config_snapshot, create_failed_execution_record,
-        executor_snapshot_with_resume_thread, parse_json_value, truncate_utf8_bytes,
+        executor_snapshot_with_next_fallback, executor_snapshot_with_resume_thread,
+        parse_json_value, truncate_utf8_bytes,
     },
     logs::execution_logs_path,
     validation::{serialize_config, validate_required},

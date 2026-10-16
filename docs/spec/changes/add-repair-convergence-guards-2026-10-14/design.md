@@ -311,3 +311,22 @@ All resolved. The owner accepted the recommendations on 2026-10-14.
   for the owner. Forge does not pass it automatically.
 - **Q3.** `repair_switch_model_when_stuck` is opt-in (default `false`).
 - **Q4.** Triage also runs at the merge-queue head.
+
+
+## Phases 4–5 implementation decisions (2026-10-16)
+
+- Anchoring and reopened state are projections in `db::review_findings`.
+  Unknown requirement IDs are also removed before an assessment is frozen;
+  empty optional fields preserve older assessment serialization.
+- `resolved_attempt` records the last actual resolution, including across a
+  later reopened status. Minor appearances count zero in a blocking streak.
+- Attempts keep the last three settled, non-manual Reviews and use owner-backed
+  diffs between reviewed commits. The oldest attempt is cut first after the
+  reviewer report; Requirement status and Pattern are protected with findings.
+- Model switching promotes the first fallback in a fresh execution snapshot
+  only. The next ordinary round starts on the primary, fresh when the previous
+  snapshot switched models, so same-agent continuation cannot make it sticky.
+- `WorkflowDefinition` owns the shared planning-state/coordination-role resolver;
+  budget charging and services use it. Review-window reads share one SQL owner.
+- Project settings stay optional JSON; no migration is required. Detailed
+  choices and verification are recorded under `/Volumes/Data/tmp/refactor/guards-45/`.

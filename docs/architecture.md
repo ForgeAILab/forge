@@ -8244,7 +8244,7 @@ sections are best effort and stay inside the prepared-prompt byte limit.
 
 Reviewer result blocks also accept optional structured `findings` and
 `resolved` ids. The frozen assessment keeps only the reviewer's bounded input;
-Forge assigns ids and derives open/resolved/unconfirmed status and streaks with
+Forge assigns ids and derives open/reopened/resolved/unconfirmed status and blocking streaks with
 `db::review_findings::finding_ledger`. `SqliteDb::review_window` reads the persisted Review
 budget window and its Reviews together. A retry-window reset starts a fresh
 ledger; a source that did not run leaves its findings unchanged. A reviewer
@@ -8259,7 +8259,22 @@ current outcome fields, only a passing step provides complete pass evidence and
 resolves its per-test findings: a first-run pass, or a CI-triage re-run of the
 whole step that passed (step class `flaky`). A step-level finding replaced by per-test
 findings becomes `superseded`, never a resolution or progress credit. The re-review prompt carries the prior ledger's
-open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
+open/reopened ids and retains the 8 KiB report slice. Both the response instruction
+and re-review section list frozen requirement IDs and explain `requirement_ids`,
+`kind` (`regression`, `missed`, `out_of_scope`) and `same_cause_as`. Parsing stays
+lenient; unknown requirement IDs are dropped before freezing, and empty optional
+fields are omitted. From review 2, a new blocking finding without a regression,
+known requirement citation, or candidate-diff file becomes minor with the note
+“outside requirements and Task files”. Continued IDs keep their identity.
+`out_of_scope` never blocks and is listed as a follow-up candidate. Anchoring
+changes only the ledger, never the assessment.
+
+A resolved finding that fails again becomes `reopened`, with its last actual
+`resolved_attempt` retained; briefs and comments say “re-broken: resolved in round
+N”. It counts as open and starts a fresh blocking streak. Minor appearances
+contribute zero: raising a minor to blocking starts at one. A structured reviewer
+fail left with no blocking findings parks `review_needs_owner` with
+`only non-blocking findings remain`, without spending a Review allowance. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. The ledger also drives round-policy routing
 and budget charging through `db::review_findings::round_policy`. Findings are naturally ordered by id before
 any API cap (`F2` before `F10`); the complete projection still reserves all ids.
@@ -8290,9 +8305,11 @@ the persisted Review-budget window, the complete finding ledger, all failing
 Review CI steps with their failure signatures and tails, optional recorded
 verify results/evidence, the reviewer report, and the reviewed coder's completion
 summary. The ordered sections are Task (description and canonical plan), Round
-(charged budget and remaining allowance), Open findings (including survived
-repair rounds), Resolved/unconfirmed changes, Failing check output, Verify,
-Reviewer report, Previous round, and Logs. Empty optional sections are omitted.
+(charged budget and remaining allowance), Requirement status, Pattern, Open
+findings (including survived repair rounds), Resolved/unconfirmed changes,
+Failing check output, Verify, Reviewer report, Attempts, and Logs. Empty optional
+sections are omitted. Pattern precedes the open list so even an exceptional
+id-only truncation retains the shared-cause instruction.
 At most 20 signature findings per step are displayed, followed by `+N more`;
 the ledger itself retains every finding. Failing check output lists blocking
 steps first; steps CI triage waived under `full` follow, labelled non-blocking,
@@ -8300,7 +8317,7 @@ so their tails never use the shared allowance first. A no-change reminder still 
 request and names its `repair_no_change` allowance.
 
 The brief body is capped at 24 KiB. It trims the report to 2 KiB, then drops
-it; drops the previous summary; reduces each check tail to 1 KiB; and reduces
+it; cuts Attempts oldest round first (keeping the latest longest); reduces each check tail to 1 KiB; and reduces
 the resolved/unconfirmed section to ids. Next, all check tails share 4 KiB
 (later steps keep their command and signatures) and the verify section keeps
 2 KiB. Only then is finding text clipped: summary 200, where 120, expected and
@@ -8310,15 +8327,35 @@ UTF-8-safe truncation note. Waived and other update lines share a 1 KiB allowanc
 once compacted; check output shares 8 KiB and logs keep 1 KiB. The final byte
 bound includes its truncation notice even if an exceptional window has more ids
 than the entire brief can contain; the complete ledger remains readable.
-Attempts/Pattern history and verify execution are later phases.
+Attempts retains the last three settled review rounds: their reviewed commit
+range, up to 20 changed files with diff statistics through the workspace owner,
+the coder completion summary (1 KiB), and resolved/left-open/opened finding IDs.
+Missing historical Git evidence is explicitly unavailable. The closing instruction
+asks the coder not to repeat an approach that left a finding open, or to explain
+why it failed before. Requirement status is one line per frozen requirement:
+`unmet` for an open blocking citation, `addressed` when only resolved findings cite
+it, otherwise `no open finding`. Pattern joins transitive `same_cause_as` families,
+including resolved ancestors and locations, and asks for every call site to be
+fixed. Requirement status and Pattern are protected with findings under the hard
+24 KiB cap; verify execution remains a later phase.
+
+A carried blocking reviewer finding (streak at least two in the latest review)
+starts a fresh repair execution instead of resuming the prior thread. The brief
+opens “Before editing, write a short root-cause note for each carried finding”,
+requesting a `decision` worklog entry. Project setting
+`repair_switch_model_when_stuck` defaults false; when opted in, an available CLI
+fallback is preferred for that execution only. Agent configuration and the full
+route stay unchanged. The next ordinary round returns to the primary candidate;
+it starts fresh if the previous execution switched, so sticky thread continuity
+cannot extend the model change. Other ordinary repair rounds retain thread reuse.
+Native Agents have no CLI fallback chain and keep their configured model.
 
 Actionable merge send-backs use brief-only `MERGE-CI` or `MERGE-CONFLICT`
 findings. `MERGE-CI` quotes the send-back's target, failing command, up to 20
 failing test signatures (`+N more`), and the last 2 KiB of output;
 `MERGE-CONFLICT` gives the committed-marker paths and reconciliation instructions.
 Neither enters the Review ledger. Dirty-worktree and owner-only repair messages
-retain their existing behavior; prompt builder ids and thread-resume policy are
-unchanged.
+retain their existing behavior and prompt builder ids.
 
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
@@ -8338,7 +8375,7 @@ dispatches a coder.
 Before coder remediation, `blocked` and `fixable_by: owner` keep their
 existing owner parks. Otherwise, structured findings drive D5 in both reviewer
 completion and review-entry hook disposition. Progress means strictly fewer
-`status == open && severity == blocking` findings than after the preceding
+`status in {open, reopened} && severity == blocking` findings than after the preceding
 Review in the same persisted window, including unchecked sources. Triage-waived
 CI findings do not count. Only reviewer findings (`F*`) checked in this attempt
 trigger repeats: streak three always parks, and streak two parks without
@@ -8346,9 +8383,11 @@ progress, with `review_needs_owner` and `repeated finding: <id> <summary>`,
 also when a required conformance check failed in the same Review (owner
 routing and the self-reported `repeat` still need the reviewer's verdict to be
 the cause). Those parks spend no retry budget. While derived rules are on, the reviewer's
-`repeat` flag is ignored. A reviewer fail with no blocking findings (including
-a minor-only list) disables derived rules for the rest of the window and
-restores the previous matching-failed-review/self-reported-repeat behavior.
+`repeat` flag is ignored. A raw reviewer fail without blocking input findings
+(no list or a minor-only list) disables derived rules for the rest of the window.
+Structured non-blocking-only failures still take the owner park above; legacy
+findings-less failures use the previous matching-failed-review/self-reported-repeat
+behavior.
 
 A chargeable failure first consumes the ordinary Review failure allowance.
 If that allowance has no retry left but the open blocking count dropped,
@@ -8361,6 +8400,13 @@ spend nothing, but an owner's review re-run gets a progress round only while
 the limit has one left (`0` stays disabled). Without progress, or with progress disabled/exhausted, ordinary
 automatic recovery and `review_budget_exhausted` apply. Coordination roots with
 a lead retain `charge_replan` and remain outside derived repeat/progress rules.
+Explicit owner findings and the non-blocking-only anchoring park still apply,
+including when recovery routes a previously settled Review.
+Services and transactional charging share `WorkflowDefinition` planning-state and
+coordination-lead-role resolution, including non-default workflows. A review-entry
+hook that fails before producing a new verdict during an already-granted progress
+round uses the existing infrastructure retry/park episode. It does not immediately
+park on the spent ordinary Review budget or spend another progress allowance.
 The workflow's reject target is used, including autonomous `working`.
 
 The dispatcher

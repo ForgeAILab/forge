@@ -204,6 +204,134 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
     }
 }
 
+// This runs three real candidate/reviewer cycles, then inspects the fourth
+// coder while it is running: a model change must not become sticky via resume.
+#[tokio::test]
+async fn follow_up_carried_finding_is_fresh_and_model_switch_lasts_one_round() {
+    for switch in [false, true] {
+        let repo_dir = common::TestDir::new("forge-convergence-repo");
+        let repo_path = setup_git_repo(repo_dir.path()).await;
+        let workspaces = common::TestDir::new("forge-convergence-workspaces");
+        let prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let adapter = ReviewFailCodexAdapter {
+            executor_calls: Arc::new(AtomicUsize::new(0)),
+            convergence_reviews: Some(Arc::new(AtomicUsize::new(0))),
+            convergence_prompts: Some(Arc::clone(&prompts)),
+            writing_reviewer: None,
+        };
+        let harness = test_app(workspaces.path(), adapter).await;
+        let project: ProjectResponse = json_request(
+            &harness.app,
+            Method::POST,
+            "/api/v1/projects",
+            json!({"name":"Convergence", "settings":{"repair_switch_model_when_stuck":switch}}),
+            StatusCode::OK,
+        )
+        .await;
+        let repo: RepoResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/repos", project.id),
+            json!({"name":"repo","local_path":repo_path.to_string_lossy(),"remote_url":repo_path.to_string_lossy(),"default_branch":"main"}), StatusCode::OK).await;
+        let daemon = register_daemon_and_report_codex(&harness.app, workspaces.path()).await;
+        let coder: AgentResponse = json_request(&harness.app, Method::POST, "/api/v1/agents",
+            json!({"name":"convergence coder","executor_type":"codex","daemon_id":daemon,"model":"primary-model", "config_json":{"fallbacks":[{"executor_type":"codex","config":{"model":"fallback-model"}}]}}), StatusCode::OK).await;
+        let reviewer = create_agent(&harness.app, "convergence reviewer", &daemon).await;
+        common::configure_execution_test_setup(
+            &harness.state.db,
+            &project.id,
+            &repo.id,
+            &coder.id,
+            &reviewer.id,
+        )
+        .await;
+        let task: TaskResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks",project.id),
+            json!({"title":"Converging repair", "description":"make a small implementation", "role_assignments":[{"role_name":"reviewer","assignee_type":"agent","assignee_id":reviewer.id}],
+                "review_config":{}}), StatusCode::OK).await;
+        // Use the shared Task-wide override accepted by the routing resolver.
+        sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+            .bind(json!({"retry_budgets":{"review":5}}).to_string())
+            .bind(&task.id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let _: TaskResponse = json_request(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/tasks/{}/claim", task.id),
+            json!({"agent_id":coder.id,"overrides":null}),
+            StatusCode::OK,
+        )
+        .await;
+        let executions = poll_until_executor_attempts(&harness.app, &task.id, 4).await;
+        let mut coders: Vec<_> = executions
+            .iter()
+            .filter(|execution| execution.role == "coder")
+            .collect();
+        coders.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let mut rounds = Vec::new();
+        for execution in coders {
+            rounds.push(
+                empty_request::<ExecutionResponse>(
+                    &harness.app,
+                    Method::GET,
+                    &format!("/api/v1/executions/{}", execution.id),
+                    StatusCode::OK,
+                )
+                .await,
+            );
+        }
+        assert_eq!(rounds.len(), 4);
+        let carried = &rounds[2];
+        assert!(
+            carried.parent_execution_id.is_none(),
+            "carried round resumed its predecessor"
+        );
+        assert!(
+            !executions
+                .iter()
+                .find(|execution| execution.id == carried.id)
+                .unwrap()
+                .is_resume
+        );
+        let snapshot = carried.executor_config_snapshot.as_ref().unwrap();
+        assert!(snapshot["config"]["resume_thread_id"].is_null());
+        assert_eq!(
+            snapshot["config"]["model"],
+            if switch {
+                "fallback-model"
+            } else {
+                "primary-model"
+            }
+        );
+        assert_eq!(snapshot["dispatch"]["execution_policy"], "new_execution");
+        {
+            let recorded = prompts.lock().unwrap();
+            let prompt = &recorded[2];
+            assert!(prompt.contains(
+                "Before editing, write a short root-cause note for each carried finding."
+            ));
+            assert!(
+                prompt.contains("Attempts:")
+                    && prompt.contains("Round 1:")
+                    && prompt.contains("Round 2:")
+            );
+            assert!(
+                prompt.contains("repair.txt"),
+                "attempt memory omitted owner-derived changed files: {prompt}"
+            );
+        }
+        let later = rounds[3].executor_config_snapshot.as_ref().unwrap();
+        assert_eq!(
+            later["config"]["model"], "primary-model",
+            "the one-round switch became sticky"
+        );
+        assert_eq!(rounds[3].status, ExecutionStatus::Running);
+        let stored = db::AgentRepo::get_by_id(&*harness.state.db, &coder.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.model.as_deref(), Some("primary-model"));
+    }
+}
+
 // The reviewer role is read-only. A reviewer whose process edits a tracked
 // file anyway (a CLI executor cannot be confined to a read-only worktree) and
 // then reports a passing review does not pass the Task: its execution fails
@@ -341,6 +469,8 @@ async fn a_reviewer_that_writes_to_the_worktree_fails_and_its_changes_are_discar
 
 struct ReviewFailCodexAdapter {
     executor_calls: Arc<AtomicUsize>,
+    convergence_reviews: Option<Arc<AtomicUsize>>,
+    convergence_prompts: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// Set: the reviewer passes the work but edits a tracked file first. The
     /// worktree it ran in is recorded here.
     writing_reviewer: Option<Arc<std::sync::Mutex<Vec<PathBuf>>>>,
@@ -350,6 +480,8 @@ impl ReviewFailCodexAdapter {
     fn new() -> Self {
         Self {
             executor_calls: Arc::new(AtomicUsize::new(0)),
+            convergence_reviews: None,
+            convergence_prompts: None,
             writing_reviewer: None,
         }
     }
@@ -357,6 +489,8 @@ impl ReviewFailCodexAdapter {
     fn with_writing_reviewer(worktrees: Arc<std::sync::Mutex<Vec<PathBuf>>>) -> Self {
         Self {
             executor_calls: Arc::new(AtomicUsize::new(0)),
+            convergence_reviews: None,
+            convergence_prompts: None,
             writing_reviewer: Some(worktrees),
         }
     }
@@ -396,6 +530,8 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
     {
         let executor_calls = Arc::clone(&self.executor_calls);
         let writing_reviewer = self.writing_reviewer.clone();
+        let convergence_reviews = self.convergence_reviews.clone();
+        let convergence_prompts = self.convergence_prompts.clone();
         Box::pin(async move {
             if let Some(worktrees) =
                 writing_reviewer.filter(|_| common::is_conformance_review_prompt(&ctx.description))
@@ -436,6 +572,38 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 });
             }
             if common::is_conformance_review_prompt(&ctx.description) {
+                if let Some(reviews) = &convergence_reviews {
+                    let round = reviews.fetch_add(1, Ordering::SeqCst);
+                    let reply = match round {
+                        0 => {
+                            json!({"result":"fail","reason":"three issues","findings":[{"summary":"carried issue"},{"summary":"fixed next"},{"summary":"also fixed next"}]})
+                        }
+                        1 => {
+                            json!({"result":"fail","reason":"one left","findings":[{"id":"F1","summary":"carried issue"}],"resolved":["F2","F3"]})
+                        }
+                        _ => {
+                            json!({"result":"fail","reason":"a new regression","findings":[{"summary":"new regression", "kind":"regression"}],"resolved":["F1"]})
+                        }
+                    };
+                    if let Some(parent) = Path::new(&ctx.logs_path).parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut writer =
+                        LogWriter::new(&ctx.logs_path, ctx.execution_id.clone(), 1024 * 1024);
+                    writer
+                        .write(
+                            LogKind::Assistant,
+                            LogStream::Main,
+                            json!({"text":reply.to_string()}),
+                        )
+                        .await?;
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Completed,
+                        summary: Some(reply.to_string()),
+                        agent_session_id: Some(format!("convergence-review-{round}")),
+                        ..Default::default()
+                    });
+                }
                 write_auditor_failure(&ctx).await?;
                 return Ok(ExecutionResult {
                     status: ExecutionOutcome::Completed,
@@ -448,8 +616,33 @@ impl CodingExecutorAdapter for ReviewFailCodexAdapter {
                 });
             }
 
+            if let Some(prompts) = &convergence_prompts {
+                prompts.lock().unwrap().push(ctx.description.clone());
+            }
             let call_index = executor_calls.fetch_add(1, Ordering::SeqCst);
-            if call_index == 1 {
+            if convergence_reviews.is_some() {
+                if call_index >= 3 {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                let path = Path::new(&ctx.worktree_path);
+                std::fs::write(
+                    path.join("repair.txt"),
+                    format!("repair round {call_index}\n"),
+                )?;
+                run_git(path, &["add", "repair.txt"]);
+                run_git(
+                    path,
+                    &[
+                        "-c",
+                        "user.name=Forge Test",
+                        "-c",
+                        "user.email=test@forge.dev",
+                        "commit",
+                        "-m",
+                        "repair candidate",
+                    ],
+                );
+            } else if call_index == 1 {
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             let session_id = if call_index == 0 {

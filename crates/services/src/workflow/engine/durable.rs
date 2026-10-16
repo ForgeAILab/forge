@@ -739,8 +739,9 @@ impl WorkflowExecution<'_> {
                         if let Some(settled) = self
                             .settle_failed_ci_entry(
                                 &task,
+                                &enter_ctx,
                                 &hook.action,
-                                &actor,
+                                &error,
                                 &entry_barrier_started_at,
                                 authority.as_ref(),
                             )

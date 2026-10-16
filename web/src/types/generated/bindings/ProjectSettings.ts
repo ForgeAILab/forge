@@ -14,6 +14,10 @@ export type ProjectSettings = {
  */
 review_ci_triage: ReviewCiTriage, 
 /**
+ * Use the next configured fallback for a carried-finding repair only.
+ */
+repair_switch_model_when_stuck?: boolean, 
+/**
  * Maximum unparked Tasks in active/gate states; 0 disables the limit.
  */
 max_active_tasks: number, retry_budgets: RetryBudgets, default_role_assignments: Array<DefaultRoleAssignment>, lifecycle_hooks: { [key in LifecycleEvent]?: Array<LifecycleHookDef> }, automatic_recovery: AutomaticRecoverySettings, environment: ProjectEnvironment, placement: ProjectPlacementSettings, };

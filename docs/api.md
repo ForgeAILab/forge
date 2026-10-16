@@ -2490,6 +2490,21 @@ empty array clears all rules.
 
 ### Project CI triage
 
+`settings.repair_switch_model_when_stuck` is an optional boolean, default `false`.
+When a reviewer finding remains blocking in two consecutive source checks, the
+repair starts a fresh execution and asks for a root-cause decision worklog entry.
+With this setting enabled and a CLI fallback chain available, that execution
+prefers the next candidate after the primary. The Agent's configuration does not
+change. The next ordinary round returns to the primary, using a fresh session
+when needed to avoid resuming the switched candidate. Without a fallback the
+fresh execution keeps the configured model. Native Agents have no CLI fallback
+chain. REST Project create/PATCH and MCP Project settings use the same boolean
+validation. The web switch is off by default.
+
+The web Project progress allowance stays blank when unset, showing the default
+of 2. Unrelated saves preserve the absent `retry_budgets.review_progress` key;
+clearing a stored allowance removes that override. Explicit `0` disables it.
+
 `settings.review_ci_triage` accepts `full` (default when omitted), `report`, or
 `off` through Project create/update (REST and MCP) and the Project settings form.
 Other values are rejected. `full` reruns failed review/queue-head CI commands once
@@ -6143,6 +6158,12 @@ replays preserve the stored bytes; changed assessment content is refused.
 The optional `findings` list accepts `summary` (required and nonblank),
 `severity` (`blocking` by default, or `minor`), `where`, `expected`, `observed`,
 and `id` only when continuing an earlier finding. New findings receive Forge ids.
+Optional `requirement_ids` cites frozen contract requirements, `kind` is
+`regression | missed | out_of_scope`, and `same_cause_as` names an earlier finding
+in the window. Unknown kinds read as absent, malformed optional values are
+ignored, and unknown requirement IDs are dropped before the assessment is frozen.
+Empty optional fields are omitted. The reviewer prompt and re-review section
+list the frozen requirement IDs and the later-review rule.
 `resolved` lists fixed reviewer ids. Malformed lists are ignored; invalid items
 are dropped. At most 50 valid items per list are retained, with each text field
 limited to 1,000 Unicode characters. These fields default to empty and are
@@ -6169,9 +6190,26 @@ detail keys or malformed metadata still produce a server corruption error.
 
 Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `summary`, `where`, `expected`, `observed`, `first_attempt`,
-`last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`, `flaky`,
-`pre_existing`, `superseded`), `streak`, and optional `ci_triage` (the CI failure class of a
-triaged CI finding). `flaky` and `pre_existing` are CI findings that
+`last_checked_attempt`, `status` (`open`, `reopened`, `resolved`, `unconfirmed`, `flaky`,
+`pre_existing`, `superseded`, `out_of_scope`), `streak`, and optional `ci_triage` (the CI failure class of a
+triaged CI finding). Items also carry optional `requirement_ids`, `kind`,
+`same_cause_as`, `anchoring_note`, and numeric `resolved_attempt`. `reopened`
+means a resolved finding failed again; `resolved_attempt` retains the last actual
+resolution and comments/briefs say “re-broken: resolved in round N”. It counts
+as open with a fresh streak. Only blocking appearances advance a streak: minor
+appearances count zero, and raising a minor to blocking starts at one.
+
+From review 2 in the window, a new blocking reviewer finding becomes minor unless
+it is a regression, cites a known requirement, or its first repository-relative
+`where` path (without `:line`) is in the candidate diff. Such a downgrade carries
+`anchoring_note: "outside requirements and Task files"`. Continued IDs keep their
+identity. `out_of_scope` never blocks, even in review 1, and is shown as a follow-up
+candidate. These rules change the projection, never the frozen assessment. A
+structured reviewer fail with no blocking findings left parks `review_needs_owner`
+with `only non-blocking findings remain`, spending no Review budget. A legacy
+findings-less fail retains its fallback routing.
+
+`flaky` and `pre_existing` are CI findings that
 `review_ci_triage: full` waived: minor, with zero streak. Under `report` the same
 classes stay `open` and blocking, with `ci_triage` set. Nullable text fields are
 `null` when unavailable. Reviewer ids are
@@ -6184,7 +6222,8 @@ for steps with test signatures, `CI-<step index>` for failed steps without
 signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
 same test keeps its id across review rounds and server/daemon owners. A
 passing step resolves its per-test findings; so does a step whose CI-triage
-re-run passed (step class `flaky`). An untruncated failure list
+re-run passed (step class `flaky`), including the final `ci:N` conformance
+observation of that passing rerun. An untruncated failure list
 only proves that every observed signature fit in the extraction cap; it cannot
 prove that a fail-fast command executed later binaries. Therefore a failed step
 never resolves an omitted test or advances that test's streak. A step-level
@@ -6196,7 +6235,8 @@ most 20 test findings per step followed by `+N more`.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
 an explicit resolution or passing Forge check resolves it. Reopening a resolved
-or unconfirmed finding starts its streak at one. A reset empties the ledger
+finding has status `reopened`; continuing an unconfirmed finding has status `open`.
+Both start a new blocking streak at one. A reset empties the ledger
 and restarts reviewer numbering. Open blocking findings drive the repeat and
 progress policy below; the frozen verdict is unchanged.
 
@@ -6676,22 +6716,26 @@ win, then the supplied Review state config; Project settings supply its default.
 It never inherits gate `max_rejections`. `remaining_retries.review_progress`
 and `retry_limits.review_progress` appear on Task detail/list responses and use
 the Review window and state even while the Task is in a repair state.
-A progress round uses an idempotent `progress:<review id>` receipt. Owner actions
+A progress round uses an idempotent `progress:<review id>` receipt. If its review
+entry hook cannot run before producing a new verdict, the existing infrastructure
+retry/park episode applies; the spent ordinary Review budget does not cause an
+immediate park or another progress debit. Owner actions
 never spend it; an owner's review re-run still gets a progress round only while
 the limit has one left. `review_verify_rerun` is invocation-scoped (limit 1) and is never
 persisted or projected as Task spending; verify execution is a later phase.
 
 After a coder-fixable failed Review, a reviewer finding open on its third
-source check parks with `review_needs_owner`, message
+blocking source check parks with `review_needs_owner`, message
 `repeated finding: <id> <summary>`. A second appearance parks only when the
 number of open blocking findings did not decrease. These parks apply even when
 a required conformance check also failed in that Review. Forge-owned findings count
 for progress but never cause repeat parks. Normal Review allowance is used
 first; when it has no retry left, a smaller open blocking count can spend one
 `review_progress` round. Otherwise normal exhaustion/recovery applies. Triage
-waivers never count. Any reviewer fail with no blocking finding disables these
-derived rules for the rest of the window and retains legacy self-reported
-repeat behavior. With derived rules on, `repeat` is ignored. Owner-fixable and
+waivers never count. A raw reviewer fail with no blocking input finding disables
+these derived rules for the rest of the window. Structured non-blocking-only
+failures still park for the owner; findings-less failures retain legacy
+self-reported repeat behavior. With derived rules on, `repeat` is ignored. Owner-fixable and
 blocked results still park first; coordination roots with a lead keep replan
 routing. Repair targets come from the workflow (`working` for autonomous).
 

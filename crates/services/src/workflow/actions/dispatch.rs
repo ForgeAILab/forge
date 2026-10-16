@@ -320,6 +320,7 @@ impl HookAction for DispatchRoleAgent {
                     "target_role": role_name,
                     "builder_id": selection.builder_id,
                     "execution_policy": selection.execution_policy,
+                    "carried_finding": dispatch_ctx.carried_repair,
                 });
 
                 ctx.event_bus.publish(ForgeEvent {

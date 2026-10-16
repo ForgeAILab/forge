@@ -1,5 +1,4 @@
-//! One derived repair request. Sections stay separate so later Attempts and
-//! Pattern sections can be added without changing sources or budget policy.
+//! One derived repair request, with bounded attempt memory and shared causes.
 use std::collections::{BTreeMap, BTreeSet};
 
 use api_types::{ReviewFindingEntry, ReviewFindingSource as Source, ReviewFindingStatus as Status};
@@ -28,6 +27,16 @@ impl RepairBudget {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RepairAttempt {
+    pub attempt: i64,
+    pub from_sha: Option<String>,
+    pub to_sha: Option<String>,
+    pub files: Vec<String>,
+    pub files_unavailable: bool,
+    pub summary: Option<String>,
+}
+
 struct CheckOutput {
     label: String,
     tail: String,
@@ -44,7 +53,10 @@ pub struct RepairBrief {
     checks: Vec<CheckOutput>,
     verify: String,
     report: String,
-    previous: String,
+    attempts: Vec<String>,
+    requirements: String,
+    patterns: Vec<Vec<ReviewFindingEntry>>,
+    carried: bool,
     logs: String,
     merge: Option<(&'static str, String)>,
     instructions: &'static str,
@@ -124,7 +136,7 @@ impl RepairBrief {
                         .filter(|signature| {
                             ledger.iter().any(|entry| {
                                 entry.id == db::review_findings::ci_finding_id(index, signature)
-                                    && entry.status == Status::Open
+                                    && entry.status.is_open()
                             })
                         })
                         .take(20)
@@ -250,15 +262,18 @@ impl RepairBrief {
         }
         Self {
             task, round,
-            open: ledger.iter().filter(|entry| entry.status == Status::Open).cloned().collect(),
-            updates: ledger.iter().filter(|entry| entry.status != Status::Open && entry.last_checked_attempt == attempt
+            open: ledger.iter().filter(|entry| entry.status.is_open()).cloned().collect(),
+            updates: ledger.iter().filter(|entry| !entry.status.is_open() && entry.last_checked_attempt == attempt
                 && entry.status != Status::Superseded
                 && (matches!(entry.status, Status::Flaky | Status::PreExisting)
                     || !previous_ledger.iter().any(|prior| prior.id == entry.id && prior.status == entry.status))).cloned().collect(),
             checks, verify: render_verify(&details["verify"]), report,
-            previous: ctx.previous_coder_summary.clone().unwrap_or_default(), logs,
+            attempts: render_attempts(ctx, reviews),
+            requirements: requirement_status(&details, &ledger),
+            patterns: finding_patterns(&ledger),
+            carried: db::review_findings::has_carried_finding(reviews), logs,
             merge: None,
-            instructions: "Address all review and validation findings, preserve the Task's intent, run the relevant checks, and complete delivery according to the execution harness contract. The Task returns for re-verification.",
+            instructions: "Address the blocking review and validation findings, preserve the Task's intent, run the relevant checks, and complete delivery according to the execution harness contract. The Task returns for re-verification.",
             displayed_ci, limited_steps,
         }
     }
@@ -331,6 +346,9 @@ impl RepairBrief {
         ));
         // Review authority is handled by Forge after repair; do not imply a
         // new review for a conflict whose authority can carry.
+        brief.carried = false;
+        brief.patterns.clear();
+        brief.requirements.clear();
         brief.open.clear();
         brief.updates.clear();
         brief.checks.clear();
@@ -360,7 +378,7 @@ impl RepairBrief {
     pub fn render(self) -> String {
         let mut limits = Limits {
             report: self.report.len(),
-            previous: true,
+            attempts: self.attempts.len(),
             tail: usize::MAX,
             tails_total: usize::MAX,
             ids_only: false,
@@ -370,18 +388,18 @@ impl RepairBrief {
         };
         // D7's ordered degradation first; then the hard-cap reductions of the
         // remaining unprotected sections, and only then finding text.
-        for stage in 0..=7 {
+        for stage in 0..=9 {
             match stage {
                 1 => limits.report = limits.report.min(2 * 1024),
                 2 => limits.report = 0,
-                3 => limits.previous = false,
-                4 => limits.tail = 1024,
-                5 => limits.ids_only = true,
-                6 => {
+                3..=5 => limits.attempts = limits.attempts.saturating_sub(1),
+                6 => limits.tail = 1024,
+                7 => limits.ids_only = true,
+                8 => {
                     limits.tails_total = 4 * 1024;
                     limits.verify = 2 * 1024;
                 }
-                7 => limits.compact = true,
+                9 => limits.compact = true,
                 _ => {}
             }
             let body = self.render_sections(&limits);
@@ -442,6 +460,15 @@ impl RepairBrief {
                 clip(&entry.summary, 200, compact),
                 entry.streak.saturating_sub(1)
             ));
+            if entry.status == Status::Reopened {
+                open.push_str(&format!(
+                    "  re-broken: resolved in round {}\n",
+                    entry.resolved_attempt.unwrap_or_default()
+                ));
+            }
+            if let Some(note) = &entry.anchoring_note {
+                open.push_str(&format!("  {note}\n"));
+            }
             if let Some(class) = entry.ci_triage {
                 open.push_str(&format!(
                     "  CI classification: {}\n",
@@ -474,12 +501,35 @@ impl RepairBrief {
     }
 
     fn render_sections(&self, limits: &Limits) -> String {
-        let mut out = self.task.clone();
+        let mut out = if self.carried {
+            format!("Before editing, write a short root-cause note for each carried finding. Record it as a decision worklog entry.\n\n{}", self.task)
+        } else {
+            self.task.clone()
+        };
         section(
             &mut out,
             "Round",
             &format!("{}\n\n{}", self.round, self.instructions),
         );
+        section(&mut out, "Requirement status", &self.requirements);
+        let mut patterns = String::new();
+        for family in &self.patterns {
+            patterns.push_str(
+                "These share a cause. Fix it at every call site and list the sites you changed.\n",
+            );
+            for entry in family {
+                patterns.push_str(&format!(
+                    "- {}: {}\n",
+                    clip(&entry.id, 120, limits.compact),
+                    clip(
+                        entry.r#where.as_deref().unwrap_or("location unavailable"),
+                        120,
+                        limits.compact
+                    )
+                ));
+            }
+        }
+        section(&mut out, "Pattern", &patterns);
         let (open, mut ci_counts) = self.open_findings(limits.compact, limits.detailed);
         section(
             &mut out,
@@ -508,6 +558,7 @@ impl RepairBrief {
                 Status::Resolved => "resolved",
                 Status::Flaky => "flaky (non-blocking)",
                 Status::PreExisting => "pre_existing (non-blocking)",
+                Status::OutOfScope => "out_of_scope (follow-up candidate)",
                 _ => "not re-checked",
             };
             let line = format!(
@@ -597,8 +648,15 @@ impl RepairBrief {
             "Reviewer report",
             prefix(&self.report, limits.report),
         );
-        if limits.previous {
-            section(&mut out, "Previous round", &self.previous);
+        if limits.attempts > 0 {
+            let attempts = self
+                .attempts
+                .iter()
+                .skip(self.attempts.len().saturating_sub(limits.attempts))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            section(&mut out, "Attempts", &format!("{attempts}\n\nDo not repeat an approach that left a finding open; if you keep one, say why it failed before."));
         }
         section(&mut out, "Logs", &bounded_text(&self.logs, 1024));
         out
@@ -607,13 +665,117 @@ impl RepairBrief {
 
 struct Limits {
     report: usize,
-    previous: bool,
+    attempts: usize,
     tail: usize,
     tails_total: usize,
     ids_only: bool,
     verify: usize,
     compact: bool,
     detailed: usize,
+}
+
+pub(super) fn repair_rounds(reviews: &[db::Review]) -> Vec<&db::Review> {
+    let mut ordered: Vec<_> = reviews
+        .iter()
+        .filter(|review| {
+            matches!(
+                review.status,
+                db::ReviewStatus::Passed | db::ReviewStatus::Failed
+            ) && !serde_json::from_str::<Value>(&review.step_results_json)
+                .unwrap_or_default()
+                .get("manual_override")
+                .is_some_and(|value| !value.is_null())
+        })
+        .collect();
+    ordered.sort_by_key(|review| review.attempt_number);
+    ordered
+}
+
+fn render_attempts(ctx: &AgentDispatchContext, reviews: &[db::Review]) -> Vec<String> {
+    let ordered = repair_rounds(reviews);
+    ordered.iter().enumerate().skip(ordered.len().saturating_sub(3)).map(|(index, review)| {
+        let memory = ctx.repair_attempts.iter().find(|memory| memory.attempt == review.attempt_number);
+        let earlier: Vec<_> = ordered[..index].iter().map(|review| (*review).clone()).collect();
+        let previous = db::review_findings::finding_ledger(&earlier).unwrap_or_default();
+        let mut through = earlier;
+        through.push((*review).clone());
+        let ledger = db::review_findings::finding_ledger(&through).unwrap_or_default();
+        let ids = |predicate: &dyn Fn(&ReviewFindingEntry) -> bool| ledger.iter().filter(|entry| predicate(entry)).map(|entry| entry.id.clone()).collect::<Vec<_>>().join(", ");
+        let resolved = ids(&|entry| entry.status == Status::Resolved && !previous.iter().any(|prior| prior.id == entry.id && prior.status == Status::Resolved));
+        let left = ids(&|entry| entry.status.is_open() && previous.iter().any(|prior| prior.id == entry.id && prior.status.is_open()));
+        let opened = ids(&|entry| entry.status.is_open() && !previous.iter().any(|prior| prior.id == entry.id && prior.status.is_open()));
+        let details: Value = serde_json::from_str(&review.step_results_json).unwrap_or_default();
+        let from = memory.and_then(|memory| memory.from_sha.as_deref()).unwrap_or("unavailable");
+        let to = memory.and_then(|memory| memory.to_sha.as_deref()).or_else(|| details["conformance"]["contract"]["commit_sha"].as_str()).unwrap_or("unavailable");
+        let summary = memory.and_then(|memory| memory.summary.as_deref())
+            .or_else(|| (index + 1 == ordered.len()).then_some(ctx.previous_coder_summary.as_deref()).flatten()).unwrap_or("unavailable");
+        format!("Round {}: {from}..{to}\nFiles changed: {}\nCoder completion: {}\nResolved: {}\nLeft open: {}\nOpened: {}", review.attempt_number,
+            memory.filter(|memory| !memory.files_unavailable).map(|memory| memory.files.join(", ")).unwrap_or_else(|| "unavailable".into()),
+            bounded_text(summary, 1024), resolved, left, opened)
+    }).collect()
+}
+
+fn requirement_status(details: &Value, ledger: &[ReviewFindingEntry]) -> String {
+    details["conformance"]["contract"]["context"]["requirements"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|requirement| requirement["id"].as_str())
+        .map(|id| {
+            let cited: Vec<_> = ledger
+                .iter()
+                .filter(|entry| entry.requirement_ids.iter().any(|known| known == id))
+                .collect();
+            let status = if cited.iter().any(|entry| {
+                entry.status.is_open()
+                    && entry.severity == api_types::ReviewFindingSeverity::Blocking
+            }) {
+                "unmet"
+            } else if !cited.is_empty()
+                && cited.iter().all(|entry| entry.status == Status::Resolved)
+            {
+                "addressed"
+            } else {
+                "no open finding"
+            };
+            format!("- {id}: {status}\n")
+        })
+        .collect()
+}
+
+fn finding_patterns(ledger: &[ReviewFindingEntry]) -> Vec<Vec<ReviewFindingEntry>> {
+    // Connected components also handle transitive links and defensive cycles.
+    let mut families: Vec<BTreeSet<String>> = Vec::new();
+    for entry in ledger {
+        let Some(parent) = entry
+            .same_cause_as
+            .as_ref()
+            .filter(|parent| ledger.iter().any(|entry| &entry.id == *parent))
+        else {
+            continue;
+        };
+        let mut family = BTreeSet::from([entry.id.clone(), parent.clone()]);
+        let mut index = 0;
+        while index < families.len() {
+            if !families[index].is_disjoint(&family) {
+                family.extend(families.remove(index));
+                index = 0;
+            } else {
+                index += 1;
+            }
+        }
+        families.push(family);
+    }
+    families
+        .into_iter()
+        .map(|family| {
+            ledger
+                .iter()
+                .filter(|entry| family.contains(&entry.id))
+                .cloned()
+                .collect()
+        })
+        .collect()
 }
 
 /// Finding text clipped like the review comment once the brief is compacted.

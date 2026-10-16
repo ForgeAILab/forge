@@ -439,8 +439,10 @@ munk verify change --request-file "$FORGE_VERIFY_DIR/munk-request.json" --config
 - Review-entry merge-base observations can open/update base Attention, but
   only newer queue-head target-tip passing observations can resolve it.
 - Project `retry_budgets.review_progress` supplies the Review state default;
-  explicit state values and Task-wide overrides win. The later anchoring,
-  reopened, and strategy-switch phases remain unimplemented.
+  explicit state values and Task-wide overrides win. Anchoring, reopened
+  findings, Attempts/Pattern memory, and fresh carried-finding executions are
+  implemented by phases 4–5 of `add-repair-convergence-guards-2026-10-14`;
+  that follow-up amends D5 and D7 above.
 
 - The hook's merged configuration is an optional trailing field on the typed
   review-routing command. Three-field queued requests decode with no supplied

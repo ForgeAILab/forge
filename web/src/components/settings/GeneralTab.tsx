@@ -25,6 +25,8 @@ interface GeneralTabProps {
   pausePending: boolean
   name: string
   reviewCiTriage: 'full' | 'report' | 'off'
+  repairSwitchModelWhenStuck: boolean
+  onRepairSwitchModelWhenStuckChange: (value: boolean) => void
   reviewProgress: string
   onReviewProgressChange: (value: string) => void
   onReviewCiTriageChange: (value: 'full' | 'report' | 'off') => void
@@ -62,6 +64,8 @@ export function GeneralTab({
   ciSteps,
   reviewCiTriage,
   reviewProgress,
+  repairSwitchModelWhenStuck,
+  onRepairSwitchModelWhenStuckChange,
   onReviewProgressChange,
   onReviewCiTriageChange,
   defaultRoleSelections,
@@ -270,7 +274,7 @@ export function GeneralTab({
           )}
           <SettingsSection
             title="Review progress rounds"
-            description="Extra repair rounds after the review allowance is spent, while open blocking findings decrease. 0 disables them."
+            description="Extra repair rounds after the review allowance is spent, while open blocking findings decrease. Leave blank for the default (2); 0 disables them."
           >
             <Label htmlFor="project-review-progress-budget">Progress round allowance</Label>
             <Input
@@ -278,9 +282,27 @@ export function GeneralTab({
               type="number"
               min={0}
               step={1}
+              placeholder="Default (2)"
               value={reviewProgress}
               onChange={(e) => onReviewProgressChange(e.target.value)}
             />
+          </SettingsSection>
+          <SettingsSection
+            title="Change model for stuck findings"
+            description="When a finding survives a repair, start a fresh session on the agent’s next fallback candidate for that round. Later rounds use the primary candidate."
+          >
+            <div className="flex items-center gap-3">
+              <Switch
+                id="repair-switch-model"
+                checked={repairSwitchModelWhenStuck}
+                onChange={(event) =>
+                  onRepairSwitchModelWhenStuckChange((event.target as HTMLInputElement).checked)
+                }
+              />
+              <Label htmlFor="repair-switch-model" className="cursor-pointer text-sm">
+                Switch model when stuck
+              </Label>
+            </div>
           </SettingsSection>
           <SettingsSection
             title="Automatic recovery agent"

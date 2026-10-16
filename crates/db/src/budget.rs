@@ -722,7 +722,7 @@ pub async fn review_verdict(
         if conformance.status == api_types::ConformanceStatus::Blocked {
             return Ok(());
         }
-        let window_reviews = reviews_in_window_in_tx(tx, &task.id).await?;
+        let window_reviews = SqliteDb::review_window_in_tx(tx, &task.id).await?.reviews;
         let previous_reviews = sqlx::query("SELECT * FROM review WHERE task_id=? AND attempt_number<? ORDER BY attempt_number DESC,id DESC LIMIT 1")
             .bind(&task.id).bind(review.attempt_number).fetch_all(&mut **tx).await?
             .into_iter().map(crate::sqlite::map_review).collect::<Result<Vec<_>>>()?;
@@ -987,7 +987,7 @@ pub fn owner_review_failure_message(
     }
     // Owner routing and the self-reported repeat need the reviewer's verdict
     // to be the cause; the derived repeat is Forge's own rule over the ledger.
-    let verdict_caused = conformance.checks.iter().all(|check| check.exit_code == 0)
+    let verdict_caused = conformance.checks.iter().all(|check| !check.is_blocking())
         && conformance.reason.as_deref().unwrap_or_default() == assessment.reason;
     let reason = if assessment.reason.is_empty() {
         "reviewer reported a blocking finding"
@@ -997,14 +997,30 @@ pub fn owner_review_failure_message(
     if verdict_caused && assessment.fixable_by == api_types::FixableBy::Owner {
         return Some(format!("fixable by owner: {reason}"));
     }
-    if derived_rules {
-        let mut projected = review.clone();
-        let mut details: Value = serde_json::from_str(&review.step_results_json).ok()?;
-        if !details.is_object() {
-            details = serde_json::json!({});
+    let mut projected = review.clone();
+    let mut details: Value = serde_json::from_str(&review.step_results_json).ok()?;
+    if !details.is_object() {
+        details = serde_json::json!({});
+    }
+    details["conformance"] = serde_json::to_value(conformance).ok()?;
+    projected.step_results_json = details.to_string();
+    if verdict_caused && !assessment.findings.is_empty() {
+        let mut window: Vec<_> = window_reviews
+            .iter()
+            .filter(|row| row.attempt_number < review.attempt_number)
+            .cloned()
+            .collect();
+        window.push(projected.clone());
+        if let Ok(ledger) = crate::review_findings::finding_ledger(&window) {
+            if !ledger.iter().any(|entry| {
+                entry.status.is_open()
+                    && entry.severity == api_types::ReviewFindingSeverity::Blocking
+            }) {
+                return Some("only non-blocking findings remain".into());
+            }
         }
-        details["conformance"] = serde_json::to_value(conformance).ok()?;
-        projected.step_results_json = details.to_string();
+    }
+    if derived_rules {
         if let Ok(policy) = crate::review_findings::round_policy(window_reviews, &projected) {
             if policy.derived {
                 return policy.repeat;
@@ -1030,7 +1046,7 @@ pub fn owner_review_failure_message(
                     })
                     .is_some_and(|conformance| {
                         conformance.status == api_types::ConformanceStatus::Failed
-                            && conformance.checks.iter().all(|check| check.exit_code == 0)
+                            && conformance.checks.iter().all(|check| !check.is_blocking())
                             && conformance.assessment.as_ref().is_some_and(|assessment| {
                                 assessment.result == api_types::ReviewResult::Fail
                                     && conformance.reason.as_deref()
@@ -1041,34 +1057,22 @@ pub fn owner_review_failure_message(
     (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
 }
 
-/// Read the accounting window inside an already fenced verdict transaction.
-async fn reviews_in_window_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    task: &str,
-) -> Result<Vec<Review>> {
-    let rows = sqlx::query(
-        "SELECT r.* FROM review r JOIN task t ON t.id=r.task_id
-        LEFT JOIN task_budget b ON b.task_id=t.id AND b.kind='review'
-        LEFT JOIN transition_log l ON l.id=b.window_id AND l.task_id=t.id
-        WHERE r.task_id=? AND r.created_at>=COALESCE(l.created_at,t.created_at)
-        ORDER BY r.attempt_number,r.id",
-    )
-    .bind(task)
-    .fetch_all(&mut **tx)
-    .await?;
-    rows.into_iter().map(crate::sqlite::map_review).collect()
-}
-
-// Native coordination leads are planners. Their aggregate reviews retain the
-// existing replan policy; no finding-based park or progress debit applies.
+// Charging uses exactly the planning-role resolution used by services.
 async fn coordination_root_in_tx(tx: &mut Transaction<'_, Sqlite>, task: &Task) -> Result<bool> {
     if task.parent_task_id.is_some() {
         return Ok(false);
     }
+    let raw: String = sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id=?")
+        .bind(&task.project_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let Some(role) = WorkflowDefinition::coordination_planning_role_from_json(&raw) else {
+        return Ok(false);
+    };
     Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment a
-        WHERE a.task_id=? AND a.role_name='planner' AND a.assignee_type='agent' AND a.assignee_id IS NOT NULL
+        WHERE a.task_id=? AND a.role_name=? AND a.assignee_type='agent' AND a.assignee_id IS NOT NULL
         AND EXISTS(SELECT 1 FROM task child WHERE child.parent_task_id=a.task_id AND child.deleted_at IS NULL))")
-        .bind(&task.id).fetch_one(&mut **tx).await?)
+        .bind(&task.id).bind(role).fetch_one(&mut **tx).await?)
 }
 
 /// Admit one progress round atomically under Task authority. A replay keeps its
@@ -1985,6 +1989,90 @@ mod tests {
                 owner_review_failure_message(&conformance, &current, &window, &window, false),
                 None
             );
+        }
+    }
+    #[tokio::test]
+    async fn budget_coordination_root_resolves_the_workflow_planning_role() {
+        let (db, task) = fixture().await;
+        let workflow: WorkflowDefinition = serde_json::from_value(json!({"states":[
+            {"name":"todo","kind":"initial","column":"Todo","display_name":"Todo","hooks":{},"config":{},"triggers":{"accept":{"to":"design"}}},
+            {"name":"design","kind":"gate","column":"Planning","display_name":"Planning","hooks":{},"config":{},"role":"architect","triggers":{"accept":{"to":"working"}}},
+            {"name":"working","kind":"active","column":"Working","display_name":"Working","hooks":{},"config":{},"role":"builder"},
+            {"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{},"role":"reviewer","canonical_phase":"review"}
+        ], "roles":[]})).unwrap();
+        assert_eq!(
+            workflow
+                .coordination_planning_state()
+                .unwrap()
+                .role
+                .as_deref(),
+            Some("architect")
+        );
+        sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+            .bind(serde_json::to_string(&workflow).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,parent_task_id,created_at,updated_at) VALUES('child','p','Child','done','t','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('lead','t','architect','agent','agent','now','now')").execute(db.pool()).await.unwrap();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(coordination_root_in_tx(&mut tx, &task).await.unwrap());
+        tx.rollback().await.unwrap();
+        sqlx::query("UPDATE task_role_assignment SET role_name='planner' WHERE id='lead'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(
+            !coordination_root_in_tx(&mut tx, &task).await.unwrap(),
+            "a planner outside the planning gate is not a lead"
+        );
+    }
+    #[test]
+    fn budget_anchoring_nonblocking_park_uses_triaged_conformance_outcome() {
+        let conformance: api_types::ReviewConformance = serde_json::from_value(json!({
+            "status":"failed", "checks":[{"check_id":"ci:0","command":"tests","exit_code":1,"output":"flake", "triage":{"mode":"full","base_status":"available","blocking":false,"class":"flaky","failures":[]}}],
+            "reason":"separate scope", "assessment":{"result":"fail","reason":"separate scope","findings":[{"summary":"later work","kind":"out_of_scope"}]}
+        })).unwrap();
+        let current = Review {
+            id: "r".into(),
+            task_id: "t".into(),
+            execution_id: "e".into(),
+            reviewer_execution_id: None,
+            auditor_execution_id: None,
+            attempt_number: 1,
+            status: ReviewStatus::Failed,
+            step_results_json: json!({"conformance":conformance}).to_string(),
+            started_at: "now".into(),
+            finished_at: None,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        for derived_rules in [true, false] {
+            assert_eq!(
+                owner_review_failure_message(&conformance, &current, &[], &[], derived_rules)
+                    .as_deref(),
+                Some("only non-blocking findings remain")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn budget_coordination_root_legacy_default_agrees_with_services_planner() {
+        let (db, task) = fixture().await;
+        sqlx::query("INSERT INTO task(id,project_id,title,status,parent_task_id,created_at,updated_at) VALUES('child','p','Child','done','t','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO task_role_assignment(id,task_id,role_name,assignee_type,assignee_id,created_at,updated_at) VALUES('lead','t','planner','agent','agent','now','now')").execute(db.pool()).await.unwrap();
+        for raw in ["{}", "", "not-json"] {
+            sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+                .bind(raw)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+            assert!(
+                coordination_root_in_tx(&mut tx, &task).await.unwrap(),
+                "services resolves {raw:?} to its default planner"
+            );
+            tx.rollback().await.unwrap();
         }
     }
 }
