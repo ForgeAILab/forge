@@ -281,6 +281,15 @@ impl RepoLocationService {
         is_admin: bool,
     ) -> Result<RepoLocation> {
         self.authorized_repo(repo_id, user_id, is_admin).await?;
+        // Demo: a server-owned location is a path on the server's filesystem.
+        if executors::server_commands::manager_only()
+            && (request.owner_kind == api_types::RepoLocationOwnerKind::Server
+                || request.kind == api_types::RepoLocationKind::SharedMount)
+        {
+            return Err(crate::server_commands::location_refused(
+                "a path on the server's filesystem cannot be a repository location",
+            ));
+        }
         if request.path.trim().is_empty() || request.path.contains('\0') {
             return Err(ServiceError::Domain(
                 "path must be nonempty and contain no NUL".to_owned(),

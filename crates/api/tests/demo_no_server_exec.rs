@@ -152,3 +152,104 @@ async fn demo_provider_credentials_and_chat_turns_are_422() {
     demo();
     support::provider_and_chat_turns(true).await;
 }
+
+#[tokio::test]
+async fn demo_server_paths_and_non_public_remotes_are_refused() {
+    demo();
+    support::repository_inputs(true).await;
+}
+
+/// The demo container's startup under the policy: `--demo` seeding, then
+/// exactly the REST calls of `deploy/demo/forge-demo-entrypoint.sh`.
+#[tokio::test]
+async fn demo_seed_and_entrypoint_calls_succeed_under_the_policy() {
+    demo();
+    let root = common::TestDir::new("demo-seed-entrypoint");
+    let harness = common::test_app(root.path(), "demo-seed-entrypoint").await;
+    services::install_demo_data(&harness.state.db)
+        .await
+        .unwrap();
+    // Seeding is idempotent, as on every container start.
+    services::install_demo_data(&harness.state.db)
+        .await
+        .unwrap();
+    let mut accounts = Vec::new();
+    for (email, password, admin) in [
+        ("admin@example.org", "AdminPassword123!", true),
+        ("tester@example.org", "TesterPassword123!", false),
+    ] {
+        let _: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            "/api/v1/auth/register",
+            json!({"email":email,"password":password,"display_name":email}),
+            StatusCode::CREATED,
+        )
+        .await;
+        let login: api_types::AuthResponse = common::json_request(
+            &harness.app,
+            Method::POST,
+            "/api/v1/auth/login",
+            json!({"email":email,"password":password}),
+            StatusCode::OK,
+        )
+        .await;
+        let me: api_types::UserResponse = common::empty_request_with_bearer(
+            &harness.app,
+            Method::GET,
+            "/api/v1/auth/me",
+            &login.access_token,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(me.is_admin, admin, "{email}");
+        accounts.push((login.access_token, me.id));
+    }
+    let projects: Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/projects",
+        &accounts[0].0,
+        StatusCode::OK,
+    )
+    .await;
+    let demo_project = projects["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["name"] == "Demo")
+        .expect("the seeded Demo Project belongs to the administrator");
+    let (remote_url, local_path): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT remote_url, local_path FROM repo WHERE project_id = ?")
+            .bind(demo_project["id"].as_str().unwrap())
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(remote_url.as_deref(), Some("https://example.com/demo.git"));
+    assert!(local_path.is_none());
+    let response = support::send_with_bearer(
+        &harness.app,
+        Method::POST,
+        &format!(
+            "/api/v1/projects/{}/members",
+            demo_project["id"].as_str().unwrap()
+        ),
+        &accounts[0].0,
+        json!({"user_id":accounts[1].1,"role":"member"}),
+    )
+    .await;
+    assert!(
+        matches!(response.0, StatusCode::OK | StatusCode::CREATED),
+        "{}",
+        response.1
+    );
+    let projects: Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/projects",
+        &accounts[1].0,
+        StatusCode::OK,
+    )
+    .await;
+    assert!(projects.to_string().contains("\"name\":\"Demo\""));
+}

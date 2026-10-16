@@ -26,3 +26,7 @@ async fn normal_environment_setup_and_probe_run() {
 async fn normal_provider_credentials_and_chat_turns_unchanged() {
     support::provider_and_chat_turns(false).await;
 }
+#[tokio::test]
+async fn normal_repository_inputs_unchanged() {
+    support::repository_inputs(false).await;
+}

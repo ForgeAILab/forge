@@ -4,11 +4,19 @@ use std::{path::Path, sync::Arc};
 
 use crate::common;
 
+/// A public literal address: accepted by the demo repository rule without a
+/// DNS lookup. Nothing connects to it: Forge's managed clone already exists.
+pub const PUBLIC_REMOTE: &str = "https://93.184.215.14/demo.git";
+
 pub async fn fixture(name: &str) -> (common::TestDir, common::Harness, String, String, Value) {
     let root = common::TestDir::new(name);
     let harness = common::test_app(root.path(), name).await;
     let repo = common::setup_git_repo(root.path());
-    let (project, repo_id) = common::create_project_and_repo(&harness.app, name, &repo).await;
+    let (project, repo_id) = if executors::server_commands::manager_only() {
+        demo_project_and_repo(&harness, name, &repo).await
+    } else {
+        common::create_project_and_repo(&harness.app, name, &repo).await
+    };
     let task: Value = common::json_request(
         &harness.app,
         Method::POST,
@@ -18,6 +26,50 @@ pub async fn fixture(name: &str) -> (common::TestDir, common::Harness, String, S
     )
     .await;
     (root, harness, project, repo_id, task)
+}
+
+/// Demo mode refuses a server path as a repository, so the demo fixture's
+/// repository is a public https remote whose managed clone Forge already has.
+async fn demo_project_and_repo(
+    harness: &common::Harness,
+    name: &str,
+    source: &Path,
+) -> (String, String) {
+    let project: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": name }),
+        StatusCode::OK,
+    )
+    .await;
+    let project_id = project["id"].as_str().unwrap().to_owned();
+    let repo: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/repos"),
+        json!({"name":"repo","remote_url":PUBLIC_REMOTE,"default_branch":"main"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo_id = repo["id"].as_str().unwrap().to_owned();
+    let managed = harness
+        .state
+        .cleanup_scheduler
+        .workspace_root()
+        .join(".repos")
+        .join(&repo_id);
+    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg("--")
+        .arg(source)
+        .arg(&managed)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    (project_id, repo_id)
 }
 
 pub async fn store_settings(harness: &common::Harness, project: &str, settings: Value) {
@@ -463,4 +515,122 @@ pub async fn provider_and_chat_turns(disabled: bool) {
         assert_eq!(provider.0, StatusCode::OK, "{}", provider.1);
         assert_ne!(message.1["code"], "server_agents_disabled", "{}", message.1);
     }
+}
+
+/// Every repository input: a server path or `file://` is never a repository,
+/// a remote must be https:// to a public address, a branch never an option.
+pub async fn repository_inputs(disabled: bool) {
+    let (root, harness, _, repo_id, _) = fixture("demo-repository-inputs").await;
+    let local = root.path().join("repo");
+    let second: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"second"}),
+        StatusCode::OK,
+    )
+    .await;
+    let second = second["id"].as_str().unwrap().to_owned();
+    let refused = [
+        json!({"name":"r","local_path":local.to_string_lossy()}),
+        json!({"name":"r","remote_url":format!("file://{}", local.display())}),
+        json!({"name":"r","remote_url":local.to_string_lossy()}),
+        json!({"name":"r","remote_url":"http://93.184.215.14/demo.git"}),
+        json!({"name":"r","remote_url":"ssh://93.184.215.14/demo.git"}),
+        json!({"name":"r","remote_url":"https://127.0.0.1/demo.git"}),
+        json!({"name":"r","remote_url":"https://10.0.0.2/demo.git"}),
+        json!({"name":"r","remote_url":"https://169.254.169.254/demo.git"}),
+        json!({"name":"r","remote_url":"https://localhost/demo.git"}),
+        json!({"name":"r","remote_url":"https://forge.internal/demo.git"}),
+        json!({"name":"r","remote_url":PUBLIC_REMOTE,"default_branch":"-main"}),
+    ];
+    for body in refused {
+        let response = send(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/projects/{second}/repos"),
+            body.clone(),
+        )
+        .await;
+        if disabled {
+            assert_refused(&response, "server_location_refused", &body.to_string());
+        } else {
+            assert_ne!(response.1["code"], "server_location_refused");
+        }
+    }
+    let update = send(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/repos/{repo_id}"),
+        json!({"local_path":local.to_string_lossy()}),
+    )
+    .await;
+    let location = send(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/repos/{repo_id}/locations"),
+        json!({"owner_kind":"server","path":local.to_string_lossy(),"kind":"primary_checkout"}),
+    )
+    .await;
+    if disabled {
+        assert_refused(&update, "server_location_refused", "repository update");
+        assert_refused(&location, "server_location_refused", "server location");
+        // A stored server path (seed or upgrade) is refused before Git runs.
+        sqlx::query("UPDATE repo SET local_path = ? WHERE id = ?")
+            .bind(local.to_string_lossy().into_owned())
+            .bind(&repo_id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let sync = send(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/repos/{repo_id}/sync"),
+            json!({}),
+        )
+        .await;
+        assert_refused(&sync, "server_location_refused", "repository sync");
+        let repo = db::RepoRepo::get_by_id(&*harness.state.db, &repo_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            services::server_commands::ensure_repository_allowed(&repo).await,
+            Err(services::ServiceError::ServerLocationRefused { .. })
+        ));
+    } else {
+        assert_eq!(update.0, StatusCode::OK, "{}", update.1);
+        assert_eq!(location.0, StatusCode::OK, "{}", location.1);
+    }
+}
+
+pub async fn send_with_bearer(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    use tower::ServiceExt;
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
