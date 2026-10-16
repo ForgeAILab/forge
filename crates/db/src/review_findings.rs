@@ -585,6 +585,14 @@ fn finding_path<'a>(location: &'a str, changed_paths: &[String]) -> Option<&'a s
     location
         .split_whitespace()
         .map(|word| word.trim_matches(['`', '\'', '"', '(', ')', ',', ';']))
+        // `./src/a.rs` and a sentence's closing period name the same file.
+        .map(|word| {
+            let mut word = word.trim_end_matches('.');
+            while let Some(rest) = word.strip_prefix("./") {
+                word = rest;
+            }
+            word
+        })
         .filter_map(|word| {
             let path = word.split(':').next().unwrap_or(word);
             let has_line = word
@@ -1524,5 +1532,28 @@ mod tests {
             assert_eq!(finding.severity, ReviewFindingSeverity::Blocking);
             assert!(finding.anchoring_note.is_none());
         }
+    }
+
+    #[test]
+    fn finding_ledger_anchoring_reads_dot_relative_and_sentence_final_paths() {
+        let first = anchored_review(1, json!([{"summary":"first"}]), json!([]));
+        let second = anchored_review(
+            2,
+            json!([
+                {"summary":"dot relative", "where":"./src/task.rs:12"},
+                {"summary":"sentence", "where":"Drafts are dropped in src/task.rs."},
+                {"summary":"outside", "where":"./src/old.rs:3"}
+            ]),
+            json!(["F1"]),
+        );
+        let ledger = finding_ledger(&[first, second]).unwrap();
+        for id in ["F2", "F3"] {
+            assert_eq!(
+                entry(&ledger, id).severity,
+                ReviewFindingSeverity::Blocking,
+                "{id}"
+            );
+        }
+        assert_eq!(entry(&ledger, "F4").severity, ReviewFindingSeverity::Minor);
     }
 }
