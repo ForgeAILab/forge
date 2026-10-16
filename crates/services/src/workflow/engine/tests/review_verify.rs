@@ -29,6 +29,12 @@ async fn fixture(ci: &[&str], verify: serde_json::Value) -> FailedCiFixture {
     f
 }
 async fn enter(f: &FailedCiFixture) -> (db::Task, db::Review, serde_json::Value) {
+    enter_state(f, "review").await
+}
+async fn enter_state(
+    f: &FailedCiFixture,
+    state: &str,
+) -> (db::Task, db::Review, serde_json::Value) {
     let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
         .await
         .unwrap()
@@ -38,7 +44,7 @@ async fn enter(f: &FailedCiFixture) -> (db::Task, db::Review, serde_json::Value)
         .workflow_execution()
         .transition_with_authority(
             &task.id,
-            "review",
+            state,
             task.version,
             &f.workflow,
             &api_types::Actor::system(api_types::SystemComponent::Workflow),
@@ -576,6 +582,49 @@ fi"#}]}),
     assert_eq!(review.status, db::ReviewStatus::Passed, "{details}");
     assert_eq!(details["verify"]["status"], "pass");
     assert_eq!(verify_count(&f).await, 2);
+    assert_stopped(&f).await;
+}
+
+#[tokio::test]
+async fn review_verify_custom_review_state_charges_rerun_and_proceeds() {
+    let mut f = fixture(
+        &[],
+        json!({"checks":[{"name":"smoke","command":r#"if [ -f "$FORGE_VERIFY_DIR/ran" ]; then
+printf '%s' '{"verdict":"pass"}' > "$FORGE_VERIFY_REPORT"
+else
+touch "$FORGE_VERIFY_DIR/ran"
+printf '%s' '{"verdict":"inconclusive"}' > "$FORGE_VERIFY_REPORT"
+fi"#}]}),
+    )
+    .await;
+    for state in &mut f.workflow.states {
+        if state.name == "review" {
+            state.name = "quality_check".into();
+        }
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "review" {
+                trigger.to = "quality_check".into();
+            }
+        }
+    }
+    sqlx::query("UPDATE project SET workflow_definition=?,settings=json_set(settings,'$.retry_budgets.review_verify_rerun',1) WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id).execute(f.db.pool()).await.unwrap();
+    sqlx::query("UPDATE task SET task_state_config=json_set(json_remove(task_state_config,'$.review'),'$.quality_check',json_extract(task_state_config,'$.review')) WHERE id=?")
+        .bind(&f.task.id).execute(f.db.pool()).await.unwrap();
+    let (_, review, details) = enter_state(&f, "quality_check").await;
+    assert_eq!(details["verify"]["status"], "pass", "{details}");
+    assert_eq!(review.status, db::ReviewStatus::Passed, "{details}");
+    assert_eq!(verify_count(&f).await, 2);
+    assert_eq!(
+        db::budget::spent(f.db.pool(), &f.task.id, "review_verify_rerun")
+            .await
+            .unwrap(),
+        1
+    );
+    let charges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_budget_charge WHERE task_id=? AND kind='review_verify_rerun' AND window_id=?")
+        .bind(&f.task.id).bind(&review.id).fetch_one(f.db.pool()).await.unwrap();
+    assert_eq!(charges, 1);
     assert_stopped(&f).await;
 }
 #[tokio::test]

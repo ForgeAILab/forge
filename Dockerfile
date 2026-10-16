@@ -62,6 +62,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/forge /usr/local/bin/forge
@@ -74,5 +75,5 @@ ENV FORGE_WEB_DIST_DIR=/usr/local/share/forge/web/dist
 
 EXPOSE 8080
 
-ENTRYPOINT ["forge"]
+ENTRYPOINT ["/usr/bin/tini", "--", "forge"]
 CMD ["--data-dir", "/data"]

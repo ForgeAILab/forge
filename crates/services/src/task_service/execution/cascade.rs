@@ -2659,9 +2659,7 @@ impl TaskService {
             }
         }
         let effective_config = state_config.cloned().or_else(|| {
-            review_state.map(|state| {
-                db::budget::state_config(&state.config, &state.name, &project.settings)
-            })
+            review_state.map(|state| db::budget::state_config(state, &project.settings))
         });
         let budget = db::budget::limit(
             task,

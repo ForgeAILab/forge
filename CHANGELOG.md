@@ -3499,6 +3499,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Verification reruns accept custom workflow review state names, charge the
+  invocation budget, and apply the review state's limits and Project defaults.
+- The Docker image runs Forge under Tini so orphaned verification and CI
+  descendants are reaped and process groups can finish stopping.
+
 - Review streaks count only blocking appearances. Progress-round entry failures
   use infrastructure retries, and custom workflow planning roles agree between
   review routing and charging. A passing conformance CI rerun resolves prior test

@@ -1,6 +1,6 @@
 //! Task budget policy and transactional accounting. Counts never come from audit prose.
 use crate::{DbError, Result, Review, ReviewStatus, SqliteDb, Task};
-use api_types::{GateConfig, WorkflowDefinition};
+use api_types::{GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, Sqlite, Transaction};
@@ -256,6 +256,35 @@ pub fn lead_recover_key(subtask: &str) -> String {
 /// Review-gate rejections, counted against the cancelled-review entry cap
 /// (`max_rejections - 1`); the Review kind itself is keyed `review`.
 pub const REVIEW_GATE_KEY: &str = "gate:review";
+/// Match the review configuration resolver: the reviewer role identifies a
+/// renamed review gate; the built-in name also covers owner-only review.
+pub fn is_review_state(state: &StateDefinition) -> bool {
+    state.kind == StateKind::Gate
+        && (state.role.as_deref() == Some("reviewer") || state.name == "review")
+}
+
+pub fn gate_budget_key(state: &StateDefinition) -> String {
+    if is_review_state(state) {
+        Kind::Review.key().into()
+    } else {
+        gate_key(&state.name)
+    }
+}
+
+fn review_state_from_json(raw: &str, status: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "{}" {
+        return status == "review";
+    }
+    match serde_json::from_str::<WorkflowDefinition>(raw) {
+        Ok(workflow) => workflow
+            .states
+            .iter()
+            .any(|state| state.name == status && is_review_state(state)),
+        Err(_) => status == "review",
+    }
+}
+
 pub fn gate_key(state: &str) -> String {
     match state {
         "review" => "review".into(),
@@ -301,11 +330,7 @@ pub fn limit(
             .and_then(|g| g.max_rejections)
             .unwrap_or(i32::MAX)
             .max(0);
-        return Ok(if task.status == "review" {
-            n.saturating_sub(1).max(0)
-        } else {
-            n
-        });
+        return Ok(n);
     }
     if let Some(n) = configured_override(task, state_config, kind) {
         return Ok(n);
@@ -346,8 +371,8 @@ pub fn remaining(limit: i64, spent: i64) -> i64 {
 pub fn allows_retry(limit: i64, spent: i64) -> bool {
     remaining(limit, spent) > 0
 }
-pub fn gate_entry_exhausted(state: &str, limit: i64, spent: i64) -> bool {
-    state != "review" && !allows_retry(limit, spent)
+pub fn gate_entry_exhausted(is_review: bool, limit: i64, spent: i64) -> bool {
+    !is_review && !allows_retry(limit, spent)
 }
 pub fn after_charge_exhausted(limit: i64, spent: i64) -> bool {
     spent > limit
@@ -558,8 +583,13 @@ pub async fn apply(tx: &mut Transaction<'_, Sqlite>, task: &str, effect: Mutatio
 
 /// The invocation starts with its first request, including a verify that passes
 /// without a rerun. Replaying the same Review never refunds an existing charge.
-pub async fn initialize_verify_budget(db: &SqliteDb, task: &Task, review_id: &str) -> Result<()> {
-    let mut tx = verify_budget_transaction(db, task, review_id).await?;
+pub async fn initialize_verify_budget(
+    db: &SqliteDb,
+    task: &Task,
+    workflow: &WorkflowDefinition,
+    review_id: &str,
+) -> Result<()> {
+    let mut tx = verify_budget_transaction(db, task, workflow, review_id).await?;
     reset(&mut tx, &task.id, Kind::ReviewVerifyRerun.key(), review_id).await?;
     tx.commit().await?;
     Ok(())
@@ -568,14 +598,22 @@ pub async fn initialize_verify_budget(db: &SqliteDb, task: &Task, review_id: &st
 async fn verify_budget_transaction(
     db: &SqliteDb,
     task: &Task,
+    workflow: &WorkflowDefinition,
     review_id: &str,
 ) -> Result<Transaction<'static, Sqlite>> {
+    if !workflow
+        .states
+        .iter()
+        .any(|state| state.name == task.status && is_review_state(state))
+    {
+        return Err(DbError::InvalidTransition);
+    }
     let mut tx = crate::begin_immediate(db.pool()).await?;
     if let Some(step) = crate::task_writer::current_task_step().filter(|s| s.task_id == task.id) {
         db.fence_hook_in_tx(&mut tx, &step).await?;
     }
-    let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task t JOIN review r ON r.task_id=t.id WHERE t.id=? AND t.version=? AND t.status='review' AND t.deleted_at IS NULL AND r.id=? AND r.status='running' AND NOT EXISTS(SELECT 1 FROM review newer WHERE newer.task_id=t.id AND newer.attempt_number>r.attempt_number))")
-        .bind(&task.id).bind(task.version).bind(review_id).fetch_one(&mut *tx).await?;
+    let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task t JOIN review r ON r.task_id=t.id WHERE t.id=? AND t.version=? AND t.status=? AND t.deleted_at IS NULL AND r.id=? AND r.status='running' AND NOT EXISTS(SELECT 1 FROM review newer WHERE newer.task_id=t.id AND newer.attempt_number>r.attempt_number))")
+        .bind(&task.id).bind(task.version).bind(&task.status).bind(review_id).fetch_one(&mut *tx).await?;
     if !current {
         return Err(DbError::VersionConflict);
     }
@@ -588,11 +626,12 @@ async fn verify_budget_transaction(
 pub async fn grant_verify_rerun(
     db: &SqliteDb,
     task: &Task,
+    workflow: &WorkflowDefinition,
     state_config: &Value,
     review_id: &str,
     evaluation: u32,
 ) -> Result<bool> {
-    let mut tx = verify_budget_transaction(db, task, review_id).await?;
+    let mut tx = verify_budget_transaction(db, task, workflow, review_id).await?;
     let key = Kind::ReviewVerifyRerun.key();
     let receipt = format!("verify:{review_id}:{evaluation}");
     reset(&mut tx, &task.id, key, review_id).await?;
@@ -659,13 +698,14 @@ pub fn projection(
             .as_ref()
             .and_then(|g| g.max_rejections)
             .is_none()
-            && state.name != "review"
+            && !is_review_state(state)
         {
             continue;
         }
-        let kind = match state.name.as_str() {
-            "review" => Kind::Review,
-            _ => Kind::GateRejection,
+        let kind = if is_review_state(state) {
+            Kind::Review
+        } else {
+            Kind::GateRejection
         };
         let mut origin = task.clone();
         origin.status = state.name.clone();
@@ -675,7 +715,7 @@ pub fn projection(
             Some(&state.config),
             state.gate_config.as_ref(),
         )?;
-        if state.name == "review" {
+        if is_review_state(state) {
             let cap = limit(
                 &origin,
                 Kind::GateRejection,
@@ -684,14 +724,17 @@ pub fn projection(
             )?;
             out.insert(
                 "review_gate".into(),
-                remaining(i64::from(cap), *counts.get(REVIEW_GATE_KEY).unwrap_or(&0)),
+                remaining(
+                    i64::from(cap.saturating_sub(1).max(0)),
+                    *counts.get(REVIEW_GATE_KEY).unwrap_or(&0),
+                ),
             );
         }
         out.insert(
             state.name.clone(),
             remaining(
                 i64::from(n),
-                *counts.get(&gate_key(&state.name)).unwrap_or(&0),
+                *counts.get(&gate_budget_key(state)).unwrap_or(&0),
             ),
         );
     }
@@ -701,7 +744,9 @@ pub fn projection(
         .filter(|k| !matches!(k, Kind::Review))
     {
         let scoped = if matches!(kind, Kind::ReviewProgress | Kind::ReviewVerifyRerun) {
-            workflow.states.iter().find(|s| s.name == "review")
+            current
+                .filter(|state| is_review_state(state))
+                .or_else(|| workflow.states.iter().find(|state| is_review_state(state)))
         } else if kind == Kind::MergeFix {
             workflow.states.iter().find(|s| s.name == "merging")
         } else {
@@ -856,7 +901,15 @@ pub async fn transition(
     if owner {
         return Ok(());
     }
-    if from == "review" && rejection {
+    let from_review = if rejection {
+        let raw: String = sqlx::query_scalar(
+            "SELECT p.workflow_definition FROM project p JOIN task t ON t.project_id=p.id WHERE t.id=?",
+        ).bind(task).fetch_one(&mut **tx).await?;
+        review_state_from_json(&raw, from)
+    } else {
+        false
+    };
+    if from_review {
         if owner_requested_review_entry(tx, task, Some(step), None).await? {
             return Ok(());
         }
@@ -887,7 +940,7 @@ pub async fn transition(
             admit(tx, task, &gate_key(from), step).await?;
             Some(Kind::MergeFix.key().to_owned())
         }
-        _ if rejection && from != "review" => Some(gate_key(from)),
+        _ if rejection => Some(gate_key(from)),
         _ => None,
     };
     if let Some(key) = key {
@@ -914,10 +967,10 @@ pub fn recovery_limit(settings: &str) -> i64 {
 
 /// Keep Project defaults in this resolver too; top-level Project review/execution
 /// retry fields were inert and remain so. Only the existing merging overlay applies.
-pub fn state_config(config: &Value, state: &str, settings: &str) -> Value {
-    let mut config = config.clone();
+pub fn state_config(state: &StateDefinition, settings: &str) -> Value {
+    let mut config = state.config.clone();
     let settings = serde_json::from_str::<Value>(settings).unwrap_or(Value::Null);
-    if state == "merging" {
+    if state.name == "merging" {
         if let Some(value) = settings.pointer("/retry_budgets/merge_fix") {
             if !config.is_object() {
                 config = serde_json::json!({});
@@ -928,7 +981,7 @@ pub fn state_config(config: &Value, state: &str, settings: &str) -> Value {
             config["retry_budgets"]["merge_fix"] = value.clone();
         }
     }
-    if state == "review" {
+    if is_review_state(state) {
         if let Some(defaults) = settings
             .get("default_review_config")
             .and_then(Value::as_object)
@@ -962,7 +1015,7 @@ pub fn state_config(config: &Value, state: &str, settings: &str) -> Value {
 pub fn with_project_defaults(workflow: &WorkflowDefinition, settings: &str) -> WorkflowDefinition {
     let mut workflow = workflow.clone();
     for state in &mut workflow.states {
-        state.config = state_config(&state.config, &state.name, settings);
+        state.config = state_config(state, settings);
     }
     workflow
 }
@@ -1014,23 +1067,41 @@ pub async fn review_rerun_entry<'e, E>(
 where
     E: sqlx::Executor<'e, Database = Sqlite>,
 {
-    // Only an entry logs its epoch; a recovery marker written while the Task
-    // sits in `review` has none.
-    let entry: Option<(String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT id,bridge_kind,bridge_payload,created_at FROM transition_log
-         WHERE task_id=? AND to_state='review' AND status_epoch IS NOT NULL AND id IS NOT ?
-         ORDER BY status_epoch DESC,created_at DESC,rowid DESC LIMIT 1",
+    // Retain only the latest entry per state, then resolve the review state
+    // from the Project workflow. Recovery markers have no entry epoch.
+    let entries = sqlx::query(
+        "WITH entries AS (
+            SELECT id,bridge_kind,bridge_payload,created_at,to_state,status_epoch,
+                   ROW_NUMBER() OVER (PARTITION BY to_state ORDER BY status_epoch DESC,created_at DESC,rowid DESC) AS ordinal
+            FROM transition_log WHERE task_id=? AND status_epoch IS NOT NULL AND id IS NOT ?
+         )
+         SELECT e.*,p.workflow_definition FROM entries e
+         JOIN task t ON t.id=? JOIN project p ON p.id=t.project_id
+         WHERE e.ordinal=1 ORDER BY e.status_epoch DESC,e.created_at DESC",
     )
     .bind(task)
     .bind(leaving)
-    .fetch_optional(executor)
+    .bind(task)
+    .fetch_all(executor)
     .await?;
-    Ok(entry.and_then(|(id, kind, payload, entered_at)| {
-        crate::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref())
-            .ok()?
-            .review_rerun_requester()
-            .map(|requested_by| (requested_by, entered_at))
-    }))
+    for entry in entries {
+        let workflow: String = entry.try_get("workflow_definition")?;
+        let state: String = entry.try_get("to_state")?;
+        if !review_state_from_json(&workflow, &state) {
+            continue;
+        }
+        let id: String = entry.try_get("id")?;
+        let kind: Option<String> = entry.try_get("bridge_kind")?;
+        let payload: Option<String> = entry.try_get("bridge_payload")?;
+        let entered_at: String = entry.try_get("created_at")?;
+        return Ok(
+            crate::decode_transition_bridge(&id, kind.as_deref(), payload.as_deref())
+                .ok()
+                .and_then(|bridge| bridge.review_rerun_requester())
+                .map(|requested_by| (requested_by, entered_at)),
+        );
+    }
+    Ok(None)
 }
 
 /// Honor routing only when the reviewer verdict caused the failure. Forge
@@ -1416,7 +1487,9 @@ pub async fn cancelled_review_entry_allows_retry(
     task: &Task,
     gate: Option<&GateConfig>,
 ) -> Result<bool> {
-    let cap = limit(task, Kind::GateRejection, None, gate)?;
+    let cap = limit(task, Kind::GateRejection, None, gate)?
+        .saturating_sub(1)
+        .max(0);
     Ok(allows_retry(
         i64::from(cap),
         spent(db.pool(), &task.id, REVIEW_GATE_KEY).await?,
@@ -1941,7 +2014,9 @@ mod tests {
             name:"review".into(), kind:api_types::StateKind::Gate, config:json!({"retry_budgets":{"review_progress":4}}),
             ..serde_json::from_value(json!({"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{}})).unwrap()
         }], ..Default::default() };
-        let merged = state_config(&json!({}), "review", &json!({"retry_budgets":{"review_progress":2},"default_review_config":{"retry_budgets":{"review":7}}}).to_string());
+        let mut state = workflow.states[0].clone();
+        state.config = json!({});
+        let merged = state_config(&state, &json!({"retry_budgets":{"review_progress":2},"default_review_config":{"retry_budgets":{"review":7}}}).to_string());
         assert_eq!(merged["retry_budgets"]["review"], 7);
         assert_eq!(merged["retry_budgets"]["review_progress"], 2);
         let gate: GateConfig = serde_json::from_value(json!({"max_rejections":99})).unwrap();
@@ -2011,14 +2086,17 @@ mod tests {
     #[tokio::test]
     async fn budget_verify_rerun_receipts_replay_and_new_reviews_get_fresh_windows() {
         let (db, task) = fixture().await;
+        let workflow: WorkflowDefinition = serde_json::from_value(json!({"roles":[],"states":[{"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{"retry_budgets":{"review_verify_rerun":3}}}]})).unwrap();
         sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('e','t','coder','completed','now','now')").execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r1','t','e',1,'running','{}','now','now','now')").execute(db.pool()).await.unwrap();
         let config = json!({"retry_budgets":{"review_verify_rerun":1}});
-        initialize_verify_budget(&db, &task, "r1").await.unwrap();
-        assert!(grant_verify_rerun(&db, &task, &config, "r1", 0)
+        initialize_verify_budget(&db, &task, &workflow, "r1")
+            .await
+            .unwrap();
+        assert!(grant_verify_rerun(&db, &task, &workflow, &config, "r1", 0)
             .await
             .unwrap());
-        assert!(grant_verify_rerun(&db, &task, &config, "r1", 0)
+        assert!(grant_verify_rerun(&db, &task, &workflow, &config, "r1", 0)
             .await
             .unwrap());
         assert_eq!(
@@ -2027,8 +2105,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        initialize_verify_budget(&db, &task, "r1").await.unwrap();
-        assert!(!grant_verify_rerun(&db, &task, &config, "r1", 1)
+        initialize_verify_budget(&db, &task, &workflow, "r1")
+            .await
+            .unwrap();
+        assert!(!grant_verify_rerun(&db, &task, &workflow, &config, "r1", 1)
             .await
             .unwrap());
         sqlx::query("UPDATE review SET status='cancelled' WHERE id='r1'")
@@ -2036,18 +2116,20 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r2','t','e',2,'running','{}','now','now','now')").execute(db.pool()).await.unwrap();
-        initialize_verify_budget(&db, &task, "r2").await.unwrap();
+        initialize_verify_budget(&db, &task, &workflow, "r2")
+            .await
+            .unwrap();
         assert_eq!(
             spent(db.pool(), &task.id, "review_verify_rerun")
                 .await
                 .unwrap(),
             0
         );
-        assert!(grant_verify_rerun(&db, &task, &config, "r2", 0)
+        assert!(grant_verify_rerun(&db, &task, &workflow, &config, "r2", 0)
             .await
             .unwrap());
         assert!(
-            grant_verify_rerun(&db, &task, &config, "r1", 0)
+            grant_verify_rerun(&db, &task, &workflow, &config, "r1", 0)
                 .await
                 .is_err(),
             "stale Review cannot restore its budget window"
@@ -2058,7 +2140,6 @@ mod tests {
                 .unwrap(),
             1
         );
-        let workflow = WorkflowDefinition { states: vec![serde_json::from_value(json!({"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{"retry_budgets":{"review_verify_rerun":3}}})).unwrap()], ..Default::default() };
         let projected = projection(
             &task,
             &workflow,
@@ -2067,6 +2148,127 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projected["review_verify_rerun"], 2);
+    }
+
+    #[tokio::test]
+    async fn budget_verify_rerun_charges_custom_review_state_and_fences_status() {
+        let (db, _) = fixture().await;
+        let workflow: WorkflowDefinition = serde_json::from_value(json!({"roles":[],"states":[
+            {"name":"quality_check","kind":"gate","role":"reviewer","column":"Review","display_name":"Quality","hooks":{},"config":{},"gate_config":{"max_rejections":2}},
+            {"name":"working","kind":"active","column":"Working","display_name":"Working","hooks":{},"config":{}}
+        ]})).unwrap();
+        sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+            .bind(serde_json::to_string(&workflow).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET status='quality_check' WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('e','t','coder','completed','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r','t','e',1,'running','{}','now','now','now')").execute(db.pool()).await.unwrap();
+        let settings =
+            json!({"retry_budgets":{"review_verify_rerun":3,"review_progress":4}}).to_string();
+        let workflow = with_project_defaults(&workflow, &settings);
+        let config = &workflow.states[0].config;
+        initialize_verify_budget(&db, &task, &workflow, "r")
+            .await
+            .unwrap();
+        assert!(grant_verify_rerun(&db, &task, &workflow, config, "r", 0)
+            .await
+            .unwrap());
+        assert!(grant_verify_rerun(&db, &task, &workflow, config, "r", 0)
+            .await
+            .unwrap());
+        let counts = load(db.pool(), &task.id).await.unwrap();
+        assert_eq!(counts[Kind::ReviewVerifyRerun.key()], 1);
+        let projected = projection(&task, &workflow, &counts, 0).unwrap();
+        assert_eq!(projected["review_verify_rerun"], 2);
+        assert_eq!(projected["review_progress"], 4);
+        assert_eq!(projected["quality_check"], 2);
+        assert_eq!(projected["review_gate"], 1);
+        assert!(!gate_entry_exhausted(
+            is_review_state(&workflow.states[0]),
+            0,
+            0
+        ));
+        assert!(gate_entry_exhausted(false, 0, 0));
+        let gate = workflow.states[0].gate_config.as_ref();
+        assert!(cancelled_review_entry_allows_retry(&db, &task, gate)
+            .await
+            .unwrap());
+
+        let owner = api_types::Actor::user(api_types::UserActionSource::Api);
+        let bridge = api_types::TransitionBridge::review_rerun(&owner);
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload,status_epoch) VALUES('owner-entry','t','quality_check','quality_check','system','entry','2026-01-01T00:00:00Z',?,?,1)")
+            .bind(bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+            .bind(bridge.bridge_payload.map(|payload| payload.to_string()))
+            .execute(db.pool()).await.unwrap();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(owner_requested_review_entry(&mut tx, &task.id, None, None)
+            .await
+            .unwrap());
+        transition(
+            &mut tx,
+            &task.id,
+            &task.status,
+            false,
+            &api_types::TransitionBridge::default(),
+            true,
+            "owner-rejection",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(review_spent(&db).await, (0, 0));
+
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,status_epoch) VALUES('automatic-entry','t','working','quality_check','system','entry','2026-01-01T00:00:01Z',2)")
+            .execute(db.pool()).await.unwrap();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(!owner_requested_review_entry(&mut tx, &task.id, None, None)
+            .await
+            .unwrap());
+        transition(
+            &mut tx,
+            &task.id,
+            &task.status,
+            false,
+            &api_types::TransitionBridge::default(),
+            true,
+            "automatic-rejection",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(review_spent(&db).await, (1, 1));
+        assert!(!cancelled_review_entry_allows_retry(&db, &task, gate)
+            .await
+            .unwrap());
+        assert_eq!(gate_budget_key(&workflow.states[0]), Kind::Review.key());
+
+        sqlx::query("UPDATE task SET status='working',version=version+1 WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            grant_verify_rerun(&db, &task, &workflow, config, "r", 1).await,
+            Err(DbError::VersionConflict)
+        ));
+        let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+        assert!(matches!(
+            initialize_verify_budget(&db, &task, &workflow, "r").await,
+            Err(DbError::InvalidTransition)
+        ));
+        assert_eq!(
+            spent(db.pool(), &task.id, "review_verify_rerun")
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     // D5 rule 1 is Forge's own rule: a reviewer finding on its third check

@@ -255,7 +255,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                     .as_ref()
                     .and_then(|config| config.reject_target.as_deref())
                     == Some(task.status.as_str()))
-            && (gate.name == "review"
+            && (db::budget::is_review_state(gate)
                 || gate
                     .gate_config
                     .as_ref()
@@ -263,7 +263,7 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
                     .is_some())
     });
     let gate_budget = |gate: &api_types::StateDefinition| {
-        let kind = if gate.name == crate::workflow::default_states::REVIEW {
+        let kind = if db::budget::is_review_state(gate) {
             db::budget::Kind::Review
         } else {
             db::budget::Kind::GateRejection
@@ -277,11 +277,11 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     }) || retry_gate.is_some_and(|gate| {
         gate_budget(gate).is_some_and(|budget| {
             db::budget::gate_entry_exhausted(
-                &gate.name,
+                db::budget::is_review_state(gate),
                 i64::from(budget),
                 *snapshot
                     .budget_spent
-                    .get(&db::budget::gate_key(&gate.name))
+                    .get(&db::budget::gate_budget_key(gate))
                     .unwrap_or(&0),
             )
         })
@@ -303,13 +303,13 @@ pub fn available_actions(snapshot: &TaskSnapshot) -> Vec<Offer> {
     let one_shot_allowed = snapshot.caller.owner
         && snapshot.wait_cause.is_none()
         && retry_gate.is_some_and(|gate| {
-            gate.name == "review"
+            db::budget::is_review_state(gate)
                 && (gate_budget(gate).is_some_and(|budget| {
                     !db::budget::allows_retry(
                         i64::from(budget),
                         *snapshot
                             .budget_spent
-                            .get(&db::budget::gate_key(&gate.name))
+                            .get(&db::budget::gate_budget_key(gate))
                             .unwrap_or(&0),
                     )
                 }) || snapshot.annotation().is_some_and(|annotation| {

@@ -82,6 +82,11 @@ docker compose up -d
 Data persists in the `forge-data` Docker volume. Set `RUST_LOG=debug` in
 `docker-compose.yml` for verbose output.
 
+The Forge image runs under Tini to reap orphaned verification, CI, and shell
+processes. Custom images or entrypoint overrides must also use an init process
+(for example, `docker run --init` or Compose `init: true`); Forge must not run
+directly as PID 1. The public demo Compose file already sets `init: true`.
+
 ## First boot
 
 By default the server:

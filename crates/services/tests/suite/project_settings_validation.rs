@@ -234,7 +234,12 @@ async fn review_round_routing_progress_setting_is_validated_and_resolved() {
         validate_project_settings(&db, &settings, &workflow(), Some(PROJECT), None)
             .await
             .unwrap();
-        let config = db::budget::state_config(&json!({}), "review", &settings.to_string());
+        let state = serde_json::from_value(json!({
+            "name":"review", "kind":"gate", "column":"Review",
+            "display_name":"Review", "hooks":{}, "config":{}
+        }))
+        .unwrap();
+        let config = db::budget::state_config(&state, &settings.to_string());
         assert_eq!(config["retry_budgets"]["review_progress"], limit);
     }
     let error = validate_project_settings(

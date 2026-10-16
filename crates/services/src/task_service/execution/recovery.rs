@@ -2089,7 +2089,7 @@ impl TaskService {
             origin
         };
 
-        let kind = if state.name == crate::workflow::default_states::REVIEW {
+        let kind = if db::budget::is_review_state(state) {
             db::budget::Kind::Review
         } else {
             db::budget::Kind::GateRejection
@@ -2102,8 +2102,12 @@ impl TaskService {
             Some(&state.config),
             state.gate_config.as_ref(),
         )?;
-        let count =
-            db::budget::spent(self.db.pool(), &task.id, &db::budget::gate_key(&state.name)).await?;
+        let count = db::budget::spent(
+            self.db.pool(),
+            &task.id,
+            &db::budget::gate_budget_key(state),
+        )
+        .await?;
         Ok((state.name.clone(), budget, count))
     }
 

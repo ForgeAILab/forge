@@ -103,7 +103,7 @@ pub(super) async fn run(
     loop {
         if consumer.is_none() {
             if evaluation == 0 {
-                db::budget::initialize_verify_budget(&ctx.db, task, &review.id)
+                db::budget::initialize_verify_budget(&ctx.db, task, &ctx.workflow, &review.id)
                     .await
                     .map_err(infrastructure)?;
             }
@@ -226,6 +226,7 @@ pub(super) async fn run(
             || !db::budget::grant_verify_rerun(
                 &ctx.db,
                 task,
+                &ctx.workflow,
                 &ctx.state_config,
                 &review.id,
                 evaluation,

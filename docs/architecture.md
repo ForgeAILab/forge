@@ -7593,6 +7593,11 @@ including when that Review passes without a rerun. Replaying initialization
 never refunds an existing charge. Task-wide overrides win
 over supplied Review state config, which includes Project defaults for both
 `review_progress` and `review_verify_rerun`.
+Review budgets resolve the Task's current review gate by its workflow definition
+(including gates with the `reviewer` role and a custom state name). Verification
+initialization and rerun charges require that review state and fence the Task's
+actual status and version; renamed review gates receive the same Project defaults
+and remaining-budget projections.
 
 Owner-fixable failures and derived repeated reviewer findings spend nothing.
 With structured findings, an open blocking reviewer finding checked for a third
