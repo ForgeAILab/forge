@@ -8354,7 +8354,8 @@ If that allowance has no retry left but the open blocking count dropped,
 supplied Review state config; the Project setting supplies a default when the
 state has none. Gate `max_rejections` never sets this budget. Its remaining
 projection uses the Review state even while the Task is working. Owner actions
-spend nothing. Without progress, or with progress disabled/exhausted, ordinary
+spend nothing, but an owner's review re-run gets a progress round only while
+the limit has one left (`0` stays disabled). Without progress, or with progress disabled/exhausted, ordinary
 automatic recovery and `review_budget_exhausted` apply. Coordination roots with
 a lead retain `charge_replan` and remain outside derived repeat/progress rules.
 The workflow's reject target is used, including autonomous `working`.

@@ -1067,7 +1067,8 @@ async fn coordination_root_in_tx(tx: &mut Transaction<'_, Sqlite>, task: &Task) 
 }
 
 /// Admit one progress round atomically under Task authority. A replay keeps its
-/// earlier grant even after spending the last allowance. Owner reruns are free.
+/// earlier grant even after spending the last allowance. Owner re-runs are
+/// free but stay within the limit.
 pub async fn grant_review_progress(
     db: &SqliteDb,
     task: &Task,
@@ -1082,12 +1083,21 @@ pub async fn grant_review_progress(
     if !valid {
         return Err(DbError::VersionConflict);
     }
-    if owner_requested_review_entry(&mut tx, &task.id, None, Some(&review.created_at)).await? {
-        return Ok(true);
-    }
     let window: String = sqlx::query_scalar("SELECT COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='review'),'initial')")
         .bind(&task.id).fetch_one(&mut *tx).await?;
     reset(&mut tx, &task.id, Kind::ReviewProgress.key(), &window).await?;
+    if owner_requested_review_entry(&mut tx, &task.id, None, Some(&review.created_at)).await? {
+        // An owner's re-run spends nothing, but it never exceeds the limit:
+        // `review_progress = 0` stays disabled and a spent window stays spent.
+        let spent: i64 =
+            sqlx::query_scalar("SELECT spent FROM task_budget WHERE task_id=? AND kind=?")
+                .bind(&task.id)
+                .bind(Kind::ReviewProgress.key())
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        return Ok(allows_retry(limit, spent));
+    }
     let receipt = format!("progress:{}", review.id);
     let paid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_budget_charge WHERE task_id=? AND kind=? AND window_id=? AND step_id=?)")
         .bind(&task.id).bind(Kind::ReviewProgress.key()).bind(&window).bind(&receipt).fetch_one(&mut *tx).await?;

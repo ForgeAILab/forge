@@ -6676,7 +6676,8 @@ It never inherits gate `max_rejections`. `remaining_retries.review_progress`
 and `retry_limits.review_progress` appear on Task detail/list responses and use
 the Review window and state even while the Task is in a repair state.
 A progress round uses an idempotent `progress:<review id>` receipt. Owner actions
-never spend it. `review_verify_rerun` is invocation-scoped (limit 1) and is never
+never spend it; an owner's review re-run still gets a progress round only while
+the limit has one left. `review_verify_rerun` is invocation-scoped (limit 1) and is never
 persisted or projected as Task spending; verify execution is a later phase.
 
 After a coder-fixable failed Review, a reviewer finding open on its third

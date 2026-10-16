@@ -10202,3 +10202,58 @@ async fn review_round_progress_receipt_replays_the_last_grant_without_refund() {
     .await
     .unwrap());
 }
+
+// An owner's review re-run spends no progress round, but it is still bounded
+// by the configured limit: `review_progress = 0` disables extra rounds for
+// owner re-runs too, and a spent allowance is not refilled by one.
+#[tokio::test]
+async fn review_round_owner_rerun_never_exceeds_the_progress_limit() {
+    for (config, spent) in [
+        (r#"{"retry_budgets":{"review":1,"review_progress":0}}"#, 0),
+        (r#"{"retry_budgets":{"review":1,"review_progress":1}}"#, 1),
+    ] {
+        let (db, service, task, execution, _dir) = seed_admitted_review_with(config).await;
+        structured_round_previous(&db, &task.id, 3).await;
+        let owner = api_types::Actor::user(api_types::UserActionSource::Api);
+        let bridge = api_types::TransitionBridge::review_rerun(&owner);
+        sqlx::query("INSERT INTO transition_log(id,task_id,from_state,to_state,triggered_by,trigger_reason,created_at,bridge_kind,bridge_payload,status_epoch) VALUES(?,?,'review','review','user','owner re-run','2000-01-01T00:00:00Z',?,?,99)")
+            .bind(new_uuid_v4())
+            .bind(&task.id)
+            .bind(bridge.bridge_kind.map(api_types::TransitionBridgeKind::as_str))
+            .bind(bridge.bridge_payload.map(|payload| payload.to_string()))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        if spent > 0 {
+            sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review_progress',COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='review'),'initial'),?)")
+                .bind(&task.id)
+                .bind(&task.id)
+                .bind(spent)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        // The owner's re-run verdict committed without spending the review budget.
+        sqlx::query("UPDATE review SET status='failed',step_results_json=? WHERE task_id=? AND attempt_number=2")
+            .bind(json!({"conformance":{"status":"failed","reason":"one left","checks":[],"assessment":{"result":"fail","reason":"one left","findings":[{"id":"F1","summary":"issue 1"}],"resolved":["F2","F3"]}}}).to_string())
+            .bind(&task.id).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task_budget SET spent=1 WHERE task_id=? AND kind='review'")
+            .bind(&task.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let current = TaskRepo::get_by_id(&*db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let (task, target, _) = service
+            .review_failure_target(&current, Some(&execution.id))
+            .await
+            .unwrap();
+        assert!(target.is_none(), "{config}: owner re-run granted a round");
+        let annotation: Value =
+            serde_json::from_str(task.error_annotation.as_deref().unwrap()).unwrap();
+        assert_eq!(annotation["type"], "review_budget_exhausted", "{config}");
+        assert_eq!(round_spending(&db, &task.id).await, (1, spent), "{config}");
+    }
+}
