@@ -1,5 +1,5 @@
 import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
-import {  CaretDown, } from '@phosphor-icons/react'
+import { CaretDown } from '@phosphor-icons/react'
 import { useState } from 'react'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
@@ -11,6 +11,7 @@ import { cn } from '@/lib/cn'
 import type { Review, Task } from '@/types/generated'
 import { formatDate } from './utils'
 import { ReviewConformancePanel } from './ReviewConformancePanel'
+import { ReviewFindingsLedger } from './ReviewFindingsLedger'
 
 const reviewStatusClassNames: Record<Review['status'], string> = {
   running: 'bg-amber-100 text-amber-900 dark:bg-amber-900/30 dark:text-amber-300',
@@ -83,8 +84,18 @@ export function TaskReviewTab({
           showRetry={isTransientApiError(reviewsError)}
         />
       ) : null}
-      <WorkflowExceptionPanel task={task} assessment={latestReview?.details.conformance.assessment} />
-      {!task.workflow_exception ? <TaskActionButtons taskId={task.id} version={task.version} offers={task.available_actions ?? []} /> : null}
+      <WorkflowExceptionPanel
+        task={task}
+        assessment={latestReview?.details.conformance.assessment}
+      />
+      {!task.workflow_exception ? (
+        <TaskActionButtons
+          taskId={task.id}
+          version={task.version}
+          offers={task.available_actions ?? []}
+        />
+      ) : null}
+      <ReviewFindingsLedger taskId={task.id} />
       {/* Header card — attempt info + actions */}
       {(task.status === 'review' || reviews.length > 0) && (
         <div className="rounded-lg border p-4">
@@ -108,13 +119,17 @@ export function TaskReviewTab({
                 <p className="text-xs text-muted-foreground">No review details yet.</p>
               ) : null}
             </div>
-
-
           </div>
         </div>
       )}
 
-      {latestReview && <ReviewConformancePanel conformance={latestReview.details.conformance} />}
+      {latestReview && (
+        <ReviewConformancePanel
+          conformance={latestReview.details.conformance}
+          taskId={task.id}
+          verify={'verify' in latestReview.details ? latestReview.details.verify : undefined}
+        />
+      )}
 
       {/* Step results */}
       <StepResultsSection latestReview={latestReview} reviewsLoading={reviewsLoading} />
@@ -184,7 +199,13 @@ export function TaskReviewTab({
                         </button>
                         {isExpanded && (
                           <div className="border-t bg-muted/20 px-4 py-3 space-y-2">
-                            <ReviewConformancePanel conformance={review.details.conformance} />
+                            <ReviewConformancePanel
+                              conformance={review.details.conformance}
+                              taskId={task.id}
+                              verify={
+                                'verify' in review.details ? review.details.verify : undefined
+                              }
+                            />
                             {review.step_results.length > 0 ? (
                               review.step_results.map((step) => (
                                 <ChatEntryContainer

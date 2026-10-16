@@ -10,7 +10,31 @@ use db::Review;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-/// Derive every finding, ordered lexically by id. The API's 200-item limit is
+/// Stable across processes and owners; signatures are normalised by check-executor.
+pub fn ci_finding_id(step: usize, signature: &str) -> String {
+    let digest = Sha256::digest(signature.as_bytes());
+    format!(
+        "CI-{step}#{:02x}{:02x}{:02x}{:02x}",
+        digest[0], digest[1], digest[2], digest[3]
+    )
+}
+
+/// A step-level `CI-<n>` the ledger closed because the step's failures are now
+/// tracked per test. The step did not pass, so it is not a resolution to show.
+pub fn superseded_by_tests(entry: &ReviewFindingEntry, ledger: &[ReviewFindingEntry]) -> bool {
+    entry.source == Source::Ci
+        && entry.status == Status::Resolved
+        && !entry.id.contains('#')
+        && ledger.iter().any(|other| {
+            other.status != Status::Resolved
+                && other
+                    .id
+                    .strip_prefix(entry.id.as_str())
+                    .is_some_and(|rest| rest.starts_with('#'))
+        })
+}
+
+/// Derive every finding, ordered naturally by id. The API's 200-item limit is
 /// applied only after derivation, so hidden entries still reserve their ids.
 pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntry>, String> {
     let mut reviews: Vec<_> = window_reviews.iter().collect();
@@ -61,6 +85,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         // Count it once per attempt, preferring the check's final observation.
         let mut observations = BTreeMap::new();
         let mut detailed_ci = BTreeSet::new();
+        let mut non_blocking = BTreeSet::new();
         for step in steps {
             let prefix = format!("CI-{}", step.index);
             let output = if step.output_tail.is_empty() {
@@ -83,7 +108,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 .collect();
             if step.exit_code == 0 || !signatures.is_empty() {
                 // A completed signature list proves earlier test findings absent.
-                if !step.failures_truncated {
+                if step.exit_code == 0 || !step.failures_truncated {
                     for (id, entry) in &ledger {
                         if entry.source == Source::Ci && id.starts_with(&format!("{prefix}#")) {
                             observations.insert(
@@ -96,16 +121,21 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 if !signatures.is_empty() {
                     detailed_ci.insert(prefix.clone());
                     for signature in signatures {
-                        let hash: String = Sha256::digest(signature.as_bytes())
-                            .iter()
-                            .map(|byte| format!("{byte:02x}"))
-                            .collect();
                         let class = classes
                             .get(&signature)
                             .copied()
                             .or_else(|| step.triage.as_ref().and_then(|triage| triage.class));
+                        let id = ci_finding_id(step.index, &signature);
+                        if step
+                            .triage
+                            .as_ref()
+                            .is_some_and(|triage| triage.mode == api_types::ReviewCiTriage::Full)
+                            && class.is_some_and(|class| !class.blocks())
+                        {
+                            non_blocking.insert(id.clone());
+                        }
                         observations.insert(
-                            format!("{prefix}#{}", &hash[..8]),
+                            id,
                             (
                                 Source::Ci,
                                 step.command.clone(),
@@ -140,6 +170,11 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 }
             }
             let class = step.triage.as_ref().and_then(|triage| triage.class);
+            if step.triage.as_ref().is_some_and(|triage| {
+                triage.mode == api_types::ReviewCiTriage::Full && !triage.blocking
+            }) {
+                non_blocking.insert(prefix.clone());
+            }
             observations.insert(
                 prefix,
                 (Source::Ci, step.command, step.exit_code == 0, output, class),
@@ -154,6 +189,13 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             };
             if !detailed_ci.contains(&id) {
                 let class = check.triage.as_ref().and_then(|triage| triage.class);
+                // The check's final observation supersedes pre-review CI.
+                non_blocking.remove(&id);
+                if check.triage.as_ref().is_some_and(|triage| {
+                    triage.mode == api_types::ReviewCiTriage::Full && !triage.blocking
+                }) {
+                    non_blocking.insert(id.clone());
+                }
                 observations.insert(
                     id,
                     (
@@ -213,7 +255,11 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             } else {
                 let finding = ReviewFinding {
                     id: None,
-                    summary: format!("{command} failed"),
+                    summary: if source == Source::Ci && id.contains('#') {
+                        observed.clone()
+                    } else {
+                        format!("{command} failed")
+                    },
                     severity: ReviewFindingSeverity::Blocking,
                     r#where: Some(command),
                     expected: Some("Pass".into()),
@@ -222,7 +268,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 open(&mut ledger, id.clone(), source, &finding, attempt);
                 let entry = ledger.get_mut(&id).expect("opened finding");
                 entry.ci_triage = class;
-                if let Some(class) = class.filter(|class| !class.blocks()) {
+                if let Some(class) = class.filter(|_| non_blocking.contains(&id)) {
                     entry.status = match class {
                         api_types::CiFailureClass::Flaky => Status::Flaky,
                         _ => Status::PreExisting,
@@ -277,7 +323,42 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
             }
         }
     }
-    Ok(ledger.into_values().collect())
+    let mut entries: Vec<_> = ledger.into_values().collect();
+    entries.sort_by(|a, b| compare_finding_ids(&a.id, &b.id));
+    Ok(entries)
+}
+
+/// Compare numeric runs by value without a fixed-width integer conversion.
+/// This also orders source ids such as CI-2 before CI-10.
+pub fn compare_finding_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (a_bytes, b_bytes) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a_bytes[i].is_ascii_digit() && b_bytes[j].is_ascii_digit() {
+            let (start_i, start_j) = (i, j);
+            while i < a.len() && a_bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b_bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            let left = a[start_i..i].trim_start_matches('0');
+            let right = b[start_j..j].trim_start_matches('0');
+            let order = left.len().cmp(&right.len()).then_with(|| left.cmp(right));
+            if order != Ordering::Equal {
+                return order;
+            }
+        } else {
+            let order = a_bytes[i].cmp(&b_bytes[j]);
+            if order != Ordering::Equal {
+                return order;
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then_with(|| a.cmp(b))
 }
 
 fn open(
@@ -384,6 +465,32 @@ mod tests {
         );
         assert!(ledger.iter().all(|entry| entry.status != Status::Open));
     }
+    #[test]
+    fn finding_ledger_report_keeps_classified_signatures_and_steps_blocking() {
+        for signatures in [true, false] {
+            let make = |mode: &str| {
+                review(
+                    1,
+                    json!({"ci_steps":[{"index":0,"command":"tests","exit_code":1,"stderr_tail":"failed",
+                "failures":if signatures { json!(["base", "flake"]) } else { json!([]) },
+                "triage":{"mode":mode,"base_status":"available","base_commit":null,"rerun_run_id":null,"base_run_id":null,"reason":null,
+                "class":if signatures { None } else { Some("flaky") },"blocking":mode == "report",
+                "failures":if signatures { json!([{"signature":"base","class":"pre_existing"},{"signature":"flake","class":"flaky"}]) } else { json!([]) }}}]}),
+                )
+            };
+            let ledger = finding_ledger(&[make("report")]).unwrap();
+            assert_eq!(ledger.len(), if signatures { 2 } else { 1 });
+            assert!(ledger.iter().all(|entry| entry.status == Status::Open
+                && entry.severity == ReviewFindingSeverity::Blocking
+                && entry.ci_triage.is_some()));
+            let ledger = finding_ledger(&[make("full")]).unwrap();
+            assert!(ledger.iter().all(|entry| matches!(
+                entry.status,
+                Status::Flaky | Status::PreExisting
+            ) && entry.streak == 0));
+        }
+    }
+
     #[test]
     fn finding_ledger_continues_resolves_and_assigns_new_ids() {
         let first = reviewer(1, json!([{"summary":"one"},{"summary":"two"}]), json!([]));
@@ -600,5 +707,109 @@ mod tests {
         assert_eq!(ledger[0].streak, 1);
         assert!(ledger[0].observed.as_ref().unwrap().len() <= 4096);
         assert!(finding_ledger(&[super::tests::review(2, json!({"ci_steps":"bad"}))]).is_err());
+    }
+    #[test]
+    fn finding_ledger_orders_numeric_id_runs_naturally_before_any_cap() {
+        let findings: Vec<_> = (1..=50)
+            .map(|n| json!({"summary":format!("finding {n}")}))
+            .collect();
+        let ledger = finding_ledger(&[reviewer(1, json!(findings), json!([]))]).unwrap();
+        assert_eq!(
+            ledger
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>(),
+            (1..=50).map(|n| format!("F{n}")).collect::<Vec<_>>()
+        );
+        let mut ids = [
+            "V-case10",
+            "F10",
+            "CI-10",
+            "CHK-step:10",
+            "CI-2",
+            "F2",
+            "V-case2",
+            "CHK-step:2",
+        ];
+        ids.sort_by(|a, b| compare_finding_ids(a, b));
+        assert_eq!(
+            ids,
+            [
+                "CHK-step:2",
+                "CHK-step:10",
+                "CI-2",
+                "CI-10",
+                "F2",
+                "F10",
+                "V-case2",
+                "V-case10"
+            ]
+        );
+    }
+    #[test]
+    fn finding_ledger_signature_ids_are_stable_and_track_each_test() {
+        let ci = |attempt, exit, failures: Value, truncated| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":2,"command":"cargo test","exit_code":exit,"stderr_tail":"tail",
+            "failures":failures,"failures_truncated":truncated}],
+            "conformance":{"status":"failed","contract":null,"assessment":null,"reason":null,"checks":[{"check_id":"ci:2","command":"cargo test","exit_code":exit,"output":"final tail"}]}}),
+            )
+        };
+        // Golden digest pins SHA-256, rather than a process-seeded hasher.
+        assert_eq!(ci_finding_id(2, "abc"), "CI-2#ba7816bf");
+        let a = ci_finding_id(2, "parser::empty");
+        let b = ci_finding_id(2, "parser::unicode");
+        let reviews = [
+            ci(1, 1, json!(["parser::empty", "parser::unicode"]), false),
+            ci(2, 1, json!(["parser::empty"]), false),
+        ];
+        let ledger = finding_ledger(&reviews).unwrap();
+        assert_eq!(ledger.len(), 2);
+        assert_eq!(
+            (entry(&ledger, &a).status, entry(&ledger, &a).streak),
+            (Status::Open, 2)
+        );
+        assert_eq!(
+            (
+                entry(&ledger, &b).status,
+                entry(&ledger, &b).last_checked_attempt
+            ),
+            (Status::Resolved, 2)
+        );
+        assert_eq!(ledger, finding_ledger(&reviews).unwrap());
+        let third = ci(3, 0, json!([]), false);
+        let fourth = ci(4, 0, json!([]), false);
+        let ledger =
+            finding_ledger(&[reviews[0].clone(), reviews[1].clone(), third, fourth]).unwrap();
+        assert_eq!(entry(&ledger, &a).last_checked_attempt, 4);
+        assert_eq!(entry(&ledger, &b).last_checked_attempt, 4);
+        assert!(ledger.iter().all(|entry| entry.status == Status::Resolved));
+    }
+
+    #[test]
+    fn finding_ledger_missing_or_truncated_signatures_cannot_resolve_tests() {
+        let ci = |attempt, failures: Value, truncated| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":0,"command":"test","exit_code":1,"stderr_tail":"tail","failures":failures,"failures_truncated":truncated}]}),
+            )
+        };
+        let a = ci_finding_id(0, "a");
+        let b = ci_finding_id(0, "b");
+        let ledger = finding_ledger(&[
+            ci(1, json!(["a", "b"]), false),
+            ci(2, json!(["a"]), true),
+            ci(3, json!([]), false),
+        ])
+        .unwrap();
+        assert_eq!(entry(&ledger, &a).status, Status::Open);
+        assert_eq!(entry(&ledger, &b).status, Status::Open);
+        assert_eq!(entry(&ledger, "CI-0").status, Status::Open);
+        let full = finding_ledger(&[ci(1, json!([]), false), ci(2, json!(["a"]), false)]).unwrap();
+        assert_eq!(entry(&full, "CI-0").status, Status::Resolved);
+        assert_eq!(entry(&full, &a).status, Status::Open);
     }
 }

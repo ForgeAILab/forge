@@ -91,11 +91,11 @@ pub(super) async fn record(
         if base_failed {
             let digest = api_types::canonical_digest_with_schema(
                 "forge.base-check/1",
-                &json!([entry.command, triage.base_commit]),
+                &json!([entry.command]),
             )
             .expect("serializable key");
             incident(db, task, &event, "base_check_failing", &format!("ci-base:{}:{digest}", task.project_id), &entry.command,
-                json!({"base_commit":triage.base_commit,"base_run_id":triage.base_run_id,"base_failures":base.and_then(|base| base.commands.get(setup_count + entry.index)).map(|step| &step.failures),"triage":triage}), &application.consumer_id).await?;
+                json!({"base_commit":triage.base_commit,"base_run_id":triage.base_run_id,"base_observed_at":base.map_or(event.created_at.as_str(), |base| base.created_at.as_str()),"base_failures":base.and_then(|base| base.commands.get(setup_count + entry.index)).map(|step| &step.failures),"triage":triage}), &application.consumer_id).await?;
         }
     }
     // A newer passing base observation resolves this command's older base
@@ -279,6 +279,116 @@ mod tests {
         db.resolve_passing_base_attention("p", "test", "2026-10-15T13:00:00Z", &event.id)
             .await
             .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key='base'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "resolved");
+    }
+
+    #[tokio::test]
+    async fn ci_triage_attention_cached_red_cannot_regress_or_reopen_a_newer_base() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let at = "2026-10-15T12:00:00Z";
+        sqlx::query("INSERT INTO project(id,name,settings,workflow_definition,created_at,updated_at) VALUES('p','p','{}','{}',?,?)").bind(at).bind(at).execute(db.pool()).await.unwrap();
+        let event = DomainEventRepo::append_event(
+            &db,
+            db::CreateDomainEvent {
+                id: db::new_uuid_v4(),
+                event_type: "check.ci_triaged".into(),
+                entity_type: "check_run".into(),
+                entity_id: "run".into(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: "p".into(),
+                correlation_id: "run".into(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: at.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let projection = |commit: &str, observed: &str| db::CreateAttentionProjection {
+            id: db::new_uuid_v4(),
+            attention_type: "base_check_failing".into(),
+            scope_type: "project".into(),
+            scope_id: "p".into(),
+            identity_id: None,
+            source_event_id: event.id.clone(),
+            priority: 60,
+            status: "open".into(),
+            summary: "base red".into(),
+            details_json:
+                json!({"command":"test","base_commit":commit,"base_observed_at":observed})
+                    .to_string(),
+            dedupe_key: "base".into(),
+            occurred_at: at.into(),
+            updated_at: at.into(),
+            acknowledged_at: None,
+            snoozed_until: None,
+            resolved_at: None,
+            updated_by_user_id: None,
+            recommended_action: "inspect_ci".into(),
+            source_sequence: Some(event.sequence),
+        };
+        // Two open per-commit items from an older build converge on the
+        // newest row without deleting either historical observation.
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        for (key, at) in [
+            ("legacy-base", "2026-10-15T11:00:00Z"),
+            ("base", "2026-10-15T12:00:00Z"),
+        ] {
+            let mut legacy = projection(key, at);
+            legacy.dedupe_key = key.into();
+            legacy.occurred_at = at.into();
+            db.insert_attention_in_tx(&mut tx, legacy).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        db.record_ci_triage_attention(projection("new", "2026-10-15T14:00:00Z"), "new", "task")
+            .await
+            .unwrap();
+        let (rows, open): (i64, i64) = sqlx::query_as("SELECT COUNT(*),SUM(status='open') FROM attention_projection WHERE attention_type='base_check_failing'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!((rows, open), (2, 1));
+
+        db.record_ci_triage_attention(projection("old", "2026-10-15T13:00:00Z"), "old", "task")
+            .await
+            .unwrap();
+        let details: String = sqlx::query_scalar(
+            "SELECT details_json FROM attention_projection WHERE dedupe_key='base'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&details).unwrap()["base_commit"],
+            "new"
+        );
+        db.resolve_passing_base_attention("p", "test", "2026-10-15T13:30:00Z", &event.id)
+            .await
+            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key='base'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(status, "open");
+        db.resolve_passing_base_attention("p", "test", "2026-10-15T15:00:00Z", &event.id)
+            .await
+            .unwrap();
+        db.record_ci_triage_attention(
+            projection("cached", "2026-10-15T14:30:00Z"),
+            "cached",
+            "task",
+        )
+        .await
+        .unwrap();
         let status: String =
             sqlx::query_scalar("SELECT status FROM attention_projection WHERE dedupe_key='base'")
                 .fetch_one(db.pool())

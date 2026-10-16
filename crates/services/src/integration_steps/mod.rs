@@ -56,6 +56,7 @@ mod proof;
 pub(crate) mod reconcile;
 mod send_back;
 mod settle;
+pub(crate) use settle::check_authority;
 #[cfg(test)]
 mod tests;
 

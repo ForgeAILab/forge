@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-15T09:11:52Z
+updated_at: 2026-10-16T01:23:30Z
 completed_at:
 ---
 
@@ -18,7 +18,7 @@ suite.
 - [x] 1.3 Update `RESPONSE_INSTRUCTION` and the correction prompt (`review_correction.rs`). Refresh the snapshot `crates/services/tests/fixtures/server_workspace_reviewer.prompt.snap`.
 - [x] 1.4 `prior_review_section` lists the prior ledger's open findings with their ids and asks for `id` / `resolved`. Keep the existing 8 KiB report slice.
 - [x] 1.5 Write `finding_ledger(window_reviews)`, a pure function in the `review` crate or `services`. It covers:
-  - Forge ids (`F<n>`, `CI-<i>`, `CHK-<id>`, `V-*`). `MERGE-*` stays out of the ledger and is brief-only;
+  - Forge ids (`F<n>`, `CI-<i>` / `CI-<i>#<signature hash>`, `CHK-<id>`, `V-*`). `MERGE-*` stays out of the ledger and is brief-only;
   - the review window boundary;
   - checked versus not-run sources;
   - `unconfirmed`;
@@ -31,23 +31,24 @@ suite.
   - a route test for the read and the refusal.
 
 ## 2. Comments and Review tab
-- [ ] 2.1 `reviewer_comment` (`cascade.rs`) renders the headline, the ledger task list, the verify line and the Review-tab pointer. Without findings it keeps the reason plus the first 2 KiB of the report. Update `reviewer_comment_*` unit tests.
-- [ ] 2.2 Repair-round and park system comments, idempotent per Review (`idempotency_key`).
-- [ ] 2.3 Web:
+- [x] 2.1 `reviewer_comment` (`cascade.rs`) renders the headline, the ledger task list, the verify line and the Review-tab pointer. Without findings it keeps the reason plus the first 2 KiB of the report. Update `reviewer_comment_*` unit tests.
+- [x] 2.2 Repair-round and park system comments, idempotent per Review (`idempotency_key`).
+- [x] 2.3 Web:
   - Ledger table in `TaskReviewTab.tsx`.
   - Per-attempt findings and verify block in `ReviewConformancePanel.tsx`.
   - Comment task lists render through the existing `remarkGfm`. Check this in `task-comments-panel.tsx`.
   - Vitest coverage for the ledger table and a park.
-- [ ] 2.4 Focused tests: comment text for failed with findings, failed without findings, and passed with minor findings. Assert that a replayed cascade posts no duplicate comment.
+- [x] 2.4 Focused tests: comment text for failed with findings, failed without findings, and passed with minor findings. Assert that a replayed cascade posts no duplicate comment.
 
 ## 3. Repair brief
-- [ ] 3.1 Add a `RepairBrief` builder in `crates/services/src/workflow/dispatch/`:
+- [x] 3.1 Add a `RepairBrief` builder in `crates/services/src/workflow/dispatch/`:
   - sections in the D7 order;
   - a 24 KiB budget with the D7 drop order;
   - sources from the ledger, Review `ci_steps` (all failing steps), `details.verify`, and the previous coder completion summary.
-- [ ] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
-- [ ] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
-- [ ] 3.4 Focused tests in `workflow/dispatch/tests.rs`:
+  - The cap is hard (owner decision 10/16): after the D7 drops, check tails share 4 KiB and verify keeps 2 KiB; then finding text is clipped (summary 200, where 120, expected/observed 300 characters) and, past a line budget, the remaining open findings are listed by id. Only an oversized Task description or plan can still exceed it (logged).
+- [x] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
+- [x] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
+- [x] 3.4 Focused tests in `workflow/dispatch/tests.rs`:
   - update `coder_prompt_review_follow_up_is_self_contained` and `coder_prompt_ci_follow_up_is_focused_on_failing_check`;
   - keep `review_feedback_comes_from_the_reviewer_execution_not_the_reviewed_one` and `merge_fix_prompts_hand_a_committed_conflict_to_the_worker` green;
   - new: a two-round brief lists resolved and open findings;

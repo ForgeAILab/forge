@@ -7572,7 +7572,6 @@ and are not budget counters.
 | AutomaticReviewRecovery | Disabled normally; configured default 1 | Review-budget exhaustion episode; execution admission |
 | ReportCorrection | 2 native correction turns | Volatile counter per invocation; provider-turn intent |
 | ReviewCheckRerun | 2 check re-runs after a timeout (3 runs) | Volatile counter per review evaluation |
-| ReviewCiTriage | 1 failed-step rerun and base comparison | Volatile allowance per Review attempt or queue-head check; durable subcheck keys prevent replay |
 | ReviewCiInfrastructure | 5 connected failures, 4 automatic retries | Interruption episode (each fresh review entry); connected retryable CI failure |
 
 A typed `RetryWindowReset` additionally resets every persisted kind. Successful
@@ -8203,11 +8202,14 @@ from the previous attempt. The response format is kept
 this small on purpose so any model can review: an earlier contract demanded one
 JSON object with per-requirement dispositions and exact file/commit citations,
 and live reviewers lost whole reviews to an invented extra field or a truncated
-commit SHA. `review::contract::parse_assessment` takes the last standalone JSON
+commit SHA. `review::contract::parse_assessment` takes the last complete JSON
 object in the reply that names a result, ignores unknown keys, accepts `verdict` for
-`result`, and keeps everything else as the Markdown `report`. A malformed outer
-result block owns its nested findings: their `result` or `verdict` keys cannot
-become the verdict. An unreadable reply goes through result correction.
+`result`, and keeps everything else as the Markdown `report`. An object listed
+right after `[` or `,` (no blank line between) is a list item, never the
+verdict, so a finding inside a malformed outer result block cannot become the
+verdict through its `result` or `verdict` key. A correction turn is appended
+after a blank line and is read even when the reply before it was cut off. An
+unreadable reply goes through result correction.
 Re-recording an immutable assessment compares parsed `ReviewConformance`
 values, so explicit and omitted defaults are equivalent without rewriting the
 stored JSON; any content change is still refused. The hard gate is
@@ -8241,14 +8243,70 @@ Forge assigns ids and derives open/resolved/unconfirmed status and streaks with
 budget window and its Reviews together. A retry-window reset starts a fresh
 ledger; a source that did not run leaves its findings unchanged. A reviewer
 that omits an open finding makes it unconfirmed, while passing Forge checks
-resolve their own findings. The re-review prompt carries the prior ledger's
+resolve their own findings. Review CI uses one `CI-<zero-based step>#<first 8
+hex digits of SHA-256(normalised signature)>` finding per failing test. The
+same identity carries across owners and server restarts. A failing step with
+no signatures uses `CI-<step>`. A complete signature list resolves tests no
+longer failing; missing or truncated lists do not prove omitted tests passed.
+A passing step resolves all its findings. The re-review prompt carries the prior ledger's
 open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. This projection does not
-change verdict routing, budgets, or Task comments.
+change verdict routing or budgets. Findings are naturally ordered by id before
+any API cap (`F2` before `F10`); the complete projection still reserves all ids.
+
+Task review comments now use this same projection after the settled attempt:
+headline, GFM checklist, optional recorded verify summary, then a Review-tab
+pointer. Open findings are unchecked, findings resolved by this review are
+checked (earlier resolutions are omitted), and unconfirmed
+findings say "not re-checked" without a checkbox, listed in that order. Each line
+is one line of text (summary clipped to 200 characters); the lines stop at 8 KiB
+and the remaining ids follow on one "Also in the ledger" line, because comments
+are read back into agent prompts. A window Review the ledger cannot read (an
+older details shape) leaves the list out of the comment; rendering a comment
+never stops the cascade that posts it. The full report stays with the
+Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
+Review-entry CI failures post the same result comment even without a reviewer.
+Repair-round system comments name the review budget and open/resolved ids; owner
+parks name the rule and open ids. Each result, repair and park comment has a
+separate Review-derived `idempotency_key`, using the existing comment repository
+transaction to suppress replay duplicates. The web Review tab reads the ledger
+above the latest attempt and keeps per-attempt findings and the full report in
+history. Verify rendering is conditional on recorded data; verify execution and
+progress-round policy are later phases.
+
+Coder and autonomous-worker repair requests use one `RepairBrief` in
+`workflow/dispatch`; automatic review recovery uses the same builder. It reads
+the persisted Review-budget window, the complete finding ledger, all failing
+Review CI steps with their failure signatures and tails, optional recorded
+verify results/evidence, the reviewer report, and the reviewed coder's completion
+summary. The ordered sections are Task (description and canonical plan), Round
+(charged budget and remaining allowance), Open findings (including survived
+repair rounds), Resolved/unconfirmed changes, Failing check output, Verify,
+Reviewer report, Previous round, and Logs. Empty optional sections are omitted.
+At most 20 signature findings per step are displayed, followed by `+N more`;
+the ledger itself retains every finding. A no-change reminder still leads the
+request and names its `repair_no_change` allowance.
+
+The brief body is capped at 24 KiB. It trims the report to 2 KiB, then drops
+it; drops the previous summary; reduces each check tail to 1 KiB; and reduces
+the resolved/unconfirmed section to ids. Next, all check tails share 4 KiB
+(later steps keep their command and signatures) and the verify section keeps
+2 KiB. Only then is finding text clipped: summary 200, where 120, expected and
+observed 300 characters; past a line budget, the remaining open findings are
+listed by id. Every open finding is always named. Only an oversized Task
+description or plan can still exceed the cap; that case is logged.
+Attempts/Pattern history and verify execution are later phases.
+
+Actionable merge send-backs use brief-only `MERGE-CI` or `MERGE-CONFLICT`
+findings. `MERGE-CI` quotes the send-back's target, failing command and output;
+`MERGE-CONFLICT` gives the committed-marker paths and reconciliation instructions.
+Neither enters the Review ledger. Dirty-worktree and owner-only repair messages
+retain their existing behavior; prompt builder ids and thread-resume policy are
+unchanged.
 
 Results map to conformance and routing as follows. `pass` becomes `passed`
 (merging, or `awaiting_human` behind a human gate). `fail` becomes `failed` and
-follows the review-remediation budget, with the reason and Markdown review as the
+follows the review-remediation budget, with the structured repair brief as the
 coder's feedback. `blocked` — the environment, not the code, stopped the
 reviewer — becomes `blocked`: the Review finishes failed and the Task is parked
 with a `review_blocked` blocking annotation for its owner, because neither the
@@ -9996,7 +10054,9 @@ running that command again without triage. Reviewer prose summarizes classificat
 counts, and the frozen check-input view shares a 20-signature display budget;
 full classifications remain in the original Review and ledger. The ledger retains per-signature
 `CI-<step>#<sha256-prefix>` findings with `ci_triage`; `flaky`/`pre_existing`
-findings are minor with zero streak. Original check results are immutable failures.
+findings are minor with zero streak under `full`. Under `report`, they remain open
+and blocking, retaining their classification in the ledger and repair brief. The
+brief labels waived findings as non-blocking under `full`. Original check results are immutable failures.
 An unchanged queue head whose Review passed by triage runs its own CI; the ordinary
 certified-pass reuse path cannot consume a triaged failure. Queue settlement
 triages against the target tip before granting a permit or authorizing send-back;
@@ -10008,10 +10068,17 @@ or integration authority, with `ci-triage:rerun:` / `ci-triage:base:` authority
 prefixes giving distinct idempotency keys. Delivery wakes the same suspended entry
 or settles the same checking head. Cancellation and configuration replacement
 withdraw the current subcheck; original failed evidence is never overwritten.
+Durable consumer keys bound the rerun and base requests; there is no volatile
+triage budget. A pending/running triage subcheck extends the head's 35-minute
+check wait, bounded by the subcheck's own deadline. Exhausted triage infrastructure
+retries settle as infrastructure and use the existing infrastructure park and
+Attention, rather than waiting for a head timeout. Exact base checkouts copy the
+Project assets; only their untracked paths are excluded from the initial
+cleanliness witness. Tracked edits and unrelated files still prevent sharing.
 
 Project Attention exposes `flaky_check` (command/signature, occurrence count and
-Task ids) and `base_check_failing` (command/base commit, signatures or reason and
-run id). Replayed observations count once. A newer passing base observation
+Task ids) and one `base_check_failing` item per Project and command (latest base
+commit, signatures or reason and run id). A newer red base updates that item. Replayed observations count once. A newer passing base observation
 resolves older incidents for that command; a cached older pass cannot resolve a
 newer incident. Mission Control renders both as warnings. Neither incident is a
 Task blocker or a certification of CI success.

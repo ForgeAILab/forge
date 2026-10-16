@@ -1195,7 +1195,7 @@ fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
 /// Parse a reviewer's reply: free Markdown ending in one result block
 /// `{"result": "pass|fail|blocked", "reason": "..."}`.
 ///
-/// The last standalone JSON object that names a result wins, so a reviewer may
+/// The last complete JSON object that names a result wins, so a reviewer may
 /// quote JSON or code in its review, or correct itself later in the same reply. The
 /// block is read leniently — unknown keys are ignored, `verdict` is accepted
 /// for `result`, and case does not matter — because a well-meant extra field
@@ -1205,28 +1205,13 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     if message.len() > MAX_REPORT_BYTES {
         return Err("review report exceeds size budget".into());
     }
-    let mut object_end = 0;
     let (span, result, reason, fixable_by, repeat, findings, resolved) = message
         .match_indices('{')
+        .rev()
         .filter_map(|(open, _)| {
-            if open < object_end {
+            if is_list_element(message, open) {
                 return None;
             }
-            // Prose and code can contain unmatched braces. Only an object-like
-            // opener owns its nested objects, even when its JSON is broken.
-            let body = message[open + 1..].trim_start();
-            let bare_key = body
-                .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-                .next()
-                .unwrap_or_default();
-            let (end, has_quoted_key) = json_object_end(message, open);
-            if !body.starts_with(['"', '\''])
-                && (bare_key.is_empty() || !body[bare_key.len()..].trim_start().starts_with(':'))
-                && !has_quoted_key
-            {
-                return None;
-            }
-            object_end = end;
             let mut values =
                 serde_json::Deserializer::from_str(&message[open..]).into_iter::<Value>();
             let value = values.next()?.ok()?;
@@ -1250,7 +1235,9 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
                 parse_resolved(value.get("resolved")),
             ))
         })
-        .fold(None, |_, block| Some(block))
+        // Prefer the last complete result object, including its closing
+        // brace, so a valid block wins over the objects nested inside it.
+        .max_by_key(|((_, close), ..)| *close)
         .ok_or(
             "review must end with one result block: {\"result\": \"pass|fail|blocked\", \
              \"reason\": \"one sentence\"}",
@@ -1266,62 +1253,14 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     })
 }
 
-/// Find the enclosing object's boundary without requiring valid JSON. A broken
-/// result block still owns its findings; none can become a standalone verdict.
-fn json_object_end(message: &str, open: usize) -> (usize, bool) {
-    let mut depth = 0;
-    let mut arrays = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut previous = open;
-    let mut has_quoted_key = false;
-    for (offset, byte) in message.as_bytes()[open..].iter().copied().enumerate() {
-        if let Some(delimiter) = quote {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == delimiter {
-                quote = None;
-                if depth == 1
-                    && arrays == 0
-                    && message[open + offset + 1..].trim_start().starts_with(':')
-                {
-                    has_quoted_key = true;
-                }
-            }
-        } else {
-            match byte {
-                b'"' | b'\'' => quote = Some(byte),
-                b'[' => arrays += 1,
-                b']' => arrays -= 1,
-                b'{' => {
-                    // A correction turn is appended as a new paragraph. If
-                    // only the outer closing brace was truncated, that new
-                    // block is independent, rather than an object value.
-                    if depth == 1
-                        && arrays == 0
-                        && !matches!(message.as_bytes()[previous], b':' | b',' | b'{')
-                        && message[previous + 1..open + offset].contains("\n\n")
-                    {
-                        return (open + offset, has_quoted_key);
-                    }
-                    depth += 1;
-                }
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return (open + offset + 1, has_quoted_key);
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !byte.is_ascii_whitespace() {
-            previous = open + offset;
-        }
-    }
-    (message.len(), has_quoted_key)
+/// An object right after `[` or `,` (with no blank line between) is an item
+/// of a list, such as a finding inside a result block whose JSON is broken.
+/// It is never the verdict. A correction turn is appended after a blank line,
+/// so it stays readable even when the turn before it was cut off mid-list.
+fn is_list_element(message: &str, open: usize) -> bool {
+    let before = &message[..open];
+    let content = before.trim_end();
+    before[content.len()..].matches('\n').count() < 2 && content.ends_with(['[', ','])
 }
 
 const MAX_FINDINGS: usize = 50;
@@ -2079,12 +2018,60 @@ mod tests {
                 format!(
                     r#"{{not-json,"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#
                 ),
+                format!(
+                    r#"{{"result":"fail","findings":[{{"summary":"a"}}, {{"summary":"bug","{key}":"pass"}}],}}"#
+                ),
+                format!(
+                    "{{\n  \"result\": \"fail\",\n  \"findings\": [\n    {{\"summary\": \"bug\", \"{key}\": \"pass\"}}\n  ],\n}}"
+                ),
             ] {
                 assert!(parse_assessment(&broken).is_err(), "{broken}");
                 let corrected =
                     format!("{broken}\n\n{{\"result\":\"fail\",\"reason\":\"corrected\"}}");
                 assert_eq!(parse_assessment(&corrected).unwrap().reason, "corrected");
             }
+        }
+    }
+
+    /// Replies the parser read before the nested-verdict guard must still
+    /// read the same: code with apostrophes or lifetimes, unclosed excerpts,
+    /// wrapped verdicts, and correction turns after any kind of cut-off.
+    #[test]
+    fn findings_parser_reads_code_quotes_and_corrections_after_a_cut_off() {
+        let fence = "```";
+        let correction = "\n\n{\"result\":\"fail\",\"reason\":\"corrected\"}";
+        let cases = [
+            format!("{fence}rust\npub struct Parser<'a> {{\n    input: &'a str,\n}}\n{fence}\n\n{{\"result\":\"fail\",\"reason\":\"lifetime\"}}"),
+            format!("{fence}ts\nconst config = {{\n  retries: 0, // don't retry\n}};\n{fence}\n\n{{\"result\":\"fail\",\"reason\":\"comment\"}}"),
+            format!("{fence}js\nswitch (kind) {{\n  case \"a\": return 1; // isn't reached\n}}\n{fence}\n{{\"result\":\"fail\",\"reason\":\"switch\"}}"),
+            format!("{fence}js\nconst routes = {{\n  home: '/',\n{fence}\n{{\"result\":\"fail\",\"reason\":\"excerpt\"}}"),
+            "`struct S<'a> { s: &'a str }` borrows.\n{\"result\":\"fail\",\"reason\":\"inline\"}".to_owned(),
+            "The type `{ id: string, name: user's name }` is off.\n{\"result\":\"fail\",\"reason\":\"type\"}".to_owned(),
+            "Partial: {name: \"x\", age: 5\n{\"result\":\"fail\",\"reason\":\"unclosed\"}".to_owned(),
+            "{\"review\":{\"result\":\"fail\",\"reason\":\"wrapped\"}}".to_owned(),
+            format!("Review.\n\n{{\"result\":\"fail\",\"reason\":\"the parser crashes on emp{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\"}},{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\",\"where\":\"a.rs\"{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\"}}{correction}"),
+        ];
+        let expected = [
+            "lifetime",
+            "comment",
+            "switch",
+            "excerpt",
+            "inline",
+            "type",
+            "unclosed",
+            "wrapped",
+            "corrected",
+            "corrected",
+            "corrected",
+            "corrected",
+        ];
+        for (reply, reason) in cases.iter().zip(expected) {
+            let parsed = parse_assessment(reply).unwrap_or_else(|error| panic!("{reply}: {error}"));
+            assert_eq!(parsed.result, ReviewResult::Fail, "{reply}");
+            assert_eq!(parsed.reason, reason, "{reply}");
         }
     }
 

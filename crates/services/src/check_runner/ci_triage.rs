@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 
 pub(crate) enum Progress {
     Pending(String),
+    Infrastructure(String),
     Complete(Vec<StepResultEntry>),
 }
 
@@ -61,8 +62,8 @@ pub(crate) async fn original_application(
     })
 }
 
-/// Calling again after a wake joins exactly the same subchecks. The volatile
-/// allowance admits one rerun bundle; durable consumer keys fence redelivery.
+/// Calling again after a wake joins exactly the same subchecks. Durable
+/// consumer keys admit one rerun bundle and base comparison across redelivery.
 pub(crate) async fn triage(
     db: &SqliteDb,
     consumers: &TaskCheckConsumers,
@@ -85,10 +86,6 @@ pub(crate) async fn triage(
         .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
     let mode = settings.review_ci_triage;
     if mode == ReviewCiTriage::Off {
-        return Ok(Progress::Complete(entries));
-    }
-    let mut allowance = db::budget::Invocation::new(db::budget::Kind::ReviewCiTriage);
-    if !allowance.consume() {
         return Ok(Progress::Complete(entries));
     }
     let failed: Vec<usize> = entries
@@ -116,6 +113,7 @@ pub(crate) async fn triage(
     let rerun = request(db, consumers, application, rerun_identity, "rerun").await?;
     let (rerun_id, rerun) = match rerun {
         Answer::Pending(id) => return Ok(Progress::Pending(id)),
+        Answer::Infrastructure(id) => return Ok(Progress::Infrastructure(id)),
         Answer::Result(id, result) => (id, result),
     };
     // A step that fails again is consistent, whatever signatures it reports:
@@ -182,6 +180,7 @@ pub(crate) async fn triage(
                 let base = request(db, consumers, application, identity, "base").await?;
                 match base {
                     Answer::Pending(id) => return Ok(Progress::Pending(id)),
+                    Answer::Infrastructure(id) => return Ok(Progress::Infrastructure(id)),
                     Answer::Result(id, result) => {
                         base_run_id = Some(id);
                         base_result = Some(result);
@@ -405,6 +404,7 @@ pub(crate) fn failure_summary(entries: &[StepResultEntry]) -> String {
 
 enum Answer {
     Pending(String),
+    Infrastructure(String),
     Result(String, StoredCheckResult),
 }
 async fn request(
@@ -443,7 +443,19 @@ async fn request(
     let consumer = requested.consumer;
     match consumers.wait_state(&consumer.id).await? {
         CheckWaitState::Result(result) => Ok(Answer::Result(result.run_id.clone(), result)),
-        CheckWaitState::Pending | CheckWaitState::Exhausted => Ok(Answer::Pending(consumer.id)),
+        CheckWaitState::Pending => Ok(Answer::Pending(consumer.id)),
+        CheckWaitState::Exhausted => {
+            // The exhausted delivery parks its current head. A later head
+            // round can rearm that applied no-verdict answer, just like the
+            // primary check; delivery itself cannot rearm before it applies.
+            if origin == CheckConsumerOrigin::Integration
+                && consumers.ask_again_after_no_verdict(&consumer).await?
+            {
+                Ok(Answer::Pending(consumer.id))
+            } else {
+                Ok(Answer::Infrastructure(consumer.id))
+            }
+        }
         CheckWaitState::Lost => Err(ServiceError::invalid_operation(
             "CI triage subcheck was withdrawn",
         )),

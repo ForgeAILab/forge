@@ -158,13 +158,13 @@ Non-Goals:
   settle, treats the step as non-blocking. A triaged step therefore never
   becomes a reusable certified pass. The unchanged-commit reuse path cannot
   skip head CI because of it.
-- **Budget:** triage uses the volatile `ReviewCiTriage` budget, limit 1 per
-  review attempt or queue-head check.
+- **Replay bound:** durable consumer request keys admit at most one rerun bundle
+  and base comparison per review attempt or queue-head check; no volatile budget.
 - **Attention.** Flaky and pre-existing failures raise Project attention, deduped:
   - `flaky_check` is keyed by the step command and signature, with a count
     and the Tasks that hit it;
-  - `base_check_failing` is keyed by step and base commit, and resolves when a
-    later base run of that step passes.
+  - `base_check_failing` is keyed by Project and step command. A newer red base
+    updates it, and a newer passing base run of that command resolves it.
 
 **D4 — No-change gate.**
 - When a coder repair round ends and the commit about to enter review equals
@@ -294,7 +294,7 @@ a coder repeat. Per-test findings make the count fine-grained.
 
 - New optional fields only. There are no schema migrations, unless
   `task_budget.kind` is constrained, in which case it is widened for
-  `review_ci_triage` and `repair_no_change`.
+  `repair_no_change`.
 - Existing Projects get `review_ci_triage: full`. This is the visible behaviour
   change, listed under CHANGELOG `### Changed` with the `off` opt-out.
 - Older daemons keep working without signatures.

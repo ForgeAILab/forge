@@ -1568,6 +1568,24 @@ impl HeadDriver {
             return Ok(Pass::Progress);
         }
         let Some(ack) = IntegrationStepAck::current(&a, IntegrationStepAction::Settle) else {
+            if let Some(authority) = crate::integration_steps::check_authority(&a) {
+                if self
+                    .w
+                    .db
+                    .integration_head_triage_pending(
+                        &a.task_ref,
+                        a.expected_epoch,
+                        &authority,
+                        &stamp(self.w.clock.now()),
+                    )
+                    .await?
+                {
+                    // Each triage stage has its own check deadline. Give its
+                    // delivery a fresh head wait instead of timing out on the
+                    // original candidate check's 35-minute allowance.
+                    self.since = Some((a.state, self.w.clock.now()));
+                }
+            }
             if self.timed_out(HeadTimeout::Check) {
                 return self
                     .park(&a, ParkReason::Timeout, "no check verdict arrived")

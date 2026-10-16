@@ -1149,3 +1149,43 @@ async fn next_check_removes_abandoned_forge_reports_without_following_symlinks()
     );
     assert!(receipt.commands[0].failures.is_empty());
 }
+
+#[tokio::test]
+async fn canonical_base_assets_are_materialized_without_invalidating_sharing_witness() {
+    let (temp, head) = candidate().await;
+    let asset = tempfile::tempdir().unwrap();
+    std::fs::write(asset.path().join("input"), "project-asset").unwrap();
+    let assets = [EnvironmentAsset {
+        source: asset.path().to_str().unwrap().into(),
+        target: "./assets with spaces".into(),
+    }];
+    let build = temp.path().join("build");
+    let inputs = ServerCheckExecutionInputs {
+        toolchain_revision: "t".into(),
+        environment_revision: "e".into(),
+        asset_revisions: BTreeMap::from([("assets".into(), "revision".into())]),
+        secret_revisions: BTreeMap::new(),
+        shell_revision: "s".into(),
+        runner_revision: "r".into(),
+    };
+    for (command, outcome, changed) in [
+        ("test \"$(cat 'assets with spaces/input')\" = project-asset", CheckExecutionOutcome::Passed, false),
+        ("test \"$(cat 'assets with spaces/input')\" = project-asset; printf 'test base ... FAILED\\n'; exit 1", CheckExecutionOutcome::Failed, false),
+        ("echo changed >> tracked", CheckExecutionOutcome::Failed, true),
+    ] {
+        let mut spec = canonical_spec(&[command]);
+        spec.scope = CheckScope::Commit;
+        let receipt = execute(CheckExecution {
+            operation_id: "base-assets", spec: &spec,
+            target: CheckoutTarget::ExactCommit { repository: temp.path(), build_area: &build, commit: &head, environment_workspace: None, assets: &assets },
+            owner: owner(), input_revisions: Some(&inputs), environment: &BTreeMap::new(),
+            deadline: Some(Instant::now() + Duration::from_secs(30)), cancel: &CancellationToken::new(),
+            permit: &CheckPermit::already_admitted(), cleanup: CleanupPlan { commands: &[], timeout: CLEANUP_TIMEOUT }, output_limit: 4096,
+        }).await;
+        assert_eq!(receipt.outcome, outcome, "{receipt:?}");
+        assert_eq!(receipt.tracked_changes, Some(changed), "{receipt:?}");
+        assert_eq!(receipt.execution_inputs, inputs.identity().unwrap());
+        assert!(receipt.cleanup.checkout_removed);
+    }
+    assert!(!temp.path().join("assets with spaces").exists());
+}

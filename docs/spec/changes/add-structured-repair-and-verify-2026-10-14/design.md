@@ -112,7 +112,9 @@ derived.**
 - Unknown ids, and ids reused for a finding Forge does not know, are treated
   as new findings.
 - Forge-owned findings get stable ids from their source:
-  - `CI-<step index>` for review CI steps;
+  - `CI-<step index>#<first 8 hex of sha256(normalised signature)>` for each
+    failing review CI test, or `CI-<step index>` when signatures are absent
+    (the signature refinement from `add-repair-convergence-guards` D1);
   - `CHK-<check id>` for required conformance checks;
   - `V-<check name>` for verify checks, plus `V-start` and `V-ready`.
 
@@ -232,8 +234,12 @@ Today the same Task parks at review 2 with `review_budget_exhausted`.
   3. check tails, each down to 1 KiB;
   4. resolved and unconfirmed list, ids only.
 
-  Task and open findings are never cut. If they alone exceed 24 KiB, each
-  finding's `expected` and `observed` are cut to 300 characters.
+  Task and open findings are never dropped. The cap is hard (owner decision,
+  2026-10-16): if the brief is still over, check tails share 4 KiB and verify
+  keeps 2 KiB; then each finding's summary is cut to 200 characters, `where`
+  to 120, `expected` and `observed` to 300, and past a line budget the
+  remaining open findings are listed by id. Only an oversized Task description
+  or plan can still exceed the cap (logged).
 
 **D8 — Verify runs as its own check request after review CI.**
 - New `CheckPurpose::ReviewVerify`, origin `entry`.

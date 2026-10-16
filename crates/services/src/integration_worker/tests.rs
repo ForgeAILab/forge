@@ -3238,3 +3238,58 @@ async fn a_result_the_target_does_not_confirm_leaves_the_slot_typed_and_merges_a
     assert_eq!(world.tip("r").await, merged);
     assert_eq!(ff_successes(&world, &held.id).await, 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ci_triage_head_wait_extends_for_each_subcheck_and_expired_runs_are_bounded() {
+    for phase in ["rerun", "base"] {
+        for state in ["queued", "running"] {
+            let world = World::new().await;
+            let a = world.add_task("r", "a", "a.txt", "a\n").await;
+            world.external_commit("r", "outside").await;
+            world.steps.hold("a", IntegrationStepAction::RequestCheck);
+            // Advancing the clock tests one head session's timer, not lease
+            // takeover (which starts a fresh session with its own wait).
+            let mut pump = Pump::new(world.worker_with(IntegrationWorkerConfig {
+                lease: Duration::from_secs(12 * 3600),
+                ..config()
+            }));
+            world.settle(&mut pump).await;
+            let checking = world.attempt(&a.id).await;
+            assert_eq!(checking.state, S::Checking);
+            let now = db::now_rfc3339();
+            let deadline = (world.clock.now() + chrono::Duration::hours(12)).to_rfc3339();
+            sqlx::query("INSERT INTO check_run(id,project_id,repo_id,commit_sha,spec_digest,identity_key,input_json,cacheable,state,operation_id,deadline_at,created_at,updated_at) VALUES('sub','p','r',?,'digest','identity','{}',0,?,'operation',?,?,?)")
+                .bind(checking.candidate_sha.as_deref()).bind(state).bind(&deadline).bind(&now).bind(&now).execute(world.db.pool()).await.unwrap();
+            let authority = crate::integration_steps::check_authority(&checking).unwrap();
+            let key = format!(
+                "task-step/1|integration|a|{}|ci-triage:{phase}:{authority}",
+                checking.expected_epoch
+            );
+            sqlx::query("INSERT INTO check_consumer(id,project_id,repo_id,task_id,status_epoch,origin,request_key,identity_key,run_id,created_at) VALUES('sub','p','r','a',?,'integration',?,'identity','sub',?)")
+                .bind(checking.expected_epoch).bind(key).bind(&now).execute(world.db.pool()).await.unwrap();
+            for _ in 0..2 {
+                world.clock.advance(2101);
+                world.settle(&mut pump).await;
+                assert_eq!(
+                    world.attempt(&a.id).await.state,
+                    S::Checking,
+                    "{phase} {state} must retain its head past 35 minutes"
+                );
+            }
+            // A lost worker cannot keep extending the head after the check's
+            // own deadline. No ack is supplied: the normal wait then expires.
+            sqlx::query("UPDATE check_run SET deadline_at=? WHERE id='sub'")
+                .bind(&now)
+                .execute(world.db.pool())
+                .await
+                .unwrap();
+            world.clock.advance(2101);
+            world.settle(&mut pump).await;
+            let end = world.attempt(&a.id).await;
+            assert_eq!(
+                (end.state, end.failure_kind),
+                (S::Parked, Some(IntegrationFailureKind::Timeout))
+            );
+        }
+    }
+}

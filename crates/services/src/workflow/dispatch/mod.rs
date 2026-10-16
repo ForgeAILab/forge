@@ -13,6 +13,7 @@ pub mod generic_prompt;
 pub mod loader;
 pub mod planner_prompt;
 pub mod read_only_task_prompt;
+pub(crate) mod repair_brief;
 pub mod reviewer_prompt;
 pub mod worker_prompt;
 
@@ -139,6 +140,10 @@ pub struct AgentDispatchContext {
     pub comments: Vec<db::TaskComment>,
     pub plan: Option<String>,
     pub prior_reviews: Vec<db::Review>,
+    /// Exact accounting window for repair; None only in synthetic contexts.
+    pub review_window: Option<Vec<db::Review>>,
+    pub previous_coder_summary: Option<String>,
+    pub repair_budget: Option<repair_brief::RepairBudget>,
     pub parent_task: Option<db::Task>,
     pub sub_tasks: Vec<db::Task>,
     pub last_manual_bounce_reason: Option<String>,

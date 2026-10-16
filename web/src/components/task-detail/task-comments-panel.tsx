@@ -510,3 +510,43 @@ export function TaskCommentsPanel({
     </>
   )
 }
+
+/** Review evidence uses the same authenticated previews and sanitization as comments. */
+export function TaskEvidencePreview({ taskId, mediaIds }: { taskId: string; mediaIds: string[] }) {
+  const media = useTaskMediaQuery(taskId)
+  const items = useMemo(
+    () => (media.data ?? []).filter((item) => mediaIds.includes(item.id)),
+    [media.data, mediaIds],
+  )
+  const byUrl = useMemo(() => new Map(items.map((item) => [item.url, item])), [items])
+  const objectUrls = useTaskMediaObjectUrls(items)
+  const components = useMemo(() => createMarkdownComponents(byUrl, objectUrls), [byUrl, objectUrls])
+  return (
+    <div className="prose prose-sm max-w-none dark:prose-invert">
+      {media.isError && (
+        <ErrorBanner
+          error={media.error}
+          fallback="Evidence failed to load"
+          showRetry={isTransientApiError(media.error)}
+          onRetry={() => void media.refetch()}
+        />
+      )}
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[[rehypeSanitize, taskCommentSanitizeSchema]]}
+        components={components}
+        urlTransform={taskCommentUrlTransform}
+        skipHtml
+      >
+        {mediaIds
+          .map((id) => {
+            const item = items.find((item) => item.id === id)
+            return item
+              ? markdownReferenceForMedia(item)
+              : `[Evidence ${escapeMarkdownLabel(id)}](/api/v1/media/${encodeURIComponent(id)})`
+          })
+          .join('\n\n')}
+      </ReactMarkdown>
+    </div>
+  )
+}

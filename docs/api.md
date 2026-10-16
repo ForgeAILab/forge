@@ -2516,11 +2516,14 @@ check carries optional `triage` for the exact CI command; its frozen display vie
 shares a 20-signature budget and explains any omitted signatures in `reason`.
 The original Review `ci_steps[].triage` retains the full classifications. Derived CI ledger
 entries carry optional `ci_triage`; `flaky` and `pre_existing` ledger statuses
-are minor and do not count as open blocking findings.
+are minor and do not count as open blocking findings under `full`. Under `report`,
+classified flaky and pre-existing findings remain open and blocking in the ledger
+and repair brief.
 
 `AttentionCategory` also includes `flaky_check` and `base_check_failing`.
 Both use Project scope and `recommended_action: inspect_ci`. Flaky items are
-deduplicated by command/signature; base items by command/base commit. Details
+deduplicated by command/signature; base items by Project and command. A newer red
+base updates the existing item with its base commit and run. Details
 include `command`, `count` (every distinct occurrence), `task_ids` (the latest 64,
 most recent last), run references and triage facts (including
 why the base is unavailable or invalid). A later passing base observation resolves
@@ -6152,7 +6155,9 @@ window. Before a reset the window starts at Task creation; after a recovery
 reset it starts at that reset's transition timestamp. Review attempts created
 at or after that timestamp belong to the window. `review_attempts` counts all
 attempts in it, including running and cancelled attempts. `items` is ordered
-lexically by id and capped at 200 entries after the full ledger is derived.
+naturally by id (`F2` before `F10`, and `CI-2` before `CI-10`) and capped
+at 200 entries after the full ledger is derived and naturally sorted. The cap
+therefore retains the earliest numeric ids within each source prefix.
 Project members with Task read access may use the route; hidden and unknown
 Tasks get the same refusal as `/tasks/{id}/reviews`.
 
@@ -6167,14 +6172,37 @@ Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`), and
 `streak`. Nullable text fields are `null` when unavailable. Reviewer ids are
 `F1`, `F2`, ... in first-seen list order within the window. Known ids continue
-findings; unknown ids become new findings. Forge sources use the stored,
-zero-based `CI-<step index>`, `CHK-<check id>` and `V-<check name>` ids.
+findings; unknown ids become new findings. A known id repeated within one
+review is one finding: its first occurrence continues it and later duplicates
+are dropped. Forge sources use the stored,
+zero-based `CI-<step index>#<first 8 hex of sha256(normalised failure signature)>`
+for steps with test signatures, `CI-<step index>` for failed steps without
+signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
+same test keeps its id across review rounds and server/daemon owners. A
+complete signature list resolves tests that stop failing; missing/truncated
+signatures do not resolve omitted tests, while a passing step resolves all its
+findings. The ledger retains all signatures; briefs and comments display at
+most 20 test findings per step followed by `+N more`.
+`source: merge` is reserved in the wire type and is not emitted in the ledger.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
 an explicit resolution or passing Forge check resolves it. Reopening a resolved
 or unconfirmed finding starts its streak at one. A reset empties the ledger
 and restarts reviewer numbering. Findings are informational in this phase;
 existing verdict routing and retry budgets remain authoritative.
+
+Finished review comments show the headline, the ledger as a Markdown checklist
+(open unchecked, resolved in this review checked, unconfirmed labelled
+"not re-checked"), omitting earlier-resolved findings, and
+`Full review: Review tab, attempt N`. The full report stays in the Review API and
+Review tab. Reviews without findings retain at most the first 2 KiB of their
+report, truncated on a UTF-8 boundary. CI-only failures get the same checklist.
+Repair and park system comments name the finding ids and current budget or
+parking rule. Result, repair and park comments each use a per-Review idempotency
+key, so replay does not append duplicates. The Review tab reads `/findings`,
+shows source, severity, status and streak with expandable finding details, and
+retains each attempt's input findings and full report. Verify presentation is
+conditional on recorded results; this phase adds no verify execution or config.
 
 Conformance `status` follows from the result and Forge's own checks. A failing
 setup step or required check makes the review `failed` whatever the reviewer

@@ -483,3 +483,43 @@ async fn machine_capacity_automatic_review_recovery_waits_without_blocking() {
         "machine_capacity"
     );
 }
+
+#[tokio::test]
+async fn automatic_review_recovery_falls_back_when_its_brief_cannot_load() {
+    let db = Arc::new(sqlite_db().await);
+    let (project_id, _, repo) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo);
+    let agent_id = seed_agent(&db).await;
+    let waiting = seed_task_with_status(&db, &project_id, "review").await;
+    seed_role_assignment(&db, &waiting.id, "coder", Some(&agent_id)).await;
+    crate::test_support::configure_project_execution_test_setup(
+        &db,
+        &project_id,
+        &agent_id,
+        &agent_id,
+    )
+    .await;
+    sqlx::query("UPDATE project SET settings = json_set(settings, '$.automatic_recovery', json_object('enabled', json('true'), 'agent_id', ?, 'max_attempts', 1)) WHERE id = ?")
+        .bind(&agent_id).bind(&project_id).execute(db.pool()).await.unwrap();
+    // Only the brief's context loader reads Task comments before dispatch.
+    sqlx::query("ALTER TABLE task_comment RENAME TO task_comment_unreadable")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let project = ProjectRepo::get_by_id(&*db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let service = TaskService::new(db.clone(), Arc::new(EventBus::default()));
+    let result = service
+        .try_dispatch_automatic_review_recovery(
+            &project,
+            &waiting,
+            Some("review-attempt"),
+            2,
+            3,
+            "review failure",
+        )
+        .await;
+    assert!(matches!(result, Ok(None)), "{result:?}");
+}

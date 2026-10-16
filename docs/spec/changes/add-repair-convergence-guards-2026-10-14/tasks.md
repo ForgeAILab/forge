@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-16T01:49:32Z
+updated_at: 2026-10-16T10:49:03Z
 completed_at:
 ---
 
@@ -17,7 +17,7 @@ completed_at:
   - normalisation, a cap of 200 signatures at 300 characters each, `failures_truncated`.
 - [x] 1.2 Strip ANSI codes from stored `output_tail` and `stderr_tail`.
 - [x] 1.3 Add `CheckCommandOutcome.failures` and `StepResultEntry.failures` (optional, `serde(default)`). Wire them through the durable runner, daemon receipts (an absent field is an empty list), generated TS and `docs/api.md`.
-- [x] 1.4 CI repair prompts list blocking signatures for every failing step (up to 20 per step). The ledger derives `CI-<step>#<hash>` findings and retains all signatures, including non-blocking triage classes.
+- [x] 1.4 The shared repair brief lists blocking signatures for every failing step (at most 20 per step). The ledger derives stable `CI-<step>#<first 8 hex of sha256(signature)>` ids with step-level fallback, retaining non-blocking triage classes.
 - [x] 1.5 Focused tests:
   - extractor unit tests per runner, using real captured output from the `world` and NovelKit logs;
   - JUnit parse;
@@ -26,7 +26,7 @@ completed_at:
 
 ## 2. CI triage
 - [x] 2.1 Project setting `review_ci_triage` (`full` default, `report`, `off`): validation, api-types, TS, `docs/api.md`, web settings.
-- [x] 2.2 Volatile budget `ReviewCiTriage` (limit 1) in `crates/db/src/budget.rs`.
+- [x] 2.2 Durable subcheck request keys bound rerun/base work across replay; no volatile triage budget.
 - [x] 2.3 Re-run the failing steps once in `RunCiSteps` (`workflow/actions/review.rs`), then classify flaky signatures and steps.
 - [x] 2.4 Base run:
   - same owner, Project env, assets and build environment as the candidate run;
@@ -85,7 +85,7 @@ completed_at:
   - Keep `auditor_failure_dispatches_follow_up_executor_with_thread_reuse` green for non-carried rounds.
 
 ## 6. Release
-- [ ] 6.1 `docs/architecture.md`: review CI triage, merge-queue head triage, Retry budgets (`review_ci_triage`, `repair_no_change`), Attention categories, repair brief.
+- [ ] 6.1 `docs/architecture.md`: review CI triage, merge-queue head triage, Retry budgets (`repair_no_change`), Attention categories, repair brief.
 - [ ] 6.2 `CHANGELOG.md` `Unreleased`:
   - `### Changed`: pre-existing and flaky failures no longer block under the default `review_ci_triage: full`; opt out with `off`.
   - `### Added`: everything else.
@@ -107,3 +107,15 @@ completed_at:
 - [x] 0a Select the latest settled (`passed`/`failed`) Review; cancelled/running/awaiting-human rows do not hide it.
 - [x] 0b Exempt explicit owner Retry of a blocked coder entry and retain that intent across another offline interruption.
 - [x] 0c Optional: strip monorepo runner prefixes before extraction, with captured pnpm/turbo fixtures.
+
+
+## 9. Merge landing decisions (2026-10-16)
+- [x] 9.1 Keep the finding ledger and shared repair brief with mode-aware CI classifications; remove the old CI prompt helper.
+- [x] 9.2 Extend queue-head waits during pending/running triage, bounded by check deadlines.
+- [x] 9.3 Park exhausted rerun/base infrastructure as infrastructure, never as a head timeout.
+- [x] 9.4 One base Attention per Project/command, updated by newer red evidence and resolved by newer passing evidence.
+- [x] 9.5 Preserve report-mode blocking findings in coder and worker repair briefs.
+- [x] 9.6 Materialize Project assets on the base and exclude only their untracked paths from the sharing witness.
+- [x] 9.7 Remove the inert volatile triage budget; retain the public triage mode.
+- [x] 9.8 Document full entry CI's new check identity and one-time cached-pass miss.
+- [x] 9.9 Run the requested focused verification and record the final report.

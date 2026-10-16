@@ -24,8 +24,6 @@ pub enum Kind {
     ReviewCiInfrastructure,
     /// Clean-checkout review checks re-run after a timeout, per evaluation.
     ReviewCheckRerun,
-    /// One candidate flake rerun plus base comparison per review/head check.
-    ReviewCiTriage,
     /// A coordination root's entries into its planning state after kickoff:
     /// one per rejected aggregate review and one per parked subtask. Charged
     /// only on a root that has a lead, so it is not in [`Kind::PERSISTED`]:
@@ -62,17 +60,13 @@ impl Kind {
             Self::ReportCorrection => "report_correction",
             Self::ReviewCiInfrastructure => "review_ci_infrastructure",
             Self::ReviewCheckRerun => "review_check_rerun",
-            Self::ReviewCiTriage => "review_ci_triage",
             Self::Replan => "replan",
         }
     }
     pub const fn default_limit(self) -> i32 {
         match self {
             Self::Review | Self::Execution | Self::WorkflowGuard => 3,
-            Self::MergeFix
-            | Self::AutomaticReviewRecovery
-            | Self::RepairNoChange
-            | Self::ReviewCiTriage => 1,
+            Self::MergeFix | Self::AutomaticReviewRecovery | Self::RepairNoChange => 1,
             Self::GateRejection => i32::MAX,
             Self::TargetMovedRebase
             | Self::ConflictHandoff
@@ -84,10 +78,7 @@ impl Kind {
     }
     /// Per-invocation counters live in memory and never reach the ledger.
     pub const fn is_volatile(self) -> bool {
-        matches!(
-            self,
-            Self::ReportCorrection | Self::ReviewCheckRerun | Self::ReviewCiTriage
-        )
+        matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
     }
 }
 /// Reserved checkpoint before configurable review-entry hooks. Negative keeps
@@ -1722,13 +1713,10 @@ mod tests {
     }
 
     #[test]
-    fn ci_triage_invocation_is_volatile_and_allows_one_bundle() {
-        assert!(Kind::ReviewCiTriage.is_volatile());
-        assert!(!Kind::PERSISTED.contains(&Kind::ReviewCiTriage));
-        let mut invocation = Invocation::new(Kind::ReviewCiTriage);
-        assert!(invocation.consume());
-        assert!(!invocation.consume());
-        assert_eq!(Invocation::new(Kind::ReviewCiTriage).remaining(), 1);
+    fn ci_triage_has_no_budget_kind() {
+        // The public triage mode remains a Project setting. It is never a
+        // retry budget: durable check request keys bound replay instead.
+        assert!(serde_json::from_str::<Kind>(r#""review_ci_triage""#).is_err());
     }
 
     #[test]

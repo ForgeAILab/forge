@@ -1,6 +1,24 @@
 //! Narrow reads for CI triage; failed comparison evidence is never a pass.
 use super::*;
 impl SqliteDb {
+    /// Only this head's outstanding triage work extends its check wait. The
+    /// check worker owns execution deadlines; expired runs cannot hold it.
+    pub async fn integration_head_triage_pending(
+        &self,
+        task: &str,
+        epoch: i64,
+        authority: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let prefix = format!("task-step/1|integration|{task}|{epoch}|ci-triage:");
+        let keys = [
+            format!("{prefix}rerun:{authority}"),
+            format!("{prefix}base:{authority}"),
+        ];
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM check_consumer c JOIN check_run r ON r.id=c.run_id WHERE c.request_key IN (?,?) AND c.cancelled_at IS NULL AND c.result_id IS NULL AND r.state IN ('queued','running','cancelling','cleaning','uncertain') AND (r.deadline_at IS NULL OR julianday(r.deadline_at)>julianday(?)))")
+            .bind(&keys[0]).bind(&keys[1]).bind(now).fetch_one(self.pool()).await?)
+    }
+
     pub async fn ci_triage_consumer(&self, request_key: &str) -> Result<Option<CheckConsumer>> {
         sqlx::query("SELECT * FROM check_consumer WHERE request_key=?")
             .bind(request_key)

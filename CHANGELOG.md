@@ -1739,8 +1739,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Changed
 
 - Pre-existing and flaky check failures no longer block review or merge under the default `review_ci_triage: full`; set `review_ci_triage: off` to retain the previous gate.
+- Under `review_ci_triage: full`, entry CI now runs every configured step instead
+  of stopping at the first failure. This changes the check identity, so existing
+  cached CI passes are missed once after upgrade.
+- Coder and autonomous-worker repair prompts now use a structured brief with
+  Task description and plan, finding history, all failing check output,
+  recorded verify evidence, the reviewer report and prior completion summary.
+  Automatic review recovery uses the same brief; no-change reminders still lead.
+  The brief body is capped at 24 KiB: after the report, previous summary and
+  check tails are cut, finding text is clipped and, past a line budget, the
+  remaining open findings are listed by id.
+- Merge-time check failures give the coder the target branch, failing command
+  and the end of its combined output (where the failure is printed, not the
+  oldest lines of the stderr tail) in a `MERGE-CI` finding. Committed conflict handoffs use
+  `MERGE-CONFLICT`; both stay out of the review ledger.
+- Review CI findings use stable per-test signature ids (`CI-<step>#<hash>`),
+  with step-level ids when signatures are unavailable. Review checklists show
+  checked findings only when resolved by that review, omitting older resolutions.
 
 
+- Review comments show the finding checklist and drop the full report. Read the
+  full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
+  findings retain a 2 KiB excerpt. The checklist lists open findings first and
+  stops at 8 KiB; later findings are named by id only. CI-only failures now get review comments, and
+  repair/park system comments name findings once per Review. The Review tab
+  displays the current ledger and per-attempt findings. Finding IDs now sort
+  naturally before the API's 200-entry cap (`F2` before `F10`).
 - Check failure signatures recognise cargo-nextest binary/test identities,
   omitting durations, progress counters and repeated stdout or summary output,
   including timed-out, signalled and retried tests (final attempt only). A jest
@@ -3080,6 +3104,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - `GET /api/v1/tasks/{id}/findings` reads the current review-window ledger,
   including open, resolved and unconfirmed findings and their streaks.
 - `forge-ctl task findings <task>` prints the same ledger as a table or JSON.
+- Demo images can target ARM64 servers with the optional `DEMO_PLATFORM` repository variable, using native builds and a separate cache for each platform (default: `linux/amd64`).
 - **A public demo deployment and a pull-request suite check.** `deploy/demo/`
   holds a Compose application for Dokploy and a demo image for a throwaway
   public instance: seeded demo data, no agent daemon, no MCP endpoint, no
@@ -3443,7 +3468,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Replaying a frozen review assessment across an upgrade accepts equivalent
   explicit or omitted default fields without rewriting its stored JSON.
 - Finding objects inside a broken reviewer result block can no longer supply
-  the review verdict; unreadable replies require result correction.
+  the review verdict; unreadable replies require result correction. An object
+  listed right after `[` or `,` is never read as the verdict; everything else
+  is read as before (the last complete result object wins), so code quoted
+  with apostrophes or Rust lifetimes and a correction turn appended after a
+  reply cut off mid-string or mid-list still settle the review.
 
 - An unchanged restart no longer records another setup-required wake decision
   for a Project's open blockers (one or several), or refreshes the timestamps

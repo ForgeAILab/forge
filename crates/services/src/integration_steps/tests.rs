@@ -4931,3 +4931,237 @@ async fn settle_ci_triage_pass_is_not_reused_by_unchanged_queue_head() {
         .await
         .is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn send_back_merge_fix_brief_carries_command_and_output() {
+    use crate::workflow::dispatch::{
+        loader, resolve_prompt_builder, BUILDER_ID_CODER_MERGE_FIX_V2,
+        BUILDER_ID_WORKER_MERGE_FIX_V1,
+    };
+    let world = World::new().await;
+    let attempt = world.add_task("brief-red", "f", "one\n").await;
+    let asked = world.place(&attempt.id, "checking", 2).await;
+    world.set(&attempt.id, "state='ejected',failure_kind='candidate_check_failed',failure_message='`cargo test` exited 101: parser::empty FAILED'").await;
+    world.ask(&asked, IntegrationStepAction::SendBack).await;
+    eventually("red check reaches repair", || async {
+        world.task("brief-red").await.status == "merge_failed"
+    })
+    .await;
+    let workflow = crate::workflow::default_workflow::default_workflow();
+    for (builder, role) in [
+        (BUILDER_ID_CODER_MERGE_FIX_V2, "coder"),
+        (BUILDER_ID_WORKER_MERGE_FIX_V1, "worker"),
+    ] {
+        let context = loader::load_agent_dispatch_context(loader::DispatchContextParams {
+            db: world.db.clone(),
+            router: &world.service.workspace_backend_router,
+            task_id: "brief-red",
+            role,
+            state_name: "merge_failed",
+            state_config: json!({}),
+            execution_policy: None,
+            workflow: &workflow,
+        })
+        .await
+        .unwrap();
+        let text = resolve_prompt_builder(builder).build(&context).user;
+        for expected in [
+            "MERGE-CI",
+            "main",
+            "cargo test",
+            "parser::empty FAILED",
+            "merge_fix budget: 1 of 1 spent; 0 remaining",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains("manual task-worktree repair"), "{text}");
+        let window = world.db.review_window("brief-red").await.unwrap();
+        assert!(::review::finding_ledger(&window.reviews)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+/// The re-ask path applies stored evidence just like a delivery. Exercise
+/// both triage phases without an owner worker so the terminal receipt can
+/// be an actual infrastructure failure rather than a command exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_infrastructure_is_not_a_pending_verdict_or_send_back() {
+    for phase in ["rerun", "base"] {
+        let world = World::new().await;
+        let a = world.add_task("infra-triage", "candidate", "one\n").await;
+        sqlx::query("UPDATE project SET settings=json_set(settings,'$.default_review_config',json(?)) WHERE id='p'")
+            .bind(json!({"setup_steps":["true"]}).to_string()).execute(world.db.pool()).await.unwrap();
+        review_ci(
+            &world,
+            "infra-triage",
+            &["printf 'test base ... FAILED\\n'; exit 1"],
+        )
+        .await;
+        world.service.compose_checks(
+            Arc::new(crate::daemon_transport::DaemonConnectionRegistry::without_handlers()),
+            Duration::from_secs(60),
+            &crate::integration_worker::IntegrationWorkerConfig::default(),
+        );
+        let ask = |round| {
+            let world = &world;
+            let id = a.id.clone();
+            async move {
+                let asked = world.place(&id, "checking", round).await;
+                world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+                eventually("triage request settles", || async {
+                    let steps = world
+                        .step("infra-triage", IntegrationStepAction::RequestCheck)
+                        .await;
+                    steps.len() == round as usize && steps.iter().all(|step| step.status == "done")
+                })
+                .await;
+            }
+        };
+        let finish = |stage: &'static str, outcome: &'static str| {
+            let world = &world;
+            async move {
+                let (consumer, run): (String, String) = sqlx::query_as("SELECT id,run_id FROM check_consumer WHERE task_id='infra-triage' AND request_key LIKE ?")
+                    .bind(format!("%|{stage}%")).fetch_one(world.db.pool()).await.unwrap();
+                let now = db::now_rfc3339();
+                let result = format!("result-{stage}");
+                let commands = json!([{"index":0,"command":"tests","exit_code":1,"stderr_tail":"","output_tail":"test base ... FAILED","failures":["base"],"started_at":now,"finished_at":now}]);
+                sqlx::query("UPDATE check_run SET state='failed',finished_at=? WHERE id=?")
+                    .bind(&now)
+                    .bind(&run)
+                    .execute(world.db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO check_result(id,run_id,identity_key,outcome,cleanup,certified,cacheable,steps_json,output_truncated,created_at) SELECT ?,id,identity_key,?,'not_performed',0,0,?,0,? FROM check_run WHERE id=?")
+                    .bind(&result).bind(outcome).bind(commands.to_string()).bind(&now).bind(&run).execute(world.db.pool()).await.unwrap();
+                sqlx::query("UPDATE check_consumer SET result_id=? WHERE id=?")
+                    .bind(&result)
+                    .bind(&consumer)
+                    .execute(world.db.pool())
+                    .await
+                    .unwrap();
+            }
+        };
+        ask(1).await;
+        finish("integration:", "fail").await;
+        ask(2).await;
+        let round = if phase == "base" {
+            finish("ci-triage:rerun:", "fail").await;
+            ask(3).await;
+            4
+        } else {
+            3
+        };
+        finish(
+            if phase == "base" {
+                "ci-triage:base:"
+            } else {
+                "ci-triage:rerun:"
+            },
+            "infrastructure_failed",
+        )
+        .await;
+        ask(round).await;
+        let attempt = world.attempt(&a.id).await;
+        let answer = ack(&attempt, IntegrationStepAction::Settle)
+            .expect("infrastructure is a terminal answer, not a pending wait");
+        assert_eq!(
+            answer.outcome,
+            IntegrationStepOutcome::Infrastructure,
+            "{phase}: {answer:?}"
+        );
+        assert!(answer.message.unwrap().contains("infrastructure"));
+        assert_eq!(world.task("infra-triage").await.status, "merging");
+        assert!(world
+            .step("infra-triage", IntegrationStepAction::SendBack)
+            .await
+            .is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_base_attention_is_one_command_across_commits_and_resolves() {
+    let world = World::new().await;
+    sqlx::query("UPDATE project SET settings=json_set(settings,'$.default_review_config',json(?)) WHERE id='p'")
+        .bind(json!({"setup_steps":["true"]}).to_string()).execute(world.db.pool()).await.unwrap();
+    let production = Production::new(&world);
+    let command = "if grep -q green base && [ ! -f candidate ]; then exit 0; fi; printf 'test base ... FAILED\\n'; exit 1";
+    let mut item_id = None;
+    let mut previous_commit = String::new();
+    for (index, contents) in ["red-one\n", "red-two\n", "green\n"].iter().enumerate() {
+        std::fs::write(world.repo().join("base"), contents).unwrap();
+        git::commit_all(&world.repo(), contents).await.unwrap();
+        let tip = git::get_current_sha(&world.repo()).await.unwrap();
+        let task = format!("base-{index}");
+        let a = world.add_task(&task, "candidate", "one\n").await;
+        review_ci(&world, &task, &[command]).await;
+        let asked = world.place(&a.id, "checking", 1).await;
+        world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+        eventually("base triage settles", || async {
+            ack(&world.attempt(&a.id).await, IntegrationStepAction::Settle).is_some()
+        })
+        .await;
+        let rows: Vec<(String, String, String)> = sqlx::query_as("SELECT id,status,details_json FROM attention_projection WHERE attention_type='base_check_failing'")
+            .fetch_all(world.db.pool()).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one item per Project and command across base commits"
+        );
+        let (id, status, details) = &rows[0];
+        assert_eq!(item_id.get_or_insert_with(|| id.clone()), id);
+        let details: Value = serde_json::from_str(details).unwrap();
+        if index < 2 {
+            assert_eq!(status, "open");
+            assert_eq!(details["base_commit"], tip);
+            assert_ne!(tip, previous_commit);
+            previous_commit = tip;
+        } else {
+            assert_eq!(
+                status, "resolved",
+                "a newer passing base resolves the command's incident"
+            );
+        }
+    }
+    drop(production);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settle_ci_triage_project_assets_do_not_prevent_shared_red_base() {
+    let world = World::new().await;
+    let source = world.temp.path().join("assets-source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("input"), "asset-content").unwrap();
+    let environment = api_types::ProjectEnvironment {
+        assets: vec![api_types::EnvironmentAsset {
+            source: source.to_str().unwrap().into(),
+            target: "assets".into(),
+        }],
+        ..Default::default()
+    };
+    sqlx::query("UPDATE project SET settings=json_set(settings,'$.environment',json(?),'$.default_review_config',json(?)) WHERE id='p'")
+        .bind(serde_json::to_string(&environment).unwrap()).bind(json!({"setup_steps":["test \"$(cat assets/input)\" = asset-content"]}).to_string()).execute(world.db.pool()).await.unwrap();
+    let production = Production::new(&world);
+    for task in ["assets-one", "assets-two"] {
+        // Both candidates ignore their assets; the older base has no such
+        // ignore rule. Its Forge-materialized assets still are declared inputs.
+        let a = world.add_task(task, ".gitignore", "assets/\n").await;
+        executors::environment::materialize_assets(&world.tree(task), &environment.assets)
+            .await
+            .unwrap();
+        review_ci(&world, task, &["test \"$(cat assets/input)\" = asset-content || exit 2; printf 'test base ... FAILED\\n'; exit 1"]).await;
+        let asked = world.place(&a.id, "checking", 1).await;
+        world.ask(&asked, IntegrationStepAction::RequestCheck).await;
+        eventually("asset head triaged", || async {
+            world.attempt(&a.id).await.permit_json.is_some()
+        })
+        .await;
+    }
+    let bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE json_extract(input_json,'$.spec.commands[0].id')='triage-base:setup:0'")
+        .fetch_one(world.db.pool()).await.unwrap();
+    assert_eq!(
+        bases, 1,
+        "materialized assets must not disable red comparison sharing"
+    );
+    drop(production);
+}

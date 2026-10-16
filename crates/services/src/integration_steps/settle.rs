@@ -208,28 +208,33 @@ pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
                     CheckInput::NoVerdict(format!("the check ended {}", result.outcome))
                 }
                 CheckResultOutcome::Fail | CheckResultOutcome::TimedOut => {
-                    let failed = result
-                        .commands
-                        .iter()
-                        .find(|command| command.exit_code != 0)
-                        .map(|command| {
-                            format!(
-                                "`{}` exited {}: {}",
-                                command.command,
-                                command.exit_code,
-                                if command.stderr_tail.trim().is_empty() {
-                                    command.output_tail.trim()
-                                } else {
-                                    command.stderr_tail.trim()
-                                }
-                            )
-                        })
+                    let failed = failed_command_message(&result.commands)
                         .unwrap_or_else(|| format!("the check ended {}", result.outcome));
                     CheckInput::Failed(timing, bounded(&failed))
                 }
             }
         }
     }
+}
+
+/// The first failing command and the end of its combined output. The cause
+/// of a red check is where its output ends; the bounded message keeps that
+/// end rather than the oldest lines of the tail.
+fn failed_command_message(commands: &[api_types::CheckCommandOutcome]) -> Option<String> {
+    let command = commands.iter().find(|command| command.exit_code != 0)?;
+    let output = if command.output_tail.trim().is_empty() {
+        command.stderr_tail.trim()
+    } else {
+        command.output_tail.trim()
+    };
+    let head = format!("`{}` exited {}: ", command.command, command.exit_code);
+    let mut start = output
+        .len()
+        .saturating_sub(super::TEXT_LIMIT.saturating_sub(head.len()));
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("{head}{}", &output[start..]))
 }
 
 /// What `settle` decided before its transaction.
@@ -353,7 +358,9 @@ impl IntegrationSteps {
                     let application = CheckApplication {
                         task_id: task.id.clone(),
                         status_epoch: attempt.expected_epoch,
-                        authority: String::new(),
+                        authority: check_authority(&attempt).ok_or_else(|| {
+                            ServiceError::invalid_operation("the head has no candidate commit")
+                        })?,
                         consumer_id: delivery.consumer.id.clone(),
                         run,
                         verdict: if result.outcome == CheckResultOutcome::InfrastructureFailed {
@@ -641,6 +648,11 @@ impl IntegrationSteps {
                             tx.commit().await?;
                         }
                         return Ok(StepOutcome::Settled);
+                    }
+                    crate::check_runner::ci_triage::Progress::Infrastructure(consumer) => {
+                        CheckInput::NoVerdict(format!(
+                            "CI triage check {consumer} produced no verdict after its infrastructure retries"
+                        ))
                     }
                     crate::check_runner::ci_triage::Progress::Complete(entries) => {
                         let blocking = entries.iter().any(crate::check_runner::ci_triage::blocks);
@@ -1255,5 +1267,45 @@ impl IntegrationSteps {
             .produce_condition_in_tx(tx, &attempt.task_ref, db::ConditionChange::Human)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod failed_message_tests {
+    use super::*;
+
+    #[test]
+    fn a_red_check_message_keeps_the_end_of_the_combined_output() {
+        let command = api_types::CheckCommandOutcome {
+            index: 0,
+            command: "cargo test".into(),
+            exit_code: 101,
+            stderr_tail: format!(
+                "{}error: test failed, to rerun pass `--lib`",
+                "   Compiling dep v0.1.0\n".repeat(100)
+            ),
+            failures: vec!["parser::empty".into()],
+            failures_truncated: false,
+            output_tail: format!(
+                "{}test parser::empty ... FAILED\ntest result: FAILED. 1 passed; 1 failed",
+                "   Compiling dep v0.1.0\n".repeat(100)
+            ),
+            started_at: "now".into(),
+            finished_at: "now".into(),
+        };
+        let message = bounded(&failed_command_message(&[command]).unwrap());
+        assert!(
+            message.starts_with("`cargo test` exited 101: "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("test result: FAILED. 1 passed; 1 failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("test parser::empty ... FAILED"),
+            "{message}"
+        );
+        assert!(message.len() <= super::super::TEXT_LIMIT);
     }
 }

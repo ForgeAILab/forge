@@ -1714,9 +1714,8 @@ async fn findings_read_caps_the_full_ledger_after_id_ordering() {
     let response: api_types::TaskFindingsResponse = serde_json::from_value(body).unwrap();
     assert_eq!(response.review_attempts, 5);
     assert_eq!(response.items.len(), 200);
-    let mut ids = (1..=250).map(|n| format!("F{n}")).collect::<Vec<_>>();
-    ids.sort();
-    ids.truncate(200);
+    // Natural id order (F2 before F10) precedes the cap: F1..F200 survive.
+    let ids = (1..=200).map(|n| format!("F{n}")).collect::<Vec<_>>();
     assert_eq!(
         response
             .items

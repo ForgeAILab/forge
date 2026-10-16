@@ -644,6 +644,45 @@ pub fn unstarted_receipt(
     }
 }
 
+async fn clean_checkout(path: &Path, target: &CheckoutTarget<'_>) -> Result<bool, String> {
+    let output = git::command_output(
+        path,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("checkout cleanliness witness failed".into());
+    }
+    let assets = match target {
+        CheckoutTarget::ExactCommit { assets, .. } => *assets,
+        CheckoutTarget::Workspace(_) => &[],
+    };
+    // Only Forge-materialized untracked assets in the disposable checkout
+    // are inputs rather than dirt. Tracked edits and other untracked files
+    // still invalidate the witness. NUL paths avoid Git quoting ambiguities.
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| {
+            entry.strip_prefix(b"?? ").is_some_and(|name| {
+                assets.iter().any(|asset| {
+                    let target = Path::new(&asset.target)
+                        .components()
+                        .filter(|part| *part != std::path::Component::CurDir)
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    name == target.as_bytes()
+                        || name
+                            .strip_prefix(target.as_bytes())
+                            .is_some_and(|rest| rest.starts_with(b"/"))
+                })
+            })
+        }))
+}
+
 pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
     let mut receipt = unstarted_receipt(
         input.operation_id,
@@ -780,13 +819,11 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             if canonical(&input.spec.execution_policy) {
                 clean_before = tokio::time::timeout(
                     CLEAN_WITNESS_TIMEOUT,
-                    git::command_output(path, &["status", "--porcelain"]),
+                    clean_checkout(path, &input.target),
                 )
                 .await
                 .ok()
-                .and_then(Result::ok)
-                .filter(|output| output.status.success())
-                .map(|output| output.stdout.is_empty());
+                .and_then(Result::ok);
             }
             let mut sequence = CheckSequence::new(input.spec.clone());
             while let Some((_, spec)) = sequence.next_command() {

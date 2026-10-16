@@ -10,7 +10,7 @@ import { qk } from '@/api/query-keys'
 import { routeSsePayload } from '@/api/sse'
 import type { useCreateComment, useDeleteComment } from '@/api/hooks'
 import type { Comment, Task, TaskMediaResponse } from '@/types/generated'
-import { TaskCommentsPanel } from './task-comments-panel'
+import { TaskCommentsPanel, TaskEvidencePreview } from './task-comments-panel'
 
 const now = '2026-05-19T12:00:00Z'
 const originalCreateObjectURL = URL.createObjectURL
@@ -157,6 +157,20 @@ describe('TaskCommentsPanel', () => {
     restoreUrlObjectMethod('revokeObjectURL', originalRevokeObjectURL)
   })
 
+  it('renders review finding task lists as disabled open and resolved checkboxes', () => {
+    renderPanel(
+      'Review failed (attempt 2): empty input crashes\n\n- [ ] F1 Still open\n- [x] F2 Resolved\n- F3 Not re-checked\n\nFull review: Review tab, attempt 2',
+      [],
+      { author_type: 'system', author_name: 'Forge' },
+    )
+    const boxes = screen.getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes).toHaveLength(2)
+    expect(boxes[0].checked).toBe(false)
+    expect(boxes[1].checked).toBe(true)
+    expect(boxes.every((box) => box.disabled)).toBe(true)
+    expect(screen.getByText('F3 Not re-checked')).toBeTruthy()
+  })
+
   it('preserves Markdown rendering for text comments', () => {
     renderPanel('**Bold** text with [Forge docs](https://example.com/docs).')
 
@@ -296,6 +310,25 @@ describe('TaskCommentsPanel', () => {
       expect.arrayContaining([[{ queryKey: qk.taskMedia(task.id) }]]),
     )
     expect(dispatch).not.toHaveBeenCalled()
+  })
+  it('reuses authenticated Task media previews for recorded verify evidence', async () => {
+    mockMediaFetch([
+      media({
+        id: 'evidence-1',
+        filename: 'smoke.png',
+        content_type: 'image/png',
+        url: '/api/v1/media/evidence-1',
+      }),
+    ])
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <TaskEvidencePreview taskId={task.id} mediaIds={['evidence-1']} />
+      </QueryClientProvider>,
+    )
+    const preview = (await screen.findByRole('img', { name: 'smoke.png' })) as HTMLImageElement
+    expect(preview.src).toMatch(/^blob:/)
+    expect(preview.dataset.mediaUrl).toBe('/api/v1/media/evidence-1')
   })
 })
 

@@ -356,3 +356,33 @@ async fn ci_triage_base_whose_setup_failed_is_not_reused() {
         .unwrap();
     assert_eq!(bases, 2);
 }
+
+#[tokio::test]
+async fn ci_triage_full_changes_cached_identity_and_documents_upgrade() {
+    let f = fixture("full", &[], &[RED, "true"]).await;
+    let (_, _, details) = enter(&f).await;
+    assert_eq!(details["ci_steps"].as_array().unwrap().len(), 2);
+    let id: String = sqlx::query_scalar("SELECT id FROM check_run ORDER BY created_at,id LIMIT 1")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let run = db::CheckRunRepo::check_run(&*f.db, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut old = run.identity.clone();
+    for command in &mut old.inputs.spec.commands {
+        assert_eq!(
+            command.failure_policy,
+            api_types::CheckFailurePolicy::Continue
+        );
+        command.failure_policy = api_types::CheckFailurePolicy::StopBundle;
+    }
+    assert_ne!(
+        run.identity.key().unwrap(),
+        old.key().unwrap(),
+        "the full-mode policy must miss old cached passes"
+    );
+    let changelog = include_str!("../../../../../../CHANGELOG.md");
+    assert!(changelog.contains("cached CI passes are missed once after upgrade"));
+}

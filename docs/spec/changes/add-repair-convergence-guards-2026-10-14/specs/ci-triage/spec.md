@@ -12,10 +12,14 @@ The setting SHALL be readable and writable through the Project settings API and 
 - **WHEN** the owner sets `review_ci_triage: "off"`
 - **THEN** a failed review CI step routes exactly as before this change, with no re-run and no base run
 
+#### Scenario: Report keeps classified findings blocking
+- **WHEN** `report` classifies signatures as flaky or pre-existing
+- **THEN** they remain open blocking findings in the ledger and repair brief, with their classifications shown
+
 ### Requirement: A failing step is re-run once to separate flakes
 When a review CI step fails and triage is not `off`, Forge SHALL re-run the failing steps once on the same candidate, in the same workspace. When the re-run fails again with at least one of the same signatures, a signature that does not fail in both runs SHALL be classified `flaky`. A step that passes on the re-run SHALL be classified wholly flaky. A step whose re-run fails with only other signatures is a consistent failure: none of its signatures is `flaky`, and all of them go to the base comparison.
 
-The re-run uses the volatile `review_ci_triage` budget, limit 1 per review attempt. It SHALL NOT create a new Review attempt or charge the review budget.
+Durable consumer request keys SHALL admit at most one rerun bundle and base comparison per review attempt or queue-head check, including after restart or redelivery. There SHALL be no volatile triage budget. It SHALL NOT create a new Review attempt or charge the review budget.
 
 #### Scenario: Timeout flake
 - **WHEN** `pnpm test` fails with `AgentAuthorityHttpTransportError` timeouts in two tests and passes on the re-run
@@ -74,6 +78,10 @@ A failing step without signatures that also fails on a valid base run SHALL be `
 - **WHEN** two Tasks on the same base commit both need a base run of the same steps
 - **THEN** one base run executes and both use its result
 
+#### Scenario: Project assets on a shared base
+- **WHEN** two Tasks need the same base check with Forge-materialized Project assets
+- **THEN** the base gets the same assets and their untracked paths do not invalidate sharing; tracked changes still do
+
 ### Requirement: Triage never certifies a failed check
 A check result that triage treats as non-blocking SHALL keep its real stored outcome (`fail`) in `check_result`. Only the Review settlement, or the queue-head settle, SHALL treat the step as non-blocking. A triaged result SHALL never be reused as a certified pass.
 
@@ -88,10 +96,18 @@ A queue-head check that fails SHALL be triaged the same way, with the target tip
 - **WHEN** a Task that passed review reaches the queue head, and its checks fail only on tests that also fail on the target tip
 - **THEN** the head is not sent back, and the merge proceeds
 
+#### Scenario: Triage outlives the original head wait
+- **WHEN** a queue-head triage rerun or base check is pending or running past the original 35-minute head check wait
+- **THEN** the head wait is extended, bounded by the check run's own deadline
+
+#### Scenario: Triage infrastructure cannot produce a verdict
+- **WHEN** either queue-head triage stage exhausts its infrastructure retries
+- **THEN** the head parks with the existing infrastructure reason and Attention rather than a timeout
+
 ### Requirement: Flaky and pre-existing failures are reported to the Project
 Forge SHALL raise deduplicated Project attention for triaged failures:
 - `flaky_check`, keyed by step command and signature, carrying a count and the Tasks that hit it;
-- `base_check_failing`, keyed by step command and base commit, carrying the failing signatures. It resolves when a later base run of that step passes.
+- `base_check_failing`, keyed by Project and step command, carrying the latest failing base commit and signatures. A newer red base updates the same item; it resolves when a newer base run of that command passes.
 
 Both SHALL be new `AttentionCategory` values, shown in Mission Control and documented in `docs/api.md`.
 
