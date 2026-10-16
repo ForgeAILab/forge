@@ -1793,12 +1793,20 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
             "{case}: the run targets the Task's own placement"
         );
         assert!(link.requests(api_types::METHOD_WORKSPACE_RUN).is_empty());
-        let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id=?")
-            .bind(task_id)
-            .fetch_one(state.db.pool())
-            .await
-            .unwrap();
-        assert_eq!(comments, 0);
+        // A CI-only failure posts its finding checklist; a pass posts nothing.
+        let comments: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM task_comment WHERE task_id=?")
+                .bind(task_id)
+                .fetch_all(state.db.pool())
+                .await
+                .unwrap();
+        match case {
+            "pass" => assert!(comments.is_empty(), "{comments:?}"),
+            _ => {
+                assert_eq!(comments.len(), 1, "{comments:?}");
+                assert!(comments[0].starts_with("Review failed"), "{comments:?}");
+            }
+        }
         let mut review_events = Vec::new();
         while let Ok(event) = events.try_recv() {
             if event.event_type.starts_with("review.") {
