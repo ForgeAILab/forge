@@ -104,6 +104,14 @@ impl Default for IntegrationStepTimers {
 /// owner's environment was not attested.
 pub(crate) const CHECK_ENVIRONMENT_UNAVAILABLE: &str = "check environment unavailable";
 const TEXT_LIMIT: usize = 1000;
+const CI_MESSAGE_LIMIT: usize = 12 * 1024;
+pub(crate) fn bounded_ci_failure(text: &str) -> String {
+    let mut end = text.len().min(CI_MESSAGE_LIMIT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
 /// Leads the retry reason of a `result` step that found its fast-forward
 /// still in flight.
 const FF_POLL: &str = "fast-forward ";
@@ -146,7 +154,13 @@ pub(crate) fn ack_value(
         action,
         outcome,
         check,
-        message: message.as_deref().map(bounded),
+        message: message.as_deref().map(|message| {
+            if outcome == IntegrationStepOutcome::CandidateCheckFailed {
+                bounded_ci_failure(message)
+            } else {
+                bounded(message)
+            }
+        }),
     })
 }
 

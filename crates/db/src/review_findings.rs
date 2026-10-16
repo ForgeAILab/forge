@@ -2,11 +2,11 @@
 //! review-budget window; computed ids and state never enter frozen assessments.
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::Review;
 use api_types::{
     ReviewConformance, ReviewFinding, ReviewFindingEntry, ReviewFindingSeverity,
     ReviewFindingSource as Source, ReviewFindingStatus as Status, StepResultEntry,
 };
-use db::Review;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -17,21 +17,6 @@ pub fn ci_finding_id(step: usize, signature: &str) -> String {
         "CI-{step}#{:02x}{:02x}{:02x}{:02x}",
         digest[0], digest[1], digest[2], digest[3]
     )
-}
-
-/// A step-level `CI-<n>` the ledger closed because the step's failures are now
-/// tracked per test. The step did not pass, so it is not a resolution to show.
-pub fn superseded_by_tests(entry: &ReviewFindingEntry, ledger: &[ReviewFindingEntry]) -> bool {
-    entry.source == Source::Ci
-        && entry.status == Status::Resolved
-        && !entry.id.contains('#')
-        && ledger.iter().any(|other| {
-            other.status != Status::Resolved
-                && other
-                    .id
-                    .strip_prefix(entry.id.as_str())
-                    .is_some_and(|rest| rest.starts_with('#'))
-        })
 }
 
 /// Derive every finding, ordered naturally by id. The API's 200-item limit is
@@ -85,6 +70,7 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         // Count it once per attempt, preferring the check's final observation.
         let mut observations = BTreeMap::new();
         let mut detailed_ci = BTreeSet::new();
+        let mut superseded = BTreeSet::new();
         let mut non_blocking = BTreeSet::new();
         for step in steps {
             let prefix = format!("CI-{}", step.index);
@@ -107,8 +93,10 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 .chain(classes.keys().cloned())
                 .collect();
             if step.exit_code == 0 || !signatures.is_empty() {
-                // A completed signature list proves earlier test findings absent.
-                if step.exit_code == 0 || !step.failures_truncated {
+                // failures_truncated=false only means extraction kept every observed
+                // failure. A red runner can stop before later binaries run, so
+                // only a passing step proves absent tests have been fixed.
+                if step.exit_code == 0 {
                     for (id, entry) in &ledger {
                         if entry.source == Source::Ci && id.starts_with(&format!("{prefix}#")) {
                             observations.insert(
@@ -146,6 +134,9 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                         );
                     }
                     // Replace an older step-only failure once precise evidence exists.
+                    if step.exit_code != 0 {
+                        superseded.insert(prefix.clone());
+                    }
                     observations.insert(
                         prefix.clone(),
                         (Source::Ci, step.command.clone(), true, String::new(), None),
@@ -188,6 +179,18 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 _ => (format!("CHK-{}", check.check_id), Source::Check),
             };
             if !detailed_ci.contains(&id) {
+                // Older Reviews can carry CI only as conformance checks. A real
+                // pass there proves all prior test findings fixed as well.
+                if source == Source::Ci && check.exit_code == 0 {
+                    for (test_id, entry) in &ledger {
+                        if entry.source == Source::Ci && test_id.starts_with(&format!("{id}#")) {
+                            observations.insert(
+                                test_id.clone(),
+                                (Source::Ci, check.command.clone(), true, String::new(), None),
+                            );
+                        }
+                    }
+                }
                 let class = check.triage.as_ref().and_then(|triage| triage.class);
                 // The check's final observation supersedes pre-review CI.
                 non_blocking.remove(&id);
@@ -248,7 +251,12 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
         for (id, (source, command, passed, observed, class)) in observations {
             if passed {
                 if let Some(entry) = ledger.get_mut(&id) {
-                    entry.status = Status::Resolved;
+                    entry.status = if entry.status == Status::Superseded || superseded.contains(&id)
+                    {
+                        Status::Superseded
+                    } else {
+                        Status::Resolved
+                    };
                     entry.last_checked_attempt = attempt;
                     entry.streak = 0;
                 }
@@ -326,6 +334,67 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
     let mut entries: Vec<_> = ledger.into_values().collect();
     entries.sort_by(|a, b| compare_finding_ids(&a.id, &b.id));
     Ok(entries)
+}
+
+/// D5 policy uses the same complete ledger as every display. Future anchoring
+/// and reopened statuses extend this projection, not a parallel finding count.
+#[derive(Debug, Default)]
+pub struct RoundPolicy {
+    pub derived: bool,
+    pub progress: bool,
+    pub repeat: Option<String>,
+}
+
+pub fn round_policy(reviews: &[Review], current: &Review) -> Result<RoundPolicy, String> {
+    let mut window: Vec<_> = reviews
+        .iter()
+        .filter(|row| row.attempt_number < current.attempt_number)
+        .cloned()
+        .collect();
+    window.push(current.clone());
+    let derived = window.iter().all(|row| {
+        let details: Value = serde_json::from_str(&row.step_results_json).unwrap_or_default();
+        if details
+            .get("manual_override")
+            .is_some_and(|value| !value.is_null())
+        {
+            return true;
+        }
+        let assessment = &details["conformance"]["assessment"];
+        assessment["result"].as_str() != Some("fail")
+            || assessment["findings"].as_array().is_some_and(|findings| {
+                findings.iter().any(|finding| {
+                    finding["severity"].as_str().unwrap_or("blocking") == "blocking"
+                        && finding["summary"]
+                            .as_str()
+                            .is_some_and(|summary| !summary.trim().is_empty())
+                })
+            })
+    });
+    if !derived {
+        return Ok(RoundPolicy::default());
+    }
+    let previous = finding_ledger(&window[..window.len() - 1])?;
+    let ledger = finding_ledger(&window)?;
+    let blocking = |entry: &&ReviewFindingEntry| {
+        entry.status == Status::Open && entry.severity == ReviewFindingSeverity::Blocking
+    };
+    let progress =
+        ledger.iter().filter(blocking).count() < previous.iter().filter(blocking).count();
+    let repeat = ledger
+        .iter()
+        .filter(blocking)
+        .find(|entry| {
+            entry.source == Source::Reviewer
+                && entry.last_checked_attempt == current.attempt_number
+                && (entry.streak >= 3 || (entry.streak >= 2 && !progress))
+        })
+        .map(|entry| format!("repeated finding: {} {}", entry.id, entry.summary));
+    Ok(RoundPolicy {
+        derived,
+        progress,
+        repeat,
+    })
 }
 
 /// Compare numeric runs by value without a fixed-width integer conversion.
@@ -410,7 +479,7 @@ mod tests {
             reviewer_execution_id: None,
             auditor_execution_id: None,
             attempt_number: attempt,
-            status: db::ReviewStatus::Failed,
+            status: crate::ReviewStatus::Failed,
             step_results_json: details.to_string(),
             started_at: format!("2026-10-15T00:00:{attempt:02}Z"),
             finished_at: None,
@@ -428,7 +497,7 @@ mod tests {
         ledger.iter().find(|entry| entry.id == id).unwrap()
     }
     #[test]
-    fn finding_ledger_resolves_test_signatures_and_excludes_triaged_noise() {
+    fn finding_ledger_preserves_unobserved_test_signatures_and_excludes_triaged_noise() {
         let first = review(
             1,
             json!({"ci_steps":[{"index":0,"command":"test","exit_code":1,"stderr_tail":"","failures":["fixed","base","flake"]}]}),
@@ -446,7 +515,8 @@ mod tests {
             .iter()
             .find(|entry| entry.observed.as_deref() == Some("fixed"))
             .unwrap();
-        assert_eq!(fixed.status, Status::Resolved);
+        assert_eq!(fixed.status, Status::Open);
+        assert_eq!((fixed.streak, fixed.last_checked_attempt), (1, 1));
         let base = ledger
             .iter()
             .find(|entry| entry.observed.as_deref() == Some("base"))
@@ -463,7 +533,13 @@ mod tests {
             (flake.status, flake.ci_triage),
             (Status::Flaky, Some(api_types::CiFailureClass::Flaky))
         );
-        assert!(ledger.iter().all(|entry| entry.status != Status::Open));
+        assert_eq!(
+            ledger
+                .iter()
+                .filter(|entry| entry.status == Status::Open)
+                .count(),
+            1
+        );
     }
     #[test]
     fn finding_ledger_report_keeps_classified_signatures_and_steps_blocking() {
@@ -776,7 +852,7 @@ mod tests {
                 entry(&ledger, &b).status,
                 entry(&ledger, &b).last_checked_attempt
             ),
-            (Status::Resolved, 2)
+            (Status::Open, 1)
         );
         assert_eq!(ledger, finding_ledger(&reviews).unwrap());
         let third = ci(3, 0, json!([]), false);
@@ -809,7 +885,121 @@ mod tests {
         assert_eq!(entry(&ledger, &b).status, Status::Open);
         assert_eq!(entry(&ledger, "CI-0").status, Status::Open);
         let full = finding_ledger(&[ci(1, json!([]), false), ci(2, json!(["a"]), false)]).unwrap();
-        assert_eq!(entry(&full, "CI-0").status, Status::Resolved);
+        assert_eq!(entry(&full, "CI-0").status, Status::Superseded);
         assert_eq!(entry(&full, &a).status, Status::Open);
+    }
+    #[test]
+    fn round_policy_fail_fast_ci_absence_is_neither_progress_nor_a_streak_step() {
+        let ci = |attempt, failures, truncated| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":0,"command":"cargo test","exit_code":101,"stderr_tail":"",
+            "failures":failures,"failures_truncated":truncated}]}),
+            )
+        };
+        for truncated in [false, true] {
+            let first = ci(1, json!(["binary_a::failure", "binary_b::failure"]), false);
+            let second = ci(2, json!(["binary_a::failure"]), truncated);
+            let policy = round_policy(std::slice::from_ref(&first), &second).unwrap();
+            assert!(!policy.progress);
+            let ledger = finding_ledger(&[first, second]).unwrap();
+            let unseen = entry(&ledger, &ci_finding_id(0, "binary_b::failure"));
+            assert_eq!(
+                (unseen.status, unseen.streak, unseen.last_checked_attempt),
+                (Status::Open, 1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn finding_ledger_superseded_is_explicit_and_never_an_actual_resolution() {
+        let step = |attempt, exit, signatures| {
+            review(
+                attempt,
+                json!({"ci_steps":[{
+            "index":0,"command":"cargo test","exit_code":exit,"stderr_tail":"",
+            "failures":signatures}]}),
+            )
+        };
+        let rounds = [
+            step(1, 101, json!([])),
+            step(2, 101, json!(["a"])),
+            step(3, 0, json!([])),
+        ];
+        let ledger = finding_ledger(&rounds[..2]).unwrap();
+        assert_eq!(entry(&ledger, "CI-0").status, Status::Superseded);
+        assert_eq!(
+            serde_json::to_value(entry(&ledger, "CI-0")).unwrap()["status"],
+            "superseded"
+        );
+        let ledger = finding_ledger(&rounds).unwrap();
+        assert_eq!(entry(&ledger, "CI-0").status, Status::Superseded);
+        assert_eq!(
+            entry(&ledger, &ci_finding_id(0, "a")).status,
+            Status::Resolved
+        );
+    }
+
+    #[test]
+    fn round_policy_counts_only_open_blocking_and_bounds_carried_findings() {
+        let first = reviewer(
+            1,
+            json!([{"summary":"one"},{"summary":"two"},{"summary":"three"},{"summary":"minor", "severity":"minor"}]),
+            json!([]),
+        );
+        let second = reviewer(
+            2,
+            json!([{"id":"F1","summary":"one"},{"id":"F4","summary":"minor", "severity":"minor"}]),
+            json!(["F2", "F3"]),
+        );
+        let policy = round_policy(std::slice::from_ref(&first), &second).unwrap();
+        assert!(policy.derived && policy.progress);
+        assert!(policy.repeat.is_none());
+        let third = reviewer(3, json!([{"id":"F1","summary":"one"}]), json!([]));
+        let policy = round_policy(&[first.clone(), second], &third).unwrap();
+        assert_eq!(policy.repeat.as_deref(), Some("repeated finding: F1 one"));
+        let no_progress = reviewer(
+            2,
+            json!([{"id":"F1","summary":"one"},{"id":"F2","summary":"two"},{"id":"F3","summary":"three"}]),
+            json!([]),
+        );
+        let policy = round_policy(&[first], &no_progress).unwrap();
+        assert!(!policy.progress);
+        assert_eq!(policy.repeat.as_deref(), Some("repeated finding: F1 one"));
+    }
+
+    #[test]
+    fn round_policy_findings_less_or_minor_only_fail_disables_the_entire_window() {
+        for findings in [json!([]), json!([{"summary":"minor","severity":"minor"}])] {
+            let old = reviewer(1, findings, json!([]));
+            let first = reviewer(2, json!([{"summary":"one"},{"summary":"two"}]), json!([]));
+            let second = reviewer(3, json!([{"id":"F1","summary":"one"}]), json!(["F2"]));
+            assert!(
+                !round_policy(&[old, first.clone()], &second)
+                    .unwrap()
+                    .derived
+            );
+            assert!(
+                round_policy(&[first], &second).unwrap().derived,
+                "a reset excludes the legacy fail"
+            );
+        }
+    }
+    #[test]
+    fn finding_ledger_conformance_ci_pass_resolves_prior_test_findings() {
+        let first = review(
+            1,
+            json!({"ci_steps":[{"index":0,"command":"tests","exit_code":1,"stderr_tail":"","failures":["a"]}]}),
+        );
+        let passed = review(
+            2,
+            json!({"conformance":{"status":"passed","checks":[{"check_id":"ci:0","command":"tests","exit_code":0,"output":"ok"}]}}),
+        );
+        let ledger = finding_ledger(&[first, passed]).unwrap();
+        assert_eq!(
+            entry(&ledger, &ci_finding_id(0, "a")).status,
+            Status::Resolved
+        );
     }
 }

@@ -225,3 +225,26 @@ async fn the_project_environment_is_validated() {
         assert!(error.to_string().contains(expected), "{expected}: {error}");
     }
 }
+
+#[tokio::test]
+async fn review_round_routing_progress_setting_is_validated_and_resolved() {
+    let db = fixture().await;
+    for limit in [0, 2, 4] {
+        let settings = json!({"retry_budgets":{"review_progress":limit}});
+        validate_project_settings(&db, &settings, &workflow(), Some(PROJECT), None)
+            .await
+            .unwrap();
+        let config = db::budget::state_config(&json!({}), "review", &settings.to_string());
+        assert_eq!(config["retry_budgets"]["review_progress"], limit);
+    }
+    let error = validate_project_settings(
+        &db,
+        &json!({"retry_budgets":{"review_progress":-1}}),
+        &workflow(),
+        Some(PROJECT),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("retry_budgets.review_progress"));
+}

@@ -93,6 +93,7 @@ const SETTINGS_TABS: Array<{
 interface ProjectFormState {
   name: string
   reviewCiTriage: 'full' | 'report' | 'off'
+  reviewProgress: string
   ciSteps: string[]
   lifecycleHooks: LifecycleHooks
   defaultRoleSelections: Record<string, string>
@@ -106,6 +107,7 @@ const EMPTY_PROJECT_FORM: ProjectFormState = {
   name: '',
   ciSteps: [],
   reviewCiTriage: 'full',
+  reviewProgress: '2',
   lifecycleHooks: {},
   defaultRoleSelections: {},
   automaticRecoveryEnabled: false,
@@ -147,6 +149,7 @@ export function ProjectSettingsPage({
     name,
     ciSteps,
     reviewCiTriage,
+    reviewProgress,
     lifecycleHooks,
     defaultRoleSelections,
     automaticRecoveryEnabled,
@@ -201,8 +204,12 @@ export function ProjectSettingsPage({
       const rawEnvironment = isRecord(project.settings?.environment)
         ? project.settings.environment
         : {}
+      const rawRetryBudgets = isRecord(project.settings?.retry_budgets)
+        ? project.settings.retry_budgets
+        : {}
       updateForm({
         name: project.name,
+        reviewProgress: String(rawRetryBudgets.review_progress ?? 2),
         ciSteps: ciStepsFromReviewConfig(project.default_review_config),
         reviewCiTriage:
           project.settings?.review_ci_triage === 'off'
@@ -231,6 +238,16 @@ export function ProjectSettingsPage({
     const nextName = name.trim()
     if (!nextName) {
       toast.error('Project name is required')
+      return
+    }
+    const progressLimit = Number(reviewProgress)
+    if (
+      !reviewProgress.trim() ||
+      !Number.isInteger(progressLimit) ||
+      progressLimit < 0 ||
+      progressLimit > 2147483647
+    ) {
+      toast.error('Review progress rounds must be a whole number 0 or greater')
       return
     }
     for (const hooks of Object.values(lifecycleHooks)) {
@@ -281,6 +298,10 @@ export function ProjectSettingsPage({
       ...settingsWithoutRolePrompts,
       max_active_tasks: activeLimit,
       review_ci_triage: reviewCiTriage,
+      retry_budgets: {
+        ...(isRecord(project.settings?.retry_budgets) ? project.settings.retry_budgets : {}),
+        review_progress: progressLimit,
+      },
       default_role_assignments: defaultRoleAssignmentsList,
       lifecycle_hooks: lifecycleHooks,
       automatic_recovery: {
@@ -433,6 +454,8 @@ export function ProjectSettingsPage({
               name={name}
               ciSteps={ciSteps}
               reviewCiTriage={reviewCiTriage}
+              reviewProgress={reviewProgress}
+              onReviewProgressChange={(reviewProgress) => updateForm({ reviewProgress })}
               onReviewCiTriageChange={(reviewCiTriage) => updateForm({ reviewCiTriage })}
               defaultRoleSelections={defaultRoleSelections}
               roles={roles}

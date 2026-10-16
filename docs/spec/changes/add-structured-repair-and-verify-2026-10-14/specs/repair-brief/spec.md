@@ -44,7 +44,12 @@ The Task section and the open findings are never dropped. When the brief is
 still over 24 KiB, Forge SHALL next share 4 KiB among the check tails and keep
 2 KiB of the verify section. If it is still over, each finding's summary is cut
 to 200 characters, `where` to 120, and `expected` and `observed` to 300; past a
-line budget the remaining open findings are listed by id only.
+line budget the remaining open findings are listed by id only. Task description
+and plan SHALL each keep at most 4 KiB including a UTF-8-safe truncation note.
+Compacted update lines SHALL share 1 KiB across all steps, including waived
+findings. Check output SHALL share 8 KiB and logs 1 KiB. If even an id-only
+window exceeds the body capacity, the final truncation notice SHALL point to
+the complete finding ledger; the byte cap is unconditional.
 
 #### Scenario: Fifty long findings
 - **WHEN** a review fails with 50 findings whose texts are 1,000 characters each
@@ -54,6 +59,10 @@ line budget the remaining open findings are listed by id only.
 - **WHEN** the reviewer report is 40 KiB and the rest of the brief is 6 KiB
 - **THEN** the brief is at most 24 KiB, contains every open finding in full, and contains at most 2 KiB of the report
 
+#### Scenario: Large Task text and many waived failures
+- **WHEN** the description and plan are each 30 KiB and 40 steps report waived failures
+- **THEN** the brief is at most 24 KiB, clips each Task text to 4 KiB with a truncation note, and limits compacted updates to a shared 1 KiB line allowance
+
 ### Requirement: Merge-time check failures reach the coder with detail
 The merge-fix request SHALL use the repair brief with a `MERGE-CI` entry in
 its open-findings section when checks fail after the rebase in the merge
@@ -62,13 +71,18 @@ send-back metadata, not from the review ledger. A conflict handoff appears
 the same way as `MERGE-CONFLICT`. The `MERGE-CI` entry carries:
 - the target branch;
 - the failing command;
-- its output tail.
+- up to 20 failing test signatures, followed by `+N more`;
+- its UTF-8-safe 2 KiB output end.
 
 The request SHALL NOT tell the coder that manual worktree repair is required.
 
 #### Scenario: Tests fail after rebase
 - **WHEN** a Task's merge attempt rebases onto `main` and `cargo test` fails
 - **THEN** the coder's merge-fix request contains the `MERGE-CI` finding with `cargo test` and its output tail, and no "manual task-worktree repair" text
+
+#### Scenario: Merge-time failures name the tests
+- **WHEN** a merge-time CI step reports more than 20 failing signatures
+- **THEN** the send-back and MERGE-CI brief name 20 signatures, show +N more, and retain a 2 KiB output end
 
 ### Requirement: Progress rounds after the review budget is spent
 A new retry budget kind `review_progress` SHALL exist:

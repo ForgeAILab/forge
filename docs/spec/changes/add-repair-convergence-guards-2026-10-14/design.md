@@ -164,7 +164,7 @@ Non-Goals:
   - `flaky_check` is keyed by the step command and signature, with a count
     and the Tasks that hit it;
   - `base_check_failing` is keyed by Project and step command. A newer red base
-    updates it, and a newer passing base run of that command resolves it.
+    updates it. Only a newer passing queue-head target-tip base run of that command resolves it; review-entry merge-base runs never resolve it.
 
 **D4 — No-change gate.**
 - When a coder repair round ends and the commit about to enter review equals

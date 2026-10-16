@@ -204,6 +204,9 @@ fn default_execution_retry_budget() -> i32 {
 #[ts(export)]
 pub struct RetryBudgets {
     pub review: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_progress: Option<i32>,
     pub merge_fix: Option<i32>,
     pub execution: Option<i32>,
 }
@@ -454,6 +457,7 @@ impl Default for ProjectSettings {
             max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
+                review_progress: Some(2),
                 merge_fix: Some(default_merge_fix_retry_budget()),
                 execution: Some(default_execution_retry_budget()),
             },

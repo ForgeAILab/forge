@@ -1,12 +1,7 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { qk } from '@/api/query-keys'
 import { getApiErrorMessage } from '@/lib/api-error'
-import type {
-  Project,
-  Review,
-  Task,
-  UpdateTaskRequest,
-} from '@/types/generated'
+import type { Project, Review, Task, UpdateTaskRequest } from '@/types/generated'
 import type { TaskMetadata } from '@/types/generated'
 import type { AssigneeSelection } from '@/components/task-controls'
 
@@ -72,7 +67,8 @@ export function getErrorInfo(
   if (typeof annotation.blocking_reason === 'string' && annotation.blocking_reason) return undefined
   const type = typeof annotation.type === 'string' ? annotation.type : undefined
   if (type === 'workspace_reset_required' || type === 'workspace_error') {
-    const message = typeof annotation.message === 'string' ? annotation.message : 'Workspace is unavailable'
+    const message =
+      typeof annotation.message === 'string' ? annotation.message : 'Workspace is unavailable'
     return { tone: 'workspace', message }
   }
   const kind = typeof annotation.kind === 'string' ? annotation.kind : undefined
@@ -113,7 +109,7 @@ export function budgetValue(value: unknown): number | undefined {
 
 export function retryBudgetFromConfig(
   config: Record<string, unknown>,
-  key: 'review' | 'merge_fix' | 'execution',
+  key: 'review' | 'review_progress' | 'merge_fix' | 'execution',
 ): string {
   const budgets = isRecord(config.retry_budgets) ? config.retry_budgets : undefined
   const value = budgetValue(budgets?.[key])
@@ -145,7 +141,8 @@ export function assignmentSelection(
   if (assignment.assignee_type === 'agent' && assignment.assignee_id) {
     return { type: 'agent', agentId: assignment.assignee_id }
   }
-  if (assignment.assignee_type === 'user') return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
+  if (assignment.assignee_type === 'user')
+    return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
   return { type: 'unassigned' }
 }
 

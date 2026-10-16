@@ -43,11 +43,7 @@ import { TaskLaunchDialog } from '@/pages/task-detail/TaskLaunchDialog'
 import { TaskOverviewPanel } from '@/pages/task-detail/TaskOverviewPanel'
 import { TaskTerminalPanel } from '@/components/task-detail/task-terminal-panel'
 import type { ExecutionConfigValue } from '@/components/execution-config/ExecutionConfigBar'
-import type {
-  
-  
-  TaskStatus,
-} from '@/types/generated'
+import type { TaskStatus } from '@/types/generated'
 
 export type TaskDetailTab =
   | 'overview'
@@ -130,7 +126,12 @@ export function TaskDetailPage({
   const workflow = taskDetailQuery.data?.workflow
   const effectiveWorkflow = workflow
   const workflowRetryBudgets = task?.retry_limits
-    ? { review: task.retry_limits.review, merge_fix: task.retry_limits.merge_fix, execution: task.retry_limits.execution }
+    ? {
+        review: task.retry_limits.review,
+        review_progress: task.retry_limits.review_progress,
+        merge_fix: task.retry_limits.merge_fix,
+        execution: task.retry_limits.execution,
+      }
     : undefined
 
   const errorInfo = task ? getErrorInfo(task) : undefined
@@ -173,13 +174,7 @@ export function TaskDetailPage({
         : [])
   ).filter((status) => !hiddenTransitions.includes(status))
 
-
-
   const managedStatusDisabledReason = undefined
-
-
-
-
 
   const terminal =
     task?.status === 'done' ||
@@ -226,14 +221,21 @@ export function TaskDetailPage({
     review: number | undefined,
     mergeFix: number | undefined,
     execution: number | undefined,
+    reviewProgress: number | undefined,
   ) => {
     if (!task) return
     const nextConfig = { ...readTaskStateConfig(task) }
-    if (review === undefined && mergeFix === undefined && execution === undefined) {
+    if (
+      review === undefined &&
+      mergeFix === undefined &&
+      execution === undefined &&
+      reviewProgress === undefined
+    ) {
       delete nextConfig.retry_budgets
     } else {
       nextConfig.retry_budgets = {
         ...(review === undefined ? {} : { review }),
+        ...(reviewProgress === undefined ? {} : { review_progress: reviewProgress }),
         ...(mergeFix === undefined ? {} : { merge_fix: mergeFix }),
         ...(execution === undefined ? {} : { execution }),
       }
@@ -283,11 +285,6 @@ export function TaskDetailPage({
     )
   }
 
-
-
-
-
-
   const onAssigneeChange = (roleName: string, selection: AssigneeSelection) => {
     if (!task || terminal) return
     rolePicker.submit({
@@ -301,7 +298,6 @@ export function TaskDetailPage({
         ),
     })
   }
-
 
   const onDuplicateTask = () => {
     if (!task) return
@@ -323,7 +319,6 @@ export function TaskDetailPage({
       },
     )
   }
-
 
   const onSubmitLaunch = (config: ExecutionConfigValue, summary: string) => {
     if (!task || !config.agentId) return
@@ -430,9 +425,7 @@ export function TaskDetailPage({
               onStatusChange={onStatusChange}
               onAssigneeChange={onAssigneeChange}
               onDuplicateTask={onDuplicateTask}
-              onOpenLaunchDialog={
-                runsHeldForSubtasks ? undefined : () => setLaunchDialogOpen(true)
-              }
+              onOpenLaunchDialog={runsHeldForSubtasks ? undefined : () => setLaunchDialogOpen(true)}
               onSaveRetryBudgets={onSaveRetryBudgets}
             />
           )}

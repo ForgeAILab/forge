@@ -1427,74 +1427,26 @@ impl HookAction for AutoCascadeOnReviewPass {
                     }
                     return HookResult::Ok;
                 }
-                let budget = match db::budget::limit(
-                    &task,
-                    db::budget::Kind::Review,
-                    Some(&ctx.state_config),
-                    ctx.gate_config.as_ref(),
-                ) {
-                    Ok(budget) => budget,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
-                let existing_count = match db::budget::spent(
-                    ctx.db.pool(),
-                    &ctx.task_id,
-                    db::budget::Kind::Review.key(),
-                )
-                .await
-                {
-                    Ok(n) => n,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        }
-                    }
-                };
-                if !db::budget::allows_retry(i64::from(budget), existing_count) {
-                    let reason = "review retry budget exhausted";
-                    if let Err(error) = block_task(
-                        ctx,
+                // One disposition path, with the hook's merged configuration:
+                // D5, progress receipts and lead-root replans cannot drift.
+                match ctx
+                    .task_service
+                    .review_failure_target_with_config(
                         &task,
-                        reason,
-                        api_types::FailureKind::ReviewGateFailed,
-                        None,
+                        ctx.execution_id.as_deref(),
+                        Some(&ctx.state_config),
                     )
                     .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    if let Err(error) = ctx
-                        .task_service
-                        .publish_review_park_comment(&review, reason)
-                        .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    HookResult::Ok
-                } else {
-                    if let Err(error) = ctx
-                        .task_service
-                        .publish_review_repair_comment(&review, existing_count, budget)
-                        .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    HookResult::Cascade {
-                        to: default_states::IN_PROGRESS.to_string(),
-                        reason: "review failed".to_string(),
-
+                {
+                    Ok((_, Some(to), reason)) => HookResult::Cascade {
+                        to,
+                        reason,
                         bridge: Default::default(),
-                    }
+                    },
+                    Ok((_, None, _)) => HookResult::Ok,
+                    Err(error) => HookResult::Failed {
+                        reason: error.to_string(),
+                    },
                 }
             }
             Some(_) | None => HookResult::Ok,

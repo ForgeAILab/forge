@@ -150,7 +150,21 @@ pub async fn load_agent_dispatch_context(
         None => latest_terminal_execution_for_role(&db, task_id, role).await?,
     };
     let previous_coder_summary = previous_coder.and_then(|execution| execution.summary);
-    let (budget_kind, gate_state) = repair_budget_source(workflow, state_name, &transition_log);
+    let (mut budget_kind, gate_state) = repair_budget_source(workflow, state_name, &transition_log);
+    if budget_kind == db::budget::Kind::Review {
+        if let Some(review) = review_window.last() {
+            if db::budget::receipt_recorded(
+                db.pool(),
+                task_id,
+                db::budget::Kind::ReviewProgress.key(),
+                &format!("progress:{}", review.id),
+            )
+            .await?
+            {
+                budget_kind = db::budget::Kind::ReviewProgress;
+            }
+        }
+    }
     let budget_config = gate_state.map(|state| {
         crate::workflow::engine::effective_state_config(
             state,

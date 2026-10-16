@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-16T01:23:30Z
+updated_at: 2026-10-16T12:52:34Z
 completed_at:
 ---
 
@@ -45,7 +45,7 @@ suite.
   - sections in the D7 order;
   - a 24 KiB budget with the D7 drop order;
   - sources from the ledger, Review `ci_steps` (all failing steps), `details.verify`, and the previous coder completion summary.
-  - The cap is hard (owner decision 10/16): after the D7 drops, check tails share 4 KiB and verify keeps 2 KiB; then finding text is clipped (summary 200, where 120, expected/observed 300 characters) and, past a line budget, the remaining open findings are listed by id. Only an oversized Task description or plan can still exceed it (logged).
+  - The cap is hard (owner decision 10/16): after the D7 drops, check tails share 4 KiB and verify keeps 2 KiB; then finding text is clipped (summary 200, where 120, expected/observed 300 characters) and, past a line budget, the remaining open findings are listed by id. Task description and plan each keep 4 KiB; compacted updates share 1 KiB across steps, and the cap includes the final truncation notice.
 - [x] 3.2 `review_fix_user`, the CI path, the autonomous worker builder (`BUILDER_ID_WORKER_REVIEW_FIX_V1`) and `render_automatic_review_recovery_prompt` use the brief. The CI path regains the Task description and plan.
 - [x] 3.3 `merge_fix_user` handles merge-time `CiFailed` from `integration_steps/send_back.rs`: a `MERGE-CI` finding with the target, command and tail. The conflict handoff uses a `MERGE-CONFLICT` finding. Dirty-worktree text is unchanged.
 - [x] 3.4 Focused tests in `workflow/dispatch/tests.rs`:
@@ -56,15 +56,24 @@ suite.
   - new: a merge-time `CiFailed` brief carries the command and tail.
 
 ## 4. Round policy
-- [ ] 4.1 `Kind::ReviewProgress` (key `review_progress`, default 2, Review window) and `Kind::ReviewVerifyRerun` (volatile, limit 1) in `crates/db/src/budget.rs`. Add a numbered migration only if `task_budget.kind` is constrained.
-- [ ] 4.2 Apply the D5 rules in `review_failure_target` and the hook-path duplicate in `workflow/actions/review.rs`:
+
+Prerequisites accepted for this phase:
+
+- [x] A1 Resolve omitted CI signatures only after a real step pass; red fail-fast runs leave omitted findings and their streaks unchanged.
+- [x] A2 Expose replaced step-level CI findings as `superseded`, including API, generated TS, web label and release notes.
+- [x] A3 Enforce the brief's 24 KiB cap with bounded Task text and a shared compacted update allowance across waived findings.
+- [x] A4 Carry 20 test signatures (`+N more`) and a 2 KiB output end through merge settlement, queue-worker storage, send-back and the repair brief.
+- [x] A5 Resolve base Attention only from newer queue-head target-tip passing observations, never review-entry merge-base passes.
+
+- [x] 4.1 `Kind::ReviewProgress` (key `review_progress`, default 2, Review window) and `Kind::ReviewVerifyRerun` (volatile, limit 1) in `crates/db/src/budget.rs`. Add a numbered migration only if `task_budget.kind` is constrained.
+- [x] 4.2 Apply the D5 rules in `review_failure_target` and the hook path in `workflow/actions/review.rs` (delegating to the shared disposition with its merged config):
   - derived repeat (reviewer `F*` findings only) parks with `ReviewNeedsOwner` and the message `repeated finding: <id> <summary>`;
   - the progress round charges `review_progress`;
   - derived rules turn off for a window with a findings-less fail;
   - lead roots keep `charge_replan`.
-- [ ] 4.3 Change `owner_review_failure_message` so it ignores the self-reported `repeat` while the derived rules are on. Owner-fixable routing is unchanged.
-- [ ] 4.4 `retry_budgets.review_progress` is accepted by the Task/Project editors, `api-types`, TS and `docs/api.md`. Add the `remaining` projection on the Task response.
-- [ ] 4.5 Focused tests:
+- [x] 4.3 Change `owner_review_failure_message` so it ignores the self-reported `repeat` while the derived rules are on. Owner-fixable routing is unchanged.
+- [x] 4.4 `retry_budgets.review_progress` is accepted by the Task/Project editors, `api-types`, TS and `docs/api.md`. Add the `remaining` projection on the Task response.
+- [x] 4.5 Focused tests:
   - keep the five `review_finding_routing_*` tests in `task_service/tests/service_tests/cases/executions.rs` green;
   - new: progress round granted, no progress parks exhausted, carried with progress gets one more round, third appearance parks, repeat without progress parks, a repeated `CI-*` failure never parks as `review_needs_owner`, `review_progress = 0` disables;
   - `system_review_ci_failure_routes_to_coder_and_spends_review_budget` and `dispatcher_failed_review_composes_finding_routing_with_ci_budget` stay green;

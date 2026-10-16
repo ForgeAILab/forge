@@ -281,6 +281,7 @@ pub(crate) async fn triage(
         &entries,
         base_result.as_ref(),
         setup_count,
+        target_tip.is_some(),
     )
     .await?;
     Ok(Progress::Complete(entries))

@@ -25,6 +25,8 @@ interface GeneralTabProps {
   pausePending: boolean
   name: string
   reviewCiTriage: 'full' | 'report' | 'off'
+  reviewProgress: string
+  onReviewProgressChange: (value: string) => void
   onReviewCiTriageChange: (value: 'full' | 'report' | 'off') => void
   ciSteps: string[]
   defaultRoleSelections: Record<string, string>
@@ -59,6 +61,8 @@ export function GeneralTab({
   name,
   ciSteps,
   reviewCiTriage,
+  reviewProgress,
+  onReviewProgressChange,
   onReviewCiTriageChange,
   defaultRoleSelections,
   roles,
@@ -264,6 +268,20 @@ export function GeneralTab({
               )}
             </SettingsSection>
           )}
+          <SettingsSection
+            title="Review progress rounds"
+            description="Extra repair rounds after the review allowance is spent, while open blocking findings decrease. 0 disables them."
+          >
+            <Label htmlFor="project-review-progress-budget">Progress round allowance</Label>
+            <Input
+              id="project-review-progress-budget"
+              type="number"
+              min={0}
+              step={1}
+              value={reviewProgress}
+              onChange={(e) => onReviewProgressChange(e.target.value)}
+            />
+          </SettingsSection>
           <SettingsSection
             title="Automatic recovery agent"
             description="Before an exhausted review retry window blocks a task, dispatch one configured agent as a final recovery attempt."

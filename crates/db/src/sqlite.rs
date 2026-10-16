@@ -662,7 +662,7 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
     })
 }
 
-fn map_review(row: SqliteRow) -> Result<Review> {
+pub(crate) fn map_review(row: SqliteRow) -> Result<Review> {
     Ok(Review {
         id: row.get("id"),
         task_id: row.get("task_id"),

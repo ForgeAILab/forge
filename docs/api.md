@@ -6170,7 +6170,7 @@ detail keys or malformed metadata still produce a server corruption error.
 Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `summary`, `where`, `expected`, `observed`, `first_attempt`,
 `last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`, `flaky`,
-`pre_existing`), `streak`, and optional `ci_triage` (the CI failure class of a
+`pre_existing`, `superseded`), `streak`, and optional `ci_triage` (the CI failure class of a
 triaged CI finding). `flaky` and `pre_existing` are CI findings that
 `review_ci_triage: full` waived: minor, with zero streak. Under `report` the same
 classes stay `open` and blocking, with `ci_triage` set. Nullable text fields are
@@ -6183,17 +6183,21 @@ zero-based `CI-<step index>#<first 8 hex of sha256(normalised failure signature)
 for steps with test signatures, `CI-<step index>` for failed steps without
 signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
 same test keeps its id across review rounds and server/daemon owners. A
-complete signature list resolves tests that stop failing; missing/truncated
-signatures do not resolve omitted tests, while a passing step resolves all its
-findings. The ledger retains all signatures; briefs and comments display at
+passing step resolves its per-test findings. An untruncated failure list
+only proves that every observed signature fit in the extraction cap; it cannot
+prove that a fail-fast command executed later binaries. Therefore a failed step
+never resolves an omitted test or advances that test's streak. A step-level
+`CI-<n>` replaced by per-test findings is `superseded`; it does not count as a
+resolution, remains superseded on later passes, and is labelled accordingly in
+the web ledger. The ledger retains all signatures; briefs and comments display at
 most 20 test findings per step followed by `+N more`.
 `source: merge` is reserved in the wire type and is not emitted in the ledger.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
 an explicit resolution or passing Forge check resolves it. Reopening a resolved
 or unconfirmed finding starts its streak at one. A reset empties the ledger
-and restarts reviewer numbering. Findings are informational in this phase;
-existing verdict routing and retry budgets remain authoritative.
+and restarts reviewer numbering. Open blocking findings drive the repeat and
+progress policy below; the frozen verdict is unchanged.
 
 Finished review comments show the headline, the ledger as a Markdown checklist
 (open unchecked, resolved in this review checked, unconfirmed labelled
@@ -6664,6 +6668,36 @@ values. Execution failure retries survive status
 changes until an explicit budget reset. Other kinds retain their natural
 contract/completion/interruption/exhaustion windows; reset additionally restores
 all persisted kinds. There is no lifetime execution maximum.
+
+`retry_budgets.review_progress` is an optional nonnegative integer on Task
+state config and Project settings (default 2, `0` disables). Task-wide values
+win, then the supplied Review state config; Project settings supply its default.
+It never inherits gate `max_rejections`. `remaining_retries.review_progress`
+and `retry_limits.review_progress` appear on Task detail/list responses and use
+the Review window and state even while the Task is in a repair state.
+A progress round uses an idempotent `progress:<review id>` receipt. Owner actions
+never spend it. `review_verify_rerun` is invocation-scoped (limit 1) and is never
+persisted or projected as Task spending; verify execution is a later phase.
+
+After a coder-fixable failed Review, a reviewer finding open on its third
+source check parks with `review_needs_owner`, message
+`repeated finding: <id> <summary>`. A second appearance parks only when the
+number of open blocking findings did not decrease. Forge-owned findings count
+for progress but never cause repeat parks. Normal Review allowance is used
+first; when it has no retry left, a smaller open blocking count can spend one
+`review_progress` round. Otherwise normal exhaustion/recovery applies. Triage
+waivers never count. Any reviewer fail with no blocking finding disables these
+derived rules for the rest of the window and retains legacy self-reported
+repeat behavior. With derived rules on, `repeat` is ignored. Owner-fixable and
+blocked results still park first; coordination roots with a lead keep replan
+routing. Repair targets come from the workflow (`working` for autonomous).
+
+Repair briefs have a hard 24 KiB byte cap, including truncation notes. Task
+description and plan each keep at most 4 KiB; compacted finding updates share
+1 KiB across all steps. Merge-CI send-backs include up to 20 failing test
+signatures, `+N more`, and a UTF-8-safe 2 KiB output end. Review-entry base
+observations may open/update `base_check_failing`; only newer queue-head
+target-tip passes resolve it.
 
 
 #### Owner check protocol (revision 5)

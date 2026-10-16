@@ -164,7 +164,7 @@ describe('Project flow control settings', () => {
             version: 7,
             settings: expect.objectContaining({
               max_active_tasks: Number(value),
-              retry_budgets: project.settings.retry_budgets,
+              retry_budgets: { review: 3, review_progress: 2 },
               environment: project.settings.environment,
               command_allowlist: project.settings.command_allowlist,
             }),
@@ -283,4 +283,23 @@ describe('Project flow control settings', () => {
     )
     expect(screen.getByRole('alert').textContent).toContain('Project settings were changed')
   })
+})
+
+it.each(['0', '4'])('saves the Project progress round allowance %s', async (value) => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((screen.getByLabelText('Progress round allowance') as HTMLInputElement).value).toBe('2'),
+  )
+  fireEvent.change(screen.getByLabelText('Progress round allowance'), { target: { value } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate).toHaveBeenCalledWith(
+    expect.objectContaining({
+      body: expect.objectContaining({
+        settings: expect.objectContaining({
+          retry_budgets: { review: 3, review_progress: Number(value) },
+        }),
+      }),
+    }),
+    expect.any(Object),
+  )
 })

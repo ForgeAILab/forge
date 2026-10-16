@@ -1579,7 +1579,7 @@ fn merge_time_ci_failed_brief_carries_target_command_and_tail() {
             assert!(text.contains(expected), "{text}");
         }
         assert!(!text.contains("manual task-worktree repair"));
-        assert!(review::finding_ledger(&ctx.prior_reviews)
+        assert!(db::review_findings::finding_ledger(&ctx.prior_reviews)
             .unwrap()
             .is_empty());
     }
@@ -1637,12 +1637,13 @@ fn repair_brief_limits_ci_findings_across_open_and_resolved_sections() {
         ] {
             let text = resolve_prompt_builder(builder).build(&ctx).user;
             assert_eq!(text.matches("\n- CI-0#").count(), 20, "{text}");
-            assert!(text.contains("Resolved and unconfirmed since the last round:"));
             if passed {
+                assert!(text.contains("Resolved and unconfirmed since the last round:"));
                 assert!(text.contains("CI-0: +8 more"), "{text}");
             } else {
-                assert!(text.contains("CI-0: +6 more"), "{text}");
-                assert!(text.contains("CI-0: +2 more"), "{text}");
+                // A red fail-fast run cannot resolve the two omitted tests.
+                assert!(!text.contains("Resolved and unconfirmed since the last round:"));
+                assert!(text.contains("CI-0: +8 more"), "{text}");
             }
         }
     }
@@ -1856,7 +1857,7 @@ fn repair_brief_ci_triage_mode_controls_blocking_findings_and_labels_noise() {
             }}]}).to_string(),
             ..fake_review(1, db::ReviewStatus::Failed)
         }];
-        let ledger = review::finding_ledger(&ctx.prior_reviews).unwrap();
+        let ledger = db::review_findings::finding_ledger(&ctx.prior_reviews).unwrap();
         assert_eq!(
             ledger
                 .iter()
@@ -1961,5 +1962,29 @@ fn repair_brief_blocking_check_output_precedes_waived_ci_output() {
         // Waived flaky output must not use up the shared tail allowance
         // before the one failure this round has to repair.
         assert!(text.contains("BLOCKING-END"), "{text}");
+    }
+}
+
+#[test]
+fn repair_brief_hard_cap_with_long_task_and_forty_waived_steps() {
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.task.description = Some("界".repeat(10 * 1024));
+    ctx.plan = Some("計".repeat(10 * 1024));
+    let steps: Vec<_> = (0..40).map(|index| json!({"index":index,"command":format!("step-{index}"),"exit_code":1,
+        "stderr_tail":"tail".repeat(1024),"failures":[format!("failure-{index} {}", "x".repeat(280))],
+        "triage":{"mode":"full","base_status":"available","blocking":false,"class":"flaky","failures":[]}})).collect();
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"ci_steps":steps}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        assert!(text.len() <= 24 * 1024, "{}", text.len());
+        assert!(text.contains("Description:") && text.contains("Original plan:"));
+        assert!(text.contains("truncated"));
+        assert!(text.contains("flaky (non-blocking)"));
     }
 }

@@ -10,6 +10,9 @@ use std::collections::HashMap;
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Review,
+    ReviewProgress,
+    /// One inconclusive verify rerun per evaluation; never persisted.
+    ReviewVerifyRerun,
     /// One reminder per Review window when a coder returns the same clean HEAD.
     RepairNoChange,
     GateRejection,
@@ -33,8 +36,9 @@ pub enum Kind {
     Replan,
 }
 impl Kind {
-    pub const PERSISTED: [Self; 10] = [
+    pub const PERSISTED: [Self; 11] = [
         Self::Review,
+        Self::ReviewProgress,
         Self::RepairNoChange,
         Self::MergeFix,
         Self::Execution,
@@ -48,6 +52,8 @@ impl Kind {
     pub fn key(self) -> &'static str {
         match self {
             Self::Review => "review",
+            Self::ReviewProgress => "review_progress",
+            Self::ReviewVerifyRerun => "review_verify_rerun",
             Self::RepairNoChange => "repair_no_change",
             Self::GateRejection => "gate",
             Self::MergeFix => "merge_fix",
@@ -66,19 +72,25 @@ impl Kind {
     pub const fn default_limit(self) -> i32 {
         match self {
             Self::Review | Self::Execution | Self::WorkflowGuard => 3,
-            Self::MergeFix | Self::AutomaticReviewRecovery | Self::RepairNoChange => 1,
+            Self::MergeFix
+            | Self::AutomaticReviewRecovery
+            | Self::RepairNoChange
+            | Self::ReviewVerifyRerun => 1,
             Self::GateRejection => i32::MAX,
             Self::TargetMovedRebase
             | Self::ConflictHandoff
             | Self::ReviewCarry
             | Self::ReviewCiInfrastructure
             | Self::Replan => 5,
-            Self::ReportCorrection | Self::ReviewCheckRerun => 2,
+            Self::ReportCorrection | Self::ReviewCheckRerun | Self::ReviewProgress => 2,
         }
     }
     /// Per-invocation counters live in memory and never reach the ledger.
     pub const fn is_volatile(self) -> bool {
-        matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
+        matches!(
+            self,
+            Self::ReportCorrection | Self::ReviewCheckRerun | Self::ReviewVerifyRerun
+        )
     }
 }
 /// Reserved checkpoint before configurable review-entry hooks. Negative keeps
@@ -276,7 +288,12 @@ pub fn limit(
 ) -> Result<i32> {
     if !matches!(
         kind,
-        Kind::Review | Kind::MergeFix | Kind::Execution | Kind::WorkflowGuard | Kind::GateRejection
+        Kind::Review
+            | Kind::ReviewProgress
+            | Kind::MergeFix
+            | Kind::Execution
+            | Kind::WorkflowGuard
+            | Kind::GateRejection
     ) {
         return Ok(kind.default_limit());
     }
@@ -468,7 +485,14 @@ pub async fn charge(
     limit: i64,
     step: &str,
 ) -> Result<Charge> {
-    if key == Kind::ReportCorrection.key() || key == Kind::ReviewCheckRerun.key() {
+    if [
+        Kind::ReportCorrection,
+        Kind::ReviewCheckRerun,
+        Kind::ReviewVerifyRerun,
+    ]
+    .iter()
+    .any(|kind| kind.key() == key)
+    {
         return Err(DbError::Check(format!("{key} is invocation-scoped")));
     }
     sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,?,COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='execution'),'initial'),0) ON CONFLICT DO NOTHING")
@@ -620,7 +644,9 @@ pub fn projection(
         .into_iter()
         .filter(|k| !matches!(k, Kind::Review))
     {
-        let scoped = if kind == Kind::MergeFix {
+        let scoped = if kind == Kind::ReviewProgress {
+            workflow.states.iter().find(|s| s.name == "review")
+        } else if kind == Kind::MergeFix {
             workflow.states.iter().find(|s| s.name == "merging")
         } else {
             current
@@ -696,20 +722,19 @@ pub async fn review_verdict(
         if conformance.status == api_types::ConformanceStatus::Blocked {
             return Ok(());
         }
-        let previous_rows=sqlx::query("SELECT id,attempt_number,status,step_results_json FROM review WHERE task_id=? AND attempt_number<? ORDER BY attempt_number DESC,id DESC LIMIT 1").bind(&task.id).bind(review.attempt_number).fetch_all(&mut **tx).await?;
-        let mut previous_reviews = Vec::new();
-        for row in previous_rows {
-            let mut previous = review.clone();
-            previous.id = row.try_get("id")?;
-            previous.attempt_number = row.try_get("attempt_number")?;
-            previous.status = row
-                .try_get::<String, _>("status")?
-                .parse()
-                .map_err(|e| DbError::Check(format!("invalid review status: {e}")))?;
-            previous.step_results_json = row.try_get("step_results_json")?;
-            previous_reviews.push(previous);
-        }
-        if owner_review_failure_message(&conformance, review, &previous_reviews).is_some() {
+        let window_reviews = reviews_in_window_in_tx(tx, &task.id).await?;
+        let previous_reviews = sqlx::query("SELECT * FROM review WHERE task_id=? AND attempt_number<? ORDER BY attempt_number DESC,id DESC LIMIT 1")
+            .bind(&task.id).bind(review.attempt_number).fetch_all(&mut **tx).await?
+            .into_iter().map(crate::sqlite::map_review).collect::<Result<Vec<_>>>()?;
+        if owner_review_failure_message(
+            &conformance,
+            review,
+            &previous_reviews,
+            &window_reviews,
+            !coordination_root_in_tx(tx, task).await?,
+        )
+        .is_some()
+        {
             return Ok(());
         }
     }
@@ -856,6 +881,18 @@ pub fn state_config(config: &Value, state: &str, settings: &str) -> Value {
                 object.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
+        if let Some(value) = settings
+            .pointer("/retry_budgets/review_progress")
+            .filter(|_| config.pointer("/retry_budgets/review_progress").is_none())
+        {
+            if !config.is_object() {
+                config = serde_json::json!({});
+            }
+            if !config.get("retry_budgets").is_some_and(Value::is_object) {
+                config["retry_budgets"] = serde_json::json!({});
+            }
+            config["retry_budgets"]["review_progress"] = value.clone();
+        }
     }
     config
 }
@@ -939,6 +976,8 @@ pub fn owner_review_failure_message(
     conformance: &api_types::ReviewConformance,
     review: &Review,
     reviews: &[Review],
+    window_reviews: &[Review],
+    derived_rules: bool,
 ) -> Option<String> {
     let assessment = conformance.assessment.as_ref()?;
     if conformance.status != api_types::ConformanceStatus::Failed
@@ -955,6 +994,20 @@ pub fn owner_review_failure_message(
     };
     if assessment.fixable_by == api_types::FixableBy::Owner {
         return Some(format!("fixable by owner: {reason}"));
+    }
+    if derived_rules {
+        let mut projected = review.clone();
+        let mut details: Value = serde_json::from_str(&review.step_results_json).ok()?;
+        if !details.is_object() {
+            details = serde_json::json!({});
+        }
+        details["conformance"] = serde_json::to_value(conformance).ok()?;
+        projected.step_results_json = details.to_string();
+        if let Ok(policy) = crate::review_findings::round_policy(window_reviews, &projected) {
+            if policy.derived {
+                return policy.repeat;
+            }
+        }
     }
     let previous_failed = reviews
         .iter()
@@ -981,6 +1034,75 @@ pub fn owner_review_failure_message(
                     })
         });
     (assessment.repeat && previous_failed).then(|| format!("repeated finding: {reason}"))
+}
+
+/// Read the accounting window inside an already fenced verdict transaction.
+async fn reviews_in_window_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    task: &str,
+) -> Result<Vec<Review>> {
+    let rows = sqlx::query(
+        "SELECT r.* FROM review r JOIN task t ON t.id=r.task_id
+        LEFT JOIN task_budget b ON b.task_id=t.id AND b.kind='review'
+        LEFT JOIN transition_log l ON l.id=b.window_id AND l.task_id=t.id
+        WHERE r.task_id=? AND r.created_at>=COALESCE(l.created_at,t.created_at)
+        ORDER BY r.attempt_number,r.id",
+    )
+    .bind(task)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(crate::sqlite::map_review).collect()
+}
+
+// Native coordination leads are planners. Their aggregate reviews retain the
+// existing replan policy; no finding-based park or progress debit applies.
+async fn coordination_root_in_tx(tx: &mut Transaction<'_, Sqlite>, task: &Task) -> Result<bool> {
+    if task.parent_task_id.is_some() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_role_assignment a
+        WHERE a.task_id=? AND a.role_name='planner' AND a.assignee_type='agent' AND a.assignee_id IS NOT NULL
+        AND EXISTS(SELECT 1 FROM task child WHERE child.parent_task_id=a.task_id AND child.deleted_at IS NULL))")
+        .bind(&task.id).fetch_one(&mut **tx).await?)
+}
+
+/// Admit one progress round atomically under Task authority. A replay keeps its
+/// earlier grant even after spending the last allowance. Owner reruns are free.
+pub async fn grant_review_progress(
+    db: &SqliteDb,
+    task: &Task,
+    review: &Review,
+    limit: i64,
+) -> Result<bool> {
+    let mut tx = crate::begin_immediate(db.pool()).await?;
+    db.fence_task_lease_in_tx(&mut tx, &task.id, "review progress round")
+        .await?;
+    let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task t WHERE t.id=? AND t.version=? AND t.status=? AND t.deleted_at IS NULL AND ?=(SELECT r.id FROM review r WHERE r.task_id=t.id ORDER BY r.attempt_number DESC,r.id DESC LIMIT 1))")
+        .bind(&task.id).bind(task.version).bind(&task.status).bind(&review.id).fetch_one(&mut *tx).await?;
+    if !valid {
+        return Err(DbError::VersionConflict);
+    }
+    if owner_requested_review_entry(&mut tx, &task.id, None, Some(&review.created_at)).await? {
+        return Ok(true);
+    }
+    let window: String = sqlx::query_scalar("SELECT COALESCE((SELECT window_id FROM task_budget WHERE task_id=? AND kind='review'),'initial')")
+        .bind(&task.id).fetch_one(&mut *tx).await?;
+    reset(&mut tx, &task.id, Kind::ReviewProgress.key(), &window).await?;
+    let receipt = format!("progress:{}", review.id);
+    let paid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_budget_charge WHERE task_id=? AND kind=? AND window_id=? AND step_id=?)")
+        .bind(&task.id).bind(Kind::ReviewProgress.key()).bind(&window).bind(&receipt).fetch_one(&mut *tx).await?;
+    let granted = paid
+        || charge(
+            &mut tx,
+            &task.id,
+            Kind::ReviewProgress.key(),
+            limit,
+            &receipt,
+        )
+        .await?
+        .charged;
+    tx.commit().await?;
+    Ok(granted)
 }
 
 /// A failed review-entry hook with no failed Review consumes one Review
@@ -1728,5 +1850,67 @@ mod tests {
         assert!(invocation.consume());
         assert!(!invocation.consume());
         assert_eq!(Invocation::new(Kind::ReportCorrection).remaining(), 2);
+    }
+    #[tokio::test]
+    async fn budget_review_progress_resolves_and_projects_in_review_window_and_verify_is_volatile()
+    {
+        let (db, mut task) = fixture().await;
+        let workflow = WorkflowDefinition { states: vec![api_types::StateDefinition {
+            name:"review".into(), kind:api_types::StateKind::Gate, config:json!({"retry_budgets":{"review_progress":4}}),
+            ..serde_json::from_value(json!({"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{}})).unwrap()
+        }], ..Default::default() };
+        let merged = state_config(&json!({}), "review", &json!({"retry_budgets":{"review_progress":2},"default_review_config":{"retry_budgets":{"review":7}}}).to_string());
+        assert_eq!(merged["retry_budgets"]["review"], 7);
+        assert_eq!(merged["retry_budgets"]["review_progress"], 2);
+        let gate: GateConfig = serde_json::from_value(json!({"max_rejections":99})).unwrap();
+        assert_eq!(
+            limit(&task, Kind::ReviewProgress, None, Some(&gate)).unwrap(),
+            2
+        );
+        assert_eq!(
+            limit(
+                &task,
+                Kind::ReviewProgress,
+                Some(&workflow.states[0].config),
+                Some(&gate)
+            )
+            .unwrap(),
+            4
+        );
+        task.task_state_config = Some(json!({"retry_budgets":{"review_progress":0}}).to_string());
+        assert_eq!(
+            limit(
+                &task,
+                Kind::ReviewProgress,
+                Some(&workflow.states[0].config),
+                None
+            )
+            .unwrap(),
+            0
+        );
+        task.task_state_config = None;
+        let projection = projection(
+            &task,
+            &workflow,
+            &HashMap::from([("review_progress".into(), 1)]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(projection.get("review_progress"), Some(&3));
+        assert!(Kind::ReviewVerifyRerun.is_volatile());
+        assert!(!Kind::PERSISTED.contains(&Kind::ReviewVerifyRerun));
+        let mut rerun = Invocation::new(Kind::ReviewVerifyRerun);
+        assert!(rerun.consume());
+        assert!(!rerun.consume());
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        assert!(charge(
+            &mut tx,
+            &task.id,
+            Kind::ReviewVerifyRerun.key(),
+            1,
+            "verify"
+        )
+        .await
+        .is_err());
     }
 }

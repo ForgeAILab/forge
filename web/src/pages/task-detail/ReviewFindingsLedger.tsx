@@ -85,7 +85,9 @@ export function ReviewFindingsLedger({ taskId }: { taskId: string }) {
                   <td className="p-2 align-top">{entry.source}</td>
                   <td className="p-2 align-top">{entry.severity}</td>
                   <td className="p-2 align-top">
-                    <Badge variant="outline">{entry.status}</Badge>
+                    <Badge variant="outline">
+                      {entry.status === 'superseded' ? 'superseded by test findings' : entry.status}
+                    </Badge>
                   </td>
                   <td className="p-2 align-top">{entry.streak}</td>
                   <td className="min-w-48 p-2 align-top">

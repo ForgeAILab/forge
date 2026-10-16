@@ -251,6 +251,8 @@ pub enum ReviewFindingStatus {
     Open,
     Resolved,
     Unconfirmed,
+    /// A step-level CI finding replaced by per-test findings.
+    Superseded,
     Flaky,
     PreExisting,
 }

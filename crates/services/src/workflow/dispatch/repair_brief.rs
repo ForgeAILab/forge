@@ -60,7 +60,7 @@ impl RepairBrief {
         let details = latest
             .and_then(|review| serde_json::from_str::<Value>(&review.step_results_json).ok())
             .unwrap_or_default();
-        let ledger = review::finding_ledger(reviews).unwrap_or_else(|error| {
+        let ledger = db::review_findings::finding_ledger(reviews).unwrap_or_else(|error| {
             tracing::warn!(task_id = %ctx.task.id, %error, "repair brief has no readable finding ledger");
             Vec::new()
         });
@@ -69,13 +69,19 @@ impl RepairBrief {
             .filter(|review| review.attempt_number < attempt)
             .cloned()
             .collect();
-        let previous_ledger = review::finding_ledger(&prior).unwrap_or_default();
-        let mut task = format!("Task: {}", ctx.task.title);
+        let previous_ledger = db::review_findings::finding_ledger(&prior).unwrap_or_default();
+        let mut task = format!("Task: {}", bounded_text(&ctx.task.title, 1024));
         if let Some(description) = ctx.task.description.as_deref() {
-            task.push_str(&format!("\n\nDescription:\n{description}"));
+            task.push_str(&format!(
+                "\n\nDescription:\n{}",
+                bounded_text(description, 4 * 1024)
+            ));
         }
         if let Some(plan) = ctx.plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
-            task.push_str(&format!("\n\nOriginal plan:\n{plan}"));
+            task.push_str(&format!(
+                "\n\nOriginal plan:\n{}",
+                bounded_text(plan, 4 * 1024)
+            ));
         }
         let mut checks = Vec::new();
         let mut waived = Vec::new();
@@ -117,12 +123,12 @@ impl RepairBrief {
                         .iter()
                         .filter(|signature| {
                             ledger.iter().any(|entry| {
-                                entry.id == review::findings::ci_finding_id(index, signature)
+                                entry.id == db::review_findings::ci_finding_id(index, signature)
                                     && entry.status == Status::Open
                             })
                         })
                         .take(20)
-                        .map(|signature| review::findings::ci_finding_id(index, signature)),
+                        .map(|signature| db::review_findings::ci_finding_id(index, signature)),
                 );
             }
             // Waived output goes last: the shared tail allowance is spent on
@@ -246,7 +252,7 @@ impl RepairBrief {
             task, round,
             open: ledger.iter().filter(|entry| entry.status == Status::Open).cloned().collect(),
             updates: ledger.iter().filter(|entry| entry.status != Status::Open && entry.last_checked_attempt == attempt
-                && !review::findings::superseded_by_tests(entry, &ledger)
+                && entry.status != Status::Superseded
                 && (matches!(entry.status, Status::Flaky | Status::PreExisting)
                     || !previous_ledger.iter().any(|prior| prior.id == entry.id && prior.status == entry.status))).cloned().collect(),
             checks, verify: render_verify(&details["verify"]), report,
@@ -396,15 +402,10 @@ impl RepairBrief {
         }
         limits.detailed = low;
         let body = self.render_sections(&limits);
-        if body.len() > BRIEF_BYTES {
-            // Only the Task's own description and plan remain uncut.
-            tracing::warn!(
-                bytes = body.len(),
-                budget = BRIEF_BYTES,
-                "repair brief exceeds budget after every permitted reduction"
-            );
-        }
-        body
+        // An arbitrarily large window can contain more ids than the entire
+        // transport budget. Keep the complete ledger authoritative and name the
+        // truncation explicitly even in this final, ids-only case.
+        bounded_text(&body, BRIEF_BYTES)
     }
 
     fn open_findings(&self, compact: bool, detailed: usize) -> (String, BTreeMap<&str, usize>) {
@@ -491,6 +492,8 @@ impl RepairBrief {
         );
         let mut updates = String::new();
         let mut omitted_updates = BTreeMap::<&str, usize>::new();
+        let mut updates_bytes = 0;
+        let mut updates_omitted = 0;
         for entry in &self.updates {
             if entry.source == Source::Ci && entry.id.contains('#') {
                 let step = entry.id.split('#').next().unwrap_or(&entry.id);
@@ -507,7 +510,7 @@ impl RepairBrief {
                 Status::PreExisting => "pre_existing (non-blocking)",
                 _ => "not re-checked",
             };
-            updates.push_str(&format!(
+            let line = format!(
                 "- {}: {status}{}\n",
                 clip(&entry.id, 120, limits.compact),
                 if limits.ids_only {
@@ -515,11 +518,27 @@ impl RepairBrief {
                 } else {
                     format!(" — {}", entry.summary)
                 }
+            );
+            if limits.compact && updates_bytes + line.len() > 1024 {
+                updates_omitted += 1;
+            } else {
+                updates_bytes += line.len();
+                updates.push_str(&line);
+            }
+        }
+        if updates_omitted > 0 {
+            updates.push_str(&format!(
+                "+{updates_omitted} more updates (see the finding ledger)\n"
             ));
         }
         for (step, count) in omitted_updates {
             updates.push_str(&format!("{step}: +{count} more (see the finding ledger)\n"));
         }
+        let updates = if limits.compact {
+            bounded_text(&updates, 1024)
+        } else {
+            updates
+        };
         section(
             &mut out,
             "Resolved and unconfirmed since the last round",
@@ -557,6 +576,11 @@ impl RepairBrief {
             }
             checks.push('\n');
         }
+        let checks = if limits.compact {
+            bounded_text(&checks, 8 * 1024)
+        } else {
+            checks
+        };
         section(&mut out, "Failing check output", &checks);
         let verify = prefix(&self.verify, limits.verify);
         if verify.len() < self.verify.len() {
@@ -576,7 +600,7 @@ impl RepairBrief {
         if limits.previous {
             section(&mut out, "Previous round", &self.previous);
         }
-        section(&mut out, "Logs", &self.logs);
+        section(&mut out, "Logs", &bounded_text(&self.logs, 1024));
         out
     }
 }
@@ -636,3 +660,16 @@ fn render_verify(verify: &Value) -> String {
 }
 
 const CONFLICT_INSTRUCTIONS: &str = "Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nForge will run the project's checks on the reconciled commit and integrate it, so keep your change limited to reconciling the files listed below, and run the relevant checks yourself before you commit.";
+
+/// Byte budget includes the UTF-8-safe truncation notice.
+fn bounded_text(value: &str, bytes: usize) -> String {
+    const NOTE: &str = "\n… (truncated; see the Task or finding ledger)";
+    if value.len() <= bytes {
+        return value.to_owned();
+    }
+    format!(
+        "{}{}",
+        prefix(value, bytes.saturating_sub(NOTE.len())),
+        NOTE
+    )
+}

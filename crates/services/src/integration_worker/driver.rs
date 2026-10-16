@@ -1663,7 +1663,9 @@ impl HeadDriver {
         let message = ack.message.clone();
         self.send_back(a, S::Ejected, |a| {
             a.failure_kind = Some(IntegrationFailureKind::CandidateCheckFailed);
-            a.failure_message = message.as_deref().map(bounded);
+            a.failure_message = message
+                .as_deref()
+                .map(crate::integration_steps::bounded_ci_failure);
         })
         .await
     }

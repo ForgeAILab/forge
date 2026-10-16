@@ -6,7 +6,7 @@
 //! - the `settle` step, when the target did not move (no check is asked);
 //! - the check's delivery (`apply_check_result`, through
 //!   [`IntegrationCheckFamily`]), after a `request_check` for a rebased head.
-use super::{ack_value, bounded, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
+use super::{ack_value, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
 use crate::{
     check_runner::consumer::{
         CheckApplication, CheckConsumerFamily, CheckVerdict, TaskCheckRequest,
@@ -210,7 +210,7 @@ pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
                 CheckResultOutcome::Fail | CheckResultOutcome::TimedOut => {
                     let failed = failed_command_message(&result.commands)
                         .unwrap_or_else(|| format!("the check ended {}", result.outcome));
-                    CheckInput::Failed(timing, bounded(&failed))
+                    CheckInput::Failed(timing, super::bounded_ci_failure(&failed))
                 }
             }
         }
@@ -222,37 +222,94 @@ pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
 /// end rather than the oldest lines of the tail.
 fn failed_command_message(commands: &[api_types::CheckCommandOutcome]) -> Option<String> {
     let command = commands.iter().find(|command| command.exit_code != 0)?;
-    let head = format!("`{}` exited {}: ", command.command, command.exit_code);
-    let output = output_end(
-        &command.output_tail,
-        &command.stderr_tail,
-        super::TEXT_LIMIT.saturating_sub(head.len()),
+    let head = format!(
+        "`{}` exited {}: ",
+        message_prefix(&command.command, 1024),
+        command.exit_code
     );
-    Some(format!("{head}{output}"))
+    let failures = failure_signatures(&command.failures, command.failures_truncated);
+    let output = output_end(&command.output_tail, &command.stderr_tail, 2 * 1024);
+    Some(format!("{head}{failures}\n{output}"))
 }
 
-/// A triaged red check names only the failures that block, and still keeps
-/// the end of the first blocking step's output: the head's message is the
-/// only failure evidence its MERGE-CI repair brief carries. The summary
-/// takes at most half of the bound.
+fn failure_signatures(failures: &[String], truncated: bool) -> String {
+    let mut out = failures
+        .iter()
+        .take(20)
+        .map(|signature| format!("\n- {}", message_prefix(signature, 300)))
+        .collect::<String>();
+    if failures.len() > 20 {
+        out.push_str(&format!("\n+{} more", failures.len() - 20));
+    }
+    if truncated {
+        out.push_str("\nAdditional failure signatures were truncated.");
+    }
+    out
+}
+
+/// Keep the failing test names and a separate 2 KiB output end. The triage
+/// summary may contain many steps; it must not consume the output allowance.
 fn triaged_failure_message(entries: &[api_types::StepResultEntry], summary: &str) -> String {
     let Some(step) = entries
         .iter()
         .find(|entry| crate::check_runner::ci_triage::blocks(entry))
     else {
-        return bounded(summary);
+        return super::bounded_ci_failure(summary);
     };
-    let mut end = summary.len().min(super::TEXT_LIMIT / 2);
-    while !summary.is_char_boundary(end) {
+    let mut failures = Vec::new();
+    let mut headers = Vec::new();
+    let mut truncated = false;
+    for entry in entries
+        .iter()
+        .filter(|entry| crate::check_runner::ci_triage::blocks(entry))
+    {
+        let mut signatures = entry.failures.clone();
+        if let Some(triage) = &entry.triage {
+            let classified: Vec<_> = triage
+                .failures
+                .iter()
+                .filter(|failure| {
+                    triage.mode != api_types::ReviewCiTriage::Full || failure.class.blocks()
+                })
+                .map(|failure| failure.signature.clone())
+                .collect();
+            if !triage.failures.is_empty() {
+                signatures = classified;
+            }
+        }
+        failures.extend(
+            signatures
+                .into_iter()
+                .map(|signature| format!("CI-{} {signature}", entry.index)),
+        );
+        truncated |= entry.failures_truncated;
+        let reason = entry
+            .triage
+            .as_ref()
+            .and_then(|triage| triage.reason.as_deref())
+            .unwrap_or_default();
+        headers.push(format!(
+            "`{}` exited {}{}{}",
+            entry.command,
+            entry.exit_code,
+            if reason.is_empty() { "" } else { "; " },
+            reason
+        ));
+    }
+    format!(
+        "{}{}\n{}",
+        message_prefix(&headers.join("\n"), 2048),
+        failure_signatures(&failures, truncated),
+        output_end(&step.output_tail, &step.stderr_tail, 2 * 1024)
+    )
+}
+
+fn message_prefix(text: &str, bytes: usize) -> &str {
+    let mut end = bytes.min(text.len());
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    let head = format!("{}\n", &summary[..end]);
-    let output = output_end(
-        &step.output_tail,
-        &step.stderr_tail,
-        super::TEXT_LIMIT.saturating_sub(head.len()),
-    );
-    format!("{head}{output}")
+    &text[..end]
 }
 
 /// The end of a step's combined output (stderr only when it is empty).
@@ -1328,7 +1385,7 @@ mod failed_message_tests {
             started_at: "now".into(),
             finished_at: "now".into(),
         };
-        let message = bounded(&failed_command_message(&[command]).unwrap());
+        let message = failed_command_message(&[command]).unwrap();
         assert!(
             message.starts_with("`cargo test` exited 101: "),
             "{message}"
@@ -1341,6 +1398,42 @@ mod failed_message_tests {
             message.contains("test parser::empty ... FAILED"),
             "{message}"
         );
-        assert!(message.len() <= super::super::TEXT_LIMIT);
+        assert!(message.len() <= super::super::CI_MESSAGE_LIMIT);
+    }
+    #[test]
+    fn merge_ci_failure_names_twenty_tests_and_keeps_two_kib_output_end() {
+        let command = api_types::CheckCommandOutcome {
+            index: 0,
+            command: "cargo test".into(),
+            exit_code: 101,
+            stderr_tail: String::new(),
+            failures: (0..25).map(|i| format!("binary::case_{i}")).collect(),
+            failures_truncated: false,
+            output_tail: format!("{}END", "x".repeat(4096)),
+            started_at: "now".into(),
+            finished_at: "now".into(),
+        };
+        let message = failed_command_message(std::slice::from_ref(&command)).unwrap();
+        for i in 0..20 {
+            assert!(
+                message.contains(&format!("- binary::case_{i}\n")),
+                "{message}"
+            );
+        }
+        assert!(message.contains("+5 more"));
+        assert!(message.ends_with(&format!("{}END", "x".repeat(2045))));
+        let entry: api_types::StepResultEntry =
+            serde_json::from_value(serde_json::to_value(command).unwrap()).unwrap();
+        let message =
+            triaged_failure_message(std::slice::from_ref(&entry), "base comparison unavailable");
+        assert!(message.contains("binary::case_19") && message.contains("+5 more"));
+        assert!(message.ends_with(&format!("{}END", "x".repeat(2045))));
+        let mut second = entry.clone();
+        second.index = 1;
+        second.command = "pytest".into();
+        second.failures = vec!["other-test".into()];
+        let message = triaged_failure_message(&[entry, second], "unused");
+        assert!(message.contains("+6 more"));
+        assert_eq!(message.matches("\n- CI-").count(), 20);
     }
 }

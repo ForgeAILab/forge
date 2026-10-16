@@ -12,6 +12,7 @@ pub(super) async fn record(
     entries: &[StepResultEntry],
     base: Option<&StoredCheckResult>,
     setup_count: usize,
+    target_tip: bool,
 ) -> Result<()> {
     let now = db::now_rfc3339();
     let summary: Vec<_> =
@@ -98,10 +99,28 @@ pub(super) async fn record(
                 json!({"base_commit":triage.base_commit,"base_run_id":triage.base_run_id,"base_observed_at":base.map_or(event.created_at.as_str(), |base| base.created_at.as_str()),"base_failures":base.and_then(|base| base.commands.get(setup_count + entry.index)).map(|step| &step.failures),"triage":triage}), &application.consumer_id).await?;
         }
     }
-    // A newer passing base observation resolves this command's older base
-    // incidents, including failures at an older target commit. Cached old
-    // evidence cannot resolve a newer incident.
-    if let Some(base) = base {
+    resolve_base_observation(
+        db,
+        &task.project_id,
+        base,
+        setup_count,
+        &event.id,
+        target_tip,
+    )
+    .await
+}
+
+/// Only a queue-head observation sees the Project target tip. Review entry
+/// compares a Task's own (possibly old) merge base, even if it runs later.
+async fn resolve_base_observation(
+    db: &SqliteDb,
+    project: &str,
+    base: Option<&StoredCheckResult>,
+    setup_count: usize,
+    event: &str,
+    target_tip: bool,
+) -> Result<()> {
+    if let Some(base) = base.filter(|_| target_tip) {
         if base
             .commands
             .iter()
@@ -114,18 +133,14 @@ pub(super) async fn record(
                 .skip(setup_count)
                 .filter(|step| step.exit_code == 0)
             {
-                db.resolve_passing_base_attention(
-                    &task.project_id,
-                    &step.command,
-                    &base.created_at,
-                    &event.id,
-                )
-                .await?;
+                db.resolve_passing_base_attention(project, &step.command, &base.created_at, event)
+                    .await?;
             }
         }
     }
     Ok(())
 }
+
 #[allow(clippy::too_many_arguments)]
 async fn incident(
     db: &SqliteDb,
@@ -267,6 +282,41 @@ mod tests {
         assert_eq!(recurring["occurrences"][63], "run-99");
         assert_eq!(recurring["task_ids"].as_array().unwrap().len(), 64);
         assert_eq!(recurring["task_ids"][63], "task-29");
+        let passing_old_merge_base = StoredCheckResult {
+            id: "passing-old-base".into(),
+            run_id: "base".into(),
+            identity_key: "base".into(),
+            outcome: db::CheckResultOutcome::Pass,
+            cleanup: db::CheckCleanup::NotPerformed,
+            certified: false,
+            cacheable: false,
+            commands: vec![api_types::CheckCommandOutcome {
+                index: 0,
+                command: "test".into(),
+                exit_code: 0,
+                stderr_tail: String::new(),
+                output_tail: String::new(),
+                failures: vec![],
+                failures_truncated: false,
+                started_at: at.into(),
+                finished_at: at.into(),
+            }],
+            output_truncated: false,
+            created_at: "2026-10-15T13:00:00Z".into(),
+        };
+        resolve_base_observation(&db, "p", Some(&passing_old_merge_base), 0, &event.id, false)
+            .await
+            .unwrap();
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM attention_projection WHERE attention_type='base_check_failing'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "open",
+            "a later green Task merge-base cannot resolve a red target-tip incident"
+        );
         db.resolve_passing_base_attention("p", "test", "2026-10-15T11:00:00Z", &event.id)
             .await
             .unwrap();
@@ -276,7 +326,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status, "open");
-        db.resolve_passing_base_attention("p", "test", "2026-10-15T13:00:00Z", &event.id)
+        resolve_base_observation(&db, "p", Some(&passing_old_merge_base), 0, &event.id, true)
             .await
             .unwrap();
         let status: String =

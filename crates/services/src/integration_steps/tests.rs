@@ -4941,7 +4941,22 @@ async fn send_back_merge_fix_brief_carries_command_and_output() {
     let world = World::new().await;
     let attempt = world.add_task("brief-red", "f", "one\n").await;
     let asked = world.place(&attempt.id, "checking", 2).await;
-    world.set(&attempt.id, "state='ejected',failure_kind='candidate_check_failed',failure_message='`cargo test` exited 101: parser::empty FAILED'").await;
+    let failure = format!(
+        "`cargo test` exited 101: parser::empty FAILED\n{}\n+5 more\n{}TAIL-END",
+        (0..20)
+            .map(|i| format!("binary::case_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "x".repeat(2040)
+    );
+    world
+        .set(
+            &attempt.id,
+            &format!(
+                "state='ejected',failure_kind='candidate_check_failed',failure_message='{failure}'"
+            ),
+        )
+        .await;
     world.ask(&asked, IntegrationStepAction::SendBack).await;
     eventually("red check reaches repair", || async {
         world.task("brief-red").await.status == "merge_failed"
@@ -4970,13 +4985,16 @@ async fn send_back_merge_fix_brief_carries_command_and_output() {
             "main",
             "cargo test",
             "parser::empty FAILED",
+            "binary::case_19",
+            "+5 more",
+            "TAIL-END",
             "merge_fix budget: 1 of 1 spent; 0 remaining",
         ] {
             assert!(text.contains(expected), "{text}");
         }
         assert!(!text.contains("manual task-worktree repair"), "{text}");
         let window = world.db.review_window("brief-red").await.unwrap();
-        assert!(::review::finding_ledger(&window.reviews)
+        assert!(db::review_findings::finding_ledger(&window.reviews)
             .unwrap()
             .is_empty());
     }
@@ -5195,6 +5213,10 @@ async fn settle_ci_triage_red_head_message_keeps_the_end_of_the_failing_output()
     let message = answer.message.unwrap();
     assert!(message.contains("set `setup_steps`"), "{message}");
     assert!(message.contains("assertion END-OF-OUTPUT-42"), "{message}");
-    assert!(message.len() <= 1000, "{}", message.len());
+    assert!(
+        message.len() <= super::CI_MESSAGE_LIMIT,
+        "{}",
+        message.len()
+    );
     drop(production);
 }

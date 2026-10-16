@@ -1738,6 +1738,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Review rounds now derive repeat parks from open blocking reviewer findings.
+  A carried finding gets another round while the open blocking count shrinks;
+  a third appearance parks for the owner. Findings-less windows retain legacy
+  repeat handling, and coordination leads retain replan routing.
+- Failed CI rounds no longer resolve tests absent from a fail-fast run's
+  signature list. Only passing steps prove those tests fixed. Base-CI Attention
+  resolves only from a newer queue-head target-tip pass.
+- Repair briefs enforce 24 KiB even with long Task text and many waived
+  failures. Merge-CI repairs name up to 20 failing tests and retain 2 KiB of output.
+
 - Pre-existing and flaky check failures no longer block review or merge under the default `review_ci_triage: full`; set `review_ci_triage: off` to retain the previous gate.
 - Under `review_ci_triage: full`, entry CI now runs every configured step instead
   of stopping at the first failure. This changes the check identity, so existing
@@ -3085,6 +3095,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   longer runs a CLI availability probe when an Agent list is loaded.
 
 ### Added
+
+- `retry_budgets.review_progress` (default 2, 0 disables), Task/Project editors,
+  and Task remaining/limit projections for extra repair rounds on progress.
+- Additive `superseded` finding status for step-level CI findings replaced by
+  per-test findings, exposed in the findings API and web ledger.
+- Invocation-scoped `review_verify_rerun` budget (limit 1) for the later verify phase.
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 

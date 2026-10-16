@@ -11,6 +11,15 @@ pub(crate) struct TaskCommand {
     pub arguments: Value,
     pub preempt: bool,
 }
+/// Routing requests may supply the hook's merged state configuration.
+#[derive(Deserialize)]
+struct ReviewFailureTargetCommand(
+    String,
+    String,
+    Option<String>,
+    #[serde(default)] Option<Value>,
+);
+
 impl TaskCommand {
     /// Commands that re-derive their work from current state when they run
     /// are must-not-lose effects: queued, they apply after a status change
@@ -596,14 +605,21 @@ impl TaskService {
                     )
                 }
                 "review_failure_target" => {
-                    let (id, status, execution): (String, String, Option<String>) =
+                    let ReviewFailureTargetCommand(id, status, execution, config) =
                         serde_json::from_value(command.arguments.clone())
                             .map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
                     let task = self.command_task(&id).await?;
                     if task.status != status {
                         return Err(db::DbError::VersionConflict.into());
                     }
-                    encode(Box::pin(self.review_failure_target(&task, execution.as_deref())).await?)
+                    encode(
+                        Box::pin(self.review_failure_target_with_config(
+                            &task,
+                            execution.as_deref(),
+                            config.as_ref(),
+                        ))
+                        .await?,
+                    )
                 }
                 "missing_review_candidate" | "reconcile_review_candidate" => {
                     let (id, version, status): (String, i64, String) =
@@ -812,5 +828,21 @@ impl TaskService {
                 _ => Err(ServiceError::invalid_operation("unknown Task command")),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn review_failure_target_command_has_optional_hook_configuration() {
+        let without: ReviewFailureTargetCommand =
+            serde_json::from_value(serde_json::json!(["task", "review", null])).unwrap();
+        assert!(without.3.is_none());
+        let config = serde_json::json!({"retry_budgets":{"review_progress":4}});
+        let with: ReviewFailureTargetCommand =
+            serde_json::from_value(serde_json::json!(["task", "review", "execution", config]))
+                .unwrap();
+        assert_eq!(with.3, Some(config));
     }
 }

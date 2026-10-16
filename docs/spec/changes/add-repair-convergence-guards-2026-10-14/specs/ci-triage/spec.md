@@ -107,7 +107,7 @@ A queue-head check that fails SHALL be triaged the same way, with the target tip
 ### Requirement: Flaky and pre-existing failures are reported to the Project
 Forge SHALL raise deduplicated Project attention for triaged failures:
 - `flaky_check`, keyed by step command and signature, carrying a count and the Tasks that hit it;
-- `base_check_failing`, keyed by Project and step command, carrying the latest failing base commit and signatures. A newer red base updates the same item; it resolves when a newer base run of that command passes.
+- `base_check_failing`, keyed by Project and step command, carrying the latest failing base commit and signatures. A newer red base updates the same item; it resolves only when a newer queue-head target-tip base run of that command passes. Review-entry merge-base observations may open/update it but never resolve it.
 
 Both SHALL be new `AttentionCategory` values, shown in Mission Control and documented in `docs/api.md`.
 

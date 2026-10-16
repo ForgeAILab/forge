@@ -1059,7 +1059,7 @@ async fn prior_review_section(
         .map(|window| window.reviews)
         .unwrap_or_default();
     window.retain(earlier);
-    let ledger = crate::finding_ledger(&window).unwrap_or_default();
+    let ledger = db::review_findings::finding_ledger(&window).unwrap_or_default();
     let mut section = String::new();
     let mut prior_commit = None;
     for review in reviews.iter().rev() {

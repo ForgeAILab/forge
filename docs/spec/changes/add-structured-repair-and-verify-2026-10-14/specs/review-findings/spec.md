@@ -83,7 +83,7 @@ Each entry has:
 - `id`, `source` (`reviewer | ci | check | verify | merge`), `severity`;
 - `summary`, `where`, `expected`, `observed`;
 - `first_attempt`, `last_checked_attempt`;
-- `status`: `open | resolved | unconfirmed`;
+- `status`: `open | resolved | unconfirmed | flaky | pre_existing | superseded`;
 - `streak`.
 
 The rules:
@@ -125,3 +125,11 @@ The types SHALL be exported to the generated TypeScript and documented in
 #### Scenario: No access
 - **WHEN** a user who cannot read the Task calls the route
 - **THEN** the response is the same refusal `GET /api/v1/tasks/{id}/reviews` returns for that user
+
+#### Scenario: A fail-fast CI round omits a previous failing binary
+- **WHEN** a CI step fails again with an untruncated list that omits a prior test
+- **THEN** that test retains its previous status, streak and last checked attempt; it contributes no false progress
+
+#### Scenario: Per-test CI findings replace a step finding
+- **WHEN** a failed step formerly represented by CI-0 now reports signatures
+- **THEN** CI-0 is superseded, not resolved, and GET findings reports that additive status

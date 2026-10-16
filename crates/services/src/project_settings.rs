@@ -133,6 +133,7 @@ pub async fn validate_project_settings(
 
     for (name, value) in [
         ("review", settings.retry_budgets.review),
+        ("review_progress", settings.retry_budgets.review_progress),
         ("merge_fix", settings.retry_budgets.merge_fix),
     ] {
         if value.is_some_and(|value| value < 0) {

@@ -233,6 +233,7 @@ export interface EffectiveLeadResponse {
 
 export interface RetryBudgets {
   review?: number | null
+  review_progress?: number | null
   merge_fix?: number | null
   execution?: number | null
 }
@@ -1199,7 +1200,7 @@ export interface WorkspacePlacementResponse {
 }
 
 export interface Workspace {
-  pending_remote_cancel: import("./bindings/PendingRemoteCancel").PendingRemoteCancel[]
+  pending_remote_cancel: import('./bindings/PendingRemoteCancel').PendingRemoteCancel[]
   id: string
   task_id: string
   repo_id: string
@@ -1640,7 +1641,7 @@ export interface OperatorStatusResponse {
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
   periodic_workers: PeriodicWorkerStatus[]
-  task_steps: import("./bindings/TaskStepQueueStatus").TaskStepQueueStatus
+  task_steps: import('./bindings/TaskStepQueueStatus').TaskStepQueueStatus
   database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]

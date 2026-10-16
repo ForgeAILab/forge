@@ -103,7 +103,7 @@ async fn ci_triage_consistent_failures_go_to_base_and_red_base_continues_to_revi
             .unwrap(),
         0
     );
-    let ledger = review::finding_ledger(&[review]).unwrap();
+    let ledger = db::review_findings::finding_ledger(&[review]).unwrap();
     assert!(ledger
         .iter()
         .all(|entry| entry.status == api_types::ReviewFindingStatus::PreExisting));
@@ -129,7 +129,7 @@ async fn ci_triage_one_introduced_failure_reaches_coder() {
     let (task, review, details) = enter(&f).await;
     assert_eq!(task.status, "in_progress", "{details}");
     assert_eq!(review.status, db::ReviewStatus::Failed);
-    let ledger = review::finding_ledger(&[review]).unwrap();
+    let ledger = db::review_findings::finding_ledger(&[review]).unwrap();
     let blocking: Vec<_> = ledger
         .iter()
         .filter(|entry| entry.severity == api_types::ReviewFindingSeverity::Blocking)

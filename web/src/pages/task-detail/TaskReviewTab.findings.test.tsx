@@ -246,3 +246,15 @@ describe('Review tab finding ledger', () => {
     expect(apiFetch).toHaveBeenCalledTimes(2)
   })
 })
+
+it('labels a step finding superseded by test findings without claiming resolution', async () => {
+  vi.mocked(apiFetch).mockResolvedValue({
+    items: [{ ...entry('CI-0', 'superseded'), source: 'ci' }],
+    window_started_at: review.created_at,
+    review_attempts: 3,
+  })
+  show()
+  const table = await screen.findByRole('table')
+  expect(within(table).getByText('superseded by test findings')).toBeTruthy()
+  expect(within(table).queryByText('resolved')).toBeNull()
+})

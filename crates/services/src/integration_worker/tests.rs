@@ -65,6 +65,7 @@ struct FakeSteps {
     answered: Mutex<HashSet<String>>,
     held: Mutex<HashSet<(String, IntegrationStepAction)>>,
     red: Mutex<HashSet<String>>,
+    red_message: Mutex<Option<String>>,
     /// Permits name another candidate (a consumer bug the worker must bound).
     bad_permit: AtomicBool,
     readied: AtomicUsize,
@@ -167,7 +168,13 @@ impl FakeSteps {
                             slot_wait_ms: 1,
                             run_ms: 2,
                         }),
-                        message: red.then(|| "tests failed".to_owned()),
+                        message: red.then(|| {
+                            self.red_message
+                                .lock()
+                                .unwrap()
+                                .clone()
+                                .unwrap_or_else(|| "tests failed".to_owned())
+                        }),
                     }
                 }
                 IntegrationStepAction::Result => {
@@ -3292,4 +3299,33 @@ async fn ci_triage_head_wait_extends_for_each_subcheck_and_expired_runs_are_boun
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_round_merge_ci_worker_preserves_signature_message_and_output_end() {
+    let world = World::new().await;
+    world.add_task("r", "first", "first.txt", "first\n").await;
+    let attempt = world
+        .add_task("r", "red-message", "second.txt", "second\n")
+        .await;
+    world.steps.red.lock().unwrap().insert("red-message".into());
+    let message = format!(
+        "cargo test\n{}\n{}END",
+        (0..20)
+            .map(|i| format!("binary::case_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "x".repeat(2045)
+    );
+    assert!(message.len() > 2048);
+    *world.steps.red_message.lock().unwrap() = Some(message.clone());
+    let mut pump = Pump::new(world.worker());
+    world.settle(&mut pump).await;
+    let red = world.attempt(&attempt.id).await;
+    assert_eq!(red.state, S::Ejected);
+    assert_eq!(red.failure_message.as_deref(), Some(message.as_str()));
+    assert!(world
+        .steps
+        .actions("red-message")
+        .contains(&IntegrationStepAction::SendBack));
 }

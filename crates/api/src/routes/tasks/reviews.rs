@@ -38,7 +38,8 @@ pub async fn list_findings(
     for review in &window.reviews {
         review_response_server_checked(review.clone())?;
     }
-    let mut items = review::finding_ledger(&window.reviews).map_err(ApiError::internal)?;
+    let mut items =
+        db::review_findings::finding_ledger(&window.reviews).map_err(ApiError::internal)?;
     // The complete ledger is naturally sorted before the transport cap.
     items.truncate(200);
     Ok(Json(api_types::TaskFindingsResponse {

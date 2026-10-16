@@ -1896,8 +1896,13 @@ impl TaskService {
         };
         let passed = conformance.status == api_types::ConformanceStatus::Passed;
         let blocked = conformance.status == api_types::ConformanceStatus::Blocked;
-        let owner_finding =
-            db::budget::owner_review_failure_message(&conformance, &review, &reviews);
+        let owner_finding = db::budget::owner_review_failure_message(
+            &conformance,
+            &review,
+            &reviews,
+            &self.db.review_window(&task.id).await?.reviews,
+            self.derived_review_rules_apply(&task).await?,
+        );
         let status = if passed && user_approval_required {
             ReviewStatus::AwaitingHuman
         } else if passed {
@@ -2226,9 +2231,13 @@ impl TaskService {
                             .await;
                     }
                     let reviews = ReviewRepo::list_by_task(&*self.db, &task.id).await?;
-                    if let Some(message) =
-                        db::budget::owner_review_failure_message(&conformance, review, &reviews)
-                    {
+                    if let Some(message) = db::budget::owner_review_failure_message(
+                        &conformance,
+                        review,
+                        &reviews,
+                        &self.db.review_window(&task.id).await?.reviews,
+                        self.derived_review_rules_apply(&task).await?,
+                    ) {
                         return self
                             .block_task_for_review_finding(
                                 &task,
@@ -2451,13 +2460,13 @@ impl TaskService {
         // cannot read (an older details shape) leaves the list out of the
         // comment instead of stopping the cascade that posts it.
         let result = (|| {
-            let ledger = ::review::finding_ledger(&reviews)?;
+            let ledger = db::review_findings::finding_ledger(&reviews)?;
             let prior: Vec<_> = reviews
                 .iter()
                 .filter(|row| row.attempt_number < review.attempt_number)
                 .cloned()
                 .collect();
-            let previous = ::review::finding_ledger(&prior)?;
+            let previous = db::review_findings::finding_ledger(&prior)?;
             Ok::<_, String>(current_comment_findings(ledger, &previous))
         })();
         Ok(result.unwrap_or_else(|error| {
@@ -2480,6 +2489,27 @@ impl TaskService {
             i64::from(limit),
             &ledger,
             "review",
+        );
+        self.create_review_comment(review, "repair", None, content)
+            .await
+    }
+
+    async fn publish_review_progress_comment(
+        &self,
+        review: &Review,
+        task: &Task,
+        config: Option<&Value>,
+    ) -> Result<()> {
+        let kind = db::budget::Kind::ReviewProgress;
+        let spent = db::budget::spent(self.db.pool(), &task.id, kind.key()).await?;
+        let limit = db::budget::limit(task, kind, config, None)?;
+        let ledger = self.review_comment_ledger(review).await?;
+        let content = repair_round_comment(
+            review.attempt_number,
+            spent,
+            i64::from(limit),
+            &ledger,
+            kind.key(),
         );
         self.create_review_comment(review, "repair", None, content)
             .await
@@ -2512,17 +2542,43 @@ impl TaskService {
         }
     }
 
+    async fn derived_review_rules_apply(&self, task: &Task) -> Result<bool> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        let workflow = WorkflowEngine::resolve_workflow_for_task(
+            task,
+            &project.workflow_definition,
+            &api_types::Actor::system(api_types::SystemComponent::Workflow),
+        );
+        Ok(
+            crate::task_hierarchy::coordination_root_lead(&self.db, task, &workflow)
+                .await?
+                .is_none(),
+        )
+    }
+
     pub(crate) async fn review_failure_target(
         &self,
         task: &Task,
         execution_id: Option<&str>,
+    ) -> Result<(Task, Option<String>, String)> {
+        self.review_failure_target_with_config(task, execution_id, None)
+            .await
+    }
+
+    pub(crate) async fn review_failure_target_with_config(
+        &self,
+        task: &Task,
+        execution_id: Option<&str>,
+        state_config: Option<&Value>,
     ) -> Result<(Task, Option<String>, String)> {
         if !db::task_writer::owns_task(&task.id) {
             return self
                 .request_task_command(
                     &task.id,
                     "review_failure_target",
-                    json!([task.id, task.status, execution_id]),
+                    json!([task.id, task.status, execution_id, state_config]),
                     false,
                 )
                 .await;
@@ -2554,15 +2610,88 @@ impl TaskService {
             .states
             .iter()
             .find(|state| state.name == task.status);
+        let lead_assigned =
+            crate::task_hierarchy::coordination_root_lead(&self.db, task, &workflow)
+                .await?
+                .is_some();
+        let policy = match latest_review.as_ref() {
+            Some(review) if review.status == ReviewStatus::Failed && !lead_assigned => {
+                let window = self.db.review_window(&task.id).await?;
+                db::review_findings::round_policy(&window.reviews, review).unwrap_or_else(|error| {
+                    tracing::warn!(task_id = %task.id, %error, "unreadable historical ledger; using ordinary review remediation");
+                    db::review_findings::RoundPolicy::default()
+                })
+            }
+            _ => db::review_findings::RoundPolicy::default(),
+        };
+        if let Some(review) = latest_review.as_ref().filter(|_| !lead_assigned) {
+            let details: Value =
+                serde_json::from_str(&review.step_results_json).unwrap_or_default();
+            if let Ok(conformance) = serde_json::from_value::<api_types::ReviewConformance>(
+                details["conformance"].clone(),
+            ) {
+                let window = self.db.review_window(&task.id).await?;
+                if let Some(message) = db::budget::owner_review_failure_message(
+                    &conformance,
+                    review,
+                    &ReviewRepo::list_by_task(&*self.db, &task.id).await?,
+                    &window.reviews,
+                    true,
+                ) {
+                    let id = review
+                        .reviewer_execution_id
+                        .as_deref()
+                        .or(execution_id)
+                        .unwrap_or(&review.execution_id);
+                    let execution = ExecutionRepo::get_by_id(&*self.db, id)
+                        .await?
+                        .ok_or_else(|| ServiceError::not_found("execution", id))?;
+                    self.block_task_for_review_finding(
+                        task,
+                        &execution,
+                        api_types::FailureKind::ReviewNeedsOwner,
+                        message.clone(),
+                    )
+                    .await?;
+                    let updated = TaskRepo::get_by_id(&*self.db, &task.id, false)
+                        .await?
+                        .ok_or(DbError::NotFound)?;
+                    return Ok((updated, None, message));
+                }
+            }
+        }
+        let effective_config = state_config.cloned().or_else(|| {
+            review_state.map(|state| {
+                db::budget::state_config(&state.config, &state.name, &project.settings)
+            })
+        });
         let budget = db::budget::limit(
             task,
             db::budget::Kind::Review,
-            review_state.map(|state| &state.config),
+            effective_config.as_ref(),
             review_state.and_then(|state| state.gate_config.as_ref()),
         )?;
         let existing_count =
             db::budget::spent(self.db.pool(), &task.id, db::budget::Kind::Review.key()).await?;
-        if !db::budget::allows_retry(i64::from(budget), existing_count) {
+        let mut progress_granted = false;
+        if !db::budget::allows_retry(i64::from(budget), existing_count) && policy.progress {
+            if let Some(review) = &latest_review {
+                let progress_limit = db::budget::limit(
+                    task,
+                    db::budget::Kind::ReviewProgress,
+                    effective_config.as_ref(),
+                    None,
+                )?;
+                progress_granted = db::budget::grant_review_progress(
+                    &self.db,
+                    task,
+                    review,
+                    i64::from(progress_limit),
+                )
+                .await?;
+            }
+        }
+        if !db::budget::allows_retry(i64::from(budget), existing_count) && !progress_granted {
             // The verdict that exhausted the budget opens its own automatic
             // recovery episode, here where the limit is resolved.
             if let Some(review) = latest_review
@@ -2645,10 +2774,6 @@ impl TaskService {
             // A coordination root with a lead re-plans: its rejection goes to
             // its planning state (`effective_reject_target`). Every other
             // Task keeps the configured target.
-            let lead_assigned =
-                crate::task_hierarchy::coordination_root_lead(&self.db, task, &workflow)
-                    .await?
-                    .is_some();
             let configured =
                 crate::task_hierarchy::effective_reject_target(&workflow, &task.status, false);
             let target = crate::task_hierarchy::effective_reject_target(
@@ -2751,8 +2876,17 @@ impl TaskService {
             );
             if !replans {
                 if let Some(review) = &latest_review {
-                    self.publish_review_repair_comment(review, existing_count, budget)
+                    if progress_granted {
+                        self.publish_review_progress_comment(
+                            review,
+                            task,
+                            effective_config.as_ref(),
+                        )
                         .await?;
+                    } else {
+                        self.publish_review_repair_comment(review, existing_count, budget)
+                            .await?;
+                    }
                 }
             }
             Ok((task.clone(), Some(target), "review failed".to_owned()))
@@ -3290,11 +3424,12 @@ fn current_comment_findings(
     ledger
         .iter()
         .filter(|entry| {
-            entry.status != Status::Resolved
-                || (!::review::findings::superseded_by_tests(entry, &ledger)
-                    && !previous
-                        .iter()
-                        .any(|prior| prior.id == entry.id && prior.status == Status::Resolved))
+            entry.status != Status::Superseded
+                && (entry.status != Status::Resolved
+                    || (entry.status != Status::Superseded
+                        && !previous
+                            .iter()
+                            .any(|prior| prior.id == entry.id && prior.status == Status::Resolved)))
         })
         .cloned()
         .collect()
@@ -3351,7 +3486,7 @@ fn reviewer_comment(
         Status::Open => 0,
         Status::Resolved => 1,
         Status::Unconfirmed => 2,
-        Status::Flaky | Status::PreExisting => 3,
+        Status::Flaky | Status::PreExisting | Status::Superseded => 3,
     });
     let mut listed = 0;
     let mut overflow = Vec::new();
@@ -3387,6 +3522,7 @@ fn reviewer_comment(
                     "passing now"
                 }
             ),
+            Status::Superseded => format!("- {id} {summary} — superseded by per-test findings"),
             Status::Unconfirmed => format!("- {id} {summary} — not re-checked"),
             Status::Flaky => format!("- {id} {summary} — flaky (non-blocking)"),
             Status::PreExisting => format!("- {id} {summary} — pre-existing (non-blocking)"),
@@ -3995,10 +4131,12 @@ mod reviewer_message_tests {
             updated_at: "now".into(),
         }
         };
-        let prior = ::review::finding_ledger(&[review(1, json!([]))]).unwrap();
-        let ledger =
-            ::review::finding_ledger(&[review(1, json!([])), review(2, json!(["parser::empty"]))])
-                .unwrap();
+        let prior = db::review_findings::finding_ledger(&[review(1, json!([]))]).unwrap();
+        let ledger = db::review_findings::finding_ledger(&[
+            review(1, json!([])),
+            review(2, json!(["parser::empty"])),
+        ])
+        .unwrap();
         let ledger = current_comment_findings(ledger, &prior);
         let text = reviewer_comment(ReviewStatus::Failed, 2, &conformance(None), &ledger, None);
         assert!(text.contains("- [ ] CI-0#"), "{text}");
@@ -4020,8 +4158,8 @@ mod reviewer_message_tests {
             started_at: "now".into(), finished_at: None, created_at: "now".into(), updated_at: "now".into(),
         }
         };
-        let prior = ::review::finding_ledger(&[review(1, 1)]).unwrap();
-        let ledger = ::review::finding_ledger(&[review(1, 1), review(2, 0)]).unwrap();
+        let prior = db::review_findings::finding_ledger(&[review(1, 1)]).unwrap();
+        let ledger = db::review_findings::finding_ledger(&[review(1, 1), review(2, 0)]).unwrap();
         let second = reviewer_comment(
             ReviewStatus::Passed,
             2,
@@ -4031,7 +4169,8 @@ mod reviewer_message_tests {
         );
         assert!(second.contains("- [x] CI-0"));
         let third_ledger =
-            ::review::finding_ledger(&[review(1, 1), review(2, 0), review(3, 0)]).unwrap();
+            db::review_findings::finding_ledger(&[review(1, 1), review(2, 0), review(3, 0)])
+                .unwrap();
         assert_eq!(third_ledger[0].last_checked_attempt, 3);
         let third = reviewer_comment(
             ReviewStatus::Passed,

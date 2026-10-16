@@ -1725,3 +1725,38 @@ async fn findings_read_caps_the_full_ledger_after_id_ordering() {
         ids
     );
 }
+
+#[tokio::test]
+async fn findings_read_reports_replaced_step_as_superseded() {
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    f.role(Some("viewer")).await;
+    let now = db::now_rfc3339();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)")
+        .bind(&candidate).bind(&f.task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    for (attempt, signatures) in [(1, json!([])), (2, json!(["binary::test"]))] {
+        db::ReviewRepo::create(db, db::CreateReview {
+            id:db::new_uuid_v4(),task_id:f.task.id.clone(),execution_id:candidate.clone(),attempt_number:attempt,status:db::ReviewStatus::Failed,
+            step_results_json:json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":101,"stderr_tail":"failed","failures":signatures}]}).to_string(),
+            started_at:now.clone(),created_at:now.clone(),updated_at:now.clone(),
+        }).await.unwrap();
+    }
+    let (status, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let step = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == "CI-0")
+        .unwrap();
+    assert_eq!(step["status"], "superseded");
+    assert_eq!(step["streak"], 0);
+}

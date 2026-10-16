@@ -94,7 +94,7 @@ derived.**
   every existing row re-serializes byte-for-byte.
 - Forge-computed state (ids for new findings, open/resolved status, age)
   never goes into the frozen row.
-- A pure function, `finding_ledger(reviews_in_window)`, computes it from the
+- A pure function, `db::review_findings::finding_ledger(reviews_in_window)`, computes it from the
   Task's ordered Reviews in the current review-budget window. The same window
   resets the review budget at a recovery boundary.
 - Routing, the repair brief, comments and `GET /tasks/{id}/findings` all call
@@ -238,8 +238,10 @@ Today the same Task parks at review 2 with `review_budget_exhausted`.
   2026-10-16): if the brief is still over, check tails share 4 KiB and verify
   keeps 2 KiB; then each finding's summary is cut to 200 characters, `where`
   to 120, `expected` and `observed` to 300, and past a line budget the
-  remaining open findings are listed by id. Only an oversized Task description
-  or plan can still exceed the cap (logged).
+  remaining open findings are listed by id. Description and plan each keep
+  4 KiB including a truncation note; compacted updates share 1 KiB across
+  steps. The final 24 KiB cap includes its notice even for an exceptional
+  window whose ids alone exceed the message capacity.
 
 **D8 — Verify runs as its own check request after review CI.**
 - New `CheckPurpose::ReviewVerify`, origin `entry`.
@@ -419,3 +421,27 @@ jq '{app_id:"web", change_summary:.title, changed_files:.changed_files,
 munk verify change --request-file "$FORGE_VERIFY_DIR/munk-request.json" --config munk.yaml
 # convert .munk/runs/<latest>/report.json → $FORGE_VERIFY_REPORT (verdict + screenshots)
 ```
+
+## Phase 4 implementation decisions (2026-10-16)
+
+- The pure ledger lives in `db::review_findings`, below both transactional
+  budget charging and reviewer/services callers, avoiding a dependency cycle.
+- `failures_truncated=false` describes extraction completeness, not command
+  coverage. Existing failure outcomes cannot prove all test binaries ran, so
+  only a passing CI step resolves omitted signatures. A failed step leaves
+  omitted findings and their streaks unchanged. Replaced step-level findings
+  become `superseded`, never progress credit.
+- Task description and plan each keep 4 KiB, including a truncation note.
+  Compacted updates share 1 KiB across steps; the 24 KiB cap is unconditional.
+  Exceptionally large id-only windows can exceed a message's capacity; the
+  final note directs the reader to the complete ledger.
+- Merge-CI messages retain 20 signatures (`+N more`) and a 2 KiB output end.
+- Review-entry merge-base observations can open/update base Attention, but
+  only newer queue-head target-tip passing observations can resolve it.
+- Project `retry_budgets.review_progress` supplies the Review state default;
+  explicit state values and Task-wide overrides win. The later anchoring,
+  reopened, and strategy-switch phases remain unimplemented.
+
+- The hook's merged configuration is an optional trailing field on the typed
+  review-routing command. Three-field queued requests decode with no supplied
+  configuration; new requests carry the hook configuration when present.

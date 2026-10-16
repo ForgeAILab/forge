@@ -214,7 +214,7 @@ impl IntegrationSteps {
                 IntegrationReason::CandidateCheckFailed {
                     attempt_id: attempt_ref(&attempt.id),
                     check: "ci_steps".into(),
-                    message: bounded(&detail),
+                    message: super::bounded_ci_failure(&detail),
                 },
                 merge_failure_result(&ctx, &task, details, FailureKind::CiFailed).await,
             )
