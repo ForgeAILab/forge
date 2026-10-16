@@ -1743,7 +1743,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a third appearance parks for the owner. Findings-less windows retain legacy
   repeat handling, and coordination leads retain replan routing.
 - Failed CI rounds no longer resolve tests absent from a fail-fast run's
-  signature list. Only passing steps prove those tests fixed. Base-CI Attention
+  signature list. Only passing steps (or a passing CI-triage re-run of the step)
+  prove those tests fixed. Base-CI Attention
   resolves only from a newer queue-head target-tip pass.
 - Repair briefs enforce 24 KiB even with long Task text and many waived
   failures. Merge-CI repairs name up to 20 failing tests and retain 2 KiB of output.

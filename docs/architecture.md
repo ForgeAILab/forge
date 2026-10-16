@@ -8256,7 +8256,8 @@ no signatures uses `CI-<step>`. A failing step's omitted signatures never resolv
 streaks. `failures_truncated: false` means every extracted failure was retained;
 it cannot prove that a fail-fast runner executed later test binaries. With the
 current outcome fields, only a passing step provides complete pass evidence and
-resolves its per-test findings. A step-level finding replaced by per-test
+resolves its per-test findings: a first-run pass, or a CI-triage re-run of the
+whole step that passed (step class `flaky`). A step-level finding replaced by per-test
 findings becomes `superseded`, never a resolution or progress credit. The re-review prompt carries the prior ledger's
 open ids and retains the 8 KiB report slice. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. The ledger also drives round-policy routing

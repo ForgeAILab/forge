@@ -130,6 +130,10 @@ The types SHALL be exported to the generated TypeScript and documented in
 - **WHEN** a CI step fails again with an untruncated list that omits a prior test
 - **THEN** that test retains its previous status, streak and last checked attempt; it contributes no false progress
 
+#### Scenario: A passing triage re-run resolves omitted tests
+- **WHEN** a CI step fails on its first run but its CI-triage re-run of the whole step passes (step class `flaky`)
+- **THEN** prior per-test findings of that step absent from the first run's list are resolved, as after a first-run pass
+
 #### Scenario: Per-test CI findings replace a step finding
 - **WHEN** a failed step formerly represented by CI-0 now reports signatures
 - **THEN** CI-0 is superseded, not resolved, and GET findings reports that additive status

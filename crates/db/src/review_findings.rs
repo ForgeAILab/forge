@@ -92,73 +92,77 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 .cloned()
                 .chain(classes.keys().cloned())
                 .collect();
-            if step.exit_code == 0 || !signatures.is_empty() {
-                // failures_truncated=false only means extraction kept every observed
-                // failure. A red runner can stop before later binaries run, so
-                // only a passing step proves absent tests have been fixed.
-                if step.exit_code == 0 {
-                    for (id, entry) in &ledger {
-                        if entry.source == Source::Ci && id.starts_with(&format!("{prefix}#")) {
-                            observations.insert(
-                                id.clone(),
-                                (Source::Ci, step.command.clone(), true, String::new(), None),
-                            );
-                        }
-                    }
-                }
-                if !signatures.is_empty() {
-                    detailed_ci.insert(prefix.clone());
-                    for signature in signatures {
-                        let class = classes
-                            .get(&signature)
-                            .copied()
-                            .or_else(|| step.triage.as_ref().and_then(|triage| triage.class));
-                        let id = ci_finding_id(step.index, &signature);
-                        if step
-                            .triage
-                            .as_ref()
-                            .is_some_and(|triage| triage.mode == api_types::ReviewCiTriage::Full)
-                            && class.is_some_and(|class| !class.blocks())
-                        {
-                            non_blocking.insert(id.clone());
-                        }
+            // failures_truncated=false only means extraction kept every observed
+            // failure. A red runner can stop before later binaries run, so only
+            // a passing step proves absent tests have been fixed: a first-run
+            // pass, or a triage re-run of the whole step that passed (`flaky`).
+            let step_passed = step.exit_code == 0
+                || step
+                    .triage
+                    .as_ref()
+                    .is_some_and(|triage| triage.class == Some(api_types::CiFailureClass::Flaky));
+            if step_passed {
+                for (id, entry) in &ledger {
+                    if entry.source == Source::Ci && id.starts_with(&format!("{prefix}#")) {
                         observations.insert(
-                            id,
-                            (
-                                Source::Ci,
-                                step.command.clone(),
-                                step.exit_code == 0,
-                                signature,
-                                class,
-                            ),
+                            id.clone(),
+                            (Source::Ci, step.command.clone(), true, String::new(), None),
                         );
                     }
-                    // Replace an older step-only failure once precise evidence exists.
-                    if step.exit_code != 0 {
-                        superseded.insert(prefix.clone());
+                }
+            }
+            if !signatures.is_empty() {
+                detailed_ci.insert(prefix.clone());
+                for signature in signatures {
+                    let class = classes
+                        .get(&signature)
+                        .copied()
+                        .or_else(|| step.triage.as_ref().and_then(|triage| triage.class));
+                    let id = ci_finding_id(step.index, &signature);
+                    if step
+                        .triage
+                        .as_ref()
+                        .is_some_and(|triage| triage.mode == api_types::ReviewCiTriage::Full)
+                        && class.is_some_and(|class| !class.blocks())
+                    {
+                        non_blocking.insert(id.clone());
                     }
                     observations.insert(
-                        prefix.clone(),
-                        (Source::Ci, step.command.clone(), true, String::new(), None),
+                        id,
+                        (
+                            Source::Ci,
+                            step.command.clone(),
+                            step.exit_code == 0,
+                            signature,
+                            class,
+                        ),
                     );
-                    if step.triage.as_ref().is_some_and(|triage| {
-                        triage.blocking && triage.mode == api_types::ReviewCiTriage::Full
-                    }) && !classes.is_empty()
-                        && classes.values().all(|class| !class.blocks())
-                    {
-                        observations.insert(
-                            prefix,
-                            (
-                                Source::Ci,
-                                step.command,
-                                false,
-                                "Failure evidence is incomplete".into(),
-                                None,
-                            ),
-                        );
-                    }
-                    continue;
                 }
+                // Replace an older step-only failure once precise evidence exists.
+                if step.exit_code != 0 {
+                    superseded.insert(prefix.clone());
+                }
+                observations.insert(
+                    prefix.clone(),
+                    (Source::Ci, step.command.clone(), true, String::new(), None),
+                );
+                if step.triage.as_ref().is_some_and(|triage| {
+                    triage.blocking && triage.mode == api_types::ReviewCiTriage::Full
+                }) && !classes.is_empty()
+                    && classes.values().all(|class| !class.blocks())
+                {
+                    observations.insert(
+                        prefix,
+                        (
+                            Source::Ci,
+                            step.command,
+                            false,
+                            "Failure evidence is incomplete".into(),
+                            None,
+                        ),
+                    );
+                }
+                continue;
             }
             let class = step.triage.as_ref().and_then(|triage| triage.class);
             if step.triage.as_ref().is_some_and(|triage| {
@@ -1001,5 +1005,44 @@ mod tests {
             entry(&ledger, &ci_finding_id(0, "a")).status,
             Status::Resolved
         );
+    }
+    // A triage re-run that passed ran the whole step green: every test absent
+    // from the first run's list is proven fixed, as after a first-run pass.
+    #[test]
+    fn finding_ledger_passing_triage_rerun_resolves_tests_absent_from_the_first_run() {
+        for (mode, flaky) in [("full", Status::Flaky), ("report", Status::Open)] {
+            let first = review(
+                1,
+                json!({"ci_steps":[{"index":0,"command":"test","exit_code":1,"stderr_tail":"","failures":["a","b"]}]}),
+            );
+            let second = review(
+                2,
+                json!({"ci_steps":[{"index":0,"command":"test","exit_code":1,"stderr_tail":"","failures":["c"],"triage":{
+                    "mode":mode,"base_status":"available","base_commit":null,"rerun_run_id":"rerun","base_run_id":null,
+                    "reason":null,"class":"flaky","blocking":mode == "report",
+                    "failures":[{"signature":"c","class":"flaky"}]
+                }}]}),
+            );
+            let ledger = finding_ledger(&[first.clone(), second.clone()]).unwrap();
+            for signature in ["a", "b"] {
+                let fixed = entry(&ledger, &ci_finding_id(0, signature));
+                assert_eq!(
+                    (fixed.status, fixed.last_checked_attempt),
+                    (Status::Resolved, 2),
+                    "{mode} {signature}"
+                );
+            }
+            assert_eq!(
+                entry(&ledger, &ci_finding_id(0, "c")).status,
+                flaky,
+                "{mode}"
+            );
+            assert!(
+                round_policy(std::slice::from_ref(&first), &second)
+                    .unwrap()
+                    .progress,
+                "{mode}"
+            );
+        }
     }
 }

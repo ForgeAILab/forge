@@ -6183,7 +6183,8 @@ zero-based `CI-<step index>#<first 8 hex of sha256(normalised failure signature)
 for steps with test signatures, `CI-<step index>` for failed steps without
 signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
 same test keeps its id across review rounds and server/daemon owners. A
-passing step resolves its per-test findings. An untruncated failure list
+passing step resolves its per-test findings; so does a step whose CI-triage
+re-run passed (step class `flaky`). An untruncated failure list
 only proves that every observed signature fit in the extraction cap; it cannot
 prove that a fail-fast command executed later binaries. Therefore a failed step
 never resolves an omitted test or advances that test's streak. A step-level
