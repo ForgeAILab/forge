@@ -8821,7 +8821,10 @@ execute and settle every group, including the background server, on pass,
 fail, timeout, cancellation and dropped execution. The start step records its
 group in `start.pgid`; before any verify starts, the owner stops a recorded
 group whose leader is gone but whose members still run (left by a server
-crash or restart), in every verify directory of the Task root. Ports handed
+crash or restart), in every verify directory of the Task root. Runs this
+server is executing are registered in memory and skipped, since a live run's
+group looks the same once its start step has exited; a Review whose own
+record cannot be confirmed stopped is refused rather than started beside it. Ports handed
 to verify runs are held by the server for the longest wall limit. Once a run’s
 receipt confirms its groups stopped, the owner deletes `start.pgid` to avoid
 signalling a reused group id later. A process that leaves its group (`setsid`

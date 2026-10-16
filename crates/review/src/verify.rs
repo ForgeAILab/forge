@@ -192,7 +192,17 @@ pub fn prepare_environment(
     let directory = directory(worktree, review_id)?;
     ensure_directory(&directory, worktree)?;
     if let Some(verify) = directory.parent() {
-        stop_orphaned_starts(verify);
+        // This Review's own record would be overwritten by the new start
+        // step: one whose group could not be confirmed stopped is kept and
+        // nothing is started beside it.
+        if stop_orphaned_starts(verify)
+            .iter()
+            .any(|name| name.to_str() == Some(review_id))
+        {
+            return Err(
+                "an earlier verify app of this Review could not be confirmed stopped".into(),
+            );
+        }
     }
     for file in ["start.exit", "start.pid", "start.pgid", "app.log", "port"]
         .into_iter()
@@ -423,10 +433,12 @@ fn pick_port(mut candidate: impl FnMut() -> Result<u16, String>) -> Result<u16, 
 /// this Task root is looked at, so neither the re-run of an attempt nor a
 /// later attempt starts beside such an orphan. Only real directories and
 /// regular files are read; a record whose group is gone is removed. A Review
-/// this server is running now is not an orphan and is left alone.
-fn stop_orphaned_starts(verify: &Path) {
+/// this server is running now is not an orphan and is left alone. Returns the
+/// Review directories whose group could not be confirmed stopped.
+fn stop_orphaned_starts(verify: &Path) -> Vec<std::ffi::OsString> {
+    let mut unconfirmed = Vec::new();
     let Ok(entries) = std::fs::read_dir(verify) else {
-        return;
+        return unconfirmed;
     };
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
@@ -450,8 +462,11 @@ fn stop_orphaned_starts(verify: &Path) {
         };
         if process_supervisor::stop_orphaned_group(group) {
             let _ = std::fs::remove_file(&record);
+        } else {
+            unconfirmed.push(entry.file_name());
         }
     }
+    unconfirmed
 }
 
 /// Refuse symlinked reserved directories before writing or reading any inputs.
@@ -708,6 +723,38 @@ mod tests {
         assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
         assert!(!alive(&app));
         assert!(!dir.join("start.pgid").exists());
+    }
+
+    /// The new start step overwrites `start.pgid`. A record whose group the
+    /// sweep could not confirm stopped (here group 1, which is never signalled)
+    /// must survive, and nothing may start beside it.
+    #[cfg(unix)]
+    #[test]
+    fn review_verify_prepare_keeps_an_unconfirmed_group_record_and_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let worktree = temp.path().join("task/repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+        executors::sandbox::TaskRoot::reserve(worktree.parent().unwrap()).unwrap();
+        let config: ReviewVerifyConfig = serde_json::from_value(
+            json!({"start":"sleep 300","checks":[{"name":"smoke","command":"true"}]}),
+        )
+        .unwrap();
+        let rerun =
+            build_bundle(&config, "workspace", 1, "review-1", 1, std::iter::empty()).unwrap();
+        let dir = directory(&worktree, "review-1").unwrap();
+        ensure_directory(&dir, &worktree).unwrap();
+        std::fs::write(dir.join("start.pgid"), "1\n").unwrap();
+        assert!(prepare_environment(&rerun, &worktree).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("start.pgid")).unwrap(),
+            "1\n"
+        );
+        // Another Review's unconfirmed record is kept for a later sweep but
+        // does not block this one, whose own directory has no such record.
+        let other =
+            build_bundle(&config, "workspace", 1, "review-2", 0, std::iter::empty()).unwrap();
+        prepare_environment(&other, &worktree).unwrap();
+        assert!(dir.join("start.pgid").is_file());
     }
 
     #[test]

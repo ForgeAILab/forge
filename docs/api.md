@@ -6415,7 +6415,10 @@ stopped and verified stopped on every outcome, using the same check executor
 and supervisor as CI. The start step records its process group in
 `start.pgid`; before a verify starts anything, Forge stops a recorded group
 that a crashed or restarted server left running in any verify directory of
-the Task root. A stopped run’s receipt causes `start.pgid` to be deleted, so
+the Task root. A verify this server is still running (for example a sibling
+coordination child's) is never treated as such a group. When this Review's own
+record cannot be confirmed stopped, the record is kept and the run ends as an
+infrastructure outcome instead of starting beside it. A stopped run’s receipt causes `start.pgid` to be deleted, so
 later recovery cannot signal an unrelated reused group id. A process that leaves
 its group (`setsid`, a daemonizing start) is outside that stop. After the run,
 Forge checks whether the port is free on both loopbacks. A port still in use
