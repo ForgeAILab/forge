@@ -2862,7 +2862,9 @@ impl TaskService {
             &project.workflow_definition,
             &crate::worker_runtime::queue::cascade_actor(),
         );
-        let mut context = crate::workflow::dispatch::loader::load_agent_dispatch_context(
+        // The brief is best effort: like a refused dispatch, an unreadable
+        // context leaves the normal review-failure routing in charge.
+        let mut context = match crate::workflow::dispatch::loader::load_agent_dispatch_context(
             crate::workflow::dispatch::loader::DispatchContextParams {
                 db: Arc::clone(&self.db),
                 router: &self.workspace_backend_router,
@@ -2876,7 +2878,19 @@ impl TaskService {
                 workflow: &workflow,
             },
         )
-        .await?;
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    project_id = %project.id,
+                    %error,
+                    "automatic review recovery skipped because its repair brief could not load"
+                );
+                return Ok(None);
+            }
+        };
         context.repair_budget = Some(crate::workflow::dispatch::repair_brief::RepairBudget {
             name: "review".into(),
             spent: existing_rejections,
