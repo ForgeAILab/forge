@@ -8,6 +8,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Demo images can target ARM64 servers with the optional `DEMO_PLATFORM` repository variable, using native builds and a separate cache for each platform (default: `linux/amd64`).
 - **A public demo deployment and a pull-request suite check.** `deploy/demo/`
   holds a Compose application for Dokploy and a demo image for a throwaway
   public instance: seeded demo data, no agent daemon, no MCP endpoint, no
