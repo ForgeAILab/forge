@@ -563,7 +563,6 @@ impl WorkflowExecution<'_> {
         task: &db::Task,
         ctx: &HookContext,
         action: &str,
-        failure: &str,
         entry_started_at: &str,
         authority: Option<&WorkflowAuthority>,
     ) -> crate::Result<Option<ReviewEntryFailure>> {
@@ -592,35 +591,9 @@ impl WorkflowExecution<'_> {
         let Some(review) = latest_review(&self.db, &task.id).await? else {
             return Ok(None);
         };
-        let review_state = ctx
-            .workflow
-            .states
-            .iter()
-            .find(|state| state.name == ctx.to_state)
-            .is_some_and(|state| {
-                state.name == "review"
-                    || state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-            });
-        if review_state
-            && review.started_at.as_str() < entry_started_at
-            && db::budget::receipt_recorded(
-                self.db.pool(),
-                &task.id,
-                db::budget::Kind::ReviewProgress.key(),
-                &format!("progress:{}", review.id),
-            )
-            .await?
-        {
-            let task = self
-                .task_service
-                .annotate_review_ci_interruption(task, ctx, failure, true, false)
-                .await?;
-            return Ok(Some(ReviewEntryFailure {
-                task,
-                cascade: None,
-                bridge: Default::default(),
-            }));
-        }
+        // Infrastructure interruptions were classified and settled by the
+        // hook above. A progress receipt does not turn configuration or other
+        // deterministic failures into infrastructure retries.
         if action != "run_ci_steps" {
             return Ok(None);
         }

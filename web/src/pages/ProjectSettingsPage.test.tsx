@@ -344,3 +344,67 @@ it('keeps model switching opt-in and saves the explicit choice', async () => {
   fireEvent.click(screen.getByRole('button', { name: 'Save' }))
   expect(mutate.mock.calls[0][0].body.settings.repair_switch_model_when_stuck).toBe(true)
 })
+
+describe('Project verify settings', () => {
+  it('edits and saves verify commands and limits while preserving CI', async () => {
+    renderSettings('general')
+    await waitFor(() =>
+      expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+    )
+    expect(
+      (screen.getByLabelText('Verify the running app before review') as HTMLInputElement).checked,
+    ).toBe(false)
+    fireEvent.click(screen.getByLabelText('Verify the running app before review'))
+    fireEvent.change(screen.getByLabelText('Start command (optional)'), {
+      target: { value: 'pnpm dev --port "$FORGE_VERIFY_PORT"' },
+    })
+    fireEvent.change(screen.getByLabelText('Readiness URL path (optional)'), {
+      target: { value: '/health' },
+    })
+    fireEvent.change(screen.getByLabelText('Check 1 command'), {
+      target: { value: './scripts/verify.sh' },
+    })
+    fireEvent.change(screen.getByLabelText('Verify run timeout (seconds)'), {
+      target: { value: '42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          default_review_config: expect.objectContaining({
+            ci_steps: ['cargo test -p db one_case'],
+            verify: expect.objectContaining({
+              ready_path: '/health',
+              timeout_seconds: 42,
+              checks: [{ name: 'smoke', command: './scripts/verify.sh' }],
+            }),
+          }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+  it('loads verify and clears it when disabled', async () => {
+    query.data = {
+      ...project,
+      default_review_config: {
+        ci_steps: ['true'],
+        verify: { ready_path: '/', checks: [{ name: 'smoke', command: 'verify' }] },
+      },
+    }
+    renderSettings('general')
+    await waitFor(() =>
+      expect((screen.getByLabelText('Check 1 command') as HTMLInputElement).value).toBe('verify'),
+    )
+    fireEvent.click(screen.getByLabelText('Verify the running app before review'))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          default_review_config: expect.objectContaining({ verify: null }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+})

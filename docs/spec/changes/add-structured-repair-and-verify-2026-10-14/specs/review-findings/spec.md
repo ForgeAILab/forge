@@ -109,8 +109,10 @@ one function.
 
 ### Requirement: Findings are readable through the API and CLI
 `GET /api/v1/tasks/{id}/findings` SHALL return the current window's ledger as
-`{ items, window_started_at, review_attempts }`. `items` is ordered by id and
-has at most 200 entries. The route needs the same Task read authority as
+`{ items, window_started_at, review_attempts }`. `items` has at most 200 entries
+after complete derivation. It prioritizes open blocking verify findings, then
+other open blocking findings, then other statuses/severities, with natural id
+ordering within each group. The route needs the same Task read authority as
 `GET /api/v1/tasks/{id}/reviews`.
 
 `forge-ctl task findings <task>` SHALL print the same ledger.
@@ -137,3 +139,7 @@ The types SHALL be exported to the generated TypeScript and documented in
 #### Scenario: Per-test CI findings replace a step finding
 - **WHEN** a failed step formerly represented by CI-0 now reports signatures
 - **THEN** CI-0 is superseded, not resolved, and GET findings reports that additive status
+
+#### Scenario: Verify findings survive a large history
+- **WHEN** more than 200 resolved or minor findings precede an open blocking `V-smoke`
+- **THEN** the capped response includes `V-smoke` before that history

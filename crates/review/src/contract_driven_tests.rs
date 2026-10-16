@@ -31,6 +31,7 @@ const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 /// What a test asks the driver for: where the reviewer logs, and which Agent
 /// reviews.
 struct DrivenReview {
+    entry_verify: Option<api_types::ReviewVerifyDetails>,
     entry_triage: Option<api_types::StepCiTriage>,
     task_id: Uuid,
     executor_execution_id: Uuid,
@@ -150,8 +151,12 @@ impl ContractDriver {
                 ci_results.last_mut().unwrap()["triage"] = serde_json::to_value(triage).unwrap();
             }
         }
+        let mut entry_details = json!({"ci_steps":ci_results});
+        if let Some(verify) = req.entry_verify {
+            entry_details["verify"] = serde_json::to_value(verify).unwrap();
+        }
         sqlx::query("UPDATE review SET step_results_json = ?, updated_at = ? WHERE id = ?")
-            .bind(json!({ "ci_steps": ci_results }).to_string())
+            .bind(entry_details.to_string())
             .bind(now_rfc3339())
             .bind(&review.id)
             .execute(db.pool())
@@ -354,12 +359,15 @@ impl ContractDriver {
             _ if task.review_passed_at.is_some() => Some(None),
             _ => None,
         };
+        let mut settled: Value = serde_json::from_str(&review.step_results_json).unwrap();
+        settled["ci_steps"] = json!(ci_results);
+        settled["auditor"] = auditor;
+        settled["conformance"] = serde_json::to_value(conformance).unwrap();
         ReviewRepo::update_status_with_review_authority_and_task_projection(
             db,
             &review.id,
             status,
-            json!({ "ci_steps": ci_results, "auditor": auditor, "conformance": conformance })
-                .to_string(),
+            settled.to_string(),
             Some(finished.clone()),
             &finished,
             task.version,
@@ -414,6 +422,9 @@ struct SeededReview {
 }
 
 async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
+    seeded_review_with_executor(ci_steps, "shell").await
+}
+async fn seeded_review_with_executor(ci_steps: Vec<&str>, executor_type: &str) -> SeededReview {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
@@ -511,7 +522,7 @@ async fn seeded_review(ci_steps: Vec<&str>) -> SeededReview {
             id: agent_id.clone(),
             name: "shell".to_owned(),
             description: None,
-            executor_type: "shell".to_owned(),
+            executor_type: executor_type.to_owned(),
             model: None,
             reasoning_effort: None,
             permission_policy: None,
@@ -708,6 +719,7 @@ async fn unbound_reviewer_contract_cannot_use_empty_or_legacy_ci_results() {
 
 fn request(seed: &SeededReview) -> DrivenReview {
     DrivenReview {
+        entry_verify: None,
         entry_triage: None,
         task_id: seed.task_id,
         executor_execution_id: seed.executor_execution_id,
@@ -1703,4 +1715,66 @@ async fn ci_triage_frozen_entry_failure_stays_nonblocking_during_conformance() {
             .unwrap()
             .blocking
     );
+}
+
+struct VerifyResultAwareAuditor;
+#[async_trait]
+impl TaskExecutor for VerifyResultAwareAuditor {
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> Result<executors::ExecutionResult, executors::ExecutorError> {
+        assert!(ctx.description.contains("Verify results:"));
+        assert!(ctx.description.contains("Save persisted"));
+        assert!(ctx.description.contains("screen-one.png"));
+        assert!(ctx.description.contains("screen-two.png"));
+        assert!(ctx.description.contains("Frozen review contract:"));
+        let report=format!("Forge verify smoke passed: Save persisted; screen-one.png and screen-two.png are recorded evidence.\n\n{}",json!({"result":"pass","reason":"Forge verify confirms the save behavior"}));
+        let mut writer = LogWriter::new(&ctx.logs_path, ctx.execution_id, MAX_LOG_BYTES);
+        writer
+            .write(LogKind::Assistant, LogStream::Main, json!({"text":report}))
+            .await?;
+        Ok(executors::ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            ..Default::default()
+        })
+    }
+    async fn cancel(&self, _: &str) -> Result<(), executors::ExecutorError> {
+        Ok(())
+    }
+}
+#[tokio::test]
+async fn reviewer_receives_and_can_cite_the_recorded_pre_review_verify_result() {
+    let seed = seeded_review_with_executor(vec!["true"], "claude_code").await;
+    git::init(seed.workspace.path()).await.unwrap();
+    tokio::fs::write(seed.workspace.path().join("README.md"), "candidate\n")
+        .await
+        .unwrap();
+    git::commit_all(seed.workspace.path(), "candidate")
+        .await
+        .unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let mut req = request(&seed);
+    req.logs_path = logs.path().join("review.jsonl").display().to_string();
+    req.auditor_agent_id = Some(seed.auditor_agent_id.clone());
+    req.entry_verify=Some(serde_json::from_value(json!({"status":"pass","checks":[{"name":"smoke","result":"pass","summary":"Save persisted","evidence":["media-one","media-two"],"evidence_paths":["/task/.forge-task/verify/1/screen-one.png","/task/.forge-task/verify/1/screen-two.png"]}]})).unwrap());
+    let runner = ContractDriver::new(
+        Arc::clone(&seed.db),
+        Arc::clone(&seed.event_bus),
+        Arc::new(VerifyResultAwareAuditor),
+    );
+    let (review, outcome) = runner.run(req).await.unwrap();
+    assert_eq!(outcome, ReviewOutcome::Passed);
+    let details: api_types::ReviewDetails =
+        serde_json::from_str(&review.step_results_json).unwrap();
+    assert_eq!(
+        details.verify.unwrap().status,
+        api_types::ReviewVerifyStatus::Pass
+    );
+    assert!(details
+        .conformance
+        .assessment
+        .unwrap()
+        .reason
+        .contains("verify"));
 }

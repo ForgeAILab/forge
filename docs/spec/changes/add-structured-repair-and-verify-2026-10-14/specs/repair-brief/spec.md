@@ -104,7 +104,9 @@ off for a window once any reviewer `fail` in it had no blocking finding. In
 that case today's exhaustion behaviour applies.
 
 Coordination roots with a lead SHALL keep `charge_replan` and get no progress
-rounds.
+rounds. During a progress round, only review-entry failures classified as
+infrastructure SHALL use the infrastructure retry path; configuration and
+other deterministic errors retain ordinary parking.
 
 #### Scenario: Progress earns a round
 - **WHEN** under the default gate, review 1 opens F1, F2 and F3, and review 2 leaves only F1 open
@@ -113,6 +115,10 @@ rounds.
 #### Scenario: No progress parks as before
 - **WHEN** the review budget is spent and review 2 leaves the same number of findings open as review 1
 - **THEN** the Task parks with `review_budget_exhausted` as today
+
+#### Scenario: Configuration error during a progress round
+- **WHEN** a progress repair returns to review with invalid entry configuration
+- **THEN** it parks as before and spends no infrastructure retry allowance
 
 #### Scenario: Disabled
 - **WHEN** a Task's `retry_budgets.review_progress` is 0

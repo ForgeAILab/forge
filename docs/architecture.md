@@ -7562,7 +7562,7 @@ and are not budget counters.
 |---|---|---|
 | Review | 2 failures, 1 routed bounce (fallback/autonomous limit 3) | Review origin window; failed verdict and existing charged gate outcome |
 | ReviewProgress | 2 extra repair rounds; 0 disables | Review origin window; `progress:<review id>` receipt |
-| ReviewVerifyRerun | 1 inconclusive verify re-run | Volatile counter per verify evaluation (execution is a later phase) |
+| ReviewVerifyRerun | 1 inconclusive verify re-run | Invocation counter checkpointed on the suspended review hook; no Task spending |
 | RepairNoChange | 1 reminder, then owner park | Review origin window; unchanged clean candidate at the end of a coder repair |
 | GateRejection(state) | Planning 2; merging 1; cancelled review entry `max_rejections - 1`; custom gate limit | Matching gate; rejected transition |
 | MergeFix | 1 ordinary repair; 0 disables | Merging origin window; ordinary repair transition |
@@ -8279,8 +8279,11 @@ contribute zero: raising a minor to blocking starts at one. A structured reviewe
 fail left with no blocking findings parks `review_needs_owner` with
 `only non-blocking findings remain`, without spending a Review allowance. The Task findings API and CLI expose
 the same projection. Merge failures stay outside it. The ledger also drives round-policy routing
-and budget charging through `db::review_findings::round_policy`. Findings are naturally ordered by id before
-any API cap (`F2` before `F10`); the complete projection still reserves all ids.
+and budget charging through `db::review_findings::round_policy`. The complete
+projection is naturally ordered by id (`F2` before `F10`) and reserves all ids.
+Before its 200-entry cap, the API prioritizes open blocking verify findings,
+then other open blockers, then other severities/statuses; each group keeps
+natural ordering.
 
 Task review comments now use this same projection after the settled attempt:
 headline, GFM checklist, optional recorded verify summary, then a Review-tab
@@ -8293,14 +8296,14 @@ are read back into agent prompts. A window Review the ledger cannot read (an
 older details shape) leaves the list out of the comment; rendering a comment
 never stops the cascade that posts it. The full report stays with the
 Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
-Review-entry CI failures post the same result comment even without a reviewer.
+Review-entry CI and verify failures post the same result comment even without a reviewer.
 Repair-round system comments name the review budget and open/resolved ids; owner
 parks name the rule and open ids. Each result, repair and park comment has a
 separate Review-derived `idempotency_key`, using the existing comment repository
 transaction to suppress replay duplicates. The web Review tab reads the ledger
 above the latest attempt and keeps per-attempt findings and the full report in
 history. Verify rendering is conditional on recorded data; verify execution and
-progress rounds use the same ledger. Verify execution is a later phase.
+progress rounds use the same ledger. Verify runs on the durable check runner as described below.
 
 Coder and autonomous-worker repair requests use one `RepairBrief` in
 `workflow/dispatch`; automatic review recovery uses the same builder. It reads
@@ -8330,17 +8333,17 @@ UTF-8-safe truncation note. Waived and other update lines share a 1 KiB allowanc
 once compacted; check output shares 8 KiB and logs keep 1 KiB. The final byte
 bound includes its truncation notice even if an exceptional window has more ids
 than the entire brief can contain; the complete ledger remains readable.
-Attempts retains the last three settled review rounds: their reviewed commit
+Attempt diffs are loaded only for coder/worker repair dispatches in active states. Attempts retains the last three settled review rounds: their reviewed commit
 range, up to 20 changed files with diff statistics through the workspace owner,
 the coder completion summary (1 KiB), and resolved/left-open/opened finding IDs.
 Missing historical Git evidence is explicitly unavailable. The closing instruction
 asks the coder not to repeat an approach that left a finding open, or to explain
-why it failed before. Requirement status is one line per frozen requirement:
+why it failed before. Requirement status shows at most 40 frozen requirements, open blockers first, then `+N more`:
 `unmet` for an open blocking citation, `addressed` when only resolved findings cite
 it, otherwise `no open finding`. Pattern joins transitive `same_cause_as` families,
 including resolved ancestors and locations, and asks for every call site to be
-fixed. Requirement status and Pattern are protected with findings under the hard
-24 KiB cap; verify execution remains a later phase. Because it is never cut,
+fixed. Requirement status is omitted when dropping it avoids clipping open finding text; a small status list is retained when the other protected content already requires compact reductions. Pattern remains alongside findings under the hard
+24 KiB cap. Because Pattern is never cut,
 Pattern has display limits instead: open members first, at most 20 sites per
 family and 30 in all (locations clipped), then "+N more"; the ledger keeps every
 member.
@@ -8410,9 +8413,10 @@ Explicit owner findings and the non-blocking-only anchoring park still apply,
 including when recovery routes a previously settled Review.
 Services and transactional charging share `WorkflowDefinition` planning-state and
 coordination-lead-role resolution, including non-default workflows. A review-entry
-hook that fails before producing a new verdict during an already-granted progress
-round uses the existing infrastructure retry/park episode. It does not immediately
-park on the spent ordinary Review budget or spend another progress allowance.
+infrastructure interruption during an already-granted progress round keeps the
+existing infrastructure retry/park episode and does not spend another progress
+allowance. Configuration and other deterministic hook errors retain ordinary
+entry parking; the progress receipt never classifies an error as infrastructure.
 The workflow's reject target is used, including autonomous `working`.
 
 The dispatcher
@@ -8777,6 +8781,37 @@ cite them.
 | What changes under a wait | Configuration: the entry asks again by itself (at most 3 times). A withdrawn check (refused forced delete): the same. Workflow: typed park | "Review-entry CI on the check runner" |
 | How long history lives | `server.check_retention_days` (30); deny-by-default predicate | "Retention of check history" |
 | What the operator sees | `GET /api/v1/operations/status`: `checks`, `check_runs`, per-machine `check_runs` / `borrowed_check_runs`, `recent_errors` (`task_check_exhausted`, `retired_review_auditor_config`) | docs/api.md |
+
+Review verify uses that same runner, after CI passes and before reviewer
+dispatch, as a separate `CheckPurpose::ReviewVerify` consumer with origin
+`entry`. `review::verify::build_bundle` generates the background start,
+readiness and ordered check commands, all `Uncacheable`, under unchanged
+`canonical-ci/1`. Verify's whole-run limit defaults to 1200 seconds (maximum
+3600) independently of CI's 3600-second entry limit. The server owner picks
+a loopback port under its existing admitted checkout lock and supplies
+`FORGE_VERIFY_*` runtime inputs. The Task-root request describes Task text,
+requirements, merge-base/candidate, changed files and open ledger findings.
+There is no new process-spawn path: check-executor and process-supervisor
+execute and settle every group, including the background server, on pass,
+fail, timeout, cancellation and dropped execution.
+
+The review hook keeps its asking-time authority through both CI and verify
+suspensions, and writes combined Review details at settlement. A verify fail
+writes `V-*` observations before reviewer dispatch and uses the existing
+review failure disposition. An inconclusive result gets one bounded rerun,
+then an uncharged `review_blocked` park with source `verify`; owner offers
+are Retry Verify, Mark Reviewed (manual approval with reason), and Cancel.
+Infrastructure failures retain review-CI interruption handling. A daemon
+placement records `not_run` / `placement_unsupported` without launching
+verify. The integration queue head never requests verify.
+
+`details.verify` records each check's result, summary, media ids, Task-root
+evidence paths, app-log tail and skipped-evidence notes. The same Task evidence
+store captures confined regular files under the 25 MiB and kind limits;
+reports cannot escape the verify directory. Reviewer prompts include the
+recorded Verify results and evidence file paths. Optional verify config follows
+the existing workflow/Project/Task merge order; Projects without it keep the
+existing review path. See [API verify configuration](api.md#behavioural-verify-before-reviewer-dispatch).
 
 Not on the runner, and unchanged: conformance setup and required checks,
 before-work and other lifecycle scripts, environment preflight and readiness

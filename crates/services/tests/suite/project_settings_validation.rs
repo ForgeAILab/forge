@@ -273,3 +273,108 @@ async fn executions_repair_model_switch_setting_is_opt_in_and_validated() {
         .is_err());
     }
 }
+
+#[tokio::test]
+async fn review_verify_project_settings_reject_invalid_fields() {
+    let db = fixture().await;
+    let settings = json!({"default_review_config":{"verify":{"ready_path":"/","ready_command":"true","checks":[{"name":"smoke","command":"true"}]}}});
+    let error = validate_project_settings(&db, &settings, &workflow(), Some(PROJECT), Some(MEMBER))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("verify.ready_command"));
+    let valid =
+        json!({"default_review_config":{"verify":{"checks":[{"name":"smoke","command":"true"}]}}});
+    validate_project_settings(&db, &valid, &workflow(), Some(PROJECT), Some(MEMBER))
+        .await
+        .unwrap();
+}
+
+async fn recorded_review_prompt(verify: bool) -> String {
+    let db = fixture().await;
+    let now = now_rfc3339();
+    let task = db::TaskRepo::create(
+        &*db,
+        db::CreateTask {
+            id: db::new_uuid_v4(),
+            project_id: PROJECT.into(),
+            parent_task_id: None,
+            assignee_type: None,
+            assignee_id: None,
+            title: "Save draft".into(),
+            description: None,
+            task_type: "task".into(),
+            status: "review".into(),
+            is_automation: false,
+            priority: 0,
+            subtask_order: None,
+            task_state_config: Some(json!({"review":{"ci_steps":["cargo test"]}}).to_string()),
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)").bind(&candidate).bind(&task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let mut details = json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":0,"stderr_tail":"","output_tail":"test save passed"}]});
+    if verify {
+        details["verify"] = json!({"status":"pass","checks":[{"name":"smoke","result":"pass","summary":"Save persisted","evidence":["media-one"],"evidence_paths":["/task/.forge-task/verify/1/screen-one.png"]}]});
+    }
+    db::ReviewRepo::create(
+        &*db,
+        db::CreateReview {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            execution_id: candidate,
+            attempt_number: 1,
+            status: db::ReviewStatus::Running,
+            step_results_json: details.to_string(),
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let router = services::lifecycle::context::embedded_workspace_router_for_test(
+        db.clone(),
+        temp.path().to_owned(),
+        None,
+    );
+    let context = services::workflow::dispatch::loader::load_agent_dispatch_context(
+        services::workflow::dispatch::loader::DispatchContextParams {
+            db,
+            router: &router,
+            task_id: &task.id,
+            role: "reviewer",
+            state_name: "review",
+            state_config: json!({"review":{"ci_steps":["cargo test"]}}),
+            execution_policy: None,
+            workflow: &workflow(),
+        },
+    )
+    .await
+    .unwrap();
+    use services::workflow::dispatch::PromptBuilder;
+    services::workflow::dispatch::reviewer_prompt::ReviewerPromptBuilder
+        .build(&context)
+        .user
+}
+#[tokio::test]
+async fn reviewer_receives_and_can_cite_the_recorded_pre_review_ci_result() {
+    let prompt = recorded_review_prompt(false).await;
+    assert!(prompt.contains("Forge already ran these checks"));
+    assert!(prompt.contains("cargo test"));
+    assert!(prompt.contains("test save passed"));
+}
+#[tokio::test]
+async fn reviewer_receives_and_can_cite_the_recorded_pre_review_verify_result() {
+    let prompt = recorded_review_prompt(true).await;
+    assert!(prompt.contains("Verify results:"));
+    assert!(prompt.contains("Save persisted"));
+    assert!(prompt.contains("screen-one.png"));
+    assert!(prompt.contains("media-one"));
+}

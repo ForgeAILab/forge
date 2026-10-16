@@ -128,6 +128,7 @@ pub(crate) fn strict_review_details(review: &Review) -> Result<Value> {
     for key in object.keys() {
         if ![
             "ci_steps",
+            "verify",
             "conformance",
             "auditor",
             "user_approval",
@@ -150,6 +151,7 @@ pub(crate) fn strict_review_details(review: &Review) -> Result<Value> {
         }
     }
     for key in [
+        "verify",
         "user_approval",
         "execution",
         "execution_retry",

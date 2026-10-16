@@ -1189,3 +1189,83 @@ async fn canonical_base_assets_are_materialized_without_invalidating_sharing_wit
     }
     assert!(!temp.path().join("assets with spaces").exists());
 }
+
+#[tokio::test]
+async fn review_verify_background_tree_is_stopped_on_cancellation_and_dropped_run() {
+    let (temp, _) = candidate().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let pid = scratch.path().join("server.pid");
+    let start = format!("sleep 300 >/dev/null 2>&1 & echo $! > '{}'", pid.display());
+    let spec = canonical_spec(&[&start, "sleep 300"]);
+    let environment = BTreeMap::new();
+    let cancel = CancellationToken::new();
+    let permit = CheckPermit::already_admitted();
+    let input = || CheckExecution {
+        operation_id: "verify-cancel",
+        spec: &spec,
+        target: CheckoutTarget::Workspace(temp.path()),
+        owner: owner(),
+        input_revisions: None,
+        environment: &environment,
+        deadline: Some(Instant::now() + Duration::from_secs(10)),
+        cancel: &cancel,
+        permit: &permit,
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: CLEANUP_TIMEOUT,
+        },
+        output_limit: 512,
+    };
+    let mut run = Box::pin(execute(input()));
+    let ready = async {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pid.is_file() {
+            assert!(Instant::now() < until, "background start did not run");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tokio::select! { result=&mut run=>panic!("run ended before cancel: {result:?}"),_=ready=>{} }
+    cancel.cancel();
+    let receipt = run.await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Cancelled);
+    assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+    assert!(!alive(std::fs::read_to_string(&pid).unwrap().trim()));
+    std::fs::remove_file(&pid).unwrap();
+    let cancel = CancellationToken::new();
+    let mut run = Box::pin(execute(CheckExecution {
+        operation_id: "verify-drop",
+        spec: &spec,
+        target: CheckoutTarget::Workspace(temp.path()),
+        owner: owner(),
+        input_revisions: None,
+        environment: &environment,
+        deadline: Some(Instant::now() + Duration::from_secs(10)),
+        cancel: &cancel,
+        permit: &permit,
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: CLEANUP_TIMEOUT,
+        },
+        output_limit: 512,
+    }));
+    let ready = async {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pid.is_file() {
+            assert!(Instant::now() < until);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tokio::select! {result=&mut run=>panic!("run ended before drop: {result:?}"),_=ready=>{} }
+    drop(run);
+    let service = std::fs::read_to_string(&pid).unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while alive(service.trim()) {
+        assert!(
+            Instant::now() < until,
+            "dropped run left its background server"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

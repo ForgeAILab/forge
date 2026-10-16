@@ -218,6 +218,19 @@ async fn resolve_attention(db: &db::SqliteDb, dedupe_key: &str) -> Result<()> {
 }
 
 pub(super) fn reject_retired_auditor_config(config: Option<&str>) -> Result<()> {
+    if let Some(raw) = config {
+        let value: Value = serde_json::from_str(raw).map_err(|error| {
+            ServiceError::invalid_operation(format!("task_state_config: {error}"))
+        })?;
+        api_types::validate_review_verify_config(&value)
+            .map_err(ServiceError::invalid_operation)?;
+        if let Some(states) = value.as_object() {
+            for state in states.values() {
+                api_types::validate_review_verify_config(state)
+                    .map_err(ServiceError::invalid_operation)?;
+            }
+        }
+    }
     if names_retired_auditor(config) {
         return Err(ServiceError::invalid_operation(format!(
             "task_state_config.{RETIRED_AUDITOR_CONFIG}"

@@ -1760,3 +1760,118 @@ async fn findings_read_reports_replaced_step_as_superseded() {
     assert_eq!(step["status"], "superseded");
     assert_eq!(step["streak"], 0);
 }
+
+#[tokio::test]
+async fn findings_read_cap_keeps_verify_and_open_blockers_before_minor_or_resolved() {
+    let f = Fixture::new().await;
+    let db = &*f.harness.state.db;
+    f.role(Some("viewer")).await;
+    let now = db::now_rfc3339();
+    let candidate = db::new_uuid_v4();
+    sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)").bind(&candidate).bind(&f.task.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    for attempt in 1..=2 {
+        let steps=(0..210).map(|index|json!({"index":index,"command":format!("check {index}"),"exit_code":if attempt==1 {1}else {0},"stderr_tail":"failed"})).collect::<Vec<_>>();
+        db::ReviewRepo::create(db,db::CreateReview{id:db::new_uuid_v4(),task_id:f.task.id.clone(),execution_id:candidate.clone(),attempt_number:attempt,status:db::ReviewStatus::Failed,
+            step_results_json:json!({"ci_steps":steps,"verify":{"status":"fail","checks":[{"name":"smoke","result":"fail","summary":"button broken"}]},"conformance":{"status":"failed","contract":null,"checks":[],"reason":null,"assessment":{"result":"fail","reason":"minor","findings":[{"summary":"label","severity":"minor"}]}}}).to_string(),started_at:now.clone(),created_at:now.clone(),updated_at:now.clone()}).await.unwrap();
+    }
+    let (status, body) = f
+        .request(
+            Method::GET,
+            "/api/v1/tasks/{task}/findings",
+            None,
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: api_types::TaskFindingsResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(response.items.len(), 200);
+    assert_eq!(response.items[0].id, "V-smoke");
+    assert!(response.items[0].status.is_open());
+}
+
+#[tokio::test]
+async fn review_verify_project_and_task_routes_validate_fields_and_inherit_config() {
+    let f = Fixture::new().await;
+    f.role(Some("admin")).await;
+    let (_, project) = f
+        .request(
+            Method::GET,
+            "/api/v1/projects/{project}",
+            None,
+            &f.other_token,
+        )
+        .await;
+    let verify = json!({"start":"app","ready_path":"/health","checks":[{"name":"smoke","command":"verify"}]});
+    let (status, updated) = f
+        .request(
+            Method::PATCH,
+            "/api/v1/projects/{project}",
+            Some(json!({"version":project["version"],"default_review_config":{"verify":verify}})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["default_review_config"]["verify"], verify);
+    let (status, child) = f
+        .request(
+            Method::POST,
+            "/api/v1/projects/{project}/tasks",
+            Some(json!({"title":"Inherits verify"})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{child}");
+    assert_eq!(child["task_state_config"]["review"]["verify"], verify);
+    let mut invalid = verify.clone();
+    invalid["ready_command"] = json!("true");
+    let (status, error) = f
+        .request(
+            Method::PATCH,
+            "/api/v1/projects/{project}",
+            Some(json!({"version":updated["version"],"default_review_config":{"verify":invalid}})),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert!(error.to_string().contains("verify.ready_command"));
+    let (status, error) = f
+        .request(
+            Method::PATCH,
+            "/api/v1/tasks/{task}",
+            Some(
+                json!({"version":f.task.version,"task_state_config":{"review":{"verify":invalid}}}),
+            ),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert!(error.to_string().contains("verify.ready_command"));
+    invalid = verify.clone();
+    invalid["checks"][0]["timeout_seconds"] = json!(-1);
+    let (status, error) = f
+        .request(
+            Method::PATCH,
+            "/api/v1/tasks/{task}",
+            Some(
+                json!({"version":f.task.version,"task_state_config":{"review":{"verify":invalid}}}),
+            ),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert!(error
+        .to_string()
+        .contains("verify.checks.0.timeout_seconds"));
+    let (status, task) = f
+        .request(
+            Method::PATCH,
+            "/api/v1/tasks/{task}",
+            Some(
+                json!({"version":f.task.version,"task_state_config":{"review":{"verify":verify}}}),
+            ),
+            &f.other_token,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["task_state_config"]["review"]["verify"], verify);
+}

@@ -561,7 +561,7 @@ async fn try_git_read(
 ///    the fix report for what that would take.)
 /// 3. The previous behavior: the named branch's current tip, or `HEAD` when
 ///    no branch is known.
-async fn review_base(
+pub async fn review_base(
     path: &(impl ReviewWorkspace + ?Sized),
     context: &ReviewGoverningContext,
 ) -> Result<String, String> {
@@ -846,6 +846,7 @@ fn parse_stored_ci_steps(details: Value) -> Result<Vec<StepResultEntry>, String>
 
 const PERSISTED_REVIEW_DETAIL_KEYS: &[&str] = &[
     "ci_steps",
+    "verify",
     "conformance",
     "auditor",
     "user_approval",
@@ -866,7 +867,7 @@ fn validate_persisted_review_detail_keys(
             return Err("persisted review ci_steps must be an array".into());
         }
     }
-    for key in ["user_approval", "execution", "execution_retry"] {
+    for key in ["user_approval", "execution", "execution_retry", "verify"] {
         if let Some(value) = details.get(key) {
             if !value.is_object() {
                 return Err(format!("persisted review {key} must be an object"));
@@ -909,8 +910,18 @@ pub async fn prepare_prompt(
     if !shell {
         if let Some(contract) = contract.as_ref() {
             let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
+            let include_verify = !prompt.contains("\nVerify results:\n");
             prompt.push_str(
-                &reviewer_context_prompt(db, task_id, execution_id, path, contract, budget).await,
+                &reviewer_context_prompt(
+                    db,
+                    task_id,
+                    execution_id,
+                    path,
+                    contract,
+                    budget,
+                    include_verify,
+                )
+                .await,
             );
         }
     }
@@ -977,8 +988,26 @@ async fn reviewer_context_prompt(
     path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
+    include_verify: bool,
 ) -> String {
     let mut out = String::new();
+    if include_verify {
+        if let Ok(reviews) = db::ReviewRepo::list_by_task(db, task_id).await {
+            if let Some(review) = reviews
+                .iter()
+                .filter(|r| r.status == db::ReviewStatus::Running)
+                .max_by_key(|r| r.attempt_number)
+            {
+                if let Ok(details) = serde_json::from_str::<Value>(&review.step_results_json) {
+                    if let Ok(verify) = serde_json::from_value::<api_types::ReviewVerifyDetails>(
+                        details["verify"].clone(),
+                    ) {
+                        out.push_str(&crate::verify::prompt(&verify));
+                    }
+                }
+            }
+        }
+    }
     if contract.base_sha != contract.commit_sha {
         let range = format!("{}..{}", contract.base_sha, contract.commit_sha);
         let diff_budget = MAX_INLINE_DIFF_BYTES.min(budget / 2);

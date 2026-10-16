@@ -2178,3 +2178,50 @@ fn repair_brief_cap_keeps_open_findings_with_long_attempts_and_a_large_pattern_f
         assert!(text.contains(expected), "{expected} missing: {text}");
     }
 }
+
+#[test]
+fn repair_brief_caps_requirement_status_before_it_can_crowd_open_findings() {
+    let mut ctx = fake_context(default_roles::CODER);
+    let mut contract = convergence_contract(1);
+    contract["context"]["requirements"]=json!((0..5000).map(|i|json!({"id":format!("R{i}"),"text":"requirement","source":"task","universal":false,"allocated_task_id":null})).collect::<Vec<_>>());
+    ctx.prior_reviews=vec![db::Review {step_results_json:json!({"ci_steps":[],"conformance":{"status":"failed","contract":contract,"checks":[],"assessment":{"result":"fail","reason":"broken","findings":[{"summary":"Save still broken","where":"form.rs:9","expected":"persists","observed":"lost","requirement_ids":["R4999"]}]}}}).to_string(),..fake_review(1,db::ReviewStatus::Failed)}];
+    let text = super::repair_brief::RepairBrief::review(&ctx).render();
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    assert!(text.contains("F1 [reviewer, blocking]"), "{text}");
+    assert!(text.contains("Save still broken"), "{text}");
+    assert!(text.contains("form.rs:9"));
+    assert!(text.contains("persists"));
+    assert!(
+        text.contains("R4999: unmet"),
+        "open requirements come first: {text}"
+    );
+    assert!(text.contains("+4960 more requirements"), "{text}");
+    let requirements = text
+        .split("Requirement status:")
+        .nth(1)
+        .unwrap()
+        .split("Open findings:")
+        .next()
+        .unwrap();
+    assert!(requirements.len() < 8 * 1024);
+}
+
+#[test]
+fn repair_brief_requirement_status_yields_before_open_finding_text_is_clipped() {
+    let mut ctx = fake_context(default_roles::CODER);
+    let mut contract = convergence_contract(1);
+    let requirement_ids = (0..40)
+        .map(|i| format!("R{i}{}", "界".repeat(120)))
+        .collect::<Vec<_>>();
+    contract["context"]["requirements"]=json!(requirement_ids.iter().map(|id|json!({"id":id,"text":"requirement","source":"task","universal":false,"allocated_task_id":null})).collect::<Vec<_>>());
+    let summary = "must retain this entire finding ".repeat(20);
+    let findings=(0..10).map(|i|json!({"summary":format!("{i} {summary}"),"expected":"e".repeat(300),"observed":"o".repeat(300),"requirement_ids":[requirement_ids[i]]})).collect::<Vec<_>>();
+    ctx.prior_reviews=vec![db::Review{step_results_json:json!({"conformance":{"status":"failed","contract":contract,"checks":[],"assessment":{"result":"fail","reason":"issues","findings":findings}}}).to_string(),..fake_review(1,db::ReviewStatus::Failed)}];
+    let text = super::repair_brief::RepairBrief::review(&ctx).render();
+    assert!(text.len() <= 24 * 1024);
+    assert!(
+        text.contains(&summary),
+        "optional requirement status clipped open finding text: {text}"
+    );
+    assert!(text.contains("F10"));
+}

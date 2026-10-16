@@ -387,6 +387,9 @@ pub struct ReviewConfig {
     pub setup_steps: Vec<String>,
     #[serde(default)]
     pub ci_steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub verify: Option<crate::ReviewVerifyConfig>,
     #[serde(default)]
     pub review_prompt: Option<String>,
     /// Wall-clock limit, in seconds, for each setup step and check Forge

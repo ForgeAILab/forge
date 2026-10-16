@@ -8,6 +8,7 @@ mod merge;
 pub(crate) mod no_change;
 mod review;
 mod subtasks;
+mod verify;
 
 pub use carry::CarryReviewAuthority;
 pub use dispatch::{DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder};

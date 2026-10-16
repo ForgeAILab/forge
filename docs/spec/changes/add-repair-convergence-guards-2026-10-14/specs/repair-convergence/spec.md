@@ -47,23 +47,36 @@ The section SHALL end with: "Do not repeat an approach that left a finding open;
 
 When the brief is over budget, Attempts SHALL be cut after the reviewer report, keeping the most recent round longest.
 
+Attempt-memory diffs SHALL be loaded only for coder/worker repair dispatches,
+not reviewer or planner dispatches.
+
 #### Scenario: Third repair round
 - **WHEN** the coder starts repair round 3
 - **THEN** the brief lists rounds 1 and 2 with their files, summaries and finding outcomes, plus the closing instruction
 
 ### Requirement: The repair brief shows requirement status and shared causes
-The brief SHALL include a "Requirement status" line for each frozen requirement:
+The brief SHALL include at most 40 "Requirement status" lines, open blocking
+requirements first, followed by `+N more` when requirements are omitted. Each
+shown frozen requirement is classified as:
 - `unmet` when an open blocking finding cites it;
 - `addressed` when only resolved findings cite it;
 - otherwise `no open finding`.
 
 When findings are linked by `same_cause_as`, the brief SHALL group each family under "Pattern", with its locations, and say: "These share a cause. Fix it at every call site and list the sites you changed."
 
-Neither section is cut for budget. Pattern has fixed display limits instead: open members first, at most 20 sites per family and 30 in all, with clipped locations, then "+N more".
+Requirement status SHALL be omitted when doing so avoids clipping open finding text to meet the hard byte budget; otherwise the normal bounded compact reductions apply. Pattern is not cut for budget and has fixed display limits instead: open members first, at most 20 sites per family and 30 in all, with clipped locations, then "+N more".
 
 #### Scenario: NK-28 style family
 - **WHEN** F3 has `same_cause_as: "F1"` (stale apply after async validation) and F1 was resolved in round 1
 - **THEN** the brief's Pattern section lists F1 and F3 with their locations and asks for a fix at every call site
+
+#### Scenario: A large requirement list cannot crowd open findings
+- **WHEN** a repair brief has thousands of requirements and an open blocking finding
+- **THEN** it shows at most 40 requirement lines with open ones first and `+N more`, remains within 24 KiB, and retains the open finding before optional requirement detail
+
+#### Scenario: Reviewers do not load repair diffs
+- **WHEN** a reviewer or planner is dispatched after a failed Review
+- **THEN** attempt-memory diffs are not loaded for that dispatch
 
 ### Requirement: A carried finding changes the strategy
 A repair round that carries a reviewer finding open in two consecutive reviews SHALL start a fresh coder execution with the full brief, instead of resuming the previous coder thread. The brief SHALL open with: "Before editing, write a short root-cause note for each carried finding."

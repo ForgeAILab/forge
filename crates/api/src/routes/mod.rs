@@ -1450,6 +1450,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
     let value = serde_json::from_str::<Value>(value)?;
     if value.is_array() {
         return Ok(ReviewDetails {
+            verify: None,
             execution: None,
             conformance: Default::default(),
             ci_steps: serde_json::from_value(value)?,
@@ -1465,6 +1466,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
     for key in object.keys() {
         if ![
             "ci_steps",
+            "verify",
             "conformance",
             "auditor",
             "user_approval",
@@ -1491,6 +1493,7 @@ fn parse_review_details(value: &str) -> serde_json::Result<ReviewDetails> {
         }
     }
     for key in [
+        "verify",
         "user_approval",
         "execution",
         "execution_retry",

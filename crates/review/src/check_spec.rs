@@ -85,9 +85,10 @@ pub fn check_family_scope(
                 CheckFamilyScope::Commit
             }
         }
-        CheckPurpose::BeforeWork | CheckPurpose::Lifecycle | CheckPurpose::EnvironmentPreflight => {
-            CheckFamilyScope::Worktree
-        }
+        CheckPurpose::ReviewVerify
+        | CheckPurpose::BeforeWork
+        | CheckPurpose::Lifecycle
+        | CheckPurpose::EnvironmentPreflight => CheckFamilyScope::Worktree,
         CheckPurpose::ReadinessProbe | CheckPurpose::EnvironmentHelper => CheckFamilyScope::Probe,
     }
 }
@@ -175,6 +176,9 @@ pub fn build_check_spec(
         true
     };
     match family {
+        CheckPurpose::ReviewVerify => {
+            return Err("review verify requires the verify bundle builder".into())
+        }
         CheckPurpose::EntryCi | CheckPurpose::ReviewCi => {
             let effective = if family == CheckPurpose::EntryCi {
                 if task_scope_is_read_only(config.source) {

@@ -6175,10 +6175,10 @@ frozen assessments.
 window. Before a reset the window starts at Task creation; after a recovery
 reset it starts at that reset's transition timestamp. Review attempts created
 at or after that timestamp belong to the window. `review_attempts` counts all
-attempts in it, including running and cancelled attempts. `items` is ordered
-naturally by id (`F2` before `F10`, and `CI-2` before `CI-10`) and capped
-at 200 entries after the full ledger is derived and naturally sorted. The cap
-therefore retains the earliest numeric ids within each source prefix.
+attempts in it, including running and cancelled attempts. `items` is capped at 200 after complete derivation. Open blocking verify
+findings come first, then other open blocking findings, then other statuses
+and severities. Each group uses natural id order (`F2` before `F10`, and
+`CI-2` before `CI-10`), so resolved/minor history cannot evict a verify blocker.
 Project members with Task read access may use the route; hidden and unknown
 Tasks get the same refusal as `/tasks/{id}/reviews`.
 
@@ -6253,7 +6253,7 @@ parking rule. Result, repair and park comments each use a per-Review idempotency
 key, so replay does not append duplicates. The Review tab reads `/findings`,
 shows source, severity, status and streak with expandable finding details, and
 retains each attempt's input findings and full report. Verify presentation is
-conditional on recorded results; this phase adds no verify execution or config.
+conditional on recorded results; configured verify runs through the durable review entry below.
 
 Conformance `status` follows from the result and Forge's own checks. A failing
 setup step or required check makes the review `failed` whatever the reviewer
@@ -6361,6 +6361,79 @@ sends the Task back with "No change since review N" and spends the persistent
 `review_needs_owner` with `no change after repair round`. Review and gate-rejection budgets are unchanged.
 Owner-started re-reviews are exempt. A changed commit or dirty worktree takes
 the normal review path; an explicit retry-window reset restores the allowance.
+
+#### Behavioural verify before reviewer dispatch
+
+`ReviewConfig.verify` is optional in the workflow state config, Project
+`default_review_config`, and Task `task_state_config`; it follows the same merge
+order as `ci_steps`. Project and Task writes validate field paths such as
+`verify.ready_command` and `verify.checks.0.name`.
+
+| Field | Default | Constraint |
+|---|---|---|
+| `start` | omitted | Optional non-empty app start command |
+| `ready_path` | omitted | Local URL path starting with `/` |
+| `ready_command` | omitted | Non-empty command; mutually exclusive with `ready_path` |
+| `ready_timeout_seconds` | 120 | Integer 1–900 |
+| `timeout_seconds` | 1200 | Whole verify run, integer 1–3600 |
+| `checks` | required | 1–16 ordered `{name, command, timeout_seconds?}` items |
+
+A check's name is unique and matches `[a-z0-9-]{1,32}`; its command is non-empty.
+Its timeout defaults to 600 seconds and accepts 1–3600. For example:
+
+```json
+{"verify":{"start":"pnpm dev --port \"$FORGE_VERIFY_PORT\"","ready_path":"/","checks":[{"name":"smoke","command":"./scripts/verify.sh"}]}}
+```
+
+After review CI passes (including an empty CI bundle), the same durable hooks
+step requests a separate `review_verify` check, origin `entry`, then suspends
+and resumes on its result. All commands are `uncacheable`, under unchanged
+`canonical-ci/1`, with verify's own wall limit. This does not change CI reuse.
+No verify runs at the integration queue head. Daemon placements record
+`details.verify = {"status":"not_run","reason":"placement_unsupported",...}`
+and continue to their reviewer.
+
+At execution start Forge picks a free loopback port and supplies every step
+with `FORGE_VERIFY_PORT`, `FORGE_VERIFY_URL` (`http://127.0.0.1:<port>`),
+`FORGE_VERIFY_DIR` (`<task root>/.forge-task/verify/<review attempt>/`),
+`FORGE_VERIFY_REQUEST` (`<dir>/request.json`), and `FORGE_VERIFY_REPORT`
+(`<dir>/<check name>.report.json`, set per check). `request.json` contains
+`task_id`, `title`, `description`, requirement texts, `base_sha`, `commit_sha`,
+`changed_files`, and the ledger's open `findings`. The optional start command
+runs in the background with output in `app.log`. Forge polls the readiness
+path until an HTTP status below 500, or repeats the readiness command until
+exit 0. Then checks run in order. Every process group started by the run is
+stopped and verified stopped on every outcome, using the same check executor
+and supervisor as CI.
+
+A check fails on non-zero exit, timeout, or an optional JSON report's
+`verdict: "fail"`/`"failed"`; it is inconclusive on exit 0 with
+`verdict: "inconclusive"`, and otherwise passes. Reports may contain
+`summary`, `findings: [{summary, where, expected, observed}]`, and
+`evidence: [{path, kind, caption}]`. A failed check creates `V-<name>` before
+any reviewer execution. Start exits and readiness timeouts create `V-start`
+and `V-ready`, carrying the `app.log` tail. A verify fail after an earlier
+review pass keeps the existing `merge-fix follow-up failed: ci` block.
+
+The first inconclusive result reruns verify once using the invocation-scoped
+`review_verify_rerun` allowance. A second parks `review_blocked`, source
+`verify`, without charging Review. Offers are Retry Verify (`retry`), Mark
+Reviewed (`approve`, reason required), and Cancel (`cancel`). Retry re-enters
+the ordinary review entry. Runner infrastructure retains the existing review
+CI infrastructure handling.
+
+Evidence paths are relative to `FORGE_VERIFY_DIR` and confined to that directory;
+absolute/traversing/symlink escapes, hard links, non-regular files, empty files,
+unsupported kinds, and files above 25 MiB are skipped with a note. Supported
+kinds are `screenshot`, `walkthrough_video`, `log`, `report`, and `other`.
+Evidence uses the existing Task evidence store. The allowed Review detail key
+`verify` exposes overall `status`, optional `reason`, per-check
+`{name,result,summary,evidence,evidence_paths,observed?}`, `app_log_tail`, and
+`notes`. `evidence` contains Task media ids; `evidence_paths` contains paths
+inside the Task root for the reviewer's **Verify results** prompt section.
+Reports are bounded to 256 KiB, findings to 50 per check with bounded text,
+and evidence lists to 50 entries per check. Malformed optional reports are
+noted; they cannot turn a non-zero command into a pass.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. Forge re-runs them in the Task's worktree at the reviewed commit
@@ -6717,13 +6790,13 @@ win, then the supplied Review state config; Project settings supply its default.
 It never inherits gate `max_rejections`. `remaining_retries.review_progress`
 and `retry_limits.review_progress` appear on Task detail/list responses and use
 the Review window and state even while the Task is in a repair state.
-A progress round uses an idempotent `progress:<review id>` receipt. If its review
-entry hook cannot run before producing a new verdict, the existing infrastructure
-retry/park episode applies; the spent ordinary Review budget does not cause an
-immediate park or another progress debit. Owner actions
+A progress round uses an idempotent `progress:<review id>` receipt. Only entry
+failures classified as infrastructure use the infrastructure retry/park episode;
+configuration and other deterministic errors retain ordinary entry parking.
+A progress receipt never reclassifies an error. Owner actions
 never spend it; an owner's review re-run still gets a progress round only while
 the limit has one left. `review_verify_rerun` is invocation-scoped (limit 1) and is never
-persisted or projected as Task spending; verify execution is a later phase.
+persisted or projected as Task spending; its counter spans suspension of one verify evaluation.
 
 After a coder-fixable failed Review, a reviewer finding open on its third
 blocking source check parks with `review_needs_owner`, message

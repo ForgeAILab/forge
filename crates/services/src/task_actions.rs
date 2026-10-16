@@ -661,6 +661,33 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
+    if task.status == "review"
+        && condition == Some(FailureKind::ReviewBlocked)
+        && task
+            .blocked_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .is_some_and(|value| value["source"] == "verify")
+    {
+        offer(
+            TaskAction::retry(),
+            &[],
+            &[Owner],
+            "review_verify_retry",
+            "Retry Verify",
+        );
+        offer(
+            TaskAction::Approve {
+                reason: None,
+                override_checks: Some(true),
+            },
+            &["reason"],
+            &[Owner],
+            "reviewer_failed_manual_pass",
+            "Mark Reviewed",
+        );
+        return offers;
+    }
     if condition_read.hard_failure {
         if workflow
             .states

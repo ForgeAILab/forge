@@ -15,7 +15,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import type { Agent, RoleDefinition } from '@/types/generated'
 
+import { ReviewVerifyEditor } from '@/components/settings/ReviewVerifyEditor'
+import type { ReviewVerifyConfig } from '@/types/generated/bindings/ReviewVerifyConfig'
+
 interface GeneralTabProps {
+  verify: ReviewVerifyConfig | null
+  onVerifyChange: (value: ReviewVerifyConfig | null) => void
   projectIsLoading: boolean
   canSave: boolean
   isSaving: boolean
@@ -62,6 +67,8 @@ export function GeneralTab({
   pausePending,
   name,
   ciSteps,
+  verify,
+  onVerifyChange,
   reviewCiTriage,
   reviewProgress,
   repairSwitchModelWhenStuck,
@@ -164,6 +171,16 @@ export function GeneralTab({
             description="Shell commands run during review. Applied to all tasks in this project by default."
           >
             <CiStepsEditor steps={ciSteps} onChange={onCiStepsChange} />
+          </SettingsSection>
+          <SettingsSection
+            title="Verify"
+            description="Exercise the candidate before a reviewer is dispatched."
+          >
+            <ReviewVerifyEditor
+              value={verify}
+              onChange={onVerifyChange}
+              disabled={!canSave || isSaving}
+            />
           </SettingsSection>
           <SettingsSection
             title="CI failure triage"

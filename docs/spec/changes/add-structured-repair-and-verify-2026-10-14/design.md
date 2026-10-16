@@ -447,3 +447,19 @@ munk verify change --request-file "$FORGE_VERIFY_DIR/munk-request.json" --config
 - The hook's merged configuration is an optional trailing field on the typed
   review-routing command. Three-field queued requests decode with no supplied
   configuration; new requests carry the hook configuration when present.
+
+## Phase 5 implementation decisions (2026-10-16)
+
+- The server owner prepares runtime inputs under its existing admitted checkout
+  lock. Generated start/readiness/check commands use the unchanged durable
+  check runner and canonical process-tree settlement; no daemon or queue-head
+  verify execution is introduced.
+- The constrained check-consumer purpose column needs a forward, data-preserving
+  rebuild, retaining all checkpoints, indexes and both scheduler triggers.
+- Inconclusive evaluations checkpoint their invocation counter across hook
+  suspension, never in Task budget spending. Their final park uses the existing
+  reason-required manual approval action for Mark Reviewed.
+- The decided follow-ups bound requirement status to 40 lines with open ones
+  first and make it yield before open finding text; avoid attempt diffs outside
+  coder/worker repair dispatches; prioritize verify/open blockers at the findings
+  read cap; and preserve infrastructure classification during progress rounds.

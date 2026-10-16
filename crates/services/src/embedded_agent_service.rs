@@ -2875,6 +2875,21 @@ fn task_role_admitted_by_workflow(active_role: Option<&str>, requested_role: &st
 
 #[async_trait::async_trait]
 impl crate::task_service::execution::ExecutionSupport for EmbeddedAgentService {
+    async fn capture_verify_evidence(
+        &self,
+        task_id: &str,
+        media_id: &str,
+        filename: &str,
+        kind: &str,
+        caption: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        self.tool_provider
+            .capture_verify_evidence(task_id, media_id, filename, kind, caption, bytes)
+            .await
+            .map_err(|error| ServiceError::invalid_operation(error.to_string()))
+    }
+
     async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()> {
         EmbeddedAgentService::inject_provider_env(self, agent_config).await
     }

@@ -435,6 +435,8 @@ pub struct ReviewExecutionEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReviewDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::ReviewVerifyDetails>,
     #[serde(default)]
     pub execution: Option<ReviewExecutionEvidence>,
     #[serde(default)]

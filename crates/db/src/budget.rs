@@ -701,7 +701,11 @@ pub async fn review_verdict(
         }
         return Ok(());
     }
-    if *status != ReviewStatus::Failed || owner || owner_step(&task.id) {
+    if *status != ReviewStatus::Failed
+        || owner
+        || owner_step(&task.id)
+        || details.pointer("/verify/status").and_then(Value::as_str) == Some("inconclusive")
+    {
         return Ok(());
     }
     let latest: Option<String> = sqlx::query_scalar(

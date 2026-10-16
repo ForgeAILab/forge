@@ -31,6 +31,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Findings reads now apply the 200-entry cap after prioritizing open blocking
+  verify findings, then other open blockers, then other severities/statuses.
+  Natural id ordering is retained within each priority group.
+
 - Later reviews anchor new blocking findings to frozen requirements, regressions,
   or candidate-diff files. Other new findings become minor; out-of-scope findings
   never block. Structured failed reviews with no blocking findings park for the
@@ -3104,6 +3108,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Optional `ReviewConfig.verify` starts the candidate app, waits for readiness,
+  and runs behavioural checks after review CI and before reviewer dispatch.
+  Verify uses the durable check runner with `canonical-ci/1` process-tree
+  settlement and its own wall limit; results are never reused. Failed checks
+  become `V-*` findings, reports can attach Task evidence, and reviewers see
+  the recorded results and evidence paths. One inconclusive rerun is followed
+  by an uncharged owner park. Daemon placements record `not_run` with
+  `placement_unsupported`. Project review settings expose the configuration.
+
 - Reviewer findings accept optional `requirement_ids`, `kind`, and `same_cause_as`.
   Repair briefs carry the last three attempts, frozen requirement status and
   shared-cause families within the 24 KiB cap. Re-broken findings name their
@@ -3115,7 +3128,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and Task remaining/limit projections for extra repair rounds on progress.
 - Additive `superseded` finding status for step-level CI findings replaced by
   per-test findings, exposed in the findings API and web ledger.
-- Invocation-scoped `review_verify_rerun` budget (limit 1) for the later verify phase.
+- Invocation-scoped `review_verify_rerun` budget (limit 1) for inconclusive verify results.
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 

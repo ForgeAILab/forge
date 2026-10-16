@@ -200,6 +200,7 @@ export interface TaskBlockingAnnotation {
 }
 
 export interface ReviewConfig {
+  verify?: import('./bindings/ReviewVerifyConfig').ReviewVerifyConfig | null
   conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
   requirement_ids?: string[]
   requirement_allocations?: Record<string, string>
@@ -875,6 +876,7 @@ export interface AuditorVerdictEntry {
 }
 
 export interface ReviewDetails {
+  verify?: import('./bindings/ReviewVerifyDetails').ReviewVerifyDetails | null
   execution?: { integration_checks: IntegrationHeadCheckEvidence[]; [key: string]: unknown } | null
   conformance: ReviewConformance
   ci_steps: StepResultEntry[]

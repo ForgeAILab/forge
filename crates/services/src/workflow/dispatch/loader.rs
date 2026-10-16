@@ -200,7 +200,17 @@ pub async fn load_agent_dispatch_context(
     if carried_repair || reset_model_after_repair {
         continuation_of_execution_id = None;
     }
-    let repair_attempts = load_repair_attempts(&db, router, &task, &review_window).await?;
+    let repair_attempts = if matches!(role, "coder" | "worker")
+        && workflow
+            .states
+            .iter()
+            .any(|state| state.name == state_name && state.kind == StateKind::Active)
+        && !super::repair_brief::repair_rounds(&review_window).is_empty()
+    {
+        load_repair_attempts(&db, router, &task, &review_window).await?
+    } else {
+        Vec::new()
+    };
 
     Ok(AgentDispatchContext {
         task,

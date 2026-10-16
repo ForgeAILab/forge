@@ -11,6 +11,7 @@ mod outcome;
 mod workspace;
 
 pub mod check_spec;
+pub mod verify;
 
 #[cfg(test)]
 mod contract_driven_tests;

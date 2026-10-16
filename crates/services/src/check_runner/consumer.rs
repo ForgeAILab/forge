@@ -611,6 +611,10 @@ impl TaskCheckConsumers {
 /// A triage subcheck retains the family's original authority while getting its
 /// own durable consumer key. Only these two internal stages are recognised.
 pub(crate) fn ci_parent_authority(authority: &str) -> &str {
+    let authority = authority
+        .strip_prefix("review-verify:")
+        .and_then(|rest| rest.split_once(':').map(|(_, parent)| parent))
+        .unwrap_or(authority);
     authority
         .strip_prefix("ci-triage:rerun:")
         .or_else(|| authority.strip_prefix("ci-triage:base:"))

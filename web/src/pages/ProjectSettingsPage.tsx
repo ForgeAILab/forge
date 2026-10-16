@@ -72,6 +72,7 @@ import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
+import type { ReviewVerifyConfig } from '@/types/generated/bindings/ReviewVerifyConfig'
 
 const SETTINGS_TABS: Array<{
   id: ProjectSettingsTab
@@ -90,7 +91,9 @@ const SETTINGS_TABS: Array<{
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
 ]
 
+
 interface ProjectFormState {
+  verify: ReviewVerifyConfig | null
   name: string
   reviewCiTriage: 'full' | 'report' | 'off'
   repairSwitchModelWhenStuck: boolean
@@ -106,6 +109,7 @@ interface ProjectFormState {
 
 const EMPTY_PROJECT_FORM: ProjectFormState = {
   name: '',
+  verify: null,
   ciSteps: [],
   reviewCiTriage: 'full',
   reviewProgress: '',
@@ -149,6 +153,7 @@ export function ProjectSettingsPage({
   const [form, updateForm] = useReducer(mergeProjectForm, EMPTY_PROJECT_FORM)
   const {
     name,
+    verify,
     ciSteps,
     reviewCiTriage,
     reviewProgress,
@@ -212,6 +217,7 @@ export function ProjectSettingsPage({
         : {}
       updateForm({
         name: project.name,
+        verify: project.default_review_config?.verify ?? null,
         reviewProgress:
           rawRetryBudgets.review_progress == null ? '' : String(rawRetryBudgets.review_progress),
         repairSwitchModelWhenStuck: project.settings?.repair_switch_model_when_stuck === true,
@@ -326,6 +332,7 @@ export function ProjectSettingsPage({
           default_review_config: {
             ...(isRecord(project.default_review_config) ? project.default_review_config : {}),
             ci_steps: normalizeCiSteps(ciSteps),
+            verify,
             review_prompt: null,
           },
         },
@@ -459,6 +466,8 @@ export function ProjectSettingsPage({
               pausePending={pauseProject.isPending || resumeProject.isPending}
               name={name}
               ciSteps={ciSteps}
+              verify={verify}
+              onVerifyChange={(verify) => updateForm({ verify })}
               reviewCiTriage={reviewCiTriage}
               reviewProgress={reviewProgress}
               repairSwitchModelWhenStuck={repairSwitchModelWhenStuck}

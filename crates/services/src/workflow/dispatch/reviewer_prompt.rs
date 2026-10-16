@@ -107,6 +107,18 @@ impl PromptBuilder for ReviewerPromptBuilder {
             }
         }
 
+        if let Some(verify) = ctx
+            .prior_reviews
+            .iter()
+            .filter(|r| r.status == db::ReviewStatus::Running)
+            .max_by_key(|r| r.attempt_number)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.step_results_json).ok())
+            .and_then(|v| {
+                serde_json::from_value::<api_types::ReviewVerifyDetails>(v["verify"].clone()).ok()
+            })
+        {
+            user.push_str(&review::verify::prompt(&verify));
+        }
         if !ctx.prior_reviews.is_empty() {
             user.push_str("\nPrior reviews:\n");
             for review in &ctx.prior_reviews {

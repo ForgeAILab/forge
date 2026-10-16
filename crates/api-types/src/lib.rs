@@ -33,6 +33,8 @@ mod repo_location;
 mod repo_review;
 mod requests;
 mod review_conformance;
+mod review_verify;
+pub use review_verify::*;
 mod runtime;
 mod settings;
 mod task_condition;

@@ -5338,9 +5338,10 @@ async fn review_comments_ci_only_failure_and_routing_replay_are_idempotent() {
 }
 
 mod no_change;
+mod review_verify;
 
 #[tokio::test]
-async fn review_progress_entry_hook_failure_uses_infrastructure_retry_not_review_park() {
+async fn review_progress_configuration_entry_failure_parks_without_infrastructure_retry() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(64));
     let task_id = new_uuid_v4();
@@ -5406,11 +5407,10 @@ async fn review_progress_entry_hook_failure_uses_infrastructure_retry_not_review
             .expect("infrastructure annotation"),
     )
     .unwrap();
-    assert_eq!(annotation["blocking_reason"], "review_ci_infrastructure");
-    assert!(annotation["message"].as_str().unwrap().contains("ci_steps"));
+    assert_ne!(annotation["blocking_reason"], "review_ci_infrastructure");
     assert!(
-        result.task.blocked_json.is_none(),
-        "the existing infrastructure backoff owns this retry"
+        result.task.entry_barrier_json.is_some(),
+        "configuration errors remain parked"
     );
     assert_eq!(
         db::budget::spent(db.pool(), &task_id, "review")
@@ -5428,7 +5428,7 @@ async fn review_progress_entry_hook_failure_uses_infrastructure_retry_not_review
         db::budget::spent(db.pool(), &task_id, "review_ci_infrastructure")
             .await
             .unwrap(),
-        1
+        0
     );
     assert_eq!(
         db::ReviewRepo::list_by_task(&*db, &task_id)

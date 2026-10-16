@@ -37,6 +37,20 @@ pub struct ExecutionOutboxReport {
 /// input and result contracts and retains its execution ordering.
 #[async_trait]
 pub trait ExecutionSupport: Send + Sync {
+    async fn capture_verify_evidence(
+        &self,
+        _task_id: &str,
+        _media_id: &str,
+        _filename: &str,
+        _kind: &str,
+        _caption: &str,
+        _bytes: &[u8],
+    ) -> Result<String> {
+        Err(ServiceError::invalid_operation(
+            "verify evidence storage is not configured",
+        ))
+    }
+
     async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()>;
     async fn ingest_execution_outbox(
         &self,
@@ -972,6 +986,24 @@ pub(super) fn latest_execution_authority(
 }
 
 impl TaskService {
+    pub(crate) async fn capture_verify_evidence(
+        &self,
+        task_id: &str,
+        media_id: &str,
+        filename: &str,
+        kind: &str,
+        caption: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        self.credential_env
+            .as_ref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("verify evidence storage is not configured")
+            })?
+            .capture_verify_evidence(task_id, media_id, filename, kind, caption, bytes)
+            .await
+    }
+
     pub(super) async fn ingest_terminal_execution_outbox(
         &self,
         task: &Task,

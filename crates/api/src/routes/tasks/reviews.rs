@@ -40,7 +40,16 @@ pub async fn list_findings(
     }
     let mut items =
         db::review_findings::finding_ledger(&window.reviews).map_err(ApiError::internal)?;
-    // The complete ledger is naturally sorted before the transport cap.
+    // Preserve the ledger's natural ordering within each priority group.
+    // Open blockers, including verify findings, must survive the read cap.
+    items.sort_by_key(|entry| {
+        let blocking =
+            entry.status.is_open() && entry.severity == api_types::ReviewFindingSeverity::Blocking;
+        (
+            !blocking,
+            blocking && entry.source != api_types::ReviewFindingSource::Verify,
+        )
+    });
     items.truncate(200);
     Ok(Json(api_types::TaskFindingsResponse {
         items,

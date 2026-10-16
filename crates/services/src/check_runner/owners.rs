@@ -172,7 +172,7 @@ impl WorkspaceCheckOwners {
             if placement.id!=*placement_id || placement.generation!=*generation || placement.owner_kind!=PlacementOwnerKind::Server || placement.workspace_handle.as_deref()!=Some(path) || placement.state!=PlacementState::Ready { return Err(ServiceError::invalid_operation("check placement changed")); }
             let actual=tokio::time::timeout(Duration::from_secs(2),git::get_current_sha(Path::new(path))).await.map_err(|_| ServiceError::invalid_operation("check candidate witness timed out"))??;
             if !is_ci_triage_base(&record.run.identity.inputs.spec) && actual!=record.run.identity.commit_sha { return Err(ServiceError::invalid_operation("check candidate changed")); }
-            let environment=self.environment(record).await?;
+            let mut environment=self.environment(record).await?;
             // Reuse the durable inherited answer for this owner generation;
             // only Project values are recombined now. A changed Project
             // environment executes as a verdict without reusable attestation.
@@ -193,6 +193,7 @@ impl WorkspaceCheckOwners {
                     environment_workspace: Some(Path::new(path)), assets: &project_environment.assets,
                 }
             } else { check_executor::CheckoutTarget::Workspace(Path::new(path)) };
+            environment.extend(review::verify::prepare_environment(&record.run.identity.inputs.spec, Path::new(path)).map_err(ServiceError::invalid_operation)?);
             crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
                 operation_id:&id,spec:&record.run.identity.inputs.spec,target,owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
             }).await

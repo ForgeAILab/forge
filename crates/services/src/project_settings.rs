@@ -54,6 +54,10 @@ pub async fn validate_project_settings(
             }
         }
     }
+    if let Some(review) = settings.get("default_review_config") {
+        api_types::validate_review_verify_config(review)
+            .map_err(ServiceError::invalid_operation)?;
+    }
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
     if !(1..=86400).contains(&settings.placement.provision_timeout_seconds) {

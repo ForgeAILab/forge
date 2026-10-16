@@ -741,7 +741,6 @@ impl WorkflowExecution<'_> {
                                 &task,
                                 &enter_ctx,
                                 &hook.action,
-                                &error,
                                 &entry_barrier_started_at,
                                 authority.as_ref(),
                             )

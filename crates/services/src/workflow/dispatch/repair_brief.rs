@@ -386,6 +386,7 @@ impl RepairBrief {
             ids_only: false,
             verify: usize::MAX,
             compact: false,
+            requirements: true,
             detailed: usize::MAX,
         };
         // D7's ordered degradation first; then the hard-cap reductions of the
@@ -408,7 +409,19 @@ impl RepairBrief {
             if body.len() <= BRIEF_BYTES {
                 return body;
             }
+            if stage >= 8 {
+                // Requirement status must never be what forces finding text
+                // to be clipped. Retain a small status list when the other
+                // protected content already requires the next reduction.
+                limits.requirements = false;
+                let without_requirements = self.render_sections(&limits);
+                if without_requirements.len() <= BRIEF_BYTES {
+                    return without_requirements;
+                }
+                limits.requirements = true;
+            }
         }
+        limits.requirements = false;
         // Past a line budget, the remaining open findings are listed by id.
         let (mut low, mut high) = (0, self.open.len());
         while low < high {
@@ -556,7 +569,9 @@ impl RepairBrief {
             "Round",
             &format!("{}\n\n{}", self.round, self.instructions),
         );
-        section(&mut out, "Requirement status", &self.requirements);
+        if limits.requirements {
+            section(&mut out, "Requirement status", &self.requirements);
+        }
         section(&mut out, "Pattern", &self.render_patterns(limits.compact));
         let (open, mut ci_counts) = self.open_findings(limits.compact, limits.detailed);
         section(
@@ -699,6 +714,7 @@ struct Limits {
     ids_only: bool,
     verify: usize,
     compact: bool,
+    requirements: bool,
     detailed: usize,
 }
 
@@ -744,7 +760,7 @@ fn render_attempts(ctx: &AgentDispatchContext, reviews: &[db::Review]) -> Vec<St
 }
 
 fn requirement_status(details: &Value, ledger: &[ReviewFindingEntry]) -> String {
-    details["conformance"]["contract"]["context"]["requirements"]
+    let mut requirements: Vec<_> = details["conformance"]["contract"]["context"]["requirements"]
         .as_array()
         .into_iter()
         .flatten()
@@ -766,9 +782,25 @@ fn requirement_status(details: &Value, ledger: &[ReviewFindingEntry]) -> String 
             } else {
                 "no open finding"
             };
-            format!("- {id}: {status}\n")
+            (
+                status != "unmet",
+                format!("- {}: {status}\n", clip(id, 120, true)),
+            )
         })
-        .collect()
+        .collect();
+    requirements.sort_by_key(|(closed, _)| *closed);
+    let mut out: String = requirements
+        .iter()
+        .take(40)
+        .map(|(_, line)| line.as_str())
+        .collect();
+    if requirements.len() > 40 {
+        out.push_str(&format!(
+            "- +{} more requirements\n",
+            requirements.len() - 40
+        ));
+    }
+    out
 }
 
 fn finding_patterns(ledger: &[ReviewFindingEntry]) -> Vec<Vec<ReviewFindingEntry>> {

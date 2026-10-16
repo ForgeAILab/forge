@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-16T12:52:34Z
+updated_at: 2026-10-16T18:03:03Z
 completed_at:
 ---
 
@@ -80,16 +80,22 @@ Prerequisites accepted for this phase:
   - the autonomous workflow uses `working` as its target.
 
 ## 5. Verify check
-- [ ] 5.1 `ReviewConfig.verify` types and validation (`api-types` `core.rs`, the Project/Task update routes), generated TS, `docs/api.md`, and the Project review settings form in the web.
-- [ ] 5.2 `CheckPurpose::ReviewVerify`. A bundle builder generates the background start step, the readiness step and one step per check, all `Uncacheable`, under `canonical-ci/1` with reuse off and verify's own wall limit.
-- [ ] 5.3 Port pick, the `FORGE_VERIFY_*` environment variables, `request.json` (from the Task, its requirements, the diff and the ledger), and the per-check report path.
-- [ ] 5.4 Order in `RunCiSteps`: after CI passes, request verify, suspend, and resume. A fail settles the Review failed with `V-*` findings before reviewer dispatch. A daemon placement records `not_run` / `placement_unsupported`.
-- [ ] 5.5 Verdict mapping and report parsing. An inconclusive result re-runs once, then parks with `review_blocked` (source verify) and the actions retry, mark_reviewed and cancel. Infrastructure failures use the existing `review_ci_infrastructure` path.
-- [ ] 5.6 Evidence capture from report paths, refusing escapes and applying the size and kind limits. Add the allowed detail key `verify`. The reviewer prompt gets a "Verify results" section.
-- [ ] 5.7 Focused tests:
+- [x] 5.1 `ReviewConfig.verify` types and validation (`api-types` `core.rs`, the Project/Task update routes), generated TS, `docs/api.md`, and the Project review settings form in the web.
+- [x] 5.2 `CheckPurpose::ReviewVerify`. A bundle builder generates the background start step, the readiness step and one step per check, all `Uncacheable`, under `canonical-ci/1` with reuse off and verify's own wall limit.
+- [x] 5.3 Port pick, the `FORGE_VERIFY_*` environment variables, `request.json` (from the Task, its requirements, the diff and the ledger), and the per-check report path.
+- [x] 5.4 Order in `RunCiSteps`: after CI passes, request verify, suspend, and resume. A fail settles the Review failed with `V-*` findings before reviewer dispatch. A daemon placement records `not_run` / `placement_unsupported`.
+- [x] 5.5 Verdict mapping and report parsing. An inconclusive result re-runs once, then parks with `review_blocked` (source verify) and the actions retry, mark_reviewed and cancel. Infrastructure failures use the existing `review_ci_infrastructure` path.
+- [x] 5.6 Evidence capture from report paths, refusing escapes and applying the size and kind limits. Add the allowed detail key `verify`. The reviewer prompt gets a "Verify results" section.
+- [x] 5.7 Focused tests:
   - check-executor: the run tree is stopped after a background start;
   - review hook: verify fails before the reviewer, CI fail skips verify, the report overrides a zero exit, a ready timeout gives `V-ready` with an `app.log` tail, inconclusive twice parks, daemon `not_run`, path escape;
   - `reviewer_receives_and_can_cite_the_recorded_pre_review_ci_result` gains a verify-results sibling.
+
+### Decided phase 5 follow-ups
+- [x] A1 Only infrastructure-classified review-entry failures use infrastructure retry during progress rounds; configuration/other failures keep ordinary parking.
+- [x] A2 Cap requirement status at 40 lines, open ones first and `+N more`; keep it from forcing open-finding clipping.
+- [x] A3 Load attempt-memory diffs only for coder/worker repair dispatches.
+- [x] A4 Prioritize open verify/blocking findings before the 200-entry findings-read cap.
 
 ## 6. Release
 - [ ] 6.1 `docs/architecture.md`: the Retry budgets table gets `review_progress` and `review_verify_rerun`. Also update Failure classification, review routing, the checks section (verify) and the Task comments notes.

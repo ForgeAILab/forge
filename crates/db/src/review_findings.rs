@@ -250,8 +250,9 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                     Some("fail" | "failed") => false,
                     _ => continue,
                 };
-                let observed = check["summary"]
+                let observed = check["observed"]
                     .as_str()
+                    .or_else(|| check["summary"].as_str())
                     .or_else(|| check["output_tail"].as_str())
                     .or_else(|| {
                         matches!(name, "start" | "ready")

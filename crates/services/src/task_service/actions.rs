@@ -332,6 +332,15 @@ impl TaskService {
                                 .await?
                                 .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
                         }
+                        TaskAction::Retry { .. } if offer.reason == "review_verify_retry" => {
+                            self.apply_review_check_retry(
+                                &task,
+                                offer.clone(),
+                                action.clone(),
+                                actor.clone(),
+                            )
+                            .await?
+                        }
                         TaskAction::Retry { .. } if offer.reason == "owner_reconcile" => {
                             self.reconcile_task_action_owner(task, action.clone())
                                 .await?
