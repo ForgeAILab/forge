@@ -2594,7 +2594,8 @@ async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queu
             assert!(refs.trim().is_empty(), "{refs}");
         }
     }
-    // The checks ran on the rebased commits in the clone.
+    // The checks ran on the rebased commits in the clone, plus the
+    // default-full rerun of the red step.
     let runs: Vec<(String, String)> = sqlx::query_as(
         "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at",
     )
@@ -2605,6 +2606,7 @@ async fn tasks_in_another_clone_merge_into_the_default_checkout_through_the_queu
         runs,
         vec![
             (two.candidate_sha.clone().unwrap(), "pass".to_owned()),
+            (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
             (three.candidate_sha.clone().unwrap(), "fail".to_owned()),
         ],
         "{runs:?}"
