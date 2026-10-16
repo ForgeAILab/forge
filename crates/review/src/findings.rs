@@ -96,7 +96,10 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                 if !signatures.is_empty() {
                     detailed_ci.insert(prefix.clone());
                     for signature in signatures {
-                        let hash = format!("{:x}", Sha256::digest(signature.as_bytes()));
+                        let hash: String = Sha256::digest(signature.as_bytes())
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect();
                         let class = classes
                             .get(&signature)
                             .copied()
