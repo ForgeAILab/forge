@@ -69,7 +69,18 @@ pub(super) async fn run(
         .resolve(&ctx.db, &workspace)
         .await
         .map_err(infrastructure)?;
-    let path = resolved.embedded_path().map_err(infrastructure)?;
+    // The worktree path comes from the workspace manager's read-only check,
+    // never from the raw placement handle.
+    let path = crate::workspace_manager::inspect_path(
+        &ctx.db,
+        &ctx.workspace_root,
+        &ctx.workspace_backend_router,
+        task,
+        workspace.clone(),
+    )
+    .await
+    .map_err(infrastructure)?
+    .ok_or_else(|| infrastructure("verify workspace has no usable worktree"))?;
     let directory = review::verify::directory(&path, review.attempt_number)?;
     review::verify::ensure_directory(&directory, &path)?;
     let saved = crate::workflow::engine::durable::hook_effect(&task.id, EFFECT)
