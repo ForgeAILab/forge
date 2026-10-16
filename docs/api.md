@@ -2504,6 +2504,9 @@ validation. The web switch is off by default.
 The web Project progress allowance stays blank when unset, showing the default
 of 2. Unrelated saves preserve the absent `retry_budgets.review_progress` key;
 clearing a stored allowance removes that override. Explicit `0` disables it.
+`retry_budgets.review_verify_rerun` (inconclusive verify reruns, default 1)
+takes the same nonnegative integer through REST/MCP; it has no web editor, and
+web saves keep a stored value.
 
 `settings.review_ci_triage` accepts `full` (default when omitted), `report`, or
 `off` through Project create/update (REST and MCP) and the Project settings form.

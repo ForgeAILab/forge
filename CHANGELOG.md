@@ -31,17 +31,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- Verify output directories now use `<task root>/.forge-task/verify/<review id>/`
-  instead of an attempt number, isolating coordination children sharing a Task
-  root. Verify command identities also use the Review id.
-- `review_verify_rerun` now uses the budget ledger per Review invocation rather
-  than a fixed volatile counter. Task/Project overrides apply (default 1, 0
-  disables), and Task budget projections include its remaining allowance.
-
-- Findings reads now apply the 200-entry cap after prioritizing open blocking
-  verify findings, then other open blockers, then other severities/statuses.
-  Natural id ordering is retained within each priority group.
-
 - Later reviews anchor new blocking findings to frozen requirements, regressions,
   or candidate-diff files. Other new findings become minor; out-of-scope findings
   never block. Structured failed reviews with no blocking findings park for the
@@ -3118,11 +3107,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Optional `ReviewConfig.verify` starts the candidate app, waits for readiness,
   and runs behavioural checks after review CI and before reviewer dispatch.
   Verify uses the durable check runner with `canonical-ci/1` process-tree
-  settlement and its own wall limit; results are never reused. Failed checks
-  become `V-*` findings, reports can attach Task evidence, and reviewers see
-  the recorded results, notes and evidence paths. Inconclusive reruns use a
-  ledger allowance (default one), then park without charging Review. Daemon placements record `not_run` with
-  `placement_unsupported`. Project review settings expose the configuration.
+  settlement and its own wall limit; results are never reused. Its files live
+  in `<task root>/.forge-task/verify/<review id>/`, so coordination children
+  sharing a Task root stay isolated and never stop each other's running app.
+  Failed checks become `V-*` findings (an app exit during readiness creates only
+  `V-ready`), reports can attach Task evidence (64 MiB per evaluation across all
+  checks), and `app.log` keeps its first 16 MiB on disk. Reviewers see the
+  recorded results, notes and evidence paths. Inconclusive reruns use the
+  ledger-backed `retry_budgets.review_verify_rerun` allowance (default 1, 0
+  disables; Task and Project overrides apply), then park without charging
+  Review. Public `FORGE_VERIFY_*` ports, URLs and paths stay readable while
+  Project secrets remain redacted. A port still in use after group cleanup adds
+  a non-blocking warning to Review details and the reviewer prompt (a process
+  that escapes its group via `setsid` stays outside containment). Daemon
+  placements record `not_run` with `placement_unsupported`. Project review
+  settings expose the configuration.
 
 - Reviewer findings accept optional `requirement_ids`, `kind`, and `same_cause_as`.
   Repair briefs carry the last three attempts, frozen requirement status and
@@ -3135,14 +3134,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and Task remaining/limit projections for extra repair rounds on progress.
 - Additive `superseded` finding status for step-level CI findings replaced by
   per-test findings, exposed in the findings API and web ledger.
-- Verify limits captured evidence to 64 MiB per evaluation across all checks,
-  and `app.log` to its first 16 MiB on disk (the app appends directly; the
-  owner cuts the file back during and after the run). Completed group
-  cleanup removes `start.pgid`. Public verify ports, URLs and paths stay readable
-  while Project secrets remain redacted. An app exit during readiness creates
-  only `V-ready`; a port still in use after cleanup produces a non-blocking
-  warning in Review details and the reviewer prompt (escaped sessions remain
-  outside process-group containment).
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 

@@ -236,6 +236,7 @@ export interface EffectiveLeadResponse {
 export interface RetryBudgets {
   review?: number | null
   review_progress?: number | null
+  review_verify_rerun?: number | null
   merge_fix?: number | null
   execution?: number | null
 }
