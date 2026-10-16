@@ -7,6 +7,8 @@ use serde_json::Value;
 use super::AgentDispatchContext;
 
 pub const BRIEF_BYTES: usize = 24 * 1024;
+const PATTERN_SITES_PER_FAMILY: usize = 20;
+const PATTERN_SITES_TOTAL: usize = 30;
 
 #[derive(Debug, Clone)]
 pub struct RepairBudget {
@@ -500,6 +502,49 @@ impl RepairBrief {
         (open, counts)
     }
 
+    /// Pattern is never cut for budget, so it is bounded by display limits
+    /// instead (as D1 bounds test findings): sites per family and in total,
+    /// open findings first. The full families stay in the finding ledger.
+    fn render_patterns(&self, compact: bool) -> String {
+        let mut patterns = String::new();
+        let mut listed = 0;
+        let mut families = self.patterns.iter();
+        for family in families.by_ref() {
+            if listed >= PATTERN_SITES_TOTAL {
+                let more = 1 + families.len();
+                patterns.push_str(&format!(
+                    "+{more} more same-cause families (see the Review tab)\n"
+                ));
+                break;
+            }
+            patterns.push_str(
+                "These share a cause. Fix it at every call site and list the sites you changed.\n",
+            );
+            let room = PATTERN_SITES_PER_FAMILY.min(PATTERN_SITES_TOTAL - listed);
+            let mut members: Vec<_> = family.iter().collect();
+            members.sort_by_key(|entry| !entry.status.is_open());
+            for entry in members.iter().take(room) {
+                patterns.push_str(&format!(
+                    "- {}: {}\n",
+                    clip(&entry.id, 120, true),
+                    clip(
+                        entry.r#where.as_deref().unwrap_or("location unavailable"),
+                        if compact { 120 } else { 240 },
+                        true
+                    )
+                ));
+            }
+            listed += room.min(family.len());
+            if family.len() > room {
+                patterns.push_str(&format!(
+                    "- +{} more sites (see the Review tab)\n",
+                    family.len() - room
+                ));
+            }
+        }
+        patterns
+    }
+
     fn render_sections(&self, limits: &Limits) -> String {
         let mut out = if self.carried {
             format!("Before editing, write a short root-cause note for each carried finding. Record it as a decision worklog entry.\n\n{}", self.task)
@@ -512,24 +557,7 @@ impl RepairBrief {
             &format!("{}\n\n{}", self.round, self.instructions),
         );
         section(&mut out, "Requirement status", &self.requirements);
-        let mut patterns = String::new();
-        for family in &self.patterns {
-            patterns.push_str(
-                "These share a cause. Fix it at every call site and list the sites you changed.\n",
-            );
-            for entry in family {
-                patterns.push_str(&format!(
-                    "- {}: {}\n",
-                    clip(&entry.id, 120, limits.compact),
-                    clip(
-                        entry.r#where.as_deref().unwrap_or("location unavailable"),
-                        120,
-                        limits.compact
-                    )
-                ));
-            }
-        }
-        section(&mut out, "Pattern", &patterns);
+        section(&mut out, "Pattern", &self.render_patterns(limits.compact));
         let (open, mut ci_counts) = self.open_findings(limits.compact, limits.detailed);
         section(
             &mut out,

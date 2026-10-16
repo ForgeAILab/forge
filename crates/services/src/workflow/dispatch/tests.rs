@@ -2134,3 +2134,47 @@ fn carried_repair_selection_is_fresh_and_noncarried_keeps_thread_reuse() {
     let (_, selection) = build_effective_prompt(&ctx, Some(&intent), None);
     assert_eq!(selection.execution_policy, EXECUTION_POLICY_NEW_EXECUTION);
 }
+
+#[test]
+fn repair_brief_cap_keeps_open_findings_with_long_attempts_and_a_large_pattern_family() {
+    use super::repair_brief::{RepairAttempt, RepairBrief};
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.task.description = Some("d".repeat(10 * 1024));
+    ctx.plan = Some("p".repeat(10 * 1024));
+    // Six reviews of fifty findings each, every one sharing F1's cause.
+    for attempt in 1..=6i64 {
+        let findings: Vec<_> = (0..50)
+            .map(|index| {
+                json!({"summary":format!("stale apply {attempt}-{index}"), "kind":"regression",
+                    "where":format!("src/site_{attempt}_{index}.rs:{index} {}", "w".repeat(900)),
+                    "same_cause_as": if attempt == 1 { serde_json::Value::Null } else { json!("F1") }})
+            })
+            .collect();
+        ctx.prior_reviews.push(db::Review {
+            step_results_json: json!({"ci_steps":[], "conformance":{"status":"failed", "contract":convergence_contract(attempt), "checks":[],
+                "assessment":{"result":"fail","reason":"problems","report":"r".repeat(30000),"findings":findings}}}).to_string(),
+            ..fake_review(attempt, db::ReviewStatus::Failed)
+        });
+        ctx.repair_attempts.push(RepairAttempt {
+            attempt,
+            from_sha: Some(format!("c{}", attempt - 1)),
+            to_sha: Some(format!("c{attempt}")),
+            files: vec!["path".repeat(1000); 20],
+            files_unavailable: false,
+            summary: Some("summary".repeat(300)),
+        });
+    }
+    let text = RepairBrief::review(&ctx).render();
+    assert!(text.len() <= 24 * 1024, "{}", text.len());
+    for expected in [
+        "Pattern:",
+        "These share a cause.",
+        "F251: src/site_6_0.rs:0",
+        "more sites (see the Review tab)",
+        "Open findings:",
+        // The latest round's new findings are what the coder must fix now.
+        "F300",
+    ] {
+        assert!(text.contains(expected), "{expected} missing: {text}");
+    }
+}

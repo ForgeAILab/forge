@@ -8340,7 +8340,10 @@ why it failed before. Requirement status is one line per frozen requirement:
 it, otherwise `no open finding`. Pattern joins transitive `same_cause_as` families,
 including resolved ancestors and locations, and asks for every call site to be
 fixed. Requirement status and Pattern are protected with findings under the hard
-24 KiB cap; verify execution remains a later phase.
+24 KiB cap; verify execution remains a later phase. Because it is never cut,
+Pattern has display limits instead: open members first, at most 20 sites per
+family and 30 in all (locations clipped), then "+N more"; the ledger keeps every
+member.
 
 A carried blocking reviewer finding (streak at least two in the latest review)
 starts a fresh repair execution instead of resuming the prior thread. The brief
