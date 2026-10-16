@@ -118,6 +118,8 @@ pub(crate) async fn triage(
         Answer::Pending(id) => return Ok(Progress::Pending(id)),
         Answer::Result(id, result) => (id, result),
     };
+    // A step that fails again is consistent, whatever signatures it reports:
+    // a rerun failing differently reproduced the failure, not a flake.
     let consistent: Vec<usize> = failed
         .iter()
         .enumerate()
@@ -125,18 +127,7 @@ pub(crate) async fn triage(
             rerun
                 .commands
                 .get(position)
-                .is_none_or(|again| {
-                    again.exit_code != 0
-                        && (again.exit_code < 0
-                            || entries[*index].failures_truncated
-                            || again.failures_truncated
-                            || entries[*index].failures.is_empty()
-                            || again.failures.is_empty()
-                            || entries[*index]
-                                .failures
-                                .iter()
-                                .any(|signature| again.failures.contains(signature)))
-                })
+                .is_none_or(|again| again.exit_code != 0)
                 .then_some(*index)
         })
         .collect();
@@ -323,10 +314,21 @@ pub(crate) fn classify(
             .chain(&again.failures)
             .cloned()
             .collect();
+        // Only a rerun that reproduced part of the failure shows that the
+        // rest came and went. One failing with other signatures proves no
+        // flake: every signature is then compared with the base.
+        let reproduced = entry
+            .failures
+            .iter()
+            .any(|signature| again.failures.contains(signature));
         for signature in signatures {
             let consistent =
                 entry.failures.contains(&signature) && again.failures.contains(&signature);
-            let class = if !consistent && !entry.failures_truncated && !again.failures_truncated {
+            let class = if !consistent
+                && reproduced
+                && !entry.failures_truncated
+                && !again.failures_truncated
+            {
                 Some(CiFailureClass::Flaky)
             } else {
                 base.map(|step| {
@@ -578,6 +580,31 @@ mod tests {
             facts(),
         );
         assert!(result.blocking);
+    }
+    #[test]
+    fn ci_triage_rerun_failing_with_other_signatures_is_not_flaky() {
+        // Fail-fast runners stop at whichever failure comes first: both are real.
+        let result = classify(
+            &step(&["first"]),
+            Some(&command(&["second"], 1)),
+            Some(&command(&[], 0)),
+            facts(),
+        );
+        assert!(result.blocking);
+        assert!(result
+            .failures
+            .iter()
+            .all(|failure| failure.class == CiFailureClass::Introduced));
+        let mut unavailable = facts();
+        unavailable.base_status = CiBaseStatus::BaseUnavailable;
+        let result = classify(
+            &step(&["first"]),
+            Some(&command(&["second"], 1)),
+            None,
+            unavailable,
+        );
+        assert!(result.blocking);
+        assert!(result.failures.is_empty());
     }
     #[test]
     fn ci_triage_rerun_with_no_verdict_does_not_prove_a_flake() {

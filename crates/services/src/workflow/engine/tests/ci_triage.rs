@@ -294,3 +294,40 @@ async fn ci_triage_candidate_signatures_with_signatureless_base_are_invalid() {
         "base_run_invalid"
     );
 }
+
+#[tokio::test]
+async fn ci_triage_rerun_failing_with_other_signatures_goes_to_the_base() {
+    // A fail-fast runner reports whichever failure comes first: the rerun
+    // fails too, with another test. Nothing here is a flake.
+    let f = fixture(
+        "full",
+        &["true"],
+        &["if [ -f .seen ]; then printf 'test suite::second ... FAILED\\n'; else touch .seen; printf 'test suite::first ... FAILED\\n'; fi; exit 1"],
+    )
+    .await;
+    let (task, review, details) = enter(&f).await;
+    assert_eq!(task.status, "in_progress", "{details}");
+    assert_eq!(review.status, db::ReviewStatus::Failed);
+    let triage = &details["ci_steps"][0]["triage"];
+    assert_eq!(triage["base_status"], "available", "{details}");
+    assert_eq!(triage["blocking"], true);
+    let classes: Vec<_> = triage["failures"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["signature"].as_str().unwrap(),
+                f["class"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            ("suite::first", "pre_existing"),
+            ("suite::second", "introduced")
+        ]
+    );
+    assert_eq!(count(&f).await, 3);
+}

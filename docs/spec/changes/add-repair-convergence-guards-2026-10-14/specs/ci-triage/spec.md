@@ -13,13 +13,17 @@ The setting SHALL be readable and writable through the Project settings API and 
 - **THEN** a failed review CI step routes exactly as before this change, with no re-run and no base run
 
 ### Requirement: A failing step is re-run once to separate flakes
-When a review CI step fails and triage is not `off`, Forge SHALL re-run the failing steps once on the same candidate, in the same workspace. A signature that does not fail in both runs SHALL be classified `flaky`. A step that passes on the re-run SHALL be classified wholly flaky.
+When a review CI step fails and triage is not `off`, Forge SHALL re-run the failing steps once on the same candidate, in the same workspace. When the re-run fails again with at least one of the same signatures, a signature that does not fail in both runs SHALL be classified `flaky`. A step that passes on the re-run SHALL be classified wholly flaky. A step whose re-run fails with only other signatures is a consistent failure: none of its signatures is `flaky`, and all of them go to the base comparison.
 
 The re-run uses the volatile `review_ci_triage` budget, limit 1 per review attempt. It SHALL NOT create a new Review attempt or charge the review budget.
 
 #### Scenario: Timeout flake
 - **WHEN** `pnpm test` fails with `AgentAuthorityHttpTransportError` timeouts in two tests and passes on the re-run
 - **THEN** the step is classified flaky, the two signatures are `flaky`, and under `full` the review continues as if the step passed
+
+#### Scenario: Re-run fails with another test
+- **WHEN** a fail-fast run fails `a` and its re-run fails `b`
+- **THEN** neither is `flaky`; both go to the base comparison
 
 #### Scenario: Consistent failure
 - **WHEN** the same three tests fail in the run and the re-run

@@ -96,8 +96,11 @@ Non-Goals:
 1. When review CI fails, Forge re-runs the failing steps once on the
    candidate, in the same workspace (earlier steps' effects are still on
    disk).
-2. A signature that does not fail in both runs is `flaky`. A step that passes
-   on the re-run is wholly flaky.
+2. A signature that does not fail in both runs is `flaky`, when the re-run
+   fails again with at least one of the same signatures. A step that passes
+   on the re-run is wholly flaky. A re-run failing with only other signatures
+   (a fail-fast runner stopping at another test) shows no flake: the step is
+   consistent and all its signatures go to the base.
 3. For the remaining consistent failures, Forge runs a base check on the base
    commit. The base is the merge base with the target branch. The run must be
    comparable to the candidate run:

@@ -9963,8 +9963,11 @@ triage but preserves blocking routing; `off` runs neither extra check and preser
 the original stop-at-first-failure gate. Under `full`, candidate bundles collect
 all CI steps, so a non-blocking early failure cannot hide a later failure. Each
 failed command is rerun once in its candidate workspace; the rerun bundle is
-uncacheable. Signatures absent from either complete run are `flaky`; a command
-passing on rerun is wholly flaky. Incomplete signature lists never prove a pass.
+uncacheable. A command passing on rerun is wholly flaky. When the rerun fails
+again and shares a signature with the first run, signatures absent from either
+complete run are `flaky`. A rerun failing with only other signatures (a fail-fast
+runner stopping at another test) proves no flake: the command is consistent and
+every signature goes to the base. Incomplete signature lists never prove a pass.
 
 Consistent failures are compared with the candidate/target merge base, or the
 exact target tip at the queue head. The base bundle has commit scope, distinct
