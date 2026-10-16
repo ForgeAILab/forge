@@ -237,9 +237,65 @@ pub fn prepare_environment(
     ]))
 }
 
+/// Review ids whose verify run this server is executing now. Once its start
+/// step has exited, a live run's group has a gone leader and running members,
+/// exactly like a group a crashed owner left behind: a sibling Review sharing
+/// the Task root must not stop it from its own sweep.
+static LIVE_RUNS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+struct LiveRun(Option<String>);
+impl LiveRun {
+    fn enter(spec: &CheckSpec) -> Self {
+        let Ok(Some(review_id)) = bundle_review(spec) else {
+            return Self(None);
+        };
+        *LIVE_RUNS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(review_id.to_owned())
+            .or_default() += 1;
+        Self(Some(review_id.to_owned()))
+    }
+}
+impl Drop for LiveRun {
+    fn drop(&mut self) {
+        let Some(review_id) = self.0.take() else {
+            return;
+        };
+        let mut live = LIVE_RUNS.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = live.get_mut(&review_id) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&review_id);
+            }
+        }
+    }
+}
+fn is_live(review_id: &str) -> bool {
+    LIVE_RUNS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(review_id)
+}
+
+/// Run an admitted bundle after [`prepare_environment`]. A verify run is
+/// marked live for its whole execution (a dropped execution unmarks it, as a
+/// crash does), and its group record is removed once settlement is confirmed.
+pub async fn run_admitted<E>(
+    spec: &CheckSpec,
+    worktree: &Path,
+    execution: impl std::future::Future<Output = Result<CheckReceipt, E>>,
+) -> Result<CheckReceipt, E> {
+    let _live = LiveRun::enter(spec);
+    let receipt = execution.await?;
+    finish_run(spec, worktree, &receipt);
+    Ok(receipt)
+}
+
 /// A stopped group no longer needs a crash-recovery record. Retaining it could
 /// later target an unrelated process group after the OS reuses its id.
-pub fn finish_run(spec: &CheckSpec, worktree: &Path, receipt: &CheckReceipt) {
+fn finish_run(spec: &CheckSpec, worktree: &Path, receipt: &CheckReceipt) {
     if receipt.commands.is_empty() || !receipt.commands.iter().all(|c| c.process_tree_stopped) {
         return;
     }
@@ -303,7 +359,8 @@ fn pick_port(mut candidate: impl FnMut() -> Result<u16, String>) -> Result<u16, 
 /// with its port. Before a verify starts anything, every Review directory of
 /// this Task root is looked at, so neither the re-run of an attempt nor a
 /// later attempt starts beside such an orphan. Only real directories and
-/// regular files are read; a record whose group is gone is removed.
+/// regular files are read; a record whose group is gone is removed. A Review
+/// this server is running now is not an orphan and is left alone.
 fn stop_orphaned_starts(verify: &Path) {
     let Ok(entries) = std::fs::read_dir(verify) else {
         return;
@@ -318,10 +375,13 @@ fn stop_orphaned_starts(verify: &Path) {
         {
             continue;
         }
-        let Some(group) = std::fs::read_to_string(&record)
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-        else {
+        let text = std::fs::read_to_string(&record).ok();
+        // Checked after the read: a run is marked live before its start step
+        // can write the record, so a record written by a live run is skipped.
+        if entry.file_name().to_str().is_some_and(is_live) {
+            continue;
+        }
+        let Some(group) = text.and_then(|text| text.trim().parse::<u32>().ok()) else {
             let _ = std::fs::remove_file(&record);
             continue;
         };
@@ -507,6 +567,84 @@ mod tests {
             !survived,
             "the restarted owner started beside the orphaned app"
         );
+    }
+
+    /// Coordination children share a Task root. Once a running verify's
+    /// start step has exited, its group looks like an orphan (leader gone,
+    /// app running); a sibling Review's prepare must not stop it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_verify_sibling_prepare_leaves_a_live_run_running() {
+        use std::time::{Duration, Instant};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("coordination-root");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        executors::sandbox::TaskRoot::reserve(&root).unwrap();
+        let config: ReviewVerifyConfig = serde_json::from_value(json!({
+            "start": r#"sleep 300 & printf '%s\n' "$!" > "$FORGE_VERIFY_DIR/app.pidfile"; wait"#,
+            "checks": [{"name": "smoke", "command": r#"touch "$FORGE_VERIFY_DIR/checking"; while [ ! -f "$FORGE_VERIFY_DIR/release" ]; do sleep 0.05; done"#}]
+        }))
+        .unwrap();
+        let a = build_bundle(&config, "first", 1, "review-a", 0, std::iter::empty()).unwrap();
+        let b = build_bundle(&config, "second", 1, "review-b", 0, std::iter::empty()).unwrap();
+        let environment = prepare_environment(&a, &first).unwrap();
+        let dir = directory(&first, "review-a").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let permit = check_executor::CheckPermit::already_admitted();
+        let mut run = Box::pin(run_admitted(&a, &first, async {
+            Ok::<_, std::convert::Infallible>(
+                check_executor::execute(check_executor::CheckExecution {
+                    operation_id: "verify-live",
+                    spec: &a,
+                    target: check_executor::CheckoutTarget::Workspace(&first),
+                    owner: CheckOwnerIdentity {
+                        owner_kind: "server".into(),
+                        machine_id: None,
+                        runtime_id: "test".into(),
+                    },
+                    input_revisions: None,
+                    environment: &environment,
+                    deadline: Some(Instant::now() + Duration::from_secs(60)),
+                    cancel: &cancel,
+                    permit: &permit,
+                    cleanup: check_executor::CleanupPlan {
+                        commands: &[],
+                        timeout: check_executor::CLEANUP_TIMEOUT,
+                    },
+                    output_limit: 512,
+                })
+                .await,
+            )
+        }));
+        let checking = async {
+            let until = Instant::now() + Duration::from_secs(20);
+            while !dir.join("checking").is_file() || !dir.join("app.pidfile").is_file() {
+                assert!(Instant::now() < until, "verify did not reach its check");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! { result = &mut run => panic!("run ended: {result:?}"), _ = checking => {} }
+        let app = std::fs::read_to_string(dir.join("app.pidfile")).unwrap();
+        assert!(alive(&app));
+        prepare_environment(&b, &second).unwrap();
+        let survived = alive(&app);
+        std::fs::write(dir.join("release"), "").unwrap();
+        let receipt = run.await.unwrap();
+        assert!(
+            survived,
+            "a sibling Review's prepare stopped a live verify app"
+        );
+        assert_eq!(
+            receipt.outcome,
+            CheckExecutionOutcome::Passed,
+            "{receipt:?}"
+        );
+        assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+        assert!(!alive(&app));
+        assert!(!dir.join("start.pgid").exists());
     }
 
     #[test]
