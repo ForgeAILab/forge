@@ -1,6 +1,6 @@
 //! Task budget policy and transactional accounting. Counts never come from audit prose.
 use crate::{DbError, Result, Review, ReviewStatus, SqliteDb, Task};
-use api_types::{GateConfig, StateDefinition, StateKind, WorkflowDefinition};
+use api_types::{CanonicalPhase, GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Row, Sqlite, Transaction};
@@ -256,11 +256,15 @@ pub fn lead_recover_key(subtask: &str) -> String {
 /// Review-gate rejections, counted against the cancelled-review entry cap
 /// (`max_rejections - 1`); the Review kind itself is keyed `review`.
 pub const REVIEW_GATE_KEY: &str = "gate:review";
-/// Match the review configuration resolver: the reviewer role identifies a
-/// renamed review gate; the built-in name also covers owner-only review.
+/// The built-in name keeps every budget rule it always had (also owner-only
+/// review). A renamed review gate is the gate the engine runs Review for: the
+/// `reviewer` role in the review phase. A reviewer-role gate in another phase
+/// (a plan or design check) keeps its own gate budget and entry cap.
 pub fn is_review_state(state: &StateDefinition) -> bool {
-    state.kind == StateKind::Gate
-        && (state.role.as_deref() == Some("reviewer") || state.name == "review")
+    state.name == "review"
+        || (state.kind == StateKind::Gate
+            && state.role.as_deref() == Some("reviewer")
+            && state.canonical_phase == Some(CanonicalPhase::Review))
 }
 
 pub fn gate_budget_key(state: &StateDefinition) -> String {
@@ -2154,7 +2158,7 @@ mod tests {
     async fn budget_verify_rerun_charges_custom_review_state_and_fences_status() {
         let (db, _) = fixture().await;
         let workflow: WorkflowDefinition = serde_json::from_value(json!({"roles":[],"states":[
-            {"name":"quality_check","kind":"gate","role":"reviewer","column":"Review","display_name":"Quality","hooks":{},"config":{},"gate_config":{"max_rejections":2}},
+            {"name":"quality_check","kind":"gate","role":"reviewer","canonical_phase":"review","column":"Review","display_name":"Quality","hooks":{},"config":{},"gate_config":{"max_rejections":2}},
             {"name":"working","kind":"active","column":"Working","display_name":"Working","hooks":{},"config":{}}
         ]})).unwrap();
         sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
@@ -2268,6 +2272,69 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    /// A reviewer-role gate outside the review phase (a design check) runs no
+    /// Review, so nothing would ever park it at verdict time: it keeps its own
+    /// gate budget, entry cap and configuration. The built-in name keeps the
+    /// review rules whatever its kind.
+    #[tokio::test]
+    async fn budget_reviewer_gate_outside_the_review_phase_keeps_its_gate_budget() {
+        let (db, _) = fixture().await;
+        let workflow: WorkflowDefinition = serde_json::from_value(json!({"roles":[],"states":[
+            {"name":"design_review","kind":"gate","role":"reviewer","canonical_phase":"working","column":"In Progress","display_name":"Design","hooks":{},"config":{},"gate_config":{"max_rejections":2}},
+            {"name":"working","kind":"active","column":"Working","display_name":"Working","hooks":{},"config":{}}
+        ]})).unwrap();
+        sqlx::query("UPDATE project SET workflow_definition=? WHERE id='p'")
+            .bind(serde_json::to_string(&workflow).unwrap())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE task SET status='design_review' WHERE id='t'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let task = TaskRepo::get_by_id(&db, "t", false).await.unwrap().unwrap();
+        let gate = &workflow.states[0];
+        assert!(!is_review_state(gate));
+        assert_eq!(gate_budget_key(gate), "gate:design_review");
+        assert!(gate_entry_exhausted(is_review_state(gate), 2, 2));
+        let settings = json!({
+            "retry_budgets":{"review_progress":4},
+            "default_review_config":{"retry_budgets":{"review":7}}
+        })
+        .to_string();
+        assert_eq!(state_config(gate, &settings), json!({}));
+
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        transition(
+            &mut tx,
+            &task.id,
+            &task.status,
+            false,
+            &api_types::TransitionBridge::default(),
+            true,
+            "design-rejection",
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(review_spent(&db).await, (0, 0));
+        let counts = load(db.pool(), &task.id).await.unwrap();
+        assert_eq!(counts["gate:design_review"], 1);
+        let projected = projection(&task, &workflow, &counts, 0).unwrap();
+        assert_eq!(projected["design_review"], 1);
+        assert!(!projected.contains_key("review_gate"));
+
+        let mut review = gate.clone();
+        review.name = "review".into();
+        review.kind = StateKind::Active;
+        assert!(is_review_state(&review));
+        assert_eq!(
+            state_config(&review, &settings)["retry_budgets"]["review"],
+            7
         );
     }
 
