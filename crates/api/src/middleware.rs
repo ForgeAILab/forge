@@ -125,7 +125,12 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let token = extract_bearer_token(req.headers()).or_else(|| extract_query_token(req.uri()));
+    let bearer = extract_bearer_token(req.headers());
+    let session = crate::session::cookie(req.headers(), crate::session::SESSION_COOKIE);
+    let cookie_only = bearer.is_none() && session.is_some();
+    let token = bearer
+        .or_else(|| session.map(str::to_owned))
+        .or_else(|| extract_query_token(req.uri()));
 
     let Some(token) = token else {
         return unauthorized_response("missing_token", "Authentication required");
@@ -139,6 +144,17 @@ pub async fn auth_middleware(
 
     match result {
         Ok((user_id, email, is_admin)) => {
+            if cookie_only {
+                let context = crate::session::SessionContext::from_request(
+                    &state,
+                    req.headers(),
+                    req.uri(),
+                    req.extensions(),
+                );
+                if let Err(error) = context.check_csrf(req.headers(), req.method()) {
+                    return error.into_response();
+                }
+            }
             req.extensions_mut()
                 .insert(crate::routes::auth::AuthenticatedUser {
                     user_id,

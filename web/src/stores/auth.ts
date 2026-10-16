@@ -6,6 +6,7 @@ type AuthState = {
   accessToken: string | null
   refreshToken: string | null
   user: UserResponse | null
+  sessionChecked: boolean
   setAuth: (auth: AuthResponse, user: UserResponse) => void
   updateTokens: (auth: AuthResponse) => void
   updateUser: (user: UserResponse) => void
@@ -18,11 +19,13 @@ export const useAuthStore = create<AuthState>()(
       accessToken: null,
       refreshToken: null,
       user: null,
+      sessionChecked: false,
       setAuth: (auth, user) =>
         set({
           accessToken: auth.access_token,
           refreshToken: auth.refresh_token,
           user,
+          sessionChecked: true,
         }),
       updateTokens: (auth) =>
         set({
@@ -35,6 +38,7 @@ export const useAuthStore = create<AuthState>()(
           accessToken: null,
           refreshToken: null,
           user: null,
+          sessionChecked: true,
         }),
     }),
     {
@@ -50,7 +54,29 @@ export const useAuthStore = create<AuthState>()(
 )
 
 // Module-level singleton ensures concurrent 401s share one refresh request
-let pendingRefresh: Promise<string> | null = null
+let pendingRefresh: Promise<string | null> | null = null
+let pendingSession: Promise<void> | null = null
+
+/** Resolve an HttpOnly session before the router decides whether to sign in. */
+export async function restoreSession(): Promise<void> {
+  const { accessToken, sessionChecked } = useAuthStore.getState()
+  if (accessToken || sessionChecked) return
+  if (pendingSession) return pendingSession
+
+  pendingSession = (async () => {
+    const response = await fetch('/api/v1/auth/me')
+    if (response.status === 401) {
+      useAuthStore.getState().clearAuth()
+      return
+    }
+    if (!response.ok) throw new Error(`Session lookup failed: HTTP ${response.status}`)
+    const user = (await response.json()) as UserResponse
+    useAuthStore.setState({ user, sessionChecked: true })
+  })().finally(() => {
+    pendingSession = null
+  })
+  return pendingSession
+}
 
 /**
  * A refresh failure the stored refresh token could still survive: the server was
@@ -70,22 +96,17 @@ function refreshTokenRejected(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 422
 }
 
-export async function refreshAccess(): Promise<string> {
+export async function refreshAccess(): Promise<string | null> {
   if (pendingRefresh) return pendingRefresh
 
-  const { refreshToken, updateTokens, clearAuth } = useAuthStore.getState()
-  if (!refreshToken) {
-    clearAuth()
-    throw new Error('No refresh token')
-  }
-
-  pendingRefresh = (async (): Promise<string> => {
+  const { accessToken, refreshToken, updateTokens, clearAuth } = useAuthStore.getState()
+  pendingRefresh = (async (): Promise<string | null> => {
     let response: Response
     try {
       response = await fetch('/api/v1/auth/refresh', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
+        body: JSON.stringify(refreshToken ? { refresh_token: refreshToken } : {}),
       })
     } catch (error) {
       // The server is down or restarting. The refresh token is still good.
@@ -99,8 +120,13 @@ export async function refreshAccess(): Promise<string> {
       throw new Error('Token refresh failed')
     }
     const auth = (await response.json()) as AuthResponse
-    updateTokens(auth)
-    return auth.access_token
+    // A cookie-only session stays cookie-only; password sign-in still persists
+    // the JSON token pair using the existing localStorage behavior.
+    if (accessToken || refreshToken) {
+      updateTokens(auth)
+      return auth.access_token
+    }
+    return null
   })().finally(() => {
     pendingRefresh = null
   })

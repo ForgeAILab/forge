@@ -8,6 +8,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
+- Cookie-authenticated unsafe REST requests, including cookie-based refresh
+  and logout, require same-origin Fetch Metadata or Origin evidence and reject
+  failures with `403 csrf_rejected`. Explicit Bearer requests are unaffected.
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
   memory and coordination records, to the authenticated caller. Any signed-in
@@ -3066,6 +3069,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- HttpOnly `forge_session` and `forge_refresh` cookies on registration, login
+  and refresh, with HTTPS-aware Secure attributes and matching logout cleanup.
+  REST, web startup and SSE support cookie-only sessions while password-login
+  JSON tokens and existing localStorage behavior remain available. TestSprite
+  can capture a session credential after username/password sign-in.
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with
   bounded signature lists and explicit truncation in receipts and Review details.

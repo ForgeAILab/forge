@@ -862,6 +862,20 @@ describe('useSSE', () => {
     useChatSelection.setState({ pendingTurns: {}, projectChatIds: {} })
   })
 
+  it('opens and reconnects a cookie-only stream without a token query parameter', () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
+    useAuthStore.setState({ accessToken: null, refreshToken: null, user: null })
+    const client = new QueryClient()
+    const { unmount } = renderHook(() => useSSE(client, null, true))
+    expect(FakeEventSource.instances[0].url).toBe('/api/v1/events')
+    act(() => FakeEventSource.instances[0].onerror?.())
+    act(() => vi.advanceTimersByTime(1000))
+    expect(FakeEventSource.instances[1].url).toBe('/api/v1/events')
+    unmount()
+    client.clear()
+  })
+
   it('registers no named SSE listeners and routes an event a named catalog would have missed (F16)', () => {
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
     const queryClient = new QueryClient()

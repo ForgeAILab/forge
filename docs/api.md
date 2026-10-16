@@ -4,14 +4,66 @@ All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. By default,
 Forge binds loopback on an OS-selected port, persists it in `~/.forge/server.json`,
 and reuses it on later starts.
 
-Authentication is required on all non-exempt routes. Requests must carry a
-`Bearer` token — either a session JWT obtained via `POST /api/v1/auth/login`
-or a personal access token (PAT) prefixed `fg_` issued at
-`POST /api/v1/auth/tokens`. MCP clients can additionally use an OAuth 2.1
-access token (see `/.well-known/oauth-authorization-server`). The
-`register`, `login`, `refresh`, and `logout` routes are the only exempt ones.
+## Authentication
+
+Authentication is required on all non-exempt routes. REST accepts an
+`Authorization: Bearer` token first, then the `forge_session` cookie. Both
+use the same token validation and authentication errors (`401 missing_token`,
+`invalid_token`, or `token_expired`). A Bearer token can be a session JWT
+obtained via `POST /api/v1/auth/login` or a personal access token (PAT)
+prefixed `fg_` issued at `POST /api/v1/auth/tokens`. The existing `?token=`
+fallback still supports clients such as EventSource; cookie-only EventSource
+connections can use `/api/v1/events` without a query credential.
+MCP keeps explicit token authentication, including OAuth 2.1 access tokens
+(see `/.well-known/oauth-authorization-server`); it does not accept session
+cookies. The `register`, `login`, `refresh`, and `logout` auth routes are
+exempt from access-token authentication.
 Do not expose Forge to the public internet without an authenticating reverse
 proxy in front of it.
+
+Successful registration, login and refresh responses set two host-only cookies
+alongside the unchanged JSON token response:
+
+| Cookie | Value | Path | Max-Age |
+|---|---|---|---|
+| `forge_session` | Access token | `/` | Access-token lifetime, currently 900 seconds |
+| `forge_refresh` | Refresh token | `/api/v1/auth` | Refresh-token lifetime, currently 604800 seconds |
+
+Both cookies have `HttpOnly` and `SameSite=Strict`. They also have `Secure`
+when the configured public origin (`FORGE_PUBLIC_BASE_URL`) uses HTTPS, the
+request itself uses HTTPS, or a loopback proxy peer supplies
+`X-Forwarded-Proto: https`. Forwarded scheme headers from other peers are
+untrusted and ignored; remote/container reverse proxies must configure the
+public base URL. Ordinary local HTTP, including `http://127.0.0.1`, works
+without `Secure`.
+
+`POST /api/v1/auth/refresh` takes `refresh_token` from its JSON
+body first, then `forge_refresh`. Send `{}` or omit the body to use the cookie.
+Rotation invalidates the old refresh token and sets both cookies again.
+`POST /api/v1/auth/logout` uses the same credential precedence, revokes the
+selected refresh token, and clears both cookies with `Max-Age=0` and the same
+paths and attributes. Access JWTs already copied by a client remain valid
+until their normal expiry.
+
+**CSRF:** unsafe requests (`POST`, `PUT`, `PATCH`, `DELETE`, and other
+non-safe methods) authenticated only by a cookie require same-origin
+evidence. `Sec-Fetch-Site` must be `same-origin` or `none`. Only when that
+header is absent may `Origin` supply the evidence: its scheme, host and port
+must match the configured public origin, or the request's own serving origin
+when no public URL is configured. Cross-site, same-site, foreign/null Origin,
+and missing evidence are refused with `403 csrf_rejected`. A matching Origin
+does not override a rejected `Sec-Fetch-Site`. Cookie-based refresh and logout
+follow this rule even without an access cookie. Credential-free logout also
+requires this evidence before clearing cookies, even if SameSite withheld
+them. Explicit Bearer requests and
+explicit refresh-token bodies keep their existing behavior.
+
+The web app continues to persist password-login tokens in `forge-auth`
+localStorage. On startup without a stored access token it checks
+`GET /api/v1/auth/me` using same-origin cookies before making an auth-guard
+decision. A cookie-only session keeps the returned user without copying tokens
+into storage; API requests omit Authorization, refresh sends `{}`, and SSE
+uses cookies. Rejected sessions clear the user and return to `/login`.
 
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).

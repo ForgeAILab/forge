@@ -1,6 +1,7 @@
 import type {
   AuthResponse,
   LoginRequest,
+  LogoutRequest,
   RegisterRequest,
   UserResponse,
 } from '@/types/generated'
@@ -43,15 +44,15 @@ export function login(body: LoginRequest): Promise<AuthResponse> {
   })
 }
 
-export function logoutApi(body: { refresh_token: string }): Promise<void> {
+export function logoutApi(body: LogoutRequest): Promise<void> {
   return authFetch<void>('/auth/logout', {
     method: 'POST',
     body: JSON.stringify(body),
   })
 }
 
-export function getMe(token: string): Promise<UserResponse> {
+export function getMe(token?: string): Promise<UserResponse> {
   return authFetch<UserResponse>('/auth/me', {
-    headers: { authorization: `Bearer ${token}` },
+    headers: token ? { authorization: `Bearer ${token}` } : undefined,
   })
 }

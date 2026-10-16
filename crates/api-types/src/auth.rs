@@ -16,16 +16,20 @@ pub struct LoginRequest {
     pub password: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct RefreshRequest {
-    pub refresh_token: String,
+    #[serde(default)]
+    #[ts(optional)]
+    pub refresh_token: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, TS)]
+#[derive(Debug, Default, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LogoutRequest {
-    pub refresh_token: String,
+    #[serde(default)]
+    #[ts(optional)]
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, TS)]

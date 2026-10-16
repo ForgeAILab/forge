@@ -17,6 +17,16 @@ Everything for it lives in [`deploy/demo/`](../deploy/demo/):
 
 The root `docker-compose.yml` is the ordinary self-host file and is unrelated.
 
+Username/password sign-in now returns HttpOnly `forge_session` and
+`forge_refresh` cookies as well as the existing JSON tokens. TestSprite can
+capture the session cookie after signing in and continue with authenticated
+requests, including when the browser starts with empty localStorage. The demo's
+`FORGE_PUBLIC_BASE_URL=https://…` makes both cookies `Secure` even though
+Cloudflare and Traefik forward HTTP to the container. Cookie-authenticated
+writes must satisfy the same-origin CSRF rule described in
+[API authentication](api.md#authentication). This behavior is covered by local
+API and web tests; a live TestSprite run is not part of this change's verification.
+
 ## Live URL
 
 <!-- OWNER: fill in once the instance is up. Do not publish a URL here before
