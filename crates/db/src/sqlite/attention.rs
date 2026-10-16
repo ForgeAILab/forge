@@ -1029,17 +1029,29 @@ impl SqliteDb {
         let old: serde_json::Value = old
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let mut occurrences: std::collections::BTreeSet<String> =
+        // A flaky test can recur for months and its item never resolves: the
+        // count is a counter, and only the latest occurrences and Tasks are
+        // kept (a redelivery arrives right after its first delivery).
+        const RECENT: usize = 64;
+        let mut occurrences: Vec<String> =
             serde_json::from_value(old["occurrences"].clone()).unwrap_or_default();
-        if !occurrences.insert(occurrence.to_owned()) {
+        if occurrences.iter().any(|seen| seen == occurrence) {
             return Ok(());
         }
-        let mut tasks: std::collections::BTreeSet<String> =
+        let count = old["count"]
+            .as_u64()
+            .unwrap_or(occurrences.len() as u64)
+            .saturating_add(1);
+        occurrences.push(occurrence.to_owned());
+        occurrences.drain(..occurrences.len().saturating_sub(RECENT));
+        let mut tasks: Vec<String> =
             serde_json::from_value(old["task_ids"].clone()).unwrap_or_default();
-        tasks.insert(task.to_owned());
+        tasks.retain(|seen| seen != task);
+        tasks.push(task.to_owned());
+        tasks.drain(..tasks.len().saturating_sub(RECENT));
         let mut details: serde_json::Value =
             serde_json::from_str(&input.details_json).map_err(|e| DbError::Check(e.to_string()))?;
-        details["count"] = serde_json::json!(occurrences.len());
+        details["count"] = serde_json::json!(count);
         details["occurrences"] = serde_json::json!(occurrences);
         details["task_ids"] = serde_json::json!(tasks);
         input.details_json = details.to_string();

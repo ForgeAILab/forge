@@ -239,6 +239,34 @@ mod tests {
         let details: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(details["count"], 2);
         assert_eq!(details["task_ids"], json!(["t1", "t2"]));
+        // A recurring flake keeps counting; the stored lists stay bounded.
+        let flaky = db::CreateAttentionProjection {
+            id: db::new_uuid_v4(),
+            attention_type: "flaky_check".into(),
+            dedupe_key: "flaky".into(),
+            ..projection.clone()
+        };
+        for occurrence in 0..100 {
+            db.record_ci_triage_attention(
+                flaky.clone(),
+                &format!("run-{occurrence}"),
+                &format!("task-{}", occurrence % 70),
+            )
+            .await
+            .unwrap();
+        }
+        let raw: String = sqlx::query_scalar(
+            "SELECT details_json FROM attention_projection WHERE dedupe_key='flaky'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let recurring: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(recurring["count"], 100);
+        assert_eq!(recurring["occurrences"].as_array().unwrap().len(), 64);
+        assert_eq!(recurring["occurrences"][63], "run-99");
+        assert_eq!(recurring["task_ids"].as_array().unwrap().len(), 64);
+        assert_eq!(recurring["task_ids"][63], "task-29");
         db.resolve_passing_base_attention("p", "test", "2026-10-15T11:00:00Z", &event.id)
             .await
             .unwrap();

@@ -2521,7 +2521,8 @@ are minor and do not count as open blocking findings.
 `AttentionCategory` also includes `flaky_check` and `base_check_failing`.
 Both use Project scope and `recommended_action: inspect_ci`. Flaky items are
 deduplicated by command/signature; base items by command/base commit. Details
-include `command`, `count`, `task_ids`, run references and triage facts (including
+include `command`, `count` (every distinct occurrence), `task_ids` (the latest 64,
+most recent last), run references and triage facts (including
 why the base is unavailable or invalid). A later passing base observation resolves
 older base incidents for its command. These items remain visible in Mission Control
 without blocking the Task. The durable `check.ci_triaged` source event carries
