@@ -649,3 +649,71 @@ async fn review_verify_deadline_before_launch_is_infrastructure_never_a_pass() {
     assert!(receipt.commands.is_empty());
     assert_eq!(receipt.outcome, api_types::CheckExecutionOutcome::TimedOut);
 }
+
+async fn set_project_env(f: &FailedCiFixture, key: &str, value: &str) {
+    let project = db::ProjectRepo::get_by_id(&*f.db, &f.task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut settings: serde_json::Value = serde_json::from_str(&project.settings).unwrap();
+    settings["environment"]["env"][key] = json!(value);
+    sqlx::query("UPDATE project SET settings=? WHERE id=?")
+        .bind(settings.to_string())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn review_verify_app_log_report_and_text_evidence_are_ansi_free_and_redacted() {
+    const SECRET: &str = "s3cr3t-verify-value";
+    let mut f = fixture(
+        &[],
+        json!({"start":r#"printf '\033[31mboot with %s\033[0m\n' "$VERIFY_SECRET"; sleep 300"#,
+            "ready_command":r#"test -s "$FORGE_VERIFY_DIR/app.log""#,
+            "checks":[{"name":"smoke","command":r#"python3 -c 'import json,os; s=os.environ["VERIFY_SECRET"]; json.dump({"verdict":"failed","summary":"\x1b[1msaw "+s+"\x1b[0m","findings":[{"summary":"leak","observed":"token "+s}],"evidence":[{"path":"app.log","kind":"log","caption":"log "+s}]}, open(os.environ["FORGE_VERIFY_REPORT"],"w"))'"#}]}),
+    )
+    .await;
+    set_project_env(&f, "VERIFY_SECRET", SECRET).await;
+    let media = f._workspace_root.path().join("media");
+    let provider = crate::native_tools::CoordinationToolProvider::new(f.db.clone());
+    provider.set_media_root(media.clone());
+    f.engine = f
+        .engine
+        .clone()
+        .with_provider_credential_env(Arc::new(EvidenceSupport(provider)));
+    let (_, review, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "fail", "{details}");
+    let tail = details["verify"]["app_log_tail"].as_str().unwrap();
+    assert!(tail.contains("boot with [REDACTED]"), "{tail:?}");
+    let check = details["verify"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "smoke")
+        .unwrap();
+    assert_eq!(check["summary"], "saw [REDACTED]", "{details}");
+    let raw = details.to_string();
+    assert!(!raw.contains(SECRET), "{raw}");
+    assert!(!raw.contains("\\u001b"), "{raw}");
+    let ledger = db::review_findings::finding_ledger(&[review]).unwrap();
+    let smoke = ledger.iter().find(|f| f.id == "V-smoke").unwrap();
+    assert!(
+        smoke
+            .observed
+            .as_deref()
+            .unwrap()
+            .contains("token [REDACTED]"),
+        "{smoke:?}"
+    );
+    let id = check["evidence"][0].as_str().unwrap();
+    let stored = db::TaskMediaRepo::get_media_by_id(&*f.db, id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = std::fs::read(media.join(&stored.storage_key)).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(text.contains("boot with [REDACTED]") && !text.contains(SECRET));
+    assert_stopped(&f).await;
+}

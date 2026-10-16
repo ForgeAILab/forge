@@ -8,7 +8,10 @@ use crate::{
 use api_types::{ReviewVerifyCheckResult, ReviewVerifyDetails, ReviewVerifyStatus as Status};
 use db::{CheckDeliveryRepo, WorkspaceRepo};
 use serde_json::{json, Value};
-use std::path::{Component, Path};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path},
+};
 
 const EFFECT: &str = "review_verify";
 pub(super) enum Error {
@@ -193,7 +196,11 @@ pub(super) async fn run(
                 "verify check was cancelled before it produced a result".into(),
             ));
         }
-        let details = read_results(ctx, task, review, &directory, &result).await?;
+        // The app's log and the checks' reports are written by the candidate,
+        // not through a command pipe: the runner never redacted them.
+        let environment = review::contract::project_environment(&ctx.db, &task.id).await?;
+        let details =
+            read_results(ctx, task, review, &directory, &result, &environment.env).await?;
         if details.status != Status::Inconclusive
             || !db::budget::allows_retry(
                 i64::from(db::budget::Kind::ReviewVerifyRerun.default_limit()),
@@ -234,7 +241,11 @@ async fn read_results(
     review: &db::Review,
     directory: &Path,
     result: &db::StoredCheckResult,
+    env: &BTreeMap<String, String>,
 ) -> Result<ReviewVerifyDetails, String> {
+    let clean = |text: &str| {
+        executors::environment::redact_environment_values(&check_executor::strip_ansi(text), env)
+    };
     let mut details = ReviewVerifyDetails {
         status: Status::Pass,
         reason: None,
@@ -243,7 +254,7 @@ async fn read_results(
         notes: vec![],
     };
     // app.log can be long: only the bounded end is read, never the full file.
-    details.app_log_tail = app_tail(directory).unwrap_or_else(|error| {
+    details.app_log_tail = app_tail(directory, env).unwrap_or_else(|error| {
         details.notes.push(format!("app.log: {error}"));
         String::new()
     });
@@ -299,7 +310,7 @@ async fn read_results(
         };
         if let Some(report) = &report {
             if let Some(summary) = report["summary"].as_str().filter(|s| !s.trim().is_empty()) {
-                entry.summary = summary.chars().take(1000).collect();
+                entry.summary = clean(summary).chars().take(1000).collect();
             }
             if command.exit_code == 0 {
                 entry.result = match report["verdict"].as_str() {
@@ -318,7 +329,10 @@ async fn read_results(
                         .iter()
                         .filter_map(|key| {
                             f[*key].as_str().map(|s| {
-                                format!("{key}: {}", s.chars().take(1000).collect::<String>())
+                                format!(
+                                    "{key}: {}",
+                                    clean(s).chars().take(1000).collect::<String>()
+                                )
                             })
                         })
                         .collect::<Vec<_>>()
@@ -349,16 +363,22 @@ async fn read_results(
                     ) {
                         return Err("unsupported evidence kind".into());
                     }
-                    let caption = evidence["caption"]
-                        .as_str()
-                        .unwrap_or(&entry.summary)
+                    let caption = clean(evidence["caption"].as_str().unwrap_or(&entry.summary))
                         .chars()
                         .take(1000)
                         .collect::<String>();
-                    let bytes = read_file(directory, name, 25 * 1024 * 1024)?
+                    let mut bytes = read_file(directory, name, 25 * 1024 * 1024)?
                         .ok_or("evidence file does not exist")?;
                     if bytes.is_empty() {
                         return Err("evidence file is empty".into());
+                    }
+                    // A text file (the app's log, a report) is kept without
+                    // the Project's values, as command output is.
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        let redacted = executors::environment::redact_environment_values(text, env);
+                        if redacted != text {
+                            bytes = redacted.into_bytes();
+                        }
                     }
                     let media_id = uuid::Uuid::new_v5(
                         &uuid::Uuid::NAMESPACE_OID,
@@ -442,6 +462,8 @@ async fn read_results(
     Ok(details)
 }
 
+const APP_LOG_WINDOW_BYTES: u64 = 64 * 1024;
+
 fn clip_tail(text: &str, limit: usize) -> String {
     let mut start = text.len().saturating_sub(limit);
     while !text.is_char_boundary(start) {
@@ -449,7 +471,7 @@ fn clip_tail(text: &str, limit: usize) -> String {
     }
     text[start..].into()
 }
-fn app_tail(directory: &Path) -> Result<String, String> {
+fn app_tail(directory: &Path, env: &BTreeMap<String, String>) -> Result<String, String> {
     use std::io::{Read, Seek, SeekFrom};
     let path = directory.join("app.log");
     if !path.exists() {
@@ -466,11 +488,20 @@ fn app_tail(directory: &Path) -> Result<String, String> {
         return Err("not a confined regular file".into());
     }
     let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::End(-(meta.len().min(4096) as i64)))
+    // More than the kept tail is read, so a value that straddles the cut is
+    // still masked whole before the tail is taken.
+    let window = meta.len().min(APP_LOG_WINDOW_BYTES);
+    file.seek(SeekFrom::End(-(window as i64)))
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
-    file.take(4096)
+    file.take(APP_LOG_WINDOW_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(check_executor::redacted_tail(
+        &bytes,
+        meta.len() > window,
+        true,
+        env,
+        check_executor::OUTPUT_TAIL_BYTES,
+    ))
 }

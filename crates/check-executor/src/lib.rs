@@ -333,6 +333,20 @@ fn redacted(
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
 }
+/// The bounded, ANSI-free, redacted tail of output that did not come through
+/// a command pipe (a verify app's own log file), masked exactly like command
+/// output tails. `truncated`: the bytes are the end of a longer stream, so
+/// they may begin inside a value; `interrupted`: the writer may have been
+/// stopped mid-write, so they may end inside one.
+pub fn redacted_tail(
+    bytes: &[u8],
+    truncated: bool,
+    interrupted: bool,
+    env: &BTreeMap<String, String>,
+    limit: usize,
+) -> String {
+    redacted(bytes, truncated, interrupted, env, limit).0
+}
 /// Build a command. The two frozen legacy policies and the canonical CI
 /// policy inherit the owner's environment through a login shell, with the
 /// Project values on top; every other policy clears it and sees only the
