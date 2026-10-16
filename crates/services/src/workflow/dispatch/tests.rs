@@ -1777,3 +1777,24 @@ fn repair_brief_keeps_the_rejection_reason_when_review_wrote_no_row() {
         );
     }
 }
+
+#[test]
+fn worker_repair_brief_keeps_the_task_comments() {
+    let mut ctx = fake_context(default_roles::WORKER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json: json!({"ci_steps":[{"index":0,"command":"cargo test","exit_code":101,"stderr_tail":"boom"}]}).to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    ctx.comments = vec![db::TaskComment {
+        author_name: "Owner".into(),
+        content: "Keep the public parser API unchanged.".into(),
+        ..fake_comment()
+    }];
+    let text = resolve_prompt_builder(BUILDER_ID_WORKER_REVIEW_FIX_V1)
+        .build(&ctx)
+        .user;
+    assert!(
+        text.contains("Recent comments:\n- Owner: Keep the public parser API unchanged."),
+        "{text}"
+    );
+}

@@ -150,7 +150,15 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
-    let body = super::repair_brief::RepairBrief::review(ctx).render();
+    let mut body = super::repair_brief::RepairBrief::review(ctx).render();
+    // The worker owns its plan and acts on the Task's comments; they sit
+    // outside the brief's sections as they did before it.
+    let mut comments = String::new();
+    append_recent_comments(ctx, &mut comments);
+    if !comments.is_empty() {
+        body.push('\n');
+        body.push_str(&comments);
+    }
     match super::coder_prompt::no_change_brief(ctx) {
         Some(brief) => format!("{brief}\n\n{body}"),
         None => body,
@@ -201,6 +209,10 @@ fn append_task_context(ctx: &AgentDispatchContext, user: &mut String) {
         user.push_str(plan);
         user.push('\n');
     }
+    append_recent_comments(ctx, user);
+}
+
+fn append_recent_comments(ctx: &AgentDispatchContext, user: &mut String) {
     if ctx
         .comments
         .iter()
