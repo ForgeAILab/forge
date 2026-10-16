@@ -3460,11 +3460,26 @@ fn finding_ids(
     ledger: &[api_types::ReviewFindingEntry],
     include: impl Fn(&api_types::ReviewFindingEntry) -> bool,
 ) -> String {
-    let ids: Vec<_> = ledger
-        .iter()
-        .filter(|entry| include(entry))
-        .map(|entry| entry.id.as_str())
-        .collect();
+    // The same per-step bound as the checklist: a step can carry hundreds
+    // of failing-test ids, and comments are read back into agent prompts.
+    let mut ids = Vec::new();
+    let mut ci_counts = std::collections::BTreeMap::new();
+    let mut ci_omitted = std::collections::BTreeMap::new();
+    for entry in ledger.iter().filter(|entry| include(entry)) {
+        if entry.source == api_types::ReviewFindingSource::Ci && entry.id.contains('#') {
+            let step = entry.id.split('#').next().unwrap_or(&entry.id);
+            let count = ci_counts.entry(step).or_insert(0);
+            if *count == 20 {
+                *ci_omitted.entry(step).or_insert(0) += 1;
+                continue;
+            }
+            *count += 1;
+        }
+        ids.push(entry.id.clone());
+    }
+    for (step, count) in ci_omitted {
+        ids.push(format!("{step} +{count} more"));
+    }
     if ids.is_empty() {
         "none".to_owned()
     } else {
@@ -3969,6 +3984,28 @@ mod reviewer_message_tests {
             None,
         );
         assert!(!third.contains("CI-0"), "{third}");
+    }
+    #[test]
+    fn repair_and_park_comments_limit_test_ids_per_step() {
+        let ledger: Vec<_> = (0..30)
+            .map(|index| {
+                let mut entry = comment_finding(
+                    &format!("CI-0#{index:08x}"),
+                    api_types::ReviewFindingStatus::Open,
+                );
+                entry.source = api_types::ReviewFindingSource::Ci;
+                entry
+            })
+            .chain([comment_finding("F1", api_types::ReviewFindingStatus::Open)])
+            .collect();
+        let text = repair_round_comment(2, 1, 3, &ledger, "review");
+        assert_eq!(text.matches("CI-0#").count(), 20, "{text}");
+        assert!(text.contains("CI-0 +10 more"), "{text}");
+        assert!(text.contains("F1"), "{text}");
+        let open = finding_ids(&ledger, |entry| {
+            entry.status == api_types::ReviewFindingStatus::Open
+        });
+        assert_eq!(open.matches("CI-0#").count(), 20, "{open}");
     }
     #[test]
     fn reviewer_comment_limits_test_findings_per_step() {
