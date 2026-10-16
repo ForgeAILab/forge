@@ -331,3 +331,28 @@ async fn ci_triage_rerun_failing_with_other_signatures_goes_to_the_base() {
     );
     assert_eq!(count(&f).await, 3);
 }
+
+#[tokio::test]
+async fn ci_triage_base_whose_setup_failed_is_not_reused() {
+    // A registry outage during install says nothing about the base commit:
+    // the next triage on that base runs setup again instead of joining it.
+    let marker = tempfile::tempdir().unwrap();
+    let setup = format!("test -f '{}'", marker.path().join("registry-up").display());
+    let f = fixture("full", &[setup.as_str()], &[RED]).await;
+    let (_, _, details) = enter(&f).await;
+    assert_eq!(
+        details["ci_steps"][0]["triage"]["base_status"], "base_run_invalid",
+        "{details}"
+    );
+    std::fs::write(marker.path().join("registry-up"), "up").unwrap();
+    let (_, review, details) = enter(&f).await;
+    let triage = &details["ci_steps"][0]["triage"];
+    assert_eq!(triage["base_status"], "available", "{details}");
+    assert_eq!(triage["failures"][0]["class"], "pre_existing");
+    assert_eq!(review.status, db::ReviewStatus::Passed, "{details}");
+    let bases: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_run WHERE json_extract(input_json,'$.spec.commands[0].id')='triage-base:setup:0'")
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(bases, 2);
+}

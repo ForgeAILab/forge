@@ -809,11 +809,13 @@ impl SqliteDb {
         let now = now_rfc3339();
         // Red base evidence is reusable only as comparison evidence under its
         // separate identity. It never becomes a certified candidate/head pass.
+        // A run whose setup failed (a registry outage during install) is no
+        // evidence about the base commit: the next request runs it again.
         let base = !reuse_only
             && api_types::is_ci_triage_base(&request.identity.inputs.spec)
             && request.identity.inputs.reusable_inputs();
         let comparison = if base {
-            sqlx::query("SELECT r.* FROM check_result r JOIN check_run run ON run.id=r.run_id WHERE r.identity_key=? AND run.cacheable=1 AND run.state='failed' AND r.outcome='fail' AND r.cleanup IN ('success','not_performed') AND json_extract(run.owner_receipt_json,'$.prepared_head')=run.commit_sha AND json_extract(run.owner_receipt_json,'$.finished_head')=run.commit_sha AND json_extract(run.owner_receipt_json,'$.tracked_changes')=0 AND json_extract(run.owner_receipt_json,'$.execution_inputs')=json_extract(run.input_json,'$.environment_identity') AND NOT EXISTS(SELECT 1 FROM json_each(run.owner_receipt_json,'$.commands') c WHERE json_extract(c.value,'$.process_tree_stopped')<>1) ORDER BY r.created_at DESC,r.id DESC LIMIT 1")
+            sqlx::query("SELECT r.* FROM check_result r JOIN check_run run ON run.id=r.run_id WHERE r.identity_key=? AND run.cacheable=1 AND run.state='failed' AND r.outcome='fail' AND r.cleanup IN ('success','not_performed') AND json_extract(run.owner_receipt_json,'$.prepared_head')=run.commit_sha AND json_extract(run.owner_receipt_json,'$.finished_head')=run.commit_sha AND json_extract(run.owner_receipt_json,'$.tracked_changes')=0 AND json_extract(run.owner_receipt_json,'$.execution_inputs')=json_extract(run.input_json,'$.environment_identity') AND NOT EXISTS(SELECT 1 FROM json_each(run.owner_receipt_json,'$.commands') c WHERE json_extract(c.value,'$.process_tree_stopped')<>1) AND json_array_length(run.owner_receipt_json,'$.commands')=json_array_length(run.input_json,'$.spec.commands') AND NOT EXISTS(SELECT 1 FROM json_each(run.owner_receipt_json,'$.commands') c WHERE json_extract(c.value,'$.id') LIKE 'triage-base:setup:%' AND IFNULL(json_extract(c.value,'$.exit_code'),-1)<>0) ORDER BY r.created_at DESC,r.id DESC LIMIT 1")
                 .bind(&key).fetch_optional(&mut *tx).await?.map(map_result).transpose()?
         } else {
             None

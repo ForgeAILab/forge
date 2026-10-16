@@ -9977,7 +9977,9 @@ candidate's Project and per-run build environment. It runs effective `setup_step
 then CI through the last candidate failure. Commit, setup/CI commands, Project,
 repository and attested environment determine sharing across Tasks. A completed
 red base can be shared as comparison evidence only when its owner witnesses and
-process settlement agree; it is never a certified or reusable candidate pass.
+process settlement agree and its setup steps all passed (a run whose install
+failed is executed again by the next request); it is never a certified or
+reusable candidate pass.
 Daemon placements and missing setup yield `base_unavailable`. Failed setup,
 incomplete base CI, mismatched owner input receipts, or missing base signatures
 for a signature-bearing red candidate yield `base_run_invalid`; consistent
