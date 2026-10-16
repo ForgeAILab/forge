@@ -195,20 +195,24 @@ steps 2, 6 and 8 cannot work before that.
 5. **API access.** In Dokploy, **Settings → Profile → API/CLI**, generate an
    API key. Find the application's `composeId` (it is in the address of the
    application's page, or in the answer of `GET /api/project.all`). Put both
-   into the repository settings listed below.
+   into the repository settings listed below. Before the first workflow run,
+   check the server's architecture with `uname -m` on the server: `x86_64`
+   means `linux/amd64` (the default); `aarch64` means `linux/arm64`. Set the
+   repository variable `DEMO_PLATFORM` to match. A deployment log saying
+   `no matching manifest for linux/arm64/v8` also identifies an ARM64 server:
+   set `DEMO_PLATFORM` to `linux/arm64` and run the workflow again.
 6. **First image.** Run the **Demo TestSprite** workflow by hand
    (`Actions → Demo TestSprite → Run workflow`). It builds and pushes
    `ghcr.io/<owner>/<repo>-demo`, moves the `live` tag and asks Dokploy to
-   deploy. A new GHCR package is private, so this first run normally fails
-   at "Wait for this build on the public URL" because Dokploy cannot pull
-   yet. Do not assume that is the reason: every failure to come up ends at
-   that same step. Open the deployment log and the container log in Dokploy
-   first. A pull error names the image; a container that did start prints
+   deploy. The package may already be readable by Dokploy. If the instance
+   does not come up, open the deployment log and the container log in Dokploy
+   first: every failure to come up ends at "Wait for this build on the public
+   URL". A pull error names the image; a container that did start prints
    `[demo-seed]` lines and stops at the one that failed (`[demo-seed] ERROR:
    …`), and a Forge that could not install its demo data prints
    `demo install failed`.
-7. **Make the package public** (see "Registry access" below): GitHub → the
-   organisation's **Packages** → `<repo>-demo` → **Package settings** →
+7. **Make the package public if needed** (see "Registry access" below):
+   GitHub → the organisation's **Packages** → `<repo>-demo` → **Package settings** →
    **Change visibility** → Public.
 8. **Deploy.** Re-run the failed job of the workflow, or press **Deploy** in
    Dokploy. In the container log the entrypoint reports each step with the
@@ -256,6 +260,7 @@ Variables (same page, `Variables` tab):
 |---|---|
 | `DOKPLOY_COMPOSE_ID` | The `composeId` of the Dokploy Compose application. |
 | `DEMO_URL` | Public URL of the demo, with scheme. The same URL as the domain in Dokploy, as `FORGE_PUBLIC_BASE_URL`, and as the URL the TestSprite project tests. |
+| `DEMO_PLATFORM` | Optional demo server platform: `linux/amd64` (default when unset) or `linux/arm64`. Any other value fails the configuration check. |
 | `TESTSPRITE_PROJECT_ID` | Id of the TestSprite project that holds the suite. |
 
 The account emails and passwords are not repository secrets. They live only in
@@ -326,6 +331,13 @@ Things that follow from there being one demo instance:
 
 ### Build time and cache
 
+`DEMO_PLATFORM` selects a native build runner: `ubuntu-latest` for
+`linux/amd64` (the default), or `ubuntu-24.04-arm` for `linux/arm64`. Both
+images target that platform, without QEMU emulation. The layer cache scope
+includes the platform, so amd64 and arm64 layers stay separate. The suite
+still runs on `ubuntu-latest`; it names the image's platform when creating
+the container to copy out the build id, without starting the container.
+
 Every run compiles the release image. Two things decide how long that takes:
 
 - **The Dockerfile's dependency layer does not cache today.** It copies the
@@ -363,12 +375,31 @@ requests with an administrator override.
 
 ## Not verified
 
-Nothing here has run against a real Dokploy, a real Forge container or GitHub
-Actions. In particular:
+The first GitHub Actions run reached Dokploy, which could read the image's
+manifest list but could not pull it on the ARM64 server: the image was built
+for amd64 only. That run did not verify a running demo container or the
+TestSprite suite.
 
-- **Dokploy facts taken from its documentation, not tried:** the
-  `compose.deploy` and `compose.stop` endpoints and the `x-api-key` header;
-  that the Domains tab adds the Traefik labels and `dokploy-network` to the
+The ARM64 path then ran end to end (`DEMO_PLATFORM=linux/arm64`): the image
+was built on `ubuntu-24.04-arm`, `compose.stop` and `compose.deploy` were
+accepted, Dokploy pulled the image without a registry credential, the
+container seeded itself and turned healthy, and the public URL served the
+run's build id and `/healthz` to the workflow. The TestSprite step ran and
+reported that the project had no tests yet.
+
+**Cloudflare in front of the demo.** If the demo host name is proxied by
+Cloudflare, Bot Fight Mode answers requests from cloud address ranges (GitHub
+runners, TestSprite's browsers) with a challenge page (`403`,
+`cf-mitigated: challenge`) on every page except static files. The workflow
+then waits until its timeout: `/demo-build.txt` answers, `/healthz` does not.
+Bot Fight Mode cannot exempt one host name on the free plan: turn it off for
+the zone (Security → Settings → Bot traffic), or serve the demo from a host
+name that Cloudflare does not proxy.
+
+The following remain unverified:
+
+- **Dokploy setup details taken from its documentation, not tried:** that
+  the Domains tab adds the Traefik labels and `dokploy-network` to the
   chosen service; that the Environment tab becomes an env file Compose reads.
 - **Not found in Dokploy's documentation:** whether `compose.stop` and
   `compose.deploy` return before the work is done (the workflow assumes they
