@@ -313,12 +313,10 @@ function UserMenu() {
   const { refreshToken, clearAuth } = useAuthStore()
 
   async function handleLogout() {
-    if (refreshToken) {
-      try {
-        await logoutApi({ refresh_token: refreshToken })
-      } catch {
-        // Server-side revocation failure is non-fatal; still clear local state
-      }
+    try {
+      await logoutApi(refreshToken ? { refresh_token: refreshToken } : {})
+    } catch {
+      // Server-side revocation failure is non-fatal; still clear local state
     }
     clearAuth()
     void navigate({ to: '/login', search: { redirect: undefined } })

@@ -1,6 +1,6 @@
 use axum::{
     extract::{FromRequestParts, Path, State},
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, HeaderMap, Method, StatusCode},
     Json,
 };
 
@@ -13,13 +13,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     errors::{ApiError, ApiResult},
+    session::{cookie, SessionBody, SessionContext, REFRESH_COOKIE},
     state::AppState,
 };
 
-pub async fn register(
+pub(crate) async fn register(
     State(state): State<AppState>,
+    session: SessionContext,
     Json(body): Json<RegisterRequest>,
-) -> ApiResult<(StatusCode, Json<AuthResponse>)> {
+) -> ApiResult<(StatusCode, HeaderMap, Json<AuthResponse>)> {
     let _user = state
         .auth_service
         .register(&body.email, &body.password, body.display_name.as_deref())
@@ -50,6 +52,7 @@ pub async fn register(
 
     Ok((
         StatusCode::CREATED,
+        session.token_cookies(&pair)?,
         Json(AuthResponse {
             access_token: pair.access_token,
             refresh_token: pair.refresh_token,
@@ -59,10 +62,11 @@ pub async fn register(
     ))
 }
 
-pub async fn login(
+pub(crate) async fn login(
     State(state): State<AppState>,
+    session: SessionContext,
     Json(body): Json<LoginRequest>,
-) -> ApiResult<Json<AuthResponse>> {
+) -> ApiResult<(HeaderMap, Json<AuthResponse>)> {
     let pair = state
         .auth_service
         .login(&body.email, &body.password)
@@ -75,21 +79,27 @@ pub async fn login(
             }
         })?;
 
-    Ok(Json(AuthResponse {
-        access_token: pair.access_token,
-        refresh_token: pair.refresh_token,
-        token_type: "Bearer".to_string(),
-        expires_in: pair.expires_in,
-    }))
+    Ok((
+        session.token_cookies(&pair)?,
+        Json(AuthResponse {
+            access_token: pair.access_token,
+            refresh_token: pair.refresh_token,
+            token_type: "Bearer".to_string(),
+            expires_in: pair.expires_in,
+        }),
+    ))
 }
 
-pub async fn refresh(
+pub(crate) async fn refresh(
     State(state): State<AppState>,
-    Json(body): Json<RefreshRequest>,
-) -> ApiResult<Json<AuthResponse>> {
+    session: SessionContext,
+    headers: HeaderMap,
+    SessionBody(body): SessionBody<RefreshRequest>,
+) -> ApiResult<(HeaderMap, Json<AuthResponse>)> {
+    let refresh_token = refresh_credential(body.refresh_token.as_deref(), &headers, &session)?;
     let pair = state
         .auth_service
-        .refresh(&body.refresh_token)
+        .refresh(refresh_token)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -107,20 +117,40 @@ pub async fn refresh(
             }
         })?;
 
-    Ok(Json(AuthResponse {
-        access_token: pair.access_token,
-        refresh_token: pair.refresh_token,
-        token_type: "Bearer".to_string(),
-        expires_in: pair.expires_in,
-    }))
+    Ok((
+        session.token_cookies(&pair)?,
+        Json(AuthResponse {
+            access_token: pair.access_token,
+            refresh_token: pair.refresh_token,
+            token_type: "Bearer".to_string(),
+            expires_in: pair.expires_in,
+        }),
+    ))
 }
 
-pub async fn logout(
+pub(crate) async fn logout(
     State(state): State<AppState>,
-    Json(body): Json<LogoutRequest>,
-) -> ApiResult<StatusCode> {
-    state.auth_service.logout(&body.refresh_token).await?;
-    Ok(StatusCode::OK)
+    session: SessionContext,
+    headers: HeaderMap,
+    SessionBody(body): SessionBody<LogoutRequest>,
+) -> ApiResult<(StatusCode, HeaderMap)> {
+    let refresh_token = refresh_credential(body.refresh_token.as_deref(), &headers, &session)?;
+    state.auth_service.logout(refresh_token).await?;
+    Ok((StatusCode::OK, session.clear_cookies()?))
+}
+
+fn refresh_credential<'a>(
+    body_token: Option<&'a str>,
+    headers: &'a HeaderMap,
+    session: &SessionContext,
+) -> ApiResult<&'a str> {
+    if let Some(token) = body_token {
+        return Ok(token);
+    }
+    // Require proof even if SameSite withheld the cookies: an anonymous
+    // cross-site logout must not clear a browser's existing session cookies.
+    session.check_csrf(headers, &Method::POST)?;
+    Ok(cookie(headers, REFRESH_COOKIE).unwrap_or(""))
 }
 
 pub async fn me(

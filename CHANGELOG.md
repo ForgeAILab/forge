@@ -33,7 +33,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   issue-tracker integrations (tokens read from the server environment) and
   `POST /api/v1/config/mcp` (agent config files written on the server) are
   refused the same way.
-
+- Issue browser session cookies only over HTTPS, avoiding live-token exposure
+  to other ports on a local HTTP host. Both cookies use the `__Host-` prefix,
+  `Secure`, `Path=/`, and no `Domain` to prevent sibling-subdomain cookie
+  planting. The refresh cookie is read only by refresh and logout; logout
+  still clears both cookies on HTTP.
+- Cookie-authenticated unsafe REST requests, including cookie-based refresh
+  and logout, require same-origin Fetch Metadata or Origin evidence and reject
+  failures with `403 csrf_rejected`. Explicit Bearer requests are unaffected.
+  Cookie-authenticated requests of any method whose `Sec-Fetch-Site` is
+  `same-site` or `cross-site` are refused the same way.
+  An explicit credential (any `Authorization` header, or `?token=`) always
+  decides the request: the session cookie never overrides it or stands in for
+  an invalid one.
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
   memory and coordination records, to the authenticated caller. Any signed-in
@@ -62,7 +74,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   accepts only public `https://` repositories (no server paths, environment
   assets, integrations or MCP config file writes). Git operations performed by
   Forge remain available.
-
+- Session cookie names are now `__Host-forge_session` and
+  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
+  unprefixed cookies are no longer read. Registration, login and refresh no
+  longer set cookies on plain HTTP; localStorage token authentication remains
+  available.
 - **Project access and mutation roles are now enforced across REST, MCP and
   SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its
   subroutes, `/tasks/{id}` and its subroutes, `/repos/{id}`, `/executions/{id}`,
@@ -3098,6 +3114,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
+  registration, login and refresh, with matching logout cleanup.
+  REST, web startup and SSE support cookie-only sessions while password-login
+  JSON tokens and existing localStorage behavior remain available. TestSprite
+  can capture a session credential after username/password sign-in.
+- Web startup revives a cookie-only session after an expired access cookie:
+  one empty-body refresh request, then one `/auth/me` retry. Failed revival
+  returns to `/login` without a loop or storing the returned tokens.
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with
   bounded signature lists and explicit truncation in receipts and Review details.

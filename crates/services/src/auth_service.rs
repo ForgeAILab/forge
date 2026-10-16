@@ -11,7 +11,7 @@ use tokio::sync::Semaphore;
 use crate::{Result, ServiceError};
 
 const ACCESS_TOKEN_EXPIRY_SECS: u64 = 900; // 15 minutes
-const REFRESH_TOKEN_EXPIRY_SECS: u64 = 7 * 24 * 3600; // 7 days
+pub const REFRESH_TOKEN_EXPIRY_SECS: u64 = 7 * 24 * 3600; // 7 days
 const BCRYPT_MAX_CONCURRENT_JOBS: usize = 4;
 const PAT_LAST_USED_WRITE_INTERVAL_SECS: i64 = 5 * 60;
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$LJ3m4ys3Lg7ECg8Mmpfmkea3RADRCnFXaOJsDaF5LxlWAyrVaoHDu";
