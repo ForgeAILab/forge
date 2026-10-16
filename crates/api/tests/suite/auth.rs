@@ -314,7 +314,7 @@ async fn concurrent_refresh_single_winner() {
     assert_eq!(failures, 1, "the other concurrent refresh must fail");
 }
 
-// Browser sessions keep the existing JSON token API and add two host-only cookies.
+// Browser sessions keep the JSON token API; only HTTPS issues __Host- cookies.
 fn session_cookie_headers(response: &axum::response::Response) -> Vec<String> {
     response
         .headers()
@@ -324,14 +324,19 @@ fn session_cookie_headers(response: &axum::response::Response) -> Vec<String> {
         .collect()
 }
 
-fn assert_session_cookies(cookies: &[String], auth: &AuthResponse, secure: bool) {
+fn assert_session_cookies(cookies: &[String], auth: &AuthResponse) {
     assert_eq!(cookies.len(), 2);
     for (name, token, path, max_age) in [
-        ("forge_session", &auth.access_token, "/", auth.expires_in),
         (
-            "forge_refresh",
+            "__Host-forge_session",
+            &auth.access_token,
+            "/",
+            auth.expires_in,
+        ),
+        (
+            "__Host-forge_refresh",
             &auth.refresh_token,
-            "/api/v1/auth",
+            "/",
             services::auth_service::REFRESH_TOKEN_EXPIRY_SECS,
         ),
     ] {
@@ -345,9 +350,26 @@ fn assert_session_cookies(cookies: &[String], auth: &AuthResponse, secure: bool)
         assert!(attributes.contains(&"SameSite=Strict"));
         assert!(attributes.contains(&format!("Path={path}").as_str()));
         assert!(attributes.contains(&format!("Max-Age={max_age}").as_str()));
-        assert_eq!(attributes.contains(&"Secure"), secure);
+        assert!(attributes.contains(&"Secure"));
         assert!(!cookie.contains("Domain="), "session must be host-only");
     }
+}
+
+fn assert_cleared_session_cookies(cookies: &[String]) {
+    assert_eq!(cookies.len(), 2);
+    for name in ["__Host-forge_session", "__Host-forge_refresh"] {
+        assert!(cookies.contains(&format!(
+            "{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"
+        )));
+    }
+}
+
+fn https_session_app(state: &api::state::AppState) -> axum::Router {
+    let mut state = state.clone();
+    let mut config = (*state.effective_config).clone();
+    config.server.public_base_url = Some("https://forge.example.com".to_owned());
+    state.effective_config = std::sync::Arc::new(config);
+    api::api_router(state)
 }
 
 fn session_request(method: Method, path: &str, cookie: &str) -> axum::http::request::Builder {
@@ -419,9 +441,17 @@ async fn cookie_session_register_login_refresh_cookie_attributes_and_scheme() {
                 StatusCode::OK
             };
             let auth: AuthResponse = parse_body(response, status).await;
-            assert_session_cookies(&cookies, &auth, secure);
+            if secure {
+                assert_session_cookies(&cookies, &auth);
+            } else {
+                assert!(cookies.is_empty(), "HTTP {action} must not issue cookies");
+            }
             refresh_token = auth.refresh_token;
         }
+        // Logout clears the same Secure cookies even over plain HTTP.
+        let response = do_logout(&app, &refresh_token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_cleared_session_cookies(&session_cookie_headers(&response));
     }
 }
 
@@ -432,7 +462,7 @@ async fn cookie_session_get_and_events_accept_cookie_and_bearer_takes_precedence
     let app = &harness.app;
     let auth = register_and_login(app, "cookie-get@example.com", "Password123!").await;
     let cookie = format!(
-        "other=value; forge_session={}; another=value",
+        "other=value; __Host-forge_session={}; another=value",
         auth.access_token
     );
     for path in ["/api/v1/auth/me", "/api/v1/events"] {
@@ -463,13 +493,17 @@ async fn cookie_session_get_and_events_accept_cookie_and_bearer_takes_precedence
     let response = app
         .clone()
         .oneshot(
-            session_request(Method::GET, "/api/v1/auth/me", "forge_session=invalid")
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", auth.access_token),
-                )
-                .body(Body::empty())
-                .unwrap(),
+            session_request(
+                Method::GET,
+                "/api/v1/auth/me",
+                "__Host-forge_session=invalid",
+            )
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", auth.access_token),
+            )
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -483,7 +517,7 @@ async fn cookie_session_csrf_blocks_unsafe_methods_and_accepts_same_origin() {
     let harness = common::test_app(workspace.path(), "cookie-csrf").await;
     let app = &harness.app;
     let auth = register_and_login(app, "cookie-csrf@example.com", "Password123!").await;
-    let cookie = format!("forge_session={}", auth.access_token);
+    let cookie = format!("__Host-forge_session={}", auth.access_token);
     for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
         for (name, value) in [
             ("sec-fetch-site", "cross-site"),
@@ -580,7 +614,7 @@ async fn cookie_session_csrf_uses_configured_public_origin() {
     config.server.public_base_url = Some("https://forge.example.com/app".to_owned());
     state.effective_config = Arc::new(config);
     let app = api::api_router(state);
-    let cookie = format!("forge_session={}", auth.access_token);
+    let cookie = format!("__Host-forge_session={}", auth.access_token);
     for (origin, expected) in [
         ("https://forge.example.com", StatusCode::CREATED),
         ("https://forge.example.com:443", StatusCode::CREATED),
@@ -606,9 +640,9 @@ async fn cookie_session_csrf_uses_configured_public_origin() {
 async fn cookie_session_refresh_rotates_cookies_logout_clears_and_revokes() {
     let workspace = common::TestDir::new("cookie-refresh");
     let harness = common::test_app(workspace.path(), "cookie-refresh").await;
-    let app = &harness.app;
+    let app = &https_session_app(&harness.state);
     let auth = register_and_login(app, "cookie-refresh@example.com", "Password123!").await;
-    let cookie = format!("forge_refresh={}", auth.refresh_token);
+    let cookie = format!("__Host-forge_refresh={}", auth.refresh_token);
     // Refresh must use only the refresh cookie: the access cookie may be expired.
     let response = app
         .clone()
@@ -622,7 +656,7 @@ async fn cookie_session_refresh_rotates_cookies_logout_clears_and_revokes() {
         .unwrap();
     let cookies = session_cookie_headers(&response);
     let refreshed: AuthResponse = parse_body(response, StatusCode::OK).await;
-    assert_session_cookies(&cookies, &refreshed, false);
+    assert_session_cookies(&cookies, &refreshed);
     assert_ne!(auth.refresh_token, refreshed.refresh_token);
     assert_eq!(
         do_refresh(app, &auth.refresh_token).await.status(),
@@ -630,7 +664,7 @@ async fn cookie_session_refresh_rotates_cookies_logout_clears_and_revokes() {
     );
 
     let cookie = format!(
-        "forge_refresh={}; forge_session={}",
+        "__Host-forge_refresh={}; __Host-forge_session={}",
         refreshed.refresh_token, refreshed.access_token
     );
     let response = app
@@ -644,17 +678,80 @@ async fn cookie_session_refresh_rotates_cookies_logout_clears_and_revokes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let cookies = session_cookie_headers(&response);
-    assert_eq!(cookies.len(), 2);
-    assert!(cookies
-        .iter()
-        .any(|cookie| cookie == "forge_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"));
-    assert!(cookies.iter().any(|cookie| cookie
-        == "forge_refresh=; HttpOnly; SameSite=Strict; Path=/api/v1/auth; Max-Age=0"));
+    assert_cleared_session_cookies(&session_cookie_headers(&response));
     assert_eq!(
         do_refresh(app, &refreshed.refresh_token).await.status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn cookie_session_refresh_reads_only_refresh_cookie() {
+    let workspace = common::TestDir::new("cookie-refresh-boundary");
+    let harness = common::test_app(workspace.path(), "cookie-refresh-boundary").await;
+    let app = &https_session_app(&harness.state);
+    let auth = register_and_login(app, "cookie-boundary@example.com", "Password123!").await;
+
+    // Path=/ sends the refresh cookie to all routes. Neither a refresh token
+    // nor even a valid access token under that name authenticates REST or MCP.
+    for token in [&auth.refresh_token, &auth.access_token] {
+        for (method, path) in [
+            (Method::GET, "/api/v1/auth/me"),
+            (Method::POST, "/api/v1/auth/tokens"),
+            (Method::POST, "/mcp"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    session_request(method, path, &format!("__Host-forge_refresh={token}"))
+                        .header("sec-fetch-site", "same-origin")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+    }
+    // A refresh token under the access-cookie name is never used for refresh.
+    let response = app
+        .clone()
+        .oneshot(
+            session_request(
+                Method::POST,
+                "/api/v1/auth/refresh",
+                &format!("__Host-forge_session={}", auth.refresh_token),
+            )
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let error: serde_json::Value = parse_body(response, StatusCode::UNAUTHORIZED).await;
+    assert_eq!(error["code"], "invalid_refresh_token");
+
+    // An unusable access cookie must not interfere with a live refresh cookie.
+    let response = app
+        .clone()
+        .oneshot(
+            session_request(
+                Method::POST,
+                "/api/v1/auth/refresh",
+                &format!(
+                    "__Host-forge_session=expired; __Host-forge_refresh={}",
+                    auth.refresh_token
+                ),
+            )
+            .header("sec-fetch-site", "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookies = session_cookie_headers(&response);
+    let refreshed: AuthResponse = parse_body(response, StatusCode::OK).await;
+    assert_session_cookies(&cookies, &refreshed);
 }
 
 #[tokio::test]
@@ -663,7 +760,7 @@ async fn cookie_session_refresh_logout_csrf_and_body_precedence() {
     let harness = common::test_app(workspace.path(), "cookie-refresh-csrf").await;
     let app = &harness.app;
     let auth = register_and_login(app, "cookie-refresh-csrf@example.com", "Password123!").await;
-    let cookie = format!("forge_refresh={}", auth.refresh_token);
+    let cookie = format!("__Host-forge_refresh={}", auth.refresh_token);
     for path in ["/api/v1/auth/refresh", "/api/v1/auth/logout"] {
         for (name, value) in [
             ("sec-fetch-site", "cross-site"),
@@ -690,7 +787,7 @@ async fn cookie_session_refresh_logout_csrf_and_body_precedence() {
             session_request(
                 Method::POST,
                 "/api/v1/auth/refresh",
-                "forge_refresh=invalid",
+                "__Host-forge_refresh=invalid",
             )
             .header("sec-fetch-site", "cross-site")
             .body(Body::from(
@@ -704,11 +801,15 @@ async fn cookie_session_refresh_logout_csrf_and_body_precedence() {
     let response = app
         .clone()
         .oneshot(
-            session_request(Method::POST, "/api/v1/auth/logout", "forge_refresh=invalid")
-                .body(Body::from(
-                    json!({ "refresh_token": refreshed.refresh_token }).to_string(),
-                ))
-                .unwrap(),
+            session_request(
+                Method::POST,
+                "/api/v1/auth/logout",
+                "__Host-forge_refresh=invalid",
+            )
+            .body(Body::from(
+                json!({ "refresh_token": refreshed.refresh_token }).to_string(),
+            ))
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -740,7 +841,7 @@ async fn cookie_session_invalid_and_expired_cookies_are_unauthorized() {
                 session_request(
                     Method::GET,
                     "/api/v1/auth/me",
-                    &format!("forge_session={token}"),
+                    &format!("__Host-forge_session={token}"),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -757,7 +858,7 @@ async fn cookie_session_invalid_and_expired_cookies_are_unauthorized() {
             session_request(
                 Method::POST,
                 "/api/v1/auth/refresh",
-                "forge_refresh=invalid",
+                "__Host-forge_refresh=invalid",
             )
             .header("sec-fetch-site", "same-origin")
             .body(Body::from("{}"))
@@ -773,7 +874,7 @@ async fn cookie_session_invalid_and_expired_cookies_are_unauthorized() {
 async fn cookie_session_empty_refresh_and_logout_bodies_use_cookies() {
     let workspace = common::TestDir::new("cookie-empty-body");
     let harness = common::test_app(workspace.path(), "cookie-empty-body").await;
-    let app = &harness.app;
+    let app = &https_session_app(&harness.state);
     register_and_login(app, "cookie-empty@example.com", "Password123!").await;
     // A cross-site form can POST an empty body while SameSite withholds the
     // cookies. It still must not receive Set-Cookie headers that log a user out.
@@ -800,7 +901,7 @@ async fn cookie_session_empty_refresh_and_logout_bodies_use_cookies() {
             StatusCode::OK,
         )
         .await;
-        let cookie = format!("forge_refresh={}", auth.refresh_token);
+        let cookie = format!("__Host-forge_refresh={}", auth.refresh_token);
         let malformed = app
             .clone()
             .oneshot(
@@ -817,7 +918,10 @@ async fn cookie_session_empty_refresh_and_logout_bodies_use_cookies() {
             let mut request = Request::builder()
                 .method(Method::POST)
                 .uri(format!("/api/v1/auth/{action}"))
-                .header(header::COOKIE, format!("forge_refresh={refresh_token}"))
+                .header(
+                    header::COOKIE,
+                    format!("__Host-forge_refresh={refresh_token}"),
+                )
                 .header("sec-fetch-site", "same-origin");
             if let Some(content_type) = content_type {
                 request = request.header(header::CONTENT_TYPE, content_type);
@@ -831,11 +935,11 @@ async fn cookie_session_empty_refresh_and_logout_bodies_use_cookies() {
             assert_eq!(cookies.len(), 2);
             if action == "refresh" {
                 let auth: AuthResponse = parse_body(response, StatusCode::OK).await;
-                assert_session_cookies(&cookies, &auth, false);
+                assert_session_cookies(&cookies, &auth);
                 refresh_token = auth.refresh_token;
             } else {
                 assert_eq!(response.status(), StatusCode::OK);
-                assert!(cookies.iter().all(|cookie| cookie.contains("Max-Age=0")));
+                assert_cleared_session_cookies(&cookies);
             }
         }
         assert_eq!(
@@ -861,7 +965,7 @@ async fn cookie_session_explicit_credentials_beat_the_cookie() {
     let app = &harness.app;
     let a = register_and_login(app, "cookie-a@example.com", "Password123!").await;
     let b = register_and_login(app, "cookie-b@example.com", "Password123!").await;
-    let cookie_a = format!("forge_session={}", a.access_token);
+    let cookie_a = format!("__Host-forge_session={}", a.access_token);
 
     // Cookie of user A, Bearer of user B: the request is user B.
     let request = session_request(Method::GET, "/api/v1/auth/me", &cookie_a)
@@ -875,7 +979,7 @@ async fn cookie_session_explicit_credentials_beat_the_cookie() {
 
     // EventSource sends its explicit `?token=` and the ambient cookie together:
     // the query credential wins, whether the cookie is another user's or stale.
-    for cookie in [cookie_a.as_str(), "forge_session=stale"] {
+    for cookie in [cookie_a.as_str(), "__Host-forge_session=stale"] {
         let request = session_request(
             Method::GET,
             &format!("/api/v1/auth/me?token={}", b.access_token),
@@ -911,7 +1015,7 @@ async fn cookie_session_refuses_cross_origin_fetch_metadata_on_every_method() {
     let harness = common::test_app(workspace.path(), "cookie-fetch-site").await;
     let app = &harness.app;
     let auth = register_and_login(app, "cookie-site@example.com", "Password123!").await;
-    let cookie = format!("forge_session={}", auth.access_token);
+    let cookie = format!("__Host-forge_session={}", auth.access_token);
 
     // SameSite=Strict still sends the cookie from another port on the same host
     // or from a sibling subdomain, e.g. as an <img> or no-cors read.

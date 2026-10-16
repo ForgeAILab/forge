@@ -64,10 +64,25 @@ export async function restoreSession(): Promise<void> {
   if (pendingSession) return pendingSession
 
   pendingSession = (async () => {
-    const response = await fetch('/api/v1/auth/me')
+    let response = await fetch('/api/v1/auth/me')
     if (response.status === 401) {
-      useAuthStore.getState().clearAuth()
-      return
+      try {
+        // The access cookie can expire while the refresh cookie is still live.
+        // Restore once without copying the returned tokens into localStorage.
+        const refreshed = await fetch('/api/v1/auth/refresh', { method: 'POST' })
+        if (!refreshed.ok) {
+          useAuthStore.getState().clearAuth()
+          return
+        }
+        response = await fetch('/api/v1/auth/me')
+        if (!response.ok) {
+          useAuthStore.getState().clearAuth()
+          return
+        }
+      } catch {
+        useAuthStore.getState().clearAuth()
+        return
+      }
     }
     if (!response.ok) throw new Error(`Session lookup failed: HTTP ${response.status}`)
     const user = (await response.json()) as UserResponse

@@ -12,8 +12,8 @@ use url::Url;
 
 use crate::{errors::ApiError, state::AppState};
 
-pub(crate) const SESSION_COOKIE: &str = "forge_session";
-pub(crate) const REFRESH_COOKIE: &str = "forge_refresh";
+pub(crate) const SESSION_COOKIE: &str = "__Host-forge_session";
+pub(crate) const REFRESH_COOKIE: &str = "__Host-forge_refresh";
 
 /// Cookie refresh/logout can omit the body entirely. Present JSON still goes
 /// through the normal extractor so malformed credentials are never ignored.
@@ -122,6 +122,11 @@ impl SessionContext {
     }
 
     pub(crate) fn token_cookies(&self, pair: &TokenPair) -> Result<HeaderMap, ApiError> {
+        // Cookies ignore ports. On local HTTP another server on this host
+        // could receive a live token, so only issue cookies over HTTPS.
+        if !self.secure {
+            return Ok(HeaderMap::new());
+        }
         self.cookies(
             &pair.access_token,
             pair.expires_in,
@@ -142,13 +147,14 @@ impl SessionContext {
         refresh_max_age: u64,
     ) -> Result<HeaderMap, ApiError> {
         let mut headers = HeaderMap::new();
-        for (name, value, path, max_age) in [
-            (SESSION_COOKIE, access, "/", access_max_age),
-            (REFRESH_COOKIE, refresh, "/api/v1/auth", refresh_max_age),
+        // The __Host- prefix requires Secure, Path=/ and no Domain, including
+        // when clearing cookies. Only refresh/logout read the refresh cookie.
+        for (name, value, max_age) in [
+            (SESSION_COOKIE, access, access_max_age),
+            (REFRESH_COOKIE, refresh, refresh_max_age),
         ] {
-            let secure = if self.secure { "; Secure" } else { "" };
             let value = HeaderValue::from_str(&format!(
-                "{name}={value}; HttpOnly; SameSite=Strict; Path={path}; Max-Age={max_age}{secure}"
+                "{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}; Secure"
             ))
             .map_err(|_| ApiError::internal("Invalid session cookie"))?;
             headers.append(header::SET_COOKIE, value);
