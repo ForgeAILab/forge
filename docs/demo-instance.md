@@ -32,11 +32,11 @@ _Not published yet._
   Tasks spread over `backlog`, `todo`, `in_progress`, `review`, `done` and
   `blocked`.
 - **No embedded execution daemon.** Demo mode skips its startup; the deployment
-  also passes `--no-embedded-daemon`. Server CLI/shell Agent launches are refused.
-  Native Chat turns using visitor-supplied credentials are described below.
+  also passes `--no-embedded-daemon`. Server CLI/shell Agent launches, native
+  agent turns and Chat turns are refused (see below).
 - **No MCP endpoint.** `--no-mcp`: `POST /mcp` is not served.
 - **No provider credentials.** The instance is started without any model
-  provider key.
+  provider key, and demo mode refuses adding one.
 - **Disposable.** There is no volume. `/data` is a memory-backed filesystem
   with a size cap, and the entrypoint empties it at every start. Every deploy,
   every restart and every crash recovery is a new instance with the same seed
@@ -95,37 +95,59 @@ Registration is open: anyone who reaches the URL can create an account and sign
 in. Through the product, a visitor's account is an ordinary one.
 
 A visitor who registers their own account starts with no Projects and can use
-the product as an ordinary user: create Projects and Tasks of their own.
-The instance supplies no model credentials and starts no embedded daemon.
-A visitor can connect their own provider credential and run native Chat turns;
-the demo policy also refuses those turns' server-side command tools. Other
-native tools keep their existing permissions.
+the product as an ordinary user: create Projects and Tasks of their own, move
+Tasks through the board, comment, and register a repository that is an
+`https://` remote at a public address.
 
-**Demo command policy.** `--demo` refuses commands the server would run from
-user configuration, including Script lifecycle hooks, review CI and setup
-steps, environment checks/setup, scaffolding, server Agent executors, native Chat command tools and
-interactive terminals. Project settings, Task overrides and workflow/template
-writes containing these commands return HTTP **422** with code
-`server_commands_disabled` and message **"This demo does not run commands"**.
-The same domain rule applies through MCP if it is enabled separately.
+**The server is a manager only.** `--demo` switches on one process-wide policy
+that Project settings cannot turn off. It refuses three things, each with HTTP
+**422** and a code of its own:
 
-Previously stored, seeded or template-derived commands are refused before
-spawning. Script hooks record failed results; asynchronous lifecycle refusals
-also appear in the Task's comments. A review entry requiring CI parks the Task
-with that reason, without scheduling commands or silently approving the Task.
-Environment checks return failed results with the refusal. This policy comes
-only from `--demo`; Project settings cannot turn it off. Demo mode also skips
-embedded-daemon startup. Ordinary installations keep their execution behavior.
+- **Commands** (`server_commands_disabled`, "This demo does not run
+  commands"): Script lifecycle hooks, review CI and setup steps, environment
+  checks and setup, scaffolding, server CLI/shell Agent executors, native
+  command tools, interactive terminals and compiler-cache helpers. Project
+  settings, Task overrides and workflow/template writes that contain them are
+  refused. Commands that are already stored (seeded, template-derived) are
+  refused before spawning: Script hooks record failed results (asynchronous
+  ones also as a Task comment), a review entry that requires CI parks the Task
+  with the reason instead of approving it, and environment checks return failed
+  results.
+- **Agents** (`server_agents_disabled`, "This demo does not run agents or
+  connect model providers"): adding a provider credential (`POST
+  /api/v1/providers`) or starting a provider authorization, and admitting a
+  Chat turn (send, retry, handoff, Genesis). Project Agent wakes admit no turn.
+  Any native turn that reaches the agent runtime by another path (inquiries,
+  native Task executions, topic rotation) fails with the same code before a
+  provider request.
+- **Server files and data** (`server_location_refused`): a repository or
+  repository location on the server's filesystem (a local path, `file://`, any
+  non-`https` URL, or a host that is local, private or resolves to such an
+  address; the provider-request address policy is reused), a branch name Git
+  could read as an option, a server-owned repository location, Project
+  environment assets (they copy server files into a worktree), issue-tracker
+  integrations (their token is read from the server's environment) and writes
+  of agent configuration files (`POST /api/v1/config/mcp`). Stored
+  repositories with a local path are refused before Git runs against them.
 
-**Git and network access remain.** Forge still performs its own Git operations
-(clone, fetch, worktree, merge and inspection) with Forge-built arguments.
-Repository setup can therefore consume resources and make outbound Git
-connections. Provider requests also remain available, subject to their existing
-HTTPS/public-address validation. The container remains attached to Dokploy's shared proxy network,
-which can reach the internet and other applications on that network. This
-change removes configured server command execution; it does not isolate that
-network or make repository access an outbound-network policy. Use a dedicated
-demo host/instance and keep unrelated services off that shared network.
+Seeding (`--demo`) and the entrypoint's account setup are unaffected: the
+seeded repository is `https://example.com/demo.git` with no local path. Demo
+mode also skips embedded-daemon startup. Ordinary installations keep their
+behavior.
+
+**What remains.** Forge still performs its own Git operations (clone, fetch,
+worktree, merge and inspection) for public `https://` repositories, so
+repository setup can consume CPU, memory and storage and makes outbound
+connections to the hosts visitors name. The public-address check resolves the
+name when it is checked; Git resolves it again when it connects, and Git
+follows an HTTP redirect on its first request, so a hostile name server or
+server can still steer one Git connection elsewhere. A visitor can connect
+their own `forge-daemon`; whatever it runs, it runs on their machine. The
+container remains attached to Dokploy's shared proxy network, which can reach
+the internet and other applications on that network. This policy removes
+server-side command execution, agent turns and server file access by
+configuration; it does not isolate the network. Use a dedicated demo host or
+instance and keep unrelated services off that shared network.
 
 The container still has a read-only root filesystem, no host filesystem or
 Docker-socket mounts, dropped Linux capabilities, and memory, CPU and process
@@ -157,8 +179,8 @@ Other limits:
   child processes) keeps the environment it was started with. The demo
   command refusal does not change host/operator access to those secrets.
 
-A visitor cannot use MCP, cannot use a model provider that the instance owner
-paid for (there is none), and cannot keep anything across a restart.
+A visitor cannot use MCP, cannot connect any model provider or run any agent
+turn on the server, and cannot keep anything across a restart.
 
 ## Setting it up in Dokploy
 
@@ -227,8 +249,8 @@ does not. Two ways to let Dokploy pull it:
 - **Registry credential in Dokploy.** **Settings → Registry**, URL `ghcr.io`,
   a GitHub user and a classic token. Dokploy's guide asks for
   `write:packages`; `read:packages` is enough for pulling. This stores a
-  GitHub token on a server that, per the limit above, strangers may be able
-  to run commands on, and it is not confirmed that Dokploy applies registry
+  GitHub token on a server that runs a public instance with open
+  registration, and it is not confirmed that Dokploy applies registry
   credentials to the image pulls of a Compose application.
 
 ## Resetting and taking it offline

@@ -5043,6 +5043,27 @@ Task. Native Chat command tools also refuse execution, including when a visitor
 connects their own provider credential; other native tools keep their permissions.
 Forge's built-in Git operations remain available. Normal mode is unchanged.
 
+The same demo switch refuses two more things, also with HTTP **422**:
+
+- `server_agents_disabled` ("This demo does not run agents or connect model
+  providers"): `POST /api/v1/providers`, `POST /api/v1/provider-authorizations`
+  and Chat turn admission (`POST /api/v1/agent-chats/{id}/messages`, turn
+  retry, handoffs, Genesis start). Turns queued by any other path fail in the
+  agent runtime with the same code before a provider request. MCP reports
+  `-32602` with `data.code: "server_agents_disabled"`; native orchestration
+  outcomes use the `server_commands_disabled` outcome code.
+- `server_location_refused` (message starts "This demo reads nothing from the
+  server and accepts only https:// repositories at a public address", followed
+  by the reason): repository create/update (`local_path`, a `file://` or other
+  non-`https` `remote_url`, a local/private host or one that resolves to a
+  private address, a `default_branch` that is not a valid Git branch name),
+  repository sync of a stored local path, registering a server-owned or
+  `shared_mount` repository location, Project settings with
+  `environment.assets`, `POST`/`PATCH /api/v1/projects/{id}/integration` and
+  integration sync, and `POST /api/v1/config/mcp`. MCP reports `-32602` with
+  `data.code: "server_location_refused"`; native outcomes use
+  `validation_error`.
+
 Common HTTP mappings:
 
 | Status | When |
@@ -5418,7 +5439,7 @@ records when the operation produced them.
 | `transient_failure` | The operation may succeed after the bounded retry guidance is followed. |
 | `internal_failure` | The operation failed without a safe caller-facing diagnosis. |
 | `validation_error` | The operation or its closed arguments are invalid. |
-| `server_commands_disabled` | Demo mode refuses configured server commands. |
+| `server_commands_disabled` | Demo mode refuses configured server commands and server-side agent turns. |
 
 `status` is one of `succeeded`, `approval_required`, `setup_required`, or
 `failed`. `ok` maps to `succeeded`; `approval_required` and `setup_required`

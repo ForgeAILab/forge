@@ -12,6 +12,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Command-bearing Project, Task and workflow writes return `422 server_commands_disabled`;
   stored hooks, checks, environment setup, scaffolds, executors, native Chat
   command tools and terminals refuse before spawn. Review entries requiring CI park with the reason.
+- Demo mode runs no agent in the server process and reads nothing from the
+  server through configuration. Adding provider credentials or authorizations
+  and admitting Chat turns return `422 server_agents_disabled`; any native turn
+  queued another way fails with that code before a provider request.
+  Repositories must be `https://` remotes at a public address: local paths,
+  `file://` and other non-https remotes, private hosts, option-like branch
+  names and server-owned repository locations return
+  `422 server_location_refused`, and a stored local-path repository is refused
+  before Git runs. Environment assets (server files copied into worktrees),
+  issue-tracker integrations (tokens read from the server environment) and
+  `POST /api/v1/config/mcp` (agent config files written on the server) are
+  refused the same way.
 
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
@@ -37,7 +49,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Breaking
 
 - `forge --demo` no longer executes configured server commands or starts the
-  embedded daemon. Git operations performed by Forge remain available.
+  embedded daemon, refuses provider credentials and Chat/agent turns, and
+  accepts only public `https://` repositories (no server paths, environment
+  assets, integrations or MCP config file writes). Git operations performed by
+  Forge remain available.
 
 - **Project access and mutation roles are now enforced across REST, MCP and
   SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its

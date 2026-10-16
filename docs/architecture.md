@@ -1016,6 +1016,18 @@ without spending retries or leaving a suspended check consumer. Stored durable
 checks return unstarted infrastructure receipts carrying the refusal. Forge's
 own Git operations remain outside this policy.
 
+The same switch also makes the demo server a manager only for agents and
+server files. `executors::server_commands::ensure_agents_allowed` refuses
+provider credential creation, provider authorization, Chat turn admission
+(`AgentTurnAdmissionService::prepare`) and, as the source guard,
+`NativeAgentRuntimeBackend::run_turn`/`fork_topic` (`ServiceError::ServerAgentsDisabled`,
+`server_agents_disabled`). `services::server_commands::validate_repository_input`
+/ `ensure_repository_allowed` accept only `https://` remotes at a public
+address (the provider-request address policy) and valid branch names, at write
+time and before Git touches a stored repository; server-owned repository
+locations, environment assets, integrations and MCP config file writes are
+refused with `ServiceError::ServerLocationRefused` (`server_location_refused`).
+
 #### Project environment
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,
