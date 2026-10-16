@@ -195,8 +195,9 @@ Non-Goals:
 - `kind`: `regression`, `missed` or `out_of_scope`. Absent is allowed.
 - `same_cause_as`: an earlier finding id.
 
-From the second review in a window, Forge applies these rules in the ledger,
-never in the frozen assessment:
+After the reviewer's first assessment in a window (a Review that stopped before
+a reviewer ran does not count), Forge applies these rules in the ledger, never
+in the frozen assessment:
 - A new (not continued) blocking finding stays blocking only if one of these
   holds:
   - its kind is `regression`;
@@ -206,7 +207,9 @@ never in the frozen assessment:
     `where` has no path, this clause is not met.
 
   Otherwise it is shown as `minor` with the note "outside requirements and
-  Task files".
+  Task files". A continued finding that was downgraded stays `minor` until it
+  meets one of these clauses: the re-review prompt asks the reviewer to copy
+  every open id, which must not turn a nit into a blocker.
 - `out_of_scope` findings never block. Their status is `out_of_scope`, and
   they are listed as follow-up candidates.
 
@@ -250,7 +253,10 @@ owner pass it in one step.
   changed."
 
 The drop order adds Attempts after the reviewer report, keeping the latest
-round longest. Requirement status and Pattern are never dropped.
+round longest. Requirement status and Pattern are never dropped. Pattern has
+display limits instead (open members first, 20 sites per family and 30 in all,
+locations clipped, then "+N more"), so a large family cannot crowd the open
+findings out of the 24 KiB brief.
 
 **D8 — Change strategy when a finding is carried.** A repair round that
 contains a carried reviewer finding (streak 2, the round D5 of the first

@@ -59,7 +59,7 @@ The brief SHALL include a "Requirement status" line for each frozen requirement:
 
 When findings are linked by `same_cause_as`, the brief SHALL group each family under "Pattern", with its locations, and say: "These share a cause. Fix it at every call site and list the sites you changed."
 
-Neither section is cut for budget.
+Neither section is cut for budget. Pattern has fixed display limits instead: open members first, at most 20 sites per family and 30 in all, with clipped locations, then "+N more".
 
 #### Scenario: NK-28 style family
 - **WHEN** F3 has `same_cause_as: "F1"` (stale apply after async validation) and F1 was resolved in round 1
