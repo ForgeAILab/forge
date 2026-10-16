@@ -1919,3 +1919,47 @@ fn repair_brief_repeated_nonblocking_ci_stays_labelled_without_false_resolution(
         }
     }
 }
+
+#[test]
+fn repair_brief_blocking_check_output_precedes_waived_ci_output() {
+    let step = |index: usize, blocking: bool| {
+        let (signature, class, tail) = if blocking {
+            (
+                "new-test".to_owned(),
+                "introduced",
+                format!("{}BLOCKING-END", "B".repeat(4000)),
+            )
+        } else {
+            (format!("flaky-{index}"), "flaky", "N".repeat(4 * 1024))
+        };
+        json!({"index": index, "command": format!("step-{index}"), "exit_code": 1,
+            "stderr_tail": "", "output_tail": tail, "failures": [signature],
+            "triage": {"mode":"full","base_status":"available","base_commit":"base",
+                "rerun_run_id":"rerun","base_run_id":"base-run","reason":null,"class":null,
+                "blocking":blocking,"failures":[{"signature":signature,"class":class}]}})
+    };
+    let mut ctx = fake_context(default_roles::CODER);
+    ctx.prior_reviews = vec![db::Review {
+        step_results_json:
+            json!({"ci_steps": (0..6).map(|index| step(index, index == 5)).collect::<Vec<_>>(),
+            "verify":{"status":"fail","app_log_tail":"L".repeat(40 * 1024),"checks":[]}})
+            .to_string(),
+        ..fake_review(1, db::ReviewStatus::Failed)
+    }];
+    for builder in [
+        BUILDER_ID_CODER_REVIEW_FIX_V2,
+        BUILDER_ID_WORKER_REVIEW_FIX_V1,
+    ] {
+        let text = resolve_prompt_builder(builder).build(&ctx).user;
+        assert!(text.len() <= 24 * 1024, "{}", text.len());
+        for index in 0..6 {
+            assert!(
+                text.contains(&format!("CI-{index}: step-{index} (exit 1)")),
+                "{text}"
+            );
+        }
+        // Waived flaky output must not use up the shared tail allowance
+        // before the one failure this round has to repair.
+        assert!(text.contains("BLOCKING-END"), "{text}");
+    }
+}

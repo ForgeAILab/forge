@@ -8284,7 +8284,9 @@ summary. The ordered sections are Task (description and canonical plan), Round
 repair rounds), Resolved/unconfirmed changes, Failing check output, Verify,
 Reviewer report, Previous round, and Logs. Empty optional sections are omitted.
 At most 20 signature findings per step are displayed, followed by `+N more`;
-the ledger itself retains every finding. A no-change reminder still leads the
+the ledger itself retains every finding. Failing check output lists blocking
+steps first; steps CI triage waived under `full` follow, labelled non-blocking,
+so their tails never use the shared allowance first. A no-change reminder still leads the
 request and names its `repair_no_change` allowance.
 
 The brief body is capped at 24 KiB. It trims the report to 2 KiB, then drops

@@ -78,6 +78,7 @@ impl RepairBrief {
             task.push_str(&format!("\n\nOriginal plan:\n{plan}"));
         }
         let mut checks = Vec::new();
+        let mut waived = Vec::new();
         let mut displayed_ci = BTreeSet::new();
         let mut limited_steps = BTreeSet::new();
         for step in details
@@ -124,7 +125,14 @@ impl RepairBrief {
                         .map(|signature| review::findings::ci_finding_id(index, signature)),
                 );
             }
-            checks.push(CheckOutput {
+            // Waived output goes last: the shared tail allowance is spent on
+            // the failures this round must repair first.
+            let list = if triage.as_ref().is_some_and(|triage| !triage.blocking) {
+                &mut waived
+            } else {
+                &mut checks
+            };
+            list.push(CheckOutput {
                 label: format!(
                     "CI-{index}: {} (exit {}){}",
                     step["command"].as_str().unwrap_or("CI step"),
@@ -158,6 +166,7 @@ impl RepairBrief {
             if id.strip_prefix("ci:").is_some_and(|index| {
                 checks
                     .iter()
+                    .chain(&waived)
                     .any(|check| check.label.starts_with(&format!("CI-{index}: ")))
             }) {
                 continue;
@@ -169,6 +178,7 @@ impl RepairBrief {
                 truncated: false,
             });
         }
+        checks.extend(waived);
         let has_assessment = details["conformance"]["assessment"].is_object()
             || details.get("auditor").is_some_and(|value| !value.is_null());
         let report = if has_assessment {
