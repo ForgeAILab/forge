@@ -1822,3 +1822,25 @@ fn merge_ci_brief_keeps_the_passed_review_and_the_previous_execution() {
         }
     }
 }
+
+#[test]
+fn automatic_recovery_brief_says_it_is_the_final_attempt() {
+    use super::repair_brief::{RepairBrief, RepairBudget};
+    let ctx = fake_context(default_roles::CODER);
+    let text = RepairBrief::review(&ctx)
+        .automatic_recovery(
+            RepairBudget {
+                name: "automatic_review_recovery".into(),
+                spent: 1,
+                limit: 1,
+            },
+            "review budget exhausted",
+        )
+        .render();
+    assert!(text.contains("final automatic recovery attempt"), "{text}");
+    assert!(text.contains("smallest useful change"), "{text}");
+    assert!(
+        text.contains("Review failure: review budget exhausted"),
+        "{text}"
+    );
+}

@@ -221,6 +221,7 @@ impl RepairBrief {
             budget.render(),
             clip(failure_reason, 2000, true)
         );
+        self.instructions = "The normal review retry flow is about to block this Task, so this is the final automatic recovery attempt. Inspect the workspace and the review failure context, make the smallest useful change that addresses the failing review, and leave the Task ready for the normal workflow to review again.";
         self
     }
 
