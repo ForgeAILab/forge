@@ -206,9 +206,11 @@ pub fn prepare_environment(
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
         }
     }
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let port = pick_port(|| {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|e| e.to_string())?;
+        Ok(listener.local_addr().map_err(|e| e.to_string())?.port())
+    })?;
     Ok(BTreeMap::from([
         ("FORGE_VERIFY_PORT".into(), port.to_string()),
         (
@@ -231,6 +233,38 @@ pub fn prepare_environment(
             directory.join("report.json").to_string_lossy().into_owned(),
         ),
     ]))
+}
+
+/// Ports handed to verify runs of this server, until the longest verify wall
+/// limit has passed. The probe listener is closed before the app binds, so
+/// the system can offer the same free port to a second Task's verify in the
+/// meantime; two apps on one port would let one Task's checks (and its
+/// readiness probe) reach the other Task's app.
+static VERIFY_PORTS: std::sync::Mutex<Vec<(u16, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+const VERIFY_PORT_HOLD: std::time::Duration = std::time::Duration::from_secs(3600 + 300);
+
+/// A free loopback port no other verify of this server holds, and that
+/// nothing serves on the IPv6 loopback either (an app that binds `localhost`
+/// may take `::1`, and a check that opens `localhost` may reach it there).
+fn pick_port(mut candidate: impl FnMut() -> Result<u16, String>) -> Result<u16, String> {
+    let now = std::time::Instant::now();
+    let mut held = VERIFY_PORTS.lock().unwrap_or_else(|p| p.into_inner());
+    held.retain(|(_, until)| *until > now);
+    for _ in 0..64 {
+        let port = candidate()?;
+        if held.iter().any(|(taken, _)| *taken == port) {
+            continue;
+        }
+        if std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+        {
+            continue;
+        }
+        held.push((port, now + VERIFY_PORT_HOLD));
+        return Ok(port);
+    }
+    Err("no free verify port".into())
 }
 
 /// The start step records its process group (`start.pgid`, written before
@@ -438,6 +472,31 @@ mod tests {
             !survived,
             "the restarted owner started beside the orphaned app"
         );
+    }
+
+    #[test]
+    fn review_verify_port_is_not_handed_out_twice_or_taken_on_ipv6() {
+        let first = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let reused = first.local_addr().unwrap().port();
+        drop(first);
+        let other = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let fresh = other.local_addr().unwrap().port();
+        drop(other);
+        // The system offers the same free port to two concurrent verifies.
+        assert_eq!(pick_port(|| Ok(reused)).unwrap(), reused);
+        let mut offers = [reused, fresh].into_iter();
+        assert_eq!(pick_port(|| Ok(offers.next().unwrap())).unwrap(), fresh);
+        // A port something serves on ::1 only is free on 127.0.0.1, not for verify.
+        if let Ok(v6) = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)) {
+            let busy = v6.local_addr().unwrap().port();
+            let spare = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let next = spare.local_addr().unwrap().port();
+            drop(spare);
+            if std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, busy)).is_ok() {
+                let mut offers = [busy, next].into_iter();
+                assert_eq!(pick_port(|| Ok(offers.next().unwrap())).unwrap(), next);
+            }
+        }
     }
 
     #[test]
