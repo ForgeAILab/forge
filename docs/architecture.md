@@ -8265,7 +8265,8 @@ and re-review section list frozen requirement IDs and explain `requirement_ids`,
 lenient; unknown requirement IDs are dropped before freezing, and empty optional
 fields are omitted. From review 2, a new blocking finding without a regression,
 known requirement citation, or candidate-diff file becomes minor with the note
-“outside requirements and Task files”. Continued IDs keep their identity.
+“outside requirements and Task files”. Continued IDs keep their identity; a
+continued downgraded finding stays minor until it qualifies.
 `out_of_scope` never blocks and is listed as a follow-up candidate. Anchoring
 changes only the ledger, never the assessment.
 

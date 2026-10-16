@@ -6203,7 +6203,7 @@ From review 2 in the window, a new blocking reviewer finding becomes minor unles
 it is a regression, cites a known requirement, or its first repository-relative
 `where` path (without `:line`) is in the candidate diff. Such a downgrade carries
 `anchoring_note: "outside requirements and Task files"`. Continued IDs keep their
-identity. `out_of_scope` never blocks, even in review 1, and is shown as a follow-up
+identity; copying a downgraded finding's id keeps it minor until it qualifies. `out_of_scope` never blocks, even in review 1, and is shown as a follow-up
 candidate. These rules change the projection, never the frozen assessment. A
 structured reviewer fail with no blocking findings left parks `review_needs_owner`
 with `only non-blocking findings remain`, spending no Review budget. A legacy

@@ -392,8 +392,14 @@ pub fn finding_ledger(window_reviews: &[Review]) -> Result<Vec<ReviewFindingEntr
                     ledger.insert(id.clone(), previous.clone());
                 }
                 let outside_scope = finding.kind == Some(ReviewFindingKind::OutOfScope);
+                // A continued id keeps an earlier downgrade: the reviewer is told
+                // to copy every open id, which must not launder a nit into a
+                // blocker. It blocks again only when it now qualifies.
+                let anchored_before = prior
+                    .get(&id)
+                    .is_some_and(|previous| previous.anchoring_note.is_some());
                 let downgraded = round > 0
-                    && !known.contains(&id)
+                    && (!known.contains(&id) || anchored_before)
                     && finding.severity == ReviewFindingSeverity::Blocking
                     && !outside_scope
                     && finding.kind != Some(ReviewFindingKind::Regression)
@@ -1446,5 +1452,49 @@ mod tests {
             ),
             (Status::Reopened, Some(2), 1)
         );
+    }
+
+    #[test]
+    fn finding_ledger_continued_downgraded_finding_stays_minor_unless_it_qualifies() {
+        // The prior-review prompt lists every open finding and asks the reviewer
+        // to copy its id; copying an anchored nit must not make it blocking.
+        let nit = json!({"id":"F2","summary":"naming nit", "where":"src/old.rs:1"});
+        let rounds = [
+            anchored_review(1, json!([{"summary":"initial"}]), json!([])),
+            anchored_review(
+                2,
+                json!([{"summary":"naming nit", "where":"src/old.rs:1"}]),
+                json!(["F1"]),
+            ),
+            anchored_review(3, json!([nit.clone()]), json!([])),
+            anchored_review(4, json!([nit]), json!([])),
+        ];
+        let ledger = finding_ledger(&rounds).unwrap();
+        let finding = entry(&ledger, "F2");
+        assert_eq!(
+            (finding.severity, finding.streak),
+            (ReviewFindingSeverity::Minor, 0)
+        );
+        assert_eq!(
+            finding.anchoring_note.as_deref(),
+            Some("outside requirements and Task files")
+        );
+        let policy = round_policy(&rounds[..3], &rounds[3]).unwrap();
+        assert!(policy.repeat.is_none(), "{:?}", policy.repeat);
+        assert!(!has_carried_finding(&rounds));
+        // Citing a requirement later is a legitimate reason to block.
+        let mut cited = rounds.to_vec();
+        cited.push(anchored_review(
+            5,
+            json!([{"id":"F2","summary":"drafts lost", "requirement_ids":["R2"]}]),
+            json!([]),
+        ));
+        let ledger = finding_ledger(&cited).unwrap();
+        let finding = entry(&ledger, "F2");
+        assert_eq!(
+            (finding.severity, finding.streak),
+            (ReviewFindingSeverity::Blocking, 1)
+        );
+        assert!(finding.anchoring_note.is_none());
     }
 }
