@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::Value;
 
 async fn fixture(ci: &[&str], verify: serde_json::Value) -> FailedCiFixture {
     let mut f = failed_ci_fixture(3, FailurePolicy::Block).await;
@@ -75,7 +76,17 @@ async fn assert_stopped(f: &FailedCiFixture) {
         );
     }
     let path = std::path::PathBuf::from(f.workspace.embedded_worktree_path_for_backend());
-    let dir = review::verify::directory(&path, 1).unwrap();
+    let review = db::ReviewRepo::list_by_task(&*f.db, &f.task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .max_by_key(|r| r.attempt_number)
+        .unwrap();
+    let dir = review::verify::directory(&path, &review.id).unwrap();
+    assert!(
+        !dir.join("start.pgid").exists(),
+        "stopped run retained its group record"
+    );
     if let Ok(pid) = std::fs::read_to_string(dir.join("start.pid")) {
         let running = std::process::Command::new("kill")
             .args(["-0", pid.trim()])
@@ -193,7 +204,7 @@ async fn review_verify_inconclusive_twice_parks_without_review_charge() {
         db::budget::spent(f.db.pool(), &task.id, "review_verify_rerun")
             .await
             .unwrap(),
-        0
+        1
     );
     let snapshot = f
         .engine
@@ -232,7 +243,7 @@ async fn review_verify_runtime_inputs_request_and_http_readiness() {
     let (_, review, details) = enter(&f).await;
     assert_eq!(review.status, db::ReviewStatus::Passed, "{details}");
     let path = std::path::PathBuf::from(f.workspace.embedded_worktree_path_for_backend());
-    let dir = review::verify::directory(&path, 1).unwrap();
+    let dir = review::verify::directory(&path, &review.id).unwrap();
     let request: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.join("seen.json")).unwrap()).unwrap();
     assert_eq!(request["task_id"], f.task.id);
@@ -745,4 +756,203 @@ async fn review_verify_unusable_report_or_unknown_verdict_is_inconclusive_not_pa
     .await;
     let (_, _, details) = enter(&f).await;
     assert_eq!(details["verify"]["status"], "pass", "{details}");
+}
+
+#[tokio::test]
+async fn review_verify_exit_during_readiness_only_creates_v_ready() {
+    let f = fixture(&[], json!({"start":"sleep 0.4; printf app-exited; exit 7", "ready_command":"false", "ready_timeout_seconds":5, "checks":[{"name":"smoke","command":"true"}]})).await;
+    let (_, review, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "fail");
+    let ledger = db::review_findings::finding_ledger(&[review]).unwrap();
+    assert!(ledger.iter().any(|f| f.id == "V-ready"));
+    assert!(!ledger.iter().any(|f| f.id == "V-start"), "{ledger:?}");
+    assert_stopped(&f).await;
+}
+
+#[tokio::test]
+async fn review_verify_rerun_ledger_honors_task_and_project_limits() {
+    for (project_limit, task_limit, runs) in
+        [(0, None, 1), (0, Some(2), 3), (2, Some(0), 1), (2, None, 3)]
+    {
+        let f = fixture(&[], json!({"checks":[{"name":"smoke","command":r#"printf '%s' '{"verdict":"inconclusive"}' > "$FORGE_VERIFY_REPORT""#}]})).await;
+        // fixture() stores the config after f.task was loaded.
+        let raw: String = sqlx::query_scalar("SELECT task_state_config FROM task WHERE id=?")
+            .bind(&f.task.id)
+            .fetch_one(f.db.pool())
+            .await
+            .unwrap();
+        let mut config: Value = serde_json::from_str(&raw).unwrap();
+        if let Some(limit) = task_limit {
+            config["retry_budgets"]["review_verify_rerun"] = json!(limit);
+        }
+        sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+            .bind(config.to_string())
+            .bind(&f.task.id)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE project SET settings=? WHERE id=?")
+            .bind(json!({"retry_budgets":{"review_verify_rerun":project_limit}}).to_string())
+            .bind(&f.task.project_id)
+            .execute(f.db.pool())
+            .await
+            .unwrap();
+        let (task, review, details) = enter(&f).await;
+        assert_eq!(details["verify"]["status"], "inconclusive", "{details}");
+        assert_eq!(verify_count(&f).await, runs);
+        assert_eq!(
+            db::budget::spent(f.db.pool(), &task.id, "review_verify_rerun")
+                .await
+                .unwrap(),
+            runs - 1
+        );
+        let charges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_budget_charge WHERE task_id=? AND kind='review_verify_rerun' AND window_id=?").bind(&task.id).bind(&review.id).fetch_one(f.db.pool()).await.unwrap();
+        assert_eq!(charges, runs - 1);
+        assert_eq!(
+            db::budget::spent(f.db.pool(), &task.id, "review")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_stopped(&f).await;
+    }
+}
+
+#[tokio::test]
+async fn review_verify_evidence_has_one_byte_budget_across_checks() {
+    let mut f = fixture(&[], json!({"checks":[
+        {"name":"first","command":r#"python3 - <<'PY'
+import os,json
+root=os.environ['FORGE_VERIFY_DIR']
+for name in ['one','two','three']:
+    with open(root+'/'+name+'.bin','wb') as f:
+        f.write(b'\xff'); f.truncate(24*1024*1024)
+json.dump({'verdict':'pass','evidence':[{'path':n+'.bin','kind':'other'} for n in ['one','two']]},open(os.environ['FORGE_VERIFY_REPORT'],'w'))
+PY"#},
+        {"name":"second","command":r#"printf '%s' '{"verdict":"pass","evidence":[{"path":"three.bin","kind":"other"}]}' > "$FORGE_VERIFY_REPORT""#}
+    ]})).await;
+    let provider = crate::native_tools::CoordinationToolProvider::new(f.db.clone());
+    provider.set_media_root(f._workspace_root.path().join("media"));
+    f.engine = f
+        .engine
+        .clone()
+        .with_provider_credential_env(Arc::new(EvidenceSupport(provider)));
+    let (_, _, details) = enter(&f).await;
+    let verify = &details["verify"];
+    assert_eq!(verify["status"], "pass", "{details}");
+    assert_eq!(verify["checks"][0]["evidence"].as_array().unwrap().len(), 2);
+    assert!(verify["checks"][1]["evidence"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(
+        verify["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("total evidence byte budget")),
+        "{verify}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "NOT MET: two capped writers buffered short startup logs; streaming app.log cap remains open"]
+async fn review_verify_app_log_stops_at_16_mib_and_keeps_readable_tail() {
+    let f = fixture(&[], json!({"start":r#"python3 -u - <<'PY'
+import os,sys,time
+marker='cap-tail-readable\n'
+sys.stdout.write('x'*(16*1024*1024-len(marker))+marker+'discarded-after-cap\n'*100000)
+sys.stdout.flush()
+open(os.environ['FORGE_VERIFY_DIR']+'/emitted','w').close()
+time.sleep(300)
+PY"#, "ready_command":r#"test -f "$FORGE_VERIFY_DIR/emitted""#, "ready_timeout_seconds":10, "checks":[{"name":"smoke","command":"true"}]})).await;
+    let (_, review, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "pass", "{details}");
+    let path = std::path::PathBuf::from(f.workspace.embedded_worktree_path_for_backend());
+    let directory = review::verify::directory(&path, &review.id).unwrap();
+    assert_eq!(
+        std::fs::metadata(directory.join("app.log")).unwrap().len(),
+        16 * 1024 * 1024
+    );
+    let tail = details["verify"]["app_log_tail"].as_str().unwrap();
+    assert!(tail.ends_with("cap-tail-readable\n"), "{tail}");
+    assert!(!tail.contains("discarded-after-cap"));
+    assert_stopped(&f).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn review_verify_escaped_listener_warns_in_details_and_reviewer_prompt() {
+    struct EscapedProcess(std::path::PathBuf);
+    impl Drop for EscapedProcess {
+        fn drop(&mut self) {
+            if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", pid.trim()])
+                    .status();
+            }
+        }
+    }
+    let f = fixture(&[], json!({"start":r#"python3 -u - <<'PY'
+import os,socket,time
+if not os.path.exists(os.environ['FORGE_VERIFY_DIR']+'/escaped.pid') and os.fork()==0:
+    os.setsid()
+    s=socket.socket(); s.bind(('127.0.0.1',int(os.environ['FORGE_VERIFY_PORT']))); s.listen()
+    open(os.environ['FORGE_VERIFY_DIR']+'/escaped.pid','w').write(str(os.getpid()))
+while True: time.sleep(1)
+PY"#, "ready_command":r#"test -s "$FORGE_VERIFY_DIR/escaped.pid""#, "ready_timeout_seconds":10, "checks":[{"name":"smoke","command":r#"if test -f "$FORGE_VERIFY_DIR/reran"; then true; else touch "$FORGE_VERIFY_DIR/reran"; printf '%s' '{"verdict":"inconclusive"}' > "$FORGE_VERIFY_REPORT"; fi"#}]})).await;
+    // The Review is allocated during enter(); locate the exact recorded pid even
+    // on an assertion failure so the regression leaves no escaped process.
+    struct RootCleanup(std::path::PathBuf);
+    impl Drop for RootCleanup {
+        fn drop(&mut self) {
+            if let Ok(entries) = std::fs::read_dir(&self.0) {
+                for e in entries.flatten() {
+                    drop(EscapedProcess(e.path().join("escaped.pid")));
+                }
+            }
+        }
+    }
+    let path = std::path::PathBuf::from(f.workspace.embedded_worktree_path_for_backend());
+    let directory = review::verify::directory(&path, "placeholder").unwrap();
+    let _cleanup = RootCleanup(directory.parent().unwrap().to_owned());
+    let (_, review, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "pass", "{details}");
+    assert_eq!(review.status, db::ReviewStatus::Passed);
+    assert_eq!(verify_count(&f).await, 2);
+    let port: u16 = std::fs::read_to_string(
+        review::verify::directory(&path, &review.id)
+            .unwrap()
+            .join("port"),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    assert!(
+        review::verify::port_warning(port).is_none(),
+        "second evaluation's port must be free; its Review still needs the first warning"
+    );
+    let verify: api_types::ReviewVerifyDetails =
+        serde_json::from_value(details["verify"].clone()).unwrap();
+    assert!(
+        verify
+            .notes
+            .iter()
+            .any(|n| n.contains("still in use") && n.contains("setsid")),
+        "{verify:?}"
+    );
+    assert!(review::verify::prompt(&verify).contains("still in use"));
+    assert_stopped(&f).await;
+}
+
+#[tokio::test]
+async fn review_verify_stopped_run_removes_pgid_record() {
+    let f = fixture(
+        &[],
+        json!({"start":"sleep 300","checks":[{"name":"smoke","command":"true"}]}),
+    )
+    .await;
+    let (_, _, details) = enter(&f).await;
+    assert_eq!(details["verify"]["status"], "pass");
+    assert_stopped(&f).await;
 }

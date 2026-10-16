@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T02:15:00Z
-updated_at: 2026-10-16T15:24:46Z
+updated_at: 2026-10-16T20:13:57Z
 completed_at:
 ---
 
@@ -89,7 +89,7 @@ completed_at:
 - [x] 6.2 `CHANGELOG.md` `Unreleased`:
   - `### Changed`: pre-existing and flaky failures no longer block under the default `review_ci_triage: full`; opt out with `off`.
   - `### Added`: everything else.
-- [ ] 6.3 A named `crates/api/tests/suite/happy_path.rs` case: on a base with one failing test, a Task's review passes CI triage, the reviewer passes it, and the Task merges.
+- [x] 6.3 A named `crates/api/tests/suite/happy_path.rs` case: on a base with one failing test, a Task's review passes CI triage, the reviewer passes it, and the Task merges.
 - [ ] 6.4 Live check on a `./test` Project seeded with one flaky test and one base-failing test:
   - the Task is not sent to the coder for either;
   - both attention items appear;

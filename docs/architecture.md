@@ -7561,8 +7561,8 @@ and are not budget counters.
 | Kind | Standard allowance | Natural window / charge |
 |---|---|---|
 | Review | 2 failures, 1 routed bounce (fallback/autonomous limit 3) | Review origin window; failed verdict and existing charged gate outcome |
-| ReviewProgress | 2 extra repair rounds; 0 disables | Review origin window; `progress:<review id>` receipt |
-| ReviewVerifyRerun | 1 inconclusive verify re-run | Invocation counter checkpointed on the suspended review hook; no Task spending |
+| `review_progress` (ReviewProgress) | 2 extra repair rounds; 0 disables | Review origin window; `progress:<review id>` receipt |
+| `review_verify_rerun` (ReviewVerifyRerun) | 1 inconclusive verify re-run; 0 disables | Ledger window keyed by Review id; `verify:<review id>:<evaluation>` receipt, checkpointed on the suspended hook; Task/Project overrides apply |
 | RepairNoChange | 1 reminder, then owner park | Review origin window; unchanged clean candidate at the end of a coder repair |
 | GateRejection(state) | Planning 2; merging 1; cancelled review entry `max_rejections - 1`; custom gate limit | Matching gate; rejected transition |
 | MergeFix | 1 ordinary repair; 0 disables | Merging origin window; ordinary repair transition |
@@ -7585,8 +7585,14 @@ refund failure retries. Automatic recovery opens an episode when Review
 exhausts (decided where the review limit is resolved, so a Project stored with
 the `'{}'` workflow uses the default workflow's gate), closes it on reset or a
 new exhaustion, and counts cancelled attempts within that episode.
-Completed/cancelled execution evidence remains intact. ReportCorrection, ReviewCheckRerun and
-ReviewVerifyRerun remain volatile; their limits/comparisons use the same module.
+Completed/cancelled execution evidence remains intact. ReportCorrection and
+ReviewCheckRerun remain volatile; their limits/comparisons use the same module.
+ReviewVerifyRerun is persisted per Review invocation, independently of the Review
+failure allowance; its first verify request initializes a fresh Review window,
+including when that Review passes without a rerun. Replaying initialization
+never refunds an existing charge. Task-wide overrides win
+over supplied Review state config, which includes Project defaults for both
+`review_progress` and `review_verify_rerun`.
 
 Owner-fixable failures and derived repeated reviewer findings spend nothing.
 With structured findings, an open blocking reviewer finding checked for a third
@@ -7789,6 +7795,16 @@ likewise derives no failure semantics from workflow state names — gate
 reject/bounce targets come only from explicit `reject`/`fail` trigger edges or
 `gate_config.reject_target`.
 
+Review failures distinguish candidate defects from owner and infrastructure work.
+CI, required checks and verify failures become `CI-*`, `CHK-*` and `V-*`
+findings and use the shared repair disposition. Reviewer `blocked` and exhausted
+inconclusive verify park as `review_blocked` (verify has `source: verify`),
+without spending the Review failure budget. Owner-fixable, repeated blocking
+reviewer findings and non-blocking-only assessments park as `review_needs_owner`.
+Ordinary exhausted repairs use `review_budget_exhausted`; progress may admit an
+extra repair as described above. Typed check-owner infrastructure failures retain
+`review_ci_infrastructure` retry/parking rather than becoming code findings.
+
 Human-facing notifications are task-outcome driven, not per-attempt:
 `task.failed` when `fail_task` sets `failed_json` (which also clears any stale
 blocking annotation), and `task.recovery_required` when crash recovery or an
@@ -7835,6 +7851,11 @@ and asserts:
 - The worktree is removed.
 - One `review` row with `status=passed` is persisted.
 - The expected event sequence appears on the bus.
+
+The named cases `structured_review_findings_are_repaired_resolved_and_merged`
+and `pre_existing_base_test_failure_is_triaged_reviewed_and_merged` additionally
+exercise coder repair and finding resolution, and review plus queue-head triage
+on a red base, through the REST router and real shell/check/integration owners.
 
 Any refactor that breaks this test likely needs a spec realignment before
 merging. Claiming a task auto-dispatches the executor via `tokio::spawn` in
@@ -8297,8 +8318,10 @@ older details shape) leaves the list out of the comment; rendering a comment
 never stops the cascade that posts it. The full report stays with the
 Review; only a findings-less review carries a UTF-8-safe 2 KiB report excerpt.
 Review-entry CI and verify failures post the same result comment even without a reviewer.
-Repair-round system comments name the review budget and open/resolved ids; owner
-parks name the rule and open ids. Each result, repair and park comment has a
+Repair-round system comments name the charged budget (`review` or
+`review_progress`) and open/resolved ids; owner parks name the rule and open ids.
+Verify comments summarize the recorded verdict, failing check names and evidence
+count; diagnostic notes remain in Review details and the reviewer prompt. Each result, repair and park comment has a
 separate Review-derived `idempotency_key`, using the existing comment repository
 transaction to suppress replay duplicates. The web Review tab reads the ledger
 above the latest attempt and keeps per-attempt findings and the full report in
@@ -8789,7 +8812,9 @@ readiness and ordered check commands, all `Uncacheable`, under unchanged
 `canonical-ci/1`. Verify's whole-run limit defaults to 1200 seconds (maximum
 3600) independently of CI's 3600-second entry limit. The server owner picks
 a loopback port under its existing admitted checkout lock and supplies
-`FORGE_VERIFY_*` runtime inputs. The Task-root request describes Task text,
+`FORGE_VERIFY_*` runtime inputs. Files live under
+`<task root>/.forge-task/verify/<review id>/`, so coordination children sharing
+a Task root cannot overwrite another Review’s request or reports. The Task-root request describes Task text,
 requirements, merge-base/candidate, changed files and open ledger findings.
 There is no new process-spawn path: check-executor and process-supervisor
 execute and settle every group, including the background server, on pass,
@@ -8797,14 +8822,24 @@ fail, timeout, cancellation and dropped execution. The start step records its
 group in `start.pgid`; before any verify starts, the owner stops a recorded
 group whose leader is gone but whose members still run (left by a server
 crash or restart), in every verify directory of the Task root. Ports handed
-to verify runs are held by the server for the longest wall limit. A process
-that leaves its group (`setsid`) is outside `canonical-ci/1`'s stop.
+to verify runs are held by the server for the longest wall limit. Once a run’s
+receipt confirms its groups stopped, the owner deletes `start.pgid` to avoid
+signalling a reused group id later. A process that leaves its group (`setsid`
+or daemonizing) is outside `canonical-ci/1`'s stop. After settlement Forge probes
+the verify port on both loopbacks. If it is still in use, `details.verify.notes`
+and the reviewer prompt carry a non-blocking warning, retained across
+inconclusive reruns even when the later port is free; Forge does not kill an
+unowned process by port. This detects an escaped listener, not every escaped
+process; group settlement is not OS-level containment.
 
 The review hook keeps its asking-time authority through both CI and verify
 suspensions, and writes combined Review details at settlement. A verify fail
 writes `V-*` observations before reviewer dispatch and uses the existing
-review failure disposition. An inconclusive result gets one bounded rerun,
-then an uncharged `review_blocked` park with source `verify`; owner offers
+review failure disposition. An app exit during readiness produces only
+`V-ready`, without an additional synthetic `V-start`. An inconclusive result
+gets a ledger-charged rerun (default one, configurable with
+`retry_budgets.review_verify_rerun`), then a `review_blocked` park with source
+`verify` without charging the Review failure budget; owner offers
 are Retry Verify, Mark Reviewed (manual approval with reason), and Cancel.
 Infrastructure failures retain review-CI interruption handling. A daemon
 placement records `not_run` / `placement_unsupported` without launching
@@ -8812,9 +8847,15 @@ verify. The integration queue head never requests verify.
 
 `details.verify` records each check's result, summary, media ids, Task-root
 evidence paths, app-log tail and skipped-evidence notes. The same Task evidence
-store captures confined regular files under the 25 MiB and kind limits;
-reports cannot escape the verify directory. Reviewer prompts include the
-recorded Verify results and evidence file paths. Optional verify config follows
+store captures confined regular files under the 25 MiB per-file and kind limits,
+with a shared 64 MiB byte allowance across all checks in one verify evaluation.
+Further files that exceed the remaining allowance are refused with a note.
+`app.log` currently has no on-disk byte cap; only its retained Review tail is
+bounded. A streaming disk cap remains an open release follow-up. Reports cannot
+escape the verify directory. Project values are redacted from output, report text and UTF-8
+evidence; public `FORGE_VERIFY_*` port, URL and directory values are excluded
+from redaction, including matching digits. Reviewer prompts include the
+recorded Verify results, notes and evidence file paths. Optional verify config follows
 the existing workflow/Project/Task merge order; Projects without it keep the
 existing review path. See [API verify configuration](api.md#behavioural-verify-before-reviewer-dispatch).
 

@@ -6396,20 +6396,28 @@ and continue to their reviewer.
 At execution start Forge picks a free loopback port (never one another
 verify of this server holds, nor one already served on `::1`) and supplies every step
 with `FORGE_VERIFY_PORT`, `FORGE_VERIFY_URL` (`http://127.0.0.1:<port>`),
-`FORGE_VERIFY_DIR` (`<task root>/.forge-task/verify/<review attempt>/`),
+`FORGE_VERIFY_DIR` (`<task root>/.forge-task/verify/<review id>/`),
 `FORGE_VERIFY_REQUEST` (`<dir>/request.json`), and `FORGE_VERIFY_REPORT`
 (`<dir>/<check name>.report.json`, set per check). `request.json` contains
 `task_id`, `title`, `description`, requirement texts, `base_sha`, `commit_sha`,
 `changed_files`, and the ledger's open `findings`. The optional start command
-runs in the background with output in `app.log`. Forge polls the readiness
+runs in the background with output in `app.log`. Its stored Review tail is
+bounded, but the file currently has no on-disk byte cap. Directories are keyed by Review id even when coordination children share a Task
+root. Forge polls the readiness
 path until an HTTP status below 500, or repeats the readiness command until
 exit 0. Then checks run in order. Every process group started by the run is
 stopped and verified stopped on every outcome, using the same check executor
 and supervisor as CI. The start step records its process group in
 `start.pgid`; before a verify starts anything, Forge stops a recorded group
 that a crashed or restarted server left running in any verify directory of
-the Task root. A process that leaves its group (`setsid`, a daemonizing
-start) is outside that stop.
+the Task root. A stopped run’s receipt causes `start.pgid` to be deleted, so
+later recovery cannot signal an unrelated reused group id. A process that leaves
+its group (`setsid`, a daemonizing start) is outside that stop. After the run,
+Forge checks whether the port is free on both loopbacks. A port still in use
+adds a non-blocking warning to `details.verify.notes` and the reviewer prompt;
+it does not fail verify or kill an unowned process. Warnings survive an
+inconclusive rerun even when the later evaluation's port is free. This detects escaped
+listeners only, not every process outside the owned groups.
 
 A check fails on non-zero exit, timeout, or an optional JSON report's
 `verdict: "fail"`/`"failed"`; it is inconclusive on exit 0 with
@@ -6419,20 +6427,27 @@ file); otherwise it passes. Verdict words are matched case-insensitively and a
 report without `verdict` leaves the exit code to decide. Reports may contain
 `summary`, `findings: [{summary, where, expected, observed}]`, and
 `evidence: [{path, kind, caption}]`. A failed check creates `V-<name>` before
-any reviewer execution. Start exits and readiness timeouts create `V-start`
-and `V-ready`, carrying the `app.log` tail. A verify fail after an earlier
+any reviewer execution. A start-step exit creates `V-start`; a readiness
+timeout or app exit during readiness creates only `V-ready`, carrying the
+`app.log` tail. A verify fail after an earlier
 review pass keeps the existing `merge-fix follow-up failed: ci` block.
 
-The first inconclusive result reruns verify once using the invocation-scoped
-`review_verify_rerun` allowance. A second parks `review_blocked`, source
-`verify`, without charging Review. Offers are Retry Verify (`retry`), Mark
+An inconclusive result reruns verify using the ledger-backed
+`retry_budgets.review_verify_rerun` allowance (default 1, 0 disables), with a
+window keyed by Review id, initialized at the first request, and an idempotent
+receipt per evaluation. Replaying initialization never refunds a debit. Task-wide
+overrides take precedence over Review state config and Project defaults. Once
+that allowance is spent, an inconclusive result parks `review_blocked`, source
+`verify`, without charging the Review failure budget. Offers are Retry Verify (`retry`), Mark
 Reviewed (`approve`, reason required), and Cancel (`cancel`). Retry re-enters
 the ordinary review entry. Runner infrastructure retains the existing review
 CI infrastructure handling.
 
 Evidence paths are relative to `FORGE_VERIFY_DIR` and confined to that directory;
 absolute/traversing/symlink escapes, hard links, non-regular files, empty files,
-unsupported kinds, and files above 25 MiB are skipped with a note. Supported
+unsupported kinds, files above 25 MiB, and files exceeding the shared 64 MiB
+evidence byte allowance per verify evaluation are skipped with a note. The
+allowance covers every check, including raw bytes and redaction expansion. Supported
 kinds are `screenshot`, `walkthrough_video`, `log`, `report`, and `other`.
 Evidence uses the existing Task evidence store. The allowed Review detail key
 `verify` exposes overall `status`, optional `reason`, per-check
@@ -6444,7 +6459,9 @@ and evidence lists to 50 entries per check. Malformed optional reports are
 noted; they cannot turn a non-zero command into a pass. The `app.log` tail,
 report summaries/findings/captions and UTF-8 evidence files are stored with
 ANSI sequences stripped (text fields) and Project environment values
-replaced by `[REDACTED]`, as command output tails are.
+replaced by `[REDACTED]`, as command output tails are. Public `FORGE_VERIFY_*`
+port/URL/directory values are excluded from redaction, including matching digits;
+Project secrets remain redacted.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. Forge re-runs them in the Task's worktree at the reviewed commit
@@ -6772,7 +6789,8 @@ omits `report_correction`, `review_gate`, and `automatic_review_recovery` while
 recovery is disabled.
 Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
 `target_moved_rebase`, `conflict_handoff`, `review_carry`,
-`automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
+`automatic_review_recovery`, `review_ci_infrastructure`, `review_progress`,
+`review_verify_rerun`, and `report_correction`.
 A coordination root that has re-planned also reports `replan` (limit 5 per
 budget window: one per rejected aggregate review and one per parked subtask);
 no other Task has the key. The limit is fixed: `retry_budgets.replan` is not
@@ -6806,8 +6824,9 @@ failures classified as infrastructure use the infrastructure retry/park episode;
 configuration and other deterministic errors retain ordinary entry parking.
 A progress receipt never reclassifies an error. Owner actions
 never spend it; an owner's review re-run still gets a progress round only while
-the limit has one left. `review_verify_rerun` is invocation-scoped (limit 1) and is never
-persisted or projected as Task spending; its counter spans suspension of one verify evaluation.
+the limit has one left. `review_verify_rerun` is ledger-backed per Review invocation
+(default 1, configurable), with its own remaining/limit projections and replay-safe
+receipts across suspension. It does not consume the Review failure allowance.
 
 After a coder-fixable failed Review, a reviewer finding open on its third
 blocking source check parks with `review_needs_owner`, message

@@ -1754,3 +1754,194 @@ PY"#}}),
     );
     common::assert_scheduler_clean(&harness.state).await;
 }
+
+/// Real shell workers and the durable review/integration owners, with no model
+/// provider: each named case supplies its own candidate and reviewer scripts.
+async fn repair_release_project(
+    harness: &TestHarness,
+    repo_path: &Path,
+    workspaces: &Path,
+) -> (ProjectResponse, AgentResponse) {
+    let project: ProjectResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Repair release"}),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/repos", project.id), json!({"name":"repo","local_path":repo_path.to_string_lossy(),"remote_url":repo_path.to_string_lossy(),"default_branch":"main"}), StatusCode::OK).await;
+    let daemon = register_daemon_and_report_shell(&harness.app, workspaces).await;
+    let agent: AgentResponse = json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/agents",
+        json!({"name":"repair-release-shell","executor_type":"shell","daemon_id":daemon}),
+        StatusCode::OK,
+    )
+    .await;
+    common::configure_execution_test_setup(
+        &harness.state.db,
+        &project.id,
+        &repo.id,
+        &agent.id,
+        &agent.id,
+    )
+    .await;
+    (project, agent)
+}
+
+#[tokio::test]
+async fn structured_review_findings_are_repaired_resolved_and_merged() {
+    let repo_dir = common::TestDir::new("findings-release-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces = common::TestDir::new("findings-release-workspaces");
+    let harness = test_app(workspaces.path()).await;
+    let (project, agent) = repair_release_project(&harness, &repo_path, workspaces.path()).await;
+    let task: TaskResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks", project.id), json!({
+        "title":"Deliver a working greeting",
+        "description":"if test -f greeting.txt; then printf 'fixed\\n' > greeting.txt; else printf 'broken\\n' > greeting.txt; fi; git add greeting.txt && git commit -m greeting",
+        "review_config":{"ci_steps":["test -f greeting.txt"], "review_prompt":r#"python3 - <<'PY'
+import json
+fixed=open('greeting.txt').read().strip()=='fixed'
+if fixed:
+    print('Read greeting.txt and confirmed the repaired greeting.')
+    print(json.dumps({'result':'pass','reason':'Greeting works','resolved':['F1']}))
+else:
+    print('Read greeting.txt: expected fixed, observed broken.')
+    print(json.dumps({'result':'fail','reason':'Greeting is broken','findings':[{'summary':'Greeting is broken','where':'greeting.txt','expected':'fixed','observed':'broken'}]}))
+PY"#}
+    }), StatusCode::OK).await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".into()).await;
+    assert_eq!(completed.status, "done");
+    let mut reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    reviews.sort_by_key(|r| r.attempt_number);
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].status, db::ReviewStatus::Failed);
+    assert_eq!(reviews[1].status, db::ReviewStatus::Passed);
+    let first: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_eq!(
+        first["conformance"]["assessment"]["findings"][0]["summary"], "Greeting is broken",
+        "{first}"
+    );
+    let findings: api_types::TaskFindingsResponse = empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}/findings", task.id),
+        StatusCode::OK,
+    )
+    .await;
+    let finding = findings.items.iter().find(|f| f.id == "F1").unwrap();
+    assert_eq!(finding.status, api_types::ReviewFindingStatus::Resolved);
+    assert_eq!(finding.resolved_attempt, Some(2));
+    let coders: Vec<(String, Option<String>)> = sqlx::query_as("SELECT id,parent_execution_id FROM execution WHERE task_id=? AND role='coder' ORDER BY created_at,id").bind(&task.id).fetch_all(harness.state.db.pool()).await.unwrap();
+    assert_eq!(coders.len(), 2);
+    assert!(coders.iter().any(|(_, parent)| parent
+        .as_ref()
+        .is_some_and(|p| coders.iter().any(|(id, _)| id == p))));
+    assert_eq!(run_git(&repo_path, &["show", "HEAD:greeting.txt"]), "fixed");
+    let merged: String = sqlx::query_scalar(
+        "SELECT integrated_sha FROM integration_attempt WHERE task_ref=? AND state='completed'",
+    )
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(merged, run_git(&repo_path, &["rev-parse", "HEAD"]));
+    assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
+}
+
+#[tokio::test]
+async fn pre_existing_base_test_failure_is_triaged_reviewed_and_merged() {
+    let repo_dir = common::TestDir::new("triage-release-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    // One actual failing shell test, with cargo-style output for its stable id.
+    std::fs::write(repo_path.join("base.txt"), "broken\n").unwrap();
+    std::fs::write(repo_path.join("base-test.sh"), "if test \"$(cat base.txt)\" = fixed; then printf 'test suite::base ... ok\\n'; else printf 'test suite::base ... FAILED\\n'; exit 1; fi\n").unwrap();
+    run_git(&repo_path, &["add", "base.txt", "base-test.sh"]);
+    run_git(&repo_path, &["commit", "-m", "one known failing base test"]);
+    let base = run_git(&repo_path, &["rev-parse", "HEAD"]);
+    let workspaces = common::TestDir::new("triage-release-workspaces");
+    let harness = test_app(workspaces.path()).await;
+    let (project, agent) = repair_release_project(&harness, &repo_path, workspaces.path()).await;
+    let task: TaskResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/tasks", project.id), json!({
+        "title":"Deliver alongside the known base failure",
+        "description":"printf 'delivered\\n' > greeting.txt && git add greeting.txt && git commit -m delivered",
+        "review_config":{"setup_steps":["true"],"ci_steps":["bash base-test.sh"], "review_prompt":r#"python3 - <<'PY'
+import json,os
+contract=json.loads(os.environ['FORGE_REVIEW_CONTRACT'])
+assert open('greeting.txt').read().strip()=='delivered'
+print('Verified the greeting; ci:0 is the known unchanged base failure.')
+print(json.dumps({'result':'pass','reason':'Deliverable verified; existing base failure is triaged'}))
+PY"#}
+    }), StatusCode::OK).await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".into()).await;
+    assert_eq!(completed.status, "done");
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
+    assert!(reviews[0].reviewer_execution_id.is_some());
+    let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_ne!(details["ci_steps"][0]["exit_code"], 0);
+    assert_eq!(
+        details["ci_steps"][0]["triage"]["blocking"], false,
+        "{details}"
+    );
+    assert_eq!(
+        details["ci_steps"][0]["triage"]["failures"][0]["class"],
+        "pre_existing"
+    );
+    assert_eq!(
+        details["conformance"]["assessment"]["result"], "pass",
+        "{details}"
+    );
+    let coders: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id=? AND role='coder'")
+            .bind(&task.id)
+            .fetch_one(harness.state.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(coders, 1, "base failure must not dispatch a repair");
+    let failed_checks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM check_result WHERE outcome='fail' AND run_id IN (SELECT run_id FROM check_consumer WHERE task_id=?)").bind(&task.id).fetch_one(harness.state.db.pool()).await.unwrap();
+    assert!(
+        failed_checks >= 3,
+        "triage retains original, rerun and base failures"
+    );
+    assert_eq!(
+        run_git(&repo_path, &["show", "HEAD:greeting.txt"]),
+        "delivered"
+    );
+    assert_eq!(run_git(&repo_path, &["show", "HEAD:base.txt"]), "broken");
+    assert_ne!(base, run_git(&repo_path, &["rev-parse", "HEAD"]));
+    let merged: String = sqlx::query_scalar(
+        "SELECT integrated_sha FROM integration_attempt WHERE task_ref=? AND state='completed'",
+    )
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(merged, run_git(&repo_path, &["rev-parse", "HEAD"]));
+    assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
+}

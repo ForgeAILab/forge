@@ -294,13 +294,7 @@ fn redacted(
     // A retained tail may begin halfway through a secret. Mask that fragment
     // too; otherwise truncation could disclose a secret suffix. Similarly the
     // final bytes of an interrupted command may be only a secret prefix.
-    let mut values = env
-        .values()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    for value in values {
+    for value in executors::environment::redaction_values(env) {
         if truncated {
             for (offset, _) in value.char_indices() {
                 if value.len() - offset < SECRET_FRAGMENT_BYTES {

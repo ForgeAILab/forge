@@ -31,6 +31,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Verify output directories now use `<task root>/.forge-task/verify/<review id>/`
+  instead of an attempt number, isolating coordination children sharing a Task
+  root. Verify command identities also use the Review id.
+- `review_verify_rerun` now uses the budget ledger per Review invocation rather
+  than a fixed volatile counter. Task/Project overrides apply (default 1, 0
+  disables), and Task budget projections include its remaining allowance.
+
 - Findings reads now apply the 200-entry cap after prioritizing open blocking
   verify findings, then other open blockers, then other severities/statuses.
   Natural id ordering is retained within each priority group.
@@ -1751,15 +1758,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Review rounds now derive repeat parks from open blocking reviewer findings.
   A carried finding gets another round while the open blocking count shrinks;
-  a third appearance parks for the owner. Findings-less windows retain legacy
+  after ordinary Review retries are spent, `review_progress` grants up to two
+  extra repair rounds (0 disables). A third appearance parks for the owner. Findings-less windows retain legacy
   repeat handling, and coordination leads retain replan routing.
 - Failed CI rounds no longer resolve tests absent from a fail-fast run's
   signature list. Only passing steps (or a passing CI-triage re-run of the step)
   prove those tests fixed. Base-CI Attention
   resolves only from a newer queue-head target-tip pass.
-- Repair briefs enforce 24 KiB even with long Task text and many waived
-  failures. Merge-CI repairs name up to 20 failing tests and retain 2 KiB of output.
-
 - Pre-existing and flaky check failures no longer block review or merge under the default `review_ci_triage: full`; set `review_ci_triage: off` to retain the previous gate.
 - Under `review_ci_triage: full`, entry CI now runs every configured step instead
   of stopping at the first failure. This changes the check identity, so existing
@@ -1768,12 +1773,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Task description and plan, finding history, all failing check output,
   recorded verify evidence, the reviewer report and prior completion summary.
   Automatic review recovery uses the same brief; no-change reminders still lead.
-  The brief body is capped at 24 KiB: after the report, previous summary and
-  check tails are cut, finding text is clipped and, past a line budget, the
-  remaining open findings are listed by id.
+  The brief body is capped at 24 KiB even with long Task text and many waived
+  failures: after the report, older attempts and check tails are cut, finding
+  text is clipped and remaining open findings are listed by id.
 - Merge-time check failures give the coder the target branch, failing command
   and the end of its combined output (where the failure is printed, not the
-  oldest lines of the stderr tail) in a `MERGE-CI` finding. Committed conflict handoffs use
+  oldest lines of the stderr tail), plus up to 20 failing signatures and a
+  2 KiB output tail, in a `MERGE-CI` finding. Committed conflict handoffs use
   `MERGE-CONFLICT`; both stay out of the review ledger.
 - Review CI findings use stable per-test signature ids (`CI-<step>#<hash>`),
   with step-level ids when signatures are unavailable. Review checklists show
@@ -1786,7 +1792,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   stops at 8 KiB; later findings are named by id only. CI-only failures now get review comments, and
   repair/park system comments name findings once per Review. The Review tab
   displays the current ledger and per-attempt findings. Finding IDs now sort
-  naturally before the API's 200-entry cap (`F2` before `F10`).
+  naturally within priority groups (`F2` before `F10`); the API’s 200-entry cap
+  prioritizes open verify blockers, then other blockers, then other findings.
 - Check failure signatures recognise cargo-nextest binary/test identities,
   omitting durations, progress counters and repeated stdout or summary output,
   including timed-out, signalled and retried tests (final attempt only). A jest
@@ -3113,8 +3120,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Verify uses the durable check runner with `canonical-ci/1` process-tree
   settlement and its own wall limit; results are never reused. Failed checks
   become `V-*` findings, reports can attach Task evidence, and reviewers see
-  the recorded results and evidence paths. One inconclusive rerun is followed
-  by an uncharged owner park. Daemon placements record `not_run` with
+  the recorded results, notes and evidence paths. Inconclusive reruns use a
+  ledger allowance (default one), then park without charging Review. Daemon placements record `not_run` with
   `placement_unsupported`. Project review settings expose the configuration.
 
 - Reviewer findings accept optional `requirement_ids`, `kind`, and `same_cause_as`.
@@ -3128,7 +3135,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   and Task remaining/limit projections for extra repair rounds on progress.
 - Additive `superseded` finding status for step-level CI findings replaced by
   per-test findings, exposed in the findings API and web ledger.
-- Invocation-scoped `review_verify_rerun` budget (limit 1) for inconclusive verify results.
+- Verify limits captured evidence to 64 MiB per evaluation across all checks.
+  Completed group
+  cleanup removes `start.pgid`. Public verify ports, URLs and paths stay readable
+  while Project secrets remain redacted. An app exit during readiness creates
+  only `V-ready`; a port still in use after cleanup produces a non-blocking
+  warning in Review details and the reviewer prompt (escaped sessions remain
+  outside process-group containment).
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 

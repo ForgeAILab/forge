@@ -11,7 +11,7 @@ use std::collections::HashMap;
 pub enum Kind {
     Review,
     ReviewProgress,
-    /// One inconclusive verify rerun per evaluation; never persisted.
+    /// Inconclusive verify reruns, ledger-backed per Review invocation.
     ReviewVerifyRerun,
     /// One reminder per Review window when a coder returns the same clean HEAD.
     RepairNoChange,
@@ -36,9 +36,10 @@ pub enum Kind {
     Replan,
 }
 impl Kind {
-    pub const PERSISTED: [Self; 11] = [
+    pub const PERSISTED: [Self; 12] = [
         Self::Review,
         Self::ReviewProgress,
+        Self::ReviewVerifyRerun,
         Self::RepairNoChange,
         Self::MergeFix,
         Self::Execution,
@@ -87,10 +88,7 @@ impl Kind {
     }
     /// Per-invocation counters live in memory and never reach the ledger.
     pub const fn is_volatile(self) -> bool {
-        matches!(
-            self,
-            Self::ReportCorrection | Self::ReviewCheckRerun | Self::ReviewVerifyRerun
-        )
+        matches!(self, Self::ReportCorrection | Self::ReviewCheckRerun)
     }
 }
 /// Reserved checkpoint before configurable review-entry hooks. Negative keeps
@@ -290,6 +288,7 @@ pub fn limit(
         kind,
         Kind::Review
             | Kind::ReviewProgress
+            | Kind::ReviewVerifyRerun
             | Kind::MergeFix
             | Kind::Execution
             | Kind::WorkflowGuard
@@ -485,13 +484,9 @@ pub async fn charge(
     limit: i64,
     step: &str,
 ) -> Result<Charge> {
-    if [
-        Kind::ReportCorrection,
-        Kind::ReviewCheckRerun,
-        Kind::ReviewVerifyRerun,
-    ]
-    .iter()
-    .any(|kind| kind.key() == key)
+    if [Kind::ReportCorrection, Kind::ReviewCheckRerun]
+        .iter()
+        .any(|kind| kind.key() == key)
     {
         return Err(DbError::Check(format!("{key} is invocation-scoped")));
     }
@@ -559,6 +554,67 @@ pub async fn apply(tx: &mut Transaction<'_, Sqlite>, task: &str, effect: Mutatio
             Ok(result.charged)
         }
     }
+}
+
+/// The invocation starts with its first request, including a verify that passes
+/// without a rerun. Replaying the same Review never refunds an existing charge.
+pub async fn initialize_verify_budget(db: &SqliteDb, task: &Task, review_id: &str) -> Result<()> {
+    let mut tx = verify_budget_transaction(db, task, review_id).await?;
+    reset(&mut tx, &task.id, Kind::ReviewVerifyRerun.key(), review_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn verify_budget_transaction(
+    db: &SqliteDb,
+    task: &Task,
+    review_id: &str,
+) -> Result<Transaction<'static, Sqlite>> {
+    let mut tx = crate::begin_immediate(db.pool()).await?;
+    if let Some(step) = crate::task_writer::current_task_step().filter(|s| s.task_id == task.id) {
+        db.fence_hook_in_tx(&mut tx, &step).await?;
+    }
+    let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task t JOIN review r ON r.task_id=t.id WHERE t.id=? AND t.version=? AND t.status='review' AND t.deleted_at IS NULL AND r.id=? AND r.status='running' AND NOT EXISTS(SELECT 1 FROM review newer WHERE newer.task_id=t.id AND newer.attempt_number>r.attempt_number))")
+        .bind(&task.id).bind(task.version).bind(review_id).fetch_one(&mut *tx).await?;
+    if !current {
+        return Err(DbError::VersionConflict);
+    }
+    Ok(tx)
+}
+
+/// Admit one further verify evaluation. The Review id is the invocation window
+/// and the evaluated result is the receipt: replay after a checkpoint gap must
+/// return the same admission without charging twice.
+pub async fn grant_verify_rerun(
+    db: &SqliteDb,
+    task: &Task,
+    state_config: &Value,
+    review_id: &str,
+    evaluation: u32,
+) -> Result<bool> {
+    let mut tx = verify_budget_transaction(db, task, review_id).await?;
+    let key = Kind::ReviewVerifyRerun.key();
+    let receipt = format!("verify:{review_id}:{evaluation}");
+    reset(&mut tx, &task.id, key, review_id).await?;
+    let paid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_budget_charge WHERE task_id=? AND kind=? AND window_id=? AND step_id=?)")
+        .bind(&task.id).bind(key).bind(review_id).bind(&receipt).fetch_one(&mut *tx).await?;
+    let admitted = paid
+        || charge(
+            &mut tx,
+            &task.id,
+            key,
+            i64::from(limit(
+                task,
+                Kind::ReviewVerifyRerun,
+                Some(state_config),
+                None,
+            )?),
+            &receipt,
+        )
+        .await?
+        .charged;
+    tx.commit().await?;
+    Ok(admitted)
 }
 /// Volatile kinds (native result-block corrections, review check re-runs) are
 /// deliberately scoped to one invocation.
@@ -644,7 +700,7 @@ pub fn projection(
         .into_iter()
         .filter(|k| !matches!(k, Kind::Review))
     {
-        let scoped = if kind == Kind::ReviewProgress {
+        let scoped = if matches!(kind, Kind::ReviewProgress | Kind::ReviewVerifyRerun) {
             workflow.states.iter().find(|s| s.name == "review")
         } else if kind == Kind::MergeFix {
             workflow.states.iter().find(|s| s.name == "merging")
@@ -885,17 +941,20 @@ pub fn state_config(config: &Value, state: &str, settings: &str) -> Value {
                 object.entry(key.clone()).or_insert_with(|| value.clone());
             }
         }
-        if let Some(value) = settings
-            .pointer("/retry_budgets/review_progress")
-            .filter(|_| config.pointer("/retry_budgets/review_progress").is_none())
-        {
-            if !config.is_object() {
-                config = serde_json::json!({});
+        for key in ["review_progress", "review_verify_rerun"] {
+            let pointer = format!("/retry_budgets/{key}");
+            if let Some(value) = settings
+                .pointer(&pointer)
+                .filter(|_| config.pointer(&pointer).is_none())
+            {
+                if !config.is_object() {
+                    config = serde_json::json!({});
+                }
+                if !config.get("retry_budgets").is_some_and(Value::is_object) {
+                    config["retry_budgets"] = serde_json::json!({});
+                }
+                config["retry_budgets"][key] = value.clone();
             }
-            if !config.get("retry_budgets").is_some_and(Value::is_object) {
-                config["retry_budgets"] = serde_json::json!({});
-            }
-            config["retry_budgets"]["review_progress"] = value.clone();
         }
     }
     config
@@ -1875,7 +1934,7 @@ mod tests {
         assert_eq!(Invocation::new(Kind::ReportCorrection).remaining(), 2);
     }
     #[tokio::test]
-    async fn budget_review_progress_resolves_and_projects_in_review_window_and_verify_is_volatile()
+    async fn budget_review_progress_resolves_and_projects_in_review_window_and_verify_is_persisted()
     {
         let (db, mut task) = fixture().await;
         let workflow = WorkflowDefinition { states: vec![api_types::StateDefinition {
@@ -1920,22 +1979,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection.get("review_progress"), Some(&3));
-        assert!(Kind::ReviewVerifyRerun.is_volatile());
-        assert!(!Kind::PERSISTED.contains(&Kind::ReviewVerifyRerun));
-        let mut rerun = Invocation::new(Kind::ReviewVerifyRerun);
-        assert!(rerun.consume());
-        assert!(!rerun.consume());
+        assert!(!Kind::ReviewVerifyRerun.is_volatile());
+        assert!(Kind::PERSISTED.contains(&Kind::ReviewVerifyRerun));
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        assert!(charge(
-            &mut tx,
-            &task.id,
-            Kind::ReviewVerifyRerun.key(),
-            1,
-            "verify"
-        )
-        .await
-        .is_err());
+        assert!(
+            charge(
+                &mut tx,
+                &task.id,
+                Kind::ReviewVerifyRerun.key(),
+                1,
+                "verify"
+            )
+            .await
+            .unwrap()
+            .charged
+        );
+        assert!(
+            !charge(
+                &mut tx,
+                &task.id,
+                Kind::ReviewVerifyRerun.key(),
+                1,
+                "verify"
+            )
+            .await
+            .unwrap()
+            .charged
+        );
+        tx.commit().await.unwrap();
     }
+    #[tokio::test]
+    async fn budget_verify_rerun_receipts_replay_and_new_reviews_get_fresh_windows() {
+        let (db, task) = fixture().await;
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('e','t','coder','completed','now','now')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r1','t','e',1,'running','{}','now','now','now')").execute(db.pool()).await.unwrap();
+        let config = json!({"retry_budgets":{"review_verify_rerun":1}});
+        initialize_verify_budget(&db, &task, "r1").await.unwrap();
+        assert!(grant_verify_rerun(&db, &task, &config, "r1", 0)
+            .await
+            .unwrap());
+        assert!(grant_verify_rerun(&db, &task, &config, "r1", 0)
+            .await
+            .unwrap());
+        assert_eq!(
+            spent(db.pool(), &task.id, "review_verify_rerun")
+                .await
+                .unwrap(),
+            1
+        );
+        initialize_verify_budget(&db, &task, "r1").await.unwrap();
+        assert!(!grant_verify_rerun(&db, &task, &config, "r1", 1)
+            .await
+            .unwrap());
+        sqlx::query("UPDATE review SET status='cancelled' WHERE id='r1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('r2','t','e',2,'running','{}','now','now','now')").execute(db.pool()).await.unwrap();
+        initialize_verify_budget(&db, &task, "r2").await.unwrap();
+        assert_eq!(
+            spent(db.pool(), &task.id, "review_verify_rerun")
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(grant_verify_rerun(&db, &task, &config, "r2", 0)
+            .await
+            .unwrap());
+        assert!(
+            grant_verify_rerun(&db, &task, &config, "r1", 0)
+                .await
+                .is_err(),
+            "stale Review cannot restore its budget window"
+        );
+        assert_eq!(
+            spent(db.pool(), &task.id, "review_verify_rerun")
+                .await
+                .unwrap(),
+            1
+        );
+        let workflow = WorkflowDefinition { states: vec![serde_json::from_value(json!({"name":"review","kind":"gate","column":"Review","display_name":"Review","hooks":{},"config":{"retry_budgets":{"review_verify_rerun":3}}})).unwrap()], ..Default::default() };
+        let projected = projection(
+            &task,
+            &workflow,
+            &HashMap::from([("review_verify_rerun".into(), 1)]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(projected["review_verify_rerun"], 2);
+    }
+
     // D5 rule 1 is Forge's own rule: a reviewer finding on its third check
     // parks even when a required conformance check also failed (which
     // replaces the reported reason). Only owner routing (`fixable_by`) and the

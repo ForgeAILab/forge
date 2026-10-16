@@ -63,7 +63,7 @@ that path (`merge-fix follow-up failed: ci`), with no new routing.
 ### Requirement: Forge starts the app and provides its inputs
 For a verify run, Forge SHALL:
 - Pick a free loopback port when the run starts.
-- Create `<task root>/.forge-task/verify/<review attempt>/`.
+- Create `<task root>/.forge-task/verify/<review id>/`.
 - Write `request.json` there, containing:
   - `task_id`, `title`, `description`;
   - the Task's requirement texts;
@@ -78,7 +78,7 @@ For a verify run, Forge SHALL:
 
 Steps run in this order:
 1. When `start` is set, Forge starts it in the background, with output going
-   to `<dir>/app.log`.
+   to `<dir>/app.log`, capped at 16 MiB while excess output continues to drain.
 2. Forge waits for readiness: `FORGE_VERIFY_URL` + `ready_path` answers with
    any HTTP status below 500, or `ready_command` exits 0. It waits at most
    `ready_timeout_seconds`.
@@ -100,7 +100,7 @@ details, and continue to the reviewer.
 
 #### Scenario: Dev server is stopped
 - **WHEN** a verify run with `start: "pnpm dev"` finishes, passed or failed
-- **THEN** no process from that run is left on the machine and the receipt says the process tree was stopped
+- **THEN** no member of an owned process group remains and the receipt says the process tree was stopped; Forge removes the `start.pgid` record
 
 #### Scenario: Daemon placement
 - **WHEN** a Task placed on a daemon reaches review with `verify` configured
@@ -125,9 +125,11 @@ when one is present, otherwise from the output tail. If the app's start
 command exits or readiness times out, the result is a fail with `V-start` or
 `V-ready`, carrying the tail of `app.log`.
 
-On the first inconclusive result in a review attempt, Forge SHALL re-run
-verify once, using the volatile budget `review_verify_rerun` with limit 1. On
-a second inconclusive result, the Task SHALL park with `review_blocked`
+An inconclusive result SHALL re-run verify while the ledger-backed budget
+`review_verify_rerun` admits another evaluation (default 1, 0 disables).
+The budget window SHALL be the Review id; Task overrides SHALL win over Review
+state config and Project defaults. A receipt per evaluation SHALL prevent replay
+from charging twice. Once exhausted, the Task SHALL park with `review_blocked`
 (source `verify`), offering `retry` (re-run verify), `mark_reviewed` (reason
 required) and `cancel_task`. Neither park charges the review budget.
 
@@ -150,7 +152,9 @@ infrastructure handling.
 Forge SHALL capture each `evidence[].path` in a check's report as Task
 evidence through the existing `task.evidence` storage, with the same kinds and
 the 25 MiB per-file limit. Paths are relative to `FORGE_VERIFY_DIR` and must
-stay inside it.
+stay inside it. A shared 64 MiB byte budget SHALL cover all evidence across
+checks in one evaluation, including raw bytes and redaction expansion. Further
+files exceeding the remaining budget SHALL be refused with a note.
 
 The Review's details SHALL gain a `verify` object with:
 - the overall status;
@@ -170,3 +174,32 @@ section with each check's result, summary and evidence file paths.
 #### Scenario: Path escape refused
 - **WHEN** a report lists `"path": "../../etc/passwd"`
 - **THEN** that entry is skipped with a note in the Review details, and the check's result is unchanged
+
+### Requirement: Verify follow-up isolation and diagnostics
+Verify directories and command identities SHALL use the Review id so children
+sharing a coordination root cannot overwrite each other's inputs or reports.
+Public `FORGE_VERIFY_*` ports, URLs and directories SHALL NOT be treated as
+secrets, including coincident matching digits; Project values SHALL remain redacted.
+An app exit during readiness SHALL create only `V-ready`, without synthetic
+`V-start`. After each run Forge SHALL check whether its port is free on both
+loopbacks. If still in use, Review verify notes and the reviewer prompt SHALL
+carry a non-blocking warning, retained across inconclusive reruns even when a
+later evaluation's port is free. Processes that escape owned groups via `setsid`
+or daemonizing are outside group cleanup; Forge SHALL NOT kill unowned processes
+by port, and a free port does not prove that every escaped process stopped.
+
+#### Scenario: Children share a Task root
+- **WHEN** two children have the same review attempt number in one coordination root
+- **THEN** their Review-id directories keep independent requests and reports
+
+#### Scenario: App exits while readiness is pending
+- **WHEN** start succeeds but the app exits before readiness succeeds
+- **THEN** the Review records `V-ready` only, with the app-log tail
+
+#### Scenario: A listener escapes its process group
+- **WHEN** a run finishes with a daemonized listener still on its verify port
+- **THEN** verify retains its verdict and both Review notes and the reviewer prompt warn about the occupied port
+
+#### Scenario: Aggregate evidence limit
+- **WHEN** earlier checks captured 48 MiB and a later check offers another 24 MiB file
+- **THEN** the later file is skipped with a total-byte-budget note and the verdict is unchanged

@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-16T18:03:03Z
+updated_at: 2026-10-16T20:37:44Z
 completed_at:
 ---
 
@@ -65,7 +65,7 @@ Prerequisites accepted for this phase:
 - [x] A4 Carry 20 test signatures (`+N more`) and a 2 KiB output end through merge settlement, queue-worker storage, send-back and the repair brief.
 - [x] A5 Resolve base Attention only from newer queue-head target-tip passing observations, never review-entry merge-base passes.
 
-- [x] 4.1 `Kind::ReviewProgress` (key `review_progress`, default 2, Review window) and `Kind::ReviewVerifyRerun` (volatile, limit 1) in `crates/db/src/budget.rs`. Add a numbered migration only if `task_budget.kind` is constrained.
+- [x] 4.1 `Kind::ReviewProgress` (key `review_progress`, default 2, Review window) and `Kind::ReviewVerifyRerun` (ledger-backed per Review invocation, default limit 1) in `crates/db/src/budget.rs`. Add a numbered migration only if `task_budget.kind` is constrained.
 - [x] 4.2 Apply the D5 rules in `review_failure_target` and the hook path in `workflow/actions/review.rs` (delegating to the shared disposition with its merged config):
   - derived repeat (reviewer `F*` findings only) parks with `ReviewNeedsOwner` and the message `repeated finding: <id> <summary>`;
   - the progress round charges `review_progress`;
@@ -97,12 +97,22 @@ Prerequisites accepted for this phase:
 - [x] A3 Load attempt-memory diffs only for coder/worker repair dispatches.
 - [x] A4 Prioritize open verify/blocking findings before the 200-entry findings-read cap.
 
+### Release verify follow-ups (2026-10-16)
+- [x] A1 Key directories and command identities by Review id; regress shared-root isolation.
+- [x] A2 Remove `start.pgid` after the receipt confirms tree settlement.
+- [x] A3 Keep public `FORGE_VERIFY_*` values readable while redacting Project values.
+- [x] A4 Charge `review_verify_rerun` through the ledger with Task/Project overrides.
+- [ ] A5 Cap evidence at 64 MiB per evaluation and app.log at 16 MiB while draining excess.
+  - Evidence cap implemented and regression passes. **NOT MET:** on-disk app.log cap; two writer approaches buffered short startup logs and failed existing readiness/tail tests. Original streaming writer restored. The named cap regression is ignored with this reason; its explicit run demonstrates the remaining gap.
+- [x] A6 Emit only `V-ready` when the app exits during readiness.
+- [x] A7 Warn in verify details and reviewer prompts when the port remains occupied; document containment limits.
+
 ## 6. Release
-- [ ] 6.1 `docs/architecture.md`: the Retry budgets table gets `review_progress` and `review_verify_rerun`. Also update Failure classification, review routing, the checks section (verify) and the Task comments notes.
-- [ ] 6.2 `CHANGELOG.md` `Unreleased`:
+- [x] 6.1 `docs/architecture.md`: the Retry budgets table gets `review_progress` and `review_verify_rerun`. Also update Failure classification, review routing, the checks section (verify) and the Task comments notes.
+- [x] 6.2 `CHANGELOG.md` `Unreleased`:
   - `### Added`: findings, the ledger route and CLI, verify, the progress budget.
   - `### Changed`: review comments drop the full report; extra repair rounds on progress; the merge-time check failure brief.
-- [ ] 6.3 `crates/api/tests/suite/happy_path.rs`: a named case where the review fails with findings, the coder repairs, the re-review resolves them, and the Task passes and merges. Extend `forge_happy_path_end_to_end` only if a separate case cannot reach that path.
+- [x] 6.3 `crates/api/tests/suite/happy_path.rs`: a named case where the review fails with findings, the coder repairs, the re-review resolves them, and the Task passes and merges. Extend `forge_happy_path_end_to_end` only if a separate case cannot reach that path.
 - [ ] 6.4 Live check on a `./test` data dir with a small web Project:
   - verify catches a broken button and the coder fixes it;
   - a two-round repair shows the ledger in comments;

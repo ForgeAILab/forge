@@ -26,24 +26,22 @@ pub fn config(state: &Value) -> Result<Option<ReviewVerifyConfig>, String> {
         .transpose()
 }
 
-/// The attempt and evaluation are in every command identity. A new evaluation
+/// The Review id and evaluation are in every command identity. A new evaluation
 /// cannot join the completed uncacheable run of an earlier one.
 pub fn build_bundle(
     config: &ReviewVerifyConfig,
     workspace_id: &str,
     generation: u64,
-    attempt: i64,
+    review_id: &str,
     evaluation: u32,
     project_keys: impl Iterator<Item = String>,
 ) -> Result<CheckSpec, String> {
     config.validate()?;
-    if attempt < 1 {
-        return Err("verify needs a positive review attempt".into());
-    }
+    validate_review_id(review_id)?;
     let mut keys: BTreeSet<_> = project_keys.collect();
     keys.extend(ENV_KEYS.map(str::to_owned));
     let mut commands = Vec::new();
-    let prefix = format!("verify:{attempt}:{evaluation}:");
+    let prefix = format!("verify:{review_id}:{evaluation}:");
     let mut add = |name: &str, shell_text: String, timeout| {
         commands.push(CheckCommandSpec {
             id: format!("{prefix}{name}"),
@@ -132,8 +130,8 @@ fn quote(value: &str) -> String {
 }
 
 /// Only Forge's generated, uncacheable canonical bundle receives runtime
-/// inputs. All commands must name the same positive attempt/evaluation.
-pub fn bundle_attempt(spec: &CheckSpec) -> Result<Option<i64>, String> {
+/// inputs. All commands must name the same Review/evaluation.
+pub fn bundle_review(spec: &CheckSpec) -> Result<Option<&str>, String> {
     let Some(first) = spec
         .commands
         .first()
@@ -143,19 +141,15 @@ pub fn bundle_attempt(spec: &CheckSpec) -> Result<Option<i64>, String> {
     };
     let mut parts = first.id.splitn(4, ':');
     parts.next();
-    let attempt: i64 = parts
-        .next()
-        .unwrap_or_default()
-        .parse()
-        .map_err(|_| "invalid verify attempt")?;
+    let review_id = parts.next().unwrap_or_default();
+    validate_review_id(review_id)?;
     let evaluation: u32 = parts
         .next()
         .unwrap_or_default()
         .parse()
         .map_err(|_| "invalid verify evaluation")?;
-    let prefix = format!("verify:{attempt}:{evaluation}:");
-    if attempt < 1
-        || spec.execution_policy != CANONICAL_CI_POLICY
+    let prefix = format!("verify:{review_id}:{evaluation}:");
+    if spec.execution_policy != CANONICAL_CI_POLICY
         || spec
             .commands
             .iter()
@@ -163,19 +157,26 @@ pub fn bundle_attempt(spec: &CheckSpec) -> Result<Option<i64>, String> {
     {
         return Err("invalid verify bundle".into());
     }
-    Ok(Some(attempt))
+    Ok(Some(review_id))
 }
 
-pub fn directory(worktree: &Path, attempt: i64) -> Result<PathBuf, String> {
-    if attempt < 1 {
-        return Err("invalid verify attempt".into());
+fn validate_review_id(review_id: &str) -> Result<(), String> {
+    if review_id.is_empty()
+        || review_id.len() > 128
+        || !review_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+    {
+        return Err("invalid verify Review id".into());
     }
+    Ok(())
+}
+
+pub fn directory(worktree: &Path, review_id: &str) -> Result<PathBuf, String> {
+    validate_review_id(review_id)?;
     let root =
         executors::sandbox::TaskRoot::of_worktree(worktree).ok_or("verify needs a Task root")?;
-    Ok(root
-        .path()
-        .join(".forge-task/verify")
-        .join(attempt.to_string()))
+    Ok(root.path().join(".forge-task/verify").join(review_id))
 }
 
 /// Called by the already-admitted server check owner, under its checkout lock.
@@ -185,15 +186,15 @@ pub fn prepare_environment(
     spec: &CheckSpec,
     worktree: &Path,
 ) -> Result<BTreeMap<String, String>, String> {
-    let Some(attempt) = bundle_attempt(spec)? else {
+    let Some(review_id) = bundle_review(spec)? else {
         return Ok(BTreeMap::new());
     };
-    let directory = directory(worktree, attempt)?;
+    let directory = directory(worktree, review_id)?;
     ensure_directory(&directory, worktree)?;
     if let Some(verify) = directory.parent() {
         stop_orphaned_starts(verify);
     }
-    for file in ["start.exit", "start.pid", "start.pgid", "app.log"]
+    for file in ["start.exit", "start.pid", "start.pgid", "app.log", "port"]
         .into_iter()
         .map(str::to_owned)
         .chain(spec.commands.iter().filter_map(|c| {
@@ -211,6 +212,7 @@ pub fn prepare_environment(
             .map_err(|e| e.to_string())?;
         Ok(listener.local_addr().map_err(|e| e.to_string())?.port())
     })?;
+    std::fs::write(directory.join("port"), port.to_string()).map_err(|e| e.to_string())?;
     Ok(BTreeMap::from([
         ("FORGE_VERIFY_PORT".into(), port.to_string()),
         (
@@ -233,6 +235,34 @@ pub fn prepare_environment(
             directory.join("report.json").to_string_lossy().into_owned(),
         ),
     ]))
+}
+
+/// A stopped group no longer needs a crash-recovery record. Retaining it could
+/// later target an unrelated process group after the OS reuses its id.
+pub fn finish_run(spec: &CheckSpec, worktree: &Path, receipt: &CheckReceipt) {
+    if receipt.commands.is_empty() || !receipt.commands.iter().all(|c| c.process_tree_stopped) {
+        return;
+    }
+    if let Ok(Some(review_id)) = bundle_review(spec) {
+        if let Ok(directory) = directory(worktree, review_id) {
+            let _ = std::fs::remove_file(directory.join("start.pgid"));
+        }
+    }
+}
+
+/// Group settlement cannot contain a daemon that created a new session. The
+/// port probe is diagnostic only; never kill an unowned process by its port.
+pub fn port_warning(port: u16) -> Option<String> {
+    let busy = [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ]
+    .into_iter()
+    .any(|ip| {
+        std::net::TcpListener::bind((ip, port))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+    });
+    busy.then(|| format!("Verify port {port} is still in use after process-group cleanup; a process may have escaped via setsid or daemonizing. Forge cannot stop processes outside its groups."))
 }
 
 /// Ports handed to verify runs of this server, until the longest verify wall
@@ -270,7 +300,7 @@ fn pick_port(mut candidate: impl FnMut() -> Result<u16, String>) -> Result<u16, 
 /// The start step records its process group (`start.pgid`, written before
 /// the app is started). A run's end stops that group; an owner that died
 /// mid-run (a server crash or restart) never did, and its app keeps running
-/// with its port. Before a verify starts anything, every attempt directory of
+/// with its port. Before a verify starts anything, every Review directory of
 /// this Task root is looked at, so neither the re-run of an attempt nor a
 /// later attempt starts beside such an orphan. Only real directories and
 /// regular files are read; a record whose group is gone is removed.
@@ -331,6 +361,9 @@ pub fn prompt(details: &ReviewVerifyDetails) -> String {
     if let Some(reason) = &details.reason {
         out.push_str(&format!("Reason: {reason}\n"));
     }
+    for note in &details.notes {
+        out.push_str(&format!("Note: {note}\n"));
+    }
     for check in &details.checks {
         out.push_str(&format!(
             "- {}: {:?} — {}\n",
@@ -357,24 +390,24 @@ mod tests {
             &config,
             "workspace",
             3,
-            7,
+            "review-7",
             0,
             vec!["PROJECT_KEY".to_owned()].into_iter(),
         )
         .unwrap();
         assert_eq!(spec.execution_policy, CANONICAL_CI_POLICY);
         assert!(!spec.cacheable());
-        assert_eq!(bundle_attempt(&spec).unwrap(), Some(7));
+        assert_eq!(bundle_review(&spec).unwrap(), Some("review-7"));
         assert_eq!(
             spec.commands
                 .iter()
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
             [
-                "verify:7:0:start",
-                "verify:7:0:ready",
-                "verify:7:0:check:smoke",
-                "verify:7:0:check:save"
+                "verify:review-7:0:start",
+                "verify:review-7:0:ready",
+                "verify:review-7:0:check:smoke",
+                "verify:review-7:0:check:save"
             ]
         );
         assert_eq!(
@@ -391,7 +424,7 @@ mod tests {
                 && ENV_KEYS.iter().all(|key| c.environment_keys.contains(*key))));
         assert_ne!(
             spec,
-            build_bundle(&config, "workspace", 3, 7, 1, std::iter::empty()).unwrap()
+            build_bundle(&config, "workspace", 3, "review-7", 1, std::iter::empty()).unwrap()
         );
     }
     #[cfg(unix)]
@@ -420,9 +453,10 @@ mod tests {
             "checks": [{"name": "smoke", "command": r#"sleep 300 & printf '%s\n%s\n' "$!" "$$" > "$FORGE_VERIFY_DIR/check.pids"; wait"#}]
         }))
         .unwrap();
-        let spec = build_bundle(&config, "workspace", 1, 1, 0, std::iter::empty()).unwrap();
+        let spec =
+            build_bundle(&config, "workspace", 1, "review-1", 0, std::iter::empty()).unwrap();
         let environment = prepare_environment(&spec, &worktree).unwrap();
-        let dir = directory(&worktree, 1).unwrap();
+        let dir = directory(&worktree, "review-1").unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         let permit = check_executor::CheckPermit::already_admitted();
         let mut run = Box::pin(check_executor::execute(check_executor::CheckExecution {
@@ -459,7 +493,8 @@ mod tests {
         let app = std::fs::read_to_string(dir.join("app.pidfile")).unwrap();
         let checks = std::fs::read_to_string(dir.join("check.pids")).unwrap();
         assert!(alive(&app));
-        let next = build_bundle(&config, "workspace", 1, 1, 1, std::iter::empty()).unwrap();
+        let next =
+            build_bundle(&config, "workspace", 1, "review-1", 1, std::iter::empty()).unwrap();
         prepare_environment(&next, &worktree).unwrap();
         let survived = alive(&app);
         for pid in app.lines().chain(checks.lines()) {
@@ -500,12 +535,45 @@ mod tests {
     }
 
     #[test]
+    fn review_verify_reviews_sharing_a_task_root_keep_independent_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("coordination-root");
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        executors::sandbox::TaskRoot::reserve(&root).unwrap();
+        let config: ReviewVerifyConfig =
+            serde_json::from_value(json!({"checks":[{"name":"smoke","command":"true"}]})).unwrap();
+        let a = build_bundle(&config, "first", 1, "review-a", 0, std::iter::empty()).unwrap();
+        let b = build_bundle(&config, "second", 1, "review-b", 0, std::iter::empty()).unwrap();
+        prepare_environment(&a, &first).unwrap();
+        let a_dir = directory(&first, "review-a").unwrap();
+        std::fs::write(a_dir.join("request.json"), "first request").unwrap();
+        std::fs::write(a_dir.join("smoke.report.json"), "first report").unwrap();
+        prepare_environment(&b, &second).unwrap();
+        let b_dir = directory(&second, "review-b").unwrap();
+        assert_ne!(a_dir, b_dir);
+        assert_eq!(a_dir.parent(), b_dir.parent());
+        std::fs::write(b_dir.join("request.json"), "second request").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a_dir.join("request.json")).unwrap(),
+            "first request"
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_dir.join("smoke.report.json")).unwrap(),
+            "first report"
+        );
+        assert!(directory(&first, "../escape").is_err());
+    }
+
+    #[test]
     fn review_verify_directory_refuses_symlinked_reserved_components() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("task/repo");
         std::fs::create_dir_all(&path).unwrap();
         executors::sandbox::TaskRoot::reserve(path.parent().unwrap()).unwrap();
-        let dir = directory(&path, 1).unwrap();
+        let dir = directory(&path, "review-1").unwrap();
         ensure_directory(&dir, &path).unwrap();
         #[cfg(unix)]
         {

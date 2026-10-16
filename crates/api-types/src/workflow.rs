@@ -210,6 +210,9 @@ pub struct RetryBudgets {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub review_progress: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_verify_rerun: Option<i32>,
     pub merge_fix: Option<i32>,
     pub execution: Option<i32>,
 }
@@ -466,6 +469,7 @@ impl Default for ProjectSettings {
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
                 review_progress: Some(2),
+                review_verify_rerun: Some(1),
                 merge_fix: Some(default_merge_fix_retry_budget()),
                 execution: Some(default_execution_retry_budget()),
             },

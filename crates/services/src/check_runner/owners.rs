@@ -204,9 +204,11 @@ impl WorkspaceCheckOwners {
                     .map_err(ServiceError::invalid_operation)?
             };
             environment.extend(verify_environment);
-            crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
+            let receipt = crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
                 operation_id:&id,spec:&record.run.identity.inputs.spec,target,owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
-            }).await
+            }).await?;
+            review::verify::finish_run(&record.run.identity.inputs.spec, Path::new(path), &receipt);
+            Ok(receipt)
         }.await.unwrap_or_else(|_| check_executor::unstarted_receipt(&id,intent.owner.clone(),CheckExecutionOutcome::Infrastructure,Some("check checkout or execution inputs unavailable".into())));
         let result = DaemonCheckResult::Completed {
             receipt: Box::new(receipt.clone()),

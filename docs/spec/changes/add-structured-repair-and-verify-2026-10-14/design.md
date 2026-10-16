@@ -279,7 +279,7 @@ judgement.**
   |---|---|
   | `FORGE_VERIFY_PORT` | a free loopback port picked when the run starts |
   | `FORGE_VERIFY_URL` | `http://127.0.0.1:$FORGE_VERIFY_PORT` |
-  | `FORGE_VERIFY_DIR` | `<task root>/.forge-task/verify/<review attempt>/` |
+  | `FORGE_VERIFY_DIR` | `<task root>/.forge-task/verify/<review id>/` |
   | `FORGE_VERIFY_REQUEST` | `$FORGE_VERIFY_DIR/request.json` |
   | `FORGE_VERIFY_REPORT` | `$FORGE_VERIFY_DIR/<check name>.report.json` |
 
@@ -300,8 +300,9 @@ Start and readiness failures are fails with `V-start` / `V-ready`. Their
 `observed` is the tail of `app.log`. The app built from this candidate did not
 come up, and the coder owns that.
 
-An inconclusive result re-runs verify once automatically. The new volatile
-budget `ReviewVerifyRerun` has limit 1. A second inconclusive parks the Task
+An inconclusive result re-runs verify while the ledger-backed `ReviewVerifyRerun`
+budget admits it (default 1, 0 disables), honoring Task/Project overrides in a
+Review-id window. An exhausted inconclusive result parks the Task
 with `review_blocked` (source `verify`). The offered actions are `retry`
 (re-run verify), `mark_reviewed` (reason required) and `cancel_task`. The
 review budget is not charged.
@@ -463,3 +464,15 @@ munk verify change --request-file "$FORGE_VERIFY_DIR/munk-request.json" --config
   first and make it yield before open finding text; avoid attempt diffs outside
   coder/worker repair dispatches; prioritize verify/open blockers at the findings
   read cap; and preserve infrastructure classification during progress rounds.
+
+## Release verify follow-ups (2026-10-16)
+
+The approved release follow-ups key runtime directories and command identities
+by Review id; remove `start.pgid` on confirmed group settlement; exclude public
+`FORGE_VERIFY_*` values from redaction; and charge inconclusive reruns through
+the budget ledger per Review invocation, honoring Task/Project overrides.
+Evidence shares 64 MiB per evaluation. The approved 16 MiB on-disk app-log cap
+remains NOT MET after two buffering regressions; the original streaming writer
+is retained, and the explicit ignored regression records the gap. App exit during readiness creates only `V-ready`.
+A post-run occupied-port warning appears in verify notes and reviewer prompts;
+processes escaping owned groups are outside containment and are not killed by port.

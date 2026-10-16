@@ -81,7 +81,7 @@ pub(super) async fn run(
     .await
     .map_err(infrastructure)?
     .ok_or_else(|| infrastructure("verify workspace has no usable worktree"))?;
-    let directory = review::verify::directory(&path, review.attempt_number)?;
+    let directory = review::verify::directory(&path, &review.id)?;
     review::verify::ensure_directory(&directory, &path)?;
     let saved = crate::workflow::engine::durable::hook_effect(&task.id, EFFECT)
         .await
@@ -96,8 +96,17 @@ pub(super) async fn run(
         .as_ref()
         .and_then(|v| v["consumer_id"].as_str())
         .map(str::to_owned);
+    let mut port_warnings: Vec<String> = saved
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v["port_warnings"].clone()).ok())
+        .unwrap_or_default();
     loop {
         if consumer.is_none() {
+            if evaluation == 0 {
+                db::budget::initialize_verify_budget(&ctx.db, task, &review.id)
+                    .await
+                    .map_err(infrastructure)?;
+            }
             // The request is durable before any check can execute. Frozen Task
             // requirements and the same merge-base rule as reviewer admission.
             let context =
@@ -135,7 +144,7 @@ pub(super) async fn run(
                 &config,
                 &workspace.id,
                 u64::try_from(resolved.placement.generation).map_err(infrastructure)?,
-                review.attempt_number,
+                &review.id,
                 evaluation,
                 environment.env.keys().cloned(),
             )?;
@@ -172,7 +181,7 @@ pub(super) async fn run(
             crate::workflow::engine::durable::record_hook_effect(
                 &task.id,
                 EFFECT,
-                &json!({"review_id":review.id,"evaluation":evaluation,"consumer_id":consumer}),
+                &json!({"review_id":review.id,"evaluation":evaluation,"consumer_id":consumer,"port_warnings":port_warnings}),
             )
             .await
             .map_err(infrastructure)?;
@@ -210,24 +219,35 @@ pub(super) async fn run(
         // The app's log and the checks' reports are written by the candidate,
         // not through a command pipe: the runner never redacted them.
         let environment = review::contract::project_environment(&ctx.db, &task.id).await?;
-        let details =
+        let mut details =
             read_results(ctx, task, review, &directory, &result, &environment.env).await?;
+        details.notes.splice(0..0, port_warnings.iter().cloned());
         if details.status != Status::Inconclusive
-            || !db::budget::allows_retry(
-                i64::from(db::budget::Kind::ReviewVerifyRerun.default_limit()),
-                i64::from(evaluation),
+            || !db::budget::grant_verify_rerun(
+                &ctx.db,
+                task,
+                &ctx.state_config,
+                &review.id,
+                evaluation,
             )
+            .await
+            .map_err(infrastructure)?
         {
             return Ok(Progress::Complete(details));
         }
         evaluation += 1;
         consumer = None;
+        port_warnings = details
+            .notes
+            .into_iter()
+            .filter(|note| note.starts_with("Verify port "))
+            .collect();
         // Persist the debit before asking again. A restarted hook has the same
-        // bounded evaluation, without a Task retry-budget charge.
+        // bounded evaluation; its ledger receipt makes this checkpoint replay safe.
         crate::workflow::engine::durable::record_hook_effect(
             &task.id,
             EFFECT,
-            &json!({"review_id":review.id,"evaluation":evaluation}),
+            &json!({"review_id":review.id,"evaluation":evaluation,"port_warnings":port_warnings}),
         )
         .await
         .map_err(infrastructure)?;
@@ -269,6 +289,16 @@ async fn read_results(
         details.notes.push(format!("app.log: {error}"));
         String::new()
     });
+    if let Some(port) = read_file(directory, "port", 8)?
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse().ok())
+    {
+        if let Some(warning) = review::verify::port_warning(port) {
+            details.notes.push(warning);
+        }
+    }
+    let mut evidence_bytes = 0;
+    let mut start_or_ready_failed = false;
     let start_exited = read_file(directory, "start.exit", 64)?.is_some();
     let run = db::CheckRunRepo::check_run(&*ctx.db, &result.run_id)
         .await
@@ -395,11 +425,16 @@ async fn read_results(
                         .chars()
                         .take(1000)
                         .collect::<String>();
-                    let mut bytes = read_file(directory, name, 25 * 1024 * 1024)?
+                    let remaining = MAX_EVIDENCE_BYTES - evidence_bytes;
+                    let mut bytes = read_file(directory, name, remaining.min(25 * 1024 * 1024))
+                        .map_err(|error| if remaining < 25 * 1024 * 1024 {
+                            format!("total evidence byte budget (64 MiB) exhausted or file refused: {error}")
+                        } else { error })?
                         .ok_or("evidence file does not exist")?;
                     if bytes.is_empty() {
                         return Err("evidence file is empty".into());
                     }
+                    let original_size = bytes.len() as u64;
                     // A text file (the app's log, a report) is kept without
                     // the Project's values, as command output is.
                     if let Ok(text) = std::str::from_utf8(&bytes) {
@@ -408,6 +443,11 @@ async fn read_results(
                             bytes = redacted.into_bytes();
                         }
                     }
+                    let size = original_size.max(bytes.len() as u64);
+                    if size > remaining {
+                        return Err("total evidence byte budget (64 MiB) exhausted".into());
+                    }
+                    evidence_bytes += size;
                     let media_id = uuid::Uuid::new_v5(
                         &uuid::Uuid::NAMESPACE_OID,
                         format!("verify:{}:{}:{}:{index}", review.id, result.id, command_id)
@@ -449,16 +489,12 @@ async fn read_results(
             && matches!(entry.name.as_str(), "start" | "ready")
             && entry.result == Status::Fail
         {
+            start_or_ready_failed = true;
             entry.observed = Some(details.app_log_tail.clone());
         }
         details.checks.push(entry);
     }
-    if start_exited
-        && !details
-            .checks
-            .iter()
-            .any(|c| c.name == "start" && c.result == Status::Fail)
-    {
+    if start_exited && !start_or_ready_failed {
         details.checks.push(ReviewVerifyCheckResult {
             name: "start".into(),
             result: Status::Fail,
@@ -491,6 +527,7 @@ async fn read_results(
 }
 
 const APP_LOG_WINDOW_BYTES: u64 = 64 * 1024;
+const MAX_EVIDENCE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn clip_tail(text: &str, limit: usize) -> String {
     let mut start = text.len().saturating_sub(limit);

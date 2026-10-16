@@ -1264,3 +1264,55 @@ async fn review_verify_background_tree_is_stopped_on_cancellation_and_dropped_ru
     let service = std::fs::read_to_string(&pid).unwrap();
     wait_until_dead(&service).await;
 }
+
+#[tokio::test]
+async fn review_verify_runtime_values_are_public_but_project_values_are_redacted() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = BTreeMap::from([
+        ("FORGE_VERIFY_PORT".into(), "54321".into()),
+        ("FORGE_VERIFY_URL".into(), "http://127.0.0.1:54321".into()),
+        ("FORGE_VERIFY_DIR".into(), "/tmp/verify-review".into()),
+        (
+            "FORGE_VERIFY_REQUEST".into(),
+            "/tmp/verify-review/request.json".into(),
+        ),
+        (
+            "FORGE_VERIFY_REPORT".into(),
+            "/tmp/verify-review/smoke.report.json".into(),
+        ),
+        ("PROJECT_TOKEN".into(), "real-project-secret".into()),
+    ]);
+    let mut command = step(
+        r#"printf '%s\n' "$FORGE_VERIFY_PORT" "$FORGE_VERIFY_URL" "$FORGE_VERIFY_DIR" "$FORGE_VERIFY_REQUEST" "$FORGE_VERIFY_REPORT" "1543219" "$PROJECT_TOKEN""#,
+    );
+    command.environment_keys = env.keys().cloned().collect();
+    let receipt = run_command(
+        temp.path(),
+        &command,
+        &env,
+        CANONICAL_CI_POLICY,
+        Some(Instant::now() + Duration::from_secs(10)),
+        &CancellationToken::new(),
+        4096,
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    for (key, value) in &env {
+        if key.starts_with("FORGE_VERIFY_") {
+            assert!(receipt.stdout_tail.contains(value), "{receipt:?}");
+        }
+    }
+    assert!(receipt.stdout_tail.contains("1543219"));
+    assert!(receipt.stdout_tail.contains("[REDACTED]"));
+    assert!(!receipt.stdout_tail.contains("real-project-secret"));
+    // Partial-tail masking must obey the same distinction.
+    assert_eq!(
+        redacted_tail(b"review/smoke.report.json 54321", true, true, &env, 4096),
+        "review/smoke.report.json 54321"
+    );
+    assert_eq!(
+        redacted_tail(b"project-secret", true, true, &env, 4096),
+        "[REDACTED]"
+    );
+}
