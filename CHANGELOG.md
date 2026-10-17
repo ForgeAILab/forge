@@ -8,12 +8,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
-- Public search and provider/fetch checks share one restricted-address policy:
-  well-known NAT64 `64:ff9b::/96` checks its embedded IPv4 destination, and
-  `192.88.99.0/24` (former 6to4 relay anycast) is refused by every consumer,
-  including IPv6 forms carrying those IPv4 addresses. Local-use NAT64
-  `64:ff9b:1::/48` remains refused. Public search retains its documented
-  additional IPv6 exclusions.
+- Public search and provider/fetch checks share one restricted-address policy.
+  Public search now judges well-known NAT64 `64:ff9b::/96` by its embedded IPv4
+  destination instead of refusing it outright; the rest of `64:ff9b::/48` and
+  local-use NAT64 `64:ff9b:1::/48` remain refused. Provider and fetch now
+  refuse `192.88.99.0/24` (former 6to4 relay anycast), as search already did,
+  including IPv6 forms carrying those IPv4 addresses. Public search retains its
+  documented additional IPv6 exclusions.
 - Provider connection tests and health probes share one HTTP client policy:
   resolve and validate the endpoint once, pin the approved addresses, and
   disable redirects and proxies so requests cannot reach an unchecked host.

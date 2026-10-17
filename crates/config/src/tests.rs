@@ -234,8 +234,11 @@ fn public_search_nat64_applies_embedded_ipv4_policy() {
         ("64:ff9b::192.88.99.1", true),
         ("64:ff9b:1::8.8.8.8", true),
         ("64:ff9b:1:1234:5678:9abc:808:808", true),
-        // Outside both the well-known /96 and local-use /48.
-        ("64:ff9b:0:1::", false),
+        // The rest of 64:ff9b::/48 outside the well-known /96 stays refused.
+        ("64:ff9b:0:1::", true),
+        ("64:ff9b::1:0:0", true),
+        ("64:ff9b:0:ffff:ffff:ffff:ffff:ffff", true),
+        // Outside both 64:ff9b::/48 and local-use 64:ff9b:1::/48.
         ("64:ff9b:2::", false),
     ] {
         assert_eq!(

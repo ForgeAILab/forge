@@ -105,11 +105,18 @@ public search refuses all IPv4-mapped/compatible and 6to4 addresses even when
 their embedded IPv4 is public; discard-only `100::/64`; `2001:1::/32` through
 `2001:5::/32` (including benchmarking and special-use assignments);
 documentation `2001:db8::/32`; ORCHID `2001:10::/28` and ORCHIDv2
-`2001:20::/28`; and the existing conservative documentation guard
+`2001:20::/28`; the rest of `64:ff9b::/48` outside the well-known `/96`
+(unassigned); and the existing conservative documentation guard
 `3ff0::/12`. Provider/fetch continues to admit these when the common policy
 does not reject them. The shared address table in
 `services::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
 checks agreement and each documented exclusion.
+`config::network_policy::tests::shared_policy_changes_only_the_two_intended_verdicts`
+compares both predicates with verbatim copies of their pre-sharing versions
+over a generated address set: the only verdict changes allowed are
+provider/fetch refusing `192.88.99.0/24` (and IPv6 forms carrying it) and
+public search admitting well-known NAT64 addresses whose embedded IPv4 is
+public.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and
 the admission-time price resolution (`pricing::auto`). It sits below `services`

@@ -7079,7 +7079,6 @@ mod tests {
             ("64:ff9b::169.254.169.254", true),
             ("64:ff9b::192.88.99.1", true),
             ("64:ff9b::255.255.255.255", true),
-            ("64:ff9b:0:1::", false),
             ("64:ff9b:1::", true),
             ("64:ff9b:1:ffff:ffff:ffff:ffff:ffff", true),
             ("64:ff9b:2::", false),
@@ -7132,6 +7131,9 @@ mod tests {
             "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
             "3ff0::1",
             "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "64:ff9b:0:1::",
+            "64:ff9b::1:0:0",
+            "64:ff9b:0:ffff:ffff:ffff:ffff:ffff",
         ] {
             let address = host.parse().expect("test IP address");
             assert!(
