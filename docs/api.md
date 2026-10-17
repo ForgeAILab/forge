@@ -324,13 +324,15 @@ Provider connection tests and health probes resolve each HTTPS endpoint once,
 reject any restricted address in the result, and connect only to those pinned
 addresses. They do not follow redirects or use proxies. Endpoint checks also
 apply when loading stored metadata. Restricted destinations include `0.0.0.0/8`,
-the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, Teredo `2001::/32`,
-and 6to4 (`2002::/16`), IPv4-mapped and IPv4-compatible IPv6 addresses whose
-embedded IPv4 address is restricted. Native provider transport and the web
-fetch tool (authorization gate and transport) use the same address predicate.
-Public search validates its endpoint and result URLs with its own, stricter
-filter, which refuses every IPv4-mapped/compatible, NAT64, 6to4 and Teredo
-address outright.
+former 6to4 relay anycast `192.88.99.0/24`, local-use NAT64 `64:ff9b:1::/48`,
+Teredo `2001::/32`, and well-known NAT64 (`64:ff9b::/96`), 6to4
+(`2002::/16`), IPv4-mapped and IPv4-compatible IPv6 addresses whose embedded
+IPv4 address is restricted. Native provider transport, the web fetch tool
+(authorization gate and transport) and public search use the same address
+predicate. Public search adds stricter IPv6 exclusions for its endpoint,
+resolver and result URLs: it refuses every IPv4-mapped/compatible and 6to4
+address outright, the rest of `64:ff9b::/48` outside the well-known `/96`,
+and the special-use ranges listed in [architecture](architecture.md).
 
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`
