@@ -477,15 +477,17 @@ impl TaskDispatcher {
                         && matches!(e.resume_policy, None | Some(db::ResumePolicy::Manual))
                         && !assignment_newer(e)
                     {
-                        if exact
-                            .is_some_and(|review| review.status == db::ReviewStatus::AwaitingHuman)
-                        {
+                        match exact.map(|review| &review.status) {
                             // This exact review already consumed the terminal
                             // execution. Only its human decision remains; a
                             // duplicate completion would do nothing.
-                            f.human_wait = true;
-                        } else {
-                            f.terminal_execution = Some(e.id.clone());
+                            Some(db::ReviewStatus::AwaitingHuman) => f.human_wait = true,
+                            // A re-run cancelled this attempt and its own
+                            // dispatch did not open the next one. Settling the
+                            // completion again would do nothing, for ever: the
+                            // role dispatch below starts the next attempt.
+                            Some(db::ReviewStatus::Cancelled) => {}
+                            _ => f.terminal_execution = Some(e.id.clone()),
                         }
                     }
                 } else if role != "reviewer" && own(e) && !assignment_newer(e) {

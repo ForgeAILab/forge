@@ -134,3 +134,79 @@ async fn awaiting_human_review_adds_no_task_steps_across_120_dispatcher_ticks() 
         1
     );
 }
+
+fn task_uuid(f: &ReviewFixture) -> uuid::Uuid {
+    uuid::Uuid::parse_str(&f.task.id).unwrap()
+}
+
+fn dispatched(f: &mut ReviewFixture) -> Vec<String> {
+    let mut ids = Vec::new();
+    while let Ok(ctx) = f.rx.try_recv() {
+        assert_eq!(ctx.task_id, f.task.id);
+        ids.push(ctx.execution_id);
+    }
+    ids
+}
+
+async fn reviews_by_attempt(f: &ReviewFixture) -> Vec<db::Review> {
+    let mut reviews = ReviewRepo::list_by_task(&*f.db, &f.task.id).await.unwrap();
+    reviews.sort_by_key(|review| review.attempt_number);
+    reviews
+}
+
+/// A re-run whose entry committed but whose reviewer dispatch failed (the
+/// dispatch hook only logs a failure) leaves the completed reviewer bound to
+/// the cancelled newest Review. That attempt has nothing left to settle: the
+/// dispatcher must start the next attempt instead of settling it forever.
+#[tokio::test]
+async fn rerun_whose_dispatch_failed_recovers_without_another_owner_request() {
+    let mut f = fixture(ReviewStatus::AwaitingHuman).await;
+    sqlx::query("CREATE TRIGGER reject_review_open BEFORE INSERT ON review BEGIN SELECT RAISE(ABORT,'injected review open failure'); END")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let _ = f
+        .dispatcher
+        .task_service
+        .rerun_review(
+            task_uuid(&f),
+            Actor::user(api_types::UserActionSource::Test),
+        )
+        .await;
+    f.dispatcher.task_service.drain(&f.task.id).await.unwrap();
+    sqlx::query("DROP TRIGGER reject_review_open")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let reviews = reviews_by_attempt(&f).await;
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(
+        reviews[0].status,
+        ReviewStatus::Cancelled,
+        "the re-run committed"
+    );
+    assert!(dispatched(&mut f).is_empty());
+
+    let launched = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            f.dispatcher.reconcile_all().await.unwrap();
+            f.dispatcher.task_service.drain(&f.task.id).await.unwrap();
+            let launched = dispatched(&mut f);
+            if !launched.is_empty() {
+                return launched;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the dispatcher starts the next attempt without another Re-run Review");
+    assert_eq!(launched.len(), 1);
+    assert_ne!(launched[0], f.reviewer.id);
+    let reviews = reviews_by_attempt(&f).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[1].status, ReviewStatus::Running);
+    assert_eq!(
+        reviews[1].reviewer_execution_id.as_deref(),
+        Some(launched[0].as_str())
+    );
+}

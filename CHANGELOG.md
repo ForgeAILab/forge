@@ -78,7 +78,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Re-running Review now cancels its previous attempt and records the new entry
   atomically, so an entry write failure leaves the previous attempt recoverable.
   A completed reviewer waiting for human approval no longer adds command steps
-  on unchanged dispatcher ticks.
+  on unchanged dispatcher ticks. A re-run whose reviewer dispatch failed after
+  its entry committed now starts the next reviewer on its own instead of
+  re-settling the cancelled attempt on every dispatcher tick.
 - Recheck Review now re-dispatches the assigned reviewer when a Task has no
   review checks, for both the built-in and renamed review gates. Checks still
   finish before reviewer dispatch. Renamed review gates also refuse Task soft
