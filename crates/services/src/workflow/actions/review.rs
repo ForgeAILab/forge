@@ -40,7 +40,12 @@ pub(super) async fn prepare_review_entry(
     else {
         return Ok(None);
     };
-    if !db::budget::is_review_state(state) {
+    // Every review-phase gate, also one held by another role or by nobody (an
+    // owner-approval gate): wider than the review lifecycle's
+    // `db::budget::is_review_state`, which needs the reviewer role.
+    if state.kind != api_types::StateKind::Gate
+        || state.canonical_phase != Some(api_types::CanonicalPhase::Review)
+    {
         return Ok(None);
     }
     // An Agent reviewer is refused dispatch for want of a candidate and

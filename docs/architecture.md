@@ -7691,7 +7691,11 @@ review-ready projections all resolve that meaning from the workflow rather than
 requiring the built-in state name. Such a gate shares the
 Task's `review` and `gate:review` budgets with every other review gate. A
 reviewer-role gate in another phase runs no Review and keeps its own
-`gate:<state>` budget and entry cap. Verification
+`gate:<state>` budget and entry cap. The review-entry candidate check
+(`prepare_review_entry`) and the no-change repair guard are wider: they apply
+to every gate whose `canonical_phase` is `review`, whatever its role, so an
+owner-approval or other-role gate keeps refusing a run without a candidate.
+Verification
 initialization and rerun charges require that review state and fence the Task's
 actual status and version; renamed review gates receive the same Project defaults
 and remaining-budget projections.

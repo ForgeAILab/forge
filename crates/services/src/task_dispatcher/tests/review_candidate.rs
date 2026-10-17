@@ -261,6 +261,69 @@ async fn owner_move_into_review_without_a_run_parks() {
     assert_missing_candidate(&lead, &task.id).await;
 }
 
+/// The review-entry decision covers every review-phase gate, not only the
+/// review lifecycle's gate: a renamed gate held by another role refuses its
+/// Agent a run without a candidate and parks for the owner, as before.
+#[tokio::test]
+async fn owner_move_into_a_renamed_review_phase_gate_without_a_run_parks() {
+    let lead = root_lead::lead_fixture(false).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "review" {
+                trigger.to = "signoff".into();
+            }
+        }
+        if state.name == "review" {
+            state.name = "signoff".into();
+            state.role = Some("approver".into());
+        }
+    }
+    sqlx::query("UPDATE project SET workflow_definition = ?, version = version + 1 WHERE id = ?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&lead.project)
+        .execute(lead.db.pool())
+        .await
+        .unwrap();
+    let task = seed_task(&lead.db, &lead.project, "owner moved", "in_progress", 0).await;
+    assign_role(&lead.db, &task.id, "approver", &lead.coder).await;
+    let task = reload(&lead.db, &task.id).await;
+    lead.dispatcher
+        .task_service
+        .transition(
+            task.id.clone(),
+            "signoff".to_owned(),
+            crate::task_service::TransitionOptions {
+                version: task.version,
+                triggered_by: owner(),
+                ..task.version.into()
+            },
+        )
+        .await
+        .unwrap();
+    passes(&lead, 4).await;
+    let task = reload(&lead.db, &task.id).await;
+    assert_eq!(task.status, "signoff");
+    assert!(
+        matches!(
+            task.condition.reasons().next(),
+            Some(db::ParkReason::Failure {
+                failure_kind: api_types::FailureKind::ReviewBlocked
+            })
+        ),
+        "{:?}",
+        task.condition
+    );
+    assert!(task
+        .condition
+        .read()
+        .interruption
+        .unwrap()
+        .reason
+        .contains("nothing to review"));
+    assert_eq!(executions(&lead.db, &task.id).await, Vec::new());
+}
+
 #[tokio::test]
 async fn owner_approval_into_review_without_a_run_parks() {
     let lead = root_lead::lead_fixture(false).await;

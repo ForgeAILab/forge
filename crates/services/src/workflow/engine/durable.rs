@@ -598,9 +598,13 @@ impl WorkflowExecution<'_> {
         }
 
         // This guard precedes every review-entry check and every path that
-        // creates a Review (including a gate without configured CI).
+        // creates a Review (including a gate without configured CI). Like
+        // `prepare_review_entry` it covers every review-phase gate.
         let mut no_change_send_back = false;
-        if cascade.is_none() && db::budget::is_review_state(to_state) {
+        if cascade.is_none()
+            && to_state.kind == StateKind::Gate
+            && to_state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+        {
             match crate::workflow::actions::no_change::repair_no_change_gate(
                 &enter_ctx,
                 &task,
