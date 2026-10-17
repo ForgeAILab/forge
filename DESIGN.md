@@ -720,6 +720,13 @@ Task action buttons render server labels and meaningful parameters. Use the exis
 
 Use existing outline buttons, Dialog, Label and Textarea primitives. Offers supply labels and fields; required text is labelled and blocks Apply while blank. Boolean selects show only offered choices. Cancellation copy states subtask propagation. Changed-action notices use a polite status region. Dialog content scrolls within the viewport, keeping all inputs reachable.
 
+Mission Control review parks use these same forms. Project owners, admins and
+members see permitted human offers and Resolve; approval with an override requires
+owner rights. While Project or membership data loads, withhold both controls and
+the muted “Owner action needed” message. Show that message after permission reads
+settle only when the viewer can perform none of the actions. Keep the park reason
+and Open review link visible in every permission state.
+
 ### Pending remote workspace cleanup
 
 Reuse the Workspace placement status section and its warning notice tokens.

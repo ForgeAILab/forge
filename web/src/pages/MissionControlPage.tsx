@@ -17,7 +17,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Textarea } from '@/components/ui/textarea'
 import { LeadInputAnswer, isLeadInput } from '@/components/lead-input-answer'
-import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
+import { actionForPost, TaskActionButtons } from '@/components/task-detail/task-action-buttons'
 import type { Offer } from '@/types/generated'
 import { useAgentQuery, useMembersQuery, useProjectQuery } from '@/api/hooks'
 import { useAuthStore } from '@/stores/auth'
@@ -146,11 +146,31 @@ function attentionTone(item: AttentionItem): string {
   return 'border-border-subtle bg-card'
 }
 
-function ownerOffers(offers: Offer[]): Offer[] {
-  return offers.filter((offer) => offer.authority.includes('owner'))
+type ReviewActionAccess = { loading: boolean; canWrite: boolean; isOwner: boolean }
+
+function reviewOffers(offers: Offer[], access: ReviewActionAccess): Offer[] {
+  if (!access.canWrite) return []
+  return offers.flatMap((offer) => {
+    // The Task action API accepts human offers from Project writers. Only
+    // approval with an override additionally requires Project owner access.
+    if (!offer.authority.includes('owner')) return []
+    if (access.isOwner || offer.action.verb !== 'approve') return [offer]
+    const action = actionForPost(offer, offer.action)
+    if (action.verb === 'approve' && action.override) return []
+    return [
+      {
+        ...offer,
+        parameters: offer.parameters.map((parameter) =>
+          parameter.name === 'override' && parameter.boolean_values?.includes(true)
+            ? { ...parameter, boolean_values: [false] }
+            : parameter,
+        ),
+      },
+    ]
+  })
 }
 
-function ReviewOwnerActions({ item, canAct }: { item: AttentionItem; canAct: boolean }) {
+function ReviewOwnerActions({ item, access }: { item: AttentionItem; access: ReviewActionAccess }) {
   const taskId = attentionTaskId(item)
   const task = item.details.task as { task_version?: number } | null | undefined
   const recovery = item.details.recovery as { actions?: Offer[] } | null | undefined
@@ -165,10 +185,10 @@ function ReviewOwnerActions({ item, canAct }: { item: AttentionItem; canAct: boo
         Open review
         <ArrowUpRight size={14} aria-hidden />
       </Link>
-      {!canAct && item.lifecycle !== 'resolved' ? (
+      {!access.loading && !access.canWrite && item.lifecycle !== 'resolved' ? (
         <p className="text-xs text-muted-foreground">Owner action needed</p>
       ) : null}
-      {canAct &&
+      {access.canWrite &&
       item.lifecycle !== 'resolved' &&
       typeof task?.task_version === 'number' &&
       Array.isArray(recovery?.actions) ? (
@@ -176,7 +196,7 @@ function ReviewOwnerActions({ item, canAct }: { item: AttentionItem; canAct: boo
           taskId={taskId}
           version={task.task_version}
           offers={recovery.actions}
-          transformOffers={ownerOffers}
+          transformOffers={(offers) => reviewOffers(offers, access)}
         />
       ) : null}
     </div>
@@ -372,17 +392,16 @@ function ReviewOwnerAttentionCard(props: AttentionCardProps) {
   const members = useMembersQuery(props.item.scope_id)
   const member = members.data?.find((entry) => entry.user_id === user?.id)
   const ownerId = project.data?.owner_id
-  // Match ProjectAccess::Owner: an explicit membership takes precedence over
-  // owner_id, and instance administration alone does not grant owner rights.
-  const canAct = Boolean(
-    user &&
-    project.data &&
-    !project.isError &&
-    members.data &&
-    !members.isError &&
-    (ownerId === null || (member ? member.role === 'owner' : ownerId === user.id)),
+  const loading = project.isLoading || members.isLoading
+  const ready = Boolean(
+    user && !loading && project.data && !project.isError && members.data && !members.isError,
   )
-  return <AttentionCardContent {...props} canAct={canAct} />
+  // Match ProjectAccess: explicit membership takes precedence over owner_id;
+  // legacy ownerless Projects grant owner rights to every signed-in user.
+  const isOwner =
+    ready && (ownerId === null || (member ? member.role === 'owner' : ownerId === user?.id))
+  const canWrite = ready && (isOwner || member?.role === 'admin' || member?.role === 'member')
+  return <AttentionCardContent {...props} reviewAccess={{ loading, canWrite, isOwner }} />
 }
 
 function AttentionCardContent({
@@ -390,8 +409,9 @@ function AttentionCardContent({
   answer,
   onAnswerChange,
   onAnswered,
-  canAct = true,
-}: AttentionCardProps & { canAct?: boolean }) {
+  reviewAccess,
+}: AttentionCardProps & { reviewAccess?: ReviewActionAccess }) {
+  const canResolve = reviewAccess?.canWrite ?? true
   const isProgressWarning = item.category === 'progress_warning'
   const taskId = isProgressWarning ? attentionTaskId(item) : null
   const retryAction = attentionRetryAction(item)
@@ -422,7 +442,7 @@ function AttentionCardContent({
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
-            {canAct && item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
+            {canResolve && item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -444,9 +464,7 @@ function AttentionCardContent({
             )}
           </p>
           <CiIncidentDetails item={item} />
-          {item.category === 'review_needs_owner' ? (
-            <ReviewOwnerActions item={item} canAct={canAct} />
-          ) : null}
+          {reviewAccess ? <ReviewOwnerActions item={item} access={reviewAccess} /> : null}
           <p className="mt-3 font-mono text-micro text-muted-foreground">
             {humanize(item.scope_type)} · {item.scope_id.slice(0, 8)} · priority {item.priority} ·
             event {item.source_event_id.slice(0, 8)}

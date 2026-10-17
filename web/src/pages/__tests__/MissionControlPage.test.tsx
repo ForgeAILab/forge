@@ -247,6 +247,24 @@ function reviewOwnerAttention(): MissionControlResponse['needs_attention'][numbe
             target_execution_id: null,
             propagates: false,
           },
+          {
+            action: { verb: 'approve', override: false },
+            label: 'Defer Finding to Follow-up',
+            reason: 'review_needs_owner',
+            authority: ['owner'],
+            parameters: [{ name: 'reason', required: true, boolean_values: null }],
+            target_execution_id: null,
+            propagates: false,
+          },
+          {
+            action: { verb: 'approve', override: true },
+            label: 'Override Failed Review',
+            reason: 'failed_review_override',
+            authority: ['owner'],
+            parameters: [{ name: 'reason', required: true, boolean_values: null }],
+            target_execution_id: null,
+            propagates: false,
+          },
         ],
       },
     },
@@ -277,43 +295,32 @@ describe('MissionControlPage', () => {
   afterEach(() => useAuthStore.getState().clearAuth())
 
   it.each([
-    'member',
     'viewer',
-    'admin',
+    'non-member',
     'instance administrator',
-    'loading project',
     'failed project',
-    'loading memberships',
     'failed memberships',
     'signed out',
-    'owner id with member role',
-  ])('keeps review parks visible without owner controls for %s', (viewer) => {
+    'owner id with viewer role',
+  ])('keeps review parks visible without unauthorized controls for %s', (viewer) => {
     const previous = data.needs_attention
     permissions.ownerId = 'another-owner'
-    permissions.role = viewer
+    permissions.role = 'viewer'
+    if (viewer === 'non-member') permissions.role = null
     if (viewer === 'instance administrator') {
       useAuthStore.setState({ user: { ...useAuthStore.getState().user!, is_admin: true } })
     }
     if (viewer === 'signed out') useAuthStore.getState().clearAuth()
-    if (viewer === 'loading project') {
-      permissions.role = 'owner'
-      permissions.projectLoading = true
-    }
     if (viewer === 'failed project') {
       permissions.role = 'owner'
       permissions.projectError = true
-    }
-    if (viewer === 'loading memberships') {
-      permissions.role = 'owner'
-      permissions.membersLoading = true
     }
     if (viewer === 'failed memberships') {
       permissions.role = 'owner'
       permissions.membersError = true
     }
-    if (viewer === 'owner id with member role') {
+    if (viewer === 'owner id with viewer role') {
       permissions.ownerId = 'user-1'
-      permissions.role = 'member'
     }
     data.needs_attention = [reviewOwnerAttention()]
     try {
@@ -334,17 +341,25 @@ describe('MissionControlPage', () => {
   })
 
   it.each([
-    { viewer: 'membership owner', ownerId: 'another-owner', role: 'owner' },
-    { viewer: 'owner id without membership', ownerId: 'user-1', role: null },
-    { viewer: 'legacy ownerless Project viewer', ownerId: null, role: 'viewer' },
-  ])('shows review owner controls to $viewer', ({ ownerId, role }) => {
+    { viewer: 'membership owner', ownerId: 'another-owner', role: 'owner', isOwner: true },
+    { viewer: 'admin member', ownerId: 'another-owner', role: 'admin', isOwner: false },
+    { viewer: 'member', ownerId: 'another-owner', role: 'member', isOwner: false },
+    { viewer: 'owner id with member role', ownerId: 'user-1', role: 'member', isOwner: false },
+    { viewer: 'owner id without membership', ownerId: 'user-1', role: null, isOwner: true },
+    { viewer: 'legacy ownerless Project viewer', ownerId: null, role: 'viewer', isOwner: true },
+  ])('shows permitted review-park controls to $viewer', ({ ownerId, role, isOwner }) => {
     const previous = data.needs_attention
     Object.assign(permissions, { ownerId, role })
     data.needs_attention = [reviewOwnerAttention()]
     try {
       render(<MissionControlPage />)
       expect(screen.queryByText('Owner action needed')).toBeNull()
-      expect(screen.getByRole('button', { name: 'Resolve' })).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'Resolve' }))
+      expect(resolveAttention).toHaveBeenCalledWith({ id: 'attention-1', expectedVersion: 1 })
+      expect(screen.getByRole('button', { name: 'Defer Finding to Follow-up' })).toBeTruthy()
+      expect(Boolean(screen.queryByRole('button', { name: 'Override Failed Review' }))).toBe(
+        isOwner,
+      )
       fireEvent.click(screen.getByRole('button', { name: 'Retry With Guidance' }))
       expect(taskAction).toHaveBeenCalledWith(
         { taskId: 'task-1', version: 12, action: { verb: 'retry' } },
@@ -354,6 +369,92 @@ describe('MissionControlPage', () => {
       data.needs_attention = previous
     }
   })
+
+  it.each([
+    { pending: 'Project', field: 'projectLoading', role: 'owner' },
+    { pending: 'Project', field: 'projectLoading', role: 'member' },
+    { pending: 'Project', field: 'projectLoading', role: 'viewer' },
+    { pending: 'memberships', field: 'membersLoading', role: 'owner' },
+    { pending: 'memberships', field: 'membersLoading', role: 'member' },
+    { pending: 'memberships', field: 'membersLoading', role: 'viewer' },
+  ] as const)(
+    'withholds controls and denial text while $pending loads for $role',
+    ({ field, role }) => {
+      const previous = data.needs_attention
+      Object.assign(permissions, { ownerId: 'another-owner', role, [field]: true })
+      data.needs_attention = [reviewOwnerAttention()]
+      try {
+        const { rerender } = render(<MissionControlPage />)
+        const card = screen
+          .getByRole('heading', { name: 'Review needs the owner: repeated finding F1' })
+          .closest('article')!
+        expect(within(card).queryAllByRole('button')).toHaveLength(0)
+        expect(within(card).queryByText('Owner action needed')).toBeNull()
+        expect(within(card).getByRole('link', { name: 'Open review' })).toBeTruthy()
+
+        permissions[field] = false
+        rerender(<MissionControlPage />)
+        if (role === 'viewer') {
+          expect(within(card).queryAllByRole('button')).toHaveLength(0)
+          expect(within(card).getByText('Owner action needed')).toBeTruthy()
+        } else {
+          expect(within(card).getByRole('button', { name: 'Retry With Guidance' })).toBeTruthy()
+          expect(within(card).getByRole('button', { name: 'Resolve' })).toBeTruthy()
+          expect(within(card).queryByText('Owner action needed')).toBeNull()
+        }
+      } finally {
+        data.needs_attention = previous
+      }
+    },
+  )
+
+  it.each(['owner', 'admin', 'member'])(
+    'handles fixed and optional approval overrides for %s',
+    (role) => {
+      const previous = data.needs_attention
+      permissions.role = role
+      permissions.ownerId = 'another-owner'
+      const item = reviewOwnerAttention()
+      const recovery = item.details.recovery as { actions: Offer[] }
+      recovery.actions = [
+        {
+          ...recovery.actions[2],
+          action: { verb: 'approve' },
+          label: 'Fixed override',
+          parameters: [{ name: 'override', required: true, boolean_values: [true] }],
+        },
+        {
+          ...recovery.actions[1],
+          label: 'Approve with optional override',
+          parameters: [{ name: 'override', required: true, boolean_values: [false, true] }],
+        },
+      ]
+      data.needs_attention = [item]
+      try {
+        render(<MissionControlPage />)
+        expect(Boolean(screen.queryByRole('button', { name: 'Fixed override' }))).toBe(
+          role === 'owner',
+        )
+        fireEvent.click(screen.getByRole('button', { name: 'Approve with optional override' }))
+        if (role === 'owner') {
+          expect(screen.getAllByRole('option').map((option) => option.textContent)).toEqual([
+            'No',
+            'Yes',
+          ])
+        } else {
+          expect(screen.queryByRole('combobox')).toBeNull()
+          expect(screen.getByText('Uses the current checks')).toBeTruthy()
+          fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+          expect(taskAction).toHaveBeenCalledWith(
+            { taskId: 'task-1', version: 12, action: { verb: 'approve', override: false } },
+            expect.anything(),
+          )
+        }
+      } finally {
+        data.needs_attention = previous
+      }
+    },
+  )
 
   it.each(['member', 'viewer', 'failed memberships', 'signed out'])(
     'keeps Resolve on other Attention categories for %s',
@@ -375,8 +476,10 @@ describe('MissionControlPage', () => {
     },
   )
 
-  it('filters review offers by owner authority after an action refreshes them', () => {
+  it.each(['owner', 'admin', 'member'])('filters refreshed review offers for %s', (role) => {
     const previous = data.needs_attention
+    permissions.role = role
+    permissions.ownerId = 'another-owner'
     const item = reviewOwnerAttention()
     const recovery = item.details.recovery as { actions: Offer[] }
     const ownerOffer = recovery.actions[0]
@@ -394,6 +497,8 @@ describe('MissionControlPage', () => {
         available_actions: [
           { ...agentOffer, label: 'Refreshed Project Agent retry' },
           { ...ownerOffer, label: 'Refreshed owner retry' },
+          { ...recovery.actions[1], label: 'Refreshed deferral' },
+          { ...recovery.actions[2], label: 'Refreshed override' },
         ],
       }),
     )
@@ -402,6 +507,10 @@ describe('MissionControlPage', () => {
       expect(screen.queryByRole('button', { name: 'Project Agent retry' })).toBeNull()
       fireEvent.click(screen.getByRole('button', { name: 'Retry With Guidance' }))
       expect(screen.queryByRole('button', { name: 'Refreshed Project Agent retry' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'Refreshed deferral' })).toBeTruthy()
+      expect(Boolean(screen.queryByRole('button', { name: 'Refreshed override' }))).toBe(
+        role === 'owner',
+      )
       fireEvent.click(screen.getByRole('button', { name: 'Refreshed owner retry' }))
       expect(taskAction).toHaveBeenLastCalledWith(
         { taskId: 'task-1', version: 13, action: { verb: 'retry' } },

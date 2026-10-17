@@ -79,8 +79,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Changed
 
 - Owner-only review parks no longer wake the Project Agent or create a redundant
-  owner escalation. Mission Control shows their Task actions and Resolve only
-  to Project owners; other viewers see the reason and `Owner action needed`.
+  owner escalation. Mission Control shows each Task action and Resolve according
+  to server authority and Project role, including ordinary actions for members
+  and admins; approval with an override remains owner-only. Permission loading
+  shows neither controls nor `Owner action needed`; that message appears only
+  when the viewer can perform none of the actions.
 - Review parks name the owner decision and park reason in Attention and show
   the owner's finding deferral and guided retry offers when eligible.
 - Workflow snapshots now commit with their queued step and transition,

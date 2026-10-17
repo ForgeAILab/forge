@@ -930,15 +930,20 @@ retains that reason (for example a repeated finding, only non-blocking findings
 remaining, or no change after repair). `details.recovery.actions` contains the
 owner's standard Task offers, including finding deferral and guided retry when
 eligible. These are versioned context snapshots: commands still use the Task
-action API and its current authorization. Mission Control renders the shared
-Task action forms and Resolve only after confirming the viewer's Project owner
-permission from the signed-in user, Project and membership data. An explicit
-membership takes precedence over `owner_id`; an owner role grants access, while
-admin/member/viewer roles and instance administration alone do not. Legacy
-ownerless Projects retain their existing signed-in-user owner rights. Other
-viewers (and pending or failed permission reads) see `Owner action needed`, the
-park reason and a link to Review, without buttons. Refreshed Task offers remain
-filtered to owner authority. Other interruption causes retain
+action API and its current authorization. Mission Control uses the same shared
+Task action forms as the Task Review tab and filters each offer by its `authority`
+and the viewer's Project role. Human offers (`owner` authority) and Attention
+Resolve require Project member, admin or owner access; approval with an override
+requires owner access. Non-owners retain ordinary approval when an offer permits
+both choices, with the override choice removed. An explicit membership takes
+precedence over `owner_id`; instance administration alone grants no additional
+Project rights. Legacy ownerless Projects retain their existing signed-in-user
+owner rights. While Project or membership data loads, neither buttons nor
+`Owner action needed` appear. Once those reads settle, viewers who can perform
+none of the actions (including signed-out users and failed permission reads) see
+`Owner action needed` without buttons. The park reason and Review link remain
+visible throughout. Refreshed offers use the same per-action permission filter.
+Other interruption causes retain
 `execution_failed`. Clearing the condition, replacing its cause, or reaching a
 terminal state resolves the old park incident. Owner parks do not prepare or
 admit a Project Agent wake, request Agent setup, or consume a blocker wake
