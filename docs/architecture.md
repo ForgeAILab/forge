@@ -1023,7 +1023,14 @@ scripted checks) records the refusal through the existing interruption park in
 `review`, before creating a Review attempt or check consumer. It spends no
 review, infrastructure or verify retries and leaves no suspended hooks step.
 Stored durable checks return unstarted infrastructure receipts carrying the refusal. Forge's
-own Git operations remain outside this policy.
+own Git operations remain allowed. `executors::server_commands::disable()` also
+appends `executors::server_commands::GIT_CONFIG` to the process environment
+(`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, plus
+`GIT_TERMINAL_PROMPT=0`), which every Git child inherits as command-scope
+configuration a repository cannot override: no HTTP redirect, no network
+protocol but `https` (`file` keeps Git's `user` default for local transfers and
+bundles), `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+`safe.bareRepository=explicit`, no submodule recursion and a low-speed abort.
 
 The same switch also makes the demo server a manager only for agents and
 server files. `executors::server_commands::ensure_agents_allowed` refuses

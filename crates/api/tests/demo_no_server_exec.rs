@@ -535,3 +535,76 @@ async fn demo_keeps_daemon_owned_repository_locations() {
     demo();
     support::daemon_owned_location(true).await;
 }
+
+/// Forge's own Git runs against repositories a visitor names. In demo mode
+/// every Git process of the server follows no HTTP redirect, speaks no network
+/// protocol but https (so a redirect or a remote cannot reach an internal
+/// plain-http service), and runs no repository hook or filesystem monitor.
+#[cfg(unix)]
+#[tokio::test]
+async fn demo_git_speaks_only_https_and_runs_no_repository_program() {
+    use std::os::unix::fs::PermissionsExt;
+    demo();
+    let root = common::TestDir::new("demo-git-policy");
+    let repo = common::setup_git_repo(root.path());
+    // Where an https redirect could lead: a plain-http listener on this host.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/internal.git",
+        listener.local_addr().unwrap().port()
+    );
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        git::command_output(&repo, &["ls-remote", "--", &url]),
+    )
+    .await
+    .expect("Git refuses http before connecting")
+    .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("transport 'http' not allowed"), "{stderr}");
+    assert!(
+        matches!(listener.accept(), Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "Git must not connect to the http listener"
+    );
+    // A hook in a repository Forge operates on does not run.
+    let marker = root.path().join("hook-ran");
+    let hook = repo.join(".git/hooks/post-checkout");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = git::command_output(&repo, &["checkout", "-q", "-b", "hooked"])
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(!marker.exists(), "a repository hook must not run");
+    // A bare repository inside checked-out content is never discovered.
+    let embedded = repo.join("vendor").join("embedded");
+    let output = git::command_output(&repo, &["init", "-q", "--bare", "vendor/embedded"])
+        .await
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let output = git::command_output(&embedded, &["rev-parse", "--git-dir"])
+        .await
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bare repository"));
+    // The process-wide policy every Git child of the server inherits.
+    for (key, value) in [
+        ("http.followRedirects", "false"),
+        ("protocol.allow", "never"),
+        ("protocol.https.allow", "always"),
+        ("core.hooksPath", "/dev/null"),
+        ("core.fsmonitor", "false"),
+        ("safe.bareRepository", "explicit"),
+    ] {
+        let output = git::command_output(&repo, &["config", "--get", key])
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            value,
+            "{key}"
+        );
+    }
+}

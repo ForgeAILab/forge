@@ -13,7 +13,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   daemon. It refuses provider credentials and Chat/agent turns, and
   accepts only public `https://` repositories (no server paths, environment
   assets, integrations or MCP config file writes). Git operations performed by
-  Forge remain available.
+  Forge remain available, but in demo mode Git follows no HTTP redirect and
+  speaks no network protocol but `https`: a repository whose host answers
+  with a redirect no longer clones.
 - Session cookie names are now `__Host-forge_session` and
   `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
   unprefixed cookies are no longer read. Registration, login and refresh no
@@ -59,6 +61,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   issue-tracker integrations (tokens read from the server environment) and
   `POST /api/v1/config/mcp` (agent config files written on the server) are
   refused the same way.
+- Demo mode restricts Forge's own Git against visitor-named repositories.
+  Every Git process of the server follows no HTTP redirect and speaks no
+  network protocol but `https`, so a public remote can no longer redirect a
+  clone or fetch to an internal or plain-http host (and through it clone an
+  internal repository). Repository hooks, filesystem monitors, bare
+  repositories embedded in checked-out content, submodule recursion and
+  credential prompts are disabled, and a transfer slower than 1000 bytes/s
+  for 60 seconds aborts. Repositories cannot override this configuration.
 - Issue browser session cookies only over HTTPS, avoiding live-token exposure
   to other ports on a local HTTP host. Both cookies use the `__Host-` prefix,
   `Secure`, `Path=/`, and no `Domain` to prevent sibling-subdomain cookie

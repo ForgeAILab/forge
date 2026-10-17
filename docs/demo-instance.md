@@ -159,10 +159,19 @@ behavior.
 **What remains.** Forge still performs its own Git operations (clone, fetch,
 worktree, merge and inspection) for public `https://` repositories, so
 repository setup can consume CPU, memory and storage and makes outbound
-connections to the hosts visitors name. The public-address check resolves the
-name when it is checked; Git resolves it again when it connects, and Git
-follows an HTTP redirect on its first request, so a hostile name server or
-server can still steer one Git connection elsewhere. A visitor can connect
+connections to the hosts visitors name. Every Git process of the demo server
+runs with command-scope configuration that repositories cannot override: it
+follows no HTTP redirect (a remote that answers with one fails to clone; use
+the address the host serves directly, for example with `.git`), speaks no
+network protocol but `https` (local paths and bundles keep Git's default policy
+for Forge's own transfers), runs no repository hook or filesystem monitor,
+discovers no bare repository inside checked-out content, recurses into no
+submodule, aborts a transfer slower than 1000 bytes/s for 60 seconds, and never
+prompts for credentials. The public-address check resolves the name when it is
+checked and Git resolves it again when it connects, so a hostile name server
+can still point that one `https` connection at another address; certificate
+verification then fails unless that address serves a valid certificate for the
+name. A visitor can connect
 their own `forge-daemon`; whatever it runs, it runs on their machine. The
 container remains attached to Dokploy's shared proxy network, which can reach
 the internet and other applications on that network. This policy removes

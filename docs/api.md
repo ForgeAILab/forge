@@ -5183,7 +5183,11 @@ budget is spent, and no hooks step stays suspended. Remove the configuration
 and retry the entry, or cancel the Task. Native Chat command tools also refuse
 execution, including when a visitor connects their own provider credential;
 other native tools keep their permissions.
-Forge's built-in Git operations remain available. Normal mode is unchanged.
+Forge's built-in Git operations remain available, under a fixed policy: in
+demo mode every Git process of the server follows no HTTP redirect, uses no
+network protocol but `https`, and runs no repository hook or filesystem monitor
+(see [Public demo instance](demo-instance.md#what-a-visitor-can-and-cannot-do)).
+Normal mode is unchanged.
 
 The same demo switch refuses two more things, also with HTTP **422**:
 
