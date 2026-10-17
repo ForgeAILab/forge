@@ -12,9 +12,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   `3fff::/20`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2
   `2001:20::/28`, and discard-only `100::/64`. Both policies judge
   IPv4-translated `::ffff:0:0:0/96` addresses by their embedded IPv4 destination.
-  Public search rejects `.internal` and `.home.arpa` endpoint/result hostnames
-  and refuses the whole endpoint if any DNS answer is blocked, including
-  mixed public/private answers, instead of connecting to the public subset.
+  Public search rejects `internal`, `home.arpa` and names under them as
+  endpoint/result hostnames, and refuses the whole endpoint if any DNS answer
+  is blocked, including mixed public/private answers, instead of connecting to
+  the public subset.
 - Public search and provider/fetch checks share one restricted-address policy.
   Public search now judges well-known NAT64 `64:ff9b::/96` by its embedded IPv4
   destination instead of refusing it outright; the rest of `64:ff9b::/48` and
@@ -47,9 +48,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Provider/fetch destinations in the IPv6 documentation, benchmarking, ORCHID
   and discard-only ranges listed above are newly refused. Providers, fetch and
   public search also refuse IPv4-translated destinations carrying restricted
-  IPv4 addresses. Public search no longer accepts `.internal` or `.home.arpa`
-  endpoint/result hostnames or endpoints with any blocked DNS answer, even
-  when other answers are public.
+  IPv4 addresses. Public search no longer accepts `internal`, `home.arpa` or
+  names under them as endpoint/result hostnames, or endpoints with any blocked
+  DNS answer, even when other answers are public.
 - Provider and fetch destinations in `192.88.99.0/24`, including IPv6 forms
   embedding those addresses, are now rejected as former 6to4 relay anycast.
 - Remote daemon clients using any `embedded:` machine id now receive HTTP 409

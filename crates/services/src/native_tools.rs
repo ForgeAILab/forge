@@ -4035,8 +4035,10 @@ fn is_private_or_local_search_host(host: &str) -> bool {
     if normalized.contains('%') {
         return true;
     }
-    if matches!(normalized.as_str(), "localhost" | "localhost.localdomain")
-        || normalized.ends_with(".localhost")
+    if matches!(
+        normalized.as_str(),
+        "localhost" | "localhost.localdomain" | "internal" | "home.arpa"
+    ) || normalized.ends_with(".localhost")
         || normalized.ends_with(".local")
         || normalized.ends_with(".internal")
         || normalized.ends_with(".home.arpa")
@@ -6974,6 +6976,11 @@ mod tests {
             "search.home.arpa",
             "nested.search.home.arpa",
             "SEARCH.HOME.ARPA.",
+            // The reserved names themselves, not only their subdomains.
+            "internal",
+            "INTERNAL.",
+            "home.arpa",
+            "HOME.ARPA.",
         ] {
             assert!(
                 normalize_public_result_url(&format!("https://{host}/result")).is_err(),
@@ -6984,6 +6991,9 @@ mod tests {
             "search.internal.example",
             "search.home.arpa.example",
             "searchinternal",
+            "example.internal.com",
+            "internal.example.com",
+            "home.arpa.example.com",
         ] {
             assert!(
                 normalize_public_result_url(&format!("https://{host}/result")).is_ok(),
@@ -7518,7 +7528,13 @@ mod tests {
         .await;
         assert!(unexpected.is_err());
 
-        for host in ["localhost", "SEARCH.INTERNAL.", "SEARCH.HOME.ARPA."] {
+        for host in [
+            "localhost",
+            "SEARCH.INTERNAL.",
+            "SEARCH.HOME.ARPA.",
+            "INTERNAL.",
+            "HOME.ARPA.",
+        ] {
             let resolver = PublicSearchResolver {
                 allowed_host: host.to_owned(),
             };

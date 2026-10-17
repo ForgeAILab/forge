@@ -283,6 +283,11 @@ fn address_tightening_public_search_refuses_local_dns_suffixes() {
         "search.home.arpa",
         "nested.search.home.arpa",
         "SEARCH.HOME.ARPA.",
+        // The reserved names themselves, not only their subdomains.
+        "internal",
+        "INTERNAL.",
+        "home.arpa",
+        "HOME.ARPA.",
     ] {
         let config = PublicSearchConfig {
             endpoint: Some(format!("https://{host}/search")),
@@ -294,6 +299,9 @@ fn address_tightening_public_search_refuses_local_dns_suffixes() {
         "search.internal.example",
         "search.home.arpa.example",
         "searchinternal",
+        "example.internal.com",
+        "internal.example.com",
+        "home.arpa.example.com",
     ] {
         let config = PublicSearchConfig {
             endpoint: Some(format!("https://{host}/search")),

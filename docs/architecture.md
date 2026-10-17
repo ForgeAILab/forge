@@ -125,9 +125,9 @@ provider/fetch refusing the six IPv6 special-use ranges above, both policies
 refusing IPv4-translated addresses carrying restricted IPv4, and public
 search admitting well-known NAT64 addresses whose embedded IPv4 is public.
 
-Public-search endpoint validation and result URLs also refuse `.internal`
-and `.home.arpa` hostnames alongside the existing local suffixes, including
-mixed case and trailing dots. At request time, search rejects the entire
+Public-search endpoint validation and result URLs also refuse `internal`,
+`home.arpa` and names under them alongside the existing local suffixes,
+including mixed case and trailing dots. At request time, search rejects the entire
 hostname if resolution is empty or any answer is blocked, matching providers
 and fetch; it never filters a mixed answer down to its public members.
 The request client receives only an all-public answer set. Deterministic
