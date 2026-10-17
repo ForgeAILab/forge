@@ -10956,6 +10956,8 @@ mod lead_operations;
 #[cfg(test)]
 #[path = "tests/refresh_recovery.rs"]
 mod refresh_recovery;
+#[path = "tests/rerun_hardening.rs"]
+mod rerun_hardening;
 #[path = "tests/review_candidate.rs"]
 mod review_candidate;
 #[path = "tests/root_lead.rs"]

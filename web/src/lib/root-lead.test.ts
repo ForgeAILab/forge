@@ -174,25 +174,71 @@ describe('launching a run on a coordination root', () => {
     ).toBe(true)
   })
 
-  it('allows a renamed review gate by its kind, reviewer role and canonical phase', () => {
+  it('allows a renamed reviewer gate in the review phase', () => {
     const review = {
       name: 'qa_review',
       kind: 'gate',
       role: 'reviewer',
       canonical_phase: 'review',
+      column: 'Quality',
     } as StateDefinition
     const task = { ...root, status: 'qa_review' }
     expect(rootHoldsRuns(task, true, { states: [review] })).toBe(false)
     expect(rootHoldsRuns(task, false, { states: [review] })).toBe(false)
     for (const state of [
-      { ...review, kind: 'active' as const },
       { ...review, role: 'coder' },
       { ...review, canonical_phase: 'working' as const },
-      { ...review, canonical_phase: null },
       { ...review, name: 'other_gate' },
     ]) {
       expect(rootHoldsRuns(task, true, { states: [state] })).toBe(true)
     }
+    expect(rootHoldsRuns(task, true)).toBe(true)
+  })
+
+  it('allows a review-phase state held by another non-implementation role', () => {
+    const state = { name: 'quality', kind: 'gate', role: 'auditor', canonical_phase: 'review', column: 'Quality' } as StateDefinition
+    const implementation = { name: 'in_progress', kind: 'active', role: 'builder' } as StateDefinition
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, { states: [implementation, state] })).toBe(false)
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+      states: [implementation, { ...state, kind: 'active' }],
+    })).toBe(false)
+    for (const role of ['coder', 'builder', null]) {
+      expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+        states: [implementation, { ...state, kind: 'gate', role }],
+      }), String(role)).toBe(true)
+    }
+  })
+
+  it.each([
+    { name: 'quality', kind: 'gate', column: ' ReViEw ' },
+    { name: 'review', kind: 'gate', column: 'Quality' },
+    { name: 'qa_review', kind: 'gate', column: 'Quality' },
+    { name: 'merge_check', kind: 'gate', column: 'Quality' },
+  ] as const)('resolves an implicit review phase for $name in $column', (implicit) => {
+    const state = { ...implicit, role: 'auditor', canonical_phase: null } as StateDefinition
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, { states: [state] })).toBe(false)
+    // An explicit phase wins over the column, legacy name and kind fallback.
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+      states: [{ ...state, canonical_phase: 'working' }],
+    })).toBe(true)
+  })
+
+  it('uses column and legacy phase precedence before the gate-name fallback', () => {
+    for (const state of [
+      { name: 'qa_review', column: 'Working' },
+      { name: 'planning', column: 'Quality' },
+      { name: 'quality', column: 'Quality' },
+    ]) {
+      expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+        states: [{ ...state, kind: 'gate', role: 'reviewer', canonical_phase: null } as StateDefinition],
+      })).toBe(true)
+    }
+  })
+
+  it('keeps merge_failed roots held even when the Task projects the review phase', () => {
+    const task = { ...root, status: 'merge_failed', canonical_phase: 'review' as const }
+    const state = { name: 'merge_failed', kind: 'active', role: 'coder', column: 'Review', canonical_phase: 'review' } as StateDefinition
+    expect(rootHoldsRuns(task, true, { states: [state] })).toBe(true)
     expect(rootHoldsRuns(task, true)).toBe(true)
   })
 

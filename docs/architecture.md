@@ -6622,6 +6622,14 @@ snapshot, the dispatch hook, execution admission and the active recovery, so a
 planning root without a lead offers, launches and admits no planner. The plan-candidate exemption applies to exactly the lead's run (the
 planning role, on a root with subtasks, in the planning state).
 
+The web's coordination-root run control follows the review execution rule:
+resolve the state's phase from its explicit phase, recognized column, legacy
+name, then kind/name fallback, and require an effective role other than `coder`
+or the workflow's implementation role. This admits custom review roles and
+implicit review phases. It does not use the Task's projected `canonical_phase`:
+`merge_failed` can project `review` while its implementation role cannot run on
+the root.
+
 **Step check (`lead_check`).** The inherited subtask workflow is
 `todo → in_progress → lead_check → done` (`cancelled` from any of them).
 `lead_check` is an optional gate in the working phase, never a review: no
@@ -10409,7 +10417,8 @@ not run anything itself:
    check) or a `reviewer`/`auditor` execution is running. The action system
    refuses earlier for the same states: it offers no `retry`, so the public
    request gets `action_unavailable`.
-2. It closes the attempt it replaces. The newest Review, when still `running`
+2. In the same transaction that records the new entry (step 3), it closes the
+   attempt it replaces. The newest Review, when still `running`
    or `awaiting_human`, is cancelled with
    `execution_retry.status = "superseded_by_rerun"`, so a human gate or a late
    reviewer cannot settle an attempt the owner asked to run again.
@@ -10422,6 +10431,14 @@ not run anything itself:
    (`bridge_kind = recovery`, `bridge_payload = {"verb": "review_rerun",
    "requested_by": <Actor>}`): the workflow routes the entry, the bridge says
    who asked.
+
+Cancellation, its event and condition update, the new status epoch, transition
+receipt and hooks step commit together. If any entry write fails, the previous
+attempt stays usable and the dispatcher can recover its completed reviewer;
+there is no committed cancellation without a replacement entry. Retrying that
+entry's barrier keeps its already-opened attempt. Once an exact bound Review
+is `awaiting_human`, the dispatcher parks on the human decision without queuing
+another settlement command for its completed reviewer.
 
 A Task whose `task_state_config` still names an auditor
 (`review.auditor_agent_id`, read only by the retired pipeline) and has no

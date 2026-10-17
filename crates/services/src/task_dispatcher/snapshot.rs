@@ -477,7 +477,16 @@ impl TaskDispatcher {
                         && matches!(e.resume_policy, None | Some(db::ResumePolicy::Manual))
                         && !assignment_newer(e)
                     {
-                        f.terminal_execution = Some(e.id.clone());
+                        if exact
+                            .is_some_and(|review| review.status == db::ReviewStatus::AwaitingHuman)
+                        {
+                            // This exact review already consumed the terminal
+                            // execution. Only its human decision remains; a
+                            // duplicate completion would do nothing.
+                            f.human_wait = true;
+                        } else {
+                            f.terminal_execution = Some(e.id.clone());
+                        }
                     }
                 } else if role != "reviewer" && own(e) && !assignment_newer(e) {
                     let config_version = crate::task_service::execution_dispatch_project_version(e);

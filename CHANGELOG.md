@@ -75,11 +75,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Re-running Review now cancels its previous attempt and records the new entry
+  atomically, so an entry write failure leaves the previous attempt recoverable.
+  A completed reviewer waiting for human approval no longer adds command steps
+  on unchanged dispatcher ticks.
 - Recheck Review now re-dispatches the assigned reviewer when a Task has no
   review checks, for both the built-in and renamed review gates. Checks still
   finish before reviewer dispatch. Renamed review gates also refuse Task soft
-  deletion during review and allow coordination-root runs in the web UI using
-  the same review-gate rule as the server.
+  deletion during review. Coordination-root runs in the web UI now resolve the
+  state's review phase and effective role as execution admission does, including
+  implicit phases and custom review roles; implementation roles remain held.
 - Custom review gates named differently from `review` now use the same review
   lifecycle as the default gate when they have the `reviewer` role and
   `canonical_phase: review`. Agent verdicts advance Tasks through integration;

@@ -1604,6 +1604,14 @@ impl WorkflowExecution<'_> {
                     let clear_review_passed_at = authority
                         .as_ref()
                         .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
+                    // Superseding the old attempt and durably entering its
+                    // replacement are one write boundary. Entry retries keep
+                    // the attempt that this entry already opened.
+                    if !entry_retry && current_status == target_state
+                        && bridge.review_rerun_requester().is_some()
+                    {
+                        self.db.cancel_review_for_rerun_in_tx(&mut transaction, &task_id, &updated_at).await?;
+                    }
                     // A status change bumps status_epoch through its trigger.
                     // A workflow self-transition (planning -> planning on a
                     // gate reject) is also a new entry: bump it here. A step
