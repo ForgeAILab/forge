@@ -7,7 +7,30 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+test-support = ["cli-adapters/test-support"]
+
+# The integration targets use the `test-support` fixtures. They name the
+# feature here instead of through a `services = { path = "." }` self
+# dev-dependency: that made every `cargo test -p services --lib` build compile
+# the plain lib and then the test lib, in series. Build them with
+# `--features test-support`; see docs/ci.md.
+[[test]]
+name = "main"
+required-features = ["test-support"]
+
+[[test]]
+name = "main_project_create_command"
+required-features = ["test-support"]
+
+[[test]]
+name = "project_provisioning_characterization"
+required-features = ["test-support"]
+
 [dependencies]
+check-executor = { path = "../check-executor" }
+operation-registry = { path = "../operation-registry" }
+pricing = { path = "../pricing" }
 api-types = { path = "../api-types" }
 cli-adapters = { path = "../cli-adapters" }
 db = { path = "../db" }
@@ -42,6 +65,10 @@ uuid = { version = "1", features = ["v4", "v5"] }
 which = "*"
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
+cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
+db = { path = "../db", features = ["test-template"] }
+pricing = { path = "../pricing", features = ["test-support"] }
 agent-runtime.workspace = true
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import {  useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { useHotkeys } from 'react-hotkeys-hook'
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels'
@@ -47,7 +47,6 @@ import { effectiveLogFilterKind, type LogFilterKind } from '@/lib/log-filter'
 import type {
   Execution,
   FollowUpRequest,
-  LaunchExecutionResponse,
   LogEntry,
 } from '@/types/generated'
 
@@ -214,6 +213,7 @@ export function ExecutionDetailPage({
   const executionQuery = useExecutionQuery(executionId)
   const usageBreakdownsQuery = useUsageBreakdownsQuery(executionId)
   const taskQuery = useTaskQuery(taskId)
+  const task = taskQuery.data
   const agentsQuery = useAgentsQuery()
   const followUpExecution = useFollowUpExecution(executionId)
   const execution = executionQuery.data
@@ -323,9 +323,7 @@ export function ExecutionDetailPage({
   }, [accessToken, executionId, executionQuery.data?.status])
 
   const usageBreakdowns = execution?.usage ?? usageBreakdownsQuery.data ?? []
-  const executionAgentSessionId = execution?.agent_session_id ?? null
-  const showRecoveryAction = execution?.status === 'cancelled' || execution?.status === 'failed'
-  const recoveryActionLabel = executionAgentSessionId ? 'Continue Side Session' : 'Re-execute'
+
 
   const parentAgent = useMemo(
     () => (agentsQuery.data?.items ?? []).find((agent) => agent.id === execution?.agent_id),
@@ -393,45 +391,6 @@ export function ExecutionDetailPage({
     }
   }, [isLoadingOlderTurn, oldestLoadedParentExecutionId, oldestLoadedTurn])
 
-  const recoveryExecution = useMutation({
-    mutationFn: () => {
-      if (!execution) {
-        throw new Error(`${productTerm('run')} not found`)
-      }
-      if (executionAgentSessionId) {
-        const body: FollowUpRequest = { message: 'Resume' }
-        return apiFetch<LaunchExecutionResponse>(`/executions/${execution.id}/follow-up`, {
-          method: 'POST',
-          body: JSON.stringify(body),
-        })
-      }
-      return apiFetch<LaunchExecutionResponse>(`/executions/${execution.id}/re-execute`, {
-        method: 'POST',
-      })
-    },
-    onSuccess: (response) => {
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: {
-          taskId: response.data.task.id,
-          executionId: response.data.execution.id,
-        },
-      })
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, `${recoveryActionLabel} failed`)),
-  })
-
-  const cancelExecution = useMutation({
-    mutationFn: () => {
-      if (!execution) throw new Error(`${productTerm('run')} not found`)
-      return apiFetch<Execution>(`/executions/${execution.id}/cancel`, { method: 'POST' })
-    },
-    onSuccess: () => {
-      void executionQuery.refetch()
-      toast.success(`${productTerm('run')} cancelled`)
-    },
-    onError: (error) => toast.error(getApiErrorMessage(error, 'Cancel failed')),
-  })
 
   const toggleLogKind = (kind: LogFilterKind) => {
     setEnabledKinds((current) => {
@@ -613,6 +572,8 @@ export function ExecutionDetailPage({
             <PanelResizeHandle className="w-px bg-border hover:bg-primary/20 transition-colors" />
             <Panel defaultSize={28} minSize={20} maxSize={42} collapsible>
               <ExecutionDetailSidebar
+                taskVersion={task?.version}
+                offers={task?.available_actions ?? []}
                 isLoading={executionQuery.isLoading}
                 execution={execution ?? null}
                 logs={logs}
@@ -627,14 +588,8 @@ export function ExecutionDetailPage({
                   })
                 }}
                 actions={{
-                  onStop: execution?.status === 'running' ? () => cancelExecution.mutate() : undefined,
-                  stopPending: cancelExecution.isPending,
                   onRefresh: execution?.status === 'running' ? () => void executionQuery.refetch() : undefined,
                   refreshPending: executionQuery.isFetching,
-                  onContinue: showRecoveryAction && executionAgentSessionId ? () => recoveryExecution.mutate() : undefined,
-                  continuePending: recoveryExecution.isPending,
-                  onRetry: showRecoveryAction && !executionAgentSessionId ? () => recoveryExecution.mutate() : undefined,
-                  retryPending: recoveryExecution.isPending,
                 }}
               />
             </Panel>

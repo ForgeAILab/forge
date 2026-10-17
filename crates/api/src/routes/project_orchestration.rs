@@ -291,7 +291,7 @@ pub async fn approve_genesis_charter_revision(
         revision.revision_number,
         &approved_project_name,
     );
-    if let Err(error) = services::append_system_chat_message(
+    if let Err(error) = services::chat_notices::append_system_chat_message(
         &state.db,
         &session.main_chat_id,
         &message_id,

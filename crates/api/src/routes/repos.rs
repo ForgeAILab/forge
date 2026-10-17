@@ -4,15 +4,15 @@ use api_types::{
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json,
 };
 use db::{
-    new_uuid_v4, normalize_repo_remote_url, now_rfc3339, CreatePrProviderConfig, CreateRepo,
-    ProjectRepo, RepoRepo, UpdateRepo, WorkMode,
+    new_uuid_v4, normalize_repo_remote_url, now_rfc3339, CreateRepo, ProjectRepo, RepoRepo,
+    UpdateRepo,
 };
 
 use crate::{
     errors::{ApiError, ApiResult},
+    json::Json,
     path_input::canonical_directory,
     routes::{page_request, paginated, repo_response, ListParams},
     state::AppState,
@@ -20,9 +20,17 @@ use crate::{
 
 pub async fn create_repo(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Json(request): Json<CreateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let project = ProjectRepo::get_by_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project", project_id.clone()))?;
@@ -50,53 +58,52 @@ pub async fn create_repo(
         name,
         local_path,
         remote_url,
-        work_mode: request
-            .work_mode
-            .map(work_mode_domain)
-            .unwrap_or(WorkMode::DirectMerge),
         default_branch: request.default_branch.unwrap_or_else(|| "main".to_owned()),
         created_at: now.clone(),
         updated_at: now.clone(),
     };
-    let provider_config = request.pr_provider.map(|provider_type| {
-        let pr_config = request.pr_provider_config.as_ref();
-        CreatePrProviderConfig {
-            id: new_uuid_v4(),
-            repo_id,
-            provider_type,
-            base_url: pr_config.and_then(|config| config.base_url.clone()),
-            polling_interval_seconds: pr_config
-                .and_then(|config| config.polling_interval_seconds)
-                .unwrap_or(300),
-            token_secret_ref: pr_config.and_then(|config| config.token.clone()),
-            created_at: now.clone(),
-            updated_at: now.clone(),
-        }
-    });
-    let repo = RepoRepo::create_primary_for_project(
-        &*state.db,
-        repo,
-        provider_config,
-        project.version,
-        now_rfc3339(),
-    )
-    .await?;
+    let repo =
+        RepoRepo::create_primary_for_project(&*state.db, repo, project.version, now_rfc3339())
+            .await?;
     Ok(Json(repo_response(repo)))
 }
 
 pub async fn list_repos(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<PaginatedResponse<RepoResponse>>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let page = RepoRepo::list_by_project(&*state.db, &project_id, page_request(&params)?).await?;
     Ok(Json(paginated(page, repo_response)))
 }
 
 pub async fn get_repo(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RepoResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", id.clone()))
+    })?;
+
     let repo = RepoRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("repo", id))?;
@@ -105,9 +112,24 @@ pub async fn get_repo(
 
 pub async fn update_repo(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<UpdateRepoRequest>,
 ) -> ApiResult<Json<RepoResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", id.clone()))
+    })?;
+
     let local_path = normalize_update_local_path(request.local_path)?;
     let repo = RepoRepo::update(
         &*state.db,
@@ -116,7 +138,6 @@ pub async fn update_repo(
             name: request.name,
             local_path,
             remote_url: request.remote_url.map(normalize_repo_remote_url),
-            work_mode: request.work_mode.map(work_mode_domain),
             default_branch: request.default_branch,
             updated_at: now_rfc3339(),
         },
@@ -127,16 +148,46 @@ pub async fn update_repo(
 
 pub async fn delete_repo(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", id.clone()))
+    })?;
+
     RepoRepo::delete(&*state.db, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn sync_repo(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<RepoSyncResponse>> {
+    let addressed_repo = db::RepoRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("repo", id.clone()))?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &addressed_repo.project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("repo", id.clone()))
+    })?;
+
     let repo = RepoRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("repo", id.clone()))?;
@@ -195,11 +246,4 @@ fn repo_name_from_remote_url(remote_url: &str) -> String {
         .next()
         .unwrap_or(remote_url);
     segment.strip_suffix(".git").unwrap_or(segment).to_owned()
-}
-
-fn work_mode_domain(work_mode: api_types::WorkMode) -> WorkMode {
-    match work_mode {
-        api_types::WorkMode::DirectMerge => WorkMode::DirectMerge,
-        api_types::WorkMode::PullRequest => WorkMode::PullRequest,
-    }
 }

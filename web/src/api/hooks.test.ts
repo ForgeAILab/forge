@@ -9,6 +9,7 @@ import {
   type ProjectMilestoneReleaseInput,
   useReleaseProjectMilestone,
   useUpdateWorkflow,
+  useDeadLetterActionMutation,
 } from './hooks'
 import { qk } from './query-keys'
 import { useAuthStore } from '@/stores/auth'
@@ -130,4 +131,27 @@ describe('execution log API helpers', () => {
     expect(queryClient.getQueryState(qk.taskDetail('task-1'))?.isInvalidated).toBe(true)
     expect(queryClient.getQueryState(qk.taskDetail('task-2'))?.isInvalidated).toBe(false)
   })
+  it.each(['replay', 'dismiss'] as const)(
+    'invalidates operator status after %s',
+    async (action) => {
+      useAuthStore.setState({ accessToken: 'access-token', refreshToken: 'refresh-token' })
+      vi.spyOn(window, 'fetch').mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            outcome: action === 'replay' ? 'replayed' : 'dismissed',
+            dead_letter: {},
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      )
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } })
+      const invalidate = vi.spyOn(client, 'invalidateQueries')
+      const { result } = renderHook(() => useDeadLetterActionMutation(), {
+        wrapper: ({ children }) => createElement(QueryClientProvider, { client }, children),
+      })
+      act(() => result.current.mutate({ id: 'dead-1', action }))
+      await waitFor(() => expect(result.current.isSuccess).toBe(true))
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.operationsStatus })
+    },
+  )
 })

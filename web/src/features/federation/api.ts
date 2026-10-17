@@ -1,4 +1,5 @@
 import { apiFetch } from '@/api/client'
+import type { AttentionResolveRequest } from '@/types/generated/bindings/AttentionResolveRequest'
 import type {
   AgentProviderCapabilitiesResponse,
   CancelProviderAuthorizationRequest,
@@ -19,6 +20,7 @@ import type {
   SetCliRuntimeAvailabilityRequest,
   SetProviderEntryAvailabilityRequest,
   StartProviderAuthorizationRequest,
+  ProjectEscalationResponse,
 } from '@/types/generated'
 import type {
   AgentConnectionHealth,
@@ -386,6 +388,39 @@ export function getEffectivePermissions(
 
 export function getMissionControl(): Promise<MissionControlResponse> {
   return apiFetch<MissionControlResponse>(federationApiPaths.missionControl)
+}
+
+export function resolveAttentionItem(
+  id: string,
+  expectedVersion: number,
+  answer?: AttentionResolveRequest['answer'],
+): Promise<AttentionItem> {
+  // JSON numbers are used on the wire; ts-rs represents this i64 as bigint.
+  const input: Omit<AttentionResolveRequest, 'expected_version'> & { expected_version: number } = {
+    expected_version: expectedVersion,
+    ...(answer === undefined ? {} : { answer }),
+  }
+  return apiFetch<AttentionItem>(
+    `${federationApiPaths.missionControl}/attention/${encodeURIComponent(id)}/resolve`,
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+    },
+  )
+}
+
+/** Answer an owner escalation at its current version. */
+export async function answerProjectEscalation(
+  projectId: string,
+  escalationId: string,
+  answer: string,
+): Promise<ProjectEscalationResponse> {
+  const path = `/projects/${encodeURIComponent(projectId)}/escalations/${encodeURIComponent(escalationId)}`
+  const current = await apiFetch<ProjectEscalationResponse>(path)
+  return apiFetch<ProjectEscalationResponse>(`${path}/answer`, {
+    method: 'POST',
+    body: JSON.stringify({ expected_version: Number(current.version), answer }),
+  })
 }
 
 export function getContextManifest(

@@ -34,14 +34,13 @@ use api_types::{
 };
 use chrono::{DateTime, Utc};
 use db::{
-    CommandReceiptRepo, CreateCommandReceipt, CreateDomainEvent, DomainEventRepo,
-    ProjectMemberRepo, ProjectOrchestrationRepo, ProjectReconciliationRecord, ProjectRepo,
+    CommandReceiptRepo, CreateCommandReceipt, CreateDomainEvent, ProjectMemberRepo,
+    ProjectOrchestrationRepo, ProjectReconciliationRecord, ProjectRepo,
     ResolveProjectReconciliation, SqliteDb,
 };
-use events::EventBus;
 use serde_json::json;
 
-use crate::{DomainEventService, Result, ServiceError};
+use crate::{Result, ServiceError};
 
 pub const RESOLVE_PROJECT_RECONCILIATION_OPERATION: &str = "project.reconciliation.resolve";
 
@@ -67,12 +66,11 @@ pub struct ProjectReconciliationPage {
 #[derive(Clone)]
 pub struct ProjectReconciliationService {
     db: Arc<SqliteDb>,
-    event_bus: Arc<EventBus>,
 }
 
 impl ProjectReconciliationService {
-    pub fn new(db: Arc<SqliteDb>, event_bus: Arc<EventBus>) -> Self {
-        Self { db, event_bus }
+    pub fn new(db: Arc<SqliteDb>) -> Self {
+        Self { db }
     }
 
     /// List reconciliations for a Project.  Bounded, read-only, and safe for
@@ -360,14 +358,6 @@ impl ProjectReconciliationService {
                 "reconciliation resolution committed without a durable command receipt",
             )
         })?;
-
-        // Post-commit publication: the transaction already committed, so a
-        // failure to mirror it to the in-process bus does not roll anything
-        // back and must not be reported as a command failure.
-        if let Some(event) = DomainEventRepo::get_event(&*self.db, &receipt.event_id).await? {
-            DomainEventService::new(Arc::clone(&self.db), Arc::clone(&self.event_bus))
-                .publish_committed(&event);
-        }
 
         let dispatch_woken = if resolved.record_type == "task" {
             match crate::wake_task_dispatch(

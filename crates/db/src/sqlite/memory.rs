@@ -9,6 +9,43 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+fn memory_item_insert(
+    item: &MemoryItem,
+) -> sqlx::query::Query<'_, Sqlite, sqlx::sqlite::SqliteArguments<'_>> {
+    sqlx::query("INSERT INTO memory_item (id, project_id, task_id, execution_id, scope_type, scope_id, visibility, owner_identity_id, authority, sensitivity, retention_priority, provenance_json, publication_source_id, supersedes_id, valid_from, valid_until, source_event_id, source_scope_type, source_scope_id, source_revision, source_type, kind, title, summary, body, metadata_json, confidence, quality_score, created_by_type, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&item.id)
+            .bind(item.project_id.as_deref())
+            .bind(item.task_id.as_deref())
+            .bind(item.execution_id.as_deref())
+            .bind(&item.scope_type)
+            .bind(&item.scope_id)
+            .bind(&item.visibility)
+            .bind(item.owner_identity_id.as_deref())
+            .bind(&item.authority)
+            .bind(&item.sensitivity)
+            .bind(item.retention_priority)
+            .bind(&item.provenance_json)
+            .bind(item.publication_source_id.as_deref())
+            .bind(item.supersedes_id.as_deref())
+            .bind(item.valid_from.as_deref())
+            .bind(item.valid_until.as_deref())
+            .bind(item.source_event_id.as_deref())
+            .bind(item.source_scope_type.as_deref())
+            .bind(item.source_scope_id.as_deref())
+            .bind(item.source_revision.as_deref())
+            .bind(&item.source_type)
+            .bind(&item.kind)
+            .bind(&item.title)
+            .bind(item.summary.as_deref())
+            .bind(&item.body)
+            .bind(&item.metadata_json)
+            .bind(item.confidence.as_deref())
+            .bind(item.quality_score)
+            .bind(item.created_by_type.as_deref())
+            .bind(item.created_by_id.as_deref())
+            .bind(&item.created_at)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemoryCursor {
     created_at: String,
@@ -72,46 +109,85 @@ fn reject_retired_room_memory(item: &MemoryItem) -> Result<()> {
     Ok(())
 }
 
+impl SqliteDb {
+    /// Insert an event-derived memory item inside a caller-owned transaction.
+    /// WorkerRuntime uses this so the projection effect and its durable cursor
+    /// advance share one commit boundary.
+    pub async fn insert_memory_item_if_source_absent_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        item: &MemoryItem,
+        source_type: &str,
+        source_ref: &str,
+    ) -> Result<bool> {
+        reject_retired_room_memory(item)?;
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM memory_item
+                WHERE scope_type = ? AND scope_id = ? AND source_type = ?
+                  AND source_type <> 'room' AND kind <> 'room_message'
+                  AND json_valid(metadata_json)
+                  AND json_extract(metadata_json, '$.source_ref') = ?
+             )",
+        )
+        .bind(&item.scope_type)
+        .bind(&item.scope_id)
+        .bind(source_type)
+        .bind(source_ref)
+        .fetch_one(&mut **transaction)
+        .await?;
+        if exists != 0 {
+            return Ok(false);
+        }
+
+        // SQLx's nested transaction owns the savepoint. Its Drop also queues
+        // rollback/release on cancellation or an error in commit/rollback.
+        let mut insertion = sqlx::Acquire::begin(&mut *transaction).await?;
+        if let Err(error) = memory_item_insert(item).execute(&mut *insertion).await {
+            insertion.rollback().await?;
+            return Err(error.into());
+        }
+        let receipt = sqlx::query("INSERT INTO memory_source_receipt
+            (source_type, source_scope_type, source_scope_id, source_ref, memory_item_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(source_type).bind(&item.scope_type).bind(&item.scope_id).bind(source_ref)
+            .bind(&item.id).bind(&item.created_at).execute(&mut *insertion).await;
+        if let Err(error) = receipt {
+            insertion.rollback().await?;
+            if error
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation())
+            {
+                let exists: i64 = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM memory_source_receipt AS receipt
+                    JOIN memory_item AS item ON item.id = receipt.memory_item_id
+                    WHERE receipt.source_type = ? AND receipt.source_scope_type = ?
+                        AND receipt.source_scope_id = ? AND receipt.source_ref = ?)",
+                )
+                .bind(source_type)
+                .bind(&item.scope_type)
+                .bind(&item.scope_id)
+                .bind(source_ref)
+                .fetch_one(&mut **transaction)
+                .await?;
+                if exists != 0 {
+                    return Ok(false);
+                }
+            }
+            return Err(error.into());
+        }
+        insertion.commit().await?;
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl MemoryRepository for SqliteDb {
     async fn insert_memory_item(&self, item: &MemoryItem) -> Result<()> {
         reject_retired_room_memory(item)?;
         // Legacy room_id/source_room_sequence columns intentionally remain in
         // the database for migration provenance, but live writers omit them.
-        sqlx::query("INSERT INTO memory_item (id, project_id, task_id, execution_id, scope_type, scope_id, visibility, owner_identity_id, authority, sensitivity, retention_priority, provenance_json, publication_source_id, supersedes_id, valid_from, valid_until, source_event_id, source_scope_type, source_scope_id, source_revision, source_type, kind, title, summary, body, metadata_json, confidence, quality_score, created_by_type, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&item.id)
-            .bind(item.project_id.as_deref())
-            .bind(item.task_id.as_deref())
-            .bind(item.execution_id.as_deref())
-            .bind(&item.scope_type)
-            .bind(&item.scope_id)
-            .bind(&item.visibility)
-            .bind(item.owner_identity_id.as_deref())
-            .bind(&item.authority)
-            .bind(&item.sensitivity)
-            .bind(item.retention_priority)
-            .bind(&item.provenance_json)
-            .bind(item.publication_source_id.as_deref())
-            .bind(item.supersedes_id.as_deref())
-            .bind(item.valid_from.as_deref())
-            .bind(item.valid_until.as_deref())
-            .bind(item.source_event_id.as_deref())
-            .bind(item.source_scope_type.as_deref())
-            .bind(item.source_scope_id.as_deref())
-            .bind(item.source_revision.as_deref())
-            .bind(&item.source_type)
-            .bind(&item.kind)
-            .bind(&item.title)
-            .bind(item.summary.as_deref())
-            .bind(&item.body)
-            .bind(&item.metadata_json)
-            .bind(item.confidence.as_deref())
-            .bind(item.quality_score)
-            .bind(item.created_by_type.as_deref())
-            .bind(item.created_by_id.as_deref())
-            .bind(&item.created_at)
-            .execute(&self.pool)
-            .await?;
+        memory_item_insert(item).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -221,102 +297,6 @@ impl MemoryRepository for SqliteDb {
 
 #[async_trait]
 impl ScopedMemoryRepository for SqliteDb {
-    async fn insert_memory_item_if_source_absent(
-        &self,
-        item: &MemoryItem,
-        source_type: &str,
-        source_ref: &str,
-    ) -> Result<(MemoryItem, bool)> {
-        reject_retired_room_memory(item)?;
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let existing = sqlx::query("SELECT * FROM memory_item WHERE scope_type = ? AND scope_id = ? AND source_type = ? AND source_type <> 'room' AND kind <> 'room_message' AND json_valid(metadata_json) AND json_extract(metadata_json, '$.source_ref') = ? ORDER BY created_at ASC, id ASC LIMIT 1")
-            .bind(&item.scope_type)
-            .bind(&item.scope_id)
-            .bind(source_type)
-            .bind(source_ref)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .map(|row| MemoryItem::from_row(&row).map_err(DbError::from))
-            .transpose()?;
-        if let Some(existing) = existing {
-            transaction.commit().await?;
-            return Ok((existing, false));
-        }
-        sqlx::query("INSERT INTO memory_item (id, project_id, task_id, execution_id, scope_type, scope_id, visibility, owner_identity_id, authority, sensitivity, retention_priority, provenance_json, publication_source_id, supersedes_id, valid_from, valid_until, source_event_id, source_scope_type, source_scope_id, source_revision, source_type, kind, title, summary, body, metadata_json, confidence, quality_score, created_by_type, created_by_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-            .bind(&item.id)
-            .bind(item.project_id.as_deref())
-            .bind(item.task_id.as_deref())
-            .bind(item.execution_id.as_deref())
-            .bind(&item.scope_type)
-            .bind(&item.scope_id)
-            .bind(&item.visibility)
-            .bind(item.owner_identity_id.as_deref())
-            .bind(&item.authority)
-            .bind(&item.sensitivity)
-            .bind(item.retention_priority)
-            .bind(&item.provenance_json)
-            .bind(item.publication_source_id.as_deref())
-            .bind(item.supersedes_id.as_deref())
-            .bind(item.valid_from.as_deref())
-            .bind(item.valid_until.as_deref())
-            .bind(item.source_event_id.as_deref())
-            .bind(item.source_scope_type.as_deref())
-            .bind(item.source_scope_id.as_deref())
-            .bind(item.source_revision.as_deref())
-            .bind(&item.source_type)
-            .bind(&item.kind)
-            .bind(&item.title)
-            .bind(item.summary.as_deref())
-            .bind(&item.body)
-            .bind(&item.metadata_json)
-            .bind(item.confidence.as_deref())
-            .bind(item.quality_score)
-            .bind(item.created_by_type.as_deref())
-            .bind(item.created_by_id.as_deref())
-            .bind(&item.created_at)
-            .execute(&mut *transaction)
-            .await?;
-        let receipt_result = sqlx::query(
-            "INSERT INTO memory_source_receipt
-             (source_type, source_scope_type, source_scope_id, source_ref, memory_item_id, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(source_type)
-        .bind(&item.scope_type)
-        .bind(&item.scope_id)
-        .bind(source_ref)
-        .bind(&item.id)
-        .bind(&item.created_at)
-        .execute(&mut *transaction)
-        .await;
-        if let Err(error) = receipt_result {
-            if error.to_string().contains("UNIQUE") {
-                transaction.rollback().await?;
-                let existing_id = sqlx::query_scalar::<_, String>(
-                    "SELECT memory_item_id FROM memory_source_receipt
-                     WHERE source_type = ? AND source_scope_type = ?
-                       AND source_scope_id = ? AND source_ref = ?",
-                )
-                .bind(source_type)
-                .bind(&item.scope_type)
-                .bind(&item.scope_id)
-                .bind(source_ref)
-                .fetch_optional(&self.pool)
-                .await?;
-                if let Some(existing_id) = existing_id {
-                    let existing = self
-                        .get_memory_item(&existing_id)
-                        .await?
-                        .ok_or(DbError::NotFound)?;
-                    return Ok((existing, false));
-                }
-            }
-            return Err(error.into());
-        }
-        transaction.commit().await?;
-        Ok((item.clone(), true))
-    }
-
     async fn get_memory_item_scoped(&self, query: MemoryGetQuery) -> Result<Option<MemoryItem>> {
         for grant in query.grants {
             let Some(row_id) = authorized_memory_row_id(
@@ -745,4 +725,239 @@ fn map_context_manifest_source(
         retention_priority: row.try_get("retention_priority")?,
         fragment_fingerprint: row.try_get("fragment_fingerprint")?,
     })
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionMemoryScopeRow {
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_identity_memory_scopes(
+        &self,
+        identity_id: &str,
+    ) -> crate::Result<Vec<AttentionMemoryScopeRow>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT scope_type, scope_id
+             FROM forge_memory_source_binding
+             WHERE identity_id = ?
+             ORDER BY scope_type ASC, scope_id ASC",
+        )
+        .bind(identity_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AttentionMemoryScopeRow {
+                    scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                    scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                })
+            })
+            .collect()
+    }
+}
+
+pub struct MemoryBackfillExecutionRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillExecutionRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn agent_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("agent_id")?)
+    }
+    pub fn role(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("role")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn summary(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("summary")?)
+    }
+    pub fn error(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("error")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_execution_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillExecutionRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, e.id, e.task_id, e.agent_id, e.role, e.status, e.summary, e.error \
+         FROM execution e JOIN task t ON t.id = e.task_id \
+         WHERE e.status IN ('completed', 'failed') \
+           AND (TRIM(COALESCE(e.summary, '')) <> '' OR TRIM(COALESCE(e.error, '')) <> '') \
+         ORDER BY e.created_at ASC, e.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillExecutionRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillReviewRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillReviewRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn execution_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("execution_id")?)
+    }
+    pub fn attempt_number(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("attempt_number")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn step_results_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("step_results_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_review_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillReviewRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, r.id, r.task_id, r.execution_id, r.attempt_number, r.status, r.step_results_json \
+         FROM review r JOIN task t ON t.id = r.task_id \
+         WHERE r.status != 'running' \
+         ORDER BY r.created_at ASC, r.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillReviewRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillCommentRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillCommentRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn author_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("author_type")?)
+    }
+    pub fn author_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("author_id")?)
+    }
+    pub fn author_name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("author_name")?)
+    }
+    pub fn content(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_comment_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillCommentRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, c.id, c.task_id, c.author_type, c.author_id, c.author_name, c.content \
+         FROM task_comment c JOIN task t ON t.id = c.task_id \
+         ORDER BY c.created_at ASC, c.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillCommentRow { row })
+            .collect())
+    }
+}
+
+pub struct MemoryBackfillTransitionRow {
+    row: SqliteRow,
+}
+impl MemoryBackfillTransitionRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn from_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("from_state")?)
+    }
+    pub fn to_state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("to_state")?)
+    }
+    pub fn trigger_name(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("trigger_name")?)
+    }
+    pub fn triggered_by(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("triggered_by")?)
+    }
+    pub fn bridge_kind(&self) -> crate::Result<Option<&str>> {
+        Ok(self.row.try_get("bridge_kind")?)
+    }
+    pub fn bridge_payload(&self) -> crate::Result<Option<&str>> {
+        Ok(self.row.try_get("bridge_payload")?)
+    }
+    pub fn trigger_reason(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("trigger_reason")?)
+    }
+    pub fn hook_results_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("hook_results_json")?)
+    }
+    pub fn rejection(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("rejection")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn memory_backfill_transition_sources(
+        &self,
+    ) -> crate::Result<Vec<MemoryBackfillTransitionRow>> {
+        let rows = sqlx::query(
+        "SELECT t.project_id, tl.id, tl.task_id, tl.from_state, tl.to_state, tl.trigger_name, tl.triggered_by, \
+                tl.bridge_kind, tl.bridge_payload, tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
+         FROM transition_log tl JOIN task t ON t.id = tl.task_id \
+         ORDER BY tl.created_at ASC, tl.id ASC",
+    ).fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MemoryBackfillTransitionRow { row })
+            .collect())
+    }
+}
+
+impl MemoryBackfillTransitionRow {
+    pub fn id_ref(&self) -> crate::Result<&str> {
+        Ok(self.row.try_get("id")?)
+    }
 }

@@ -48,7 +48,8 @@ async fn stale_atomic_recovery_marker_is_not_inserted_on_status_cas_loss() {
             from_state: crate::workflow::default_states::REVIEW.to_owned(),
             to_state: crate::workflow::default_states::REVIEW.to_owned(),
             trigger_name: Some("resume_process".to_owned()),
-            triggered_by: "user:recovery:resume_process".to_owned(),
+            triggered_by: "user:action:send_back".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "stale request".to_owned(),
             hook_results_json: None,
             rejection: false,
@@ -65,7 +66,7 @@ async fn stale_atomic_recovery_marker_is_not_inserted_on_status_cas_loss() {
 }
 
 #[tokio::test]
-async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
+async fn test_retry_budget_reset_preserves_history_and_refreshes_budget() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -102,6 +103,7 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
     .await;
     let first_log_id = seed_review_rejection_log(&db, &task.id, "review failed once").await;
     let second_log_id = seed_review_rejection_log(&db, &task.id, "review failed twice").await;
+    sqlx::query("INSERT INTO task_budget(task_id,kind,window_id,spent) VALUES(?,'review','fixture',2) ON CONFLICT(task_id,kind) DO UPDATE SET spent=2").bind(&task.id).execute(db.pool()).await.unwrap();
     let task = set_retry_exhausted_metadata(&db, &task).await;
 
     let original_logs = TransitionLogRepo::list_by_task(&*db, &task.id)
@@ -111,10 +113,10 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
         .await
         .expect("reviews load");
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("rejection count loads"),
@@ -122,9 +124,15 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
     );
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
             Some("reason".to_owned()),
             None,
         )
@@ -147,21 +155,21 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
 
     let marker = logs
         .iter()
-        .find(|log| log.trigger_name.as_deref() == Some("reset_retry_window"))
+        .find(|log| log.trigger_name.as_deref() == Some("retry"))
         .expect("reset marker exists");
     assert_eq!(marker.from_state, crate::workflow::default_states::REVIEW);
     assert_eq!(marker.to_state, crate::workflow::default_states::REVIEW);
     assert!(!marker.rejection);
 
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("post-reset rejection count loads"),
-        1
+        0
     );
     assert_eq!(
         recovered.status,
@@ -172,7 +180,7 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
 
     let resume_marker = logs
         .iter()
-        .find(|log| log.trigger_name.as_deref() == Some("resume_process"))
+        .find(|log| log.trigger_name.as_deref() == Some("retry") && log.hook_results_json.is_none())
         .expect("resume marker exists");
     assert_eq!(
         resume_marker.from_state,
@@ -187,7 +195,7 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
     let resume_transition = logs
         .iter()
         .find(|log| {
-            log.triggered_by == "user:recovery:resume_process"
+            log.triggered_by == "user:action:retry"
                 && log.from_state == crate::workflow::default_states::REVIEW
                 && log.to_state == crate::workflow::default_states::IN_PROGRESS
         })
@@ -196,7 +204,7 @@ async fn test_reset_retry_window_preserves_history_and_refreshes_budget() {
 }
 
 #[tokio::test]
-async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
+async fn test_retry_budget_reset_resumes_an_exhausted_merging_gate() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -214,6 +222,7 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
             to_state: crate::workflow::default_states::MERGE_FAILED.to_owned(),
             trigger_name: Some("retry".to_owned()),
             triggered_by: api_types::Actor::system(api_types::SystemComponent::Test).display(),
+            bridge: Default::default(),
             trigger_reason: "merge conflict".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -231,7 +240,6 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
         artifact: None,
         message: Some("merge-fix retry budget exhausted".to_owned()),
         hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResetRetryWindow],
     });
     let task = TaskRepo::update(
         &*db,
@@ -262,18 +270,24 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
     .expect("merge budget block sets");
 
     let actions = service
-        .available_task_actions(&task.id)
+        .test_action_values(&task.id)
         .await
         .expect("task actions resolve");
     assert!(
-        !actions.contains(&api_types::TaskAction::Resume),
+        !actions.contains(&api_types::TaskAction::Release { reason: None }),
         "a blocked gate must advertise typed recovery instead of a no-op resume"
     );
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetRetryWindow,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(true),
+                guidance: None,
+            },
             Some("retry the merge repair".to_owned()),
             None,
         )
@@ -291,9 +305,9 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
         .expect("transition logs reload");
     assert!(logs
         .iter()
-        .any(|log| log.trigger_name.as_deref() == Some("reset_retry_window")));
+        .any(|log| log.trigger_name.as_deref() == Some("retry")));
     assert!(logs.iter().any(|log| {
-        log.triggered_by == "user:recovery:resume_process"
+        log.triggered_by == "user:action:retry"
             && log.from_state == crate::workflow::default_states::MERGING
             && log.to_state == crate::workflow::default_states::MERGE_FAILED
             && log.rejection
@@ -301,7 +315,7 @@ async fn test_reset_retry_window_resumes_an_exhausted_merging_gate() {
 }
 
 #[tokio::test]
-async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
+async fn restart_starts_a_fresh_merge_retry_window() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -321,6 +335,7 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
             to_state: crate::workflow::default_states::MERGE_FAILED.to_owned(),
             trigger_name: Some("retry".to_owned()),
             triggered_by: "system:workflow".to_owned(),
+            bridge: Default::default(),
             trigger_reason: "merge conflict".to_owned(),
             hook_results_json: None,
             rejection: true,
@@ -338,7 +353,6 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
         artifact: None,
         message: Some("Recovered after server restart".to_owned()),
         hook: None,
-        recovery_actions: vec![api_types::RecoveryAction::ResetToInitial],
     });
     TaskRepo::update(
         &*db,
@@ -362,9 +376,9 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
     .expect("recovery annotation records");
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResetToInitial,
+            api_types::TaskAction::Restart { reason: None },
             Some("restart from todo".to_owned()),
             None,
         )
@@ -373,10 +387,10 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
 
     assert_eq!(recovered.status, crate::workflow::default_states::TODO);
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::MERGING,
+            &db::budget::gate_key(crate::workflow::default_states::MERGING)
         )
         .await
         .expect("merge retry count loads"),
@@ -387,13 +401,13 @@ async fn reset_to_initial_starts_a_fresh_merge_retry_window() {
         .expect("transition logs load");
     assert!(logs.iter().any(|entry| {
         entry.from_state == crate::workflow::default_states::MERGING
-            && entry.trigger_name.as_deref() == Some("reset_to_initial")
+            && entry.trigger_name.as_deref() == Some("restart")
             && !entry.rejection
     }));
 }
 
 #[tokio::test]
-async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window() {
+async fn test_retry_without_reset_from_review_reject_target_preserves_exhausted_window() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -410,9 +424,15 @@ async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window(
     let task = set_retry_exhausted_metadata(&db, &task).await;
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ProceedOnce,
+            api_types::TaskAction::Retry {
+                reason: None,
+                fresh_session: None,
+                refresh_workspace: None,
+                reset_budget: Some(false),
+                guidance: None,
+            },
             Some("allow one focused repair".to_owned()),
             Some("address the latest review finding".to_owned()),
         )
@@ -431,7 +451,7 @@ async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window(
         .expect("transition logs reload");
     let marker = logs
         .iter()
-        .find(|log| log.trigger_name.as_deref() == Some("proceed_once"))
+        .find(|log| log.trigger_name.as_deref() == Some("retry"))
         .expect("proceed-once marker exists");
     assert_eq!(marker.from_state, crate::workflow::default_states::REVIEW);
     assert_eq!(marker.to_state, crate::workflow::default_states::REVIEW);
@@ -440,10 +460,10 @@ async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window(
         .trigger_reason
         .contains("Guidance: address the latest review finding"));
     assert_eq!(
-        TransitionLogRepo::count_gate_rejections(
-            &*db,
+        db::budget::spent(
+            db.pool(),
             &task.id,
-            crate::workflow::default_states::REVIEW,
+            &db::budget::gate_key(crate::workflow::default_states::REVIEW)
         )
         .await
         .expect("post-recovery rejection count loads"),
@@ -453,7 +473,7 @@ async fn test_proceed_once_from_review_reject_target_preserves_exhausted_window(
 }
 
 #[tokio::test]
-async fn test_resume_process_moves_failed_review_back_to_in_progress() {
+async fn test_continue_task_process_moves_failed_review_back_to_in_progress() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let service = TaskService::new(Arc::clone(&db), event_bus);
@@ -476,14 +496,16 @@ async fn test_resume_process_moves_failed_review_back_to_in_progress() {
         &task.id,
         &execution.id,
         1,
-        json!({ "ci_steps": [{"command": "cargo test", "exit_code": 1}] }),
+        json!({ "ci_steps": [{"index":0,"command":"cargo test","exit_code":1,"stderr_tail":"validation failed"}] }),
     )
     .await;
 
     let recovered = service
-        .recover_task(
+        .test_apply_action(
             task.id.clone(),
-            api_types::RecoveryAction::ResumeProcess,
+            api_types::TaskAction::SendBack {
+                guidance: "Continue implementation after the failed review.".to_owned(),
+            },
             Some("send failed review back to coder".to_owned()),
             None,
         )
@@ -498,9 +520,117 @@ async fn test_resume_process_moves_failed_review_back_to_in_progress() {
         .await
         .expect("transition logs reload");
     assert!(logs.iter().any(|log| {
-        log.triggered_by == "user:recovery:resume_process"
+        log.triggered_by == "user:action:send_back"
             && log.from_state == crate::workflow::default_states::REVIEW
             && log.to_state == crate::workflow::default_states::IN_PROGRESS
             && log.rejection
+            // Base never read a send-back as a gate decision.
+            && log.bridge.bridge_kind.is_none()
     }));
+}
+
+/// One recovery rule for new writes and the backfill: only the same-state
+/// `retry` marker is `recovery`; the gate->target move it allows is an
+/// ordinary rejection with no kind.
+#[tokio::test]
+async fn retry_marker_is_the_only_recovery_row() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, repo_dir) = seed_project_repo(&db).await;
+    initialize_primary_repository(&repo_dir);
+    let task =
+        seed_task_with_status(&db, &project_id, crate::workflow::default_states::PLANNING).await;
+    let task = TaskRepo::update(
+        &*db,
+        db::UpdateTask {
+            id: task.id.clone(),
+            expected_version: task.version,
+            title: None,
+            description: None,
+            priority: None,
+            merge_config: None,
+            plan: None,
+            error_annotation: Some(Some(
+                json!({"type": "executor_failed", "message": "planner stopped"}).to_string(),
+            )),
+            blocked_json: None,
+            failed_json: None,
+            task_state_config: None,
+            parent_task_id: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    service
+        .continue_task_process(task.clone(), Some("retry planning".to_owned()), None)
+        .await
+        .unwrap();
+    let rows: Vec<_> = TransitionLogRepo::list_by_task(&*db, &task.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|log| (log.trigger_name, log.rejection, log.bridge))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (Some("reject".to_owned()), true, Default::default()),
+            (
+                Some("retry".to_owned()),
+                false,
+                api_types::TransitionBridge::recovery("retry", false)
+            ),
+        ]
+    );
+}
+
+/// New gate-decision writes match the rows base read as decisions (and the
+/// backfill rule): only the plain "gate approved" approval.
+#[tokio::test]
+async fn only_the_plain_gate_approval_is_a_gate_decision() {
+    let db = Arc::new(sqlite_db().await);
+    let service = TaskService::new(Arc::clone(&db), Arc::new(EventBus::new(16)));
+    let (project_id, _repo_id, _repo_dir) = seed_project_repo(&db).await;
+    let mut workflow = crate::workflow::default_workflow::default_workflow();
+    for state in &mut workflow.states {
+        state.hooks = api_types::StateHooks::default();
+    }
+    sqlx::query("UPDATE project SET workflow_definition=?,version=version+1 WHERE id=?")
+        .bind(serde_json::to_string(&workflow).unwrap())
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for (guidance, reason, kind) in [
+        (
+            None,
+            "gate approved",
+            Some(api_types::TransitionBridgeKind::GateApproved),
+        ),
+        (Some("LGTM, ship it"), "LGTM, ship it", None),
+    ] {
+        let task =
+            seed_task_with_status(&db, &project_id, crate::workflow::default_states::REVIEW).await;
+        service
+            .apply_gate_decision(
+                &task,
+                &workflow,
+                api_types::WorkflowTrigger::Accept,
+                guidance.map(str::to_owned),
+                api_types::Actor::user(api_types::UserActionSource::Test),
+                false,
+            )
+            .await
+            .unwrap();
+        let logs = TransitionLogRepo::list_by_task(&*db, &task.id)
+            .await
+            .unwrap();
+        let decision = logs
+            .iter()
+            .find(|log| log.from_state == crate::workflow::default_states::REVIEW)
+            .unwrap();
+        assert_eq!(decision.trigger_reason, reason);
+        assert_eq!(decision.bridge.bridge_kind, kind, "{reason}");
+    }
 }

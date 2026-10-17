@@ -1,0 +1,45 @@
+────────────
+ Nextest run ID e1cf607c-2a06-439d-90d7-afb8355aee4e with nextest profile: default
+    Starting 3 tests across 1 binary
+        FAIL [   0.010s] (1/3) nextest-status parser::fails
+  stdout ───
+
+    running 1 test
+    test parser::fails ... FAILED
+
+    failures:
+
+    failures:
+        parser::fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'parser::fails' (9549454) panicked at src/lib.rs:8:18:
+    assertion `left == right` failed
+      left: 1
+     right: 2
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+     SIGABRT [   0.035s] (2/3) nextest-status parser::aborts
+  stdout ───
+
+    running 1 test
+
+    (test aborted with signal 6: SIGABRT)
+
+ TERMINATING [>  1.000s] (───) nextest-status parser::hangs
+     TIMEOUT [   1.002s] (3/3) nextest-status parser::hangs
+  stdout ───
+
+    running 1 test
+
+    (test timed out)
+
+────────────
+     Summary [   1.004s] 3 tests run: 0 passed, 2 failed, 1 timed out, 0 skipped
+        FAIL [   0.010s] (1/3) nextest-status parser::fails
+     SIGABRT [   0.035s] (2/3) nextest-status parser::aborts
+     TIMEOUT [   1.002s] (3/3) nextest-status parser::hangs
+error: test run failed

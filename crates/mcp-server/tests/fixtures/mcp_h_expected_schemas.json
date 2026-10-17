@@ -1,0 +1,2137 @@
+{
+  "mcp_account": {
+    "forge_project_escalate": {
+      "properties": {
+        "dedupe_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "need": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        }
+      },
+      "required": [
+        "dedupe_key",
+        "need"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_task": {
+      "properties": {
+        "depends_on_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_task_id": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "task",
+            "planning_task",
+            "sub_task",
+            "discovery"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id",
+        "title"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_tasks": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "sort_by": {
+          "enum": [
+            "created_at",
+            "updated_at",
+            "priority",
+            "board_position",
+            "id",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_task": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_preview_prompt": {
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "trigger": {
+          "enum": [
+            "accept",
+            "reject",
+            "fail",
+            "retry",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "role",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_memory_search": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layer": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 255,
+          "enum": [
+            1,
+            2,
+            3,
+            null
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 4294967295
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "token_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "project_id",
+        "query"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_memory_get": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "layer": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 255,
+          "enum": [
+            1,
+            2,
+            3,
+            null
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_assign_agent": {
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_task_action": {
+      "properties": {
+        "action": {
+          "type": "object",
+          "properties": {
+            "verb": {
+              "type": "string",
+              "enum": [
+                "start",
+                "hold",
+                "release",
+                "retry",
+                "send_back",
+                "approve",
+                "restart",
+                "cancel"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fresh_session": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "refresh_workspace": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "reset_budget": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "guidance": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "override": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "verb"
+          ],
+          "additionalProperties": false
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_task_diff": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_executions": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_task": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_transition_task": {
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_register_agent": {
+      "properties": {
+        "daemon_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executor_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "executor_type",
+        "name"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agents": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "busy",
+            "error",
+            "offline",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_projects": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_project": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_project": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_project": {
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "settings": {},
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "project_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_project_lifecycle_hooks": {
+      "properties": {
+        "lifecycle_hooks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "script",
+                    "plugin"
+                  ]
+                },
+                "command": {
+                  "type": "string"
+                },
+                "timeout_seconds": {
+                  "type": "integer",
+                  "minimum": 1.0
+                },
+                "blocking": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "config": {}
+              },
+              "required": [
+                "type"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lifecycle_hooks",
+        "project_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_follow_up_execution": {
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "overrides": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "model_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "permission_policy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hard_deadline_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "execution_id",
+        "message"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_add_task_dependency": {
+      "properties": {
+        "depends_on_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "depends_on_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_remove_task_dependency": {
+      "properties": {
+        "depends_on_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "depends_on_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_task_dependencies": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_task_dependents": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_sub_tasks": {
+      "properties": {
+        "parent_task_id": {
+          "type": "string"
+        },
+        "subtasks": {
+          "items": {
+            "properties": {
+              "assignee_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parent_task_id",
+        "subtasks"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_sub_tasks": {
+      "properties": {
+        "parent_task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_reorder_sub_tasks": {
+      "properties": {
+        "ordered_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "parent_task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordered_ids",
+        "parent_task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_profiles": {
+      "properties": {
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_sessions": {
+      "properties": {
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_session": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_main_agent": {
+      "properties": {},
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_set_main_agent": {
+      "properties": {
+        "autonomy_policy": {},
+        "expected_version": {
+          "type": "integer"
+        },
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_project_agent": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_set_project_agent": {
+      "properties": {
+        "autonomy_policy": {},
+        "expected_version": {
+          "type": "integer"
+        },
+        "identity_id": {
+          "type": "string"
+        },
+        "permission_ceiling": {},
+        "project_id": {
+          "type": "string"
+        },
+        "subscriptions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wake_budget": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "expected_version",
+        "identity_id",
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_integration_queue": {
+      "properties": {
+        "limit": {
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "target_branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_chats": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_chat": {
+      "properties": {
+        "chat_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "chat_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_chat_messages": {
+      "properties": {
+        "before_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "chat_id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "chat_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_send_agent_chat_message": {
+      "properties": {
+        "chat_id": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "dedupe_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "chat_id",
+        "content"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_handoffs": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_handoff": {
+      "properties": {
+        "handoff_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "handoff_id",
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_agent_handoff": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "dedupe_key": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_job_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "dedupe_key",
+        "project_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "mcp_project": {
+    "forge_project_escalate": {
+      "properties": {
+        "dedupe_key": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "need": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        }
+      },
+      "required": [
+        "dedupe_key",
+        "need"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_task": {
+      "properties": {
+        "depends_on_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent_task_id": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "task",
+            "planning_task",
+            "sub_task",
+            "discovery"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_tasks": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "sort_by": {
+          "enum": [
+            "created_at",
+            "updated_at",
+            "priority",
+            "board_position",
+            "id",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_task": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_preview_prompt": {
+      "properties": {
+        "role": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "trigger": {
+          "enum": [
+            "accept",
+            "reject",
+            "fail",
+            "retry",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "role",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_memory_search": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "layer": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 255,
+          "enum": [
+            1,
+            2,
+            3,
+            null
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 4294967295
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "token_budget": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 4294967295
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_memory_get": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "layer": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0.0,
+          "maximum": 255,
+          "enum": [
+            1,
+            2,
+            3,
+            null
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_assign_agent": {
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_task_action": {
+      "properties": {
+        "action": {
+          "type": "object",
+          "properties": {
+            "verb": {
+              "type": "string",
+              "enum": [
+                "start",
+                "hold",
+                "release",
+                "retry",
+                "send_back",
+                "approve",
+                "restart",
+                "cancel"
+              ]
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "fresh_session": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "refresh_workspace": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "reset_budget": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "guidance": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "override": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "verb"
+          ],
+          "additionalProperties": false
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_task_diff": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_executions": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_task": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_transition_task": {
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "status",
+        "task_id",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_register_agent": {
+      "properties": {
+        "daemon_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "executor_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "executor_type",
+        "name"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agents": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "busy",
+            "error",
+            "offline",
+            null
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_projects": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_project": {
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_project": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_project": {
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "settings": {},
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_update_project_lifecycle_hooks": {
+      "properties": {
+        "lifecycle_hooks": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "script",
+                    "plugin"
+                  ]
+                },
+                "command": {
+                  "type": "string"
+                },
+                "timeout_seconds": {
+                  "type": "integer",
+                  "minimum": 1.0
+                },
+                "blocking": {
+                  "type": "boolean"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "enabled": {
+                  "type": "boolean"
+                },
+                "config": {}
+              },
+              "required": [
+                "type"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "lifecycle_hooks",
+        "version"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_follow_up_execution": {
+      "properties": {
+        "agent_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "overrides": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "model_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "permission_policy": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hard_deadline_seconds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "maximum": 4294967295
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "execution_id",
+        "message"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_add_task_dependency": {
+      "properties": {
+        "depends_on_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "depends_on_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_remove_task_dependency": {
+      "properties": {
+        "depends_on_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "depends_on_id",
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_task_dependencies": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_task_dependents": {
+      "properties": {
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_sub_tasks": {
+      "properties": {
+        "parent_task_id": {
+          "type": "string"
+        },
+        "subtasks": {
+          "items": {
+            "properties": {
+              "assignee_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "title"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parent_task_id",
+        "subtasks"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_sub_tasks": {
+      "properties": {
+        "parent_task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parent_task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_reorder_sub_tasks": {
+      "properties": {
+        "ordered_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "parent_task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ordered_ids",
+        "parent_task_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_profiles": {
+      "properties": {
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_sessions": {
+      "properties": {
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_session": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_main_agent": {
+      "properties": {},
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_set_main_agent": {
+      "properties": {
+        "autonomy_policy": {},
+        "expected_version": {
+          "type": "integer"
+        },
+        "identity_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_project_agent": {
+      "properties": {
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_set_project_agent": {
+      "properties": {
+        "autonomy_policy": {},
+        "expected_version": {
+          "type": "integer"
+        },
+        "identity_id": {
+          "type": "string"
+        },
+        "permission_ceiling": {},
+        "project_id": {
+          "type": "string"
+        },
+        "subscriptions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "wake_budget": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "expected_version",
+        "identity_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_integration_queue": {
+      "properties": {
+        "limit": {
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "target_branch": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_chats": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_chat": {
+      "properties": {
+        "chat_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "chat_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_chat_messages": {
+      "properties": {
+        "before_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "chat_id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "chat_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_send_agent_chat_message": {
+      "properties": {
+        "chat_id": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "dedupe_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "chat_id",
+        "content"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_list_agent_handoffs": {
+      "properties": {
+        "cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_get_agent_handoff": {
+      "properties": {
+        "handoff_id": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "handoff_id"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    },
+    "forge_create_agent_handoff": {
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "dedupe_key": {
+          "type": "string"
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_turn_job_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "dedupe_key"
+      ],
+      "type": "object",
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,9 +1,8 @@
-import { Copy, Trash, Warning } from '@phosphor-icons/react'
+import { Copy, Warning } from '@phosphor-icons/react'
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { apiFetch } from '@/api/client'
 import {
-  useCancelTask,
   useDuplicateTask,
   useMembersQuery,
   useProjectAgentsQuery,
@@ -13,11 +12,13 @@ import {
 import { qk } from '@/api/query-keys'
 import {
   type AssigneeSelection,
-  AgentAssigneeDropdown,
   TaskStatusBadge,
   TaskStatusDropdown,
 } from '@/components/task-controls'
+import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-role-assignees'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
+import { TaskPlacementDiagnostics } from '@/components/task-detail/task-placement-diagnostics'
+import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { productTerm } from '@/lib/i18n'
 import { Badge } from '@/components/ui/badge'
@@ -33,9 +34,10 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Textarea } from '@/components/ui/textarea'
 import { getApiErrorMessage } from '@/lib/api-error'
-import { getHumanGateActions } from '@/lib/gate-actions'
+import { roleAssignmentErrorMessage } from '@/lib/root-lead'
+import { TaskActionButtons } from './task-action-buttons'
+import { TaskLeadInputWait } from './task-lead-input-wait'
 import { useEffect, useState, type ReactNode } from 'react'
 import type {
   Agent,
@@ -55,20 +57,14 @@ interface TaskDetailSidebarProps {
   executions: Execution[]
   availableTransitions: string[]
   transitionPending: boolean
-  cancelTask: ReturnType<typeof useCancelTask>
   priorityDraft: string
   setPriorityDraft: (value: string) => void
   savePriority: () => void
   agentName: (agentId?: string | null) => string | undefined | null
   formatDate: (value?: string | null) => string
   onStatusChange: (status: string, reason?: string) => void
-  onApproveGate: (stateName: string) => void
-  onRejectGate: (stateName: string, reason: string) => void
 }
 
-function hasAwaitingHuman(task: Task): task is Task & { awaiting_human: boolean } {
-  return 'awaiting_human' in task && typeof task.awaiting_human === 'boolean'
-}
 
 function getTaskDetailApiErrorMessage(error: unknown, fallback = 'Request failed'): string {
   return getApiErrorMessage(error, fallback)
@@ -81,29 +77,34 @@ export function TaskDetailSidebar({
   executions,
   availableTransitions,
   transitionPending,
-  cancelTask,
   priorityDraft,
   setPriorityDraft,
   savePriority,
   agentName,
   formatDate,
   onStatusChange,
-  onApproveGate,
-  onRejectGate,
 }: TaskDetailSidebarProps) {
   const rolePicker = useRolePicker()
   const duplicateTask = useDuplicateTask()
   const projectId = task?.project_id ?? ''
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
+  // A root Task with subtasks is a coordination root: its planning role is
+  // the lead. The subtasks panel reads the same relations, so this is cached.
+  const rootRelations = useTaskRelationsQuery(
+    task?.id ?? '',
+    projectId,
+    Boolean(task) && task?.parent_task_id == null,
+  )
+  const isCoordinationRoot =
+    task?.parent_task_id == null &&
+    ((rootRelations.data?.subtasks.length ?? 0) > 0 || task?.effective_lead?.source === 'own')
   const [pendingSelection, setPendingSelection] = useState<{
     roleName: string
     selection: AssigneeSelection
   } | null>(null)
   const [resetWorkspace, setResetWorkspace] = useState(false)
   const [resetWorktree, setResetWorktree] = useState(false)
-  const [rejectingStateName, setRejectingStateName] = useState<string | null>(null)
-  const [rejectReasonDraft, setRejectReasonDraft] = useState('')
   const terminal = task?.status === 'done' || task?.status === 'cancelled'
   const effectiveWorkflow = workflow
   const currentRole =
@@ -112,29 +113,12 @@ export function TaskDetailSidebar({
     effectiveWorkflow?.states.find((state) => state.name === 'in_progress')?.role ??
     effectiveWorkflow?.roles.find((role) => role.name === 'coder')?.name ??
     'coder'
-  const gateActions = getHumanGateActions(task, effectiveWorkflow)
-
-  const openRejectDialog = (stateName: string) => {
-    setRejectingStateName(stateName)
-    setRejectReasonDraft('')
-  }
-
-  const closeRejectDialog = () => {
-    setRejectingStateName(null)
-    setRejectReasonDraft('')
-  }
-
-  const submitRejectDialog = () => {
-    if (!rejectingStateName) return
-    const reason = rejectReasonDraft.trim()
-    if (!reason) {
-      toast.error('Rejection reason is required')
-      return
-    }
-    onRejectGate(rejectingStateName, reason)
-    closeRejectDialog()
-  }
   const effectiveAvailableTransitions = availableTransitions
+  const condition = task?.condition
+  const leadInputWait = condition?.kind === 'parked' &&
+    [condition.primary, ...condition.additional].some((reason) =>
+      reason.kind === 'human_decision' && reason.boundary === 'lead_input',
+    )
 
   const closeReassignmentDialog = () => {
     setPendingSelection(null)
@@ -154,7 +138,11 @@ export function TaskDetailSidebar({
       selection,
       resetWorkspace: resetFlags?.resetWorkspace,
       resetWorktree: resetFlags?.resetWorktree,
-      onError: (error) => toast.error(getTaskDetailApiErrorMessage(error, 'Assignment failed')),
+      onError: (error) =>
+        toast.error(
+          roleAssignmentErrorMessage(error) ??
+            getTaskDetailApiErrorMessage(error, 'Assignment failed'),
+        ),
     })
   }
 
@@ -190,28 +178,12 @@ export function TaskDetailSidebar({
         ) : task ? (
           <div className="p-5">
             <SidebarField label={productTerm('phase')}>
-              {gateActions ? (
-                <div className={gateActions.rejectLabel ? 'mb-2 grid grid-cols-2 gap-2' : 'mb-2'}>
-                  <Button
-                    className="w-full"
-                    disabled={transitionPending}
-                    size="sm"
-                    onClick={() => onApproveGate(gateActions.stateName)}
-                  >
-                    {gateActions.approveLabel}
-                  </Button>
-                  {gateActions.rejectLabel ? (
-                    <Button
-                      className="w-full"
-                      disabled={transitionPending}
-                      size="sm"
-                      variant="outline"
-                      onClick={() => openRejectDialog(gateActions.stateName)}
-                    >
-                      {gateActions.rejectLabel}
-                    </Button>
-                  ) : null}
-                </div>
+              {!task.workflow_exception ? (
+                <TaskActionButtons
+                  taskId={task.id}
+                  version={task.version}
+                  offers={task.available_actions ?? []}
+                />
               ) : null}
               <span className="block">
                 {effectiveAvailableTransitions.length > 0 ? (
@@ -226,9 +198,16 @@ export function TaskDetailSidebar({
                   <TaskStatusBadge status={task.status} />
                 )}
               </span>
+              <span className="mt-2 block empty:hidden">
+                <TaskStepCheck task={task} workflow={effectiveWorkflow} agentName={agentName} />
+              </span>
             </SidebarField>
 
-            {hasAwaitingHuman(task) && task.awaiting_human ? (
+            {leadInputWait ? (
+              <SidebarField label="Lead question">
+                <TaskLeadInputWait taskId={task.id} />
+              </SidebarField>
+            ) : task.condition.details.human_wait ? (
               <SidebarField label={task.status === 'planning' ? 'Plan' : 'Review'}>
                 <Badge className="border-transparent bg-violet-100 text-violet-900 dark:bg-violet-950 dark:text-violet-300 text-[11px]">
                   {task.status === 'planning' ? 'Plan ready - awaiting review' : 'Awaiting human'}
@@ -240,38 +219,24 @@ export function TaskDetailSidebar({
               const roles = effectiveWorkflow?.roles ?? [
                 { name: 'coder', display_name: 'Coder', description: '' },
               ]
-              const orderedRoles = [
-                ...roles.filter((r) => r.name === coderRole),
-                ...roles.filter((r) => r.name !== coderRole),
-              ]
               return (
                 <SidebarField label="Assignees">
                   <div
                     className="flex flex-wrap gap-1.5"
                     title={terminal ? 'task is terminal; cannot reassign' : undefined}
                   >
-                    {orderedRoles.map((role) => {
-                      const existing = task.role_assignments.find(
-                        (ra) => ra.role_name === role.name,
-                      )
-                      return (
-                        <span key={role.name}>
-                          <AgentAssigneeDropdown
-                            agents={projectAgentsData ?? []}
-                            members={membersData}
-                            disabled={terminal || rolePicker.isPending}
-                            fallbackName={assignmentAgentName(existing, agentName)}
-                            value={assignmentSelection(existing)}
-                            variant="chip"
-                            roleLabel={role.display_name || role.name}
-                            requiredNow={currentRole === role.name}
-                            onChange={(selection) =>
-                              handleRoleSelection(role.name, existing, selection)
-                            }
-                          />
-                        </span>
-                      )
-                    })}
+                    <TaskRoleAssignees
+                      task={task}
+                      roles={roles}
+                      coderRole={coderRole}
+                      currentRole={currentRole}
+                      isCoordinationRoot={isCoordinationRoot}
+                      agents={projectAgentsData ?? []}
+                      members={membersData}
+                      disabled={terminal || rolePicker.isPending}
+                      agentName={agentName}
+                      onSelect={handleRoleSelection}
+                    />
                   </div>
                 </SidebarField>
               )
@@ -311,6 +276,16 @@ export function TaskDetailSidebar({
               />
             </SidebarField>
 
+            {(task.placement ?? task.workspace?.placement) ? (
+              <div className="pb-4">
+                <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} pendingRemoteCancelCount={task.workspace?.pending_remote_cancel.length ?? 0} />
+                <TaskPlacementDiagnostics
+                  diagnostics={task.placement_diagnostics ?? []}
+                  hasLead={task.effective_lead?.source === 'own'}
+                />
+              </div>
+            ) : null}
+
             {task.workspace ? (
               <>
                 <SidebarField label="Branch">
@@ -326,27 +301,12 @@ export function TaskDetailSidebar({
               </>
             ) : null}
 
-            {task.status === 'done' ? (
+            {task.status === 'done' &&
+            (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
               <p className="mt-4 text-xs text-muted-foreground">Workspace cleaned after merge.</p>
             ) : null}
 
             <div className="space-y-2 py-3">
-              {task.status !== 'done' && task.status !== 'cancelled' ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="w-full gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                  disabled={cancelTask.isPending}
-                  onClick={() => {
-                    cancelTask.mutate(task.id, {
-                      onError: (error) => toast.error(getApiErrorMessage(error, 'Cancel failed')),
-                    })
-                  }}
-                >
-                  <Trash size={14} />
-                  Cancel task
-                </Button>
-              ) : null}
               {(task.status === 'done' || task.status === 'cancelled') && (
                 <Button
                   variant="outline"
@@ -369,36 +329,6 @@ export function TaskDetailSidebar({
           </div>
         ) : null}
       </aside>
-
-      <Dialog
-        open={rejectingStateName != null}
-        onOpenChange={(open) => {
-          if (!open) closeRejectDialog()
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Reject Gate</DialogTitle>
-          </DialogHeader>
-          <Textarea
-            value={rejectReasonDraft}
-            onChange={(event) => setRejectReasonDraft(event.target.value)}
-            placeholder="Describe what needs to change"
-            rows={4}
-          />
-          <DialogFooter>
-            <Button variant="outline" onClick={closeRejectDialog}>
-              Cancel
-            </Button>
-            <Button
-              disabled={transitionPending || !rejectReasonDraft.trim()}
-              onClick={submitRejectDialog}
-            >
-              Reject
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <Dialog
         open={Boolean(pendingSelection)}
@@ -515,26 +445,6 @@ function SidebarField({
   )
 }
 
-function assignmentSelection(assignment?: TaskRoleAssignmentResponse): AssigneeSelection {
-  if (!assignment) return { type: 'unassigned' }
-  if (assignment.assignee_type === 'agent' && assignment.assignee_id) {
-    return { type: 'agent', agentId: assignment.assignee_id }
-  }
-  if (assignment.assignee_type === 'user') {
-    return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
-  }
-  return { type: 'unassigned' }
-}
-
-function assignmentAgentName(
-  assignment: TaskRoleAssignmentResponse | undefined,
-  agentName: (agentId?: string | null) => string | undefined | null,
-): string | undefined {
-  return assignment?.assignee_type === 'agent' && assignment.assignee_id
-    ? (agentName(assignment.assignee_id) ?? assignment.assignee_id)
-    : undefined
-}
-
 function sameSelection(
   assignment: TaskRoleAssignmentResponse | undefined,
   selection: AssigneeSelection,
@@ -575,7 +485,10 @@ export function useParentTaskCandidatesQuery(projectId: string, search: string, 
   })
 }
 
-export function filterParentTaskCandidates(candidates: TaskListItem[], taskId: string): TaskListItem[] {
+export function filterParentTaskCandidates(
+  candidates: TaskListItem[],
+  taskId: string,
+): TaskListItem[] {
   return candidates.filter(
     (candidate) => candidate.parent_task_id == null && candidate.id !== taskId,
   )

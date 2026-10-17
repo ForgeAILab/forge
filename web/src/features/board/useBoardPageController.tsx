@@ -1,10 +1,12 @@
 import type { MouseEvent } from 'react'
+import type { DropResult } from '@hello-pangea/dnd'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useSearch } from '@tanstack/react-router'
 import {
   useAgentsQuery,
   useAssignRole,
   useCreateTask,
+  useTaskDetailQuery,
   useTransitionTask,
   useWorkflowQuery,
 } from '@/api/hooks'
@@ -18,6 +20,7 @@ import {
   getValidDropColumns,
   groupByColumns,
   matchesFilters,
+  workflowTriggerTargets,
 } from '@/lib/workflow-utils'
 import { useFilterStore } from '@/stores/filters'
 import type { WorkflowDefinition } from '@/types/generated'
@@ -43,8 +46,9 @@ const DEFAULT_COLUMNS: ColumnGroup[] = [
   {
     primaryState: 'in_progress',
     columnName: 'In Progress',
-    states: ['in_progress'],
-    stateLabels: { in_progress: 'In Progress' },
+    states: ['in_progress', 'lead_check'],
+    stateLabels: { in_progress: 'In Progress', lead_check: 'Lead Check' },
+    inheritedStates: ['lead_check'],
     subStates: [],
     taskCount: 0,
     isTerminal: false,
@@ -176,9 +180,25 @@ export function useBoardPageController(projectId: string) {
   const draggingTask = dragSession.state.draggableId
     ? tasks.find((task) => task.id === dragSession.state.draggableId)
     : undefined
+  // Task detail carries the server-resolved inherited workflow. Never offer
+  // Project exits to a subtask while that projection is still loading.
+  const draggingSubtaskDetail = useTaskDetailQuery(
+    draggingTask?.parent_task_id != null ? draggingTask.id : '',
+  )
+  const applicableWorkflow =
+    draggingTask?.parent_task_id != null ? draggingSubtaskDetail.data?.workflow : workflowQuery.data
   const validDropStatuses = draggingTask
-    ? validTargetColumns(draggingTask.status, workflowQuery.data, boardColumns)
+    ? validTargetColumns(draggingTask, applicableWorkflow, boardColumns)
     : []
+  const onDragEnd = (result: DropResult) => {
+    const destination = result.destination?.droppableId
+    const sameColumn =
+      destination && columnStates[destination]?.includes(draggingTask?.status ?? '')
+    if (destination && !sameColumn && !validDropStatuses.includes(destination)) {
+      return dragSession.onDragEnd({ ...result, destination: null })
+    }
+    return dragSession.onDragEnd(result)
+  }
   const agentNamesById = useMemo(
     () => new Map((agentsQuery.data?.items ?? []).map((agent) => [agent.id, agent.name])),
     [agentsQuery.data],
@@ -364,7 +384,7 @@ export function useBoardPageController(projectId: string) {
     contextMenu,
     createDialogOpen,
     createTask,
-    dragSession,
+    dragSession: { ...dragSession, onDragEnd },
     filterAgentIds,
     filterBlockedOnly,
     filterIncludeArchived,
@@ -442,12 +462,21 @@ function visibleColumns(
 }
 
 function validTargetColumns(
-  status: string,
+  task: Task,
   workflow: WorkflowDefinition | undefined,
   columns: ColumnGroup[],
 ): string[] {
-  if (workflow) return getValidDropColumns(workflow, status)
-  return (taskStatusTransitions[status] ?? []).filter((target) =>
+  if (workflow) {
+    if (task.parent_task_id == null) return getValidDropColumns(workflow, task.status)
+    const targets = workflowTriggerTargets(workflow, task.status)
+    return getValidDropColumns(workflow, task.status, columns).filter(
+      (target) =>
+        targets.includes(target) ||
+        columns.find((column) => column.primaryState === target)?.states.includes(task.status),
+    )
+  }
+  if (task.parent_task_id != null) return []
+  return (taskStatusTransitions[task.status] ?? []).filter((target) =>
     columns.some((column) => column.primaryState === target),
   )
 }

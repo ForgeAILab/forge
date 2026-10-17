@@ -54,20 +54,7 @@ export const BUILTIN_PLUGINS: Array<{
   label: string
   description: string
   supportedEvents: LifecycleEvent[]
-}> = [
-  {
-    name: 'knowledge-inject',
-    label: 'Knowledge Inject',
-    description: 'Injects relevant knowledge base entries into agent context',
-    supportedEvents: ['before_work'],
-  },
-  {
-    name: 'knowledge-capture',
-    label: 'Knowledge Capture',
-    description: 'Captures knowledge from completed tasks',
-    supportedEvents: ['on_task_done'],
-  },
-]
+}> = []
 
 export function lifecycleHooksFromSettings(
   settings: Record<string, unknown> | null | undefined,
@@ -138,11 +125,6 @@ export function repoFormFromRepo(repo: Repo): RepoFormState {
     local_path: repo.local_path ?? '',
     remote_url: repo.remote_url ?? '',
     default_branch: repo.default_branch || 'main',
-    work_mode: repo.work_mode,
-    pr_provider: repo.pr_provider_status?.provider_type ?? repo.pr_provider ?? 'github',
-    pr_base_url: '',
-    pr_token: '',
-    pr_polling_interval_seconds: String(repo.pr_provider_status?.polling_interval_seconds ?? 60),
   }
 }
 

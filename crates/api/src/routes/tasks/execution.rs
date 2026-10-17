@@ -2,9 +2,24 @@ use super::*;
 
 pub async fn claim_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<ClaimTaskRequest>,
 ) -> ApiResult<Json<TaskResponse>> {
+    let authorized_task = crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_agent_usable(
+        &state,
+        &authorized_task.project_id,
+        &request.agent_id,
+        &user.user_id,
+    )
+    .await?;
     let assignee = Assignee::Agent(request.agent_id.clone());
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
@@ -14,18 +29,33 @@ pub async fn claim_task(
     });
     let claimed = state
         .task_service
-        .claim_task(id, assignee, overrides)
+        .claim_and_start_task(id, assignee, overrides)
         .await?;
-    let execution_id = claimed.execution.id.clone();
-    state.task_service.start_execution(execution_id).await?;
-    Ok(Json(task_response(&state.db, claimed.task).await?))
+    Ok(Json(
+        task_response(&state.db, &state.workspace_backend_router, claimed.task).await?,
+    ))
 }
 
 pub async fn launch_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<LaunchExecutionRequest>,
 ) -> ApiResult<Json<LaunchExecutionResponse>> {
+    let authorized_task = crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_agent_usable(
+        &state,
+        &authorized_task.project_id,
+        &request.agent_id,
+        &user.user_id,
+    )
+    .await?;
     let overrides = request.overrides.map(|overrides| ExecutionOverrides {
         model_id: overrides.model_id,
         reasoning_effort: overrides.reasoning_effort,
@@ -51,9 +81,14 @@ pub async fn launch_task(
 
     Ok(Json(LaunchExecutionResponse {
         data: api_types::LaunchExecutionData {
-            task: task_response(&state.db, launched.task).await?,
+            task: task_response(&state.db, &state.workspace_backend_router, launched.task).await?,
             execution: execution_response(launched.execution),
-            workspace: workspace_response(launched.workspace),
+            workspace: workspace_response(
+                &state.db,
+                &state.workspace_backend_router,
+                launched.workspace,
+            )
+            .await?,
             execution_behavior,
         },
     }))

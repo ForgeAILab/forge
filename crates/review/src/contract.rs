@@ -2,13 +2,14 @@
 use api_types::*;
 use db::{Execution, ExecutionRepo, Review, ReviewConformanceRepo, ReviewRepo, SqliteDb};
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path, time::Duration};
-use tokio::process::Command;
+use std::collections::BTreeSet;
+
+use crate::{CommandLimits, ReviewWorkspace};
 
 const MAX_CONTEXT_BYTES: usize = 96 * 1024;
 const MAX_PREPARED_PROMPT_BYTES: usize = 192 * 1024;
 const MAX_REPORT_BYTES: usize = 128 * 1024;
-const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+pub const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
 const MAX_CANDIDATE_PATH_BYTES: usize = 64 * 1024;
 const CHARTER_REQUIREMENT_ROOTS: [(&str, bool); 11] = [
     ("/identity/one_line_vision", false),
@@ -32,11 +33,20 @@ Also check:
 - Scope: the delta stays inside the Task. Unrelated refactors, renames, formatting churn, new dependencies, or edits to files the Task does not need are a blocking problem; name the files and why they are outside scope.
 Stop once you can answer these. Do not audit unchanged code or fail on style preferences.
 Write your review in Markdown: for each requirement say whether it is met and what you ran to show it, and for each problem say what was expected, what you observed, and where (command output, screenshot, or file and line). Then end your reply with exactly one JSON object on its own:
-{"result": "pass", "reason": "one sentence"}
+{"result": "pass", "reason": "one sentence", "fixable_by": "coder", "repeat": false}
 result is one of:
 - "pass": every requirement is met, verified by running it, and nothing blocks the Task.
-- "fail": the implementation is wrong, incomplete, untested, or out of scope; the reason and your review go to the coder to fix.
+- "fail": the implementation is wrong, incomplete, untested, or out of scope; coder-fixable findings go to the coder, while owner-only or repeated findings may park for the owner.
 - "blocked": you could not reach a verdict because of the review environment, not the code (for example the toolchain or dependencies are missing). Explain what is missing; the project owner resolves it.
+fixable_by is "coder" (default) or "owner". Use "owner" only when the blocking finding needs something the coder cannot provide in this Task: another OS or hardware, an external service or credential, Forge-side metadata or links, a scope/product decision, or a change to acceptance criteria; otherwise use "coder".
+repeat defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
+Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
+Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}.
+findings is an optional list of problems. Each item needs a one-sentence summary; severity is "blocking" (default) or "minor". Include where (file and line, command, or screen), expected, and observed when available. Keep at most 50 items and each text field at most 1,000 characters. A pass may include minor findings; a fail remains a fail even without blocking findings.
+Each finding may cite requirement_ids from the frozen requirement ids listed below. kind is "regression" (re-broken behavior), "missed" (unmet requirement), or "out_of_scope" (follow-up candidate; never blocking); unknown kinds are ignored. Use same_cause_as with an earlier finding id when they share a root cause.
+After the first review in a window, raise a new blocking finding only for a regression, an unmet requirement (cite its id), or a file in candidate_changed_paths. Other new findings become minor with an anchoring note. Preserve prior ids and address the shared cause at every call site.
+Forge assigns new finding ids. For a prior finding still open, copy its id into the item; list prior ids that are fixed in the optional resolved list. Do not invent ids for new findings. An omitted prior finding is unconfirmed, not resolved.
+Findings example: {"result":"fail","reason":"Empty input still crashes","findings":[{"id":"F1","summary":"Empty input crashes parse()","severity":"blocking","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"summary":"Help text has a typo","severity":"minor"}],"resolved":["F2"]}.
 Do not pass work you could not check."#;
 
 pub async fn load_context(
@@ -454,14 +464,11 @@ pub fn governing_prompt(context: &ReviewGoverningContext) -> String {
 /// Put `worktree` back at `commit` after the checks: reset tracked files and
 /// HEAD, and remove untracked files that are not ignored, which integration
 /// would otherwise refuse as a dirty worktree. Ignored caches are kept.
-async fn restore_reviewed_tree(worktree: &Path, commit: &str) -> Result<(), String> {
-    git_read(worktree, &["reset", "--hard", "--quiet", commit])
-        .await
-        .map_err(|error| format!("review worktree could not be reset to {commit}: {error}"))?;
-    git_read(worktree, &["clean", "-fdq"])
-        .await
-        .map_err(|error| format!("review worktree could not be cleaned: {error}"))?;
-    Ok(())
+async fn restore_reviewed_tree(
+    worktree: &(impl ReviewWorkspace + ?Sized),
+    commit: &str,
+) -> Result<(), String> {
+    worktree.restore(commit).await
 }
 
 const COMMAND_TIMED_OUT: &str = "review command timed out";
@@ -481,59 +488,30 @@ pub fn is_check_timeout(reason: &str) -> bool {
     reason.starts_with(CHECK_TIMEOUT_PREFIX)
 }
 
-async fn check_output(
-    command: &mut Command,
+async fn check_workspace_output(
+    workspace: &(impl ReviewWorkspace + ?Sized),
     label: &str,
+    environment: &std::collections::BTreeMap<String, String>,
     seconds: u32,
-) -> Result<std::process::Output, String> {
-    bounded_output(command, u64::from(seconds), MAX_EVIDENCE_BYTES)
+) -> Result<crate::CommandOutput, String> {
+    workspace
+        .run(
+            label,
+            environment,
+            Some(CommandLimits {
+                timeout_secs: u64::from(seconds),
+                max_output_bytes: MAX_EVIDENCE_BYTES,
+            }),
+        )
         .await
         .map_err(|error| {
-            if error == COMMAND_TIMED_OUT {
+            let reason = error.to_string();
+            if reason.contains(COMMAND_TIMED_OUT) {
                 format!("{CHECK_TIMEOUT_PREFIX}: `{label}` ran longer than {seconds}s")
             } else {
-                error
+                reason
             }
         })
-}
-
-async fn bounded_output(
-    command: &mut Command,
-    seconds: u64,
-    limit: usize,
-) -> Result<std::process::Output, String> {
-    use std::process::Stdio;
-    use tokio::io::AsyncReadExt;
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    let stdout = child.stdout.take().ok_or("missing stdout pipe")?;
-    let stderr = child.stderr.take().ok_or("missing stderr pipe")?;
-    let read = |pipe: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>| async move {
-        let mut bytes = Vec::new();
-        pipe.take((limit + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|e| e.to_string())?;
-        if bytes.len() > limit {
-            return Err("review command output exceeds size budget".to_owned());
-        }
-        Ok(bytes)
-    };
-    tokio::time::timeout(Duration::from_secs(seconds), async {
-        let (stdout, stderr) = tokio::try_join!(read(Box::pin(stdout)), read(Box::pin(stderr)))?;
-        let status = child.wait().await.map_err(|e| e.to_string())?;
-        Ok(std::process::Output {
-            status,
-            stdout,
-            stderr,
-        })
-    })
-    .await
-    .map_err(|_| COMMAND_TIMED_OUT.to_owned())?
 }
 
 fn output_tail(text: &str) -> String {
@@ -546,43 +524,25 @@ fn output_tail(text: &str) -> String {
         .collect()
 }
 
-pub async fn git_read(path: &Path, args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    let output = bounded_output(&mut command, 30, MAX_EVIDENCE_BYTES).await?;
-    if !output.status.success() {
-        return Err(format!(
-            "git evidence unavailable: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+pub async fn git_read(
+    workspace: &(impl ReviewWorkspace + ?Sized),
+    args: &[&str],
+) -> Result<String, String> {
+    workspace
+        .git_read(args, false)
+        .await?
+        .ok_or_else(|| "git evidence unavailable".to_owned())
 }
 
 /// Like `git_read`, but a nonzero exit (no common ancestor, unknown ref, ...)
 /// resolves to `Ok(None)` instead of an error. Mirrors
 /// `crates/services/src/diff.rs::try_run_git` so callers can attempt a
 /// `merge-base` lookup and fall back cleanly when it does not apply.
-async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(path)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE");
-    let output = bounded_output(&mut command, 30, MAX_EVIDENCE_BYTES).await?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    String::from_utf8(output.stdout)
-        .map(Some)
-        .map_err(|e| e.to_string())
+async fn try_git_read(
+    workspace: &(impl ReviewWorkspace + ?Sized),
+    args: &[&str],
+) -> Result<Option<String>, String> {
+    workspace.git_read(args, true).await
 }
 
 /// Resolve the review base commit: the point the reviewed branch actually
@@ -601,7 +561,10 @@ async fn try_git_read(path: &Path, args: &[&str]) -> Result<Option<String>, Stri
 ///    the fix report for what that would take.)
 /// 3. The previous behavior: the named branch's current tip, or `HEAD` when
 ///    no branch is known.
-async fn review_base(path: &Path, context: &ReviewGoverningContext) -> Result<String, String> {
+pub async fn review_base(
+    path: &(impl ReviewWorkspace + ?Sized),
+    context: &ReviewGoverningContext,
+) -> Result<String, String> {
     let config: Value = context.task_scope["merge_config"]
         .as_str()
         .map(serde_json::from_str)
@@ -634,7 +597,7 @@ pub async fn admit(
     db: &SqliteDb,
     execution_id: &str,
     task_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
 ) -> Result<ReviewContract, String> {
     let context = load_context(db, task_id, Some(execution_id)).await?;
     let check_results = completed_ci_check_results(db, task_id, execution_id, &context).await?;
@@ -677,7 +640,7 @@ pub async fn admit(
 }
 
 pub async fn candidate_changed_paths(
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     base_sha: &str,
     commit_sha: &str,
 ) -> Result<Vec<String>, String> {
@@ -739,6 +702,7 @@ async fn completed_ci_check_results(
         .map_err(|error| format!("invalid stored review check results: {error}"))?;
     let stored = parse_stored_ci_steps(details)?;
     let mut results = Vec::with_capacity(stored.len());
+    let mut triage_signature_budget = 20;
     let mut seen_indices = BTreeSet::new();
     for result in stored {
         let index = result.index;
@@ -768,6 +732,7 @@ async fn completed_ci_check_results(
             result.output_tail.clone()
         };
         results.push(ConformanceCheckResult {
+            triage: compact_ci_triage(result.triage, &mut triage_signature_budget),
             check_id,
             command: result.command,
             exit_code: result.exit_code,
@@ -788,6 +753,28 @@ async fn completed_ci_check_results(
         ));
     }
     Ok(results)
+}
+
+/// Frozen reviewer input is a bounded view. Full classifications remain on
+/// the Review/ledger; settlement only needs each exact check's blocking flag.
+fn compact_ci_triage(
+    mut triage: Option<StepCiTriage>,
+    remaining: &mut usize,
+) -> Option<StepCiTriage> {
+    if let Some(triage) = &mut triage {
+        let total = triage.failures.len();
+        let keep = total.min(*remaining);
+        *remaining -= keep;
+        if keep < total {
+            let reason = triage.reason.get_or_insert_with(String::new);
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!("Showing {keep} of {total} classified signatures; full evidence remains on the Review"));
+            triage.failures.truncate(keep);
+        }
+    }
+    triage
 }
 
 /// Resolve the Review attempt that supplied pre-review checks for this
@@ -859,6 +846,7 @@ fn parse_stored_ci_steps(details: Value) -> Result<Vec<StepResultEntry>, String>
 
 const PERSISTED_REVIEW_DETAIL_KEYS: &[&str] = &[
     "ci_steps",
+    "verify",
     "conformance",
     "auditor",
     "user_approval",
@@ -879,7 +867,7 @@ fn validate_persisted_review_detail_keys(
             return Err("persisted review ci_steps must be an array".into());
         }
     }
-    for key in ["user_approval", "execution", "execution_retry"] {
+    for key in ["user_approval", "execution", "execution_retry", "verify"] {
         if let Some(value) = details.get(key) {
             if !value.is_object() {
                 return Err(format!("persisted review {key} must be an object"));
@@ -891,7 +879,14 @@ fn validate_persisted_review_detail_keys(
 
 pub fn contract_prompt(contract: &ReviewContract) -> String {
     format!(
-        "\n\n{RESPONSE_INSTRUCTION}\n\nFrozen review contract:\n{}",
+        "\n\n{RESPONSE_INSTRUCTION}\n\nFrozen requirement ids: {}\n\nFrozen review contract:\n{}",
+        contract
+            .context
+            .requirements
+            .iter()
+            .map(|requirement| requirement.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         serde_json::to_string(contract).expect("contract serializes")
     )
 }
@@ -900,10 +895,10 @@ pub async fn prepare_prompt(
     db: &SqliteDb,
     execution_id: &str,
     task_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     reviewer: bool,
     shell: bool,
-    mut prompt: String,
+    prompt: String,
 ) -> Result<String, String> {
     let (context, contract) = if reviewer {
         let contract = admit(db, execution_id, task_id, path).await?;
@@ -911,31 +906,55 @@ pub async fn prepare_prompt(
     } else {
         (load_context(db, task_id, Some(execution_id)).await?, None)
     };
+    let mut prompt = assemble_prepared_prompt(&context, contract.as_ref(), shell, prompt)?;
+    if !shell {
+        if let Some(contract) = contract.as_ref() {
+            let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
+            let include_verify = !prompt.contains("\nVerify results:\n");
+            prompt.push_str(
+                &reviewer_context_prompt(
+                    db,
+                    task_id,
+                    execution_id,
+                    path,
+                    contract,
+                    budget,
+                    include_verify,
+                )
+                .await,
+            );
+        }
+    }
+    Ok(prompt)
+}
+
+pub fn assemble_prepared_prompt(
+    context: &ReviewGoverningContext,
+    contract: Option<&ReviewContract>,
+    shell: bool,
+    mut prompt: String,
+) -> Result<String, String> {
     if shell {
         // Shell descriptions are executable programs. Supply structured context
         // as data without appending natural language to the user's command.
         let quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
         let mut prelude = format!(
             "export FORGE_GOVERNING_CONTEXT={}\n",
-            quote(&serde_json::to_string(&context).map_err(|e| e.to_string())?)
+            quote(&serde_json::to_string(context).map_err(|e| e.to_string())?)
         );
         if let Some(contract) = contract {
             prelude.push_str(&format!(
                 "export FORGE_REVIEW_CONTRACT={}\n",
-                quote(&serde_json::to_string(&contract).map_err(|e| e.to_string())?)
+                quote(&serde_json::to_string(contract).map_err(|e| e.to_string())?)
             ));
         }
         prelude.push_str(&prompt);
         return Ok(prelude);
     }
     if let Some(contract) = contract {
-        prompt.push_str(&contract_prompt(&contract));
-        let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
-        prompt.push_str(
-            &reviewer_context_prompt(db, task_id, execution_id, path, &contract, budget).await,
-        );
+        prompt.push_str(&contract_prompt(contract));
     } else {
-        prompt.push_str(&governing_prompt(&context));
+        prompt.push_str(&governing_prompt(context));
     }
     if prompt.len() > MAX_PREPARED_PROMPT_BYTES {
         return Err(format!(
@@ -952,6 +971,11 @@ pub async fn prepare_prompt(
 const MAX_INLINE_DIFF_BYTES: usize = 48 * 1024;
 /// Largest slice of the previous review's report carried into a re-review.
 const MAX_PRIOR_REPORT_BYTES: usize = 8 * 1024;
+/// Largest open-findings list carried into a re-review; ids past it are
+/// listed bare. Each line's summary and location are clipped first.
+const MAX_PRIOR_FINDINGS_BYTES: usize = 8 * 1024;
+const MAX_PRIOR_FINDING_SUMMARY_CHARS: usize = 200;
+const MAX_PRIOR_FINDING_WHERE_CHARS: usize = 120;
 
 /// Context a reviewer would otherwise spend its first turns fetching: the
 /// candidate diff and, on a re-review, the previous verdict and what changed
@@ -961,11 +985,29 @@ async fn reviewer_context_prompt(
     db: &SqliteDb,
     task_id: &str,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
+    include_verify: bool,
 ) -> String {
     let mut out = String::new();
+    if include_verify {
+        if let Ok(reviews) = db::ReviewRepo::list_by_task(db, task_id).await {
+            if let Some(review) = reviews
+                .iter()
+                .filter(|r| r.status == db::ReviewStatus::Running)
+                .max_by_key(|r| r.attempt_number)
+            {
+                if let Ok(details) = serde_json::from_str::<Value>(&review.step_results_json) {
+                    if let Ok(verify) = serde_json::from_value::<api_types::ReviewVerifyDetails>(
+                        details["verify"].clone(),
+                    ) {
+                        out.push_str(&crate::verify::prompt(&verify));
+                    }
+                }
+            }
+        }
+    }
     if contract.base_sha != contract.commit_sha {
         let range = format!("{}..{}", contract.base_sha, contract.commit_sha);
         let diff_budget = MAX_INLINE_DIFF_BYTES.min(budget / 2);
@@ -995,7 +1037,11 @@ async fn reviewer_context_prompt(
 }
 
 /// `git diff --stat` plus the full diff when it fits in `limit` bytes.
-async fn diff_section(path: &Path, range: &str, limit: usize) -> Option<String> {
+async fn diff_section(
+    path: &(impl ReviewWorkspace + ?Sized),
+    range: &str,
+    limit: usize,
+) -> Option<String> {
     let stat = try_git_read(path, &["diff", "--stat=120", range, "--"])
         .await
         .ok()
@@ -1026,31 +1072,54 @@ async fn prior_review_section(
     db: &SqliteDb,
     task_id: &str,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
 ) -> Option<String> {
     let mut reviews = ReviewRepo::list_by_task(db, task_id).await.ok()?;
-    reviews.sort_by_key(|review| std::cmp::Reverse(review.attempt_number));
-    for review in reviews {
-        let Some(reviewer_execution_id) = review.reviewer_execution_id.as_deref() else {
+    let current_attempt = reviews
+        .iter()
+        .find(|review| {
+            review.reviewer_execution_id.as_deref() == Some(execution_id)
+                || review.auditor_execution_id.as_deref() == Some(execution_id)
+                || review.execution_id == execution_id
+        })
+        .map(|review| review.attempt_number);
+    let earlier =
+        |review: &Review| current_attempt.is_none_or(|attempt| review.attempt_number < attempt);
+    reviews.retain(earlier);
+    // The previous verdict is context whatever the budget window; only the
+    // ledger restarts at a recovery reset. A ledger read that fails drops the
+    // open list, not the verdict.
+    let mut window = db
+        .review_window(task_id)
+        .await
+        .map(|window| window.reviews)
+        .unwrap_or_default();
+    window.retain(earlier);
+    let ledger = db::review_findings::finding_ledger(&window).unwrap_or_default();
+    let mut section = String::new();
+    let mut prior_commit = None;
+    for review in reviews.iter().rev() {
+        let Some(reviewer_execution_id) = review
+            .reviewer_execution_id
+            .as_deref()
+            .or(review.auditor_execution_id.as_deref())
+        else {
             continue;
         };
-        if reviewer_execution_id == execution_id {
-            continue;
-        }
         let Ok(Some(conformance)) = db.review_conformance(reviewer_execution_id).await else {
             continue;
         };
         let Some(assessment) = conformance.assessment else {
             continue;
         };
-        let prior_commit = conformance.contract.map(|prior| prior.commit_sha);
+        prior_commit = conformance.contract.map(|prior| prior.commit_sha);
         let result = serde_json::to_value(assessment.result)
             .ok()
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_default();
-        let mut section = format!(
+        section.push_str(&format!(
             "\n\nPrevious review (attempt {}, result {result}{}): {}\n",
             review.attempt_number,
             prior_commit
@@ -1058,7 +1127,7 @@ async fn prior_review_section(
                 .map(|sha| format!(", commit {sha}"))
                 .unwrap_or_default(),
             assessment.reason
-        );
+        ));
         let report = assessment.report.trim();
         if !report.is_empty() {
             section.push_str("Its report:\n");
@@ -1068,35 +1137,88 @@ async fn prior_review_section(
             }
             section.push('\n');
         }
-        section.push_str("Confirm each problem it raised is resolved, and review what changed since. Do not reopen parts it accepted unless the new changes touch them.\n");
-        if let Some(prior_commit) = prior_commit.filter(|sha| *sha != contract.commit_sha) {
-            let is_ancestor = try_git_read(
-                path,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &prior_commit,
-                    &contract.commit_sha,
-                ],
-            )
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-            if is_ancestor {
-                let range = format!("{prior_commit}..{}", contract.commit_sha);
-                let limit = MAX_INLINE_DIFF_BYTES.min(budget.saturating_sub(section.len()) / 2);
-                if let Some(diff) = diff_section(path, &range, limit).await {
-                    section.push_str(&format!("Changes since the previous review ({range}):\n"));
-                    section.push_str(&diff);
-                }
+        break;
+    }
+    if section.is_empty() {
+        let latest = window.last()?;
+        section.push_str(&format!(
+            "\n\nPrevious review (attempt {}, status {}):\n",
+            latest.attempt_number, latest.status
+        ));
+    }
+    let open: Vec<_> = ledger
+        .iter()
+        .filter(|entry| entry.status.is_open())
+        .collect();
+    if !open.is_empty() {
+        section.push_str("Open findings in the prior review ledger:\n");
+        // Every id fits: the ids are what keep findings stable across rounds.
+        let mut listed = 0;
+        let mut overflow = Vec::new();
+        for entry in open {
+            let mut line = format!(
+                "- {}: {}",
+                entry.id,
+                clip_chars(&entry.summary, MAX_PRIOR_FINDING_SUMMARY_CHARS)
+            );
+            if let Some(location) = &entry.r#where {
+                line.push_str(&format!(
+                    " ({})",
+                    clip_chars(location, MAX_PRIOR_FINDING_WHERE_CHARS)
+                ));
+            }
+            line.push('\n');
+            if overflow.is_empty() && listed + line.len() <= MAX_PRIOR_FINDINGS_BYTES {
+                listed += line.len();
+                section.push_str(&line);
             } else {
-                section.push_str("The branch was rewritten since that review (for example rebased), so there is no incremental diff; compare against the candidate diff above.\n");
+                overflow.push(entry.id.as_str());
             }
         }
-        return (section.len() <= budget).then_some(section);
+        if !overflow.is_empty() {
+            section.push_str(&format!(
+                "Also open (details in the Review history): {}\n",
+                overflow.join(", ")
+            ));
+        }
+        section.push_str("For each reviewer finding still open, copy its id into findings. Put fixed reviewer ids in resolved; omission means unconfirmed. Forge re-checks its own CI, check and verify ids.\n");
     }
-    None
+    section.push_str(&format!("Frozen requirement ids: {}. After the first review in this window, a new blocking finding must be a regression, cite an unmet requirement, or name a file in candidate_changed_paths. Mark shared causes with same_cause_as.\n",
+        contract.context.requirements.iter().map(|requirement| requirement.id.as_str()).collect::<Vec<_>>().join(", ")));
+    section.push_str("Confirm each problem it raised is resolved, and review what changed since. Do not reopen parts it accepted unless the new changes touch them.\n");
+    if let Some(prior_commit) = prior_commit.filter(|sha| *sha != contract.commit_sha) {
+        let is_ancestor = try_git_read(
+            path,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &prior_commit,
+                &contract.commit_sha,
+            ],
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if is_ancestor {
+            let range = format!("{prior_commit}..{}", contract.commit_sha);
+            let limit = MAX_INLINE_DIFF_BYTES.min(budget.saturating_sub(section.len()) / 2);
+            if let Some(diff) = diff_section(path, &range, limit).await {
+                section.push_str(&format!("Changes since the previous review ({range}):\n"));
+                section.push_str(&diff);
+            }
+        } else {
+            section.push_str("The branch was rewritten since that review (for example rebased), so there is no incremental diff; compare against the candidate diff above.\n");
+        }
+    }
+    (section.len() <= budget).then_some(section)
+}
+
+fn clip_chars(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_owned(),
+    }
 }
 
 fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
@@ -1113,8 +1235,8 @@ fn truncate_at_char_boundary(text: &str, limit: usize) -> &str {
 /// Parse a reviewer's reply: free Markdown ending in one result block
 /// `{"result": "pass|fail|blocked", "reason": "..."}`.
 ///
-/// The last JSON object that names a result wins, so a reviewer may quote
-/// JSON or code in its review, or correct itself later in the same reply. The
+/// The last complete JSON object that names a result wins, so a reviewer may
+/// quote JSON or code in its review, or correct itself later in the same reply. The
 /// block is read leniently — unknown keys are ignored, `verdict` is accepted
 /// for `result`, and case does not matter — because a well-meant extra field
 /// or a slightly different key used to throw away a whole review. Everything
@@ -1123,16 +1245,39 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     if message.len() > MAX_REPORT_BYTES {
         return Err("review report exceeds size budget".into());
     }
-    let (span, result, reason) = message
+    let (span, result, reason, fixable_by, repeat, findings, resolved) = message
         .match_indices('{')
         .rev()
-        .find_map(|(open, _)| {
+        .filter_map(|(open, _)| {
+            if is_list_element(message, open) {
+                return None;
+            }
             let mut values =
                 serde_json::Deserializer::from_str(&message[open..]).into_iter::<Value>();
             let value = values.next()?.ok()?;
             let (result, reason) = result_block(&value)?;
-            Some(((open, open + values.byte_offset()), result, reason))
+            let fixable_by = match value.get("fixable_by").and_then(Value::as_str) {
+                Some(value) if value.trim().eq_ignore_ascii_case("owner") => FixableBy::Owner,
+                _ => FixableBy::Coder,
+            };
+            let repeat = match value.get("repeat") {
+                Some(Value::Bool(value)) => *value,
+                Some(Value::String(value)) => value.trim().eq_ignore_ascii_case("true"),
+                _ => false,
+            };
+            Some((
+                (open, open + values.byte_offset()),
+                result,
+                reason,
+                fixable_by,
+                repeat,
+                parse_findings(value.get("findings")),
+                parse_resolved(value.get("resolved")),
+            ))
         })
+        // Prefer the last complete result object, including its closing
+        // brace, so a valid block wins over the objects nested inside it.
+        .max_by_key(|((_, close), ..)| *close)
         .ok_or(
             "review must end with one result block: {\"result\": \"pass|fail|blocked\", \
              \"reason\": \"one sentence\"}",
@@ -1140,8 +1285,77 @@ pub fn parse_assessment(message: &str) -> Result<ReviewAssessment, String> {
     Ok(ReviewAssessment {
         result,
         reason,
+        fixable_by,
+        repeat,
+        findings,
+        resolved,
         report: report_without_block(message, span),
     })
+}
+
+/// An object right after `[` or `,` (with no blank line between) is an item
+/// of a list, such as a finding inside a result block whose JSON is broken.
+/// It is never the verdict. A correction turn is appended after a blank line,
+/// so it stays readable even when the turn before it was cut off mid-list.
+fn is_list_element(message: &str, open: usize) -> bool {
+    let before = &message[..open];
+    let content = before.trim_end();
+    before[content.len()..].matches('\n').count() < 2 && content.ends_with(['[', ','])
+}
+
+const MAX_FINDINGS: usize = 50;
+const MAX_FINDING_TEXT_CHARS: usize = 1_000;
+
+fn finding_text(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.chars().take(MAX_FINDING_TEXT_CHARS).collect())
+}
+
+fn parse_findings(value: Option<&Value>) -> Vec<ReviewFinding> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            Some(ReviewFinding {
+                requirement_ids: parse_resolved(item.get("requirement_ids")),
+                kind: item.get("kind").and_then(Value::as_str).and_then(|kind| {
+                    match kind.trim().to_ascii_lowercase().as_str() {
+                        "regression" => Some(api_types::ReviewFindingKind::Regression),
+                        "missed" => Some(api_types::ReviewFindingKind::Missed),
+                        "out_of_scope" => Some(api_types::ReviewFindingKind::OutOfScope),
+                        _ => None,
+                    }
+                }),
+                same_cause_as: finding_text(item.get("same_cause_as")),
+                summary: finding_text(item.get("summary"))?,
+                id: finding_text(item.get("id")),
+                severity: match item.get("severity").and_then(Value::as_str) {
+                    Some(severity) if severity.trim().eq_ignore_ascii_case("minor") => {
+                        ReviewFindingSeverity::Minor
+                    }
+                    _ => ReviewFindingSeverity::Blocking,
+                },
+                r#where: finding_text(item.get("where")),
+                expected: finding_text(item.get("expected")),
+                observed: finding_text(item.get("observed")),
+            })
+        })
+        .take(MAX_FINDINGS)
+        .collect()
+}
+
+fn parse_resolved(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| finding_text(Some(id)))
+        .take(MAX_FINDINGS)
+        .collect()
 }
 
 fn result_block(value: &Value) -> Option<(ReviewResult, String)> {
@@ -1189,7 +1403,7 @@ fn report_without_block(message: &str, (open, close): (usize, usize)) -> String 
 pub async fn evaluate(
     db: &SqliteDb,
     execution_id: &str,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     message: &str,
 ) -> Result<ReviewConformance, String> {
     let contract = db
@@ -1211,6 +1425,9 @@ pub async fn evaluate(
     };
     let validation = evaluate_inner(db, path, message, &contract, &mut result).await;
     if let Err(reason) = validation {
+        if let Some(error) = path.infrastructure_error(&reason) {
+            return Err(error.to_string());
+        }
         // A check that outran its limit says nothing about the candidate or
         // the reviewer's verdict (a build lock held by a sibling Task is the
         // usual cause). Leave it unrecorded so the checks alone can run again.
@@ -1271,14 +1488,29 @@ async fn verify_contract_context(db: &SqliteDb, contract: &ReviewContract) -> Re
     Ok(())
 }
 
+fn retain_contract_requirement_ids(report: &mut ReviewAssessment, contract: &ReviewContract) {
+    for finding in &mut report.findings {
+        finding.requirement_ids.retain(|id| {
+            contract
+                .context
+                .requirements
+                .iter()
+                .any(|requirement| requirement.id == *id)
+        });
+        finding.requirement_ids.sort();
+        finding.requirement_ids.dedup();
+    }
+}
+
 async fn evaluate_inner(
     db: &SqliteDb,
-    path: &Path,
+    path: &(impl ReviewWorkspace + ?Sized),
     message: &str,
     contract: &ReviewContract,
     result: &mut ReviewConformance,
 ) -> Result<(), String> {
-    let report = parse_assessment(message)?;
+    let mut report = parse_assessment(message)?;
+    retain_contract_requirement_ids(&mut report, contract);
     // Keep the review even when the checks below fail: its Markdown is what
     // the coder or the owner reads next.
     result.assessment = Some(report.clone());
@@ -1303,7 +1535,7 @@ async fn evaluate_inner(
         !contract.context.setup_steps.is_empty() || !contract.context.required_checks.is_empty();
     let environment = project_environment(db, &contract.context.task_id).await?;
     if runs_checks {
-        executors::environment::materialize_assets(checkout, &environment.assets).await?;
+        checkout.materialize_assets(&environment).await?;
     }
     let timeout = contract
         .context
@@ -1311,21 +1543,13 @@ async fn evaluate_inner(
         .unwrap_or(DEFAULT_CHECK_TIMEOUT_SECONDS);
     let mut setup_failed = false;
     for (index, setup) in contract.context.setup_steps.iter().enumerate() {
-        let mut command = Command::new("bash");
-        command
-            .args(["-lc", setup])
-            .envs(&environment.env)
-            .current_dir(checkout)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .kill_on_drop(true);
-        let output = check_output(&mut command, setup, timeout).await?;
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let output = check_workspace_output(checkout, setup, &environment.env, timeout).await?;
+        let mut text = output.stdout;
+        text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
-        let exit_code = output.status.code().unwrap_or(-1);
+        let exit_code = output.exit_code.unwrap_or(-1);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: format!("setup:{index}"),
             command: setup.clone(),
             exit_code,
@@ -1342,23 +1566,30 @@ async fn evaluate_inner(
         .iter()
         .take_while(|_| !setup_failed)
     {
-        let mut command = Command::new("bash");
-        command
-            .args(["-lc", &check.command])
-            .envs(&environment.env)
-            .current_dir(checkout)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .kill_on_drop(true);
-        let output = check_output(&mut command, &check.command, timeout).await?;
-        let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        // Entry triage already established that these exact CI failures are
+        // non-blocking. Keep their real verdict and frozen classification;
+        // do not turn conformance into another untriaged run of that command.
+        if let Some(previous) = contract.check_results.iter().find(|previous| {
+            previous.check_id == check.id
+                && previous.command == check.command
+                && previous
+                    .triage
+                    .as_ref()
+                    .is_some_and(|triage| !triage.blocking)
+        }) {
+            result.checks.push(previous.clone());
+            continue;
+        }
+        let output =
+            check_workspace_output(checkout, &check.command, &environment.env, timeout).await?;
+        let mut text = output.stdout;
+        text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: check.id.clone(),
             command: check.command.clone(),
-            exit_code: output.status.code().unwrap_or(-1),
+            exit_code: output.exit_code.unwrap_or(-1),
             output: output_tail(&text),
         });
     }
@@ -1402,7 +1633,10 @@ async fn evaluate_inner(
         result.reason = Some(reason);
         return Ok(());
     }
-    let failed_check = result.checks.iter().any(|check| check.exit_code != 0);
+    let failed_check = result
+        .checks
+        .iter()
+        .any(ConformanceCheckResult::is_blocking);
     // A failing required check is a defect in the candidate whatever the
     // reviewer concluded. Otherwise the reviewer's result stands: a pass is
     // only as strong as the checks Forge ran, which is why projects should
@@ -1439,6 +1673,38 @@ mod tests {
             "documents":[], "workflow":{}, "project_settings":{}})
     }
 
+    #[test]
+    fn ci_triage_reviewer_input_bounds_signature_lists_without_changing_routing() {
+        let triage = StepCiTriage {
+            mode: ReviewCiTriage::Full,
+            base_status: CiBaseStatus::Available,
+            base_commit: None,
+            rerun_run_id: None,
+            base_run_id: None,
+            reason: None,
+            class: None,
+            blocking: false,
+            failures: (0..200)
+                .map(|index| CiFailureTriage {
+                    signature: format!("test-{index}"),
+                    class: CiFailureClass::PreExisting,
+                })
+                .collect(),
+        };
+        let mut budget = 20;
+        let first = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        let second = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        assert_eq!(first.failures.len(), 20);
+        assert!(second.failures.is_empty());
+        assert!(!first.blocking && !second.blocking);
+        assert_eq!(
+            triage.failures.len(),
+            200,
+            "source evidence remains complete"
+        );
+        assert!(first.reason.unwrap().contains("20 of 200"));
+        assert!(second.reason.unwrap().contains("0 of 200"));
+    }
     #[tokio::test]
     async fn project_environment_fails_closed_without_task_authority() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -1586,6 +1852,451 @@ mod tests {
         let verdict = parse_assessment("{\"verdict\": \"passed\"}").unwrap();
         assert_eq!(verdict.result, ReviewResult::Pass);
         assert_eq!(verdict.reason, "");
+        assert_eq!(verdict.fixable_by, FixableBy::Coder);
+        assert!(!verdict.repeat);
+    }
+
+    #[tokio::test]
+    async fn prior_review_prompt_includes_window_open_ids_and_an_8k_report_slice() {
+        use db::TransitionLogRepo;
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = SqliteDb::new(pool);
+        let start = "2026-10-15T00:00:00Z";
+        sqlx::query(
+            "INSERT INTO project(id,name,created_at,updated_at) VALUES('project','Review',?,?)",
+        )
+        .bind(start)
+        .bind(start)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES('task','project','Review','review',?,?)")
+            .bind(start).bind(start).execute(db.pool()).await.unwrap();
+        for id in ["candidate", "prior-reviewer"] {
+            sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,'task','reviewer','completed',?,?)")
+                .bind(id).bind(start).bind(start).execute(db.pool()).await.unwrap();
+        }
+        let contract = ReviewContract {
+            execution_id: "prior-reviewer".into(),
+            policy: REVIEW_CONFORMANCE_POLICY.into(),
+            commit_sha: "same".into(),
+            base_sha: "same".into(),
+            candidate_changed_paths: Vec::new(),
+            context: context_from_source(&source()).unwrap(),
+            check_results: Vec::new(),
+            digest: "prior-contract".into(),
+        };
+        // A historical contract fixture lets this test exercise prompt reads
+        // without requiring Git or admitting a new reviewer execution.
+        sqlx::query("INSERT INTO execution_review_contract VALUES(?,?,?,?,?,?)")
+            .bind(&contract.execution_id)
+            .bind("task")
+            .bind(&contract.digest)
+            .bind(&contract.context.source_digest)
+            .bind(serde_json::to_string(&contract).unwrap())
+            .bind(start)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        // Two short findings, then 48 at the 1,000-character field limit.
+        let mut findings = vec![json!({"summary":"one"}), json!({"summary":"two"})];
+        findings.extend((3..=50).map(
+            |n| json!({"summary":format!("{n}{}", "S".repeat(1_000)),"where":"W".repeat(1_000)}),
+        ));
+        let block = json!({"result":"fail","reason":"observed problem","findings":findings});
+        let assessment = parse_assessment(&format!("{}END\n{block}", "R".repeat(9000))).unwrap();
+        assert_eq!(assessment.findings.len(), 50);
+        let conformance = ReviewConformance {
+            status: ConformanceStatus::Failed,
+            contract: Some(contract.clone()),
+            assessment: Some(assessment),
+            checks: Vec::new(),
+            reason: Some("observed problem".into()),
+        };
+        db.record_review_conformance(&conformance).await.unwrap();
+        for (attempt, details) in [
+            (1, json!({"conformance":conformance})),
+            (
+                2,
+                json!({"ci_steps":[{"index":2,"command":"cargo test","exit_code":101,"stderr_tail":"failed"}]}),
+            ),
+        ] {
+            let review = ReviewRepo::create(
+                &db,
+                db::CreateReview {
+                    id: format!("review-{attempt}"),
+                    task_id: "task".into(),
+                    execution_id: "candidate".into(),
+                    attempt_number: attempt,
+                    status: db::ReviewStatus::Failed,
+                    step_results_json: details.to_string(),
+                    started_at: format!("2026-10-15T00:00:0{attempt}Z"),
+                    created_at: format!("2026-10-15T00:00:0{attempt}Z"),
+                    updated_at: start.into(),
+                },
+            )
+            .await
+            .unwrap();
+            if attempt == 1 {
+                sqlx::query("UPDATE review SET reviewer_execution_id='prior-reviewer' WHERE id=?")
+                    .bind(review.id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let section = prior_review_section(
+            &db,
+            "task",
+            "next-reviewer",
+            &directory.path().to_path_buf(),
+            &contract,
+            32 * 1024,
+        )
+        .await
+        .unwrap();
+        for expected in [
+            "F1: one",
+            "F2: two",
+            "CI-2: cargo test failed",
+            "copy its id into findings",
+            "in resolved",
+            "Frozen requirement ids:",
+            "After the first review in this window",
+            "candidate_changed_paths",
+            "same_cause_as",
+            "[report truncated]",
+        ] {
+            assert!(section.contains(expected), "missing {expected}");
+        }
+        for requirement in &contract.context.requirements {
+            assert!(section.contains(&requirement.id));
+        }
+        assert!(section.contains(&"R".repeat(8192)));
+        assert!(!section.contains(&"R".repeat(8193)));
+        assert!(!section.contains("END"));
+        // 50 open findings at the field limits stay bounded, and every id is
+        // offered for continuation.
+        let overflow: Vec<&str> = section
+            .lines()
+            .find_map(|line| line.strip_prefix("Also open (details in the Review history): "))
+            .map(|ids| ids.split(", ").collect())
+            .unwrap_or_default();
+        for n in 1..=50 {
+            let id = format!("F{n}");
+            assert!(
+                section.contains(&format!("- {id}: ")) || overflow.contains(&id.as_str()),
+                "missing {id}"
+            );
+        }
+        assert!(!section.contains(&"S".repeat(201)));
+        assert!(section.len() < 18 * 1024, "{}", section.len());
+        TransitionLogRepo::insert_recovery_marker(
+            &db,
+            "task",
+            "review",
+            "reset_retry_window",
+            "test",
+            "new window",
+        )
+        .await
+        .unwrap();
+        // A recovery reset restarts the ledger, not the reviewer's context:
+        // the previous verdict and report stay; no stale ids are offered.
+        let section = prior_review_section(
+            &db,
+            "task",
+            "next-reviewer",
+            &directory.path().to_path_buf(),
+            &contract,
+            32 * 1024,
+        )
+        .await
+        .unwrap();
+        assert!(section.contains("Previous review (attempt 1, result fail"));
+        assert!(section.contains(&"R".repeat(8192)));
+        assert!(!section.contains("Open findings"));
+        assert!(!section.contains("F1: one"));
+    }
+
+    #[test]
+    fn findings_unknown_requirement_ids_are_dropped_before_freezing() {
+        let context = context_from_source(&source()).unwrap();
+        let known = context.requirements[0].id.clone();
+        let contract = ReviewContract {
+            execution_id: "e".into(),
+            policy: REVIEW_CONFORMANCE_POLICY.into(),
+            commit_sha: "c".into(),
+            base_sha: "b".into(),
+            candidate_changed_paths: vec![],
+            context,
+            check_results: vec![],
+            digest: "d".into(),
+        };
+        let mut report = parse_assessment(&json!({"result":"fail","findings":[{"summary":"missed", "requirement_ids":[known, "R99", known]}]}).to_string()).unwrap();
+        retain_contract_requirement_ids(&mut report, &contract);
+        assert_eq!(report.findings[0].requirement_ids, [known]);
+        assert!(!serde_json::to_string(&report).unwrap().contains("R99"));
+        let prompt = contract_prompt(&contract);
+        assert!(prompt.contains(&format!(
+            "Frozen requirement ids: {}",
+            contract
+                .context
+                .requirements
+                .iter()
+                .map(|requirement| requirement.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+        assert!(prompt.contains("After the first review in a window"));
+    }
+
+    #[test]
+    fn findings_parser_anchoring_fields_are_lenient_and_omit_empty_values() {
+        let parsed = parse_assessment(&json!({"result":"fail","findings":[
+            {"summary":"valid", "requirement_ids":[" R2 ",4,null,""], "kind":" MISSED ", "same_cause_as":" F1 "},
+            {"summary":"malformed", "requirement_ids":{}, "kind":"new_kind", "same_cause_as":4},
+            {"summary":"regressed", "kind":"regression"},
+            {"summary":"later work", "kind":"out_of_scope"}
+        ]}).to_string()).unwrap();
+        assert_eq!(parsed.findings[0].requirement_ids, ["R2"]);
+        assert_eq!(
+            parsed.findings[0].kind,
+            Some(api_types::ReviewFindingKind::Missed)
+        );
+        assert_eq!(parsed.findings[0].same_cause_as.as_deref(), Some("F1"));
+        let malformed = serde_json::to_value(&parsed.findings[1]).unwrap();
+        for field in ["requirement_ids", "kind", "same_cause_as"] {
+            assert!(malformed.get(field).is_none(), "{malformed}");
+        }
+        assert_eq!(
+            parsed.findings[2].kind,
+            Some(api_types::ReviewFindingKind::Regression)
+        );
+        assert_eq!(
+            parsed.findings[3].kind,
+            Some(api_types::ReviewFindingKind::OutOfScope)
+        );
+    }
+
+    #[test]
+    fn findings_parser_reads_findings_and_resolutions() {
+        let parsed = parse_assessment(r#"Report.
+{"result":"fail","reason":"empty input crashes","findings":[{"summary":"Empty input crashes parse()","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"id":"F2","summary":"typo","severity":" MINOR "}],"resolved":["F1"]}"#).unwrap();
+        assert_eq!(parsed.result, ReviewResult::Fail);
+        assert_eq!(parsed.report, "Report.");
+        assert_eq!(parsed.findings.len(), 2);
+        assert_eq!(parsed.findings[0].severity, ReviewFindingSeverity::Blocking);
+        assert_eq!(
+            parsed.findings[0].r#where.as_deref(),
+            Some("src/parse.rs:42")
+        );
+        assert_eq!(
+            parsed.findings[0].expected.as_deref(),
+            Some("error message")
+        );
+        assert_eq!(parsed.findings[0].observed.as_deref(), Some("panic"));
+        assert_eq!(parsed.findings[1].severity, ReviewFindingSeverity::Minor);
+        assert_eq!(parsed.findings[1].id.as_deref(), Some("F2"));
+        assert_eq!(parsed.resolved, ["F1"]);
+    }
+
+    #[test]
+    fn findings_parser_ignores_malformed_lists_and_items() {
+        for malformed in [json!(null), json!("see above"), json!({}), json!(7)] {
+            let parsed = parse_assessment(
+                &json!({"result":"fail","reason":"x","findings":malformed,"resolved":malformed})
+                    .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.result, ReviewResult::Fail);
+            assert_eq!(parsed.reason, "x");
+            assert!(parsed.findings.is_empty());
+            assert!(parsed.resolved.is_empty());
+        }
+        let parsed = parse_assessment(&json!({"result":"pass","findings":[null,4,"x",{}, {"summary":"  "}, {"summary":4}, {"summary":"good","severity":{}}, {"summary":"other","severity":"unknown","where":4}],"resolved":[null,{},8," ","F1"]}).to_string()).unwrap();
+        assert_eq!(parsed.findings.len(), 2);
+        assert!(parsed
+            .findings
+            .iter()
+            .all(|finding| finding.severity == ReviewFindingSeverity::Blocking));
+        assert!(parsed.findings[1].r#where.is_none());
+        assert_eq!(parsed.resolved, ["F1"]);
+    }
+
+    #[test]
+    fn findings_parser_nested_result_keys_cannot_override_the_verdict() {
+        let parsed = parse_assessment(r#"{"result":"fail","reason":"outer","findings":[{"summary":"bug","result":"pass"}],"resolved":[{"result":"blocked"}]}"#).unwrap();
+        assert_eq!(parsed.result, ReviewResult::Fail);
+        assert_eq!(parsed.reason, "outer");
+        assert_eq!(parsed.findings.len(), 1);
+        assert!(parsed.resolved.is_empty());
+        assert!(parsed.report.is_empty());
+    }
+
+    #[test]
+    fn findings_parser_broken_outer_block_cannot_supply_a_nested_verdict() {
+        for key in ["result", "verdict"] {
+            for broken in [
+                format!(r#"{{"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}],}}"#),
+                format!(r#"{{"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]"#),
+                format!(r#"{{"result":fail,"findings":[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(r#"{{result:"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(r#"{{'result':'fail','findings':[{{"summary":"bug","{key}":"pass"}}]}}"#),
+                format!(
+                    r#"{{/* comment */"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#
+                ),
+                format!(
+                    r#"{{not-json,"result":"fail","findings":[{{"summary":"bug","{key}":"pass"}}]}}"#
+                ),
+                format!(
+                    r#"{{"result":"fail","findings":[{{"summary":"a"}}, {{"summary":"bug","{key}":"pass"}}],}}"#
+                ),
+                format!(
+                    "{{\n  \"result\": \"fail\",\n  \"findings\": [\n    {{\"summary\": \"bug\", \"{key}\": \"pass\"}}\n  ],\n}}"
+                ),
+            ] {
+                assert!(parse_assessment(&broken).is_err(), "{broken}");
+                let corrected =
+                    format!("{broken}\n\n{{\"result\":\"fail\",\"reason\":\"corrected\"}}");
+                assert_eq!(parse_assessment(&corrected).unwrap().reason, "corrected");
+            }
+        }
+    }
+
+    /// Replies the parser read before the nested-verdict guard must still
+    /// read the same: code with apostrophes or lifetimes, unclosed excerpts,
+    /// wrapped verdicts, and correction turns after any kind of cut-off.
+    #[test]
+    fn findings_parser_reads_code_quotes_and_corrections_after_a_cut_off() {
+        let fence = "```";
+        let correction = "\n\n{\"result\":\"fail\",\"reason\":\"corrected\"}";
+        let cases = [
+            format!("{fence}rust\npub struct Parser<'a> {{\n    input: &'a str,\n}}\n{fence}\n\n{{\"result\":\"fail\",\"reason\":\"lifetime\"}}"),
+            format!("{fence}ts\nconst config = {{\n  retries: 0, // don't retry\n}};\n{fence}\n\n{{\"result\":\"fail\",\"reason\":\"comment\"}}"),
+            format!("{fence}js\nswitch (kind) {{\n  case \"a\": return 1; // isn't reached\n}}\n{fence}\n{{\"result\":\"fail\",\"reason\":\"switch\"}}"),
+            format!("{fence}js\nconst routes = {{\n  home: '/',\n{fence}\n{{\"result\":\"fail\",\"reason\":\"excerpt\"}}"),
+            "`struct S<'a> { s: &'a str }` borrows.\n{\"result\":\"fail\",\"reason\":\"inline\"}".to_owned(),
+            "The type `{ id: string, name: user's name }` is off.\n{\"result\":\"fail\",\"reason\":\"type\"}".to_owned(),
+            "Partial: {name: \"x\", age: 5\n{\"result\":\"fail\",\"reason\":\"unclosed\"}".to_owned(),
+            "{\"review\":{\"result\":\"fail\",\"reason\":\"wrapped\"}}".to_owned(),
+            format!("Review.\n\n{{\"result\":\"fail\",\"reason\":\"the parser crashes on emp{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\"}},{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\",\"where\":\"a.rs\"{correction}"),
+            format!("Review.\n\n{{\"result\":\"fail\",\"findings\":[{{\"summary\":\"one\"}}{correction}"),
+        ];
+        let expected = [
+            "lifetime",
+            "comment",
+            "switch",
+            "excerpt",
+            "inline",
+            "type",
+            "unclosed",
+            "wrapped",
+            "corrected",
+            "corrected",
+            "corrected",
+            "corrected",
+        ];
+        for (reply, reason) in cases.iter().zip(expected) {
+            let parsed = parse_assessment(reply).unwrap_or_else(|error| panic!("{reply}: {error}"));
+            assert_eq!(parsed.result, ReviewResult::Fail, "{reply}");
+            assert_eq!(parsed.reason, reason, "{reply}");
+        }
+    }
+
+    #[test]
+    fn findings_parser_keeps_legacy_serialization() {
+        let parsed = parse_assessment(r#"{"result":"fail","reason":"legacy"}"#).unwrap();
+        assert!(parsed.findings.is_empty());
+        assert!(parsed.resolved.is_empty());
+        // The v0.13.12 shape: defaults are omitted, so a frozen row from that
+        // writer and a new default verdict serialize the same way.
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            r#"{"result":"fail","reason":"legacy","report":""}"#
+        );
+        let routed = parse_assessment(
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&routed).unwrap(),
+            r#"{"result":"fail","reason":"x","fixable_by":"owner","repeat":true,"report":""}"#
+        );
+    }
+
+    #[test]
+    fn findings_parser_caps_valid_items_and_unicode_text() {
+        let long = "界".repeat(1_100);
+        let parsed = parse_assessment(&json!({"result":"fail","findings":[{"summary":long,"id":long,"where":long,"expected":long,"observed":long}],"resolved":[long]}).to_string()).unwrap();
+        let finding = &parsed.findings[0];
+        for text in [
+            Some(finding.summary.as_str()),
+            finding.id.as_deref(),
+            finding.r#where.as_deref(),
+            finding.expected.as_deref(),
+            finding.observed.as_deref(),
+            Some(parsed.resolved[0].as_str()),
+        ] {
+            assert_eq!(text.unwrap().chars().count(), 1_000);
+        }
+        let mut findings = vec![json!({"summary":""}); 10];
+        findings.extend((0..60).map(|n| json!({"summary":format!("finding {n}")})));
+        let parsed = parse_assessment(&json!({"result":"fail","findings":findings,"resolved":(0..60).map(|n|format!("F{n}")).collect::<Vec<_>>()} ).to_string()).unwrap();
+        assert_eq!(parsed.findings.len(), 50);
+        assert_eq!(parsed.findings.last().unwrap().summary, "finding 49");
+        assert_eq!(parsed.resolved.len(), 50);
+    }
+
+    #[test]
+    fn finding_routing_fields_are_read_leniently_from_the_last_result() {
+        let owner = parse_assessment(
+            r#"{"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"OWNER"}"#,
+        )
+        .unwrap();
+        assert_eq!(owner.fixable_by, FixableBy::Owner);
+        assert!(!owner.repeat);
+        for repeat in [json!(true), json!("true"), json!(" TRUE ")] {
+            let parsed = parse_assessment(
+                &json!({
+                    "result": "failed", "fixable_by": "CoDeR", "repeat": repeat,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.fixable_by, FixableBy::Coder);
+            assert!(parsed.repeat);
+        }
+        for unknown in [json!(null), json!(7), json!("unknown"), json!({})] {
+            let parsed = parse_assessment(
+                &json!({
+                    "result": "fail", "fixable_by": unknown, "repeat": unknown,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(parsed.fixable_by, FixableBy::Coder);
+            assert!(!parsed.repeat);
+        }
+        for repeat in [json!(false), json!("false"), json!("FALSE")] {
+            assert!(
+                !parse_assessment(&json!({"result":"fail", "repeat":repeat}).to_string())
+                    .unwrap()
+                    .repeat
+            );
+        }
+        let last = parse_assessment(
+            "{\"result\":\"fail\",\"fixable_by\":\"owner\",\"repeat\":true}\n\
+             {\"result\":\"fail\",\"reason\":\"last result\"}",
+        )
+        .unwrap();
+        assert_eq!(last.reason, "last result");
+        assert_eq!(last.fixable_by, FixableBy::Coder);
+        assert!(!last.repeat);
     }
 
     #[test]
@@ -1885,7 +2596,19 @@ mod tests {
         let prompt = contract_prompt(&c);
         assert_eq!(prompt.matches(&c.context.source_digest).count(), 1);
         assert!(!prompt.contains("Forge governing context"));
-        assert!(prompt.len() <= serialized.len() + RESPONSE_INSTRUCTION.len() + 64);
+        assert!(prompt.contains("fixable_by is \"coder\" (default) or \"owner\""));
+        assert!(prompt.contains("repeat defaults to false"));
+        assert!(prompt.contains("Owner example:") && prompt.contains("Repeat example:"));
+        let requirement_ids_bytes: usize = c
+            .context
+            .requirements
+            .iter()
+            .map(|requirement| requirement.id.len() + 2)
+            .sum();
+        assert!(
+            prompt.len()
+                <= serialized.len() + RESPONSE_INSTRUCTION.len() + requirement_ids_bytes + 96
+        );
         assert!(prompt.len() <= MAX_PREPARED_PROMPT_BYTES);
     }
 

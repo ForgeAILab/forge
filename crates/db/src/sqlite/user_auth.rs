@@ -198,3 +198,41 @@ fn map_refresh_token(row: SqliteRow) -> Result<RefreshToken> {
         created_at: row.try_get("created_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn bootstrap_first_user_admin_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        updated_at: String,
+        user_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE user SET is_admin = 1, updated_at = ? WHERE id = ?")
+            .bind(updated_at)
+            .bind(user_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+pub async fn execution_admission_account_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    owner_id: String,
+) -> crate::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
+            .bind(owner_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+pub async fn execution_admission_default_account_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+) -> crate::Result<Option<String>> {
+    Ok(sqlx::query_scalar::<_, String>(
+        "SELECT id FROM user ORDER BY is_admin DESC, created_at, id LIMIT 1",
+    )
+    .fetch_optional(connection)
+    .await?)
+}

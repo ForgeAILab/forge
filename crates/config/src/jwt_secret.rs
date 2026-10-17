@@ -365,9 +365,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn config_for(data_dir: &Path) -> ForgeConfig {
-        let mut config = ForgeConfig::default();
-        config.forge.data_dir = data_dir.to_path_buf();
-        config
+        ForgeConfig::with_data_dir(data_dir.to_path_buf())
     }
 
     #[cfg(unix)]

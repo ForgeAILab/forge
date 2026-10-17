@@ -183,10 +183,10 @@ pub(crate) async fn force_task_version_conflict_after_transition(
     let now = now_rfc3339().replace('\'', "''");
     let sql = format!(
         "CREATE TRIGGER \"{trigger_name}\"
-         AFTER UPDATE OF hook_results_json ON transition_log
+         AFTER INSERT ON task_step
          WHEN NEW.task_id = '{first_task_id}'
-          AND NEW.to_state = '{to_state}'
-          AND NEW.hook_results_json IS NOT NULL
+          AND NEW.expected_status = '{to_state}'
+          AND NEW.kind = 'hooks'
          BEGIN
              UPDATE task
              SET version = version + 1, updated_at = '{now}'
@@ -197,4 +197,160 @@ pub(crate) async fn force_task_version_conflict_after_transition(
         .execute(db.pool())
         .await
         .expect("test agent capacity cutover trigger creates");
+}
+
+/// Preserve final-state assertions while testing the asynchronous cascade path.
+pub(crate) async fn drain_transition(
+    service: &crate::TaskService,
+    mut result: crate::task_service::TransitionResult,
+) -> crate::task_service::TransitionResult {
+    result.task = service
+        .drain(&result.task.id)
+        .await
+        .expect("Task steps drain");
+    result.review = db::ReviewRepo::list_by_task(&*service.workflow_engine().db, &result.task.id)
+        .await
+        .expect("Review history loads")
+        .into_iter()
+        .max_by_key(|r| r.attempt_number);
+    result.pending_steps = 0;
+    result
+}
+
+/// Enqueue-only producers return before their Task projection changes.
+pub(crate) async fn drain_task_steps(db: &SqliteDb, task_id: &str) {
+    let service = crate::TaskService::new(
+        std::sync::Arc::new(db.clone()),
+        std::sync::Arc::new(events::EventBus::default()),
+    );
+    service
+        .drain(task_id)
+        .await
+        .expect("queued Task effects settle");
+}
+
+/// A claimed step for a Task, as the worker holds while it executes a step.
+/// Unit tests of in-lease helpers run them inside it, as production does;
+/// outside a lease those helpers only queue their writes. Claim it before
+/// opening a write transaction the helper will use.
+pub(crate) struct TestTaskLease {
+    db: SqliteDb,
+    step: db::TaskStep,
+}
+
+impl TestTaskLease {
+    pub(crate) async fn claim(db: &SqliteDb, task_id: &str) -> Self {
+        use db::TaskStepRepo;
+        let id = db::new_uuid_v4();
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_key,chain_id,chain_position,expected_status,expected_version,expected_epoch,lane,status,claimed_by,lease_until,available_at,attempts,created_at,updated_at) SELECT ?,t.id,COALESCE((SELECT MAX(seq) FROM task_step WHERE task_id=t.id),0)+1,'command','{}',?,?,1,t.status,t.version,t.status_epoch,'fast','claimed','test-lease',?,?,1,?,? FROM task t WHERE t.id=?")
+            .bind(&id).bind(&id).bind(&id).bind(db::task_writer::lease_deadline()).bind(&now).bind(&now).bind(&now).bind(task_id)
+            .execute(db.pool()).await.expect("test lease step");
+        let step = db
+            .task_steps(task_id)
+            .await
+            .expect("test lease reads steps")
+            .into_iter()
+            .find(|step| step.id == id)
+            .expect("test lease step exists");
+        Self {
+            db: db.clone(),
+            step,
+        }
+    }
+
+    pub(crate) async fn run<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        db::task_writer::in_task_step(self.step.clone(), future).await
+    }
+
+    pub(crate) async fn release(self) {
+        use db::TaskStepRepo;
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .expect("test lease settles");
+        let _ = self
+            .db
+            .finish_step_in_tx(&mut tx, &self.step, "done", None)
+            .await;
+        tx.commit().await.expect("test lease commits");
+        self.db
+            .release_step(&self.step.id, "test-lease")
+            .await
+            .expect("test lease releases");
+    }
+}
+
+/// Run `future` under a fresh [`TestTaskLease`] for `task_id`.
+pub(crate) async fn with_task_lease<T>(
+    db: &SqliteDb,
+    task_id: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let lease = TestTaskLease::claim(db, task_id).await;
+    let output = lease.run(future).await;
+    lease.release().await;
+    output
+}
+
+/// A native Agent with a healthy provider connection: the only kind of
+/// Agent that may lead a coordination root.
+pub(crate) async fn seed_native_agent(db: &SqliteDb) -> String {
+    use db::{AgentConnectionHealthRepo, AgentRepo};
+    let now = now_rfc3339();
+    let id = db::new_uuid_v4();
+    let agent = AgentRepo::create_identity_with_profile(
+        db,
+        db::CreateAgentIdentity {
+            id: id.clone(),
+            name: "lead".to_owned(),
+            description: None,
+            max_concurrent_tasks: 2,
+            heartbeat_interval_seconds: 30,
+            max_missed_heartbeats: 3,
+            status: db::AgentStatus::Idle,
+            last_heartbeat_at: Some(now.clone()),
+            is_default: false,
+            paused: false,
+            owner_id: None,
+            visibility: "global".to_owned(),
+            account_permission_ceiling: "{}".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+        db::CreateAgentProfile {
+            id: db::new_uuid_v4(),
+            identity_id: id.clone(),
+            backend_kind: "native".to_owned(),
+            executor_type: "embedded".to_owned(),
+            provider: Some("fixture".to_owned()),
+            model: Some("fixture-model".to_owned()),
+            reasoning_effort: None,
+            permission_policy: None,
+            prompt_template: None,
+            capabilities_json: "{}".to_owned(),
+            tool_policy_json: "{}".to_owned(),
+            config_json: "{}".to_owned(),
+            credential_ref: None,
+            daemon_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("native agent creates");
+    assert_eq!(agent.backend_kind, "native");
+    AgentConnectionHealthRepo::upsert_connection_health(
+        db,
+        db::UpsertAgentConnectionHealth {
+            profile_id: agent.profile_id.clone(),
+            status: "healthy".to_owned(),
+            capability_status_json: "{}".to_owned(),
+            checked_at: Some(now.clone()),
+            error_code: None,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("connection health records");
+    id
 }

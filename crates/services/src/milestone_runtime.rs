@@ -27,7 +27,7 @@ use db::{
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
-use sqlx::{Row, Sqlite, Transaction};
+use sqlx::{Sqlite, Transaction};
 use uuid::Uuid;
 
 use crate::{
@@ -286,16 +286,16 @@ impl MilestoneRuntime {
                 });
             }
         }
-        let locked = sqlx::query(
-            "UPDATE project_milestone SET version = version
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .bind(expected_milestone_version)
-        .execute(&mut *tx)
-        .await?;
-        if locked.rows_affected() != 1 {
+        let locked = self
+            .db
+            .lock_milestone_version_in_tx(
+                &mut tx,
+                milestone_id,
+                project_id,
+                expected_milestone_version,
+            )
+            .await?;
+        if locked != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         let milestone = self
@@ -406,16 +406,10 @@ impl MilestoneRuntime {
         // prevents a check/evidence mutation from being observed after the
         // candidate was computed but before the lifecycle CAS.
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        if let Some(existing) = sqlx::query(
-            "SELECT * FROM project_readiness_snapshot
-             WHERE project_id = ? AND idempotency_key = ?",
-        )
-        .bind(project_id)
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(readiness_record_from_row)
-        .transpose()?
+        if let Some(existing) = self
+            .db
+            .readiness_by_idempotency_in_tx(&mut tx, project_id, idempotency_key)
+            .await?
         {
             if existing.milestone_id != milestone_id
                 || existing.expected_milestone_version != expected_milestone_version
@@ -450,16 +444,16 @@ impl MilestoneRuntime {
         // readiness candidate must observe one authoritative SQLite snapshot;
         // a later lifecycle CAS alone would still permit a source mutation to
         // race between the first read and the evaluation.
-        let locked = sqlx::query(
-            "UPDATE project_milestone SET version = version
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .bind(expected_milestone_version)
-        .execute(&mut *tx)
-        .await?;
-        if locked.rows_affected() != 1 {
+        let locked = self
+            .db
+            .lock_milestone_version_in_tx(
+                &mut tx,
+                milestone_id,
+                project_id,
+                expected_milestone_version,
+            )
+            .await?;
+        if locked != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
 
@@ -547,18 +541,16 @@ impl MilestoneRuntime {
             .clone()
             .into_snapshot(new_uuid_v4(), now_rfc3339());
 
-        let current: i64 = sqlx::query_scalar(
-            "SELECT version FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(db::DbError::NotFound)?;
+        let current: i64 = self
+            .db
+            .milestone_version_in_tx(&mut tx, milestone_id, project_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
         if current != expected_milestone_version {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         insert_readiness(
+            &self.db,
             &mut tx,
             &snapshot,
             authorization,
@@ -597,24 +589,23 @@ impl MilestoneRuntime {
                 serde_json::to_string(&projection_reasons.reconciliation).map_err(json_error)?,
             )
         };
-        let changed = sqlx::query(
-            "UPDATE project_milestone
-             SET lifecycle = ?, blocker_reason_json = ?, stale_reason_json = ?,
-                 reconciliation_reason_json = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = ?
-               AND lifecycle IN ('active', 'ready_for_release', 'released')",
-        )
-        .bind(next_lifecycle)
-        .bind(blocker)
-        .bind(stale)
-        .bind(reconciliation)
-        .bind(&snapshot.computed_at)
-        .bind(milestone_id)
-        .bind(project_id)
-        .bind(expected_milestone_version)
-        .execute(&mut *tx)
-        .await?;
-        if changed.rows_affected() != 1 {
+        let changed = self
+            .db
+            .update_milestone_readiness_projection_in_tx(
+                &mut tx,
+                &db::UpdateMilestoneReadinessProjectionInput {
+                    lifecycle: next_lifecycle,
+                    blocker_json: &blocker,
+                    stale_json: &stale,
+                    reconciliation_json: &reconciliation,
+                    now: &snapshot.computed_at,
+                    milestone_id,
+                    project_id,
+                    expected_milestone_version,
+                },
+            )
+            .await?;
+        if changed != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         self.repair_primary_pointer_in_tx(&mut tx, project_id, milestone_id)
@@ -734,16 +725,16 @@ impl MilestoneRuntime {
         // the manifest/pins/lifecycle/event commit below happens while this
         // lock is held.
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let locked = sqlx::query(
-            "UPDATE project_milestone SET version = version
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .bind(expected_milestone_version)
-        .execute(&mut *tx)
-        .await?;
-        if locked.rows_affected() != 1 {
+        let locked = self
+            .db
+            .lock_milestone_version_in_tx(
+                &mut tx,
+                milestone_id,
+                project_id,
+                expected_milestone_version,
+            )
+            .await?;
+        if locked != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
 
@@ -825,16 +816,11 @@ impl MilestoneRuntime {
             idempotency_key,
             &released_at,
         )?;
-        if let Some(existing) = sqlx::query(
-            "SELECT * FROM project_release
-             WHERE project_id = ? AND idempotency_key = ?",
-        )
-        .bind(project_id)
-        .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
-        .await?
+        if let Some(existing) = self
+            .db
+            .release_by_idempotency_in_tx(&mut tx, project_id, idempotency_key)
+            .await?
         {
-            let existing = release_record_from_row(existing)?;
             if existing.milestone_id != milestone_id
                 || existing.readiness_snapshot_id != readiness_snapshot_id
                 || existing.readiness_digest != readiness_digest
@@ -851,29 +837,24 @@ impl MilestoneRuntime {
             tx.commit().await?;
             return self.release_from_record(existing).await;
         }
-        let current_version: i64 = sqlx::query_scalar(
-            "SELECT version FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(db::DbError::NotFound)?;
+        let current_version: i64 = self
+            .db
+            .milestone_version_in_tx(&mut tx, milestone_id, project_id)
+            .await?
+            .ok_or(db::DbError::NotFound)?;
         if current_version != expected_milestone_version {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        let current_candidate = sqlx::query(
-            "SELECT * FROM project_readiness_snapshot
-             WHERE id = ? AND project_id = ? AND milestone_id = ?",
-        )
-        .bind(readiness_snapshot_id)
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(readiness_record_from_row)
-        .transpose()?
-        .ok_or(db::DbError::NotFound)?;
+        let current_candidate = self
+            .db
+            .milestone_readiness_by_id_in_tx(
+                &mut tx,
+                readiness_snapshot_id,
+                project_id,
+                milestone_id,
+            )
+            .await?
+            .ok_or(db::DbError::NotFound)?;
         if current_candidate.readiness_digest != readiness_digest
             || current_candidate.readiness_digest != verified.readiness_digest
             || current_candidate.definition_revision_id
@@ -881,129 +862,126 @@ impl MilestoneRuntime {
         {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        let inserted = sqlx::query(
-            "INSERT INTO project_release (
-                id, project_id, milestone_id, release_sequence, release_revision,
-                release_identifier, milestone_revision_id, readiness_snapshot_id,
-                readiness_digest, summary, changelog,
-                known_issues_json, charter_revision_id, document_revisions_json, decision_ids_json,
-                task_references_json, validation_references_json, git_references_json,
-                evidence_references_json, waivers_json, releasing_principal_type,
-                releasing_principal_id, releasing_principal_display_name,
-                authorization_basis, authorization_action,
-                explicit_event, authorization_occurred_at, schema_version,
-                snapshot_digest, idempotency_key, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&release_id)
-        .bind(project_id)
-        .bind(milestone_id)
-        .bind(release_revision)
-        .bind(release_revision)
-        .bind(&snapshot.release_identity)
-        .bind(&snapshot.milestone_definition_revision_id)
-        .bind(readiness_snapshot_id)
-        .bind(&snapshot.readiness_digest)
-        .bind(&snapshot.summary)
-        .bind(serde_json::to_string(&snapshot.changelog).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.known_issues).map_err(json_error)?)
-        .bind((!snapshot.charter_revision.revision_id.is_empty())
-            .then_some(snapshot.charter_revision.revision_id.as_str()))
-        .bind(serde_json::to_string(&snapshot.document_revisions).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.included_decisions).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.included_tasks).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.validation_results).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.repository_references).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.evidence_pins).map_err(json_error)?)
-        .bind(serde_json::to_string(&snapshot.waived_check_ids).map_err(json_error)?)
-        .bind("user")
-        .bind(&actor.id)
-        .bind(actor.display_name.as_deref())
-        .bind(&authorization.authorization_basis)
-        .bind(&authorization.action)
-        .bind(&authorization.event_id)
-        .bind(&authorization.occurred_at)
-        .bind(RELEASE_SCHEMA_VERSION)
-        .bind(&snapshot.snapshot_digest)
-        .bind(idempotency_key)
-        .bind(&released_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx_conflict)?;
-        if inserted.rows_affected() != 1 {
+        let inserted = self
+            .db
+            .insert_milestone_release_in_tx(
+                &mut tx,
+                &db::InsertMilestoneReleaseInput {
+                    id: &release_id,
+                    project_id,
+                    milestone_id,
+                    release_revision,
+                    release_identifier: &snapshot.release_identity,
+                    milestone_revision_id: &snapshot.milestone_definition_revision_id,
+                    readiness_snapshot_id,
+                    readiness_digest: &snapshot.readiness_digest,
+                    summary: &snapshot.summary,
+                    changelog: &(serde_json::to_string(&snapshot.changelog).map_err(json_error)?),
+                    known_issues_json: &(serde_json::to_string(&snapshot.known_issues)
+                        .map_err(json_error)?),
+                    charter_revision_id: (!snapshot.charter_revision.revision_id.is_empty())
+                        .then_some(snapshot.charter_revision.revision_id.as_str()),
+                    document_revisions_json: &(serde_json::to_string(&snapshot.document_revisions)
+                        .map_err(json_error)?),
+                    decision_ids_json: &(serde_json::to_string(&snapshot.included_decisions)
+                        .map_err(json_error)?),
+                    task_references_json: &(serde_json::to_string(&snapshot.included_tasks)
+                        .map_err(json_error)?),
+                    validation_references_json: &(serde_json::to_string(
+                        &snapshot.validation_results,
+                    )
+                    .map_err(json_error)?),
+                    git_references_json: &(serde_json::to_string(&snapshot.repository_references)
+                        .map_err(json_error)?),
+                    evidence_references_json: &(serde_json::to_string(&snapshot.evidence_pins)
+                        .map_err(json_error)?),
+                    waivers_json: &(serde_json::to_string(&snapshot.waived_check_ids)
+                        .map_err(json_error)?),
+                    principal_type: "user",
+                    principal_id: &actor.id,
+                    principal_display_name: actor.display_name.as_deref(),
+                    authorization_basis: &authorization.authorization_basis,
+                    authorization_action: &authorization.action,
+                    explicit_event: &authorization.event_id,
+                    authorization_occurred_at: &authorization.occurred_at,
+                    schema_version: RELEASE_SCHEMA_VERSION,
+                    snapshot_digest: &snapshot.snapshot_digest,
+                    idempotency_key,
+                    created_at: &released_at,
+                },
+            )
+            .await
+            .map_err(map_db_conflict)?;
+        if inserted != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         let mut reference_ordinal: i64 = 0;
         for task in &snapshot.included_tasks {
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'task', ?, ?, ?, NULL, ?)",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(&task.task_id)
-            .bind(task.task_version.to_string())
-            .bind(&task.task_state)
-            .bind(serde_json::to_string(task).map_err(json_error)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_task_reference_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseTaskReferenceInput {
+                        release_id: &release_id,
+                        ordinal: reference_ordinal,
+                        record_id: &task.task_id,
+                        record_version: &task.task_version.to_string(),
+                        record_state: &task.task_state,
+                        metadata_json: &(serde_json::to_string(task).map_err(json_error)?),
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
         }
         for validation in &snapshot.validation_results {
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'validation', ?, ?, ?, ?, ?)",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(&validation.validation_id)
-            .bind(validation.evaluated_at.clone())
-            .bind(format!("{:?}", validation.status).to_ascii_lowercase())
-            .bind(&validation.result_digest)
-            .bind(serde_json::to_string(validation).map_err(json_error)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_validation_reference_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseValidationReferenceInput {
+                        release_id: &release_id,
+                        ordinal: reference_ordinal,
+                        record_id: &validation.validation_id,
+                        record_version: &validation.evaluated_at.clone(),
+                        record_state: &(format!("{:?}", validation.status).to_ascii_lowercase()),
+                        record_digest: &validation.result_digest,
+                        metadata_json: &(serde_json::to_string(validation).map_err(json_error)?),
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
         }
         for document in &snapshot.document_revisions {
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'document', ?, NULL, 'approved', ?, ?)",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(&document.revision_id)
-            .bind(&document.content_digest)
-            .bind(serde_json::to_string(document).map_err(json_error)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_document_reference_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseDocumentReferenceInput {
+                        release_id: &release_id,
+                        ordinal: reference_ordinal,
+                        record_id: &document.revision_id,
+                        record_digest: &document.content_digest,
+                        metadata_json: &(serde_json::to_string(document).map_err(json_error)?),
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
         }
         for decision in &snapshot.included_decisions {
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'decision', ?, NULL, ?, ?, ?)",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(&decision.decision_id)
-            .bind(format!("{:?}", decision.state).to_ascii_lowercase())
-            .bind(&decision.digest)
-            .bind(serde_json::to_string(decision).map_err(json_error)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_decision_reference_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseDecisionReferenceInput {
+                        release_id: &release_id,
+                        ordinal: reference_ordinal,
+                        record_id: &decision.decision_id,
+                        record_state: &(format!("{:?}", decision.state).to_ascii_lowercase()),
+                        record_digest: &decision.digest,
+                        metadata_json: &(serde_json::to_string(decision).map_err(json_error)?),
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
         }
         for repository in &snapshot.repository_references {
@@ -1018,22 +996,21 @@ impl MilestoneRuntime {
             let record_digest =
                 canonical_digest_with_schema(MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION, &reference)
                     .map_err(json_error)?;
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'git_ref', ?, ?, ?, ?, ?)",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(record_id)
-            .bind(reference.task_version.to_string())
-            .bind(reference.execution_status.as_deref())
-            .bind(record_digest)
-            .bind(serde_json::to_string(&reference).map_err(json_error)?)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_git_reference_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseGitReferenceInput {
+                        release_id: &release_id,
+                        ordinal: reference_ordinal,
+                        record_id: &record_id,
+                        record_version: &reference.task_version.to_string(),
+                        execution_status: reference.execution_status.as_deref(),
+                        record_digest: &record_digest,
+                        metadata_json: &(serde_json::to_string(&reference).map_err(json_error)?),
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
             if let Some(review_id) = reference.review_id.as_deref() {
                 let review_version = reference
@@ -1053,80 +1030,75 @@ impl MilestoneRuntime {
                     }),
                 )
                 .map_err(json_error)?;
-                sqlx::query(
-                    "INSERT INTO project_release_reference (
-                        release_id, ordinal, reference_kind, record_id,
-                        record_version, record_state, record_digest, metadata_json
-                     ) VALUES (?, ?, 'review', ?, ?, ?, ?, ?)",
-                )
-                .bind(&release_id)
-                .bind(reference_ordinal)
-                .bind(review_id)
-                .bind(review_version)
-                .bind(reference.review_status.as_deref())
-                .bind(review_digest)
-                .bind(serde_json::to_string(&reference).map_err(json_error)?)
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx_conflict)?;
+                self.db
+                    .insert_release_review_reference_in_tx(
+                        &mut tx,
+                        &db::InsertReleaseReviewReferenceInput {
+                            release_id: &release_id,
+                            ordinal: reference_ordinal,
+                            record_id: review_id,
+                            review_version,
+                            record_state: reference.review_status.as_deref(),
+                            record_digest: &review_digest,
+                            metadata_json: &(serde_json::to_string(&reference)
+                                .map_err(json_error)?),
+                        },
+                    )
+                    .await
+                    .map_err(map_db_conflict)?;
                 reference_ordinal += 1;
             }
         }
         for issue in &snapshot.known_issues {
-            sqlx::query(
-                "INSERT INTO project_release_reference (
-                    release_id, ordinal, reference_kind, record_id,
-                    record_version, record_state, record_digest, metadata_json
-                 ) VALUES (?, ?, 'known_issue', ?, NULL, NULL, NULL, '{}')",
-            )
-            .bind(&release_id)
-            .bind(reference_ordinal)
-            .bind(issue)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_known_issue_reference_in_tx(
+                    &mut tx,
+                    &release_id,
+                    reference_ordinal,
+                    issue,
+                )
+                .await
+                .map_err(map_db_conflict)?;
             reference_ordinal += 1;
         }
         for (ordinal, pin) in snapshot.evidence_pins.iter().enumerate() {
             let metadata = serde_json::to_string(pin).map_err(json_error)?;
-            sqlx::query(
-                "INSERT INTO project_release_media_pin (
-                    id, project_id, release_id, asset_id, attachment_id,
-                    legacy_task_media_id, asset_checksum, attachment_digest,
-                    availability, pin_digest, created_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&pin.id)
-            .bind(project_id)
-            .bind(&pin.release_id)
-            .bind(&pin.asset_id)
-            .bind(&pin.attachment_id)
-            .bind(pin.task_media_id.as_deref())
-            .bind(&pin.asset_checksum)
-            .bind(&pin.attachment_digest)
-            .bind(evidence_availability_name(pin.availability))
-            .bind(
-                canonical_digest_with_schema(MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION, &metadata)
-                    .map_err(json_error)?,
-            )
-            .bind(&released_at)
-            .execute(&mut *tx)
-            .await
-            .map_err(map_sqlx_conflict)?;
+            self.db
+                .insert_release_evidence_pin_in_tx(
+                    &mut tx,
+                    &db::InsertReleaseEvidencePinInput {
+                        id: &pin.id,
+                        project_id,
+                        release_id: &pin.release_id,
+                        asset_id: &pin.asset_id,
+                        attachment_id: &pin.attachment_id,
+                        task_media_id: pin.task_media_id.as_deref(),
+                        asset_checksum: &pin.asset_checksum,
+                        attachment_digest: &pin.attachment_digest,
+                        availability: evidence_availability_name(pin.availability),
+                        pin_digest: &(canonical_digest_with_schema(
+                            MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION,
+                            &metadata,
+                        )
+                        .map_err(json_error)?),
+                        created_at: &released_at,
+                    },
+                )
+                .await
+                .map_err(map_db_conflict)?;
             let _ = ordinal;
         }
-        let transitioned = sqlx::query(
-            "UPDATE project_milestone SET lifecycle = 'released', version = version + 1,
-                 updated_at = ? WHERE id = ? AND project_id = ? AND version = ?
-                 AND lifecycle IN ('ready_for_release', 'released')",
-        )
-        .bind(&released_at)
-        .bind(milestone_id)
-        .bind(project_id)
-        .bind(expected_milestone_version)
-        .execute(&mut *tx)
-        .await?;
-        if transitioned.rows_affected() != 1 {
+        let transitioned = self
+            .db
+            .mark_milestone_released_in_tx(
+                &mut tx,
+                &released_at,
+                milestone_id,
+                project_id,
+                expected_milestone_version,
+            )
+            .await?;
+        if transitioned != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         self.repair_primary_pointer_in_tx(&mut tx, project_id, milestone_id)
@@ -1150,13 +1122,12 @@ impl MilestoneRuntime {
             &released_at,
         )
         .await?;
-        let row = sqlx::query("SELECT * FROM project_release WHERE id = ?")
-            .bind(&release_id)
-            .fetch_one(&mut *tx)
+        let row = self
+            .db
+            .release_record_by_id_in_tx(&mut tx, &release_id)
             .await?;
         tx.commit().await?;
-        self.release_from_record(release_record_from_row(row)?)
-            .await
+        self.release_from_record(row).await
     }
 
     pub async fn set_primary(
@@ -1192,54 +1163,47 @@ impl MilestoneRuntime {
         }
 
         let mut tx = db::begin_immediate(self.db.pool()).await?;
-        let locked = sqlx::query(
-            "UPDATE project SET version = version
-             WHERE id = ? AND version = ?",
-        )
-        .bind(project_id)
-        .bind(expected_project_version)
-        .execute(&mut *tx)
-        .await?;
-        if locked.rows_affected() != 1 {
+        let locked = self
+            .db
+            .lock_primary_milestone_project_version_in_tx(
+                &mut tx,
+                project_id,
+                expected_project_version,
+            )
+            .await?;
+        if locked != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        let active_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM project_milestone
-             WHERE project_id = ? AND lifecycle = 'active'",
-        )
-        .bind(project_id)
-        .fetch_one(&mut *tx)
-        .await?;
+        let active_count: i64 = self
+            .db
+            .active_milestone_count_in_tx(&mut tx, project_id)
+            .await?;
         if active_count > 0 && primary_milestone_id.is_none() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "an active Project must retain an explicit primary milestone".to_owned(),
             });
         }
         if let Some(id) = primary_milestone_id {
-            let valid: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM project_milestone
-                 WHERE id = ? AND project_id = ? AND lifecycle = 'active'",
-            )
-            .bind(id)
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let valid: Option<i64> = self
+                .db
+                .active_milestone_exists_in_tx(&mut tx, id, project_id)
+                .await?;
             if valid.is_none() {
                 return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
             }
         }
         let occurred_at = now_rfc3339();
-        let updated = sqlx::query(
-            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
-                 updated_at = ? WHERE id = ? AND version = ?",
-        )
-        .bind(primary_milestone_id)
-        .bind(&occurred_at)
-        .bind(project_id)
-        .bind(expected_project_version)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() != 1 {
+        let updated = self
+            .db
+            .set_primary_milestone_in_tx(
+                &mut tx,
+                primary_milestone_id,
+                &occurred_at,
+                project_id,
+                expected_project_version,
+            )
+            .await?;
+        if updated != 1 {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
         let entity_id = primary_milestone_id
@@ -1271,19 +1235,14 @@ impl MilestoneRuntime {
         project_id: &str,
         release_id: &str,
     ) -> crate::Result<Option<api_types::ProjectRelease>> {
-        let Some(row) =
-            sqlx::query("SELECT * FROM project_release WHERE id = ? AND project_id = ?")
-                .bind(release_id)
-                .bind(project_id)
-                .fetch_optional(self.db.pool())
-                .await?
+        let Some(row) = self
+            .db
+            .project_release_record_by_id(release_id, project_id)
+            .await?
         else {
             return Ok(None);
         };
-        Ok(Some(
-            self.release_from_record(release_record_from_row(row)?)
-                .await?,
-        ))
+        Ok(Some(self.release_from_record(row).await?))
     }
 
     pub async fn get_readiness(
@@ -1292,21 +1251,14 @@ impl MilestoneRuntime {
         milestone_id: &str,
         snapshot_id: &str,
     ) -> crate::Result<Option<ReadinessSnapshot>> {
-        let Some(row) = sqlx::query(
-            "SELECT * FROM project_readiness_snapshot
-             WHERE id = ? AND project_id = ? AND milestone_id = ?",
-        )
-        .bind(snapshot_id)
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_optional(self.db.pool())
-        .await?
+        let Some(row) = self
+            .db
+            .milestone_readiness_record_by_id(snapshot_id, project_id, milestone_id)
+            .await?
         else {
             return Ok(None);
         };
-        Ok(Some(readiness_from_record(readiness_record_from_row(
-            row,
-        )?)?))
+        Ok(Some(readiness_from_record(row)?))
     }
 
     /// Recompute the current governed inputs for one immutable readiness
@@ -1352,15 +1304,10 @@ impl MilestoneRuntime {
         // accepts the snapshot whose readiness transition produced the
         // milestone's current version, then records its own one-step CAS, so
         // a released milestone sits two versions past the snapshot it pinned.
-        let pinned_by_release = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM project_release
-             WHERE project_id = ? AND milestone_id = ? AND readiness_snapshot_id = ?",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .bind(snapshot_id)
-        .fetch_one(&mut *tx)
-        .await?
+        let pinned_by_release = self
+            .db
+            .releases_pinning_readiness_count_in_tx(&mut tx, project_id, milestone_id, snapshot_id)
+            .await?
             > 0;
         let recheck = self
             .recheck_readiness_in_tx(&mut tx, project_id, milestone_id, record)
@@ -1452,18 +1399,11 @@ impl MilestoneRuntime {
         project_id: &str,
         milestone_id: &str,
     ) -> crate::Result<Vec<ReadinessSnapshot>> {
-        let rows = sqlx::query(
-            "SELECT * FROM project_readiness_snapshot
-             WHERE project_id = ? AND milestone_id = ?
-             ORDER BY created_at ASC, id ASC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(self.db.pool())
-        .await?;
-        rows.into_iter()
-            .map(|row| readiness_from_record(readiness_record_from_row(row)?))
-            .collect()
+        let rows = self
+            .db
+            .milestone_readiness_records(project_id, milestone_id)
+            .await?;
+        rows.into_iter().map(readiness_from_record).collect()
     }
 
     pub async fn list_releases(
@@ -1471,21 +1411,13 @@ impl MilestoneRuntime {
         project_id: &str,
         milestone_id: &str,
     ) -> crate::Result<Vec<ProjectRelease>> {
-        let rows = sqlx::query(
-            "SELECT * FROM project_release
-             WHERE project_id = ? AND milestone_id = ?
-             ORDER BY release_revision ASC, id ASC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .milestone_release_records(project_id, milestone_id)
+            .await?;
         let mut releases = Vec::with_capacity(rows.len());
         for row in rows {
-            releases.push(
-                self.release_from_record(release_record_from_row(row)?)
-                    .await?,
-            );
+            releases.push(self.release_from_record(row).await?);
         }
         Ok(releases)
     }
@@ -1508,17 +1440,10 @@ impl MilestoneRuntime {
         project_id: &str,
         milestone_id: &str,
     ) -> crate::Result<Option<ProjectMilestoneRecord>> {
-        sqlx::query(
-            "SELECT * FROM project_milestone
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(milestone_record_from_row)
-        .transpose()
-        .map_err(crate::ServiceError::from)
+        self.db
+            .project_milestone_record_in_tx(tx, milestone_id, project_id)
+            .await
+            .map_err(crate::ServiceError::from)
     }
 
     async fn readiness_by_id_in_tx(
@@ -1527,17 +1452,10 @@ impl MilestoneRuntime {
         project_id: &str,
         id: &str,
     ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
-        sqlx::query(
-            "SELECT * FROM project_readiness_snapshot
-             WHERE project_id = ? AND id = ?",
-        )
-        .bind(project_id)
-        .bind(id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(readiness_record_from_row)
-        .transpose()
-        .map_err(crate::ServiceError::from)
+        self.db
+            .project_readiness_record_in_tx(tx, project_id, id)
+            .await
+            .map_err(crate::ServiceError::from)
     }
 
     async fn definition_record_in_tx(
@@ -1547,19 +1465,10 @@ impl MilestoneRuntime {
         milestone_id: &str,
         revision_id: &str,
     ) -> crate::Result<Option<ProjectMilestoneRevisionRecord>> {
-        sqlx::query(
-            "SELECT r.* FROM project_milestone_revision r
-             JOIN project_milestone m ON m.id = r.milestone_id
-             WHERE r.id = ? AND r.milestone_id = ? AND m.project_id = ?",
-        )
-        .bind(revision_id)
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(milestone_revision_record_from_row)
-        .transpose()
-        .map_err(crate::ServiceError::from)
+        self.db
+            .milestone_definition_record_in_tx(tx, revision_id, milestone_id, project_id)
+            .await
+            .map_err(crate::ServiceError::from)
     }
 
     async fn hydrate_charter_in_tx(
@@ -1571,39 +1480,26 @@ impl MilestoneRuntime {
         let Some(charter) = definition.content.charter_revision.as_mut() else {
             return Ok(());
         };
-        let row = sqlx::query(
-            "SELECT c.id AS charter_id,
-                    c.current_approved_revision_id,
-                    cr.id AS revision_id,
-                    cr.lifecycle,
-                    cr.content_digest,
-                    cr.render_version,
-                    cr.rendered_digest
-             FROM project_charter c
-             JOIN project_charter_revision cr ON cr.charter_id = c.id
-             WHERE c.project_id = ? AND cr.id = ?",
-        )
-        .bind(project_id)
-        .bind(&charter.revision_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let row = self
+            .db
+            .milestone_charter_authority_in_tx(tx, project_id, &charter.revision_id)
+            .await?;
         let Some(row) = row else {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         };
-        let current_approved_revision_id: Option<String> =
-            row.try_get("current_approved_revision_id")?;
-        let lifecycle: String = row.try_get("lifecycle")?;
-        let revision_id: String = row.try_get("revision_id")?;
+        let current_approved_revision_id: Option<String> = row.current_approved_revision_id.clone();
+        let lifecycle: String = row.lifecycle.clone();
+        let revision_id: String = row.revision_id.clone();
         if current_approved_revision_id.as_deref() != Some(revision_id.as_str())
             || lifecycle != "approved"
         {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
-        charter.artifact_id = row.try_get("charter_id")?;
+        charter.artifact_id = row.charter_id.clone();
         charter.revision_id = revision_id;
-        charter.content_digest = row.try_get("content_digest")?;
-        charter.render_version = Some(row.try_get("render_version")?);
-        charter.render_digest = Some(row.try_get("rendered_digest")?);
+        charter.content_digest = row.content_digest.clone();
+        charter.render_version = Some(row.render_version.clone());
+        charter.render_digest = Some(row.rendered_digest.clone());
         Ok(())
     }
 
@@ -1632,17 +1528,10 @@ impl MilestoneRuntime {
         definition_revision_id: &str,
         charter_revision_id: Option<&str>,
     ) -> crate::Result<Vec<ValidationResult>> {
-        let rows = sqlx::query(
-            "SELECT r.* FROM project_milestone_check_result r
-             JOIN project_milestone_check c ON c.id = r.check_id
-             WHERE r.project_id = ? AND r.milestone_id = ?
-               AND r.definition_revision_id = c.definition_revision_id
-             ORDER BY r.check_id ASC, r.created_at DESC, r.id DESC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = self
+            .db
+            .milestone_check_result_rows_in_tx(tx, project_id, milestone_id)
+            .await?;
         validation_results_from_rows(
             rows,
             project_id,
@@ -1657,18 +1546,10 @@ impl MilestoneRuntime {
         project_id: &str,
         milestone_id: &str,
     ) -> crate::Result<Vec<EvidenceAttachment>> {
-        let rows = sqlx::query(
-            "SELECT a.*, m.legacy_task_media_id, m.checksum AS asset_checksum
-             FROM project_media_attachment a
-             JOIN media_asset m ON m.id = a.asset_id AND m.project_id = a.project_id
-             WHERE a.project_id = ? AND a.milestone_id = ?
-               AND a.attachment_kind = 'evidence' AND a.deleted_at IS NULL
-             ORDER BY a.id ASC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = self
+            .db
+            .milestone_evidence_rows_in_tx(tx, project_id, milestone_id)
+            .await?;
         evidence_from_rows(rows, project_id)
     }
 
@@ -1682,41 +1563,34 @@ impl MilestoneRuntime {
         if evidence.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "SELECT a.id, a.asset_id, a.task_media_id, a.project_url,
-                    a.checksum AS attachment_digest, m.checksum AS asset_checksum
-             FROM project_media_attachment a
-             JOIN media_asset m ON m.id = a.asset_id AND m.project_id = a.project_id
-             WHERE a.project_id = ? AND a.milestone_id = ?
-               AND a.attachment_kind = 'evidence' AND a.deleted_at IS NULL
-             ORDER BY a.id ASC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = self
+            .db
+            .milestone_release_pin_metadata_in_tx(tx, project_id, milestone_id)
+            .await?;
         let metadata: Vec<ReleasePinMetadata> = rows
             .into_iter()
             .map(|row| {
                 let attachment_digest: String = row
-                    .try_get::<Option<String>, _>("attachment_digest")?
+                    .attachment_digest
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "release evidence attachment is missing its digest".to_owned(),
                     })?;
                 let asset_checksum: String = row
-                    .try_get::<Option<String>, _>("asset_checksum")?
+                    .asset_checksum
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "release evidence asset is missing its checksum".to_owned(),
                     })?;
                 Ok(ReleasePinMetadata {
-                    attachment_id: row.try_get("id")?,
-                    asset_id: row.try_get("asset_id")?,
+                    attachment_id: row.id.clone(),
+                    asset_id: row.asset_id.clone(),
                     attachment_digest,
                     asset_checksum,
-                    task_media_id: row.try_get("task_media_id")?,
-                    stable_project_url: row.try_get("project_url")?,
+                    task_media_id: row.task_media_id.clone(),
+                    stable_project_url: row.project_url.clone(),
                 })
             })
             .collect::<crate::Result<Vec<_>>>()?;
@@ -1745,19 +1619,13 @@ impl MilestoneRuntime {
         project_id: &str,
         milestone_id: &str,
     ) -> crate::Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT id, affected_records_json
-             FROM project_decision
-             WHERE project_id = ? AND decision_class = 'waiver' AND state = 'active'
-               AND length(trim(authorization_action)) > 0
-               AND length(trim(authorization_occurred_at)) > 0",
-        )
-        .bind(project_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = self
+            .db
+            .active_milestone_waiver_rows_in_tx(tx, project_id)
+            .await?;
         let mut ids = Vec::new();
         for row in rows {
-            let affected: String = row.try_get("affected_records_json")?;
+            let affected: String = row.affected_records_json.clone();
             let affected: Value = parse_json_required(&affected, "waiver affected_records")?;
             if affected.get("milestone_id").and_then(Value::as_str) == Some(milestone_id) {
                 if let Some(check_id) = affected.get("check_id").and_then(Value::as_str) {
@@ -1777,33 +1645,20 @@ impl MilestoneRuntime {
         milestone_id: &str,
         charter_revision_id: Option<&str>,
     ) -> crate::Result<Vec<ReleaseDecisionReference>> {
-        let rows = sqlx::query(
-            "SELECT id, state, decision_class, question, context_json,
-                    options_json, selected_outcome, rationale,
-                    principal_type, principal_id, authority_basis,
-                    authorization_action, explicit_event,
-                    authorization_occurred_at, charter_revision_id,
-                    source_refs_json,
-                    affected_records_json, supersedes_decision_id, created_at
-             FROM project_decision
-             WHERE project_id = ? AND state = 'active'
-               AND (
-                    json_extract(affected_records_json, '$.milestone_id') = ?
-                    OR (? IS NOT NULL AND charter_revision_id = ?)
-               )
-             ORDER BY id ASC",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .bind(charter_revision_id)
-        .bind(charter_revision_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let rows = self
+            .db
+            .effective_milestone_decision_rows_in_tx(
+                tx,
+                project_id,
+                milestone_id,
+                charter_revision_id,
+            )
+            .await?;
         rows.into_iter()
             .map(|row| {
-                let decision_id: String = row.try_get("id")?;
+                let decision_id: String = row.id.clone();
                 let affected: Value = parse_json_required(
-                    &row.try_get::<String, _>("affected_records_json")?,
+                    &row.affected_records_json.clone(),
                     "decision affected_records",
                 )?;
                 let affected_milestone_id = affected
@@ -1815,38 +1670,31 @@ impl MilestoneRuntime {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 let principal = PrincipalRef {
-                    kind: principal_kind(&row.try_get::<String, _>("principal_type")?)?,
-                    id: row.try_get("principal_id")?,
+                    kind: principal_kind(&row.principal_type.clone())?,
+                    id: row.principal_id.clone(),
                     display_name: None,
                 };
                 let authorization = AuthorizationProvenance {
                     principal,
-                    authorization_basis: row.try_get("authority_basis")?,
-                    action: row.try_get("authorization_action")?,
-                    event_id: row.try_get("explicit_event")?,
-                    occurred_at: row.try_get("authorization_occurred_at")?,
+                    authorization_basis: row.authority_basis.clone(),
+                    action: row.authorization_action.clone(),
+                    event_id: row.explicit_event.clone(),
+                    occurred_at: row.authorization_occurred_at.clone(),
                 };
-                let decision_class: String = row.try_get("decision_class")?;
-                let question: String = row.try_get("question")?;
-                let context: Value = parse_json_required(
-                    &row.try_get::<String, _>("context_json")?,
-                    "decision context",
-                )?;
-                let options: Value = parse_json_required(
-                    &row.try_get::<String, _>("options_json")?,
-                    "decision options",
-                )?;
-                let selected_outcome: String = row.try_get("selected_outcome")?;
-                let rationale: String = row.try_get("rationale")?;
-                let state: String = row.try_get("state")?;
-                let source_refs: Value = parse_json_required(
-                    &row.try_get::<String, _>("source_refs_json")?,
-                    "decision source_refs",
-                )?;
-                let charter_revision_id: Option<String> = row.try_get("charter_revision_id")?;
-                let supersedes_decision_id: Option<String> =
-                    row.try_get("supersedes_decision_id")?;
-                let created_at: String = row.try_get("created_at")?;
+                let decision_class: String = row.decision_class.clone();
+                let question: String = row.question.clone();
+                let context: Value =
+                    parse_json_required(&row.context_json.clone(), "decision context")?;
+                let options: Value =
+                    parse_json_required(&row.options_json.clone(), "decision options")?;
+                let selected_outcome: String = row.selected_outcome.clone();
+                let rationale: String = row.rationale.clone();
+                let state: String = row.state.clone();
+                let source_refs: Value =
+                    parse_json_required(&row.source_refs_json.clone(), "decision source_refs")?;
+                let charter_revision_id: Option<String> = row.charter_revision_id.clone();
+                let supersedes_decision_id: Option<String> = row.supersedes_decision_id.clone();
+                let created_at: String = row.created_at.clone();
                 validate_persisted_authorization_receipt(
                     &authorization,
                     &format!("decision {decision_id}"),
@@ -1900,21 +1748,14 @@ impl MilestoneRuntime {
         project_id: &str,
         changed_milestone_id: &str,
     ) -> crate::Result<()> {
-        let primary: Option<String> =
-            sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
-                .bind(project_id)
-                .fetch_one(&mut **tx)
-                .await?;
+        let primary: Option<String> = self.db.primary_milestone_id_in_tx(tx, project_id).await?;
         if primary.as_deref() != Some(changed_milestone_id) {
             return Ok(());
         }
-        let changed_lifecycle: String = sqlx::query_scalar(
-            "SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?",
-        )
-        .bind(changed_milestone_id)
-        .bind(project_id)
-        .fetch_one(&mut **tx)
-        .await?;
+        let changed_lifecycle: String = self
+            .db
+            .milestone_lifecycle_in_tx(tx, changed_milestone_id, project_id)
+            .await?;
         // Readiness and release advance the primary outcome; they do not make
         // the Project forget which milestone it delivered. Keep the pointer
         // until a user explicitly emphasizes another milestone. Only a
@@ -1926,25 +1767,19 @@ impl MilestoneRuntime {
         ) {
             return Ok(());
         }
-        let replacement: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM project_milestone
-             WHERE project_id = ? AND lifecycle = 'active' AND id != ?
-             ORDER BY milestone_sequence ASC, id ASC LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(changed_milestone_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        sqlx::query(
-            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
-             updated_at = ? WHERE id = ? AND primary_milestone_id = ?",
-        )
-        .bind(replacement)
-        .bind(now_rfc3339())
-        .bind(project_id)
-        .bind(changed_milestone_id)
-        .execute(&mut **tx)
-        .await?;
+        let replacement: Option<String> = self
+            .db
+            .replacement_active_milestone_id_in_tx(tx, project_id, changed_milestone_id)
+            .await?;
+        self.db
+            .repair_primary_milestone_in_tx(
+                tx,
+                replacement,
+                &(now_rfc3339()),
+                project_id,
+                changed_milestone_id,
+            )
+            .await?;
         Ok(())
     }
 
@@ -1963,35 +1798,23 @@ impl MilestoneRuntime {
         document_states: &[ReadinessDocumentState],
         commit_build_check_context: &[String],
     ) -> crate::Result<Vec<ReadinessInput>> {
-        let milestone_source = sqlx::query(
-            "SELECT version, updated_at, milestone_key, display_label, lifecycle,
-                    current_definition_revision_id
-             FROM project_milestone
-             WHERE id = ? AND project_id = ?",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let definition_source = sqlx::query(
-            "SELECT revision, content_digest, rendered_digest, render_version,
-                    lifecycle, created_at
-             FROM project_milestone_revision
-             WHERE id = ? AND milestone_id = ?",
-        )
-        .bind(definition_revision_id)
-        .bind(milestone_id)
-        .fetch_one(&mut **tx)
-        .await?;
-        let milestone_version: i64 = milestone_source.try_get("version")?;
-        let milestone_observed_at: String = milestone_source.try_get("updated_at")?;
+        let milestone_source = self
+            .db
+            .milestone_readiness_source_in_tx(tx, milestone_id, project_id)
+            .await?;
+        let definition_source = self
+            .db
+            .milestone_definition_readiness_source_in_tx(tx, definition_revision_id, milestone_id)
+            .await?;
+        let milestone_version: i64 = milestone_source.version;
+        let milestone_observed_at: String = milestone_source.updated_at.clone();
         if milestone_version <= 0 || milestone_observed_at.trim().is_empty() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "milestone source manifest has invalid version or timestamp".to_owned(),
             });
         }
         let current_definition_revision_id: Option<String> =
-            milestone_source.try_get("current_definition_revision_id")?;
+            milestone_source.current_definition_revision_id.clone();
         if current_definition_revision_id.as_deref() != Some(definition_revision_id) {
             return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
         }
@@ -2000,25 +1823,24 @@ impl MilestoneRuntime {
             &json!({
                 "project_id": project_id,
                 "milestone_id": milestone_id,
-                "milestone_key": milestone_source.try_get::<String, _>("milestone_key")?,
-                "display_label": milestone_source.try_get::<Option<String>, _>("display_label")?,
-                "lifecycle": milestone_source.try_get::<String, _>("lifecycle")?,
-                "current_definition_revision_id": milestone_source
-                    .try_get::<Option<String>, _>("current_definition_revision_id")?,
+                "milestone_key": milestone_source.milestone_key.clone(),
+                "display_label": milestone_source.display_label.clone(),
+                "lifecycle": milestone_source.lifecycle.clone(),
+                "current_definition_revision_id": milestone_source.current_definition_revision_id.clone(),
             }),
         )
         .map_err(json_error)?;
-        let definition_revision: i64 = definition_source.try_get("revision")?;
-        let definition_digest: String = definition_source.try_get("content_digest")?;
-        let definition_observed_at: String = definition_source.try_get("created_at")?;
+        let definition_revision: i64 = definition_source.revision;
+        let definition_digest: String = definition_source.content_digest.clone();
+        let definition_observed_at: String = definition_source.created_at.clone();
         let definition_source_digest = canonical_digest_with_schema(
             MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
             &json!({
                 "revision": definition_revision,
                 "content_digest": definition_digest,
-                "rendered_digest": definition_source.try_get::<String, _>("rendered_digest")?,
-                "render_version": definition_source.try_get::<String, _>("render_version")?,
-                "lifecycle": definition_source.try_get::<String, _>("lifecycle")?,
+                "rendered_digest": definition_source.rendered_digest.clone(),
+                "render_version": definition_source.render_version.clone(),
+                "lifecycle": definition_source.lifecycle.clone(),
             }),
         )
         .map_err(json_error)?;
@@ -2039,32 +1861,27 @@ impl MilestoneRuntime {
             },
         ];
         if let Some(charter) = charter {
-            let charter_source = sqlx::query(
-                "SELECT revision, created_at, content_digest, render_version, rendered_digest
-                 FROM project_charter_revision
-                 WHERE id = ? AND charter_id = ?",
-            )
-            .bind(&charter.revision_id)
-            .bind(&charter.artifact_id)
-            .fetch_one(&mut **tx)
-            .await?;
+            let charter_source = self
+                .db
+                .charter_readiness_source_in_tx(tx, &charter.revision_id, &charter.artifact_id)
+                .await?;
             let charter_digest = canonical_digest_with_schema(
                 MILESTONE_READINESS_DIGEST_SCHEMA_VERSION,
                 &json!({
                     "artifact_id": charter.artifact_id,
                     "revision_id": charter.revision_id,
-                    "content_digest": charter_source.try_get::<String, _>("content_digest")?,
-                    "render_version": charter_source.try_get::<String, _>("render_version")?,
-                    "render_digest": charter_source.try_get::<String, _>("rendered_digest")?,
+                    "content_digest": charter_source.content_digest.clone(),
+                    "render_version": charter_source.render_version.clone(),
+                    "render_digest": charter_source.rendered_digest.clone(),
                 }),
             )
             .map_err(json_error)?;
             inputs.push(ReadinessInput {
                 source_kind: "charter".to_owned(),
                 source_id: charter.revision_id.clone(),
-                source_version: charter_source.try_get("revision")?,
+                source_version: charter_source.revision,
                 source_digest: charter_digest,
-                observed_at: charter_source.try_get("created_at")?,
+                observed_at: charter_source.created_at.clone(),
             });
         }
         for result in checks {
@@ -2078,14 +1895,10 @@ impl MilestoneRuntime {
         }
         for attachment in evidence {
             let authorization: AuthorizationProvenance = parse_json_required(
-                &sqlx::query_scalar::<_, String>(
-                    "SELECT authorization_json FROM project_media_attachment
-                     WHERE id = ? AND project_id = ?",
-                )
-                .bind(&attachment.id)
-                .bind(project_id)
-                .fetch_one(&mut **tx)
-                .await?,
+                &self
+                    .db
+                    .evidence_authorization_json_in_tx(tx, &attachment.id, project_id)
+                    .await?,
                 "evidence authorization",
             )?;
             if !same_principal(&authorization.principal, &attachment.author) {
@@ -2113,29 +1926,18 @@ impl MilestoneRuntime {
             });
         }
         for waiver_id in waiver_ids {
-            let waiver = sqlx::query(
-                "SELECT id, rationale, authority_basis, authorization_action,
-                        principal_type, principal_id, explicit_event,
-                        authorization_occurred_at,
-                        affected_records_json, created_at
-                 FROM project_decision
-                 WHERE project_id = ? AND decision_class = 'waiver' AND state = 'active'
-                   AND json_extract(affected_records_json, '$.milestone_id') = ?
-                   AND json_extract(affected_records_json, '$.check_id') = ?
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(milestone_id)
-            .bind(waiver_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                message: format!("active waiver for check {waiver_id} is unavailable"),
-            })?;
+            let waiver = self
+                .db
+                .active_check_waiver_source_in_tx(tx, project_id, milestone_id, waiver_id)
+                .await?
+                .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                    message: format!("active waiver for check {waiver_id} is unavailable"),
+                })?;
             let waiver_principal = PrincipalRef {
-                kind: principal_kind(&waiver.try_get::<String, _>("principal_type")?)?,
+                kind: principal_kind(&waiver.principal_type.clone())?,
                 id: waiver
-                    .try_get::<Option<String>, _>("principal_id")?
+                    .principal_id
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: format!("active waiver {waiver_id} is missing its principal"),
@@ -2144,21 +1946,21 @@ impl MilestoneRuntime {
             };
             let waiver_authorization = AuthorizationProvenance {
                 principal: waiver_principal,
-                authorization_basis: waiver.try_get("authority_basis")?,
-                action: waiver.try_get("authorization_action")?,
-                event_id: waiver.try_get("explicit_event")?,
-                occurred_at: waiver.try_get("authorization_occurred_at")?,
+                authorization_basis: waiver.authority_basis.clone(),
+                action: waiver.authorization_action.clone(),
+                event_id: waiver.explicit_event.clone(),
+                occurred_at: waiver.authorization_occurred_at.clone(),
             };
             validate_persisted_authorization_receipt(
                 &waiver_authorization,
                 &format!("waiver {waiver_id}"),
             )?;
             let waiver_payload = json!({
-                "id": waiver.try_get::<String, _>("id")?,
-                "rationale": waiver.try_get::<String, _>("rationale")?,
+                "id": waiver.id.clone(),
+                "rationale": waiver.rationale.clone(),
                 "authorization": waiver_authorization,
                 "affected_records": parse_json_required::<Value>(
-                    &waiver.try_get::<String, _>("affected_records_json")?,
+                    &waiver.affected_records_json.clone(),
                     "waiver affected_records",
                 )?,
             });
@@ -2171,7 +1973,7 @@ impl MilestoneRuntime {
                     &waiver_payload,
                 )
                 .map_err(json_error)?,
-                observed_at: waiver.try_get("created_at")?,
+                observed_at: waiver.created_at.clone(),
             });
         }
         for task in task_states {
@@ -2249,18 +2051,10 @@ impl MilestoneRuntime {
         // creation, and a definition authored before (or without) that Task
         // selection must not compute "ready" while governed work is open.
         // Cancelled/archived/deleted governed Tasks no longer gate.
-        let governed_task_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT g.task_id FROM project_task_governance g
-             JOIN task t ON t.id = g.task_id
-             WHERE g.milestone_id = ? AND t.project_id = ?
-               AND t.deleted_at IS NULL AND t.archived_at IS NULL
-               AND t.status != 'cancelled'
-             ORDER BY g.task_id",
-        )
-        .bind(milestone_id)
-        .bind(project_id)
-        .fetch_all(&mut **tx)
-        .await?;
+        let governed_task_ids: Vec<String> = self
+            .db
+            .governed_milestone_task_ids_in_tx(tx, milestone_id, project_id)
+            .await?;
         let mut selected_task_ids: Vec<&String> = definition.content.task_ids.iter().collect();
         for task_id in &governed_task_ids {
             if !selected_task_ids.contains(&task_id) {
@@ -2269,22 +2063,18 @@ impl MilestoneRuntime {
         }
         let mut tasks = Vec::with_capacity(selected_task_ids.len());
         for task_id in selected_task_ids {
-            let row = sqlx::query(
-                "SELECT version, task_type, status, deleted_at, updated_at
-                 FROM task WHERE id = ? AND project_id = ?",
-            )
-            .bind(task_id)
-            .bind(project_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                message: format!("milestone references missing Task {task_id}"),
-            })?;
-            let deleted_at: Option<String> = row.try_get("deleted_at")?;
-            let version: i64 = row.try_get("version")?;
-            let task_type: String = row.try_get("task_type")?;
-            let task_status: String = row.try_get("status")?;
-            let observed_at: String = row.try_get("updated_at")?;
+            let row = self
+                .db
+                .milestone_task_source_in_tx(tx, task_id, project_id)
+                .await?
+                .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                    message: format!("milestone references missing Task {task_id}"),
+                })?;
+            let deleted_at: Option<String> = row.deleted_at.clone();
+            let version: i64 = row.version;
+            let task_type: String = row.task_type.clone();
+            let task_status: String = row.status.clone();
+            let observed_at: String = row.updated_at.clone();
             if version <= 0
                 || task_type.trim().is_empty()
                 || task_status.trim().is_empty()
@@ -2309,36 +2099,32 @@ impl MilestoneRuntime {
 
         let mut documents = Vec::with_capacity(definition.content.document_revisions.len());
         for document in &definition.content.document_revisions {
-            let row = sqlx::query(
-                "SELECT d.version, d.updated_at, d.current_approved_revision_id,
-                        r.id AS revision_id, r.lifecycle, r.content_digest
-                 FROM project_document d
-                 JOIN project_document_revision r
-                   ON r.id = ? AND r.document_id = d.id
-                 WHERE d.id = ? AND d.project_id = ?",
-            )
-            .bind(&document.revision_id)
-            .bind(&document.artifact_id)
-            .bind(project_id)
-            .fetch_optional(&mut **tx)
-            .await?
-            .ok_or_else(|| crate::ServiceError::InvalidOperation {
-                message: format!(
-                    "milestone references missing Document revision {}",
-                    document.revision_id
-                ),
-            })?;
+            let row = self
+                .db
+                .milestone_document_source_in_tx(
+                    tx,
+                    &document.revision_id,
+                    &document.artifact_id,
+                    project_id,
+                )
+                .await?
+                .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                    message: format!(
+                        "milestone references missing Document revision {}",
+                        document.revision_id
+                    ),
+                })?;
             let current_approved_revision_id: Option<String> =
-                row.try_get("current_approved_revision_id")?;
-            let content_digest: String = row.try_get("content_digest")?;
+                row.current_approved_revision_id.clone();
+            let content_digest: String = row.content_digest.clone();
             if document.content_digest.trim().is_empty()
                 || document.content_digest != content_digest
             {
                 return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
             }
-            let version: i64 = row.try_get("version")?;
-            let lifecycle: String = row.try_get("lifecycle")?;
-            let observed_at: String = row.try_get("updated_at")?;
+            let version: i64 = row.version;
+            let lifecycle: String = row.lifecycle.clone();
+            let observed_at: String = row.updated_at.clone();
             if version <= 0 || lifecycle.trim().is_empty() || observed_at.trim().is_empty() {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: format!(
@@ -2349,7 +2135,7 @@ impl MilestoneRuntime {
             }
             documents.push(ReadinessDocumentState {
                 document_id: document.artifact_id.clone(),
-                revision_id: row.try_get("revision_id")?,
+                revision_id: row.revision_id.clone(),
                 version,
                 lifecycle,
                 current_approved: current_approved_revision_id.as_deref()
@@ -2374,67 +2160,36 @@ impl MilestoneRuntime {
     ) -> crate::Result<Vec<String>> {
         let mut context = Vec::new();
         for task in tasks {
-            let rows = sqlx::query(
-                "SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
-                        CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END AS remote_url,
-                        repo.default_branch,
-                        e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
-                        e.before_sha, e.after_sha, e.summary AS execution_summary,
-                        e.created_at AS execution_created_at, e.updated_at AS execution_updated_at,
-                        r.id AS review_id, r.status AS review_status,
-                        r.step_results_json AS ci_results, NULL AS audit_result,
-                        NULL AS human_decision,
-                        r.created_at AS review_created_at, r.updated_at AS review_updated_at
-                 FROM task t
-                 JOIN project p ON p.id = t.project_id
-                 LEFT JOIN execution e ON e.id = (
-                     SELECT e2.id FROM execution e2
-                     WHERE e2.task_id = t.id
-                     ORDER BY e2.updated_at DESC, e2.id DESC LIMIT 1
-                 )
-                 LEFT JOIN workspace w ON w.id = e.workspace_id
-                 JOIN repo ON repo.id = CASE
-                     WHEN e.id IS NULL THEN p.primary_repo_id
-                     ELSE w.repo_id
-                 END AND repo.project_id = t.project_id
-                 LEFT JOIN review r ON r.id = (
-                     SELECT r2.id FROM review r2
-                     WHERE r2.execution_id = e.id
-                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
-                 )
-                 WHERE t.id = ? AND t.project_id = ?
-                 LIMIT 1",
-            )
-            .bind(&task.task_id)
-            .bind(project_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+            let rows = self
+                .db
+                .milestone_repository_context_in_tx(tx, &task.task_id, project_id)
+                .await?;
             let row = rows.ok_or_else(|| crate::ServiceError::InvalidOperation {
                 message: format!("selected Task {} has no repository record", task.task_id),
             })?;
             let reference = RepositoryContextReference {
                 task_id: task.task_id.clone(),
                 task_version: task.version,
-                repository_id: row.try_get("repo_id")?,
-                repository_name: row.try_get("repository_name")?,
-                repository_kind: row.try_get("repository_kind")?,
-                remote_url: db::normalize_repo_remote_url(row.try_get("remote_url")?),
-                default_branch: row.try_get("default_branch")?,
-                execution_id: row.try_get("execution_id")?,
-                execution_status: row.try_get("execution_status")?,
-                execution_role: row.try_get("execution_role")?,
-                before_sha: row.try_get("before_sha")?,
-                after_sha: row.try_get("after_sha")?,
-                execution_summary: row.try_get("execution_summary")?,
-                execution_created_at: row.try_get("execution_created_at")?,
-                execution_updated_at: row.try_get("execution_updated_at")?,
-                review_id: row.try_get("review_id")?,
-                review_status: row.try_get("review_status")?,
-                ci_results: row.try_get("ci_results")?,
-                audit_result: row.try_get("audit_result")?,
-                human_decision: row.try_get("human_decision")?,
-                review_created_at: row.try_get("review_created_at")?,
-                review_updated_at: row.try_get("review_updated_at")?,
+                repository_id: row.repo_id.clone(),
+                repository_name: row.repository_name.clone(),
+                repository_kind: row.repository_kind.clone(),
+                remote_url: db::normalize_repo_remote_url(row.remote_url.clone()),
+                default_branch: row.default_branch.clone(),
+                execution_id: row.execution_id.clone(),
+                execution_status: row.execution_status.clone(),
+                execution_role: row.execution_role.clone(),
+                before_sha: row.before_sha.clone(),
+                after_sha: row.after_sha.clone(),
+                execution_summary: row.execution_summary.clone(),
+                execution_created_at: row.execution_created_at.clone(),
+                execution_updated_at: row.execution_updated_at.clone(),
+                review_id: row.review_id.clone(),
+                review_status: row.review_status.clone(),
+                ci_results: row.ci_results.clone(),
+                audit_result: row.audit_result.clone(),
+                human_decision: row.human_decision.clone(),
+                review_created_at: row.review_created_at.clone(),
+                review_updated_at: row.review_updated_at.clone(),
                 observed_at: task.observed_at.clone(),
             };
             validate_repository_context_reference(&reference).map_err(|error| {
@@ -2594,18 +2349,10 @@ impl MilestoneRuntime {
         tx: &mut Transaction<'_, Sqlite>,
         project_id: &str,
     ) -> crate::Result<String> {
-        let event_id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM domain_event
-             WHERE scope_type = 'project' AND scope_id = ?
-               AND event_type NOT IN (
-                   'milestone.readiness.evaluated',
-                   'project_release.candidate_requested'
-               )
-             ORDER BY sequence DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let event_id: Option<String> = self
+            .db
+            .milestone_source_event_watermark_in_tx(tx, project_id)
+            .await?;
         Ok(event_id.unwrap_or_else(|| "none".to_owned()))
     }
 
@@ -2614,18 +2361,14 @@ impl MilestoneRuntime {
         tx: &mut Transaction<'_, Sqlite>,
         project_id: &str,
     ) -> crate::Result<PrincipalRef> {
-        let row = sqlx::query(
-            "SELECT identity_id FROM project_agent_binding
-             WHERE project_id = ? AND state = 'active'
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(project_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| crate::ServiceError::not_found("project_agent_binding", project_id))?;
+        let row = self
+            .db
+            .active_project_agent_identity_in_tx(tx, project_id)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("project_agent_binding", project_id))?;
         Ok(PrincipalRef {
             kind: PrincipalKind::Agent,
-            id: row.try_get("identity_id")?,
+            id: row.identity_id.clone(),
             display_name: None,
         })
     }
@@ -2635,13 +2378,10 @@ impl MilestoneRuntime {
         tx: &mut Transaction<'_, Sqlite>,
         milestone_id: &str,
     ) -> crate::Result<i64> {
-        Ok(sqlx::query_scalar(
-            "SELECT COALESCE(MAX(release_revision), 0) + 1
-             FROM project_release WHERE milestone_id = ?",
-        )
-        .bind(milestone_id)
-        .fetch_one(&mut **tx)
-        .await?)
+        Ok(self
+            .db
+            .next_milestone_release_revision_in_tx(tx, milestone_id)
+            .await?)
     }
 
     async fn readiness_by_id(
@@ -2649,15 +2389,7 @@ impl MilestoneRuntime {
         project_id: &str,
         id: &str,
     ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
-        Ok(
-            sqlx::query("SELECT * FROM project_readiness_snapshot WHERE project_id = ? AND id = ?")
-                .bind(project_id)
-                .bind(id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .map(readiness_record_from_row)
-                .transpose()?,
-        )
+        Ok(self.db.project_readiness_record(project_id, id).await?)
     }
 
     async fn release_by_idempotency(
@@ -2665,15 +2397,10 @@ impl MilestoneRuntime {
         project_id: &str,
         key: &str,
     ) -> crate::Result<Option<ProjectReleaseRecord>> {
-        Ok(sqlx::query(
-            "SELECT * FROM project_release WHERE project_id = ? AND idempotency_key = ?",
-        )
-        .bind(project_id)
-        .bind(key)
-        .fetch_optional(self.db.pool())
-        .await?
-        .map(release_record_from_row)
-        .transpose()?)
+        Ok(self
+            .db
+            .project_release_by_idempotency(project_id, key)
+            .await?)
     }
 
     async fn release_by_readiness_target(
@@ -2683,20 +2410,15 @@ impl MilestoneRuntime {
         readiness_snapshot_id: &str,
         readiness_digest: &str,
     ) -> crate::Result<Option<ProjectReleaseRecord>> {
-        Ok(sqlx::query(
-            "SELECT * FROM project_release
-             WHERE project_id = ? AND milestone_id = ?
-               AND readiness_snapshot_id = ? AND readiness_digest = ?
-             ORDER BY release_revision ASC, id ASC LIMIT 1",
-        )
-        .bind(project_id)
-        .bind(milestone_id)
-        .bind(readiness_snapshot_id)
-        .bind(readiness_digest)
-        .fetch_optional(self.db.pool())
-        .await?
-        .map(release_record_from_row)
-        .transpose()?)
+        Ok(self
+            .db
+            .project_release_by_readiness_target(
+                project_id,
+                milestone_id,
+                readiness_snapshot_id,
+                readiness_digest,
+            )
+            .await?)
     }
 
     async fn release_from_record(
@@ -2761,24 +2483,17 @@ impl MilestoneRuntime {
             .await?;
         let charter_revision =
             if let Some(charter_revision_id) = record.charter_revision_id.as_deref() {
-                let row = sqlx::query(
-                    "SELECT cr.charter_id, cr.revision, cr.content_digest,
-                            cr.render_version, cr.rendered_digest
-                     FROM project_charter_revision cr
-                     JOIN project_charter c ON c.id = cr.charter_id
-                     WHERE cr.id = ? AND c.project_id = ?",
-                )
-                .bind(charter_revision_id)
-                .bind(&record.project_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+                let row = self
+                    .db
+                    .release_charter_revision_source(charter_revision_id, &record.project_id)
+                    .await?;
                 row.map(|row| {
-                    Ok::<_, sqlx::Error>(ArtifactRef {
-                        artifact_id: row.try_get("charter_id")?,
+                    Ok::<_, crate::ServiceError>(ArtifactRef {
+                        artifact_id: row.charter_id.clone(),
                         revision_id: charter_revision_id.to_owned(),
-                        content_digest: row.try_get("content_digest")?,
-                        render_version: Some(row.try_get("render_version")?),
-                        render_digest: Some(row.try_get("rendered_digest")?),
+                        content_digest: row.content_digest.clone(),
+                        render_version: Some(row.render_version.clone()),
+                        render_digest: Some(row.rendered_digest.clone()),
                     })
                 })
                 .transpose()?
@@ -2984,27 +2699,19 @@ impl MilestoneRuntime {
                 "{}".to_owned(),
             ));
         }
-        let rows = sqlx::query(
-            "SELECT reference_kind, record_id, record_version, record_state,
-                    record_digest, metadata_json
-             FROM project_release_reference
-             WHERE release_id = ? ORDER BY ordinal ASC",
-        )
-        .bind(release_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.release_reference_rows(release_id).await?;
         if rows.len() != expected.len() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "immutable release references do not match its snapshot".to_owned(),
             });
         }
         for (row, (kind, id, version, state, digest, metadata)) in rows.into_iter().zip(expected) {
-            if row.try_get::<String, _>("reference_kind")? != kind
-                || row.try_get::<String, _>("record_id")? != id
-                || row.try_get::<Option<String>, _>("record_version")? != version
-                || row.try_get::<Option<String>, _>("record_state")? != state
-                || row.try_get::<Option<String>, _>("record_digest")? != digest
-                || row.try_get::<String, _>("metadata_json")? != metadata
+            if row.reference_kind.clone() != kind
+                || row.record_id.clone() != id
+                || row.record_version.clone() != version
+                || row.record_state.clone() != state
+                || row.record_digest.clone() != digest
+                || row.metadata_json.clone() != metadata
             {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: "immutable release reference disagrees with its snapshot".to_owned(),
@@ -3022,64 +2729,53 @@ impl MilestoneRuntime {
     ) -> crate::Result<Vec<api_types::EvidencePin>> {
         let frozen: Vec<api_types::EvidencePin> =
             parse_json_required(frozen_evidence_json, "release evidence_references")?;
-        let rows = sqlx::query(
-            "SELECT p.id, p.release_id, p.attachment_id, p.asset_id,
-                    p.asset_checksum, p.attachment_digest, p.availability,
-                    p.pin_digest, p.created_at, m.checksum AS live_asset_checksum,
-                    (SELECT t.availability FROM media_asset_tombstone t
-                     WHERE t.asset_id = p.asset_id
-                       AND (t.release_pin_id = p.id OR
-                            (t.release_pin_id IS NULL AND t.release_id = p.release_id))
-                     ORDER BY t.created_at DESC, t.id DESC LIMIT 1) AS tombstone_availability
-             FROM project_release_media_pin p
-             JOIN media_asset m ON m.id = p.asset_id
-             WHERE p.project_id = ? AND p.release_id = ? ORDER BY p.id ASC",
-        )
-        .bind(project_id)
-        .bind(release_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self
+            .db
+            .release_evidence_pin_rows(project_id, release_id)
+            .await?;
         rows.into_iter()
             .map(|row| {
-                let attachment_id = row
-                    .try_get::<Option<String>, _>("attachment_id")?
-                    .ok_or_else(|| crate::ServiceError::InvalidOperation {
+                let attachment_id = row.attachment_id.clone().ok_or_else(|| {
+                    crate::ServiceError::InvalidOperation {
                         message: "immutable release pin is missing attachment_id".to_owned(),
-                    })?;
+                    }
+                })?;
                 let attachment_digest = row
-                    .try_get::<Option<String>, _>("attachment_digest")?
+                    .attachment_digest
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable release pin is missing attachment digest".to_owned(),
                     })?;
                 let asset_checksum = row
-                    .try_get::<Option<String>, _>("asset_checksum")?
+                    .asset_checksum
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable release pin is missing asset checksum".to_owned(),
                     })?;
                 if let Some(live_asset_checksum) = row
-                    .try_get::<Option<String>, _>("live_asset_checksum")?
+                    .live_asset_checksum
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                 {
                     if live_asset_checksum != asset_checksum {
                         return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
                     }
                 }
-                let availability =
-                    evidence_availability(&row.try_get::<String, _>("availability")?)?;
+                let availability = evidence_availability(&row.availability.clone())?;
                 let pin_digest: String = row
-                    .try_get::<Option<String>, _>("pin_digest")?
+                    .pin_digest
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable release pin is missing pin_digest".to_owned(),
                     })?;
-                let availability_projection =
-                    match row.try_get::<Option<String>, _>("tombstone_availability")? {
-                        Some(value) => release_evidence_tombstone(&value)?,
-                        None => release_evidence_availability(availability),
-                    };
-                let id: String = row.try_get("id")?;
+                let availability_projection = match row.tombstone_availability.clone() {
+                    Some(value) => release_evidence_tombstone(&value)?,
+                    None => release_evidence_availability(availability),
+                };
+                let id: String = row.id.clone();
                 let frozen_pin = frozen.iter().find(|pin| pin.id == id).ok_or_else(|| {
                     crate::ServiceError::InvalidOperation {
                         message: format!("release pin {id} is missing frozen metadata"),
@@ -3088,12 +2784,12 @@ impl MilestoneRuntime {
                 if frozen_pin.attachment_digest != attachment_digest
                     || frozen_pin.asset_checksum != asset_checksum
                     || frozen_pin.attachment_id != attachment_id
-                    || frozen_pin.asset_id != row.try_get::<String, _>("asset_id")?
-                    || frozen_pin.release_id != row.try_get::<String, _>("release_id")?
+                    || frozen_pin.asset_id != row.asset_id.clone()
+                    || frozen_pin.release_id != row.release_id.clone()
                     || frozen_pin.availability != availability
                     || frozen_pin.availability_projection
                         != release_evidence_availability(availability)
-                    || frozen_pin.pinned_at != row.try_get::<String, _>("created_at")?
+                    || frozen_pin.pinned_at != row.created_at.clone()
                 {
                     return Err(crate::ServiceError::Db(db::DbError::VersionConflict));
                 }
@@ -3111,16 +2807,16 @@ impl MilestoneRuntime {
                 }
                 Ok(api_types::EvidencePin {
                     id,
-                    release_id: row.try_get("release_id")?,
+                    release_id: row.release_id.clone(),
                     attachment_id,
-                    asset_id: row.try_get("asset_id")?,
+                    asset_id: row.asset_id.clone(),
                     attachment_digest,
                     asset_checksum,
                     availability,
                     availability_projection,
                     task_media_id: frozen_pin.task_media_id.clone(),
                     stable_project_url: frozen_pin.stable_project_url.clone(),
-                    pinned_at: row.try_get("created_at")?,
+                    pinned_at: row.created_at.clone(),
                 })
             })
             .collect::<crate::Result<Vec<_>>>()
@@ -3188,18 +2884,18 @@ pub(crate) fn projection_reasons(reasons: &[ReadinessReason]) -> ProjectionReaso
 }
 
 fn validation_results_from_rows(
-    rows: Vec<sqlx::sqlite::SqliteRow>,
+    rows: Vec<db::MilestoneCheckResultRow>,
     project_id: &str,
     expected_definition_revision_id: &str,
     expected_charter_revision_id: Option<&str>,
 ) -> crate::Result<Vec<ValidationResult>> {
     let mut latest = std::collections::BTreeMap::<String, ValidationResult>::new();
     for row in rows {
-        let check_id: String = row.try_get("check_id")?;
+        let check_id: String = row.check_id.clone();
         if latest.contains_key(&check_id) {
             continue;
         }
-        let source_kind: String = row.try_get("source_kind")?;
+        let source_kind: String = row.source_kind.clone();
         match source_kind.as_str() {
             // Each of these has a server-owned admission path that supplies
             // exact provenance: `manual` through the user attestation route,
@@ -3214,30 +2910,30 @@ fn validation_results_from_rows(
                 });
             }
         }
-        let id: String = row.try_get("id")?;
+        let id: String = row.id.clone();
         if id.trim().is_empty() || check_id.trim().is_empty() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: "immutable validation result is missing identity fields".to_owned(),
             });
         }
         let principal = PrincipalRef {
-            kind: principal_kind(&row.try_get::<String, _>("principal_type")?)?,
-            id: row.try_get("principal_id")?,
+            kind: principal_kind(&row.principal_type.clone())?,
+            id: row.principal_id.clone(),
             display_name: None,
         };
-        let evaluated_at: String = row.try_get("created_at")?;
-        let status = check_status(&row.try_get::<String, _>("outcome")?)?;
-        let input_digest: String = row.try_get("input_digest")?;
+        let evaluated_at: String = row.created_at.clone();
+        let status = check_status(&row.outcome.clone())?;
+        let input_digest: String = row.input_digest.clone();
         if evaluated_at.trim().is_empty() || input_digest.trim().is_empty() {
             return Err(crate::ServiceError::InvalidOperation {
                 message: format!("immutable validation {id} is missing target provenance"),
             });
         }
         let source_manifest: Value = parse_json_required(
-            &row.try_get::<String, _>("source_manifest_json")?,
+            &row.source_manifest_json.clone(),
             "validation source_manifest",
         )?;
-        let definition_revision_id: String = row.try_get("definition_revision_id")?;
+        let definition_revision_id: String = row.definition_revision_id.clone();
         let manifest_definition_revision_id = source_manifest
             .get("check_definition_revision_id")
             .and_then(Value::as_str);
@@ -3250,7 +2946,7 @@ fn validation_results_from_rows(
                 message: format!("invalid validation governing revisions: {error}"),
             })?;
         let persisted_charter_revision_id: Option<String> =
-            row.try_get("governing_charter_revision_id")?;
+            row.governing_charter_revision_id.clone();
         // The approved Charter is the whole governing authority for a result.
         let expected_revision_ids =
             expected_charter_revision_id.map(|charter| vec![charter.to_owned()]);
@@ -3295,10 +2991,10 @@ fn validation_results_from_rows(
         }
         let authorization = AuthorizationProvenance {
             principal: principal.clone(),
-            authorization_basis: row.try_get("authorization_basis")?,
-            action: row.try_get("authorization_action")?,
-            event_id: row.try_get("explicit_event")?,
-            occurred_at: row.try_get("authorization_occurred_at")?,
+            authorization_basis: row.authorization_basis.clone(),
+            action: row.authorization_action.clone(),
+            event_id: row.explicit_event.clone(),
+            occurred_at: row.authorization_occurred_at.clone(),
         };
         if source_kind == "manual" {
             if principal.kind != PrincipalKind::User {
@@ -3338,7 +3034,7 @@ fn validation_results_from_rows(
                 input_digest,
                 governing_revision_ids: governing,
                 expected_version: {
-                    let version: i64 = row.try_get("expected_version")?;
+                    let version: i64 = row.expected_version;
                     if version <= 0 {
                         return Err(crate::ServiceError::InvalidOperation {
                             message: format!(
@@ -3349,7 +3045,7 @@ fn validation_results_from_rows(
                     version
                 },
                 event_id: {
-                    let event_id: String = row.try_get("explicit_event")?;
+                    let event_id: String = row.explicit_event.clone();
                     if event_id.trim().is_empty() || event_id != authorization.event_id {
                         return Err(crate::ServiceError::InvalidOperation {
                             message: format!(
@@ -3380,25 +3076,24 @@ fn same_principal(left: &PrincipalRef, right: &PrincipalRef) -> bool {
 }
 
 fn evidence_from_rows(
-    rows: Vec<sqlx::sqlite::SqliteRow>,
+    rows: Vec<db::MilestoneEvidenceRow>,
     project_id: &str,
 ) -> crate::Result<Vec<EvidenceAttachment>> {
     rows.into_iter()
         .map(|row| {
             let author = PrincipalRef {
-                kind: principal_kind(&row.try_get::<String, _>("author_type")?)?,
+                kind: principal_kind(&row.author_type.clone())?,
                 id: row
-                    .try_get::<Option<String>, _>("author_id")?
+                    .author_id
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable evidence attachment is missing author_id".to_owned(),
                     })?,
                 display_name: None,
             };
-            let attachment_authorization: AuthorizationProvenance = parse_json_required(
-                &row.try_get::<String, _>("authorization_json")?,
-                "evidence authorization",
-            )?;
+            let attachment_authorization: AuthorizationProvenance =
+                parse_json_required(&row.authorization_json.clone(), "evidence authorization")?;
             if !same_principal(&attachment_authorization.principal, &author) {
                 return Err(crate::ServiceError::InvalidOperation {
                     message: "immutable evidence authorization principal disagrees with author"
@@ -3410,43 +3105,42 @@ fn evidence_from_rows(
                 EVIDENCE_ATTACH_AUTHORIZATION_ACTION,
             )?;
             Ok(EvidenceAttachment {
-                id: row.try_get("id")?,
+                id: row.id.clone(),
                 project_id: project_id.to_owned(),
-                asset_id: row.try_get("asset_id")?,
-                task_id: row.try_get("task_id")?,
-                source_task_id: row.try_get("source_task_id")?,
-                source_run_id: row.try_get("source_execution_id")?,
-                source_validation_id: row.try_get("source_validation_id")?,
-                source_task_version: row.try_get("source_task_version")?,
-                source_context_digest: row.try_get("source_context_digest")?,
-                source_definition_revision_id: row.try_get("source_definition_revision_id")?,
-                milestone_id: row.try_get("milestone_id")?,
+                asset_id: row.asset_id.clone(),
+                task_id: row.task_id.clone(),
+                source_task_id: row.source_task_id.clone(),
+                source_run_id: row.source_execution_id.clone(),
+                source_validation_id: row.source_validation_id.clone(),
+                source_task_version: row.source_task_version,
+                source_context_digest: row.source_context_digest.clone(),
+                source_definition_revision_id: row.source_definition_revision_id.clone(),
+                milestone_id: row.milestone_id.clone(),
                 acceptance_check_ids: parse_json_required(
-                    &row.try_get::<String, _>("acceptance_check_ids_json")?,
+                    &row.acceptance_check_ids_json.clone(),
                     "evidence acceptance_check_ids",
                 )?,
                 caption: row
-                    .try_get::<Option<String>, _>("caption")?
+                    .caption
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable evidence attachment is missing caption".to_owned(),
                     })?,
-                kind: evidence_kind(
-                    row.try_get::<Option<String>, _>("evidence_kind")?
-                        .as_deref(),
-                )?,
+                kind: evidence_kind(row.evidence_kind.clone().as_deref())?,
                 checksum: row
-                    .try_get::<Option<String>, _>("checksum")?
+                    .checksum
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .ok_or_else(|| crate::ServiceError::InvalidOperation {
                         message: "immutable evidence attachment is missing checksum".to_owned(),
                     })?,
-                availability: evidence_availability(&row.try_get::<String, _>("availability")?)?,
+                availability: evidence_availability(&row.availability.clone())?,
                 author,
-                captured_at: row.try_get("created_at")?,
-                version: row.try_get("version")?,
-                created_at: row.try_get("created_at")?,
-                removed_at: row.try_get("deleted_at")?,
+                captured_at: row.created_at.clone(),
+                version: row.version,
+                created_at: row.created_at.clone(),
+                removed_at: row.deleted_at.clone(),
             })
         })
         .collect()
@@ -3750,56 +3444,53 @@ fn release_snapshot(
 }
 
 async fn insert_readiness(
+    db: &SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     snapshot: &ReadinessSnapshot,
     authorization: &AuthorizationProvenance,
     idempotency_key: &str,
     expected_milestone_version: i64,
 ) -> crate::Result<()> {
-    sqlx::query(
-        "INSERT INTO project_readiness_snapshot (
-            id, project_id, milestone_id, definition_revision_id,
-            input_manifest_json, event_watermark, outcome, blocking_reasons_json,
-            check_results_json, waiver_manifest_json, evidence_manifest_json,
-            commit_context_json, computing_policy_revision, readiness_digest,
-            principal_type, principal_id, authorization_basis, authorization_action,
-            expected_milestone_version, explicit_event, authorization_occurred_at,
-            idempotency_key, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    db.insert_milestone_readiness_in_tx(
+        tx,
+        &db::InsertMilestoneReadinessInput {
+            id: &snapshot.id,
+            project_id: &snapshot.project_id,
+            milestone_id: &snapshot.milestone_id,
+            definition_revision_id: &snapshot.milestone_definition_revision_id,
+            input_manifest_json: &(serde_json::to_string(&snapshot.input_manifest)
+                .map_err(json_error)?),
+            event_watermark: &snapshot.source_event_watermark,
+            outcome: readiness_result_name(snapshot.result),
+            blocking_reasons_json: &(serde_json::to_string(&snapshot.reasons)
+                .map_err(json_error)?),
+            check_results_json: &(serde_json::to_string(&snapshot.check_results)
+                .map_err(json_error)?),
+            waiver_manifest_json: &(serde_json::to_string(&snapshot.waiver_ids)
+                .map_err(json_error)?),
+            evidence_manifest_json: &(serde_json::to_string(&PersistedEvidenceManifest {
+                ids: snapshot.evidence_attachment_ids.clone(),
+                digests: snapshot.evidence_digests.clone(),
+                availability: snapshot.evidence_availability.clone(),
+            })
+            .map_err(json_error)?),
+            commit_context_json: &(serde_json::to_string(&snapshot.commit_build_check_context)
+                .map_err(json_error)?),
+            computing_policy_revision: &snapshot.computing_policy_revision,
+            readiness_digest: &snapshot.readiness_digest,
+            principal_type: principal_kind_name(authorization.principal.kind),
+            principal_id: &authorization.principal.id,
+            authorization_basis: &authorization.authorization_basis,
+            authorization_action: &authorization.action,
+            expected_milestone_version,
+            explicit_event: &authorization.event_id,
+            authorization_occurred_at: &authorization.occurred_at,
+            idempotency_key,
+            created_at: &snapshot.computed_at,
+        },
     )
-    .bind(&snapshot.id)
-    .bind(&snapshot.project_id)
-    .bind(&snapshot.milestone_id)
-    .bind(&snapshot.milestone_definition_revision_id)
-    .bind(serde_json::to_string(&snapshot.input_manifest).map_err(json_error)?)
-    .bind(&snapshot.source_event_watermark)
-    .bind(readiness_result_name(snapshot.result))
-    .bind(serde_json::to_string(&snapshot.reasons).map_err(json_error)?)
-    .bind(serde_json::to_string(&snapshot.check_results).map_err(json_error)?)
-    .bind(serde_json::to_string(&snapshot.waiver_ids).map_err(json_error)?)
-    .bind(
-        serde_json::to_string(&PersistedEvidenceManifest {
-            ids: snapshot.evidence_attachment_ids.clone(),
-            digests: snapshot.evidence_digests.clone(),
-            availability: snapshot.evidence_availability.clone(),
-        })
-        .map_err(json_error)?,
-    )
-    .bind(serde_json::to_string(&snapshot.commit_build_check_context).map_err(json_error)?)
-    .bind(&snapshot.computing_policy_revision)
-    .bind(&snapshot.readiness_digest)
-    .bind(principal_kind_name(authorization.principal.kind))
-    .bind(&authorization.principal.id)
-    .bind(&authorization.authorization_basis)
-    .bind(&authorization.action)
-    .bind(expected_milestone_version)
-    .bind(&authorization.event_id)
-    .bind(&authorization.occurred_at)
-    .bind(idempotency_key)
-    .bind(&snapshot.computed_at)
-    .execute(&mut **tx)
     .await
-    .map_err(map_sqlx_conflict)?;
+    .map_err(map_db_conflict)?;
     for (ordinal, input) in snapshot.input_manifest.iter().enumerate() {
         let availability = if input.source_kind == "evidence" {
             match snapshot
@@ -3827,32 +3518,28 @@ async fn insert_readiness(
         } else {
             None
         };
-        sqlx::query(
-            "INSERT INTO project_readiness_input (
-                readiness_snapshot_id, ordinal, source_kind, source_id,
-                source_version, source_digest, availability, disposition, metadata_json
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'included', ?)",
+        db.insert_milestone_readiness_input_in_tx(
+            tx,
+            &db::InsertMilestoneReadinessSourceInput {
+                snapshot_id: &snapshot.id,
+                ordinal: i64::try_from(ordinal).map_err(|_| {
+                    crate::ServiceError::InvalidOperation {
+                        message: "readiness input ordinal overflow".to_owned(),
+                    }
+                })?,
+                source_kind: &input.source_kind,
+                source_id: &input.source_id,
+                source_version: &input.source_version.to_string(),
+                source_digest: &input.source_digest,
+                availability,
+                metadata_json: &(serde_json::to_string(&json!({
+                    "observed_at": input.observed_at,
+                }))
+                .map_err(json_error)?),
+            },
         )
-        .bind(&snapshot.id)
-        .bind(
-            i64::try_from(ordinal).map_err(|_| crate::ServiceError::InvalidOperation {
-                message: "readiness input ordinal overflow".to_owned(),
-            })?,
-        )
-        .bind(&input.source_kind)
-        .bind(&input.source_id)
-        .bind(input.source_version.to_string())
-        .bind(&input.source_digest)
-        .bind(availability)
-        .bind(
-            serde_json::to_string(&json!({
-                "observed_at": input.observed_at,
-            }))
-            .map_err(json_error)?,
-        )
-        .execute(&mut **tx)
         .await
-        .map_err(map_sqlx_conflict)?;
+        .map_err(map_db_conflict)?;
     }
     Ok(())
 }
@@ -4254,125 +3941,6 @@ struct PersistedEvidenceManifest {
     availability: Vec<EvidenceAvailability>,
 }
 
-fn milestone_record_from_row(row: sqlx::sqlite::SqliteRow) -> db::Result<ProjectMilestoneRecord> {
-    Ok(ProjectMilestoneRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        milestone_sequence: row.try_get("milestone_sequence")?,
-        milestone_key: row.try_get("milestone_key")?,
-        display_label: row.try_get("display_label")?,
-        current_definition_revision_id: row.try_get("current_definition_revision_id")?,
-        lifecycle: row.try_get("lifecycle")?,
-        blocker_reason_json: row.try_get("blocker_reason_json")?,
-        stale_reason_json: row.try_get("stale_reason_json")?,
-        reconciliation_reason_json: row.try_get("reconciliation_reason_json")?,
-        version: row.try_get("version")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn milestone_revision_record_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> db::Result<ProjectMilestoneRevisionRecord> {
-    Ok(ProjectMilestoneRevisionRecord {
-        id: row.try_get("id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        revision: row.try_get("revision")?,
-        base_revision: row.try_get("base_revision")?,
-        base_revision_id: row.try_get("base_revision_id")?,
-        lifecycle: row.try_get("lifecycle")?,
-        display_label: row.try_get("display_label")?,
-        outcome: row.try_get("outcome")?,
-        included_scope_json: row.try_get("included_scope_json")?,
-        excluded_scope_json: row.try_get("excluded_scope_json")?,
-        charter_revision_id: row.try_get("charter_revision_id")?,
-        document_revisions_json: row.try_get("document_revisions_json")?,
-        task_selection_json: row.try_get("task_selection_json")?,
-        dependencies_json: row.try_get("dependencies_json")?,
-        risks_json: row.try_get("risks_json")?,
-        acceptance_checks_json: row.try_get("acceptance_checks_json")?,
-        evidence_requirements_json: row.try_get("evidence_requirements_json")?,
-        known_issues_json: row.try_get("known_issues_json")?,
-        change_summary: row.try_get("change_summary")?,
-        schema_version: row.try_get("schema_version")?,
-        render_version: row.try_get("render_version")?,
-        rendered_view: row.try_get("rendered_view")?,
-        content_digest: row.try_get("content_digest")?,
-        rendered_digest: row.try_get("rendered_digest")?,
-        author_type: row.try_get("author_type")?,
-        author_id: row.try_get("author_id")?,
-        source_refs_json: row.try_get("source_refs_json")?,
-        created_at: row.try_get("created_at")?,
-    })
-}
-
-fn readiness_record_from_row(
-    row: sqlx::sqlite::SqliteRow,
-) -> db::Result<ProjectReadinessSnapshotRecord> {
-    Ok(ProjectReadinessSnapshotRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        definition_revision_id: row.try_get("definition_revision_id")?,
-        input_manifest_json: row.try_get("input_manifest_json")?,
-        event_watermark: row.try_get("event_watermark")?,
-        outcome: row.try_get("outcome")?,
-        blocking_reasons_json: row.try_get("blocking_reasons_json")?,
-        check_results_json: row.try_get("check_results_json")?,
-        waiver_manifest_json: row.try_get("waiver_manifest_json")?,
-        evidence_manifest_json: row.try_get("evidence_manifest_json")?,
-        commit_context_json: row.try_get("commit_context_json")?,
-        computing_policy_revision: row.try_get("computing_policy_revision")?,
-        readiness_digest: row.try_get("readiness_digest")?,
-        principal_type: row.try_get("principal_type")?,
-        principal_id: row.try_get("principal_id")?,
-        authorization_basis: row.try_get("authorization_basis")?,
-        authorization_action: row.try_get("authorization_action")?,
-        expected_milestone_version: row.try_get("expected_milestone_version")?,
-        explicit_event: row.try_get("explicit_event")?,
-        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-        idempotency_key: row.try_get("idempotency_key")?,
-        created_at: row.try_get("created_at")?,
-    })
-}
-
-fn release_record_from_row(row: sqlx::sqlite::SqliteRow) -> db::Result<ProjectReleaseRecord> {
-    Ok(ProjectReleaseRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        release_sequence: row.try_get("release_sequence")?,
-        release_revision: row.try_get("release_revision")?,
-        release_identifier: row.try_get("release_identifier")?,
-        milestone_revision_id: row.try_get("milestone_revision_id")?,
-        readiness_snapshot_id: row.try_get("readiness_snapshot_id")?,
-        readiness_digest: row.try_get("readiness_digest")?,
-        summary: row.try_get("summary")?,
-        changelog: row.try_get("changelog")?,
-        known_issues_json: row.try_get("known_issues_json")?,
-        charter_revision_id: row.try_get("charter_revision_id")?,
-        document_revisions_json: row.try_get("document_revisions_json")?,
-        decision_ids_json: row.try_get("decision_ids_json")?,
-        task_references_json: row.try_get("task_references_json")?,
-        validation_references_json: row.try_get("validation_references_json")?,
-        git_references_json: row.try_get("git_references_json")?,
-        evidence_references_json: row.try_get("evidence_references_json")?,
-        waivers_json: row.try_get("waivers_json")?,
-        releasing_principal_type: row.try_get("releasing_principal_type")?,
-        releasing_principal_id: row.try_get("releasing_principal_id")?,
-        releasing_principal_display_name: row.try_get("releasing_principal_display_name")?,
-        authorization_basis: row.try_get("authorization_basis")?,
-        authorization_action: row.try_get("authorization_action")?,
-        explicit_event: row.try_get("explicit_event")?,
-        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-        schema_version: row.try_get("schema_version")?,
-        snapshot_digest: row.try_get("snapshot_digest")?,
-        idempotency_key: row.try_get("idempotency_key")?,
-        created_at: row.try_get("created_at")?,
-    })
-}
-
 fn validate_authorization(
     authorization: &AuthorizationProvenance,
     actor: &PrincipalRef,
@@ -4461,11 +4029,11 @@ fn map_orchestration_error(error: MilestoneOrchestrationError) -> crate::Service
     }
 }
 
-fn map_sqlx_conflict(error: sqlx::Error) -> crate::ServiceError {
+fn map_db_conflict(error: db::DbError) -> crate::ServiceError {
     if error.to_string().to_ascii_lowercase().contains("unique") {
         crate::ServiceError::Db(db::DbError::VersionConflict)
     } else {
-        crate::ServiceError::Db(error.into())
+        crate::ServiceError::Db(error)
     }
 }
 
@@ -4734,7 +4302,6 @@ mod tests {
                     name: "Local Repo".to_owned(),
                     remote_url: remote_url.map(str::to_owned),
                     local_path: Some("/tmp/local-repo".to_owned()),
-                    work_mode: db::WorkMode::DirectMerge,
                     default_branch: "main".to_owned(),
                     created_at: now.to_owned(),
                     updated_at: now.to_owned(),
@@ -4794,6 +4361,80 @@ mod tests {
                 assert!(validate_repository_context_reference(&incomplete).is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn repository_context_digest_includes_stored_repository_kind() {
+        let pool = create_sqlite_pool("sqlite::memory:")
+            .await
+            .expect("pool creates");
+        run_migrations(&pool).await.expect("migrations run");
+        let db = Arc::new(SqliteDb::new(pool));
+        let observed_at = "2026-09-30T10:11:12Z";
+        sqlx::query(
+            "INSERT INTO project
+             (id, name, settings, workflow_definition, primary_repo_id, created_at, updated_at)
+             VALUES ('project-digest', 'Digest Project', '{}', '{}', NULL, ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("project inserts");
+        sqlx::query(
+            "INSERT INTO repo
+             (id, project_id, name, remote_url, work_mode, default_branch, created_at, updated_at)
+             VALUES ('repo-digest', 'project-digest', 'Digest Repo',
+                     'https://example.test/digest.git', 'pull_request', 'release', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("repository inserts");
+        sqlx::query(
+            "UPDATE project SET primary_repo_id = 'repo-digest' WHERE id = 'project-digest'",
+        )
+        .execute(db.pool())
+        .await
+        .expect("primary repository selects");
+        sqlx::query(
+            "INSERT INTO task
+             (id, project_id, title, task_type, status, created_at, updated_at)
+             VALUES ('task-digest', 'project-digest', 'Digest Task', 'task', 'done', ?, ?)",
+        )
+        .bind(observed_at)
+        .bind(observed_at)
+        .execute(db.pool())
+        .await
+        .expect("task inserts");
+
+        let runtime = MilestoneRuntime::new(Arc::clone(&db));
+        let mut tx = db.pool().begin().await.expect("transaction begins");
+        let contexts = runtime
+            .commit_build_check_context_in_tx(
+                &mut tx,
+                "project-digest",
+                &[ReadinessTaskState {
+                    task_id: "task-digest".to_owned(),
+                    version: 3,
+                    task_type: "task".to_owned(),
+                    state: "done".to_owned(),
+                    observed_at: observed_at.to_owned(),
+                }],
+            )
+            .await
+            .expect("repository context builds");
+        tx.rollback().await.expect("transaction rolls back");
+
+        let reference: RepositoryContextReference =
+            serde_json::from_str(&contexts[0]).expect("repository context decodes");
+        assert_eq!(reference.repository_kind, "pull_request");
+        assert_eq!(
+            canonical_digest_with_schema(MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION, &reference)
+                .expect("release reference digest computes"),
+            "58b2fd11c4b612dda1dd63aca95a472fffc117d212c79cc95e0612aaaa587f47"
+        );
     }
 
     #[tokio::test]

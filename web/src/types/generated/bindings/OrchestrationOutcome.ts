@@ -2,6 +2,7 @@
 import type { ApprovalTarget } from "./ApprovalTarget";
 import type { CanonicalScopeRef } from "./CanonicalScopeRef";
 import type { CurrentVersionOrRevision } from "./CurrentVersionOrRevision";
+import type { DeniedBy } from "./DeniedBy";
 import type { OutcomeCode } from "./OutcomeCode";
 import type { OutcomeStatus } from "./OutcomeStatus";
 import type { RetryInstruction } from "./RetryInstruction";
@@ -16,4 +17,12 @@ export type OrchestrationOutcome = { code: OutcomeCode, status: OutcomeStatus, o
  * tools use this for safe conflict targets such as an execution id;
  * arbitrary internal error payloads never belong here.
  */
-details: unknown | null, safe_message: string, correlation_id: string, replayed: boolean, receipt_id: string | null, event_id: string | null, };
+details: unknown | null, 
+/**
+ * Safe cause of a native policy denial, never cross-scope detail.
+ */
+denied_by: DeniedBy | null, 
+/**
+ * Sensible operations held by this caller, when one is available.
+ */
+alternatives: Array<string> | null, safe_message: string, correlation_id: string, replayed: boolean, receipt_id: string | null, event_id: string | null, };

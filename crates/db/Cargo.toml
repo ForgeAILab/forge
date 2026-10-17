@@ -7,21 +7,44 @@ license.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Test processes share a migrated image; normal builds retain migration replay.
+test-template = ["dep:rusqlite", "dep:tempfile"]
+
+# The integration target reads the shared template. It names the feature here
+# instead of through a `db = { path = "." }` self dev-dependency, which made
+# `cargo test -p db --lib` compile the plain lib and then the test lib, in
+# series. Build it with `--features test-template`; see docs/ci.md.
+[[test]]
+name = "main"
+required-features = ["test-template"]
+
 [dependencies]
+operation-registry = { path = "../operation-registry" }
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 thiserror = "2"
+tracing = "0.1"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 base64 = "0.22"
 hex = "0.4"
 include_dir = "0.7"
 sha2 = "0.11"
 
+# Keep the same libsqlite3-sys version as sqlx 0.8; no raw/unsafe handles.
+rusqlite = { version = "0.32.1", default-features = false, features = ["backup"], optional = true }
+tempfile = { version = "3", optional = true }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
+
 [dev-dependencies]
+# Unit tests get the template code through `cfg(test)`, so its two optional
+# dependencies are also dev-dependencies (same versions as above).
+rusqlite = { version = "0.32.1", default-features = false, features = ["backup"] }
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 workspace = { path = "../workspace" }
 sha2 = "0.11"

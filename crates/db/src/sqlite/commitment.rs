@@ -61,6 +61,9 @@ impl AgentCommitmentRepo for SqliteDb {
         if let Some(status) = &query.status {
             builder.push(" AND status = ").push_bind(status.to_string());
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_commitment", user_id);
+        }
         builder
             .push(" ORDER BY COALESCE(due_at, created_at) ASC, created_at ASC, id ASC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));
@@ -69,134 +72,21 @@ impl AgentCommitmentRepo for SqliteDb {
     }
 
     async fn update_commitment(&self, input: UpdateAgentCommitment) -> Result<AgentCommitment> {
-        let current = self
-            .get_commitment(&input.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if current.version != input.expected_version {
-            if self.lifecycle_exists(&input.id, &input.dedupe_key).await? {
-                return Ok(current);
-            }
-            return Err(DbError::VersionConflict);
-        }
-
-        let status = input.status.unwrap_or_else(|| current.status.clone());
-        let due_at = input.due_at.unwrap_or_else(|| current.due_at.clone());
-        let description = input
-            .description
-            .unwrap_or_else(|| current.description.clone());
-        let blocked_reason = input
-            .blocked_reason
-            .unwrap_or_else(|| current.blocked_reason.clone());
-        let cancellation_reason = input
-            .cancellation_reason
-            .unwrap_or_else(|| current.cancellation_reason.clone());
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let result = sqlx::query(
-            "UPDATE agent_commitment SET
-                status = ?, due_at = ?, description = ?, blocked_reason = ?,
-                cancellation_reason = CASE WHEN ? = 'cancelled' THEN ? ELSE cancellation_reason END,
-                cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
-                version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?",
-        )
-        .bind(status.to_string())
-        .bind(due_at.as_deref())
-        .bind(description.as_deref())
-        .bind(blocked_reason.as_deref())
-        .bind(status.to_string())
-        .bind(cancellation_reason.as_deref())
-        .bind(status.to_string())
-        .bind(if status == AgentCommitmentStatus::Cancelled {
-            Some(input.updated_at.as_str())
-        } else {
-            None
-        })
-        .bind(&input.updated_at)
-        .bind(&input.id)
-        .bind(input.expected_version)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-
-        insert_commitment_lifecycle(
-            &mut transaction,
-            &CreateLifecycle {
-                commitment_id: &input.id,
-                from_status: Some(&current.status),
-                to_status: &status,
-                actor_type: &input.actor_type,
-                actor_id: &input.actor_id,
-                reason: input.reason.as_deref(),
-                evidence_id: input.evidence_id.as_deref(),
-                dedupe_key: &input.dedupe_key,
-                id: new_uuid_v4(),
-                created_at: &input.updated_at,
-            },
-        )
-        .await?;
+        let result = self
+            .update_commitment_in_tx(&mut transaction, input)
+            .await?;
         transaction.commit().await?;
-        self.get_commitment(&input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        Ok(result)
     }
 
     async fn complete_commitment(&self, input: CompleteAgentCommitment) -> Result<AgentCommitment> {
-        let current = self
-            .get_commitment(&input.id)
-            .await?
-            .ok_or(DbError::NotFound)?;
-        if current.status == AgentCommitmentStatus::Completed
-            && self.lifecycle_exists(&input.id, &input.dedupe_key).await?
-        {
-            return Ok(current);
-        }
-        if current.version != input.expected_version {
-            return Err(DbError::VersionConflict);
-        }
-        if current.status == AgentCommitmentStatus::Cancelled {
-            return Err(DbError::InvalidTransition);
-        }
-
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        insert_commitment_evidence(&mut transaction, &input.evidence).await?;
-        let result = sqlx::query(
-            "UPDATE agent_commitment SET status = 'completed', completed_at = ?,
-                blocked_reason = NULL, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?
-               AND status NOT IN ('completed', 'cancelled')",
-        )
-        .bind(&input.completed_at)
-        .bind(&input.updated_at)
-        .bind(&input.id)
-        .bind(input.expected_version)
-        .execute(&mut *transaction)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::VersionConflict);
-        }
-        insert_commitment_lifecycle(
-            &mut transaction,
-            &CreateLifecycle {
-                commitment_id: &input.id,
-                from_status: Some(&current.status),
-                to_status: &AgentCommitmentStatus::Completed,
-                actor_type: &input.actor_type,
-                actor_id: &input.actor_id,
-                reason: input.reason.as_deref(),
-                evidence_id: Some(&input.evidence.id),
-                dedupe_key: &input.dedupe_key,
-                id: new_uuid_v4(),
-                created_at: &input.updated_at,
-            },
-        )
-        .await?;
+        let result = self
+            .complete_commitment_in_tx(&mut transaction, input)
+            .await?;
         transaction.commit().await?;
-        self.get_commitment(&input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        Ok(result)
     }
 
     async fn transfer_commitment(&self, input: TransferAgentCommitment) -> Result<AgentCommitment> {
@@ -504,4 +394,265 @@ fn map_agent_commitment_lifecycle(row: SqliteRow) -> Result<AgentCommitmentLifec
         dedupe_key: row.try_get("dedupe_key")?,
         created_at: row.try_get("created_at")?,
     })
+}
+
+impl SqliteDb {
+    pub async fn update_commitment_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: UpdateAgentCommitment,
+    ) -> Result<AgentCommitment> {
+        let current = self
+            .get_commitment_in_tx(transaction, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if current.version != input.expected_version {
+            if self
+                .lifecycle_exists_in_tx(transaction, &input.id, &input.dedupe_key)
+                .await?
+            {
+                return Ok(current);
+            }
+            return Err(DbError::VersionConflict);
+        }
+
+        let status = input.status.unwrap_or_else(|| current.status.clone());
+        let due_at = input.due_at.unwrap_or_else(|| current.due_at.clone());
+        let description = input
+            .description
+            .unwrap_or_else(|| current.description.clone());
+        let blocked_reason = input
+            .blocked_reason
+            .unwrap_or_else(|| current.blocked_reason.clone());
+        let cancellation_reason = input
+            .cancellation_reason
+            .unwrap_or_else(|| current.cancellation_reason.clone());
+        let result = sqlx::query(
+            "UPDATE agent_commitment SET
+                status = ?, due_at = ?, description = ?, blocked_reason = ?,
+                cancellation_reason = CASE WHEN ? = 'cancelled' THEN ? ELSE cancellation_reason END,
+                cancelled_at = CASE WHEN ? = 'cancelled' THEN ? ELSE cancelled_at END,
+                version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?",
+        )
+        .bind(status.to_string())
+        .bind(due_at.as_deref())
+        .bind(description.as_deref())
+        .bind(blocked_reason.as_deref())
+        .bind(status.to_string())
+        .bind(cancellation_reason.as_deref())
+        .bind(status.to_string())
+        .bind(if status == AgentCommitmentStatus::Cancelled {
+            Some(input.updated_at.as_str())
+        } else {
+            None
+        })
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+
+        insert_commitment_lifecycle(
+            transaction,
+            &CreateLifecycle {
+                commitment_id: &input.id,
+                from_status: Some(&current.status),
+                to_status: &status,
+                actor_type: &input.actor_type,
+                actor_id: &input.actor_id,
+                reason: input.reason.as_deref(),
+                evidence_id: input.evidence_id.as_deref(),
+                dedupe_key: &input.dedupe_key,
+                id: new_uuid_v4(),
+                created_at: &input.updated_at,
+            },
+        )
+        .await?;
+        self.get_commitment_in_tx(transaction, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+    pub async fn complete_commitment_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: CompleteAgentCommitment,
+    ) -> Result<AgentCommitment> {
+        let current = self
+            .get_commitment_in_tx(transaction, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)?;
+        if current.status == AgentCommitmentStatus::Completed
+            && self
+                .lifecycle_exists_in_tx(transaction, &input.id, &input.dedupe_key)
+                .await?
+        {
+            return Ok(current);
+        }
+        if current.version != input.expected_version {
+            return Err(DbError::VersionConflict);
+        }
+        if current.status == AgentCommitmentStatus::Cancelled {
+            return Err(DbError::InvalidTransition);
+        }
+
+        insert_commitment_evidence(transaction, &input.evidence).await?;
+        let result = sqlx::query(
+            "UPDATE agent_commitment SET status = 'completed', completed_at = ?,
+                blocked_reason = NULL, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?
+               AND status NOT IN ('completed', 'cancelled')",
+        )
+        .bind(&input.completed_at)
+        .bind(&input.updated_at)
+        .bind(&input.id)
+        .bind(input.expected_version)
+        .execute(&mut **transaction)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::VersionConflict);
+        }
+        insert_commitment_lifecycle(
+            transaction,
+            &CreateLifecycle {
+                commitment_id: &input.id,
+                from_status: Some(&current.status),
+                to_status: &AgentCommitmentStatus::Completed,
+                actor_type: &input.actor_type,
+                actor_id: &input.actor_id,
+                reason: input.reason.as_deref(),
+                evidence_id: Some(&input.evidence.id),
+                dedupe_key: &input.dedupe_key,
+                id: new_uuid_v4(),
+                created_at: &input.updated_at,
+            },
+        )
+        .await?;
+        self.get_commitment_in_tx(transaction, &input.id)
+            .await?
+            .ok_or(DbError::NotFound)
+    }
+    pub async fn get_commitment_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+    ) -> Result<Option<AgentCommitment>> {
+        sqlx::query("SELECT * FROM agent_commitment WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_agent_commitment)
+            .transpose()
+    }
+    async fn lifecycle_exists_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        id: &str,
+        key: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?").bind(id).bind(key).fetch_one(&mut **tx).await? > 0)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectCommitmentSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectCommitmentSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn due_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("due_at")?)
+    }
+    pub fn originating_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("originating_task_id")?)
+    }
+    pub fn evidence_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("evidence_required")?)
+    }
+    pub fn blocked_reason(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("blocked_reason")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn evidence_count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("evidence_count")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_commitment_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectCommitmentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.status, c.due_at, c.originating_task_id,
+                c.evidence_required, c.blocked_reason, c.version, c.updated_at,
+                (SELECT COUNT(*) FROM agent_commitment_evidence e
+                 WHERE e.commitment_id = c.id) AS evidence_count
+         FROM agent_commitment c
+         JOIN project_agent_binding b
+           ON b.project_id = c.scope_id
+          AND b.identity_id = c.owner_identity_id
+          AND b.state = 'active'
+         WHERE c.scope_type = 'project' AND c.scope_id = ?
+         ORDER BY COALESCE(c.due_at, c.updated_at) ASC, c.updated_at ASC, c.id ASC
+         LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectCommitmentSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_commitment_ids(&self, task_id: &str) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_commitment
+             WHERE originating_task_id = ? ORDER BY id ASC",
+        )
+        .bind(task_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_delivery_evidence_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        commitment_id: &str,
+        task_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_evidence WHERE commitment_id = ? AND evidence_type = 'task_delivery' AND evidence_id = ?").bind(commitment_id).bind(task_id).fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_commitment_lifecycle_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        commitment_id: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agent_commitment_lifecycle WHERE commitment_id = ? AND dedupe_key = ?").bind(commitment_id).bind(dedupe_key).fetch_one(connection).await?)
+    }
 }

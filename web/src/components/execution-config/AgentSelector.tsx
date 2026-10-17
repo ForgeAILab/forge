@@ -19,6 +19,7 @@ const EFFECTIVE_STATUS_DOT: Record<string, string> = {
   active: 'bg-emerald-500',
   busy: 'bg-amber-500',
   daemon_unavailable: 'bg-zinc-400',
+  daemon_upgrade_required: 'bg-amber-500',
   offline: 'bg-red-500',
   error: 'bg-red-500',
 }

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link } from '@tanstack/react-router'
 import {
   ArrowClockwise,
@@ -15,9 +15,21 @@ import {
 } from '@phosphor-icons/react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import { useAgentChatsQuery } from '@/features/agent-chat/hooks'
+import { Textarea } from '@/components/ui/textarea'
+import { LeadInputAnswer, isLeadInput } from '@/components/lead-input-answer'
+import { useAgentQuery } from '@/api/hooks'
+import {
+  useAgentChatsQuery,
+  useAgentChatTurnsQuery,
+  useRetryAgentChatTurnMutation,
+} from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
-import { useMissionControlQuery } from '@/features/federation/hooks'
+import type { RetryTurnAction } from '@/types/generated/bindings/RetryTurnAction'
+import {
+  useAnswerEscalationMutation,
+  useMissionControlQuery,
+  useResolveAttentionMutation,
+} from '@/features/federation/hooks'
 import type {
   AgentHealthItem,
   AttentionConsumerHealth,
@@ -64,6 +76,7 @@ function attentionTaskId(item: AttentionItem): string | null {
 function attentionActionLabel(value: string | null | undefined): string {
   const normalized = value?.trim().toLowerCase().replaceAll(' ', '_')
   if (normalized === 'inspect_run') return 'Inspect run'
+  if (normalized === 'inspect_ci') return 'Inspect CI'
   return humanize(value)
 }
 
@@ -73,6 +86,31 @@ function isInspectRunAction(value: string | null | undefined): boolean {
 
 function count(value: bigint | number): number {
   return typeof value === 'bigint' ? Number(value) : value
+}
+
+function attentionRetryAction(
+  item: AttentionItem,
+): (Omit<RetryTurnAction, 'expected_version'> & { expected_version: number }) | null {
+  if (item.lifecycle === 'resolved') return null
+  const candidate = item.details.retry_action
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null
+  const action = candidate as Record<string, unknown>
+  if (
+    action.kind !== 'retry_turn' ||
+    typeof action.chat_id !== 'string' ||
+    typeof action.turn_id !== 'string' ||
+    typeof action.expected_version !== 'number' ||
+    !Number.isSafeInteger(action.expected_version) ||
+    action.expected_version < 0
+  ) {
+    return null
+  }
+  return {
+    kind: action.kind,
+    chat_id: action.chat_id,
+    turn_id: action.turn_id,
+    expected_version: action.expected_version,
+  }
 }
 
 function attentionTone(item: AttentionItem): string {
@@ -93,7 +131,10 @@ function attentionTone(item: AttentionItem): string {
       'review_risk',
       'budget_threshold',
       'commitment_overdue',
+      'conflict_hotspot',
       'progress_warning',
+      'flaky_check',
+      'base_check_failing',
     ].includes(item.category)
   ) {
     return 'border-warning/30 bg-warning/5'
@@ -101,11 +142,199 @@ function attentionTone(item: AttentionItem): string {
   return 'border-border-subtle bg-card'
 }
 
-function AttentionCard({ item }: { item: AttentionItem }) {
-  const isProgressWarning = item.category === 'progress_warning'
-  const taskId = isProgressWarning ? attentionTaskId(item) : null
+function CiIncidentDetails({ item }: { item: AttentionItem }) {
+  if (!['flaky_check', 'base_check_failing'].includes(item.category)) return null
+  const details = item.details
+  const tasks = Array.isArray(details.task_ids)
+    ? details.task_ids.filter((id): id is string => typeof id === 'string')
+    : []
+  const triage =
+    details.triage && typeof details.triage === 'object'
+      ? (details.triage as Record<string, unknown>)
+      : null
+  const failures = Array.isArray(details.base_failures)
+    ? details.base_failures.filter((s): s is string => typeof s === 'string')
+    : []
+  const signature = typeof details.signature === 'string' ? details.signature : ''
+  const reason = typeof triage?.reason === 'string' ? triage.reason : ''
+  return (
+    <div className="mt-3 space-y-2 text-xs">
+      {typeof details.command === 'string' ? (
+        <code className="block whitespace-pre-wrap break-words">{details.command}</code>
+      ) : null}
+      {typeof details.count === 'number' ? (
+        <p className="text-muted-foreground">
+          {details.count} occurrences · {tasks.length} tasks
+        </p>
+      ) : null}
+      {typeof details.base_commit === 'string' ? (
+        <p className="break-words text-muted-foreground">
+          Base: <code>{details.base_commit}</code>
+        </p>
+      ) : null}
+      {reason ? <p className="break-words text-muted-foreground">{reason}</p> : null}
+      {signature ? <p className="break-words font-mono">{signature}</p> : null}
+      {failures.length ? (
+        <details>
+          <summary className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            {failures.length} base failures
+          </summary>
+          <ul className="mt-2 space-y-1">
+            {failures.map((failure) => (
+              <li className="break-words font-mono" key={failure}>
+                {failure}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+      <div className="flex flex-wrap gap-2">
+        {tasks.map((taskId) => (
+          <Link
+            key={taskId}
+            to="/tasks/$taskId/$tab"
+            params={{ taskId, tab: 'executions' }}
+            className="rounded-sm underline underline-offset-2 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`Inspect CI for task ${taskId}`}
+          >
+            Task {taskId.slice(0, 8)}
+          </Link>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function escalationOf(item: AttentionItem): { id: string; need: string } | null {
+  if (item.recommended_action !== 'answer_escalation' || item.scope_type !== 'project') return null
+  const id = item.details.escalation_id
+  const need = item.details.need
+  return typeof id === 'string' && id
+    ? { id, need: typeof need === 'string' ? need : item.summary }
+    : null
+}
+
+/** The owner's answer to a Project Agent escalation; it wakes the Agent. */
+function EscalationAnswer({
+  item,
+  escalation,
+}: {
+  item: AttentionItem
+  escalation: { id: string; need: string }
+}) {
+  const [answer, setAnswer] = useState('')
+  const submit = useAnswerEscalationMutation()
+  const inputId = `escalation-answer-${item.id}`
+  return (
+    <div className="mt-3 space-y-2">
+      <p className="whitespace-pre-wrap text-xs leading-5 text-foreground">{escalation.need}</p>
+      <label htmlFor={inputId} className="sr-only">
+        Answer
+      </label>
+      <Textarea
+        id={inputId}
+        value={answer}
+        maxLength={4096}
+        placeholder="Answer the Project Agent"
+        disabled={submit.isPending || submit.isSuccess}
+        onChange={(event) => setAnswer(event.target.value)}
+      />
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!answer.trim() || submit.isPending || submit.isSuccess}
+        onClick={() =>
+          submit.mutate({ projectId: item.scope_id, escalationId: escalation.id, answer })
+        }
+      >
+        {submit.isPending ? 'Answering…' : 'Answer'}
+      </Button>
+      {submit.error ? (
+        <p className="text-xs text-destructive" role="alert">
+          {submit.error.message}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+type LeadAnswerDraft = { answer: string; position: number }
+type LeadAnswerDrafts = Record<string, LeadAnswerDraft>
+
+function WithdrawnLeadDraft({
+  id,
+  answer,
+  onDismiss,
+}: {
+  id: string
+  answer: string
+  onDismiss: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const [copyError, setCopyError] = useState(false)
   return (
     <article
+      id={`attention-${id}`}
+      className="space-y-2 rounded-lg border border-border-subtle bg-muted p-4"
+      role="status"
+    >
+      <p className="whitespace-pre-wrap break-words text-sm text-muted-foreground">
+        This question was withdrawn; your draft: <span className="text-foreground">{answer}</span>
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(answer)
+              setCopied(true)
+              setCopyError(false)
+            } catch {
+              setCopyError(true)
+            }
+          }}
+        >
+          {copied ? 'Copied' : 'Copy draft'}
+        </Button>
+        <Button variant="outline" size="sm" onClick={onDismiss}>
+          Dismiss draft
+        </Button>
+      </div>
+      {copyError ? (
+        <p className="text-xs text-muted-foreground">
+          Could not copy. Select your draft to copy it.
+        </p>
+      ) : null}
+    </article>
+  )
+}
+
+function AttentionCard({
+  item,
+  answer,
+  onAnswerChange,
+  onAnswered,
+}: {
+  item: AttentionItem
+  answer: string
+  onAnswerChange: (answer: string) => void
+  onAnswered: () => void
+}) {
+  const isProgressWarning = item.category === 'progress_warning'
+  const taskId = isProgressWarning ? attentionTaskId(item) : null
+  const retryAction = attentionRetryAction(item)
+  const retryTurn = useRetryAgentChatTurnMutation(retryAction?.chat_id)
+  const resolve = useResolveAttentionMutation()
+  const escalation = escalationOf(item)
+  const turns = useAgentChatTurnsQuery(retryAction?.chat_id)
+  const anotherTurnLive =
+    turns.data?.some((turn) =>
+      ['queued', 'leased', 'retry_wait', 'awaiting_input'].includes(turn.status),
+    ) ?? false
+  return (
+    <article
+      id={`attention-${item.id}`}
       className={`rounded-lg border p-4 ${attentionTone(item)}`}
       role={isProgressWarning ? 'status' : undefined}
       aria-live={isProgressWarning ? 'polite' : undefined}
@@ -122,6 +351,17 @@ function AttentionCard({ item }: { item: AttentionItem }) {
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
+            {item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="ml-auto"
+                disabled={resolve.isPending || resolve.isSuccess}
+                onClick={() => resolve.mutate({ id: item.id, expectedVersion: item.version })}
+              >
+                {resolve.isPending ? 'Resolving…' : 'Resolve'}
+              </Button>
+            ) : null}
           </div>
           <p className="mt-1 text-xs leading-5 text-muted-foreground">
             {isProgressWarning ? (
@@ -132,6 +372,7 @@ function AttentionCard({ item }: { item: AttentionItem }) {
               humanize(item.category)
             )}
           </p>
+          <CiIncidentDetails item={item} />
           <p className="mt-3 font-mono text-micro text-muted-foreground">
             {humanize(item.scope_type)} · {item.scope_id.slice(0, 8)} · priority {item.priority} ·
             event {item.source_event_id.slice(0, 8)}
@@ -139,7 +380,30 @@ function AttentionCard({ item }: { item: AttentionItem }) {
           {item.recommended_action ? (
             <div className="mt-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-2 text-xs font-medium text-foreground">
               <span>Next: </span>
-              {isProgressWarning && taskId && isInspectRunAction(item.recommended_action) ? (
+              {retryAction ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={
+                    retryTurn.isPending ||
+                    retryTurn.isSuccess ||
+                    turns.isLoading ||
+                    turns.isError ||
+                    anotherTurnLive
+                  }
+                  onClick={() =>
+                    retryTurn.mutate({
+                      turnId: retryAction.turn_id,
+                      input: {
+                        expected_version: retryAction.expected_version,
+                        idempotency_key: `agent-chat-turn-retry:${retryAction.turn_id}:${retryAction.expected_version}`,
+                      },
+                    })
+                  }
+                >
+                  {retryTurn.isPending ? 'Retrying…' : 'Retry turn'}
+                </Button>
+              ) : isProgressWarning && taskId && isInspectRunAction(item.recommended_action) ? (
                 <Link
                   to="/tasks/$taskId/$tab"
                   params={{ taskId, tab: 'executions' }}
@@ -153,6 +417,27 @@ function AttentionCard({ item }: { item: AttentionItem }) {
                 <span>{attentionActionLabel(item.recommended_action)}</span>
               )}
             </div>
+          ) : null}
+          {escalation && item.lifecycle !== 'resolved' ? (
+            <EscalationAnswer item={item} escalation={escalation} />
+          ) : null}
+          {isLeadInput(item) ? (
+            <LeadInputAnswer
+              item={item}
+              answer={answer}
+              onAnswerChange={onAnswerChange}
+              onAnswered={onAnswered}
+            />
+          ) : null}
+          {retryTurn.error ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {retryTurn.error.message}
+            </p>
+          ) : null}
+          {resolve.error ? (
+            <p className="mt-2 text-xs text-destructive" role="alert">
+              {resolve.error.message}
+            </p>
           ) : null}
         </div>
       </div>
@@ -336,6 +621,11 @@ function ActivityMetadata({ label, value }: { label: string; value: string }) {
 }
 
 function CoordinationActivityRow({ item }: { item: CoordinationActivityItem }) {
+  const lead = useAgentQuery(item.actor_type === 'task_lead' ? item.actor_id : undefined)
+  const actor =
+    item.actor_type === 'task_lead'
+      ? `Lead · ${lead.data?.name ?? item.actor_id}`
+      : `${humanize(item.actor_type)} · ${item.actor_id}`
   const isDirectCommand = item.activity_kind === 'direct_command'
   const kindLabel = isDirectCommand ? 'Direct command receipt' : 'Approval action'
   return (
@@ -372,7 +662,7 @@ function CoordinationActivityRow({ item }: { item: CoordinationActivityItem }) {
         </time>
       </div>
       <dl className="mt-4 grid min-w-0 gap-x-4 gap-y-3 border-t border-border-subtle pt-3 xl:grid-cols-4">
-        <ActivityMetadata label="Actor" value={`${humanize(item.actor_type)} · ${item.actor_id}`} />
+        <ActivityMetadata label="Actor" value={actor} />
         <ActivityMetadata label="Scope" value={`${humanize(item.scope_type)} · ${item.scope_id}`} />
         <ActivityMetadata label="Input digest" value={item.input_digest} />
         <ActivityMetadata label="Correlation" value={item.correlation_id} />
@@ -551,10 +841,6 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
       <p className="mt-3 text-sm font-medium text-foreground">{health.consumer_name}</p>
       <div className="mt-2 grid gap-2 text-xs sm:grid-cols-2">
         <div>
-          <p className="text-muted-foreground">Processed events</p>
-          <p className="mt-1 font-mono text-foreground">{health.processed_events}</p>
-        </div>
-        <div>
           <p className="text-muted-foreground">Last sequence</p>
           <p className="mt-1 font-mono text-foreground">{health.last_sequence}</p>
         </div>
@@ -563,6 +849,9 @@ function ConsumerHealth({ health }: { health: AttentionConsumerHealth | null }) 
         Last success {formatDate(health.last_success_at)}
         {health.last_error_code ? ` · ${health.last_error_code}` : ''}
       </p>
+      {health.last_error_message ? (
+        <p className="mt-2 text-xs text-muted-foreground">{health.last_error_message}</p>
+      ) : null}
     </Card>
   )
 }
@@ -602,15 +891,41 @@ function MissionContent({
   chatIsLoading,
   chatIsError,
   onRetryChats,
+  leadDrafts,
+  onLeadDraftChange,
+  onDismissLeadDraft,
 }: {
   data: MissionControlResponse
   chatEntries: AgentChatEntry[]
   chatIsLoading: boolean
   chatIsError: boolean
   onRetryChats: () => void
+  leadDrafts: LeadAnswerDrafts
+  onLeadDraftChange: (id: string, answer: string, position: number) => void
+  onDismissLeadDraft: (id: string) => void
 }) {
   const attention = data.needs_attention
   const humanInput = attention.filter((item) => item.category === 'human_input_required')
+  const humanInputRows: { id: string; item: AttentionItem | null }[] = humanInput.map((item) => ({
+    id: item.id,
+    item,
+  }))
+  const attentionIds = new Set(attention.map((item) => item.id))
+  const withdrawnDrafts = Object.entries(leadDrafts)
+    .filter(([id, draft]) => !attentionIds.has(id) && draft.answer.trim())
+    .sort(([, a], [, b]) => a.position - b.position)
+  for (const [id, draft] of withdrawnDrafts) {
+    humanInputRows.splice(draft.position, 0, { id, item: null })
+  }
+  const renderAttentionCard = (item: AttentionItem, position: number) => (
+    <AttentionCard
+      key={item.id}
+      item={item}
+      answer={leadDrafts[item.id]?.answer ?? ''}
+      onAnswerChange={(answer) => onLeadDraftChange(item.id, answer, position)}
+      onAnswered={() => onDismissLeadDraft(item.id)}
+    />
+  )
   const commitments = attention.filter((item) => item.category === 'commitment_overdue')
   const otherAttention = attention.filter(
     (item) => item.category !== 'human_input_required' && item.category !== 'commitment_overdue',
@@ -632,6 +947,7 @@ function MissionContent({
   const coordinationActivity = data.coordination_activity
   const hasAny =
     attention.length +
+      withdrawnDrafts.length +
       data.review_ready.length +
       data.active_work.length +
       relevantAgentHealth.length +
@@ -700,23 +1016,28 @@ function MissionContent({
           count={otherAttention.length}
           icon={<WarningCircle size={16} />}
         >
-          <div className="space-y-2 p-3">
-            {otherAttention.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
-          </div>
+          <div className="space-y-2 p-3">{otherAttention.map(renderAttentionCard)}</div>
         </ProjectionSection>
       ) : null}
-      {humanInput.length > 0 ? (
+      {humanInputRows.length > 0 ? (
         <ProjectionSection
           title="Questions / human input"
           count={humanInput.length}
           icon={<Question size={16} />}
         >
           <div className="space-y-2 p-3">
-            {humanInput.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
+            {humanInputRows.map((row, position) =>
+              row.item ? (
+                renderAttentionCard(row.item, position)
+              ) : (
+                <WithdrawnLeadDraft
+                  key={row.id}
+                  id={row.id}
+                  answer={leadDrafts[row.id].answer}
+                  onDismiss={() => onDismissLeadDraft(row.id)}
+                />
+              ),
+            )}
           </div>
         </ProjectionSection>
       ) : null}
@@ -726,11 +1047,7 @@ function MissionContent({
           count={commitments.length}
           icon={<Clock size={16} />}
         >
-          <div className="space-y-2 p-3">
-            {commitments.map((item) => (
-              <AttentionCard key={item.id} item={item} />
-            ))}
-          </div>
+          <div className="space-y-2 p-3">{commitments.map(renderAttentionCard)}</div>
         </ProjectionSection>
       ) : null}
       {data.review_ready.length > 0 ? (
@@ -779,6 +1096,14 @@ function MissionContent({
 export function MissionControlPage() {
   const query = useMissionControlQuery()
   const chatsQuery = useAgentChatsQuery()
+  const [leadDrafts, setLeadDrafts] = useState<LeadAnswerDrafts>({})
+  const dismissLeadDraft = (id: string) => {
+    setLeadDrafts((drafts) => {
+      const next = { ...drafts }
+      delete next[id]
+      return next
+    })
+  }
   const computedAt = query.data?.computed_at ? Date.parse(query.data.computed_at) : Number.NaN
   const isStale = Boolean(
     query.data &&
@@ -844,6 +1169,11 @@ export function MissionControlPage() {
           chatIsLoading={chatsQuery.isLoading}
           chatIsError={chatsQuery.isError}
           onRetryChats={() => void chatsQuery.refetch()}
+          leadDrafts={leadDrafts}
+          onLeadDraftChange={(id, answer, position) =>
+            setLeadDrafts((drafts) => ({ ...drafts, [id]: { answer, position } }))
+          }
+          onDismissLeadDraft={dismissLeadDraft}
         />
       ) : null}
       {query.data ? (

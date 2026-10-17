@@ -24,7 +24,7 @@ pub struct ReconciliationListQuery {
 }
 
 fn service(state: &AppState) -> ProjectReconciliationService {
-    ProjectReconciliationService::new(state.db.clone(), state.event_bus.clone())
+    ProjectReconciliationService::new(state.db.clone())
 }
 
 pub async fn list_project_reconciliations(
@@ -33,6 +33,13 @@ pub async fn list_project_reconciliations(
     Path(project_id): Path<String>,
     Query(query): Query<ReconciliationListQuery>,
 ) -> ApiResult<Json<ProjectReconciliationListResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let page = service(&state)
         .list(
             &project_id,
@@ -53,6 +60,13 @@ pub async fn get_project_reconciliation(
     user: AuthenticatedUser,
     Path((project_id, reconciliation_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ProjectReconciliation>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let reconciliation = service(&state)
         .get(&project_id, &user.user_id, &reconciliation_id)
         .await?;
@@ -65,6 +79,13 @@ pub async fn resolve_project_reconciliation(
     Path((project_id, reconciliation_id)): Path<(String, String)>,
     Json(request): Json<ResolveProjectReconciliationRequest>,
 ) -> ApiResult<Json<ResolveProjectReconciliationResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     // For the server-suggested invalid-baseline correction, this one
     // authenticated user gesture is both approval and atomic activation.
     let response = service(&state)

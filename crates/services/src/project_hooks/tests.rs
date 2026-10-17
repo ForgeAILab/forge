@@ -417,12 +417,18 @@ async fn all_work_completed_matches_when_all_visible_tasks_are_cancelled() {
 }
 
 async fn test_service() -> (Arc<SqliteDb>, ProjectHookService) {
+    test_service_with_event_capacity(128).await
+}
+
+async fn test_service_with_event_capacity(
+    event_capacity: usize,
+) -> (Arc<SqliteDb>, ProjectHookService) {
     let pool = create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool creates");
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
-    let event_bus = Arc::new(EventBus::new(128));
+    let event_bus = Arc::new(EventBus::new(event_capacity));
     let task_service = Arc::new(TaskService::new(Arc::clone(&db), Arc::clone(&event_bus)));
     let notification_service = Arc::new(NotificationService::new(
         Arc::clone(&db),
@@ -443,6 +449,7 @@ async fn seed_available_agent(db: &SqliteDb) -> String {
     DaemonRepo::upsert_by_machine_id(
         db,
         UpsertDaemon {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             machine_id: format!("machine-{daemon_id}"),
             hostname: "test-host".to_owned(),
@@ -463,6 +470,7 @@ async fn seed_available_agent(db: &SqliteDb) -> String {
     DaemonRepo::update_report(
         db,
         UpdateDaemonReport {
+            max_concurrent_runs: None,
             id: daemon_id.clone(),
             last_report_at: now.clone(),
             status: DaemonStatus::Online,
@@ -654,4 +662,677 @@ async fn start_with_shutdown_stops_and_releases_the_parent_receiver() {
         .expect("project hook worker stops promptly")
         .expect("project hook worker joins");
     assert_eq!(event_bus.receiver_count(), 0);
+}
+
+#[tokio::test]
+async fn worker_robustness_project_hook_receiver_continues_after_lag() {
+    let (db, service) = test_service_with_event_capacity(1).await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let rules = serde_json::to_string(&vec![create_task_rule(
+        "after-lag",
+        "Created after lag",
+        None,
+        1,
+    )])
+    .unwrap();
+    ProjectRepo::set_project_hooks_json(&*db, &project.id, &rules, &now_rfc3339())
+        .await
+        .unwrap();
+    let event_bus = Arc::clone(&service.event_bus);
+    let mut receiver = event_bus.subscribe();
+    for entity_id in ["first", "second"] {
+        event_bus.publish(events::ForgeEvent {
+            event_type: "test.event".to_owned(),
+            entity_id: entity_id.to_owned(),
+            timestamp: events::event_timestamp(),
+            context: events::EventContext::Empty {},
+        });
+    }
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+    ));
+    // Ignore fixture creation so this proves transition delivery itself.
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = (SELECT MAX(sequence) FROM domain_event) WHERE consumer_name = 'project-hooks'").execute(db.pool()).await.unwrap();
+    let event = append_transition(&db, &task).await;
+    let service = Arc::new(service);
+    let runtime = crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service));
+    assert_eq!(runtime.run_once(100).await.unwrap(), 1);
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if task_count_by_title(&db, &project.id, "Created after lag").await == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("post-lag event is delivered");
+    assert_eq!(
+        crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service))
+            .run_once(100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(hook_runs(&db, &project.id).await.len(), 1);
+    assert!(
+        db::DomainEventRepo::get_consumer_cursor(&*db, "project-hooks")
+            .await
+            .unwrap()
+            .unwrap()
+            .last_sequence
+            >= event.sequence
+    );
+}
+
+async fn append_transition(db: &SqliteDb, task: &Task) -> db::DomainEvent {
+    db::DomainEventRepo::append_event(
+        db,
+        db::CreateDomainEvent::task_transition(
+            new_uuid_v4(),
+            &task.id,
+            &task.project_id,
+            "review",
+            "done",
+            Some("complete"),
+            "system",
+            "completed",
+            false,
+            now_rfc3339(),
+            json!({}),
+        ),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn durable_database_hook_and_cursor_commit_atomically_before_publication() {
+    use crate::worker_runtime::{Outcome, Worker, WorkerRuntime};
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let mut rule = create_task_rule("notify", "unused", None, 1);
+    rule.action = ProjectHookAction::Notify {
+        title: "Finished".to_owned(),
+        message: "All work completed".to_owned(),
+        severity: Some("info".to_owned()),
+    };
+    ProjectRepo::set_project_hooks_json(
+        &*db,
+        &project.id,
+        &serde_json::to_string(&vec![rule]).unwrap(),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let event = append_transition(&db, &task).await;
+    let Outcome::Done(prepared) = service.handle(&event).await.unwrap() else {
+        panic!("hook matches");
+    };
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service.commit(&mut tx, &event, &prepared).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert!(hook_runs(&db, &project.id).await.is_empty());
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service.commit(&mut tx, &event, &prepared).await.unwrap();
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        "project-hooks",
+        0,
+        event.sequence,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Crash here: no after_commit call. Restart cannot repeat the DB action.
+    let service = Arc::new(service);
+    assert_eq!(
+        WorkerRuntime::new(Arc::clone(&db), service)
+            .run_once(100)
+            .await
+            .unwrap(),
+        0
+    );
+    let notifications: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification WHERE event_type = 'project_hook.notify'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(notifications, 1);
+    assert_eq!(
+        hook_runs(&db, &project.id).await[0].status,
+        ProjectHookRunStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn durable_external_started_marker_is_not_relaunched_after_restart() {
+    use crate::worker_runtime::{Outcome, Worker, WorkerRuntime};
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let mut rule = create_task_rule("dispatch", "unused", None, 1);
+    rule.action = ProjectHookAction::DispatchAgent {
+        agent_id: seed_available_agent(&db).await,
+        prompt: Some("unchanged prompt".to_owned()),
+        follow_up: None,
+    };
+    ProjectRepo::set_project_hooks_json(
+        &*db,
+        &project.id,
+        &serde_json::to_string(&vec![rule]).unwrap(),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let event = append_transition(&db, &task).await;
+    let Outcome::Done(prepared) = service.handle(&event).await.unwrap() else {
+        panic!("hook matches");
+    };
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service.commit(&mut tx, &event, &prepared).await.unwrap();
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        "project-hooks",
+        0,
+        event.sequence,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let service = Arc::new(service);
+    WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service))
+        .run_once(100)
+        .await
+        .unwrap();
+    // Even an explicit duplicate evaluation cannot admit the same external run.
+    service
+        .evaluate_for_project(
+            &project.id,
+            EvaluationCause::TaskTransitioned { task_id: task.id },
+        )
+        .await
+        .unwrap();
+    let runs = hook_runs(&db, &project.id).await;
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, ProjectHookRunStatus::Running);
+    assert!(runs[0].automation_task_id.is_some());
+    assert!(runs[0].execution_id.is_none());
+    let tasks: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE project_id = ? AND is_automation = 1")
+            .bind(&project.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(tasks, 1);
+}
+
+#[tokio::test]
+async fn upgrade_head_seed_prevents_historical_hook_delivery() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let mut rule = create_task_rule("old-completion", "unused", None, 1);
+    rule.action = ProjectHookAction::Notify {
+        title: "Finished".to_owned(),
+        message: "All work completed".to_owned(),
+        severity: None,
+    };
+    ProjectRepo::set_project_hooks_json(
+        &*db,
+        &project.id,
+        &serde_json::to_string(&vec![rule]).unwrap(),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    for index in 0..3000 {
+        let event = db::CreateDomainEvent::task_transition(
+            format!("old-transition-{index}"),
+            &task.id,
+            &project.id,
+            "review",
+            "done",
+            Some("complete"),
+            "system",
+            "completed",
+            false,
+            now_rfc3339(),
+            json!({}),
+        );
+        db::DomainEventRepo::append_event_in_tx(&*db, &mut tx, &event)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM event_consumer_cursor WHERE consumer_name IN ('project-hooks', 'notifications')").execute(&mut *tx).await.unwrap();
+    sqlx::raw_sql(
+        include_str!("../../../db/migrations/V202610030200__notify_hooks_consumers.sql")
+            .split("-- These mutations")
+            .next()
+            .unwrap(),
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let service = Arc::new(service);
+    assert_eq!(
+        crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::clone(&service))
+            .run_once(100)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(hook_runs(&db, &project.id).await.is_empty());
+    append_transition(&db, &task).await;
+    assert_eq!(
+        crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), service)
+            .run_once(100)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(hook_runs(&db, &project.id).await.len(), 1);
+}
+
+#[tokio::test]
+async fn durable_rules_recheck_completion_after_a_rule_creates_visible_work() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let create = create_task_rule("create-first", "New visible work", None, 1);
+    let mut notify = create_task_rule("notify-second", "unused", None, 1);
+    notify.action = ProjectHookAction::Notify {
+        title: "Finished".to_owned(),
+        message: "All work completed".to_owned(),
+        severity: None,
+    };
+    ProjectRepo::set_project_hooks_json(
+        &*db,
+        &project.id,
+        &serde_json::to_string(&vec![create, notify]).unwrap(),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE event_consumer_cursor SET last_sequence = (SELECT MAX(sequence) FROM domain_event) WHERE consumer_name = 'project-hooks'").execute(db.pool()).await.unwrap();
+    append_transition(&db, &task).await;
+    crate::worker_runtime::WorkerRuntime::new(Arc::clone(&db), Arc::new(service))
+        .run_once(100)
+        .await
+        .unwrap();
+    assert_eq!(
+        task_count_by_title(&db, &project.id, "New visible work").await,
+        1
+    );
+    assert_eq!(hook_runs(&db, &project.id).await.len(), 1);
+    let notifications: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification WHERE event_type = 'project_hook.notify'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(notifications, 0);
+}
+
+#[tokio::test]
+async fn durable_hook_created_task_keeps_project_default_roles_and_current_version() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let settings = json!({"default_role_assignments": [
+        {"role_name": "coder", "assignee_type": "user", "assignee_id": "hook-owner"},
+        {"role_name": "reviewer", "assignee_type": "user", "assignee_id": "hook-reviewer"}
+    ]});
+    sqlx::query("UPDATE project SET settings = ? WHERE id = ?")
+        .bind(settings.to_string())
+        .bind(&project.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let project = ProjectRepo::get_by_id(&*db, &project.id)
+        .await
+        .unwrap()
+        .unwrap();
+    ProjectHookEngine::new(&service)
+        .run(
+            &project,
+            create_task_rule("default-roles", "Follow-up with defaults", None, 1),
+            trigger_match("project.all_work_completed:1"),
+        )
+        .await
+        .unwrap();
+    let roles: Vec<(String, String)> = sqlx::query_as("SELECT a.role_name, a.assignee_id FROM task_role_assignment a JOIN task t ON t.id = a.task_id WHERE t.project_id = ? ORDER BY a.role_name").bind(&project.id).fetch_all(db.pool()).await.unwrap();
+    assert_eq!(
+        roles,
+        vec![
+            ("coder".to_owned(), "hook-owner".to_owned()),
+            ("reviewer".to_owned(), "hook-reviewer".to_owned())
+        ]
+    );
+    let version: i64 = sqlx::query_scalar(
+        "SELECT version FROM task WHERE project_id = ? AND title = 'Follow-up with defaults'",
+    )
+    .bind(&project.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(version, 3);
+}
+
+#[tokio::test]
+async fn durable_comments_commit_before_publication_and_keep_missing_target_reason() {
+    use crate::worker_runtime::{Outcome, Worker, WorkerRuntime};
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let mut comment = create_task_rule("comment", "unused", None, 1);
+    comment.action = ProjectHookAction::AddComment {
+        target_task_id: None,
+        content: "Saved comment".to_owned(),
+    };
+    let mut missing = create_task_rule("missing", "unused", None, 1);
+    missing.action = ProjectHookAction::AddComment {
+        target_task_id: Some("missing-target".to_owned()),
+        content: "Uncreated comment".to_owned(),
+    };
+    ProjectRepo::set_project_hooks_json(
+        &*db,
+        &project.id,
+        &serde_json::to_string(&vec![comment, missing]).unwrap(),
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    let event = append_transition(&db, &task).await;
+    let Outcome::Done(prepared) = service.handle(&event).await.unwrap() else {
+        panic!("hook matches");
+    };
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    service.commit(&mut tx, &event, &prepared).await.unwrap();
+    db.advance_domain_event_cursor_in_tx(
+        &mut tx,
+        "project-hooks",
+        0,
+        event.sequence,
+        &now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    // Crash before either post-commit publication or memory indexing.
+    WorkerRuntime::new(Arc::clone(&db), Arc::new(service))
+        .run_once(100)
+        .await
+        .unwrap();
+    let comments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_comment WHERE task_id = ?")
+        .bind(&task.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(comments, 1);
+    let runs = hook_runs(&db, &project.id).await;
+    assert_eq!(runs.len(), 2);
+    let failed = runs.iter().find(|run| run.rule_id == "missing").unwrap();
+    assert_eq!(failed.status, ProjectHookRunStatus::Failed);
+    assert_eq!(
+        failed.reason.as_deref(),
+        Some(
+            crate::ServiceError::not_found("task", "missing-target")
+                .to_string()
+                .as_str()
+        )
+    );
+}
+
+async fn started_external_run(
+    db: &Arc<SqliteDb>,
+    service: &ProjectHookService,
+    project: &db::Project,
+) -> (super::engine::PreparedHook, super::engine::CommittedHook) {
+    let mut rule = create_task_rule("recover-dispatch", "unused", None, 1);
+    rule.action = ProjectHookAction::DispatchAgent {
+        agent_id: seed_available_agent(db).await,
+        prompt: None,
+        follow_up: None,
+    };
+    let engine = ProjectHookEngine::new(service);
+    let prepared = engine
+        .prepare(
+            project,
+            rule,
+            trigger_match("project.all_work_completed:recover"),
+        )
+        .await
+        .unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    let committed = engine.commit(&mut tx, &prepared).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    (prepared, committed)
+}
+
+async fn age_started_run(db: &SqliteDb, project: &str) {
+    sqlx::query(
+        "UPDATE project_hook_run SET updated_at = ? WHERE project_id = ? AND status = 'running'",
+    )
+    .bind((chrono::Utc::now() - chrono::Duration::minutes(11)).to_rfc3339())
+    .bind(project)
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tick_fails_abandoned_dispatch_without_replaying_and_releases_rule_limit() {
+    use crate::worker_runtime::Worker;
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    started_external_run(&db, &service, &project).await;
+    service.tick().await.unwrap();
+    assert_eq!(
+        hook_runs(&db, &project.id).await[0].status,
+        ProjectHookRunStatus::Running,
+        "fresh launch retains grace"
+    );
+    age_started_run(&db, &project.id).await;
+    let mut hints = service.event_bus.subscribe();
+    service.tick().await.unwrap();
+    let runs = hook_runs(&db, &project.id).await;
+    assert_eq!(runs[0].status, ProjectHookRunStatus::Failed);
+    assert!(runs[0].completed_at.is_some());
+    assert!(runs[0]
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("without an execution record"));
+    assert_eq!(
+        ProjectHookRunRepo::count_active_for_rule(&*db, &project.id, "recover-dispatch")
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        matches!(hints.try_recv().unwrap().context, events::EventContext::ProjectHookRunChanged { status, .. } if status == "failed")
+    );
+    service.tick().await.unwrap();
+    assert!(hints.try_recv().is_err(), "settled run is not swept again");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+        .bind(&runs[0].automation_task_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn tick_recovers_successful_dispatch_after_status_write_failed() {
+    use crate::worker_runtime::Worker;
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let (_, committed) = started_external_run(&db, &service, &project).await;
+    let run = hook_runs(&db, &project.id).await.remove(0);
+    let execution = new_uuid_v4();
+    sqlx::query("INSERT INTO execution (id, task_id, role, status, created_at, updated_at) VALUES (?, ?, 'executor', 'running', ?, ?)")
+        .bind(&execution).bind(&run.automation_task_id).bind(now_rfc3339()).bind(now_rfc3339()).execute(db.pool()).await.unwrap();
+    sqlx::raw_sql("CREATE TRIGGER reject_dispatch_status BEFORE UPDATE OF status ON project_hook_run WHEN NEW.status = 'dispatched' BEGIN SELECT RAISE(ABORT, 'injected status failure'); END;").execute(db.pool()).await.unwrap();
+    let engine = ProjectHookEngine::new(&service);
+    assert!(engine
+        .finish_external_launch(
+            &committed,
+            async { Ok(execution.clone()) },
+            Duration::from_secs(1)
+        )
+        .await
+        .is_err());
+    assert_eq!(
+        hook_runs(&db, &project.id).await[0].status,
+        ProjectHookRunStatus::Running
+    );
+    sqlx::query("DROP TRIGGER reject_dispatch_status")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    age_started_run(&db, &project.id).await;
+    service.tick().await.unwrap();
+    let repaired = hook_runs(&db, &project.id).await.remove(0);
+    assert_eq!(repaired.status, ProjectHookRunStatus::Dispatched);
+    assert_eq!(repaired.execution_id.as_deref(), Some(execution.as_str()));
+    assert!(repaired
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("launch was not replayed"));
+    assert_eq!(
+        ProjectHookRunRepo::count_active_for_rule(&*db, &project.id, "recover-dispatch")
+            .await
+            .unwrap(),
+        0
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM execution WHERE task_id = ?")
+        .bind(&run.automation_task_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn slow_external_launch_is_bounded_and_later_hook_can_publish() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let (_, committed) = started_external_run(&db, &service, &project).await;
+    let engine = ProjectHookEngine::new(&service);
+    let result = timeout(
+        Duration::from_secs(1),
+        engine.finish_external_launch(
+            &committed,
+            std::future::pending::<crate::Result<String>>(),
+            Duration::from_millis(10),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(result.unwrap_err().to_string().contains("timed out"));
+    let marker = hook_runs(&db, &project.id).await.remove(0);
+    assert_eq!(marker.status, ProjectHookRunStatus::Running);
+    assert!(marker
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("launch will not be replayed"));
+    let mut notify = create_task_rule("later-rule", "unused", None, 1);
+    notify.action = ProjectHookAction::Notify {
+        title: "Later hook".to_owned(),
+        message: "Still delivered".to_owned(),
+        severity: None,
+    };
+    let mut hints = service.event_bus.subscribe();
+    engine
+        .run(
+            &project,
+            notify,
+            trigger_match("project.all_work_completed:recover"),
+        )
+        .await
+        .unwrap();
+    let mut notified = false;
+    while let Ok(event) = hints.try_recv() {
+        notified |= matches!(event.context, events::EventContext::NotificationCreated { title, .. } if title == "Later hook");
+    }
+    assert!(notified);
+}
+
+struct FirstTriggerReadFails(std::sync::atomic::AtomicBool);
+#[async_trait::async_trait]
+impl HookTrigger for FirstTriggerReadFails {
+    async fn evaluate(&self, context: &TriggerContext<'_>) -> crate::Result<Option<TriggerMatch>> {
+        if self.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(db::DbError::Sqlx(sqlx::Error::ColumnNotFound(
+                "injected trigger read failure".to_owned(),
+            ))
+            .into());
+        }
+        AllWorkCompletedTrigger.evaluate(context).await
+    }
+}
+
+#[tokio::test]
+async fn failed_trigger_read_records_one_rule_and_continues_to_the_next() {
+    let (db, service) = test_service().await;
+    let project = seed_project(&db).await;
+    let task = seed_task(&db, &project.id, "done", false).await;
+    let rules = ["failed-read", "healthy-rule"].map(|id| {
+        let mut rule = create_task_rule(id, "unused", None, 1);
+        rule.action = ProjectHookAction::Notify {
+            title: id.to_owned(),
+            message: "Completed".to_owned(),
+            severity: None,
+        };
+        rule
+    });
+    let prepared = super::evaluator::prepare_rules(
+        &service,
+        &project,
+        EvaluationCause::TaskTransitioned { task_id: task.id },
+        "read-failure-event",
+        rules.into(),
+        &FirstTriggerReadFails(std::sync::atomic::AtomicBool::new(true)),
+    )
+    .await
+    .unwrap();
+    let engine = ProjectHookEngine::new(&service);
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    for rule in &prepared {
+        assert!(engine.still_matches(&mut tx, rule).await.unwrap());
+        engine.commit(&mut tx, rule).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+    let runs = hook_runs(&db, &project.id).await;
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        runs.iter()
+            .find(|run| run.rule_id == "failed-read")
+            .unwrap()
+            .status,
+        ProjectHookRunStatus::Failed
+    );
+    assert_eq!(
+        runs.iter()
+            .find(|run| run.rule_id == "healthy-rule")
+            .unwrap()
+            .status,
+        ProjectHookRunStatus::Completed
+    );
+    let titles: Vec<String> = sqlx::query_scalar("SELECT title FROM notification")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(titles, vec!["healthy-rule"]);
 }

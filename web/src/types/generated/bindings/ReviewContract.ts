@@ -11,6 +11,6 @@ candidate_changed_paths: Array<string>, context: ReviewGoverningContext,
 /**
  * Results Forge recorded before dispatching the reviewer. These are
  * immutable reviewer inputs; conformance admission reruns required checks
- * before accepting the assessment.
+ * except exact CI results already classified non-blocking by entry triage.
  */
 check_results: Array<ConformanceCheckResult>, digest: string, };

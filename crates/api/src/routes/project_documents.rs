@@ -24,7 +24,7 @@ use axum::{
 };
 use db::{
     ProjectDecisionCandidateRecord, ProjectDecisionRecord, ProjectDocumentRecord,
-    ProjectDocumentRevisionRecord, ProjectMemberRepo, ProjectOrchestrationRepo, ProjectRepo,
+    ProjectDocumentRevisionRecord, ProjectOrchestrationRepo,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -61,7 +61,13 @@ pub async fn list_project_documents(
     Path(project_id): Path<String>,
     Query(query): Query<ProjectArtifactListQuery>,
 ) -> ApiResult<Json<ProjectDocumentListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let rows = if let Some((updated_at, id)) = cursor.as_ref() {
@@ -116,7 +122,13 @@ pub async fn get_project_document(
     user: AuthenticatedUser,
     Path((project_id, document_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ProjectDocument>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let document = scoped_document(&state, &project_id, &document_id).await?;
     Ok(Json(document_to_api(document)?))
 }
@@ -127,6 +139,13 @@ pub async fn create_project_document(
     Path(project_id): Path<String>,
     Json(request): Json<CreateProjectDocumentRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectDocument>)> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -174,7 +193,13 @@ pub async fn list_project_document_revisions(
     Path((project_id, document_id)): Path<(String, String)>,
     Query(query): Query<ProjectArtifactListQuery>,
 ) -> ApiResult<Json<ProjectDocumentRevisionListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let document = scoped_document(&state, &project_id, &document_id).await?;
     let limit = bounded_limit(query.limit);
     let cursor = match decode_cursor(query.cursor.as_deref())? {
@@ -224,7 +249,13 @@ pub async fn get_project_document_revision(
     user: AuthenticatedUser,
     Path((project_id, document_id, revision_id)): Path<(String, String, String)>,
 ) -> ApiResult<Json<ProjectDocumentRevision>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let document = scoped_document(&state, &project_id, &document_id).await?;
     let revision =
         ProjectOrchestrationRepo::get_project_document_revision(&*state.db, &revision_id)
@@ -240,7 +271,13 @@ pub async fn get_project_document_revision_diff(
     Path((project_id, document_id, revision_id)): Path<(String, String, String)>,
     Query(query): Query<RevisionDiffQuery>,
 ) -> ApiResult<Json<ProjectDocumentRevisionDiffResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let document = scoped_document(&state, &project_id, &document_id).await?;
     let target = ProjectOrchestrationRepo::get_project_document_revision(&*state.db, &revision_id)
         .await?
@@ -283,7 +320,13 @@ pub async fn save_project_document_revision(
     Path((project_id, document_id)): Path<(String, String)>,
     Json(request): Json<SaveProjectDocumentRevisionRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectDocumentRevision>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -349,7 +392,13 @@ pub async fn approve_project_document(
     Path((project_id, document_id)): Path<(String, String)>,
     Json(request): Json<ApproveProjectDocumentRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectDocumentApproval>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
     if request.document_id != document_id {
         return Err(ApiError::bad_request(
@@ -421,7 +470,13 @@ pub async fn list_decision_candidates(
     Path(project_id): Path<String>,
     Query(query): Query<ProjectArtifactListQuery>,
 ) -> ApiResult<Json<DecisionCandidateListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let mut statement = String::from(
@@ -467,7 +522,13 @@ pub async fn create_decision_candidate(
     Path(project_id): Path<String>,
     Json(request): Json<CreateDecisionCandidateRequest>,
 ) -> ApiResult<(StatusCode, Json<DecisionCandidate>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -507,7 +568,13 @@ pub async fn get_decision_candidate(
     user: AuthenticatedUser,
     Path((project_id, candidate_id)): Path<(String, String)>,
 ) -> ApiResult<Json<DecisionCandidate>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let candidate =
         ProjectOrchestrationRepo::get_project_decision_candidate(&*state.db, &candidate_id)
             .await?
@@ -522,7 +589,13 @@ pub async fn approve_decision_candidate(
     Path((project_id, candidate_id)): Path<(String, String)>,
     Json(request): Json<ApproveDecisionCandidateRequest>,
 ) -> ApiResult<(StatusCode, Json<DecisionRecord>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -555,7 +628,13 @@ pub async fn reject_decision_candidate(
     Path((project_id, candidate_id)): Path<(String, String)>,
     Json(request): Json<RejectDecisionCandidateRequest>,
 ) -> ApiResult<(StatusCode, Json<DecisionCandidate>)> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -590,7 +669,13 @@ pub async fn list_decisions(
     Path(project_id): Path<String>,
     Query(query): Query<ProjectArtifactListQuery>,
 ) -> ApiResult<Json<DecisionRecordListResponse>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let mut statement = String::from(
@@ -654,7 +739,13 @@ pub async fn get_decision(
     user: AuthenticatedUser,
     Path((project_id, decision_id)): Path<(String, String)>,
 ) -> ApiResult<Json<DecisionRecord>> {
-    require_project_access(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let mut record = get_decision_record(&state, &project_id, &decision_id).await?;
     let replaced_state: Option<String> = sqlx::query_scalar(
         "SELECT state FROM project_decision
@@ -675,23 +766,6 @@ pub async fn get_decision(
 #[serde(deny_unknown_fields)]
 pub struct RevisionDiffQuery {
     pub base_revision_id: Option<String>,
-}
-
-async fn require_project_access(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() == Some(user_id) || project.owner_id.is_none() {
-        return Ok(());
-    }
-    ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    Ok(())
 }
 
 async fn scoped_document(

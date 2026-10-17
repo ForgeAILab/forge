@@ -42,6 +42,9 @@ pub enum TaskCmd {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Show one Task. A Task in the merge queue also prints its queue
+    /// target, phase, position and wait reason.
+    #[command(visible_alias = "show")]
     Get {
         id: String,
     },
@@ -55,8 +58,40 @@ pub enum TaskCmd {
         status: String,
         version: i64,
     },
-    Cancel {
+    Actions {
         id: String,
+    },
+    /// Read the finding ledger in the Task's current review-budget window.
+    Findings {
+        id: String,
+    },
+    /// Apply an offered action. Exit code 3 means action_unavailable; refresh with task actions.
+    Action {
+        /// Task ID.
+        id: String,
+        #[arg(value_parser = ["start", "hold", "release", "retry", "send_back", "approve", "restart", "cancel"])]
+        verb: String,
+        /// Task version from task actions; omitted fetches the current version.
+        #[arg(long)]
+        version: Option<i64>,
+        /// retry: start a new session instead of continuing the offered thread.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        fresh_session: Option<bool>,
+        /// retry: refresh the workspace before retrying checks when offered.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        refresh_workspace: Option<bool>,
+        /// retry: reset the retry window; false requests one attempt and requires --reason.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        reset_budget: Option<bool>,
+        /// send_back: required revision guidance; retry: optional follow-up guidance.
+        #[arg(long)]
+        guidance: Option<String>,
+        /// approve: override failed checks when offered; true requires --reason.
+        #[arg(long = "override", num_args = 0..=1, default_missing_value = "true")]
+        override_checks: Option<bool>,
+        /// approve/hold/release/retry/restart/cancel: audit reason; required when the offer says so.
+        #[arg(long)]
+        reason: Option<String>,
     },
     PromptPreview {
         task_id: String,
@@ -94,6 +129,94 @@ pub enum MediaCmd {
         #[arg(long)]
         media_url: Vec<String>,
     },
+}
+
+fn format_offer(offer: &api_types::Offer) -> String {
+    let parameters = offer
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let mut text = parameter.name.clone();
+            if parameter.required {
+                text.push_str(" (required)");
+            }
+            if let Some(condition) = &parameter.required_when {
+                text.push_str(&format!(
+                    " (required when {}={})",
+                    condition.parameter, condition.value
+                ));
+            }
+            if let Some(values) = &parameter.boolean_values {
+                text.push_str(&format!("={values:?}"));
+            }
+            text
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}: {} | inputs: {} | presets: {} | propagates: {}",
+        offer.action.verb(),
+        offer.label,
+        if parameters.is_empty() {
+            "none"
+        } else {
+            &parameters
+        },
+        serde_json::to_string(&offer.action).expect("action serializes"),
+        offer.propagates
+    )
+}
+
+fn format_findings(response: &api_types::TaskFindingsResponse) -> Result<String> {
+    let rows = response
+        .items
+        .iter()
+        .map(|entry| {
+            Ok(vec![
+                entry.id.clone(),
+                serde_json::to_value(entry.status)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                serde_json::to_value(entry.source)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                serde_json::to_value(entry.severity)?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                entry.streak.to_string(),
+                entry.first_attempt.to_string(),
+                entry.last_checked_attempt.to_string(),
+                entry.summary.clone(),
+                entry.r#where.clone().unwrap_or_default(),
+                entry.expected.clone().unwrap_or_default(),
+                entry.observed.clone().unwrap_or_default(),
+            ])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(
+        "Window started: {}\nReview attempts: {}\n{}",
+        response.window_started_at,
+        response.review_attempts,
+        tabled::Table::from_rows(
+            &[
+                "ID",
+                "Status",
+                "Source",
+                "Severity",
+                "Streak",
+                "First attempt",
+                "Last checked",
+                "Summary",
+                "Where",
+                "Expected",
+                "Observed"
+            ],
+            rows
+        )
+    ))
 }
 
 impl TaskArgs {
@@ -139,7 +262,14 @@ impl TaskArgs {
             }
             TaskCmd::Get { id } => {
                 let task: TaskResponse = client.get(&format!("/api/v1/tasks/{id}")).await?;
-                print_task(output, &task)
+                print_task(output, &task)?;
+                if let (OutputFormat::Table, Some(integration)) = (output, &task.integration) {
+                    print!(
+                        "{}",
+                        crate::integration_queue::task_integration_text(integration)
+                    );
+                }
+                Ok(())
             }
             TaskCmd::Claim { id, agent_id } => {
                 let request = ClaimTaskRequest {
@@ -167,11 +297,103 @@ impl TaskArgs {
                     .await?;
                 print_task(output, &response.task)
             }
-            TaskCmd::Cancel { id } => {
-                let task: TaskResponse = client
-                    .post(&format!("/api/v1/tasks/{id}/cancel"), &json!({}))
-                    .await?;
-                print_task(output, &task)
+            TaskCmd::Findings { id } => {
+                let response: api_types::TaskFindingsResponse =
+                    client.get(&format!("/api/v1/tasks/{id}/findings")).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        println!("{}", format_findings(&response)?);
+                        Ok(())
+                    }
+                }
+            }
+            TaskCmd::Actions { id } => {
+                let response: api_types::TaskActionsResponse =
+                    client.get(&format!("/api/v1/tasks/{id}/actions")).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        println!("Version: {}", response.version);
+                        for offer in response.available_actions {
+                            println!("{}", format_offer(&offer));
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            TaskCmd::Action {
+                id,
+                verb,
+                version,
+                fresh_session,
+                refresh_workspace,
+                reset_budget,
+                guidance,
+                override_checks,
+                reason,
+            } => {
+                let action = build_action(
+                    verb,
+                    *fresh_session,
+                    *refresh_workspace,
+                    *reset_budget,
+                    guidance.as_deref(),
+                    *override_checks,
+                    reason.as_deref(),
+                )?;
+                let version = match version {
+                    Some(version) => *version,
+                    None => {
+                        client
+                            .get::<api_types::TaskActionsResponse>(&format!(
+                                "/api/v1/tasks/{id}/actions"
+                            ))
+                            .await?
+                            .version
+                    }
+                };
+                let task: Result<TaskResponse> = client
+                    .post(
+                        &format!("/api/v1/tasks/{id}/actions"),
+                        &api_types::TaskActionRequest { action, version },
+                    )
+                    .await;
+                match task {
+                    Ok(task) => print_task(output, &task),
+                    Err(error) => {
+                        if let Some(unavailable) =
+                            error.downcast_ref::<crate::client::ActionUnavailable>()
+                        {
+                            match output {
+                                OutputFormat::Json => print_json(&unavailable.response)?,
+                                OutputFormat::Table => {
+                                    eprintln!("Action unavailable. Available now:");
+                                    if let Some(offers) = unavailable
+                                        .response
+                                        .pointer("/details/available_actions")
+                                        .and_then(serde_json::Value::as_array)
+                                    {
+                                        for offer in offers {
+                                            eprintln!(
+                                                "{}: {}",
+                                                offer
+                                                    .pointer("/action/verb")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("?"),
+                                                offer
+                                                    .get("label")
+                                                    .and_then(serde_json::Value::as_str)
+                                                    .unwrap_or("")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error)
+                    }
+                }
             }
             TaskCmd::PromptPreview {
                 task_id,
@@ -376,4 +598,228 @@ fn html_attr_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn build_action(
+    verb: &str,
+    fresh: Option<bool>,
+    refresh: Option<bool>,
+    reset: Option<bool>,
+    guidance: Option<&str>,
+    override_checks: Option<bool>,
+    reason: Option<&str>,
+) -> Result<api_types::TaskAction> {
+    for (name, supplied, allowed) in [
+        ("--fresh-session", fresh.is_some(), verb == "retry"),
+        ("--refresh-workspace", refresh.is_some(), verb == "retry"),
+        ("--reset-budget", reset.is_some(), verb == "retry"),
+        (
+            "--guidance",
+            guidance.is_some(),
+            matches!(verb, "retry" | "send_back"),
+        ),
+        ("--override", override_checks.is_some(), verb == "approve"),
+        (
+            "--reason",
+            reason.is_some(),
+            !matches!(verb, "start" | "send_back"),
+        ),
+    ] {
+        anyhow::ensure!(!supplied || allowed, "{name} does not belong to {verb}");
+    }
+    if verb == "send_back" {
+        anyhow::ensure!(
+            guidance.is_some_and(|value| !value.trim().is_empty()),
+            "send_back requires nonblank --guidance"
+        );
+    }
+    if override_checks == Some(true) || reset == Some(false) {
+        anyhow::ensure!(
+            reason.is_some_and(|value| !value.trim().is_empty()),
+            "this action requires nonblank --reason"
+        );
+    }
+    let mut action = json!({"verb": verb});
+    for (name, value) in [
+        ("fresh_session", fresh),
+        ("refresh_workspace", refresh),
+        ("reset_budget", reset),
+    ] {
+        if let Some(value) = value {
+            action[name] = json!(value);
+        }
+    }
+    if let Some(value) = guidance {
+        action["guidance"] = json!(value);
+    }
+    if let Some(value) = reason {
+        action["reason"] = json!(value);
+    }
+    if verb == "approve" {
+        if let Some(value) = override_checks {
+            action["override"] = json!(value);
+        }
+    }
+    Ok(serde_json::from_value(action)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        task: TaskArgs,
+    }
+    #[tokio::test]
+    async fn findings_command_reads_the_ledger_and_formats_every_field() {
+        use axum::{routing::get, Json, Router};
+        let response: api_types::TaskFindingsResponse = serde_json::from_value(json!({
+            "items":[{"id":"F1","source":"reviewer","severity":"blocking","summary":"crash","where":"src/lib.rs:2","expected":"error","observed":"panic","first_attempt":1,"last_checked_attempt":2,"status":"open","streak":2}],
+            "window_started_at":"2026-10-15T00:00:00Z","review_attempts":2
+        })).unwrap();
+        let table = format_findings(&response).unwrap();
+        for expected in [
+            "F1",
+            "reviewer",
+            "blocking",
+            "crash",
+            "src/lib.rs:2",
+            "error",
+            "panic",
+            "open",
+            "2026-10-15T00:00:00Z",
+            "Review attempts: 2",
+        ] {
+            assert!(table.contains(expected), "{table}");
+        }
+        let expected = response.clone();
+        let app = Router::new().route(
+            "/api/v1/tasks/the-task/findings",
+            get(move || async move { Json(expected) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ForgeClient::new_without_credentials(format!("http://{address}"));
+        let command = Cli::try_parse_from(["ctl", "findings", "the-task"]).unwrap();
+        assert!(matches!(&command.task.cmd,TaskCmd::Findings{id} if id=="the-task"));
+        command
+            .task
+            .run(&client, &OutputFormat::Json)
+            .await
+            .unwrap();
+        command
+            .task
+            .run(&client, &OutputFormat::Table)
+            .await
+            .unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn show_is_the_documented_name_of_get() {
+        for name in ["show", "get"] {
+            assert!(matches!(
+                Cli::try_parse_from(["ctl", name, "t"]).unwrap().task.cmd,
+                TaskCmd::Get { .. }
+            ));
+        }
+    }
+    #[test]
+    fn actions_and_action_commands_parse() {
+        assert!(matches!(
+            Cli::try_parse_from(["ctl", "actions", "t"])
+                .unwrap()
+                .task
+                .cmd,
+            TaskCmd::Actions { .. }
+        ));
+        let parsed = Cli::try_parse_from([
+            "ctl",
+            "action",
+            "t",
+            "retry",
+            "--fresh-session",
+            "--reset-budget",
+            "false",
+            "--reason",
+            "inspect first",
+            "--guidance",
+            "fix check",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.task.cmd,
+            TaskCmd::Action {
+                fresh_session: Some(true),
+                reset_budget: Some(false),
+                reason: Some(_),
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn action_parameters_are_validated_locally() {
+        assert!(build_action("send_back", None, None, None, None, None, None).is_err());
+        assert!(build_action("send_back", None, None, None, Some("  "), None, None).is_err());
+        assert!(build_action("cancel", Some(false), None, None, None, None, None).is_err());
+        assert!(build_action("hold", None, None, None, None, Some(false), None).is_err());
+        assert!(build_action("start", None, None, None, None, None, Some("why")).is_err());
+        assert!(build_action("approve", None, None, None, None, Some(true), None).is_err());
+        assert_eq!(
+            serde_json::to_value(
+                build_action(
+                    "send_back",
+                    None,
+                    None,
+                    None,
+                    Some("Fix the failing check"),
+                    None,
+                    None
+                )
+                .unwrap()
+            )
+            .unwrap(),
+            json!({"verb":"send_back","guidance":"Fix the failing check"})
+        );
+    }
+    #[test]
+    fn action_help_describes_task_version_verb_flags_and_unavailable_exit() {
+        use clap::CommandFactory;
+        let mut command = Cli::command();
+        let action = command.find_subcommand_mut("action").unwrap();
+        let help = action.render_long_help().to_string();
+        for expected in [
+            "Task version",
+            "retry:",
+            "send_back:",
+            "approve:",
+            "Exit code 3",
+            "action_unavailable",
+        ] {
+            assert!(help.contains(expected), "missing {expected}: {help}");
+        }
+    }
+    #[test]
+    fn offer_table_prints_required_fixed_presets_and_propagation() {
+        let offer = serde_json::from_value(json!({"action":{"verb":"retry","refresh_workspace":true},"parameters":[{"name":"reason","required":true,"boolean_values":null},{"name":"reset_budget","required":false,"boolean_values":[true]}],"authority":["owner"],"reason":"test","label":"Retry","propagates":true,"target_execution_id":null})).unwrap();
+        let row = format_offer(&offer);
+        for expected in [
+            "reason (required)",
+            "reset_budget=[true]",
+            "refresh_workspace",
+            "propagates: true",
+        ] {
+            assert!(row.contains(expected), "{row}");
+        }
+        assert_eq!(
+            serde_json::to_value(
+                build_action("approve", None, None, None, None, None, None).unwrap()
+            )
+            .unwrap(),
+            json!({"verb":"approve"})
+        );
+    }
 }

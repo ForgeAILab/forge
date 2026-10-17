@@ -1,12 +1,30 @@
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
+/// Locate forge.yaml before reading file settings: launch override, env, default.
+/// A file's forge.data_dir can change runtime storage, but not this lookup.
 #[must_use]
-pub fn default_config_path() -> PathBuf {
-    default_data_dir().join("forge.yaml")
+pub fn default_config_path(data_dir: Option<&Path>) -> PathBuf {
+    data_dir
+        .map_or_else(data_dir_from_env, Path::to_path_buf)
+        .join("forge.yaml")
 }
 
 #[must_use]
 pub fn default_data_dir() -> PathBuf {
+    assert!(
+        !(env::var_os("FORGE_TEST_FORBID_DEFAULT_DATA_DIR").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+            && env::current_exe().is_ok_and(|executable| {
+                executable.parent().and_then(std::path::Path::file_name)
+                    == Some(std::ffi::OsStr::new("deps"))
+            })),
+        "a test tried to use the real Forge data directory; inject a tempfile::TempDir via \
+         ForgeConfig::with_data_dir, ConfigOverrides::data_dir, \
+         or FORGE_DATA_DIR instead of resolving the default"
+    );
     home_dir().map_or_else(|| PathBuf::from(".forge"), |home| home.join(".forge"))
 }
 
@@ -19,9 +37,12 @@ pub fn data_dir_from_env() -> PathBuf {
         .unwrap_or_else(default_data_dir)
 }
 
+/// Where a server that never chose a workspace root keeps Task worktrees,
+/// repository clones and execution logs: beside its database, so the
+/// operating system's temp cleaner never removes them.
 #[must_use]
-pub fn default_workspace_root() -> PathBuf {
-    env::temp_dir().join("forge").join("worktrees")
+pub fn default_workspace_root(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("worktrees")
 }
 
 pub(crate) fn expand_path(value: &str) -> PathBuf {

@@ -11,7 +11,6 @@ use db::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{Result, ServiceError};
@@ -552,12 +551,10 @@ where
             .await?)
     }
 
-    /// Index one finalized Agent Chat message in the chat's canonical memory
-    /// scope. The singular-chat visibility label and chat id are the
-    /// canonical ACL/provenance boundary. The
-    /// source-receipt write is part of the repository transaction, so replay
-    /// after a lease expiry cannot create a duplicate memory item.
-    pub async fn record_agent_chat_message_event(
+    /// Build the projection for one finalized Agent Chat message without
+    /// writing it. WorkerRuntime performs this preparation before opening the
+    /// short transaction that applies the item and advances its cursor.
+    pub(crate) fn prepare_agent_chat_message_event(
         &self,
         event: &DomainEvent,
         chat: &AgentChat,
@@ -647,11 +644,7 @@ where
             created_by_id: message.author_id.clone(),
             created_at: now,
         };
-        let (item, inserted) = self
-            .db
-            .insert_memory_item_if_source_absent(&item, "agent_chat", &message.id)
-            .await?;
-        Ok(inserted.then_some(item))
+        Ok(Some(item))
     }
 }
 
@@ -659,10 +652,6 @@ impl<R> MemoryService<R>
 where
     R: MemoryBackfillRepository + Send + Sync,
 {
-    pub async fn backfill_all(db: Arc<R>) -> Result<BackfillSummary> {
-        Self::new(db).backfill_sources().await
-    }
-
     pub async fn backfill_sources(&self) -> Result<BackfillSummary> {
         let mut results = backfill_results_by_type();
         for source in self.db.list_memory_backfill_sources().await? {
@@ -698,13 +687,14 @@ where
         project_id: &str,
         transition: &TransitionLog,
         hook_results_json: Option<&str>,
+        evidence: TransitionFailureEvidence,
     ) -> Result<Option<Uuid>> {
         if !transition_has_failure_signal(
             &transition.from_state,
             &transition.to_state,
-            &transition.trigger_reason,
             hook_results_json.or(transition.hook_results_json.as_deref()),
             transition.rejection,
+            evidence,
         ) {
             return Ok(None);
         }
@@ -879,32 +869,24 @@ impl MemoryBackfillRepository for SqliteDb {
 }
 
 async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, e.id, e.task_id, e.agent_id, e.role, e.status, e.summary, e.error \
-         FROM execution e JOIN task t ON t.id = e.task_id \
-         WHERE e.status IN ('completed', 'failed') \
-           AND (TRIM(COALESCE(e.summary, '')) <> '' OR TRIM(COALESCE(e.error, '')) <> '') \
-         ORDER BY e.created_at ASC, e.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_execution_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
-            let summary: Option<String> = row.try_get("summary")?;
-            let error: Option<String> = row.try_get("error")?;
+            let status: String = row.status()?;
+            let summary: Option<String> = row.summary()?;
+            let error: Option<String> = row.error()?;
             let body = summary
                 .clone()
                 .or(error.clone())
                 .unwrap_or_else(|| status.clone());
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
-                execution_id: Some(row.try_get("id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
+                execution_id: Some(row.id()?),
                 source_type: MemorySourceType::Execution,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::ExecutionSummary,
-                title: format!("Execution {status}: {}", row.try_get::<String, _>("role")?),
+                title: format!("Execution {status}: {}", row.role()?),
                 summary: snippet(&body),
                 body,
                 confidence: Some(if status == "completed" {
@@ -912,38 +894,26 @@ async fn list_execution_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSourc
                 } else {
                     MemoryConfidence::Partial
                 }),
-                creator: row
-                    .try_get::<Option<String>, _>("agent_id")?
-                    .map(agent_creator),
+                creator: row.agent_id()?.map(agent_creator),
             })
         })
         .collect()
 }
 
 async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, r.id, r.task_id, r.execution_id, r.attempt_number, r.status, r.step_results_json \
-         FROM review r JOIN task t ON t.id = r.task_id \
-         WHERE r.status != 'running' \
-         ORDER BY r.created_at ASC, r.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_review_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let status: String = row.try_get("status")?;
-            let body: String = row.try_get("step_results_json")?;
+            let status: String = row.status()?;
+            let body: String = row.step_results_json()?;
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
-                execution_id: Some(row.try_get("execution_id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
+                execution_id: Some(row.execution_id()?),
                 source_type: MemorySourceType::Review,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::ReviewResult,
-                title: format!(
-                    "Review {status} attempt {}",
-                    row.try_get::<i64, _>("attempt_number")?
-                ),
+                title: format!("Review {status} attempt {}", row.attempt_number()?),
                 summary: review_summary_from_json(&body, &status),
                 body,
                 confidence: Some(if status == "passed" || status == "failed" {
@@ -958,25 +928,19 @@ async fn list_review_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>>
 }
 
 async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, c.id, c.task_id, c.author_type, c.author_id, c.author_name, c.content \
-         FROM task_comment c JOIN task t ON t.id = c.task_id \
-         ORDER BY c.created_at ASC, c.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_comment_sources().await?;
     rows.into_iter()
         .map(|row| {
-            let author_type: String = row.try_get("author_type")?;
-            let author_id: Option<String> = row.try_get("author_id")?;
-            let content: String = row.try_get("content")?;
-            let author_name: String = row.try_get("author_name")?;
+            let author_type: String = row.author_type()?;
+            let author_id: Option<String> = row.author_id()?;
+            let content: String = row.content()?;
+            let author_name: String = row.author_name()?;
             Ok(MemoryBackfillSource {
-                project_id: row.try_get("project_id")?,
-                task_id: Some(row.try_get("task_id")?),
+                project_id: row.project_id()?,
+                task_id: Some(row.task_id()?),
                 execution_id: None,
                 source_type: MemorySourceType::Comment,
-                source_ref: row.try_get("id")?,
+                source_ref: row.id()?,
                 kind: MemoryKind::Comment,
                 title: format!("Comment by {author_name}"),
                 summary: snippet(&content),
@@ -994,40 +958,40 @@ async fn list_comment_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>
 }
 
 async fn list_transition_sources(db: &SqliteDb) -> Result<Vec<MemoryBackfillSource>> {
-    let rows = sqlx::query(
-        "SELECT t.project_id, tl.id, tl.task_id, tl.from_state, tl.to_state, tl.trigger_name, tl.triggered_by, \
-                tl.trigger_reason, tl.hook_results_json, tl.rejection, tl.created_at \
-         FROM transition_log tl JOIN task t ON t.id = tl.task_id \
-         ORDER BY tl.created_at ASC, tl.id ASC",
-    )
-    .fetch_all(db.pool())
-    .await?;
+    let rows = db.memory_backfill_transition_sources().await?;
     let mut sources = Vec::new();
     for row in rows {
         let transition = TransitionLog {
-            id: row.try_get("id")?,
-            task_id: row.try_get("task_id")?,
-            from_state: row.try_get("from_state")?,
-            to_state: row.try_get("to_state")?,
-            trigger_name: row.try_get("trigger_name")?,
-            triggered_by: row.try_get("triggered_by")?,
-            trigger_reason: row.try_get("trigger_reason")?,
-            hook_results_json: row.try_get("hook_results_json")?,
-            rejection: row.try_get::<i64, _>("rejection")? != 0,
-            created_at: row.try_get("created_at")?,
+            id: row.id()?,
+            task_id: row.task_id()?,
+            from_state: row.from_state()?,
+            to_state: row.to_state()?,
+            trigger_name: row.trigger_name()?,
+            triggered_by: row.triggered_by()?,
+            bridge: db::decode_transition_bridge(
+                row.id_ref()?,
+                row.bridge_kind()?,
+                row.bridge_payload()?,
+            )?,
+            trigger_reason: row.trigger_reason()?,
+            hook_results_json: row.hook_results_json()?,
+            rejection: row.rejection()? != 0,
+            created_at: row.created_at()?,
         };
+        // History keeps only the row's own typed evidence: the Task's
+        // annotation and Review verdict at that moment were not recorded.
         if !transition_has_failure_signal(
             &transition.from_state,
             &transition.to_state,
-            &transition.trigger_reason,
             transition.hook_results_json.as_deref(),
             transition.rejection,
+            TransitionFailureEvidence::default(),
         ) {
             continue;
         }
         let body = transition_body(&transition, None);
         sources.push(MemoryBackfillSource {
-            project_id: row.try_get("project_id")?,
+            project_id: row.project_id()?,
             task_id: Some(transition.task_id.clone()),
             execution_id: None,
             source_type: MemorySourceType::Transition,
@@ -1425,17 +1389,42 @@ fn transition_body(transition: &TransitionLog, hook_results_json: Option<&str>) 
     .to_string()
 }
 
+/// Typed failure evidence observed when a transition's hooks settle. Reason
+/// prose and hook messages are never failure signals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TransitionFailureEvidence {
+    /// The Task carries an interruption of this kind once the hooks ran, for
+    /// example the dispatch-failure rollback or a blocked review gate.
+    pub failure_kind: Option<api_types::FailureKind>,
+    /// A hook of this transition acted on a failed Review verdict.
+    pub review_failed: bool,
+}
+
+#[cfg(test)]
+impl TransitionFailureEvidence {
+    /// The interruption kind of a stored `error_annotation`, if any.
+    pub(crate) fn annotation_kind(raw: Option<&str>) -> Option<api_types::FailureKind> {
+        match serde_json::from_str::<api_types::TaskAnnotation>(raw?).ok()? {
+            api_types::TaskAnnotation::Blocking(annotation) => Some(annotation.annotation_type),
+            api_types::TaskAnnotation::Legacy(value) => {
+                serde_json::from_value(value.get("type")?.clone()).ok()
+            }
+        }
+    }
+}
+
 fn transition_has_failure_signal(
     from_state: &str,
     to_state: &str,
-    trigger_reason: &str,
     hook_results_json: Option<&str>,
     rejection: bool,
+    evidence: TransitionFailureEvidence,
 ) -> bool {
     if rejection
         || state_name_is_failure(from_state)
         || state_name_is_failure(to_state)
-        || text_has_failure_signal(trigger_reason)
+        || evidence.failure_kind.is_some()
+        || evidence.review_failed
     {
         return true;
     }
@@ -1457,23 +1446,11 @@ fn hook_result_is_failure(entry: &Value) -> bool {
             .get("status")
             .and_then(Value::as_str)
             .is_some_and(|status| matches!(status, "failure" | "hook_error"))
-        || entry
-            .get("error")
-            .and_then(Value::as_str)
-            .is_some_and(text_has_failure_signal)
 }
 
 fn state_name_is_failure(state: &str) -> bool {
     let lower = state.to_ascii_lowercase();
     lower.contains("fail") || lower.contains("error") || lower.contains("blocked")
-}
-
-fn text_has_failure_signal(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    lower.contains("failed")
-        || lower.contains("failure")
-        || lower.contains("error")
-        || lower.contains("hook_error")
 }
 
 fn agent_creator(agent_id: String) -> MemoryCreator {
@@ -1757,5 +1734,61 @@ mod tests {
         assert!(guard_evidence_json(r#"{"note":"Authorization: Bearer sk-secret"}"#).is_err());
         assert!(guard_memory_reason("private key material").is_err());
         assert_eq!(guard_evidence_json("{}").expect("valid evidence"), "{}");
+    }
+}
+
+#[cfg(test)]
+mod typed_transition_tests {
+    use super::{transition_has_failure_signal as signal, TransitionFailureEvidence};
+
+    #[test]
+    fn failure_memory_uses_typed_evidence_not_prose() {
+        let none = TransitionFailureEvidence::default();
+        // Rejection, failure-named states and failed hooks are row evidence.
+        assert!(!signal("todo", "in_progress", None, false, none));
+        assert!(signal("todo", "in_progress", None, true, none));
+        assert!(signal("merging", "merge_failed", None, false, none));
+        assert!(signal(
+            "todo",
+            "in_progress",
+            Some(r#"[{"action":"run_ci_steps","outcome":"failed","error":"boom"}]"#),
+            false,
+            none
+        ));
+        // A hook message is prose: "failed" in a skipped/ok entry is no signal.
+        assert!(!signal(
+            "todo",
+            "in_progress",
+            Some(r#"[{"outcome":"ok","error":"failed"},{"outcome":"skipped","error":"error"}]"#),
+            false,
+            none
+        ));
+        // The dispatch-failure rollback and the failed-review cascade carry
+        // only typed evidence from the hooks that produced them.
+        let dispatch_failed = TransitionFailureEvidence {
+            failure_kind: Some(api_types::FailureKind::DispatchFailed),
+            review_failed: false,
+        };
+        assert!(signal("in_progress", "todo", None, false, dispatch_failed));
+        let review_failed = TransitionFailureEvidence {
+            failure_kind: None,
+            review_failed: true,
+        };
+        assert!(signal("in_progress", "review", None, false, review_failed));
+    }
+
+    #[test]
+    fn annotation_kind_reads_blocking_and_legacy_annotations() {
+        assert_eq!(
+            TransitionFailureEvidence::annotation_kind(Some(
+                r#"{"type":"dispatch_failed","message":"no agent","state":"in_progress"}"#
+            )),
+            Some(api_types::FailureKind::DispatchFailed)
+        );
+        assert_eq!(
+            TransitionFailureEvidence::annotation_kind(Some(r#"{"note":"no type"}"#)),
+            None
+        );
+        assert_eq!(TransitionFailureEvidence::annotation_kind(None), None);
     }
 }

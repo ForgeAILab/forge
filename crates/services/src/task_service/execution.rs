@@ -1,20 +1,268 @@
 use super::*;
 use crate::agent_capacity::count_running_executions;
+use crate::turn_log_sink::TurnProgressObserver;
 use crate::workflow::dispatch::{
     build_effective_prompt, dispatch_intent_from_workflow_dispatch, effective_prompt_selection,
     loader::load_agent_dispatch_context,
 };
+use async_trait::async_trait;
 use db::{UpdateTask, UpdateTaskStatus};
+use std::sync::{Mutex as StdMutex, OnceLock};
+
+pub mod embedded_task_executor;
+
+/// The execution whose outbox is ingested. Provenance comes from here, never
+/// from the files the harness wrote.
+#[derive(Debug, Clone, Copy)]
+pub struct ExecutionOutboxInput<'a> {
+    pub task_id: &'a str,
+    pub execution_id: &'a str,
+    pub agent_id: &'a str,
+    pub role: Option<&'a str>,
+    pub worktree_path: &'a str,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExecutionOutboxReport {
+    pub worklog_entries: usize,
+    pub evidence_items: usize,
+    /// One human-readable reason per entry that was not ingested.
+    pub rejected: Vec<String>,
+    pub(crate) plan_candidate: bool,
+    pub(crate) plan_rejected: bool,
+}
+
+/// Provider credentials and owner outboxes used by Task execution.
+/// The composition root supplies the agents adapter; the Task core owns the
+/// input and result contracts and retains its execution ordering.
+#[async_trait]
+pub trait ExecutionSupport: Send + Sync {
+    async fn capture_verify_evidence(
+        &self,
+        _task_id: &str,
+        _media_id: &str,
+        _filename: &str,
+        _kind: &str,
+        _caption: &str,
+        _bytes: &[u8],
+    ) -> Result<String> {
+        Err(ServiceError::invalid_operation(
+            "verify evidence storage is not configured",
+        ))
+    }
+
+    async fn inject_provider_env(&self, agent_config: &mut Value) -> Result<()>;
+    async fn ingest_execution_outbox(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+    ) -> ExecutionOutboxReport;
+    async fn ingest_execution_outbox_entries(
+        &self,
+        input: &ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> ExecutionOutboxReport;
+}
+
+pub const UNCOMMITTED_WORKTREE_FAILURE: &str = "embedded worker completed with uncommitted worktree changes while HEAD was unchanged; refusing completion because those changes were not delivered";
+
+/// Shared state for the server-owned execution lease.
+///
+/// The embedded adapter receives this through a short-lived registry rather
+/// than through `ExecutionContext`: the latter is also constructed by all CLI
+/// adapters and is deliberately transport-neutral.  The runner registers the
+/// handle immediately before dispatch and removes it after the future exits.
+/// Both heartbeat and semantic-progress calls serialize on the same mutex so
+/// every successful CAS advances one authoritative execution version.
+pub struct EmbeddedExecutionLease {
+    db: Arc<SqliteDb>,
+    execution_id: String,
+    owner: String,
+    state: Mutex<EmbeddedExecutionLeaseState>,
+}
+
+#[derive(Debug, Clone)]
+struct EmbeddedExecutionLeaseState {
+    execution_version: i64,
+}
+
+/// Turn events are semantic progress only.  They never renew the execution
+/// owner lease: the server-controlled runner heartbeat does that
+/// independently, so a quiet provider request or long-running tool remains
+/// live while its owner is healthy.
+#[async_trait]
+impl TurnProgressObserver for EmbeddedExecutionLease {
+    async fn record_progress(&self) {
+        let progress_at = db::now_rfc3339();
+        if let Err(error) = self.record_progress(progress_at, db::now_rfc3339()).await {
+            tracing::debug!(
+                execution_id = %self.execution_id,
+                %error,
+                "failed to record native execution semantic progress"
+            );
+        }
+    }
+}
+
+impl std::fmt::Debug for EmbeddedExecutionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedExecutionLease")
+            .field("execution_id", &self.execution_id)
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddedExecutionLease {
+    pub(crate) fn new(
+        db: Arc<SqliteDb>,
+        execution_id: impl Into<String>,
+        owner: impl Into<String>,
+        execution_version: i64,
+    ) -> Self {
+        Self {
+            db,
+            execution_id: execution_id.into(),
+            owner: owner.into(),
+            state: Mutex::new(EmbeddedExecutionLeaseState { execution_version }),
+        }
+    }
+
+    pub(crate) async fn renew(
+        &self,
+        lease_expires_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::renew_lease(
+                &*self.db,
+                db::RenewExecutionLease {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    lease_expires_at: lease_expires_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    // A semantic-progress or adjacent same-owner CAS may
+                    // have advanced the version between the heartbeat read
+                    // and renewal. Refresh once; only a different owner or
+                    // terminal row means this runner has truly lost liveness.
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded heartbeat renewal retry always returns")
+    }
+
+    pub(crate) async fn record_progress(
+        &self,
+        progress_at: String,
+        now: String,
+    ) -> db::Result<db::ExecutionLeaseMutation> {
+        let mut state = self.state.lock().await;
+        for attempt in 0..2 {
+            let outcome = ExecutionRepo::record_progress(
+                &*self.db,
+                db::RecordExecutionProgress {
+                    execution_id: self.execution_id.clone(),
+                    expected_version: state.execution_version,
+                    owner: self.owner.clone(),
+                    progress_at: progress_at.clone(),
+                    now: now.clone(),
+                },
+            )
+            .await?;
+            match outcome {
+                db::ExecutionLeaseMutation::Updated(execution) => {
+                    state.execution_version = execution.execution_version;
+                    return Ok(db::ExecutionLeaseMutation::Updated(execution));
+                }
+                db::ExecutionLeaseMutation::Concurrent {
+                    current: Some(current),
+                } if attempt == 0
+                    && current.status == ExecutionStatus::Running
+                    && current.lease_owner.as_deref() == Some(self.owner.as_str()) =>
+                {
+                    state.execution_version = current.execution_version;
+                }
+                other => return Ok(other),
+            }
+        }
+        unreachable!("bounded semantic-progress retry always returns")
+    }
+
+    pub(crate) async fn owner_and_version(&self) -> (String, i64) {
+        let state = self.state.lock().await;
+        (self.owner.clone(), state.execution_version)
+    }
+}
+
+type EmbeddedExecutionLeaseRegistry = StdMutex<HashMap<String, Arc<EmbeddedExecutionLease>>>;
+
+fn embedded_execution_leases() -> &'static EmbeddedExecutionLeaseRegistry {
+    static REGISTRY: OnceLock<EmbeddedExecutionLeaseRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub(crate) fn register_execution_lease(
+    execution_id: impl Into<String>,
+    lease: Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        leases.insert(execution_id.into(), lease);
+    }
+}
+
+pub(crate) fn unregister_execution_lease(
+    execution_id: &str,
+    expected: &Arc<EmbeddedExecutionLease>,
+) {
+    if let Ok(mut leases) = embedded_execution_leases().lock() {
+        if leases
+            .get(execution_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected))
+        {
+            leases.remove(execution_id);
+        }
+    }
+}
+
+pub fn execution_lease_for(execution_id: &str) -> Option<Arc<EmbeddedExecutionLease>> {
+    embedded_execution_leases()
+        .lock()
+        .ok()
+        .and_then(|leases| leases.get(execution_id).cloned())
+}
 
 mod cascade;
 mod environment;
 mod follow_up;
 mod guards;
+pub(crate) use guards::is_agent_paused_pre_dispatch_failure;
+#[cfg(test)]
+pub(crate) use guards::DISK_PRE_DISPATCH_ERROR_PREFIX;
+pub(super) use guards::WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX;
 mod hooks;
 mod launch;
 pub(crate) mod ledger;
 mod recovery;
 mod runner;
+mod step_check;
 
 const PLAN_PUBLICATION_CLAIM_KEY: &str = "plan_publication_claim";
 const PLAN_PUBLICATION_CLEANUP_KEY: &str = "plan_publication_cleanup";
@@ -22,12 +270,13 @@ const TERMINAL_EXECUTION_SETTLEMENT_KEY: &str = "terminal_execution_settlement";
 
 pub(super) use recovery::REPLAYING_RECOVERY;
 pub(crate) use runner::discard_execution_plan_stage;
+#[cfg(test)]
+pub(crate) use runner::launch_gate;
 pub(super) use runner::{bounded_lease_expiry, execution_deadline_seconds, rfc3339_after};
 
 pub(crate) use cascade::should_block_task_for_failed_execution;
 pub(crate) use cascade::{
     exact_review_for_execution, reviewer_execution_lacks_exact_review_binding,
-    terminal_review_is_bound_to_execution,
 };
 
 #[derive(Debug, Clone)]
@@ -156,6 +405,7 @@ pub(crate) fn pending_plan_publication_cleanup_owner(task: &Task) -> Result<Opti
 /// failure remains recoverable by the dispatcher.
 pub(crate) async fn cleanup_execution_plan_private_files(
     db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
     task: &Task,
     execution_id: &str,
 ) -> Result<()> {
@@ -177,33 +427,23 @@ pub(crate) async fn cleanup_execution_plan_private_files(
         // retired without inventing an untrusted filesystem path.
         return Ok(());
     };
-    crate::plan_artifact::discard_staged_execution_plan(
-        std::path::Path::new(&workspace.worktree_path),
-        execution_id,
-    )
-    .map_err(|error| {
-        ServiceError::invalid_operation(format!(
-            "failed to remove settled execution plan stage: {error}"
-        ))
-    })?;
-    if let Some(outbox) = executors::execution_outbox_path(
-        std::path::Path::new(&workspace.worktree_path),
-        execution_id,
-    ) {
-        match std::fs::remove_dir_all(&outbox) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ServiceError::invalid_operation(format!(
-                    "failed to remove settled execution plan outbox: {error}"
-                )));
-            }
-        }
-    }
+    let resolved = router.resolve(db, &workspace).await?;
+    crate::plan_artifact::ExecutionPlan::new(db, &resolved)
+        .discard(execution_id)
+        .await
+        .map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to remove settled execution plan stage: {error}"
+            ))
+        })?;
     Ok(())
 }
 
-pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Task) -> Result<Task> {
+pub(crate) async fn clear_stale_plan_publication_claim(
+    db: &SqliteDb,
+    router: &WorkspaceBackendRouter,
+    task: &Task,
+) -> Result<Task> {
     let Some(claim) = parse_plan_publication_claim(task)? else {
         return Ok(task.clone());
     };
@@ -215,7 +455,7 @@ pub(crate) async fn clear_stale_plan_publication_claim(db: &SqliteDb, task: &Tas
     // published for the state that created them. Remove them before the
     // marker: a crash between these steps leaves a harmless marker that the
     // next dispatcher pass can finish clearing, never an unowned candidate.
-    cleanup_execution_plan_private_files(db, task, &claim.execution_id).await?;
+    cleanup_execution_plan_private_files(db, router, task, &claim.execution_id).await?;
 
     TaskRepo::mutate_metadata(
         db,
@@ -746,11 +986,29 @@ pub(super) fn latest_execution_authority(
 }
 
 impl TaskService {
+    pub(crate) async fn capture_verify_evidence(
+        &self,
+        task_id: &str,
+        media_id: &str,
+        filename: &str,
+        kind: &str,
+        caption: &str,
+        bytes: &[u8],
+    ) -> Result<String> {
+        self.credential_env
+            .as_ref()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("verify evidence storage is not configured")
+            })?
+            .capture_verify_evidence(task_id, media_id, filename, kind, caption, bytes)
+            .await
+    }
+
     pub(super) async fn ingest_terminal_execution_outbox(
         &self,
         task: &Task,
         execution: &Execution,
-    ) -> Result<crate::native_tools::ExecutionOutboxReport> {
+    ) -> Result<crate::task_service::execution::ExecutionOutboxReport> {
         let workspace = match execution.workspace_id.as_deref() {
             Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id).await?,
             None => {
@@ -763,15 +1021,26 @@ impl TaskService {
             execution.agent_id.as_deref(),
             workspace,
         ) else {
-            return Ok(crate::native_tools::ExecutionOutboxReport::default());
+            return Ok(crate::task_service::execution::ExecutionOutboxReport::default());
         };
+        let resolved = self
+            .workspace_backend_router
+            .resolve(&self.db, &workspace)
+            .await?;
+        // Daemon-owned outboxes are carried in the retained terminal report;
+        // their handles do not name files on the Forge host.
+        if resolved.placement.owner_kind == db::PlacementOwnerKind::Daemon {
+            return Ok(crate::task_service::execution::ExecutionOutboxReport::default());
+        }
+        // The outbox sits in the Task root, beside the worktree.
+        let path = crate::workspace_manager::task_root_anchor(&resolved)?;
         let report = embedded
-            .ingest_execution_outbox(&crate::native_tools::ExecutionOutboxInput {
+            .ingest_execution_outbox(&crate::task_service::execution::ExecutionOutboxInput {
                 task_id: &task.id,
                 execution_id: &execution.id,
                 agent_id,
                 role: Some(execution.role.as_str()),
-                worktree_path: &workspace.worktree_path,
+                worktree_path: &path.to_string_lossy(),
             })
             .await;
         if report.worklog_entries > 0 || report.evidence_items > 0 {
@@ -805,7 +1074,7 @@ async fn clear_execution_retry_metadata_inner(
     Ok(())
 }
 
-fn execution_retry_clear_mutations(
+pub(super) fn execution_retry_clear_mutations(
     task: &Task,
     clear_deferred_dispatch: bool,
 ) -> Result<Vec<db::TaskMetadataMutation>> {
@@ -813,32 +1082,21 @@ fn execution_retry_clear_mutations(
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
     let mut mutations = Vec::new();
-    if let Some(expected_count) = metadata.extra.get("execution_retry_count").cloned() {
-        let mut nested = vec![
-            db::TaskMetadataMutation::Remove {
-                key: "execution_retry_count".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_at".to_owned(),
-            },
-            db::TaskMetadataMutation::Remove {
-                key: "last_execution_failure_execution_id".to_owned(),
-            },
-        ];
-        if clear_deferred_dispatch {
-            nested.push(db::TaskMetadataMutation::Remove {
-                key: "deferred_dispatch".to_owned(),
+    for key in [
+        "last_execution_failure_at",
+        "last_execution_failure_execution_id",
+    ] {
+        if let Some(expected) = metadata.extra.get(key).cloned() {
+            mutations.push(db::TaskMetadataMutation::RemoveIf {
+                key: key.into(),
+                expected,
             });
         }
-        mutations.push(db::TaskMetadataMutation::CompareAndMutate {
-            key: "execution_retry_count".to_owned(),
-            expected: expected_count,
-            mutations: nested,
-        });
-    } else if clear_deferred_dispatch {
+    }
+    if clear_deferred_dispatch {
         if let Some(expected) = metadata.extra.get("deferred_dispatch").cloned() {
             mutations.push(db::TaskMetadataMutation::RemoveIf {
-                key: "deferred_dispatch".to_owned(),
+                key: "deferred_dispatch".into(),
                 expected,
             });
         }
@@ -961,6 +1219,7 @@ pub(super) async fn set_planning_awaiting_review_metadata(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) async fn planning_review_matches_current_state_entry(
     db: &SqliteDb,
     task: &Task,

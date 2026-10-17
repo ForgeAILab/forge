@@ -8,10 +8,12 @@ use serde_json::Value;
 use crate::workflow::default_roles;
 
 pub mod coder_prompt;
+pub mod coordination_prompt;
 pub mod generic_prompt;
 pub mod loader;
 pub mod planner_prompt;
 pub mod read_only_task_prompt;
+pub(crate) mod repair_brief;
 pub mod reviewer_prompt;
 pub mod worker_prompt;
 
@@ -26,6 +28,10 @@ pub const BUILDER_ID_WORKER_REVIEW_FIX_V1: &str = "worker.review_fix.v1";
 pub const BUILDER_ID_WORKER_MERGE_FIX_V1: &str = "worker.merge_fix.v1";
 pub const BUILDER_ID_REVIEWER_CONFORMANCE_V1: &str = "reviewer.conformance.v1";
 pub const BUILDER_ID_PLANNER_DEFAULT_V2: &str = "planner.default.v2";
+/// The lead of a coordination root: the planner run on a root with subtasks.
+pub const BUILDER_ID_PLANNER_COORDINATION_V1: &str = "planner.coordination.v1";
+/// The step check: the root's lead run on a subtask in its `lead_check` gate.
+pub const BUILDER_ID_PLANNER_STEP_CHECK_V1: &str = "planner.step_check.v1";
 pub const BUILDER_ID_READ_ONLY_TASK_V1: &str = "task.read_only.v1";
 pub const BUILDER_ID_GENERIC_DEFAULT_V2: &str = "generic.default.v2";
 
@@ -82,6 +88,10 @@ Review report: record what you verified with `task.worklog` (append) entries -- 
 const OUTBOX_REVIEW_REPORT_CONTRACT: &str = "\
 Review report: this harness has no Forge tools. The directory named by the `FORGE_OUTBOX` environment variable is the only place you may write your report (build output and scratch files elsewhere are discarded with the worktree); Forge ingests it when this run ends. Append one JSON object per line to `$FORGE_OUTBOX/worklog.jsonl` for what you verified -- {\"kind\":\"validation\",\"summary\":\"...\"} for a check you ran, `blocker` for what stopped you -- and one JSON object per line to `$FORGE_OUTBOX/evidence.jsonl`, one per artifact, for the output behind a finding -- {\"kind\":\"log\",\"caption\":\"...\",\"content\":\"<verbatim output>\"}, or a `path` to a file you saved under `$FORGE_OUTBOX`, such as a screenshot. Evidence `kind` is `screenshot`, `walkthrough_video`, `log`, `report`, or `other`. The verdict itself belongs in the result block that ends your reply.";
 
+pub const REVIEW_FINDING_ROUTING_CONTRACT: &str = r#"Result fields: `fixable_by` is "coder" (default) or "owner". Use "owner" only when the blocking finding needs something the coder cannot provide in this Task: another OS or hardware, an external service or credential, Forge-side metadata or links, a scope/product decision, or a change to acceptance criteria; otherwise use "coder". `repeat` defaults to false; set it true only when the previous review attempt raised the same blocking finding and it is still unaddressed.
+Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
+Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}."#;
+
 /// Tell an implementing agent exactly which checks gate review and how they
 /// run. Without this the agent validates with whatever interpreter or command
 /// it prefers, passes locally, and learns the real gate only from a rejection.
@@ -130,6 +140,13 @@ pub struct AgentDispatchContext {
     pub comments: Vec<db::TaskComment>,
     pub plan: Option<String>,
     pub prior_reviews: Vec<db::Review>,
+    /// Exact accounting window for repair; None only in synthetic contexts.
+    pub review_window: Option<Vec<db::Review>>,
+    pub previous_coder_summary: Option<String>,
+    pub repair_attempts: Vec<repair_brief::RepairAttempt>,
+    pub carried_repair: bool,
+    pub reset_model_after_repair: bool,
+    pub repair_budget: Option<repair_brief::RepairBudget>,
     pub parent_task: Option<db::Task>,
     pub sub_tasks: Vec<db::Task>,
     pub last_manual_bounce_reason: Option<String>,
@@ -142,6 +159,33 @@ pub struct AgentDispatchContext {
     pub delivery: TaskDelivery,
     /// Checks Forge runs before review; see [`required_checks_section`].
     pub review_ci_steps: Vec<String>,
+    /// The step's own changes, loaded for a step check only.
+    pub step_diff: Option<StepDiff>,
+}
+
+/// Bound on the diff embedded in a step-check prompt.
+pub const STEP_DIFF_LIMIT: usize = 32 * 1024;
+
+/// The changes a finished subtask left in the shared workspace, for the
+/// lead's step check: the workspace against the commit the step started from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepDiff {
+    Loaded {
+        /// The commit the diff starts from.
+        base_sha: String,
+        /// Whether that commit is the end of the previous step (a recorded
+        /// head) or, with none recorded, the root's branch point: then the
+        /// diff also holds the earlier steps.
+        since_previous_step: bool,
+        files_changed: u64,
+        additions: u64,
+        deletions: u64,
+        /// At most [`STEP_DIFF_LIMIT`] bytes.
+        diff: String,
+        truncated: bool,
+    },
+    /// The diff could not be read; the lead reads the workspace instead.
+    Unavailable { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,7 +247,8 @@ static DEFAULT_ROLE_BUILDERS: OnceLock<DefaultRoleBuilderMap> = OnceLock::new();
 fn registry() -> &'static BuilderRegistry {
     PROMPT_BUILDERS.get_or_init(|| {
         let mut builders: HashMap<String, Arc<dyn PromptBuilder>> = HashMap::new();
-        let defaults: [Arc<dyn PromptBuilder>; 10] = [
+        let defaults: [Arc<dyn PromptBuilder>; 12] = [
+            Arc::new(coordination_prompt::StepCheckPromptBuilder),
             Arc::new(coder_prompt::CoderImplementationPromptBuilder),
             Arc::new(coder_prompt::CoderReviewFixPromptBuilder),
             Arc::new(coder_prompt::CoderMergeFixPromptBuilder),
@@ -212,6 +257,7 @@ fn registry() -> &'static BuilderRegistry {
             Arc::new(worker_prompt::WorkerMergeFixPromptBuilder),
             Arc::new(reviewer_prompt::ReviewerPromptBuilder),
             Arc::new(planner_prompt::PlannerPromptBuilder),
+            Arc::new(coordination_prompt::CoordinationPlannerPromptBuilder),
             Arc::new(read_only_task_prompt::ReadOnlyTaskPromptBuilder),
             Arc::new(generic_prompt::GenericPromptBuilder),
         ];
@@ -246,20 +292,6 @@ fn default_role_builders() -> &'static DefaultRoleBuilderMap {
         ]);
         Arc::new(RwLock::new(defaults))
     })
-}
-
-pub fn register_prompt_builder(builder: Arc<dyn PromptBuilder>) {
-    let mut builders = registry()
-        .write()
-        .expect("prompt builder registry lock poisoned");
-    builders.insert(builder.id().to_string(), builder);
-}
-
-pub fn register_default_role_builder(role: &str, builder_id: &str) {
-    let mut role_defaults = default_role_builders()
-        .write()
-        .expect("default role builder mapping lock poisoned");
-    role_defaults.insert(role.to_string(), builder_id.to_string());
 }
 
 pub fn resolve_prompt_builder(builder_id: &str) -> Arc<dyn PromptBuilder> {
@@ -340,6 +372,20 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             description: "Planning prompt for structured implementation plans.",
         },
         PromptBuilderRegistryEntry {
+            id: BUILDER_ID_PLANNER_COORDINATION_V1,
+            label: "Planner (Coordination Lead)",
+            compatible_role_hints: &[default_roles::PLANNER],
+            description:
+                "Lead prompt for a root Task with subtasks: reviews the ordered breakdown before the subtasks run.",
+        },
+        PromptBuilderRegistryEntry {
+            id: BUILDER_ID_PLANNER_STEP_CHECK_V1,
+            label: "Planner (Step Check)",
+            compatible_role_hints: &[default_roles::PLANNER],
+            description:
+                "Lead prompt for one finished subtask: accepts the step or returns it with findings, as a result block.",
+        },
+        PromptBuilderRegistryEntry {
             id: BUILDER_ID_READ_ONLY_TASK_V1,
             label: "Read-only Task",
             compatible_role_hints: &[default_roles::CODER, default_roles::WORKER],
@@ -353,26 +399,6 @@ pub fn prompt_builder_registry_entries() -> Vec<PromptBuilderRegistryEntry> {
             description: "Fallback prompt for custom roles without a specialized builder.",
         },
     ]
-}
-
-pub fn dispatch_intent_from_config(value: &Value) -> DispatchIntent {
-    let dispatch = value.get("dispatch").unwrap_or(value);
-    let prompt_config = dispatch
-        .get("prompt")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
-
-    DispatchIntent {
-        builder_id: dispatch
-            .get("builder")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        execution_policy: dispatch
-            .get("execution_policy")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        prompt_config,
-    }
 }
 
 pub fn dispatch_intent_from_workflow_dispatch(
@@ -454,6 +480,9 @@ pub fn build_effective_prompt(
 ) -> (AgentPrompt, EffectivePromptSelection) {
     let mut selection =
         effective_prompt_selection(&dispatch_ctx.role, trigger_dispatch, state_dispatch);
+    if dispatch_ctx.carried_repair || dispatch_ctx.reset_model_after_repair {
+        selection.execution_policy = EXECUTION_POLICY_NEW_EXECUTION.to_owned();
+    }
     let read_only_worker = dispatch_ctx.read_only_task
         && matches!(
             dispatch_ctx.role.as_str(),
@@ -461,6 +490,23 @@ pub fn build_effective_prompt(
         );
     if read_only_worker {
         selection.builder_id = BUILDER_ID_READ_ONLY_TASK_V1.to_owned();
+    }
+    // The planner run on a root Task that has subtasks is its lead: it plans
+    // through the breakdown, not through a checklist of its own.
+    if selection.builder_id == BUILDER_ID_PLANNER_DEFAULT_V2
+        && dispatch_ctx.task.parent_task_id.is_none()
+        && !dispatch_ctx.sub_tasks.is_empty()
+    {
+        selection.builder_id = BUILDER_ID_PLANNER_COORDINATION_V1.to_owned();
+    }
+    // A planner run on a subtask in an inherited workflow state is the step
+    // check, whatever builder the role would default to: it owes a result
+    // block, never a plan.
+    if dispatch_ctx.role == crate::workflow::inherited_subtask_workflow::STEP_CHECK_ROLE
+        && dispatch_ctx.task.parent_task_id.is_some()
+        && crate::workflow::inherited_subtask_workflow::is_inherited_state(&dispatch_ctx.state_name)
+    {
+        selection.builder_id = BUILDER_ID_PLANNER_STEP_CHECK_V1.to_owned();
     }
     let base_prompt = resolve_prompt_builder(&selection.builder_id).build(dispatch_ctx);
     let prompt = apply_prompt_overrides(base_prompt, &dispatch_ctx.state_config);
@@ -482,6 +528,35 @@ pub fn build_effective_prompt(
         );
     }
     (prompt, selection)
+}
+
+/// Whether a comment is a hand-off note of the root's lead.
+pub(crate) fn is_handoff_note(comment: &db::TaskComment) -> bool {
+    comment.worklog_kind.as_deref() == Some(db::COMMENT_KIND_HANDOFF)
+}
+
+/// The lead's hand-off notes for this Task, for the top of an implementation
+/// prompt: the newest few, oldest first, each attributed to the lead. They
+/// are left out of the ordinary comment list below them.
+pub(crate) fn handoff_notes_section(ctx: &AgentDispatchContext) -> Option<String> {
+    let notes = ctx
+        .comments
+        .iter()
+        .filter(|comment| is_handoff_note(comment))
+        .collect::<Vec<_>>();
+    if notes.is_empty() {
+        return None;
+    }
+    let keep = crate::task_service::lead::HANDOFF_NOTES_IN_PROMPT;
+    let mut section = String::from(
+        "\nHand-off notes from the lead of this feature (read these first; the lead planned this step and checks it when you finish):\n",
+    );
+    for note in &notes[notes.len().saturating_sub(keep)..] {
+        section.push_str("- lead: ");
+        section.push_str(&note.content);
+        section.push('\n');
+    }
+    Some(section)
 }
 
 pub(crate) fn default_tool_names(role: &str) -> Vec<String> {

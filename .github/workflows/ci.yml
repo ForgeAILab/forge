@@ -1,11 +1,12 @@
 name: CI
 
 on:
-  # Other branches are covered by their pull_request run; a push trigger on
-  # every branch ran the whole suite twice per PR.
+  # Long-lived integration lanes populate branch-scoped caches on pushes.
+  # Other branches are covered by their pull_request run.
   push:
     branches:
       - main
+      - next/**
   pull_request:
 
 concurrency:
@@ -14,10 +15,23 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.sha || github.ref }}
   cancel-in-progress: true
 
+# Same-repository next/** PRs use the push checks on their head commit. Keep
+# fork PRs (even heads named next/**) covered by the pull_request checks.
+# PR merge-ref caches cannot warm the branch's push runs.
 jobs:
-  rust:
-    name: Rust
+  # The Rust gates run as eight parallel jobs: lint, and one test job per shard.
+  # Each job has its own dependency cache; a shared key would be saved by
+  # whichever job finishes first and miss for the others.
+  rust-lint:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'next/') }}
+    name: Rust lint
     runs-on: ubuntu-latest
+    # Every cargo invocation of the job builds with the same debug-info level,
+    # so `make types` reuses the cached dependencies instead of rebuilding them
+    # under a second profile. scripts/ci-rust.sh explains the setting.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -30,13 +44,22 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: rust
-          # Branch and PR copies crowd out the default-branch cache.
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          shared-key: rust-lint
+          # Only trusted branch pushes write; PR merge refs remain read-only.
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/next/')) }}
+          # Retain dependency artifacts; discard workspace binaries/incremental.
+          cache-workspace-crates: false
+          cache-bin: false
           cache-on-failure: true
 
-      - name: Run Rust CI
-        run: ./scripts/ci-rust.sh
+      # A workspace package no test shard covers would stop being tested
+      # without any job turning red.
+      - name: Check test shard coverage
+        run: python3 scripts/ci_rust_shards.py check
+
+      - name: Run fmt and clippy
+        if: ${{ !cancelled() }}
+        run: ./scripts/ci-rust.sh lint
 
       - name: Check TypeScript binding drift
         if: ${{ !cancelled() }}
@@ -51,11 +74,120 @@ jobs:
             exit 1
           fi
 
-      - name: Test performance collector
+      - name: Test performance tooling
         if: ${{ !cancelled() }}
-        run: python3 -m unittest discover -s scripts -p test_collect_performance.py -v
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+  rust-test:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'next/') }}
+    name: Rust test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One red shard must not cancel the others: a run reports every failure.
+      fail-fast: false
+      matrix:
+        # Package/target selections, the test features of the services and db
+        # integration targets and the complementary services filters are
+        # defined in scripts/ci_rust_shards.py;
+        # its `check` (in the lint job) fails if this list differs from it.
+        shard: [services-unit-a, services-unit-b, services-integration, api-a, api-b, db, rest]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      # Keep cold/warm build measurements separate from test execution. The
+      # small HTML upload takes <1 second in the measured services unit run.
+      CI_RUST_TIMINGS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test-${{ matrix.shard }}
+          # Only trusted branch pushes write; PR merge refs remain read-only.
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/next/')) }}
+          # Retain dependency artifacts; discard workspace binaries/incremental.
+          cache-workspace-crates: false
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Run tests
+        run: ./scripts/ci-rust.sh test ${{ matrix.shard }}
+
+      - name: Upload build timings
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-${{ matrix.shard }}
+          path: target/cargo-timings/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # One stable check for branch protection and for the workflow conclusion:
+  # Normal runs require all Rust jobs. A same-repository next/** PR waits for
+  # the whole push workflow on its exact head SHA, so skipped PR jobs cannot
+  # report a false green while the canonical push checks are red or pending.
+  rust:
+    name: Rust
+    if: ${{ always() }}
+    needs: [rust-lint, rust-test]
+    timeout-minutes: 90
+    permissions:
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require lint and every test shard
+        if: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'next/')) }}
+        env:
+          LINT_RESULT: ${{ needs.rust-lint.result }}
+          TEST_RESULT: ${{ needs.rust-test.result }}
+        run: |
+          echo "Rust lint: $LINT_RESULT"
+          echo "Rust test shards: $TEST_RESULT"
+          [[ "$LINT_RESULT" == success && "$TEST_RESULT" == success ]]
+
+      - name: Wait for integration-lane CI
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'next/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          LANE_BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          missing_polls=0
+          while true; do
+            if ! run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs" --method GET \
+              -f head_sha="$SHA" -f event=push -f branch="$LANE_BRANCH" -f per_page=1 \
+              --jq '.workflow_runs[0] // empty | "\(.status) \(.conclusion // "-") \(.html_url)"'); then
+              echo "::warning::Could not read integration-lane CI; retrying."
+            elif [[ -z "$run" ]]; then
+              missing_polls=$((missing_polls + 1))
+              if ((missing_polls >= 15)); then
+                echo "::error::No push CI run on $LANE_BRANCH for $SHA. Push this commit with CI enabled."
+                exit 1
+              fi
+            else
+              read -r status conclusion url <<<"$run"
+              if [[ "$status" == completed ]]; then
+                if [[ "$conclusion" == success ]]; then
+                  echo "Integration-lane CI passed on $SHA: $url"
+                  exit 0
+                fi
+                echo "::error::Integration-lane CI on $SHA finished with '$conclusion': $url"
+                exit 1
+              fi
+              echo "Integration-lane CI on $SHA is $status: $url"
+            fi
+            sleep 20
+          done
 
   audit:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'next/') }}
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
@@ -72,6 +204,7 @@ jobs:
         run: cargo audit
 
   web:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'next/') }}
     name: Web
     runs-on: ubuntu-latest
     container: mcr.microsoft.com/playwright:v1.59.1-noble
@@ -123,6 +256,7 @@ jobs:
         run: pnpm run e2e
 
   npm-bootstrapper:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || !startsWith(github.head_ref, 'next/') }}
     name: npm Bootstrapper
     runs-on: ubuntu-latest
     steps:

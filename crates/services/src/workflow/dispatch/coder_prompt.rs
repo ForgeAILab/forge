@@ -127,6 +127,9 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         "Task: {}\n\nImplementation objective:\nMake the requested code changes in the worktree and leave the task ready for review.\n",
         ctx.task.title
     );
+    if let Some(notes) = crate::workflow::dispatch::handoff_notes_section(ctx) {
+        user.push_str(&notes);
+    }
     if let Some(description) = ctx.task.description.as_deref() {
         user.push_str("\nDescription:\n");
         user.push_str(description);
@@ -147,9 +150,25 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
         user.push('\n');
     }
 
-    if !ctx.comments.is_empty() {
+    if let Some(findings) = returned_step_findings(ctx) {
+        user.push_str(
+            "\nThe lead checked this step and returned it. Your earlier work is in the worktree; change exactly what the findings ask and finish the step again:\n",
+        );
+        user.push_str(&findings);
+        user.push('\n');
+    }
+
+    if ctx
+        .comments
+        .iter()
+        .any(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+    {
         user.push_str("\nRecent comments:\n");
-        for comment in &ctx.comments {
+        for comment in ctx
+            .comments
+            .iter()
+            .filter(|comment| !crate::workflow::dispatch::is_handoff_note(comment))
+        {
             user.push_str("- ");
             user.push_str(&comment.author_name);
             user.push_str(": ");
@@ -161,93 +180,26 @@ fn implementation_user(ctx: &AgentDispatchContext) -> String {
 }
 
 fn review_fix_user(ctx: &AgentDispatchContext) -> String {
-    if let Some(reason) = latest_ci_failure_reason(ctx) {
-        let mut user = format!("Task: {}\n", ctx.task.title);
-        user.push_str(
-            "\nCI failed during review. Fix only the failing check below, keep the existing implementation direction, and complete the minimal correction according to the execution harness contract.\n",
-        );
-        user.push_str("\nCI failure:\n");
-        user.push_str(&reason);
-        user.push('\n');
-        if let Some(execution_id) = ctx.continuation_of_execution_id.as_deref() {
-            user.push_str("\nPrevious coder execution:\n");
-            user.push_str(execution_id);
-            user.push('\n');
-        }
-        if let Some(logs_path) = ctx.continuation_logs_path.as_deref() {
-            user.push_str("\nPrevious coder log file:\n");
-            user.push_str(logs_path);
-            user.push('\n');
-        }
-        return user;
+    let body = super::repair_brief::RepairBrief::review(ctx).render();
+    match no_change_brief(ctx) {
+        Some(brief) => format!("{brief}\n\n{body}"),
+        None => body,
     }
-
-    let mut user = format!("Task: {}\n", ctx.task.title);
-    if let Some(description) = ctx.task.description.as_deref() {
-        user.push_str("\nDescription:\n");
-        user.push_str(description);
-        user.push('\n');
-    }
-    if let Some(plan) = ctx.plan.as_deref().filter(|plan| !plan.trim().is_empty()) {
-        user.push_str("\nOriginal plan:\n");
-        user.push_str(plan);
-        user.push('\n');
-    }
-    user.push_str(
-        "\nThe reviewer agent flagged the previous implementation. Inspect the current worktree diff, address only the review findings, and complete delivery according to the execution harness contract. The task will return to the reviewer agent for re-verification.\n",
-    );
-    if let Some(reason) = review_feedback(ctx) {
-        user.push_str("\nReview feedback:\n");
-        user.push_str(&reason);
-        user.push('\n');
-    }
-    if let Some(execution_id) = ctx.latest_review_execution_id.as_deref() {
-        user.push_str("\nReviewer execution:\n");
-        user.push_str(execution_id);
-        user.push('\n');
-    }
-    if let Some(logs_path) = ctx.latest_review_logs_path.as_deref() {
-        user.push_str("\nReviewer log file:\n");
-        user.push_str(logs_path);
-        user.push('\n');
-    }
-    if let Some(execution_id) = ctx.continuation_of_execution_id.as_deref() {
-        user.push_str("\nPrevious coder execution:\n");
-        user.push_str(execution_id);
-        user.push('\n');
-    }
-    if let Some(logs_path) = ctx.continuation_logs_path.as_deref() {
-        user.push_str("\nPrevious coder log file:\n");
-        user.push_str(logs_path);
-        user.push('\n');
-    }
-    if let Some(attempt) = last_failed_review_attempt(ctx) {
-        user.push_str(&format!(
-            "\nReview attempt {attempt} failed. Address the review feedback, keep the change scoped, and resubmit.\n"
-        ));
-    }
-    user
 }
 
-fn latest_ci_failure_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.prior_reviews
+pub(crate) fn no_change_brief(ctx: &AgentDispatchContext) -> Option<&str> {
+    ctx.transition_log
         .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| {
-            let value =
-                serde_json::from_str::<serde_json::Value>(&review.step_results_json).ok()?;
-            let has_auditor = value
-                .get("auditor")
-                .is_some_and(|auditor| !auditor.is_null());
-            if has_auditor {
-                return None;
-            }
-            ci_failure_reason(&value)
-        })
+        .rev()
+        .find(|entry| entry.to_state == ctx.state_name)
+        .filter(|entry| entry.bridge.is_repair_no_change())
+        .map(|entry| entry.trigger_reason.as_str())
 }
 
 fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
+    if let Some(brief) = super::repair_brief::RepairBrief::merge(ctx) {
+        return brief.render();
+    }
     let mut user = String::new();
     if matches!(
         merge_failure_kind(ctx),
@@ -259,10 +211,6 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
             user.push_str("Integration found uncommitted changes in the task worktree, not a merge conflict. Preserve the existing work; do not rebase or discard it.\n\n");
         }
         user.push_str("Inspect the worktree changes, finish the intended implementation, complete delivery according to the execution harness contract, and verify the focused checks pass.");
-    } else if let Some(reason) = conflict_handoff_reason(ctx) {
-        user.push_str("Forge rebased this Task's branch onto the latest target and committed the merge conflicts with their Git conflict markers left in place. There is no rebase in progress: reconcile the conflicts by editing files, then commit the reconciled files with an ordinary `git commit` as you would any delivery. Never rebase, merge, or rewrite history — Forge owns the branch.\n\nFor every file listed below, keep the intent of BOTH sides — the target's change and this Task's change — and remove every `<<<<<<<`, `=======`, `>>>>>>>`, and diff3 `|||||||` section. Conflicts in shared registration points (export lists, package or workspace member lists, command indexes, README sections) almost always mean keeping both entries. Where a lockfile conflicted, regenerate it with the project's tool (for example `uv lock` or `pnpm install --lockfile-only`) instead of hand-merging it. Do not rewrite or redesign the feature. Then run the relevant checks, commit, and complete delivery; uncommitted edits are not delivered. Forge refuses to integrate a handed-off file that still adds conflict markers.\n\nConflict:\n");
-        user.push_str(&reason);
-        user.push_str("\n\nForge will run the project's checks on the reconciled commit and integrate it, so keep your change limited to reconciling the files listed above, and run the relevant checks yourself before you commit.");
     } else {
         if ctx.task.review_passed_at.is_some() {
             user.push_str("The task previously passed review, but integration found a real merge conflict. That conflict requires manual workspace repair and a fresh review before Forge retries integration.\n\n");
@@ -272,17 +220,27 @@ fn merge_fix_user(ctx: &AgentDispatchContext) -> String {
     user
 }
 
-/// The latest `merge_failed` entry, when Forge committed a rebase conflict
-/// with its markers for this Worker to reconcile.
-fn conflict_handoff_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    last_merge_failed_reason(ctx)
-        .filter(|reason| reason.contains(crate::workflow::CONFLICT_HANDOFF_MARKER))
+fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
+    ctx.task
+        .condition
+        .read()
+        .diagnostic
+        .map(|a| a.annotation_type)
 }
 
-fn merge_failure_kind(ctx: &AgentDispatchContext) -> Option<api_types::FailureKind> {
-    let annotation = ctx.task.error_annotation.as_deref()?;
-    let value = serde_json::from_str::<serde_json::Value>(annotation).ok()?;
-    serde_json::from_value(value.get("type")?.clone()).ok()
+/// The lead's findings when this entry into the implementation state is a
+/// step returned by the step check (`lead_check`).
+fn returned_step_findings(ctx: &AgentDispatchContext) -> Option<String> {
+    ctx.transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == ctx.state_name)
+        .filter(|entry| {
+            entry.rejection
+                && entry.from_state == default_states::LEAD_CHECK
+                && entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::GateRejected)
+        })
+        .map(|entry| entry.trigger_reason.clone())
 }
 
 fn last_merge_failed_reason(ctx: &AgentDispatchContext) -> Option<String> {
@@ -299,72 +257,4 @@ fn last_failed_review_attempt(ctx: &AgentDispatchContext) -> Option<i64> {
         .filter(|review| review.status == ReviewStatus::Failed)
         .map(|review| review.attempt_number)
         .max()
-}
-
-fn last_review_rejection_reason(ctx: &AgentDispatchContext) -> Option<String> {
-    let review_reason = ctx
-        .prior_reviews
-        .iter()
-        .filter(|review| review.status == ReviewStatus::Failed)
-        .max_by_key(|review| review.attempt_number)
-        .and_then(|review| review_failure_reason(&review.step_results_json));
-    if review_reason.is_some() {
-        return review_reason;
-    }
-
-    ctx.transition_log
-        .iter()
-        .rev()
-        .find(|entry| {
-            entry.from_state == default_states::REVIEW
-                && entry.to_state == ctx.state_name
-                && entry.rejection
-        })
-        .map(|entry| entry.trigger_reason.clone())
-}
-
-fn review_feedback(ctx: &AgentDispatchContext) -> Option<String> {
-    ctx.latest_review_feedback
-        .as_deref()
-        .map(str::trim)
-        .filter(|feedback| !feedback.is_empty())
-        .map(str::to_owned)
-        .or_else(|| last_review_rejection_reason(ctx))
-}
-
-fn review_failure_reason(step_results_json: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(step_results_json).ok()?;
-    value
-        .get("auditor")
-        .and_then(|auditor| auditor.get("reason"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| ci_failure_reason(&value))
-}
-
-fn ci_failure_reason(value: &serde_json::Value) -> Option<String> {
-    let steps = value
-        .get("ci_steps")
-        .or_else(|| if value.is_array() { Some(value) } else { None })?
-        .as_array()?;
-    let failed = steps.iter().find(|step| {
-        step.get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-    })?;
-    let command = failed
-        .get("command")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("CI step");
-    let output = failed
-        .get("output_tail")
-        .and_then(serde_json::Value::as_str)
-        .filter(|output| !output.trim().is_empty())
-        .or_else(|| {
-            failed
-                .get("stderr_tail")
-                .and_then(serde_json::Value::as_str)
-        })
-        .unwrap_or("");
-    Some(format!("CI failed: {command}\n{output}"))
 }

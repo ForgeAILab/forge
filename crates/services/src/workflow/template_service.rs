@@ -285,10 +285,27 @@ impl WorkflowTemplateService {
             },
         })?;
 
-        let document: TemplateDocument =
+        let mut document: TemplateDocument =
             serde_yaml::from_str(&contents).map_err(|error| ServiceError::InvalidOperation {
                 message: format!("invalid workflow template {}: {error}", path.display()),
             })?;
+        // A template written before a hook was removed still names it. The
+        // stored workflows got the same rewrite from their migration; a file
+        // gets it here, when it is read: the removed name is dropped,
+        // everything else is kept, and the file is replaced so the notice is
+        // logged once.
+        let removed = strip_removed_hooks(&mut document.definition);
+        if !removed.is_empty() {
+            tracing::warn!(
+                template = %path.display(),
+                hooks = %removed.join(", "),
+                "workflow template named a removed hook; the hook was dropped and the file rewritten"
+            );
+            if let Err(error) = self.write_template_document(path, &document) {
+                // Read-only directory: the template still loads without it.
+                tracing::warn!(template = %path.display(), %error, "workflow template could not be rewritten without its removed hook");
+            }
+        }
         Ok(document)
     }
 
@@ -343,6 +360,40 @@ impl WorkflowTemplateService {
         }
         Ok(())
     }
+}
+
+/// Drop every hook whose action was removed from the registry
+/// ([`crate::workflow::registry::REMOVED_HOOK_ACTIONS`]) from `definition`.
+/// Returns the names dropped, once each. The same rewrite migration
+/// `V202610111217` applies to stored workflows.
+pub(crate) fn strip_removed_hooks(definition: &mut WorkflowDefinition) -> Vec<&'static str> {
+    let mut dropped = Vec::new();
+    for state in &mut definition.states {
+        let hooks = &mut state.hooks;
+        for list in [
+            &mut hooks.before_exit,
+            &mut hooks.on_exit,
+            &mut hooks.before_enter,
+            &mut hooks.on_enter,
+            &mut hooks.after_enter,
+        ] {
+            list.retain(|hook| {
+                match crate::workflow::registry::REMOVED_HOOK_ACTIONS
+                    .iter()
+                    .find(|removed| **removed == hook.action)
+                {
+                    Some(removed) => {
+                        if !dropped.contains(removed) {
+                            dropped.push(*removed);
+                        }
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
+    }
+    dropped
 }
 
 fn is_yaml_path(path: &Path) -> bool {
@@ -437,14 +488,69 @@ mod tests {
     use std::fs;
 
     use super::{
-        builtin_autonomous_v1_template, builtin_default_template, WorkflowTemplateService,
+        builtin_autonomous_v1_template, builtin_default_template, strip_removed_hooks,
+        TemplateDocument, WorkflowTemplateService,
     };
+    use crate::workflow::{default_workflow::default_workflow, validation::validate_workflow};
 
     fn temp_workflows_dir() -> std::path::PathBuf {
         let path =
             std::env::temp_dir().join(format!("forge-workflow-templates-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).expect("create temp workflows dir");
         path
+    }
+
+    /// A custom template written before `auto_cascade_on_merge_result` was
+    /// removed: it loads, lists and validates without the hook, keeps every
+    /// other hook and field, and the file on disk is rewritten.
+    #[tokio::test]
+    async fn a_template_naming_a_removed_hook_loads_without_it_and_is_rewritten() {
+        let dir = temp_workflows_dir();
+        let service = WorkflowTemplateService::new(dir.clone());
+        service.initialize().await.expect("initialize");
+        let mut definition = default_workflow();
+        let merging = definition
+            .states
+            .iter_mut()
+            .find(|state| state.name == crate::workflow::default_states::MERGING)
+            .expect("merging state");
+        let run_merge = merging.hooks.on_enter[0].clone();
+        let mut removed = run_merge.clone();
+        removed.action = "auto_cascade_on_merge_result".to_owned();
+        merging.hooks.on_enter.push(removed.clone());
+        merging.hooks.after_enter.push(removed);
+        let document = TemplateDocument {
+            display_name: "Mine".to_owned(),
+            description: "kept".to_owned(),
+            definition,
+        };
+        let path = dir.join("mine.yaml");
+        fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("auto_cascade_on_merge_result"));
+
+        let loaded = service
+            .get_template("mine")
+            .await
+            .expect("the template loads");
+        assert_eq!(loaded.display_name, "Mine");
+        assert_eq!(loaded.description, "kept");
+        assert_eq!(loaded.definition, default_workflow());
+        validate_workflow(&loaded.definition).expect("usable for a Project");
+        assert!(service
+            .list_templates()
+            .await
+            .expect("listing still works")
+            .iter()
+            .any(|template| template.name == "mine"));
+        assert!(!fs::read_to_string(&path)
+            .unwrap()
+            .contains("auto_cascade_on_merge_result"));
+        // A second read finds nothing to drop.
+        let mut again = service.get_template("mine").await.unwrap().definition;
+        assert!(strip_removed_hooks(&mut again).is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

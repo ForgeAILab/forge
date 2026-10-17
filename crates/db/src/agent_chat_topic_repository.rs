@@ -68,12 +68,45 @@ pub struct CreateAgentChatTopic {
 /// the insert, so nothing can race between the check and the write.
 #[derive(Debug, Clone)]
 pub struct RotateAgentChatTopic {
+    pub runtime_session_id: Option<String>,
+    pub rotation_owner: Option<String>,
     pub topic: CreateAgentChatTopic,
     /// The visible timeline divider. `sequence` is only a hint -- the store
     /// allocates the real value exactly like every other Agent Chat message
     /// append, and the persisted topic's `starting_message_sequence` is that
     /// allocated value.
     pub divider_message: crate::CreateAgentChatMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbandonAgentChatTopicRotation {
+    pub chat_id: String,
+    pub intent_id: String,
+    pub owner_token: String,
+    /// Stable, redaction-safe failure class (for example `runtime`).
+    pub error_kind: String,
+    pub attempts: i64,
+    /// The runtime fork saved the successor (and superseded the source).
+    pub hand_over: bool,
+    /// The visible system notice; `sequence` is allocated by the store.
+    pub notice_message: crate::CreateAgentChatMessage,
+}
+
+/// Body of the system notice appended when a topic rotation is abandoned.
+#[must_use]
+pub fn topic_rotation_failed_message_body(label: &str) -> String {
+    format!(
+        "Could not start the new topic \"{label}\". The conversation continues on the current topic."
+    )
+}
+
+/// Body of the notice when the successor took over but the topic record
+/// could not be written.
+#[must_use]
+pub fn topic_rotation_unrecorded_message_body(label: &str) -> String {
+    format!(
+        "The new topic \"{label}\" could not be recorded. The conversation continues with a summarized context."
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +135,31 @@ pub trait AgentChatTopicRepo: Send + Sync {
 
 #[async_trait]
 pub trait AgentChatTopicTransactionRepo: Send + Sync {
+    /// Persist one coalesced rotation intent; its id survives retries and
+    /// crashes. A request that meets an already pending intent applies its
+    /// label and summary to that intent (the newest request wins). Refused
+    /// with [`crate::DbError::AgentChatTopicDenied`] while a Product Genesis
+    /// session for the chat's account needs a decision; the check and the
+    /// write share one immediate transaction.
+    async fn request_agent_chat_topic(&self, input: RotateAgentChatTopic) -> Result<String>;
+
+    /// The chat's pending rotation intent id, if any.
+    async fn pending_agent_chat_topic(&self, chat_id: &str) -> Result<Option<String>>;
+
+    /// Abandon a rotation intent that exhausted its attempts. In one
+    /// transaction: the intent (and with it `rotation_pending`) is removed,
+    /// a visible system notice is appended, and an
+    /// `agent_chat.topic.rotation_failed` event records the error kind. The
+    /// chat keeps its current topic. Without `hand_over` it also keeps its
+    /// session and the reserved successor is marked `failed`; with it (the
+    /// runtime fork completed and superseded the source) the successor takes
+    /// over the chat. `false` when the intent is no longer held by
+    /// `owner_token`.
+    async fn abandon_agent_chat_topic_rotation(
+        &self,
+        input: AbandonAgentChatTopicRotation,
+    ) -> Result<bool>;
+
     /// Rotate to a new topic, or refuse per [`AgentChatTopicDenialReason`].
     async fn rotate_agent_chat_topic(
         &self,

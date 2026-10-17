@@ -42,7 +42,7 @@ struct PriceIdentity {
     rate_revision_id: Option<String>,
     catalog_snapshot_id: Option<String>,
     catalog_provider_id: Option<String>,
-    catalog_freshness: Option<crate::pricing::CatalogFreshness>,
+    catalog_freshness: Option<pricing::CatalogFreshness>,
     /// Immutable rate materialized during admission so the canonical frozen
     /// selection digest can be persisted, rather than a separate envelope
     /// digest that settlement could not authenticate.
@@ -202,19 +202,26 @@ fn candidates_from_snapshot(snapshot: &Value) -> Result<Vec<Candidate>> {
     Ok(candidates)
 }
 
-fn subject_ref(
+async fn subject_ref(
+    db: &SqliteDb,
+    tx: &mut Transaction<'_, Sqlite>,
     candidate: &Candidate,
     snapshot: &Value,
     agent: &db::Agent,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>)> {
     let provider_entry = nonempty(candidate.config.get("credential_ref"))
         .or_else(|| nonempty(candidate.config.get("provider_entry_id")))
         .or_else(|| nonempty(snapshot.get("credential_ref")))
         .or_else(|| agent.credential_ref.clone());
-    let daemon_id = nonempty(candidate.config.get("daemon_id"))
-        .or_else(|| nonempty(snapshot.get("resolved_daemon_id")))
-        .or_else(|| agent.daemon_id.clone());
-    (provider_entry, daemon_id)
+    let daemon_id = if let Some(placement_id) = nonempty(snapshot.get("placement_id")) {
+        let placement = db::WorkspacePlacementRepo::get_by_id_in_tx(db, tx, &placement_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("workspace placement", placement_id))?;
+        placement.execution_daemon_id.or(placement.daemon_id)
+    } else {
+        nonempty(snapshot.get("daemon_id")).or_else(|| agent.daemon_id.clone())
+    };
+    Ok((provider_entry, daemon_id))
 }
 
 async fn resolve_price_identity(
@@ -233,22 +240,23 @@ async fn resolve_price_identity(
             ..Default::default()
         });
     };
-    let (provider_entry, daemon_id) = subject_ref(candidate, snapshot, agent);
+    let (provider_entry, daemon_id) = subject_ref(db, tx, candidate, snapshot, agent).await?;
     let executor_type = candidate.executor_type.to_string();
     // Provision the subject and materialize the binding this agent resolves:
     // the models.dev row for the runtime model under the effective
     // adjustment (agent, else provider entry / CLI runtime, else list).
-    let scope_key = crate::pricing_auto::prepare_price_in_tx(
+    let scope_key = pricing::auto::prepare_price_in_tx(
         db,
         tx,
         owner_user_id,
-        &crate::pricing_auto::SubjectRef {
+        &pricing::auto::SubjectRef {
             provider_entry_id: provider_entry.clone(),
             daemon_id: daemon_id.clone(),
             executor_type: Some(executor_type.clone()),
         },
         Some(agent.id.as_str()),
         runtime_model,
+        crate::provider_credentials::provider_entry_endpoint,
         admitted_at,
     )
     .await?;
@@ -304,15 +312,13 @@ async fn resolve_price_identity(
     // evidence with the admitted runtime identity and only then rejects a
     // contradiction as `identity_mismatch`.
     let catalog_freshness = match binding.source_kind {
-        PricingRateSourceKind::ManualOverride => {
-            Some(crate::pricing::CatalogFreshness::NotApplicable)
-        }
+        PricingRateSourceKind::ManualOverride => Some(pricing::CatalogFreshness::NotApplicable),
         PricingRateSourceKind::ModelsDevCatalog => {
             let snapshot_id = rate.catalog_snapshot_id.as_deref().ok_or_else(|| {
                 ServiceError::invalid_operation("catalog pricing binding has no immutable snapshot")
             })?;
             Some(
-                crate::pricing_db::catalog_freshness_for_snapshot_in_tx(
+                pricing::sqlite::catalog_freshness_for_snapshot_in_tx(
                     tx,
                     snapshot_id,
                     chrono::DateTime::parse_from_rfc3339(admitted_at)
@@ -407,6 +413,33 @@ fn selection_digest(
         .map_err(|error| ServiceError::invalid_operation(error.to_string()))
 }
 
+/// The account an execution's pricing selections are admitted under: the
+/// Project owner, else the Agent owner. Admission is never skipped because
+/// both are missing: such an execution is admitted under the instance's first
+/// administrator, the account that claims ownerless resources at bootstrap
+/// (else the earliest account). With no adjustment of its own on the subject,
+/// that account resolves the plain models.dev list price.
+async fn admission_account_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    project_id: &str,
+    agent: &db::Agent,
+) -> Result<Option<String>> {
+    let project_owner: Option<String> = db::execution_admission_project_owner_in_tx(tx, project_id)
+        .await?
+        .flatten();
+    for owner in [project_owner, agent.owner_id.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|owner| !owner.trim().is_empty())
+    {
+        let account = db::execution_admission_account_in_tx(tx, owner).await?;
+        if account.is_some() {
+            return Ok(account);
+        }
+    }
+    Ok(db::execution_admission_default_account_in_tx(tx).await?)
+}
+
 /// Same admission operation with the concrete DB handle required by the
 /// repository trait.
 pub(crate) async fn admit_task_execution_in_tx_with_db(
@@ -419,39 +452,25 @@ pub(crate) async fn admit_task_execution_in_tx_with_db(
 ) -> Result<()> {
     // Keep the implementation single-sourced while avoiding a DB handle in
     // every pure candidate helper.
-    let owner_candidate: Option<String> =
-        sqlx::query_scalar("SELECT COALESCE(owner_id, ?) FROM project WHERE id = ?")
-            .bind(agent.owner_id.as_deref())
-            .bind(&task.project_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let owner_candidate = owner_candidate.filter(|value| !value.trim().is_empty());
-    let owner_user_id = match owner_candidate {
-        Some(owner_user_id) => {
-            sqlx::query_scalar::<_, String>("SELECT id FROM user WHERE id = ?")
-                .bind(owner_user_id)
-                .fetch_optional(&mut **tx)
-                .await?
-        }
-        None => None,
-    };
-    // A legacy Project can have no surviving account principal. Without an
-    // owner there is no valid pricing authority or account scope, so preserve
-    // execution behavior and leave the run visible through the domain-run
-    // denominator instead of minting an ownerless runtime ledger row.
-    let Some(owner_user_id) = owner_user_id else {
+    //
+    // Every runtime ledger row and pricing subject belongs to an account, so
+    // only an instance with no account at all has nothing to admit against.
+    let Some(owner_user_id) = admission_account_in_tx(tx, &task.project_id, agent).await? else {
         return Ok(());
     };
-    if sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pricing_selection WHERE source_id = ? AND domain_kind = 'execution'",
-    )
-    .bind(&execution.id)
-    .fetch_one(&mut **tx)
-    .await?
-        > 0
-    {
+    if db::execution_pricing_selection_count_in_tx(tx, &execution.id).await? > 0 {
         return Ok(());
     }
+    let mut placement_snapshot = snapshot.clone();
+    if let Some(workspace_id) = execution.workspace_id.as_deref() {
+        let placement = db::WorkspacePlacementRepo::get_by_workspace_id_in_tx(db, tx, workspace_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("workspace placement", workspace_id.to_owned())
+            })?;
+        placement_snapshot["placement_id"] = serde_json::json!(placement.id);
+    }
+    let snapshot = &placement_snapshot;
     let admitted_at = db::now_rfc3339();
     for candidate in candidates_from_snapshot(snapshot)? {
         let identity = resolve_price_identity(
@@ -550,13 +569,7 @@ pub(crate) async fn ensure_task_execution_admission(
     };
     let mut tx = db::begin_immediate(db.pool()).await?;
     admit_task_execution_in_tx_with_db(db, &mut tx, task, execution, &agent, snapshot).await?;
-    let admitted = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM pricing_selection WHERE source_id = ? AND domain_kind = 'execution'",
-    )
-    .bind(&execution.id)
-    .fetch_one(&mut *tx)
-    .await?
-        > 0;
+    let admitted = db::execution_pricing_selection_count_in_tx(&mut tx, &execution.id).await? > 0;
     tx.commit().await?;
     Ok(admitted)
 }
@@ -886,36 +899,28 @@ fn parse_reported_nano_usd(value: &str) -> Result<i64> {
 
 fn db_reason_to_service(
     reason: Option<CostCoverageReasonCode>,
-) -> crate::pricing::PriceSelectionReasonCode {
+) -> pricing::PriceSelectionReasonCode {
     match reason.unwrap_or(CostCoverageReasonCode::MissingBinding) {
         CostCoverageReasonCode::MissingProvider => {
-            crate::pricing::PriceSelectionReasonCode::MissingProvider
+            pricing::PriceSelectionReasonCode::MissingProvider
         }
-        CostCoverageReasonCode::MissingModel => {
-            crate::pricing::PriceSelectionReasonCode::MissingModel
-        }
+        CostCoverageReasonCode::MissingModel => pricing::PriceSelectionReasonCode::MissingModel,
         CostCoverageReasonCode::IdentityMismatch => {
-            crate::pricing::PriceSelectionReasonCode::IdentityMismatch
+            pricing::PriceSelectionReasonCode::IdentityMismatch
         }
-        CostCoverageReasonCode::MissingRate => {
-            crate::pricing::PriceSelectionReasonCode::MissingRate
-        }
-        CostCoverageReasonCode::UnresolvedTier => {
-            crate::pricing::PriceSelectionReasonCode::UnresolvedTier
-        }
-        CostCoverageReasonCode::Unmetered => crate::pricing::PriceSelectionReasonCode::Unmetered,
-        _ => crate::pricing::PriceSelectionReasonCode::MissingBinding,
+        CostCoverageReasonCode::MissingRate => pricing::PriceSelectionReasonCode::MissingRate,
+        CostCoverageReasonCode::UnresolvedTier => pricing::PriceSelectionReasonCode::UnresolvedTier,
+        CostCoverageReasonCode::Unmetered => pricing::PriceSelectionReasonCode::Unmetered,
+        _ => pricing::PriceSelectionReasonCode::MissingBinding,
     }
 }
 
-fn persisted_catalog_freshness(
-    selection: &PricingSelection,
-) -> Result<crate::pricing::CatalogFreshness> {
+fn persisted_catalog_freshness(selection: &PricingSelection) -> Result<pricing::CatalogFreshness> {
     match selection.catalog_freshness.as_deref() {
-        Some("fresh") => Ok(crate::pricing::CatalogFreshness::Fresh),
-        Some("stale") => Ok(crate::pricing::CatalogFreshness::Stale),
-        Some("refresh_failed") => Ok(crate::pricing::CatalogFreshness::RefreshFailed),
-        Some("not_applicable") | None => Ok(crate::pricing::CatalogFreshness::NotApplicable),
+        Some("fresh") => Ok(pricing::CatalogFreshness::Fresh),
+        Some("stale") => Ok(pricing::CatalogFreshness::Stale),
+        Some("refresh_failed") => Ok(pricing::CatalogFreshness::RefreshFailed),
+        Some("not_applicable") | None => Ok(pricing::CatalogFreshness::NotApplicable),
         Some(value) => Err(ServiceError::invalid_operation(format!(
             "unknown persisted catalog freshness: {value}"
         ))),
@@ -926,36 +931,34 @@ pub(crate) fn frozen_selection(
     selection: &PricingSelection,
     rate: Option<&db::PricingRateRevision>,
     reason: Option<CostCoverageReasonCode>,
-) -> Result<crate::pricing::FrozenPriceSelection> {
+) -> Result<pricing::FrozenPriceSelection> {
     let rate = (selection.selection_status == PricingSelectionStatus::Priced)
         .then_some(rate)
         .flatten();
     let reason = selection.selection_reason.or(reason);
     let source_kind = selection.source_kind.map(|kind| match kind {
-        PricingRateSourceKind::ModelsDevCatalog => {
-            crate::pricing::PricingSourceKind::ModelsDevCatalog
-        }
-        PricingRateSourceKind::ManualOverride => crate::pricing::PricingSourceKind::ManualOverride,
+        PricingRateSourceKind::ModelsDevCatalog => pricing::PricingSourceKind::ModelsDevCatalog,
+        PricingRateSourceKind::ManualOverride => pricing::PricingSourceKind::ManualOverride,
     });
     let rates = rate.map(|rate| {
-        crate::pricing::EventBucketRates::new(
+        pricing::EventBucketRates::new(
             rate.rates
                 .input
-                .and_then(crate::pricing::NanoUsdPerMillion::from_nano_usd),
+                .and_then(pricing::NanoUsdPerMillion::from_nano_usd),
             rate.rates
                 .output
-                .and_then(crate::pricing::NanoUsdPerMillion::from_nano_usd),
+                .and_then(pricing::NanoUsdPerMillion::from_nano_usd),
             rate.rates
                 .cache_read
-                .and_then(crate::pricing::NanoUsdPerMillion::from_nano_usd),
+                .and_then(pricing::NanoUsdPerMillion::from_nano_usd),
             rate.rates
                 .cache_write
-                .and_then(crate::pricing::NanoUsdPerMillion::from_nano_usd),
+                .and_then(pricing::NanoUsdPerMillion::from_nano_usd),
         )
     });
     let tiers = rate
         .filter(|rate| !rate.tiers_json.trim().is_empty() && rate.tiers_json.trim() != "[]")
-        .map(|rate| crate::pricing::parse_persisted_context_tiers(&rate.tiers_json))
+        .map(|rate| pricing::parse_persisted_context_tiers(&rate.tiers_json))
         .transpose()
         .map_err(|error| {
             ServiceError::invalid_operation(format!("invalid persisted pricing tiers: {error}"))
@@ -963,7 +966,7 @@ pub(crate) fn frozen_selection(
         .unwrap_or_default();
     let legacy_context_over_200k = rate
         .and_then(|rate| rate.legacy_context_over_200k_json.as_deref())
-        .map(crate::pricing::parse_persisted_legacy_context_rate)
+        .map(pricing::parse_persisted_legacy_context_rate)
         .transpose()
         .map_err(|error| {
             ServiceError::invalid_operation(format!(
@@ -971,15 +974,15 @@ pub(crate) fn frozen_selection(
             ))
         })?;
     let status = if selection.selection_status == PricingSelectionStatus::Priced && rate.is_some() {
-        crate::pricing::PriceSelectionStatus::Priced
+        pricing::PriceSelectionStatus::Priced
     } else {
-        crate::pricing::PriceSelectionStatus::Unpriced
+        pricing::PriceSelectionStatus::Unpriced
     };
     let attempt_ordinal = u32::try_from(selection.attempt_ordinal).map_err(|_| {
         ServiceError::invalid_operation("persisted candidate attempt ordinal does not fit in u32")
     })?;
     let catalog_freshness = persisted_catalog_freshness(selection)?;
-    let selection = crate::pricing::freeze_persisted_price_selection(
+    let selection = pricing::freeze_persisted_price_selection(
         selection.subject_id.clone(),
         selection.subject_revision_digest.clone(),
         selection.runtime_model.clone(),
@@ -996,8 +999,7 @@ pub(crate) fn frozen_selection(
         legacy_context_over_200k,
         catalog_freshness,
         status,
-        (status == crate::pricing::PriceSelectionStatus::Unpriced)
-            .then_some(db_reason_to_service(reason)),
+        (status == pricing::PriceSelectionStatus::Unpriced).then_some(db_reason_to_service(reason)),
     );
     selection
         .validate()
@@ -1084,7 +1086,7 @@ async fn usage_event_for_report_with_rate(
     };
     let reported = reported_nano_usd
         .map(|value| {
-            crate::pricing::NanoUsd::from_nano_usd(value)
+            pricing::NanoUsd::from_nano_usd(value)
                 .ok_or_else(|| ServiceError::invalid_operation("reported USD amount overflows"))
         })
         .transpose()?;
@@ -1119,13 +1121,13 @@ async fn usage_event_for_report_with_rate(
     // An unpriced selection carries no rates, so nothing proves an omitted
     // bucket free. It keeps the strict rule and reports the sparse reason.
     let complete_counters = has_counters
-        && if frozen_selection.status == crate::pricing::PriceSelectionStatus::Priced {
+        && if frozen_selection.status == pricing::PriceSelectionStatus::Priced {
             !omits_priced_bucket
         } else {
             reported_buckets.iter().all(|reported| *reported)
         };
     let counters = complete_counters.then(|| {
-        crate::pricing::EventTokenCounts::new(
+        pricing::EventTokenCounts::new(
             report.counters.input_tokens.unwrap_or_default(),
             report.counters.output_tokens.unwrap_or_default(),
             report.counters.cache_read_tokens.unwrap_or_default(),
@@ -1133,11 +1135,11 @@ async fn usage_event_for_report_with_rate(
         )
     });
     let mut estimate = if has_counters && !complete_counters && reported.is_none() {
-        crate::pricing::EventEstimate::Unpriced {
-            reason: crate::pricing::PriceSelectionReasonCode::Unmetered,
+        pricing::EventEstimate::Unpriced {
+            reason: pricing::PriceSelectionReasonCode::Unmetered,
         }
     } else {
-        crate::pricing::estimate_usage_event(crate::pricing::UsageEventEstimateInput {
+        pricing::estimate_usage_event(pricing::UsageEventEstimateInput {
             counters,
             provider_reported_amount: reported,
             selection: frozen_selection,
@@ -1153,15 +1155,15 @@ async fn usage_event_for_report_with_rate(
         // Malformed/unbounded producer identity is itself a contradiction:
         // do not silently fall back to the admitted rate or persist the raw
         // value. Retain token evidence as explicitly unpriced.
-        estimate = crate::pricing::EventEstimate::Unpriced {
-            reason: crate::pricing::PriceSelectionReasonCode::IdentityMismatch,
+        estimate = pricing::EventEstimate::Unpriced {
+            reason: pricing::PriceSelectionReasonCode::IdentityMismatch,
         };
     } else if reported.is_none() {
         let selected_tier = match &estimate {
-            crate::pricing::EventEstimate::Estimated { provenance, .. } => {
+            pricing::EventEstimate::Estimated { provenance, .. } => {
                 provenance.selected_tier.as_deref()
             }
-            crate::pricing::EventEstimate::Partial {
+            pricing::EventEstimate::Partial {
                 provenance: Some(provenance),
                 ..
             } => provenance.selected_tier.as_deref(),
@@ -1171,8 +1173,8 @@ async fn usage_event_for_report_with_rate(
             .as_deref()
             .is_some_and(|reported_tier| selected_tier != Some(reported_tier))
         {
-            estimate = crate::pricing::EventEstimate::Unpriced {
-                reason: crate::pricing::PriceSelectionReasonCode::UnresolvedTier,
+            estimate = pricing::EventEstimate::Unpriced {
+                reason: pricing::PriceSelectionReasonCode::UnresolvedTier,
             };
         }
     }
@@ -1184,7 +1186,7 @@ async fn usage_event_for_report_with_rate(
         formula_revision,
         selected_tier,
     ) = match estimate {
-        crate::pricing::EventEstimate::ProviderReported { amount } => (
+        pricing::EventEstimate::ProviderReported { amount } => (
             Some(amount.as_nano_usd()),
             None,
             db::UsageCostKind::ProviderReported,
@@ -1192,7 +1194,7 @@ async fn usage_event_for_report_with_rate(
             None,
             None,
         ),
-        crate::pricing::EventEstimate::Estimated { amount, provenance } => (
+        pricing::EventEstimate::Estimated { amount, provenance } => (
             None,
             Some(amount.as_nano_usd()),
             db::UsageCostKind::Estimated,
@@ -1200,31 +1202,29 @@ async fn usage_event_for_report_with_rate(
             Some(provenance.formula_revision),
             provenance.selected_tier,
         ),
-        crate::pricing::EventEstimate::Partial {
+        pricing::EventEstimate::Partial {
             reason, provenance, ..
         } => (
             None,
             None,
             db::UsageCostKind::None,
             Some(match reason {
-                crate::pricing::PriceSelectionReasonCode::MissingProvider => {
+                pricing::PriceSelectionReasonCode::MissingProvider => {
                     CostCoverageReasonCode::MissingProvider
                 }
-                crate::pricing::PriceSelectionReasonCode::MissingModel => {
+                pricing::PriceSelectionReasonCode::MissingModel => {
                     CostCoverageReasonCode::MissingModel
                 }
-                crate::pricing::PriceSelectionReasonCode::IdentityMismatch => {
+                pricing::PriceSelectionReasonCode::IdentityMismatch => {
                     CostCoverageReasonCode::IdentityMismatch
                 }
-                crate::pricing::PriceSelectionReasonCode::MissingRate => {
+                pricing::PriceSelectionReasonCode::MissingRate => {
                     CostCoverageReasonCode::MissingRate
                 }
-                crate::pricing::PriceSelectionReasonCode::UnresolvedTier => {
+                pricing::PriceSelectionReasonCode::UnresolvedTier => {
                     CostCoverageReasonCode::UnresolvedTier
                 }
-                crate::pricing::PriceSelectionReasonCode::Unmetered => {
-                    CostCoverageReasonCode::Unmetered
-                }
+                pricing::PriceSelectionReasonCode::Unmetered => CostCoverageReasonCode::Unmetered,
                 _ => CostCoverageReasonCode::MissingBinding,
             }),
             provenance
@@ -1232,29 +1232,27 @@ async fn usage_event_for_report_with_rate(
                 .map(|value| value.formula_revision.clone()),
             provenance.and_then(|value| value.selected_tier),
         ),
-        crate::pricing::EventEstimate::Unpriced { reason } => (
+        pricing::EventEstimate::Unpriced { reason } => (
             None,
             None,
             db::UsageCostKind::None,
             Some(match reason {
-                crate::pricing::PriceSelectionReasonCode::MissingProvider => {
+                pricing::PriceSelectionReasonCode::MissingProvider => {
                     CostCoverageReasonCode::MissingProvider
                 }
-                crate::pricing::PriceSelectionReasonCode::MissingModel => {
+                pricing::PriceSelectionReasonCode::MissingModel => {
                     CostCoverageReasonCode::MissingModel
                 }
-                crate::pricing::PriceSelectionReasonCode::IdentityMismatch => {
+                pricing::PriceSelectionReasonCode::IdentityMismatch => {
                     CostCoverageReasonCode::IdentityMismatch
                 }
-                crate::pricing::PriceSelectionReasonCode::MissingRate => {
+                pricing::PriceSelectionReasonCode::MissingRate => {
                     CostCoverageReasonCode::MissingRate
                 }
-                crate::pricing::PriceSelectionReasonCode::UnresolvedTier => {
+                pricing::PriceSelectionReasonCode::UnresolvedTier => {
                     CostCoverageReasonCode::UnresolvedTier
                 }
-                crate::pricing::PriceSelectionReasonCode::Unmetered => {
-                    CostCoverageReasonCode::Unmetered
-                }
+                pricing::PriceSelectionReasonCode::Unmetered => CostCoverageReasonCode::Unmetered,
                 _ => CostCoverageReasonCode::MissingBinding,
             }),
             None,
@@ -1782,6 +1780,7 @@ pub(crate) fn terminal_with_ledger(
     terminal_report_digest: Option<String>,
 ) -> TerminalizeExecutionWithLedger {
     TerminalizeExecutionWithLedger {
+        plan: None,
         terminal,
         settlements,
         terminal_report_id,
@@ -2254,17 +2253,264 @@ mod tests {
         .is_none());
     }
 
+    /// A Project and Agent without an owner are an anomaly, not a reason to
+    /// skip admission: the execution is still admitted, priced from the plain
+    /// models.dev catalogue row, and its usage report settles.
+    #[tokio::test]
+    async fn ownerless_execution_is_admitted_at_the_catalogue_price_and_settles() {
+        use pricing::PricingCatalogRepository as _;
+
+        let db = Arc::new(test_db().await);
+        let now = db::now_rfc3339();
+        // The first registered account is the instance administrator.
+        db::UserRepo::create_user(
+            &*db,
+            &db::User {
+                id: "instance-admin".to_owned(),
+                email: "admin@example.test".to_owned(),
+                password_hash: "test".to_owned(),
+                display_name: None,
+                is_admin: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("account creates");
+        let when = std::time::SystemTime::now();
+        let snapshot = pricing::parse_models_dev_catalog(
+            br#"{"openai": {"id":"openai","name":"OpenAI","models":{
+                "gpt-ownerless":{"id":"gpt-ownerless","last_updated":"2026-09-01",
+                  "cost":{"input":1,"output":2}}}}}"#,
+        )
+        .expect("catalogue parses")
+        .into_snapshot("ownerless-snapshot", None, when, when)
+        .expect("snapshot materializes");
+        pricing::sqlite::SqlitePricingRepository::new(Arc::clone(&db))
+            .activate_catalog_snapshot(snapshot, "ownerless-refresh")
+            .await
+            .expect("catalogue activates");
+
+        let project = db::ProjectRepo::create(
+            &*db,
+            db::CreateProject {
+                id: db::new_uuid_v4(),
+                name: "Ownerless".to_owned(),
+                settings: "{}".to_owned(),
+                workflow_definition: "{}".to_owned(),
+                primary_repo_id: None,
+                owner_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("ownerless project creates");
+        let agent = db::AgentRepo::create(
+            &*db,
+            db::CreateAgent {
+                id: db::new_uuid_v4(),
+                name: "Ownerless worker".to_owned(),
+                description: None,
+                executor_type: "codex".to_owned(),
+                model: Some("gpt-ownerless".to_owned()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("ownerless agent creates");
+        let task = db::TaskRepo::create(
+            &*db,
+            db::CreateTask {
+                id: db::new_uuid_v4(),
+                project_id: project.id.clone(),
+                parent_task_id: None,
+                subtask_order: None,
+                assignee_type: None,
+                assignee_id: None,
+                title: "Ownerless work".to_owned(),
+                description: None,
+                task_type: "task".to_owned(),
+                status: "in_progress".to_owned(),
+                is_automation: false,
+                priority: 0,
+                task_state_config: None,
+                merge_config: None,
+                plan: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("task creates");
+        let snapshot = serde_json::json!({
+            "executor_type": "codex",
+            "config": {"model": "gpt-ownerless"},
+            "daemon_id": "ownerless-daemon",
+        });
+        let execution = db::ExecutionRepo::create(
+            &*db,
+            db::CreateExecution {
+                id: db::new_uuid_v4(),
+                task_id: task.id.clone(),
+                agent_id: Some(agent.id.clone()),
+                role: "coder".to_owned(),
+                status: db::ExecutionStatus::Running,
+                stop_reason: None,
+                stopped_by: None,
+                resume_policy: None,
+                stopped_at: None,
+                parent_execution_id: None,
+                agent_session_id: None,
+                agent_message_id: None,
+                last_activity_at: None,
+                summary: None,
+                logs_path: None,
+                before_sha: None,
+                after_sha: None,
+                error: None,
+                executor_config_snapshot_json: Some(snapshot.to_string()),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .expect("execution creates");
+
+        assert!(
+            ensure_task_execution_admission(&db, &task, &execution, &snapshot)
+                .await
+                .expect("ownerless admission succeeds")
+        );
+        let selections =
+            db::UsageLedgerRepo::list_pricing_selections_for_source(&*db, &execution.id)
+                .await
+                .expect("selections load");
+        assert_eq!(selections.len(), 1);
+        let selection = &selections[0];
+        assert_eq!(selection.owner_user_id.as_deref(), Some("instance-admin"));
+        assert_eq!(selection.selection_status, PricingSelectionStatus::Priced);
+        assert_eq!(
+            selection.source_kind,
+            Some(PricingRateSourceKind::ModelsDevCatalog)
+        );
+        assert_eq!(
+            selection.catalog_snapshot_id.as_deref(),
+            Some("ownerless-snapshot")
+        );
+        let rate: (Option<String>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT catalog_provider_id, owner_user_id, input_nano_usd_per_million,
+                    output_nano_usd_per_million
+             FROM pricing_rate_revision WHERE id = ?",
+        )
+        .bind(selection.rate_revision_id.as_deref().expect("frozen rate"))
+        .fetch_one(db.pool())
+        .await
+        .expect("rate loads");
+        // The global catalogue row, not an account's manual rate.
+        assert_eq!(
+            rate,
+            (
+                Some("openai".to_owned()),
+                None,
+                Some(1_000_000_000),
+                Some(2_000_000_000)
+            )
+        );
+
+        // The owner's terminal usage report finds its admitted candidate.
+        let mut report = UsageReport::metered(
+            "ownerless-report",
+            executors::UsageCounters {
+                input_tokens: Some(1_000_000),
+                output_tokens: Some(1_000_000),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        );
+        report.candidate_key = selection.candidate_key.clone();
+        let reports = [report];
+        let mut tx = db::begin_immediate(db.pool()).await.expect("transaction");
+        let prepared = ensure_remote_task_usage_invocations_in_tx(
+            &db,
+            &mut tx,
+            &execution,
+            &reports,
+            Some(&snapshot),
+            &now,
+        )
+        .await
+        .expect("the report matches the admitted selection");
+        assert_eq!(prepared.len(), 1);
+        for input in prepared {
+            let invocation =
+                db::UsageLedgerRepo::create_usage_invocation_in_tx(&*db, &mut tx, input)
+                    .await
+                    .expect("invocation creates");
+            db::UsageLedgerRepo::start_usage_invocation_in_tx(
+                &*db,
+                &mut tx,
+                db::StartUsageInvocation {
+                    id: invocation.id,
+                    expected_version: invocation.version,
+                    started_at: now.clone(),
+                    updated_at: now.clone(),
+                },
+            )
+            .await
+            .expect("invocation starts");
+        }
+        tx.commit().await.expect("invocation commits");
+        settle_late_task_usage(&db, &execution.id, &reports, &now)
+            .await
+            .expect("usage settles");
+
+        let invocations =
+            db::UsageLedgerRepo::list_usage_invocations_for_source(&*db, &execution.id)
+                .await
+                .expect("invocations load");
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].lifecycle, UsageInvocationLifecycle::Settled);
+        let events =
+            db::UsageLedgerRepo::list_usage_events_for_invocation(&*db, &invocations[0].id)
+                .await
+                .expect("events load");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].owner_user_id.as_deref(), Some("instance-admin"));
+        assert_eq!(events[0].cost_kind, db::UsageCostKind::Estimated);
+        // One million tokens each at 1 and 2 USD per million.
+        assert_eq!(events[0].estimated_nano_usd, Some(3_000_000_000));
+    }
+
     #[test]
     fn admission_reason_survives_frozen_selection_reconstruction() {
         let selection = selection(Some(CostCoverageReasonCode::IdentityMismatch));
         let frozen = frozen_selection(&selection, None, None).expect("selection freezes");
         assert_eq!(
             frozen.reason,
-            Some(crate::pricing::PriceSelectionReasonCode::IdentityMismatch)
+            Some(pricing::PriceSelectionReasonCode::IdentityMismatch)
         );
         assert_eq!(
             frozen.catalog_freshness,
-            crate::pricing::CatalogFreshness::NotApplicable
+            pricing::CatalogFreshness::NotApplicable
         );
     }
 

@@ -107,7 +107,7 @@ describe('ReviewConformancePanel', () => {
     expect(screen.queryByText(/This review covered/)).not.toBeTruthy()
   })
 
-  it('shows the exact Charter and commit with the reviewer\'s Markdown review', () => {
+  it("shows the exact Charter and commit with the reviewer's Markdown review", () => {
     const result: ReviewConformance = {
       status: 'passed',
       reason: null,
@@ -146,6 +146,8 @@ describe('ReviewConformancePanel', () => {
         },
       },
       assessment: {
+        fixable_by: 'coder',
+        repeat: false,
         result: 'pass',
         reason: 'The CLI and library compile',
         report: 'The crate is implemented in `src/lib.rs:1-3`.',
@@ -158,4 +160,61 @@ describe('ReviewConformancePanel', () => {
     expect(screen.getByText('charter-r1')).toBeTruthy()
     expect(screen.getByText(/src\/lib.rs:1-3/)).toBeTruthy()
   })
+})
+
+it('shows per-attempt findings, resolved ids and the full report without a contract', () => {
+  const result: ReviewConformance = {
+    status: 'failed',
+    reason: 'Empty input crashes',
+    checks: [],
+    contract: null,
+    assessment: {
+      result: 'fail',
+      reason: 'Empty input crashes',
+      report: 'Detailed reviewer report',
+      findings: [
+        {
+          id: 'F2',
+          summary: 'Handle empty input',
+          severity: 'blocking',
+          where: 'parse.ts:42',
+          expected: 'An error',
+          observed: 'A panic',
+        },
+      ],
+      resolved: ['F1'],
+    },
+  }
+  render(<ReviewConformancePanel conformance={result} />)
+  expect(screen.getByText(/Handle empty input/)).toBeTruthy()
+  expect(screen.getByText('Resolved in this attempt: F1')).toBeTruthy()
+  expect(screen.getByText('Detailed reviewer report')).toBeTruthy()
+  expect(screen.queryByRole('region', { name: 'Verify results' })).toBeNull()
+})
+
+it('renders recorded verify checks and a skipped reason only when supplied', () => {
+  const { rerender } = render(
+    <ReviewConformancePanel
+      verify={{
+        status: 'fail',
+        checks: [
+          {
+            name: 'smoke',
+            result: 'fail',
+            summary: 'Button does nothing',
+            evidence: ['screenshot-1', 'screenshot-1'],
+          },
+        ],
+      }}
+    />,
+  )
+  expect(screen.getByText('Verify: fail')).toBeTruthy()
+  expect(screen.getByText(/smoke · fail — Button does nothing/)).toBeTruthy()
+  expect(screen.getByText('1 evidence')).toBeTruthy()
+  rerender(
+    <ReviewConformancePanel verify={{ status: 'not_run', reason: 'placement_unsupported' }} />,
+  )
+  expect(screen.getByText('placement_unsupported')).toBeTruthy()
+  rerender(<ReviewConformancePanel />)
+  expect(screen.queryByRole('region', { name: 'Verify results' })).toBeNull()
 })

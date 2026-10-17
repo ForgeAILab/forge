@@ -75,6 +75,9 @@ impl AgentActionRepo for SqliteDb {
         if let Some(status) = &query.status {
             builder.push(" AND status = ").push_bind(status.to_string());
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_action", user_id);
+        }
         builder
             .push(" ORDER BY created_at DESC, id DESC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));
@@ -396,4 +399,151 @@ fn map_agent_action_execution(row: SqliteRow) -> Result<AgentActionExecution> {
         created_at: row.try_get("created_at")?,
         completed_at: row.try_get("completed_at")?,
     })
+}
+
+impl SqliteDb {
+    pub async fn attention_coordination_table_count(&self, table: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionApprovalCoordinationActionsRow {
+    pub id: crate::Result<String>,
+    pub actor_identity_id: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+    pub operation: crate::Result<String>,
+    pub payload_hash: crate::Result<String>,
+    pub policy_result: crate::Result<String>,
+    pub status: crate::Result<String>,
+    pub correlation_id: crate::Result<String>,
+    pub outcome_json: crate::Result<Option<String>>,
+    pub updated_at: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_approval_coordination_actions(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<AttentionApprovalCoordinationActionsRow>> {
+        let (action_predicate, action_values) =
+            Self::attention_coordination_scope_visibility_predicate(user_id, project_id, "a");
+        let action_sql = format!(
+            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id, a.operation,
+                    a.payload_hash, a.policy_result, a.status, a.correlation_id,
+                    a.outcome_json, a.updated_at
+             FROM agent_action a
+             WHERE a.policy_result = 'approval_required'
+               AND a.status IN ('pending_approval', 'approved')
+               AND {action_predicate}
+             ORDER BY a.updated_at DESC, a.id DESC
+             LIMIT ?"
+        );
+        let mut action_query = sqlx::query(&action_sql);
+        for value in &action_values {
+            action_query = action_query.bind(value);
+        }
+        let action_rows = action_query.bind(limit).fetch_all(self.pool()).await?;
+        Ok(action_rows
+            .into_iter()
+            .map(|row| AttentionApprovalCoordinationActionsRow {
+                id: row.try_get("id").map_err(crate::DbError::from),
+                actor_identity_id: row
+                    .try_get("actor_identity_id")
+                    .map_err(crate::DbError::from),
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+                operation: row.try_get("operation").map_err(crate::DbError::from),
+                payload_hash: row.try_get("payload_hash").map_err(crate::DbError::from),
+                policy_result: row.try_get("policy_result").map_err(crate::DbError::from),
+                status: row.try_get("status").map_err(crate::DbError::from),
+                correlation_id: row.try_get("correlation_id").map_err(crate::DbError::from),
+                outcome_json: row.try_get("outcome_json").map_err(crate::DbError::from),
+                updated_at: row.try_get("updated_at").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct AttentionCoordinationScopesRow {
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn attention_coordination_scopes(
+        &self,
+        table: &str,
+        identity_column: &str,
+        statuses: &[&str],
+        identity_id: &str,
+    ) -> crate::Result<Vec<AttentionCoordinationScopesRow>> {
+        let placeholders = vec!["?"; statuses.len()].join(", ");
+        let sql = format!(
+            "SELECT scope_type, scope_id FROM {table}
+             WHERE {identity_column} = ? AND status IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql).bind(identity_id);
+        for status in statuses {
+            query = query.bind(status);
+        }
+        let rows = query.fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| AttentionCoordinationScopesRow {
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
+}
+
+pub struct TaskOutcomeActionOriginSourceRow {
+    pub result_json: crate::Result<String>,
+    pub id: crate::Result<String>,
+    pub actor_identity_id: crate::Result<String>,
+    pub scope_type: crate::Result<String>,
+    pub scope_id: crate::Result<String>,
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_action_origin_sources(
+        &self,
+    ) -> crate::Result<Vec<TaskOutcomeActionOriginSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.actor_identity_id, a.scope_type, a.scope_id,
+                    e.result_json
+             FROM agent_action AS a
+             JOIN agent_action_execution AS e ON e.action_id = a.id
+             WHERE a.operation = 'task.propose'
+               AND e.status = 'succeeded'
+               AND e.result_json IS NOT NULL
+             ORDER BY a.id ASC, e.created_at ASC",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TaskOutcomeActionOriginSourceRow {
+                result_json: row.try_get("result_json").map_err(crate::DbError::from),
+                id: row.try_get("id").map_err(crate::DbError::from),
+                actor_identity_id: row
+                    .try_get("actor_identity_id")
+                    .map_err(crate::DbError::from),
+                scope_type: row.try_get("scope_type").map_err(crate::DbError::from),
+                scope_id: row.try_get("scope_id").map_err(crate::DbError::from),
+            })
+            .collect())
+    }
 }

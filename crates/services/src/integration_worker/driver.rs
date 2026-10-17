@@ -1,0 +1,2216 @@
+//! Per-queue head driver. One `pass` performs the action of the head's row
+//! in the table and at most one state transition chain; every await point is
+//! followed by a re-read, so a pass can stop anywhere and the next claim
+//! continues from the stored rows.
+use super::{
+    is_conflict, later, parse_time, stamp, CrashPoint, GateCause, HeadAction, HeadFacts,
+    HeadTimeout, IntegrationQueueWorker, IntegrationStepAck, IntegrationStepAction,
+    IntegrationStepOutcome, IntegrationStepState, ObjectTransferDirection, ObjectTransferEndpoint,
+    ObjectTransferOutcome, ObjectTransferRelease, ObjectTransferRequest, OwnerFastForwardRequest,
+    OwnerRebaseRequest, TaskGate,
+};
+use crate::{
+    integration_effects::EffectOwner,
+    integration_owner::{OwnerEffectRefusal, OwnerMergeReceipt, OwnerRebaseReceipt},
+    MergeOutcome, Result, ServiceError,
+};
+use api_types::WorkspaceOwnerOperationOutcome;
+use chrono::{DateTime, Utc};
+use db::{
+    IntegrationActivationRepo, IntegrationAttempt, IntegrationAttemptState as S,
+    IntegrationCheckTiming, IntegrationCiSkipReason, IntegrationEffectReceipt,
+    IntegrationEffectRequest, IntegrationFailureKind, IntegrationLostRace, IntegrationLostRaceKind,
+    IntegrationOperationKind, IntegrationOperationState, IntegrationOwnerFence,
+    IntegrationPhaseTimings, IntegrationQueue, IntegrationQueueState,
+};
+use serde_json::json;
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// A row changed; run the next pass at once.
+    Progress,
+    /// Nothing to do before this delay (or a wake).
+    Wait(Duration),
+    /// The head left the slot (terminal, ejected, parked, ...).
+    Released,
+    /// The lease is not this driver's any more, or it stopped on request.
+    Lost,
+}
+
+/// Why the worker parked an attempt. `code` leads `failure_message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkReason {
+    Infrastructure,
+    Timeout,
+    /// The Task's owner, Project or Agent stopped it (`TaskGate::Gated`).
+    Gate(GateCause),
+    TargetNotReady,
+    /// The machine that owns the Task's checkout is not connected, or its
+    /// placement is not `ready` again yet. No retry is counted: the wait ends
+    /// when the owner is back (`TaskService::integration_owner_ready` makes
+    /// the attempt due at once), and the sweep asks again meanwhile.
+    OwnerOffline,
+    TargetDirty,
+    WorktreeDirty,
+    UnsupportedConflict,
+    TransferTooLarge,
+    ExternalMovesExhausted,
+    RoundsExhausted,
+    /// A deciding Task step settled without answering, again after re-asks.
+    StepFailed,
+    /// The `result` step's proof failed: the owner of the target says the
+    /// target does not contain the commit this attempt recorded as merged
+    /// (the target was rewound after the fast-forward). The attempt is
+    /// validated again from the target as it is, on the counted retry timer.
+    NotLanded,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Retry {
+    /// Counted against `infra_retry`; then the owner decides.
+    Counted,
+    /// Re-queued by the next sweep interval, uncounted.
+    Soon,
+    /// No automatic retry.
+    Owner,
+}
+impl ParkReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Infrastructure => "infrastructure",
+            Self::Timeout => "timeout",
+            Self::Gate(cause) => cause.code(),
+            Self::TargetNotReady => "target_not_ready",
+            Self::OwnerOffline => "owner_offline",
+            Self::TargetDirty => "target_dirty",
+            Self::WorktreeDirty => "worktree_dirty",
+            Self::UnsupportedConflict => "unsupported_conflict",
+            Self::TransferTooLarge => "transfer_too_large",
+            Self::ExternalMovesExhausted => "external_target_moves_exhausted",
+            Self::RoundsExhausted => "rounds_exhausted",
+            Self::StepFailed => "task_step_failed",
+            Self::NotLanded => "target_missing_commit",
+        }
+    }
+    fn kind(self) -> IntegrationFailureKind {
+        match self {
+            Self::Infrastructure | Self::StepFailed => IntegrationFailureKind::Infrastructure,
+            Self::Timeout => IntegrationFailureKind::Timeout,
+            Self::NotLanded => IntegrationFailureKind::NeedsFact,
+            Self::TargetNotReady | Self::OwnerOffline => IntegrationFailureKind::TargetUnavailable,
+            _ => IntegrationFailureKind::OwnerRequired,
+        }
+    }
+    fn retry(self) -> Retry {
+        match self {
+            Self::Infrastructure | Self::Timeout | Self::StepFailed | Self::NotLanded => {
+                Retry::Counted
+            }
+            Self::Gate(_) | Self::TargetNotReady | Self::OwnerOffline => Retry::Soon,
+            _ => Retry::Owner,
+        }
+    }
+    /// A failure to reach an owner machine is a wait for that machine, not
+    /// an infrastructure failure of the merge: it spends no counted retry.
+    fn unreached(error: &ServiceError) -> Self {
+        match error {
+            ServiceError::DaemonUnavailable { .. }
+            | ServiceError::DaemonTimeout { .. }
+            | ServiceError::DaemonNotReady { .. }
+            | ServiceError::DaemonUpgradeRequired { .. } => Self::OwnerOffline,
+            _ => Self::Infrastructure,
+        }
+    }
+}
+
+fn bounded(text: &str) -> String {
+    let mut end = text.len().min(2048);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+fn millis(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    (to - from).num_milliseconds().max(0)
+}
+fn add(slot: &mut Option<i64>, value: i64) {
+    *slot = Some(slot.unwrap_or(0).saturating_add(value));
+}
+/// The owner a queue's target (or a fence's `target_owner`) names.
+fn target_owner(owner: Option<&serde_json::Value>) -> Option<EffectOwner> {
+    let owner = owner?;
+    match (
+        owner["owner_kind"].as_str()?,
+        owner["daemon_id"].as_str(),
+        owner["runtime_id"].as_str(),
+    ) {
+        ("server", _, _) => Some(EffectOwner::Server),
+        ("daemon", Some(daemon_id), Some(runtime_id)) => Some(EffectOwner::Daemon {
+            daemon_id: daemon_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+        }),
+        _ => None,
+    }
+}
+/// The owner that performs the effect of a stored intent (the Task's owner
+/// for a rebase off the target's owner, else the target's owner).
+fn intent_owner(intent: &serde_json::Value) -> &serde_json::Value {
+    let request = &intent["request"];
+    request["witness"]
+        .get("effect_owner")
+        .filter(|owner| owner.is_object())
+        .unwrap_or(&request["fence"]["target_owner"])
+}
+/// The Git witness that the head's candidate has landed: the target contains
+/// the commit the Task's checkout stands on, and that commit is the one the
+/// attempt names. A checkout that stands anywhere else in the target's
+/// history (HEAD on the target tip while another writer rebases it, a
+/// checkout reset to the target) proves nothing about the reviewed commit,
+/// and a stopped rebase's HEAD is not a candidate at all. Only an attempt
+/// that names no commit (an imported row) is read from HEAD alone.
+fn landed(a: &IntegrationAttempt, facts: &HeadFacts) -> bool {
+    facts.candidate_in_target
+        && !facts.rebase_in_progress
+        && a.candidate_sha
+            .as_deref()
+            .or(a.original_candidate_sha.as_deref())
+            .is_none_or(|sha| sha == facts.candidate_head)
+}
+
+/// The Task's checkout is off the commit the attempt names because this
+/// attempt's own rebase moved it: its last rebase succeeded from exactly that
+/// commit, without a conflict, and was never applied. Applying a rebase
+/// records the rebased commit as the candidate; a head that left the slot
+/// between the receipt and that write (it waited for its placement until the
+/// step wait ran out and parked `owner_offline`, or its session ended there)
+/// still names the commit it was admitted with. Its next round validates
+/// first, and must not read that as a candidate somebody changed: nobody
+/// did, and the Task would go back to review for a commit the queue made.
+/// The rebased commit is checked before it merges, like any rebase.
+///
+/// While the target has not moved since that rebase, the checkout must also
+/// stand on it; one that does not was changed after the rebase.
+fn rebased_and_not_applied(
+    a: &IntegrationAttempt,
+    admitted: Option<&str>,
+    facts: &HeadFacts,
+) -> bool {
+    receipts(a)
+        .into_iter()
+        .rev()
+        .find(|receipt| receipt.request.kind == IntegrationOperationKind::Rebase)
+        .is_some_and(|receipt| {
+            receipt.operation_state == IntegrationOperationState::Succeeded
+                && receipt.request.witness["expected_head_sha"].as_str() == admitted
+                && (receipt.request.witness["expected_target_sha"].as_str()
+                    != Some(&facts.target_tip)
+                    || facts.target_in_candidate)
+                && matches!(
+                    serde_json::from_value::<OwnerRebaseReceipt>(receipt.result),
+                    Ok(OwnerRebaseReceipt::Completed {
+                        outcome: WorkspaceOwnerOperationOutcome::Rebased
+                    })
+                )
+        })
+}
+
+fn receipts(attempt: &IntegrationAttempt) -> Vec<IntegrationEffectReceipt> {
+    serde_json::from_value(attempt.effect_receipts_json.clone()).unwrap_or_default()
+}
+
+pub struct HeadDriver {
+    w: Arc<IntegrationQueueWorker>,
+    queue_id: String,
+    generation: i64,
+    /// Steps this session enqueued, by `(effect_seq, action)`. A new session
+    /// (a new claim) asks again under a new `effect_seq`.
+    enqueued: HashSet<(i64, IntegrationStepAction)>,
+    /// When this session first saw the head in its present state.
+    since: Option<(S, DateTime<Utc>)>,
+    result_checked: Option<DateTime<Utc>>,
+    /// The ends of an object transfer this session made for the head.
+    transferred: Option<ObjectTransferRelease>,
+    /// The head this session last drove. When it leaves the slot its
+    /// transfer refs are released, whichever session bound them.
+    head_seen: Option<String>,
+    /// The claim generation whose inbound transfer this session made.
+    inbound_generation: Option<i64>,
+    /// Permits this session could not use (they did not bind the head).
+    refused_permits: u32,
+    /// Deciding steps this session asked again because they settled without
+    /// answering.
+    reasked: u32,
+    /// When this session last asked for the head's check.
+    check_asked: Option<DateTime<Utc>>,
+    /// While the head's result is unknown: when the owner is asked next, and
+    /// the owner connection the last ask saw (`None`: not connected).
+    reconcile_at: Option<DateTime<Utc>>,
+    owner_link: Option<u64>,
+    /// Location verifications this session requested after the owner refused
+    /// the claim's target.
+    verifications: u32,
+    /// Test instrumentation: this session holds the head Task's merge.
+    holding: Option<(String, super::holders::MergeHold)>,
+    stop: CancellationToken,
+}
+
+impl HeadDriver {
+    pub(crate) fn new(w: Arc<IntegrationQueueWorker>, claimed: &IntegrationQueue) -> Self {
+        Self {
+            w,
+            queue_id: claimed.id.clone(),
+            generation: claimed.fence_generation,
+            enqueued: HashSet::new(),
+            since: None,
+            result_checked: None,
+            transferred: None,
+            head_seen: None,
+            inbound_generation: None,
+            refused_permits: 0,
+            reasked: 0,
+            check_asked: None,
+            reconcile_at: None,
+            owner_link: None,
+            verifications: 0,
+            holding: None,
+            stop: CancellationToken::new(),
+        }
+    }
+    pub fn queue_id(&self) -> &str {
+        &self.queue_id
+    }
+    pub fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    /// Drive the head until it leaves the slot, the lease is lost or `stop`
+    /// fires. Repeated errors end the session; the lease then expires and
+    /// the next claim takes over, so the backoff is bounded by the lease.
+    pub async fn run(mut self, stop: CancellationToken) {
+        self.stop = stop.clone();
+        let mut errors = 0u32;
+        loop {
+            if stop.is_cancelled() {
+                break;
+            }
+            let wait = match self.pass().await {
+                Ok(Pass::Progress) => {
+                    errors = 0;
+                    continue;
+                }
+                Ok(Pass::Wait(wait)) => {
+                    errors = 0;
+                    wait
+                }
+                Ok(Pass::Released | Pass::Lost) => break,
+                Err(error) => {
+                    errors += 1;
+                    tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %error, "integration head pass failed");
+                    if errors > 5 {
+                        break;
+                    }
+                    self.w.config.conflict_backoff * errors
+                }
+            };
+            tokio::select! {
+                _ = stop.cancelled() => break,
+                _ = self.w.answered() => {}
+                _ = self.w.clock.sleep(wait) => {}
+            }
+        }
+        self.w.release_active(&self.queue_id);
+    }
+
+    /// One pass. A version conflict is not an error: another writer (a Task
+    /// step's acknowledgment, a cancel request) got in; the next pass re-reads.
+    pub async fn pass(&mut self) -> Result<Pass> {
+        match self.step().await {
+            Err(error) if is_conflict(&error) => Ok(Pass::Wait(self.w.config.conflict_backoff)),
+            Ok(pass @ (Pass::Released | Pass::Lost)) => {
+                self.holding = None;
+                if pass == Pass::Released {
+                    // The slot is free: an admission of the same Task's next
+                    // entry that waits for it looks now.
+                    self.w.notify_released();
+                    // A session that took the head over (a restart, a lost
+                    // lease) made no transfer itself, but the head it
+                    // releases may have refs from the session before it.
+                    let release = match self.transferred.take() {
+                        Some(release) => Some(release),
+                        None => self.recorded_release().await,
+                    };
+                    if let Some(release) = release {
+                        // Best effort: a leftover ref holds objects only; the
+                        // transfer owner also sweeps ended attempts at start.
+                        if let Err(error) = self.w.transfer.release(release).await {
+                            tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %error, "integration transfer refs were not released");
+                        }
+                    }
+                }
+                self.w.release_active(&self.queue_id);
+                Ok(pass)
+            }
+            other => other,
+        }
+    }
+
+    /// The two ends an attempt's transfers were made between, from its own
+    /// durable owner fields: the Task's repo location and the queue's
+    /// target. `None` when the Task is placed in the default checkout (no
+    /// transfer was ever needed) or the rows no longer say.
+    async fn recorded_release(&self) -> Option<ObjectTransferRelease> {
+        let a = self.w.attempt(self.head_seen.as_deref()?).await.ok()?;
+        let queue = self.w.queue(&self.queue_id).await.ok()?;
+        let task_location = a.repo_location_id.clone()?;
+        let target_location = queue.target_location_id.clone()?;
+        if task_location == target_location {
+            return None;
+        }
+        let owner = match a.owner_kind? {
+            db::IntegrationOwnerKind::Server => EffectOwner::Server,
+            db::IntegrationOwnerKind::Daemon => EffectOwner::Daemon {
+                daemon_id: a.daemon_id.clone()?,
+                runtime_id: a.runtime_id.clone()?,
+            },
+        };
+        Some(ObjectTransferRelease {
+            attempt_id: a.id,
+            task: ObjectTransferEndpoint {
+                repo_location_id: task_location,
+                owner,
+            },
+            target: ObjectTransferEndpoint {
+                repo_location_id: target_location,
+                owner: target_owner(queue.target_owner_json.as_ref())?,
+            },
+        })
+    }
+
+    async fn step(&mut self) -> Result<Pass> {
+        let w = Arc::clone(&self.w);
+        if !w.renew_if_due(&self.queue_id, self.generation).await? {
+            return Ok(Pass::Lost);
+        }
+        let queue = w.queue(&self.queue_id).await?;
+        let Some(head) = queue.head_attempt_id.clone() else {
+            return Ok(Pass::Released);
+        };
+        self.head_seen = Some(head.clone());
+        let a = w.attempt(&head).await?;
+        if self
+            .holding
+            .as_ref()
+            .is_none_or(|(task, _)| *task != a.task_ref)
+        {
+            self.holding = None;
+            self.holding = Some((
+                a.task_ref.clone(),
+                super::holders::hold(
+                    &w.db,
+                    &a.task_ref,
+                    super::holders::MergeHolder::WorkerDriver,
+                ),
+            ));
+        }
+        let now = w.clock.now();
+        if self.since.map(|(state, _)| state) != Some(a.state) {
+            self.since = Some((a.state, now));
+        }
+        match super::head_row(a.state).action {
+            HeadAction::Start => self.start(a).await,
+            HeadAction::Validate => self.validate(a, &queue).await,
+            HeadAction::Rebase => self.rebase(a, &queue).await,
+            HeadAction::AwaitCheck => self.await_check(a).await,
+            HeadAction::AwaitPermit => self.await_permit(a).await,
+            HeadAction::CommitFastForward => self.commit_fast_forward(a, &queue).await,
+            HeadAction::FastForward => self.fast_forward(a, &queue).await,
+            HeadAction::Reconcile => self.reconcile(a, &queue).await,
+            HeadAction::AwaitResult => self.await_result(a, &queue).await,
+            HeadAction::Requeue => {
+                if let Some(wait) = self.unknown_result_wait(&a) {
+                    return Ok(Pass::Wait(wait));
+                }
+                w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
+            }
+            // A released or terminal attempt cannot hold the slot.
+            HeadAction::Released | HeadAction::Terminal => Ok(Pass::Lost),
+        }
+    }
+
+    /// A head whose result is unknown keeps its slot and its lease (this
+    /// session stays, so every pass renews). The owner is asked again every
+    /// `reconcile_interval`, and at once when its receipt has arrived (the
+    /// reconnect lookup recorded it) or the owner is on a new connection.
+    /// `None`: ask now.
+    fn unknown_result_wait(&mut self, a: &IntegrationAttempt) -> Option<Duration> {
+        let at = self.reconcile_at?;
+        // An imported unknown result has no intent and so no owner link to
+        // watch: it is asked again on the timer alone.
+        if let Some(intent) = a.effect_intent_json.as_ref() {
+            let link = self.w.owner.owner_connection(intent_owner(intent));
+            if link.is_some() && link != self.owner_link {
+                return None;
+            }
+            self.owner_link = link;
+        } else if !matches!(
+            a.current_operation_state,
+            Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+        ) {
+            return None;
+        }
+        let now = self.w.clock.now();
+        (now < at).then(|| {
+            (at - now)
+                .to_std()
+                .unwrap_or_default()
+                .min(self.w.config.poll)
+                .max(Duration::from_millis(1))
+        })
+    }
+
+    fn timed_out(&self, timeout: HeadTimeout) -> bool {
+        let limit = match timeout {
+            HeadTimeout::None => return false,
+            HeadTimeout::Validate => self.w.config.validate_timeout,
+            HeadTimeout::Rebase => self.w.config.rebase_deadline,
+            HeadTimeout::Check => self.w.config.check_wait,
+            HeadTimeout::Step => self.w.config.step_wait,
+            HeadTimeout::Permit => self.w.config.permit_lifetime,
+            HeadTimeout::FastForward => self.w.config.ff_owner_bound,
+        };
+        self.since
+            .is_some_and(|(_, since)| self.w.clock.now() >= later(since, limit))
+    }
+
+    async fn timings(
+        &self,
+        attempt_id: &str,
+        change: impl FnOnce(&mut IntegrationPhaseTimings) + Send,
+    ) -> Result<()> {
+        let a = self.w.attempt(attempt_id).await?;
+        let mut timings = a.phase_timings.clone().unwrap_or_default();
+        change(&mut timings);
+        if a.phase_timings.as_ref() != Some(&timings) {
+            self.w
+                .db
+                .record_integration_head_timings(attempt_id, a.revision, &timings)
+                .await?;
+        }
+        Ok(())
+    }
+    /// Total head time, written while the attempt still holds the slot.
+    async fn close_timings(&self, a: &IntegrationAttempt) -> Result<()> {
+        let now = self.w.clock.now();
+        let started = parse_time(a.started_at.as_deref());
+        self.timings(&a.id, |timings| {
+            if let Some(started) = started {
+                timings.head_total_ms = Some(millis(started, now));
+            }
+        })
+        .await
+    }
+
+    async fn enqueue(
+        &mut self,
+        a: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<()> {
+        self.w
+            .steps
+            .enqueue_step(&IntegrationQueueWorker::step_request(a, action))
+            .await?;
+        self.enqueued.insert((a.effect_seq, action));
+        self.w.fault(a.state, CrashPoint::AfterStepEnqueue)
+    }
+
+    /// Ask for a deciding step (`request_check`, `settle`) under a fresh
+    /// `effect_seq`. The causation key carries no generation, so an enqueue
+    /// repeated after a takeover at the same `effect_seq` would be dropped as
+    /// a duplicate while the stored step still names the old generation.
+    async fn fresh_step(
+        &mut self,
+        a: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<IntegrationAttempt> {
+        let a = self
+            .w
+            .advance(&a.id, a.state, |a| {
+                a.effect_seq += 1;
+                a.effect_ack_json = None;
+                a.acknowledged_at = None;
+                a.permit_json = None;
+            })
+            .await?;
+        // A permit of an earlier ask pre-enqueued its protected `result`
+        // step. It sleeps until its own deadline and holds back every later
+        // step of the Task, this one included. That round is over: wake it,
+        // so it reads the newer `effect_seq`, writes nothing and finishes.
+        // (The ask before this one, and the one a takeover moved past.)
+        for stale in [a.effect_seq - 1, a.effect_seq - 2] {
+            if stale > 0 {
+                self.w.steps.ready_result_step(&a.id, stale).await?;
+            }
+        }
+        self.enqueue(&a, action).await?;
+        Ok(a)
+    }
+
+    /// The step this state waits for, asked once per session.
+    async fn ensure_step(
+        &mut self,
+        a: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<bool> {
+        if self.enqueued.contains(&(a.effect_seq, action)) {
+            return Ok(false);
+        }
+        self.fresh_step(a, action).await?;
+        Ok(true)
+    }
+
+    /// The deciding step of this wait settled without answering (its handler
+    /// failed for good, or a preempting command dropped it): the wait would
+    /// only end at its timeout. Ask again under a new `effect_seq`, a bounded
+    /// number of times per session, then park with a typed cause.
+    /// `Ok(None)`: the step can still answer.
+    async fn reask_dead_step(
+        &mut self,
+        a: &IntegrationAttempt,
+        action: IntegrationStepAction,
+    ) -> Result<Option<Pass>> {
+        let state = self
+            .w
+            .steps
+            .step_state(&IntegrationQueueWorker::step_request(a, action))
+            .await?;
+        if state == IntegrationStepState::TaskLeft {
+            // The Task moved on by another route; nothing is left to decide.
+            return self.release_cancelled(a).await.map(Some);
+        }
+        if state != IntegrationStepState::Dead {
+            return Ok(None);
+        }
+        if self.reasked >= self.w.config.step_reasks {
+            return self
+                .park(
+                    a,
+                    ParkReason::StepFailed,
+                    &format!(
+                        "the `{}` Task step failed after {} asks",
+                        action.as_str(),
+                        self.reasked + 1
+                    ),
+                )
+                .await
+                .map(Some);
+        }
+        self.reasked += 1;
+        self.fresh_step(a, action).await?;
+        Ok(Some(Pass::Progress))
+    }
+
+    // ----- releases -----------------------------------------------------
+
+    /// The Task gate, read from storage alone. `Some`: the head left the
+    /// slot (the Task left its entry, or its owner stopped it).
+    async fn gated(&mut self, a: &IntegrationAttempt) -> Result<Option<Pass>> {
+        match self.w.facts.task_gate(a).await? {
+            TaskGate::Live => Ok(None),
+            TaskGate::Left => self.release_cancelled(a).await.map(Some),
+            TaskGate::Gated(cause) => self
+                .park(a, ParkReason::Gate(cause), cause.message())
+                .await
+                .map(Some),
+        }
+    }
+
+    async fn release_cancelled(&mut self, a: &IntegrationAttempt) -> Result<Pass> {
+        if a.effect_intent_json.is_some() {
+            self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+            return Ok(Pass::Progress);
+        }
+        self.enqueue(a, IntegrationStepAction::Clear).await?;
+        self.close_timings(a).await?;
+        self.w
+            .advance(&a.id, S::Cancelled, |a| {
+                a.permit_json = None;
+                a.deadline = None;
+            })
+            .await?;
+        Ok(Pass::Released)
+    }
+
+    async fn park(
+        &mut self,
+        a: &IntegrationAttempt,
+        reason: ParkReason,
+        detail: &str,
+    ) -> Result<Pass> {
+        if a.effect_intent_json.is_some() {
+            // An admitted effect is settled by its owner, never by a park.
+            self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+            return Ok(Pass::Progress);
+        }
+        let now = self.w.clock.now();
+        let journal = a
+            .operation_receipts_json
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let parks = |entry: &&serde_json::Value| entry["kind"] == "worker_park";
+        // Counted retries since the owner last retried (`owner_retry` is
+        // written by the owner's Retry and starts them again).
+        let since_retry = journal
+            .iter()
+            .rposition(|entry| entry["kind"] == "owner_retry")
+            .map_or(0, |at| at + 1);
+        let counted = journal[since_retry..]
+            .iter()
+            .filter(parks)
+            .filter(|entry| entry["counted"] == true)
+            .count();
+        // Parks for this same reason with nothing but the re-queue between
+        // them (`start` adds one to `effect_seq`; any step adds more).
+        // The re-queue of a parked attempt adds one too (its `park` step
+        // restates `waiting`), and a head reconciled back to `queued` skips
+        // that one: a gap of one or two.
+        let mut repeats = 0u32;
+        let mut seq = a.effect_seq;
+        for entry in journal.iter().rev().filter(parks) {
+            let Some(at) = entry["effect_seq"].as_i64() else {
+                break;
+            };
+            if entry["reason"] != reason.code() || !(1..=2).contains(&(seq - at)) {
+                break;
+            }
+            repeats += 1;
+            seq = at;
+        }
+        let (kind, available_at, message) = match reason.retry() {
+            Retry::Counted => match self.w.config.infra_retry.get(counted) {
+                Some(delay) => (
+                    reason.kind(),
+                    Some(stamp(later(now, *delay))),
+                    format!("{}: {detail}", reason.code()),
+                ),
+                None => (
+                    IntegrationFailureKind::OwnerRequired,
+                    None,
+                    format!("retries_exhausted: {}: {detail}", reason.code()),
+                ),
+            },
+            // A wait with no end of its own (a paused Project, a target that
+            // is not ready): the retry backs off to `soon_retry_max`.
+            Retry::Soon => (
+                reason.kind(),
+                Some(stamp(later(
+                    now,
+                    self.w
+                        .config
+                        .sweep_interval
+                        .saturating_mul(1u32 << repeats.min(16))
+                        .min(self.w.config.soon_retry_max),
+                ))),
+                format!("{}: {detail}", reason.code()),
+            ),
+            Retry::Owner => (reason.kind(), None, format!("{}: {detail}", reason.code())),
+        };
+        // The Task was told when this wait began. A wait with no end of its
+        // own (`Soon`) is not told again on each retry, and its re-queue
+        // restates nothing either; a counted retry was re-queued with
+        // `waiting` restated, so its next park says so again.
+        if repeats == 0 || reason.retry() != Retry::Soon {
+            self.enqueue(a, IntegrationStepAction::Park).await?;
+        }
+        self.close_timings(a).await?;
+        let entry = json!({"kind":"worker_park","reason":reason.code(),"counted":reason.retry()==Retry::Counted,"effect_seq":a.effect_seq,"at":stamp(now)});
+        // The same wait found again by the sweep (a gate that has not
+        // lifted): the journal already says so, and it is bounded.
+        let again = journal.last().is_some_and(|last| {
+            last["kind"] == "worker_park"
+                && last["reason"] == reason.code()
+                && last["effect_seq"] == a.effect_seq
+        });
+        self.w
+            .advance(&a.id, S::Parked, move |a| {
+                if !again {
+                    super::journal_push(a, entry);
+                }
+                a.failure_kind = Some(kind);
+                a.failure_message = Some(bounded(&message));
+                a.available_at = available_at;
+                a.permit_json = None;
+                a.deadline = None;
+            })
+            .await?;
+        Ok(Pass::Released)
+    }
+
+    /// The owner does not recognise the claim's target: its record of the
+    /// default checkout differs from the one the claim froze (the server
+    /// changed the location since the owner last verified it: a default
+    /// toggle, a provisioning note). The refusal ran no Git. The worker asks
+    /// for the location to be verified again, which gives the owner the
+    /// server's present record, and the head goes on in a new round (a new
+    /// claim generation re-reads the target). `Ok(None)`: verification was
+    /// requested, retry. After two requests in one session, or when the
+    /// verification cannot be requested, the head leaves the slot and
+    /// retries with backoff.
+    async fn foreign_owner(&mut self, a: &IntegrationAttempt) -> Result<Option<Pass>> {
+        let location = self.w.queue(&self.queue_id).await?.target_location_id;
+        if let (Some(locations), Some(location), true) =
+            (self.w.locations.as_ref(), location, self.verifications < 2)
+        {
+            self.verifications += 1;
+            match locations.verify_location(&location).await {
+                Ok(()) => return Ok(None),
+                Err(error) => {
+                    tracing::warn!(target: "services::integration_worker", queue_id = %self.queue_id, %location, %error, "location verification after an owner refusal failed");
+                }
+            }
+        }
+        self.park(
+            a,
+            ParkReason::TargetNotReady,
+            "the owner of the default checkout does not recognise this claim's target yet",
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn send_back(
+        &mut self,
+        a: &IntegrationAttempt,
+        to: S,
+        change: impl FnOnce(&mut IntegrationAttempt) + Send,
+    ) -> Result<Pass> {
+        self.enqueue(a, IntegrationStepAction::SendBack).await?;
+        self.close_timings(a).await?;
+        self.w
+            .advance(&a.id, to, |a| {
+                a.permit_json = None;
+                a.deadline = None;
+                change(a);
+            })
+            .await?;
+        Ok(Pass::Released)
+    }
+
+    // ----- rounds ---------------------------------------------------------
+
+    /// Another fence generation for the same head. One generation admits one
+    /// receipt per effect kind, so a second rebase or fast-forward needs it.
+    /// `Ok(None)`: the head was parked or the lease is gone.
+    async fn new_round(
+        &mut self,
+        a: &IntegrationAttempt,
+        lost: Option<IntegrationLostRaceKind>,
+        counted: bool,
+    ) -> Result<Option<Pass>> {
+        let now = self.w.clock.now();
+        let mut rounds = 0;
+        let mut external = 0;
+        self.timings(&a.id, |timings| {
+            if let Some(kind) = lost {
+                timings.lost_races.push(IntegrationLostRace {
+                    kind,
+                    round: timings.rounds.max(1),
+                    at: stamp(now),
+                });
+            }
+            if counted {
+                timings.rounds += 1;
+            }
+            rounds = timings.rounds;
+            external = timings.external_target_moves();
+        })
+        .await?;
+        let a = self.w.attempt(&a.id).await?;
+        if external > self.w.config.external_move_allowance {
+            return self
+                .park(
+                    &a,
+                    ParkReason::ExternalMovesExhausted,
+                    "the target branch keeps moving outside Forge",
+                )
+                .await
+                .map(Some);
+        }
+        if rounds > self.w.config.max_rounds {
+            return self
+                .park(
+                    &a,
+                    ParkReason::RoundsExhausted,
+                    "too many integration rounds",
+                )
+                .await
+                .map(Some);
+        }
+        let queue = self.w.queue(&self.queue_id).await?;
+        match self
+            .w
+            .db
+            .start_integration_round(
+                &queue.id,
+                queue.revision,
+                &self.w.instance,
+                self.generation,
+                &stamp(now),
+                &stamp(later(now, self.w.config.lease)),
+            )
+            .await
+        {
+            Ok(queue) => {
+                self.generation = queue.fence_generation;
+                self.enqueued.clear();
+                Ok(None)
+            }
+            Err(db::DbError::VersionConflict) => {
+                let queue = self.w.queue(&self.queue_id).await?;
+                if queue.state == IntegrationQueueState::Suspended
+                    && queue.lease_owner.as_deref() == Some(&self.w.instance)
+                {
+                    // The target stopped being ready; the storage left the
+                    // lease with us. Release the head instead of holding it
+                    // until expiry.
+                    let a = self.w.attempt(&a.id).await?;
+                    return self
+                        .park(
+                            &a,
+                            ParkReason::TargetNotReady,
+                            "the default checkout is not ready",
+                        )
+                        .await
+                        .map(Some);
+                }
+                Ok(Some(Pass::Lost))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn facts(&self, a: &IntegrationAttempt, queue: &IntegrationQueue) -> Result<HeadFacts> {
+        match tokio::time::timeout(
+            self.w.config.validate_timeout,
+            self.w.facts.head_facts(a, queue),
+        )
+        .await
+        {
+            Ok(facts) => facts,
+            Err(_) => Err(ServiceError::invalid_operation(
+                "integration head facts timed out",
+            )),
+        }
+    }
+    async fn fence(&self, a: &IntegrationAttempt) -> Result<IntegrationOwnerFence> {
+        self.w
+            .db
+            .integration_owner_fence(&a.id)
+            .await?
+            .ok_or_else(|| ServiceError::invalid_operation("integration head has no owner fence"))
+    }
+
+    async fn transfer(
+        &mut self,
+        a: &IntegrationAttempt,
+        queue: &IntegrationQueue,
+        facts: &HeadFacts,
+        direction: ObjectTransferDirection,
+    ) -> Result<Option<Pass>> {
+        if facts.shared_object_store {
+            return Ok(None);
+        }
+        let started = self.w.clock.now();
+        // `have` names commits the receiver holds, so the bundle carries only
+        // what is new. Inbound, the source is the default checkout: it does
+        // not know the candidate, but it knows the target commits the Task's
+        // clone already has (its own target branch, and the tip an earlier
+        // round of this attempt brought, whose ref is kept until release).
+        let (have, want) = match direction {
+            ObjectTransferDirection::Inbound => (
+                vec![
+                    facts.candidate_head.clone(),
+                    facts.task_target_tip.clone(),
+                    a.target_tip_sha.clone().unwrap_or_default(),
+                ],
+                facts.target_tip.clone(),
+            ),
+            // Outbound, the commit sent is the one the permit binds (the
+            // attempt's candidate), never whatever the Task's checkout has
+            // as HEAD at this moment: the ref the transfer binds on the
+            // target's owner can then only hold the checked candidate.
+            ObjectTransferDirection::Outbound => (
+                vec![
+                    facts.target_tip.clone(),
+                    a.target_tip_sha.clone().unwrap_or_default(),
+                ],
+                a.candidate_sha
+                    .clone()
+                    .unwrap_or_else(|| facts.candidate_head.clone()),
+            ),
+        };
+        let mut seen = HashSet::new();
+        let have: Vec<String> = have
+            .into_iter()
+            .filter(|sha| !sha.is_empty() && *sha != want && seen.insert(sha.clone()))
+            .collect();
+        let fence = self.fence(a).await?;
+        let target = ObjectTransferEndpoint {
+            repo_location_id: fence.target_owner["location_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            owner: target_owner(Some(&fence.target_owner)).unwrap_or(EffectOwner::Server),
+        };
+        self.transferred = Some(ObjectTransferRelease {
+            attempt_id: a.id.clone(),
+            task: facts.task_location.clone(),
+            target: target.clone(),
+        });
+        let outcome = self
+            .w
+            .transfer
+            .transfer(ObjectTransferRequest {
+                fence,
+                direction,
+                task: facts.task_location.clone(),
+                target,
+                target_branch: queue.target_branch.clone(),
+                have,
+                want,
+                max_bytes: self.w.config.transfer_cap_bytes,
+            })
+            .await;
+        match outcome {
+            Ok(ObjectTransferOutcome::Transferred { .. }) => {
+                if direction == ObjectTransferDirection::Inbound {
+                    self.inbound_generation = Some(self.generation);
+                }
+                let elapsed = millis(started, self.w.clock.now());
+                self.timings(&a.id, |timings| add(&mut timings.transfer_ms, elapsed))
+                    .await?;
+                Ok(None)
+            }
+            Ok(ObjectTransferOutcome::TooLarge { bytes }) => {
+                let a = self.w.attempt(&a.id).await?;
+                self.park(
+                    &a,
+                    ParkReason::TransferTooLarge,
+                    &format!(
+                        "change too large to move between machines ({bytes} bytes); place the Task on the target machine"
+                    ),
+                )
+                .await
+                .map(Some)
+            }
+            Err(error) => {
+                let a = self.w.attempt(&a.id).await?;
+                self.park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .await
+                    .map(Some)
+            }
+        }
+    }
+
+    // ----- states ---------------------------------------------------------
+
+    async fn start(&mut self, a: IntegrationAttempt) -> Result<Pass> {
+        if a.cancel_requested_at.is_some() {
+            return self.release_cancelled(&a).await;
+        }
+        // A member whose Task its owner stopped is skipped here: it leaves
+        // the slot before a round is counted or anything is read from Git,
+        // and the next member is claimed.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
+        let now = self.w.clock.now();
+        let enqueued = parse_time(Some(&a.enqueued_at));
+        let mut rounds = 0;
+        self.timings(&a.id, |timings| {
+            timings.rounds += 1;
+            rounds = timings.rounds;
+            if timings.queued_ms.is_none() {
+                timings.queued_ms = enqueued.map(|enqueued| millis(enqueued, now));
+            }
+        })
+        .await?;
+        if rounds > self.w.config.max_rounds {
+            let a = self.w.attempt(&a.id).await?;
+            return self
+                .park(
+                    &a,
+                    ParkReason::RoundsExhausted,
+                    "too many integration rounds",
+                )
+                .await;
+        }
+        self.w
+            .advance(&a.id, S::Validating, |a| {
+                // Head age reads `started_at`; the claim does not set it.
+                if a.started_at.is_none() {
+                    a.started_at = Some(stamp(now));
+                }
+                a.effect_seq += 1;
+                a.effect_ack_json = None;
+                a.acknowledged_at = None;
+                a.permit_json = None;
+                a.deadline = None;
+                a.available_at = None;
+                a.failure_kind = None;
+                a.failure_message = None;
+            })
+            .await?;
+        Ok(Pass::Progress)
+    }
+
+    async fn validate(&mut self, a: IntegrationAttempt, queue: &IntegrationQueue) -> Result<Pass> {
+        if a.cancel_requested_at.is_some() {
+            return self.release_cancelled(&a).await;
+        }
+        // The Task gate first, from storage: a Task its owner stopped leaves
+        // the slot before any Git is read or written, and spends no retry.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
+        let started = self.w.clock.now();
+        let facts = match self.facts(&a, queue).await {
+            Ok(facts) => facts,
+            Err(error) if self.timed_out(HeadTimeout::Validate) => {
+                return self.park(&a, ParkReason::Timeout, &error.to_string()).await
+            }
+            Err(error) => {
+                return self
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
+                    .await
+            }
+        };
+        match facts.gate {
+            TaskGate::Live => {}
+            TaskGate::Left => return self.release_cancelled(&a).await,
+            TaskGate::Gated(cause) => {
+                return self
+                    .park(&a, ParkReason::Gate(cause), cause.message())
+                    .await
+            }
+        }
+        let admitted = a
+            .candidate_sha
+            .clone()
+            .or_else(|| a.original_candidate_sha.clone());
+        if facts.rebase_in_progress {
+            // A rebase is stopped in the Task's checkout (a merge the old
+            // path started and never reported, or an owner that died in the
+            // middle of one). Nobody else will finish it: the owner's rebase
+            // does, by the interrupted-rebase rule (`git::integration::
+            // rebase` continues it and hands a conflict to the Worker, or
+            // reports the conflict it cannot hand off). HEAD is the commit
+            // the stopped rebase stands on, which is what the owner's
+            // witness names. This is read before the landed witness below: a
+            // rebase that stopped on its first commit leaves HEAD on the
+            // target tip, which is not "the candidate has landed".
+            let head = facts.candidate_head.clone();
+            let tip = facts.target_tip.clone();
+            self.w
+                .advance(&a.id, S::Rebasing, |a| {
+                    a.candidate_sha = Some(head);
+                    a.target_tip_sha = Some(tip);
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
+        if landed(&a, &facts) {
+            // Landed witness: the candidate is already in the target.
+            let head = facts.candidate_head.clone();
+            let tip = facts.target_tip.clone();
+            self.w
+                .advance(&a.id, S::Applied, |a| {
+                    a.candidate_sha = Some(head.clone());
+                    a.target_tip_sha = Some(tip);
+                    a.integrated_sha = Some(head);
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
+        if admitted
+            .as_deref()
+            .is_some_and(|sha| sha != facts.candidate_head)
+            && !rebased_and_not_applied(&a, admitted.as_deref(), &facts)
+        {
+            return self
+                .send_back(&a, S::NeedsReview, |a| {
+                    a.failure_message =
+                        Some("the candidate commit changed after it was admitted".into());
+                })
+                .await;
+        }
+        if facts.worktree_dirty {
+            return self
+                .send_back(&a, S::Ejected, |a| {
+                    a.failure_kind = Some(IntegrationFailureKind::OwnerRequired);
+                    a.failure_message =
+                        Some("worktree_dirty: the Task checkout has uncommitted changes".into());
+                })
+                .await;
+        }
+        if facts.target_dirty {
+            return self
+                .park(
+                    &a,
+                    ParkReason::TargetDirty,
+                    "the default checkout has uncommitted changes",
+                )
+                .await;
+        }
+        if let Some(pass) = self
+            .transfer(&a, queue, &facts, ObjectTransferDirection::Inbound)
+            .await?
+        {
+            return Ok(pass);
+        }
+        let rebased_by_queue = a
+            .original_candidate_sha
+            .as_deref()
+            .is_some_and(|original| original != facts.candidate_head);
+        let checked = a.checks_commit_sha.as_deref() == Some(&facts.candidate_head);
+        let elapsed = millis(started, self.w.clock.now());
+        // Every attempt of an entry that was imported as a missing-source
+        // quarantine owes the head check, not only the attempt the owner's
+        // Retry admitted: a successor of that attempt has no more proof of
+        // its candidate than it had.
+        let retried_incomplete_import = self.w.db.retried_quarantined_import(&a.task_ref).await?;
+        let triaged_review = self.w.db.review_ci_passed_by_triage(&a.task_ref).await?;
+        let skip_check = facts.target_in_candidate
+            && (!triaged_review || checked)
+            && (!rebased_by_queue || checked)
+            && (!retried_incomplete_import || checked);
+        let lost = !facts.target_in_candidate;
+        let now = self.w.clock.now();
+        self.timings(&a.id, |timings| {
+            add(&mut timings.validate_ms, elapsed);
+            if skip_check && !rebased_by_queue {
+                timings.check = Some(IntegrationCheckTiming::Skipped {
+                    reason: IntegrationCiSkipReason::TargetUnchanged,
+                });
+            }
+            if lost {
+                // The slot was free while the target moved: earlier queue
+                // members (free of charge). A move while the slot is held is
+                // recorded as external where it is detected.
+                timings.lost_races.push(IntegrationLostRace {
+                    kind: IntegrationLostRaceKind::QueueMember,
+                    round: timings.rounds.max(1),
+                    at: stamp(now),
+                });
+            }
+        })
+        .await?;
+        let head = facts.candidate_head.clone();
+        let tip = facts.target_tip.clone();
+        if skip_check {
+            // Unchanged target: the reviewed commit goes to authorization as
+            // it is; no new check.
+            let a = self.w.attempt(&a.id).await?;
+            let a = self.fresh_step(&a, IntegrationStepAction::Settle).await?;
+            self.w
+                .advance(&a.id, S::AwaitingTaskStep, |a| {
+                    a.candidate_sha = Some(head);
+                    a.target_tip_sha = Some(tip);
+                })
+                .await?;
+        } else {
+            self.w
+                .advance(&a.id, S::Rebasing, |a| {
+                    a.candidate_sha = Some(head);
+                    a.target_tip_sha = Some(tip);
+                })
+                .await?;
+        }
+        Ok(Pass::Progress)
+    }
+
+    async fn rebase(&mut self, a: IntegrationAttempt, queue: &IntegrationQueue) -> Result<Pass> {
+        if a.effect_intent_json.is_some() {
+            self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+            return Ok(Pass::Progress);
+        }
+        if a.cancel_requested_at.is_some() {
+            return self.release_cancelled(&a).await;
+        }
+        // No intent exists: a gate that landed since validation stops the
+        // rebase before it is asked for.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
+        let facts = match self.facts(&a, queue).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                return self
+                    .park(&a, ParkReason::unreached(&error), &error.to_string())
+                    .await
+            }
+        };
+        // A rebase whose receipt was recorded but never applied (the process
+        // stopped between the receipt and the transition), in this or an
+        // earlier generation. Applying it changes `candidate_sha`, so it is
+        // adopted once.
+        let adopted = receipts(&a).into_iter().rev().find(|receipt| {
+            receipt.request.kind == IntegrationOperationKind::Rebase
+                && receipt.operation_state == IntegrationOperationState::Succeeded
+                && receipt.request.witness["expected_head_sha"].as_str()
+                    == a.candidate_sha.as_deref()
+                && receipt.request.witness["expected_target_sha"].as_str()
+                    == Some(&facts.target_tip)
+                && (receipt.request.fence.generation == self.generation
+                    || a.candidate_sha.as_deref() != Some(&facts.candidate_head))
+        });
+        if let Some(receipt) = adopted {
+            let outcome: OwnerRebaseReceipt =
+                serde_json::from_value(receipt.result).map_err(|e| {
+                    ServiceError::invalid_operation(format!("invalid rebase receipt: {e}"))
+                })?;
+            return self
+                .apply_rebase(&a, queue, outcome, 0, &facts.target_tip)
+                .await;
+        }
+        if a.candidate_sha.as_deref() != Some(&facts.candidate_head) {
+            return self
+                .park(
+                    &a,
+                    ParkReason::Infrastructure,
+                    "the candidate moved under the head",
+                )
+                .await;
+        }
+        if a.target_tip_sha.as_deref() != Some(&facts.target_tip) {
+            // Moved while this head held the slot: nobody in the queue can
+            // have done it.
+            let tip = facts.target_tip.clone();
+            self.w
+                .advance(&a.id, S::Rebasing, |a| a.target_tip_sha = Some(tip))
+                .await?;
+            let a = self.w.attempt(&a.id).await?;
+            return Ok(self
+                .new_round(&a, Some(IntegrationLostRaceKind::External), true)
+                .await?
+                .unwrap_or(Pass::Progress));
+        }
+        if facts.target_in_candidate && !facts.rebase_in_progress {
+            // The candidate is already on this tip: an earlier round of this
+            // attempt rebased it and left the slot before its check came
+            // back (the Task's owner stopped it meanwhile, or the check found
+            // no verdict). There is nothing to rebase: no Git effect is asked
+            // for, only the check of the commit that is there.
+            if !facts.placement_ready {
+                if self.timed_out(HeadTimeout::Step) {
+                    return self
+                        .park(
+                            &a,
+                            ParkReason::OwnerOffline,
+                            "the Task's checkout is not ready on its machine",
+                        )
+                        .await;
+                }
+                return Ok(Pass::Wait(self.w.config.poll));
+            }
+            let a = self
+                .fresh_step(&a, IntegrationStepAction::RequestCheck)
+                .await?;
+            self.w
+                .advance(&a.id, S::Checking, |a| {
+                    a.checks_json = None;
+                    a.checks_commit_sha = None;
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
+        // In another clone the rebase witness is the ref this generation's
+        // inbound transfer binds. Validation transferred under the generation
+        // it ran in; a later round of the same head transfers again here
+        // (a repeat of a key moves nothing).
+        if self.inbound_generation != Some(self.generation) {
+            if let Some(pass) = self
+                .transfer(&a, queue, &facts, ObjectTransferDirection::Inbound)
+                .await?
+            {
+                return Ok(pass);
+            }
+        }
+        let fence = self.fence(&a).await?;
+        self.w.fault(S::Rebasing, CrashPoint::BeforeEffect)?;
+        let started = self.w.clock.now();
+        let cancel = self.stop.child_token();
+        let outcome = {
+            let effect = self.w.owner.rebase(OwnerRebaseRequest {
+                fence,
+                workspace: facts.workspace.clone(),
+                target_branch: queue.target_branch.clone(),
+                expected_head_sha: facts.candidate_head.clone(),
+                expected_target_sha: facts.target_tip.clone(),
+                handoff_conflicts: true,
+                deadline: self.w.config.rebase_deadline,
+                cancel: cancel.clone(),
+            });
+            tokio::pin!(effect);
+            // The effect can outlive a lease period: keep the lease, and
+            // stop the effect when the Task is cancelled meanwhile.
+            let watch = async {
+                loop {
+                    self.w.clock.sleep(self.w.config.poll).await;
+                    if !matches!(
+                        self.w.renew_if_due(&self.queue_id, self.generation).await,
+                        Ok(true)
+                    ) {
+                        cancel.cancel();
+                    }
+                    if self
+                        .w
+                        .attempt(&a.id)
+                        .await
+                        .is_ok_and(|a| a.cancel_requested_at.is_some())
+                    {
+                        cancel.cancel();
+                    }
+                }
+            };
+            tokio::select! {
+                outcome = &mut effect => outcome,
+                () = watch => unreachable!("the watch never returns"),
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let now = self.w.attempt(&a.id).await?;
+                let answered = now.effect_intent_json.is_some()
+                    || receipts(&now).iter().any(|receipt| {
+                        receipt.request.kind == IntegrationOperationKind::Rebase
+                            && receipt.request.fence.generation == self.generation
+                    });
+                if answered {
+                    // An intent or a receipt exists: the rows decide on the
+                    // next pass (reconcile the unknown result, or adopt the
+                    // receipt).
+                    return Err(error);
+                }
+                // The owner was never asked: the request failed before its
+                // intent (the owner could not be told the claim, or storage
+                // refused the effect). Nothing ran. The head leaves the slot
+                // with a typed, counted retry, so the members behind it go
+                // on; left in `rebasing` it would be re-claimed at every
+                // lease expiry for as long as the cause lasts.
+                return self
+                    .park(&now, ParkReason::unreached(&error), &error.to_string())
+                    .await;
+            }
+        };
+        self.w.fault(S::Rebasing, CrashPoint::AfterEffectReceipt)?;
+        let elapsed = millis(started, self.w.clock.now());
+        self.apply_rebase(&a, queue, outcome, elapsed, &facts.target_tip)
+            .await
+    }
+
+    async fn apply_rebase(
+        &mut self,
+        a: &IntegrationAttempt,
+        queue: &IntegrationQueue,
+        outcome: OwnerRebaseReceipt,
+        elapsed_ms: i64,
+        target_tip: &str,
+    ) -> Result<Pass> {
+        // The receipt bumped the revision: everything below re-reads.
+        let a = self.w.attempt(&a.id).await?;
+        self.timings(&a.id, |timings| add(&mut timings.rebase_ms, elapsed_ms))
+            .await?;
+        let a = self.w.attempt(&a.id).await?;
+        match outcome {
+            OwnerRebaseReceipt::Completed {
+                outcome: WorkspaceOwnerOperationOutcome::Rebased,
+            } => {
+                // The receipt names no commit; read the rebased HEAD.
+                let facts = self.facts(&a, queue).await?;
+                if !facts.placement_ready {
+                    // The owner answered for its rebase (it is connected),
+                    // but the Task's placement is not `ready` again yet: the
+                    // owner reconciliation after a reconnect has not run.
+                    // The check owner refuses such a placement for good, so
+                    // the check is not asked for until it is ready. The
+                    // receipt stays to be adopted on the next pass.
+                    if self.timed_out(HeadTimeout::Step) {
+                        return self
+                            .park(
+                                &a,
+                                ParkReason::OwnerOffline,
+                                "the Task's checkout is not ready on its machine",
+                            )
+                            .await;
+                    }
+                    return Ok(Pass::Wait(self.w.config.poll));
+                }
+                let head = facts.candidate_head;
+                let tip = target_tip.to_owned();
+                let a = self
+                    .fresh_step(&a, IntegrationStepAction::RequestCheck)
+                    .await?;
+                self.w
+                    .advance(&a.id, S::Checking, |a| {
+                        a.candidate_sha = Some(head);
+                        a.target_tip_sha = Some(tip);
+                        a.checks_json = None;
+                        a.checks_commit_sha = None;
+                    })
+                    .await?;
+                Ok(Pass::Progress)
+            }
+            OwnerRebaseReceipt::Completed {
+                outcome:
+                    WorkspaceOwnerOperationOutcome::Conflict {
+                        details,
+                        conflict_paths,
+                    },
+            } => {
+                let paths = json!(conflict_paths);
+                let paths = db::validate_integration_paths(&paths)
+                    .is_ok()
+                    .then_some(paths);
+                self.send_back(&a, S::Ejected, |a| {
+                    a.conflict_paths_json = paths;
+                    a.failure_message = Some(bounded(&details));
+                })
+                .await
+            }
+            OwnerRebaseReceipt::Completed {
+                outcome: WorkspaceOwnerOperationOutcome::UnsupportedConflict { details },
+            } => {
+                self.park(&a, ParkReason::UnsupportedConflict, &details)
+                    .await
+            }
+            OwnerRebaseReceipt::Completed {
+                outcome: WorkspaceOwnerOperationOutcome::Dirty { files },
+            } => {
+                self.park(&a, ParkReason::WorktreeDirty, &files.join(", "))
+                    .await
+            }
+            OwnerRebaseReceipt::Completed { .. } => {
+                self.park(&a, ParkReason::Infrastructure, "unexpected rebase outcome")
+                    .await
+            }
+            OwnerRebaseReceipt::Infrastructure { .. } => {
+                // Uncertain: the intent stays; only a receipt settles it.
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
+            }
+            OwnerRebaseReceipt::TimedOut { .. } => {
+                self.park(&a, ParkReason::Timeout, "the rebase ran out of time")
+                    .await
+            }
+            OwnerRebaseReceipt::Cancelled { .. } => {
+                if a.cancel_requested_at.is_some() {
+                    self.release_cancelled(&a).await
+                } else {
+                    // Shutdown or a lost lease: stop; the next claim rebases.
+                    Ok(Pass::Lost)
+                }
+            }
+            OwnerRebaseReceipt::Refused {
+                reason: OwnerEffectRefusal::StaleFence,
+            } => Ok(Pass::Lost),
+            OwnerRebaseReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            } => {
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                let a = self.w.attempt(&a.id).await?;
+                Ok(self
+                    .new_round(&a, None, true)
+                    .await?
+                    .unwrap_or(Pass::Progress))
+            }
+            OwnerRebaseReceipt::Refused { .. } | OwnerRebaseReceipt::NotPerformed {} => {
+                // The witness no longer holds (the target moved while this
+                // head held the slot) or this generation already has a rebase
+                // receipt: read again in a new round.
+                let facts = self.facts(&a, queue).await?;
+                let lost = (a.target_tip_sha.as_deref() != Some(&facts.target_tip))
+                    .then_some(IntegrationLostRaceKind::External);
+                let tip = facts.target_tip;
+                self.w
+                    .advance(&a.id, S::Rebasing, |a| a.target_tip_sha = Some(tip))
+                    .await?;
+                let a = self.w.attempt(&a.id).await?;
+                Ok(self
+                    .new_round(&a, lost, true)
+                    .await?
+                    .unwrap_or(Pass::Progress))
+            }
+        }
+    }
+
+    async fn await_check(&mut self, a: IntegrationAttempt) -> Result<Pass> {
+        if a.cancel_requested_at.is_some() {
+            return self.release_cancelled(&a).await;
+        }
+        // A gate that lands while the check runs: the head leaves the slot
+        // and stops waiting. The verdict, when it arrives, finds the attempt
+        // parked and is applied to nothing; the check is asked again once the
+        // gate has lifted.
+        if let Some(pass) = self.gated(&a).await? {
+            return Ok(pass);
+        }
+        if self
+            .ensure_step(&a, IntegrationStepAction::RequestCheck)
+            .await?
+        {
+            self.check_asked = Some(self.w.clock.now());
+            return Ok(Pass::Progress);
+        }
+        let Some(ack) = IntegrationStepAck::current(&a, IntegrationStepAction::Settle) else {
+            if let Some(authority) = crate::integration_steps::check_authority(&a) {
+                if self
+                    .w
+                    .db
+                    .integration_head_triage_pending(
+                        &a.task_ref,
+                        a.expected_epoch,
+                        &authority,
+                        &stamp(self.w.clock.now()),
+                    )
+                    .await?
+                {
+                    // Each triage stage has its own check deadline. Give its
+                    // delivery a fresh head wait instead of timing out on the
+                    // original candidate check's 35-minute allowance.
+                    self.since = Some((a.state, self.w.clock.now()));
+                }
+            }
+            if self.timed_out(HeadTimeout::Check) {
+                return self
+                    .park(&a, ParkReason::Timeout, "no check verdict arrived")
+                    .await;
+            }
+            if let Some(pass) = self
+                .reask_dead_step(&a, IntegrationStepAction::RequestCheck)
+                .await?
+            {
+                self.check_asked = Some(self.w.clock.now());
+                return Ok(pass);
+            }
+            // The verdict reaches the Task by a delivery step of the check
+            // runner. One that failed is not delivered again, but the next
+            // ask applies the stored verdict (and an ask for a check still
+            // running only joins it): ask on a timer instead of waiting the
+            // check timeout out.
+            let now = self.w.clock.now();
+            let asked = *self.check_asked.get_or_insert(now);
+            if now >= later(asked, self.w.config.check_reask) {
+                self.fresh_step(&a, IntegrationStepAction::RequestCheck)
+                    .await?;
+                self.check_asked = Some(now);
+                return Ok(Pass::Progress);
+            }
+            return Ok(Pass::Wait(self.w.config.poll));
+        };
+        if let Some(check) = ack.check.clone() {
+            self.timings(&a.id, |timings| timings.check = Some(check))
+                .await?;
+        }
+        let a = self.w.attempt(&a.id).await?;
+        match ack.outcome {
+            IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
+            IntegrationStepOutcome::Infrastructure => {
+                // No verdict because the Task's owner stopped it meanwhile:
+                // that is the gate's wait, not an infrastructure retry.
+                if let Some(pass) = self.gated(&a).await? {
+                    return Ok(pass);
+                }
+                self.park(
+                    &a,
+                    ParkReason::Infrastructure,
+                    ack.message.as_deref().unwrap_or("no check verdict"),
+                )
+                .await
+            }
+            IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
+            IntegrationStepOutcome::Permit
+            | IntegrationStepOutcome::NeedsReview
+            | IntegrationStepOutcome::NotLanded
+            | IntegrationStepOutcome::Done => {
+                // The same acknowledgment is the settle decision; the next
+                // state consumes it.
+                let passed = ack.outcome == IntegrationStepOutcome::Permit;
+                let seq = a.effect_seq;
+                self.w
+                    .advance(&a.id, S::AwaitingTaskStep, |a| {
+                        if passed {
+                            a.checks_commit_sha = a.candidate_sha.clone();
+                            a.checks_json = Some(json!({"result":"passed"}));
+                        }
+                    })
+                    .await?;
+                self.enqueued.insert((seq, IntegrationStepAction::Settle));
+                Ok(Pass::Progress)
+            }
+        }
+    }
+    async fn check_failed(
+        &mut self,
+        a: &IntegrationAttempt,
+        ack: &IntegrationStepAck,
+    ) -> Result<Pass> {
+        let message = ack.message.clone();
+        self.send_back(a, S::Ejected, |a| {
+            a.failure_kind = Some(IntegrationFailureKind::CandidateCheckFailed);
+            a.failure_message = message
+                .as_deref()
+                .map(crate::integration_steps::bounded_ci_failure);
+        })
+        .await
+    }
+
+    async fn await_permit(&mut self, a: IntegrationAttempt) -> Result<Pass> {
+        if a.cancel_requested_at.is_some() {
+            // No fast-forward intent exists yet, so the cancel wins even over
+            // a permit that was already written.
+            return self.release_cancelled(&a).await;
+        }
+        // Before the decision is asked for or while it is awaited. A permit
+        // that is already written was decided before the gate landed: the
+        // `settle` step reads the same gate in the transaction of the permit.
+        let permitted = IntegrationStepAck::current(&a, IntegrationStepAction::Settle)
+            .is_some_and(|ack| ack.outcome == IntegrationStepOutcome::Permit);
+        if !permitted {
+            if let Some(pass) = self.gated(&a).await? {
+                return Ok(pass);
+            }
+        }
+        if self.ensure_step(&a, IntegrationStepAction::Settle).await? {
+            return Ok(Pass::Progress);
+        }
+        let Some(ack) = IntegrationStepAck::current(&a, IntegrationStepAction::Settle) else {
+            if self.timed_out(HeadTimeout::Step) {
+                return self
+                    .park(&a, ParkReason::Timeout, "no Task-step decision arrived")
+                    .await;
+            }
+            if let Some(pass) = self
+                .reask_dead_step(&a, IntegrationStepAction::Settle)
+                .await?
+            {
+                return Ok(pass);
+            }
+            return Ok(Pass::Wait(self.w.config.poll));
+        };
+        let waited = self
+            .since
+            .map(|(_, since)| millis(since, self.w.clock.now()))
+            .unwrap_or(0);
+        self.timings(&a.id, |timings| add(&mut timings.step_wait_ms, waited))
+            .await?;
+        let a = self.w.attempt(&a.id).await?;
+        match ack.outcome {
+            IntegrationStepOutcome::Permit => {
+                let deadline = stamp(later(self.w.clock.now(), self.w.config.permit_lifetime));
+                match self
+                    .w
+                    .advance(&a.id, S::ReadyFf, |a| a.deadline = Some(deadline))
+                    .await
+                {
+                    Ok(_) => Ok(Pass::Progress),
+                    // The permit does not bind this candidate, target, Task
+                    // entry and slot: ask again, a bounded number of times
+                    // (each ask is a Task step).
+                    Err(ServiceError::Db(db::DbError::Check(detail))) => {
+                        self.refused_permits += 1;
+                        if self.refused_permits > 2 {
+                            return self.park(&a, ParkReason::Infrastructure, &detail).await;
+                        }
+                        self.enqueued.clear();
+                        Ok(Pass::Wait(self.w.config.poll))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            IntegrationStepOutcome::NeedsReview => {
+                let message = ack.message.clone();
+                self.send_back(&a, S::NeedsReview, |a| {
+                    a.failure_message = message.as_deref().map(bounded);
+                })
+                .await
+            }
+            IntegrationStepOutcome::CandidateCheckFailed => self.check_failed(&a, &ack).await,
+            IntegrationStepOutcome::TaskLeft => self.release_cancelled(&a).await,
+            IntegrationStepOutcome::Infrastructure
+            | IntegrationStepOutcome::NotLanded
+            | IntegrationStepOutcome::Done => {
+                // The step refused the permit under the Task gate.
+                if let Some(pass) = self.gated(&a).await? {
+                    return Ok(pass);
+                }
+                self.park(
+                    &a,
+                    ParkReason::Infrastructure,
+                    ack.message
+                        .as_deref()
+                        .unwrap_or("the Task step could not decide"),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn commit_fast_forward(
+        &mut self,
+        a: IntegrationAttempt,
+        queue: &IntegrationQueue,
+    ) -> Result<Pass> {
+        if a.cancel_requested_at.is_some() {
+            return self.release_cancelled(&a).await;
+        }
+        let expired = parse_time(a.deadline.as_deref())
+            .is_some_and(|deadline| deadline <= self.w.clock.now())
+            || self.timed_out(HeadTimeout::Permit);
+        if expired {
+            self.w
+                .advance(&a.id, S::AwaitingTaskStep, |a| {
+                    a.permit_json = None;
+                    a.effect_seq += 1;
+                    a.effect_ack_json = None;
+                    a.acknowledged_at = None;
+                    a.deadline = None;
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
+        let facts = match self.facts(&a, queue).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                return self
+                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .await
+            }
+        };
+        // The Task's checkout no longer holds the candidate the permit was
+        // written for. The permit is dropped and the Task step decides again
+        // (it refuses a changed candidate); nothing is sent to the target.
+        if !facts.shared_object_store
+            && a.candidate_sha.as_deref() != Some(facts.candidate_head.as_str())
+        {
+            self.w
+                .advance(&a.id, S::AwaitingTaskStep, |a| {
+                    a.permit_json = None;
+                    a.effect_seq += 1;
+                    a.effect_ack_json = None;
+                    a.acknowledged_at = None;
+                    a.deadline = None;
+                })
+                .await?;
+            return Ok(Pass::Progress);
+        }
+        if let Some(pass) = self
+            .transfer(&a, queue, &facts, ObjectTransferDirection::Outbound)
+            .await?
+        {
+            return Ok(pass);
+        }
+        // Cancel-or-commit. The cancel request and this write are both a
+        // compare-and-set on the attempt revision, and a cancel is refused
+        // once `ff_inflight` is stored: exactly one of them wins.
+        let committed = self
+            .w
+            .advance_if(&a.id, S::FfInflight, |a| a.cancel_requested_at.is_none())
+            .await?;
+        match committed {
+            Some(_) => Ok(Pass::Progress),
+            None => {
+                let a = self.w.attempt(&a.id).await?;
+                self.release_cancelled(&a).await
+            }
+        }
+    }
+
+    async fn fast_forward(
+        &mut self,
+        a: IntegrationAttempt,
+        queue: &IntegrationQueue,
+    ) -> Result<Pass> {
+        let (Some(candidate), Some(target)) = (a.candidate_sha.clone(), a.target_tip_sha.clone())
+        else {
+            self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+            return Ok(Pass::Progress);
+        };
+        if a.effect_intent_json.is_some() {
+            self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+            return Ok(Pass::Progress);
+        }
+        let facts = match self.facts(&a, queue).await {
+            Ok(facts) => facts,
+            Err(_) => {
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                return Ok(Pass::Progress);
+            }
+        };
+        let fence = self.fence(&a).await?;
+        self.w.fault(S::FfInflight, CrashPoint::BeforeEffect)?;
+        let started = self.w.clock.now();
+        // Never cancelled by shutdown: a started fast-forward runs to its
+        // receipt or to the owner's own bound.
+        let outcome = self
+            .w
+            .owner
+            .fast_forward(OwnerFastForwardRequest {
+                fence,
+                workspace: facts.workspace.clone(),
+                target_branch: queue.target_branch.clone(),
+                task_branch: facts.task_branch.clone(),
+                candidate_sha: candidate.clone(),
+                target_sha: target.clone(),
+                deadline: self.w.config.ff_owner_bound,
+            })
+            .await;
+        self.w
+            .fault(S::FfInflight, CrashPoint::AfterEffectReceipt)?;
+        let elapsed = millis(started, self.w.clock.now());
+        match outcome {
+            Ok(OwnerMergeReceipt::Completed {
+                outcome:
+                    MergeOutcome::Done {
+                        before_sha,
+                        after_sha,
+                        ..
+                    },
+            }) => {
+                self.timings(&a.id, |timings| add(&mut timings.ff_ms, elapsed))
+                    .await?;
+                self.w
+                    .advance(&a.id, S::Applied, |a| {
+                        a.integrated_before_sha = Some(before_sha);
+                        a.integrated_sha = Some(after_sha);
+                        a.deadline = None;
+                    })
+                    .await?;
+                Ok(Pass::Progress)
+            }
+            Ok(OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::StaleFence,
+            }) => Ok(Pass::Lost),
+            Ok(OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::ForeignOwner,
+            }) => {
+                let a = self.w.attempt(&a.id).await?;
+                if let Some(pass) = self.foreign_owner(&a).await? {
+                    return Ok(pass);
+                }
+                // The refusal is this generation's fast-forward receipt:
+                // reconciliation reads it as "not landed" and re-queues the
+                // head for a new round.
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
+            }
+            Ok(OwnerMergeReceipt::Completed {
+                outcome: MergeOutcome::TargetMoved { .. },
+            })
+            | Ok(OwnerMergeReceipt::Refused {
+                reason: OwnerEffectRefusal::WitnessMismatch,
+            }) => {
+                let a = self.w.attempt(&a.id).await?;
+                let moved = self.facts(&a, queue).await.ok().filter(|facts| {
+                    facts.target_tip != target && facts.candidate_head == candidate
+                });
+                let Some(facts) = moved else {
+                    self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                    return Ok(Pass::Progress);
+                };
+                // The target moved under a head that held the slot: a writer
+                // outside Forge. Rebase again in a new round.
+                self.w
+                    .advance(&a.id, S::Rebasing, |a| {
+                        a.target_tip_sha = Some(facts.target_tip);
+                        a.permit_json = None;
+                        a.effect_seq += 1;
+                        a.effect_ack_json = None;
+                        a.acknowledged_at = None;
+                        a.deadline = None;
+                    })
+                    .await?;
+                let a = self.w.attempt(&a.id).await?;
+                Ok(self
+                    .new_round(&a, Some(IntegrationLostRaceKind::External), true)
+                    .await?
+                    .unwrap_or(Pass::Progress))
+            }
+            // Settled without a merge, uncertain, or no receipt at all:
+            // reconciliation decides from the rows and a Git witness.
+            Ok(_) | Err(_) => {
+                self.w.advance(&a.id, S::Reconciling, |_| {}).await?;
+                Ok(Pass::Progress)
+            }
+        }
+    }
+
+    async fn reconcile(&mut self, a: IntegrationAttempt, queue: &IntegrationQueue) -> Result<Pass> {
+        let mut a = a;
+        if let Some(intent) = a.effect_intent_json.as_ref() {
+            // Only the owner settles an admitted effect, under its own
+            // checkout lock: a receipt, an exact proof, or "the ref never
+            // moved". The worker records nothing itself.
+            let outcome =
+                match serde_json::from_value::<IntegrationEffectRequest>(intent["request"].clone())
+                {
+                    Ok(request) => self.w.owner.reconcile_effect(&request).await,
+                    Err(_) => self.w.owner.reconcile_outstanding().await,
+                };
+            if let Err(error) = outcome {
+                tracing::warn!(target: "services::integration_worker", attempt_id = %a.id, %error, "integration owner reconciliation failed");
+            }
+            a = self.w.attempt(&a.id).await?;
+        }
+        // Read after the settlement, so the facts are never older than it.
+        let facts = self.facts(&a, queue).await;
+        if let Some(intent) = a.effect_intent_json.clone() {
+            // Unknown result. Nothing is guessed: the queue is quarantined
+            // with a typed reason and the reconcile timer keeps asking.
+            let message = "integration result unknown: the owner has no settled receipt";
+            let queue = self.w.queue(&self.queue_id).await?;
+            if queue.state == IntegrationQueueState::Open {
+                self.w
+                    .db
+                    .quarantine_integration_queue(
+                        &queue.id,
+                        queue.revision,
+                        &self.w.instance,
+                        self.generation,
+                        IntegrationFailureKind::NeedsFact,
+                        message,
+                    )
+                    .await?;
+            }
+            self.enqueue(&a, IntegrationStepAction::Park).await?;
+            self.w
+                .advance(&a.id, S::Quarantined, |a| {
+                    a.failure_kind = Some(IntegrationFailureKind::NeedsFact);
+                    a.failure_message = Some(message.into());
+                })
+                .await?;
+            // The slot and the lease stay with this session. Leaving here
+            // would make the lease expiry the retry clock.
+            self.w.defer_reconcile(&self.queue_id);
+            let now = self.w.clock.now();
+            self.reconcile_at = Some(later(now, self.w.config.reconcile_interval));
+            self.owner_link = self.w.owner.owner_connection(intent_owner(&intent));
+            return Ok(Pass::Wait(
+                self.w.config.poll.min(self.w.config.reconcile_interval),
+            ));
+        }
+        // An unknown result the importer took over: a merge that was in
+        // flight the old way when the server was upgraded. It has no fenced
+        // intent, so no owner receipt will ever settle it, and storage lets
+        // it leave only as `applied` or `quarantined` while the operation is
+        // unknown. Git decides once the checkouts can be read: every owner
+        // was restarted for the upgrade, so nothing started before it still
+        // runs. Until then the head is quarantined with a typed reason and
+        // asked again on the reconcile timer; it never loops on a refused
+        // write.
+        if matches!(
+            a.current_operation_state,
+            Some(IntegrationOperationState::Running | IntegrationOperationState::Uncertain)
+        ) {
+            match &facts {
+                Ok(facts) => {
+                    let landed = landed(&a, facts);
+                    let head = facts.candidate_head.clone();
+                    a = self
+                        .w
+                        .advance(&a.id, S::Reconciling, |a| {
+                            a.current_operation_state =
+                                landed.then_some(IntegrationOperationState::Succeeded);
+                            if landed {
+                                a.candidate_sha = Some(head);
+                            }
+                        })
+                        .await?;
+                }
+                Err(error) => {
+                    let message = format!(
+                        "the result of the merge that was in progress before the upgrade is unknown: {error}"
+                    );
+                    let queue = self.w.queue(&self.queue_id).await?;
+                    if queue.state == IntegrationQueueState::Open {
+                        self.w
+                            .db
+                            .quarantine_integration_queue(
+                                &queue.id,
+                                queue.revision,
+                                &self.w.instance,
+                                self.generation,
+                                IntegrationFailureKind::NeedsFact,
+                                &message,
+                            )
+                            .await?;
+                    }
+                    self.enqueue(&a, IntegrationStepAction::Park).await?;
+                    self.w
+                        .advance(&a.id, S::Quarantined, |a| {
+                            a.failure_kind = Some(IntegrationFailureKind::NeedsFact);
+                            a.failure_message = Some(bounded(&message));
+                        })
+                        .await?;
+                    self.w.defer_reconcile(&self.queue_id);
+                    self.reconcile_at =
+                        Some(later(self.w.clock.now(), self.w.config.reconcile_interval));
+                    return Ok(Pass::Wait(
+                        self.w.config.poll.min(self.w.config.reconcile_interval),
+                    ));
+                }
+            }
+        }
+        self.reconcile_at = None;
+        // Settled. The newest receipt and a Git witness decide.
+        let last = receipts(&a).into_iter().next_back();
+        let merged = last.as_ref().and_then(|receipt| {
+            (receipt.operation_state == IntegrationOperationState::Succeeded
+                && matches!(
+                    receipt.request.kind,
+                    IntegrationOperationKind::FastForward | IntegrationOperationKind::Merge
+                ))
+            .then(|| serde_json::from_value::<OwnerMergeReceipt>(receipt.result.clone()).ok())
+            .flatten()
+        });
+        if let Some(OwnerMergeReceipt::Completed {
+            outcome:
+                MergeOutcome::Done {
+                    before_sha,
+                    after_sha,
+                    ..
+                },
+        }) = merged
+        {
+            self.w
+                .advance(&a.id, S::Applied, |a| {
+                    a.integrated_before_sha = Some(before_sha);
+                    a.integrated_sha = Some(after_sha);
+                    a.failure_kind = None;
+                    a.failure_message = None;
+                    a.deadline = None;
+                })
+                .await?;
+            self.reopen_if_quarantined(&a.id).await?;
+            return Ok(Pass::Progress);
+        }
+        let facts = match facts {
+            Ok(facts) => facts,
+            Err(error) => {
+                return self
+                    .park(&a, ParkReason::Infrastructure, &error.to_string())
+                    .await
+            }
+        };
+        if a.candidate_sha.is_some() && landed(&a, &facts) {
+            let head = facts.candidate_head.clone();
+            self.w
+                .advance(&a.id, S::Applied, |a| {
+                    a.integrated_sha = Some(head);
+                    a.failure_kind = None;
+                    a.failure_message = None;
+                    a.deadline = None;
+                })
+                .await?;
+            self.reopen_if_quarantined(&a.id).await?;
+            return Ok(Pass::Progress);
+        }
+        let rebased = last.as_ref().is_some_and(|receipt| {
+            receipt.request.kind == IntegrationOperationKind::Rebase
+                && receipt.operation_state == IntegrationOperationState::Succeeded
+                && receipt.request.witness["expected_head_sha"].as_str()
+                    == a.candidate_sha.as_deref()
+        });
+        // Proven not landed: back to validation (or to the rebase whose
+        // receipt is still to be applied) at no cost to the Task.
+        let to = if rebased { S::Rebasing } else { S::Queued };
+        self.w
+            .advance(&a.id, to, |a| {
+                a.permit_json = None;
+                a.deadline = None;
+                a.failure_kind = None;
+                a.failure_message = None;
+            })
+            .await?;
+        self.reopen_if_quarantined(&a.id).await?;
+        let a = self.w.attempt(&a.id).await?;
+        // `start` counts the round of a re-queued head itself.
+        Ok(self
+            .new_round(&a, None, rebased)
+            .await?
+            .unwrap_or(Pass::Progress))
+    }
+
+    async fn reopen_if_quarantined(&self, attempt_id: &str) -> Result<()> {
+        let queue = self.w.queue(&self.queue_id).await?;
+        if queue.state == IntegrationQueueState::Quarantined {
+            let head = self.w.attempt(attempt_id).await?;
+            self.w.reopen(&queue, &head).await?;
+        }
+        Ok(())
+    }
+
+    async fn await_result(
+        &mut self,
+        a: IntegrationAttempt,
+        queue: &IntegrationQueue,
+    ) -> Result<Pass> {
+        let action = IntegrationStepAction::Result;
+        if !self.enqueued.contains(&(a.effect_seq, action)) {
+            // Idempotent: `settle` pre-enqueued the same causation key.
+            self.enqueue(&a, action).await?;
+            self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
+        }
+        let now = self.w.clock.now();
+        let answer = IntegrationStepAck::current(&a, action);
+        if let Some(answer) = answer
+            .as_ref()
+            .filter(|answer| answer.outcome == IntegrationStepOutcome::NotLanded)
+        {
+            // The Task was not reported merged. The recorded result is
+            // dropped with the slot; the next validation reads the target.
+            let detail = answer
+                .message
+                .clone()
+                .unwrap_or_else(|| "the target does not contain the merged commit".into());
+            let a = self
+                .w
+                .advance(&a.id, S::Applied, |a| {
+                    a.integrated_sha = None;
+                    a.integrated_before_sha = None;
+                })
+                .await?;
+            return self.park(&a, ParkReason::NotLanded, &detail).await;
+        }
+        let mut done = answer.is_some();
+        let due = self
+            .result_checked
+            .is_none_or(|at| now >= later(at, self.w.config.sweep_interval));
+        if !done && due {
+            // Re-armed on every sweep interval while the attempt is `applied`
+            // without its acknowledgment: a `result` step that hit an error
+            // parked itself for `result_park`, and the merge has landed.
+            self.w.steps.ready_result_step(&a.id, a.effect_seq).await?;
+            // The other exit: the Task has left `merging` (the result step
+            // advanced it and died before its acknowledgment).
+            if self.result_checked.is_some() {
+                done = self
+                    .facts(&a, queue)
+                    .await
+                    .is_ok_and(|facts| facts.gate == TaskGate::Left);
+            }
+            self.result_checked = Some(now);
+        }
+        if !done {
+            return Ok(Pass::Wait(self.w.config.poll));
+        }
+        self.close_timings(&a).await?;
+        self.w.advance(&a.id, S::Completed, |_| {}).await?;
+        Ok(Pass::Released)
+    }
+}

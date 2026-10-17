@@ -4,6 +4,20 @@ import type { DefaultRoleAssignment } from "./DefaultRoleAssignment";
 import type { LifecycleEvent } from "./LifecycleEvent";
 import type { LifecycleHookDef } from "./LifecycleHookDef";
 import type { ProjectEnvironment } from "./ProjectEnvironment";
+import type { ProjectPlacementSettings } from "./ProjectPlacementSettings";
 import type { RetryBudgets } from "./RetryBudgets";
+import type { ReviewCiTriage } from "./ReviewCiTriage";
 
-export type ProjectSettings = { retry_budgets: RetryBudgets, default_role_assignments: Array<DefaultRoleAssignment>, lifecycle_hooks: { [key in LifecycleEvent]?: Array<LifecycleHookDef> }, automatic_recovery: AutomaticRecoverySettings, environment: ProjectEnvironment, };
+export type ProjectSettings = { 
+/**
+ * How failed review and queue-head CI is triaged. Existing Projects default to full.
+ */
+review_ci_triage: ReviewCiTriage, 
+/**
+ * Use the next configured fallback for a carried-finding repair only.
+ */
+repair_switch_model_when_stuck?: boolean, 
+/**
+ * Maximum unparked Tasks in active/gate states; 0 disables the limit.
+ */
+max_active_tasks: number, retry_budgets: RetryBudgets, default_role_assignments: Array<DefaultRoleAssignment>, lifecycle_hooks: { [key in LifecycleEvent]?: Array<LifecycleHookDef> }, automatic_recovery: AutomaticRecoverySettings, environment: ProjectEnvironment, placement: ProjectPlacementSettings, };

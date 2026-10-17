@@ -1,15 +1,13 @@
-import { ArrowClockwise, Play, Spinner, WarningCircle } from '@phosphor-icons/react'
+import { ArrowClockwise, Spinner, WarningCircle } from '@phosphor-icons/react'
 
 import { Button } from '@/components/ui/button'
-import type { Execution } from '@/types/generated'
+import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
+import type { Execution, Offer } from '@/types/generated'
 
 type LivenessActions = {
   onRefresh?: () => void
   refreshPending?: boolean
-  onContinue?: () => void
-  continuePending?: boolean
-  onRetry?: () => void
-  retryPending?: boolean
+
 }
 
 type NoticeKind =
@@ -125,59 +123,28 @@ export function getExecutionLivenessNotice(execution: Execution): NoticeState | 
   return null
 }
 
-function actionForNotice(state: NoticeState, actions: LivenessActions, isRunning: boolean) {
-  if (isRunning && actions.onRefresh) {
-    return actions.onRefresh
-      ? {
-          label: 'Refresh run',
-          pending: actions.refreshPending,
-          onClick: actions.onRefresh,
-          icon: <ArrowClockwise size={14} aria-hidden />,
-        }
-      : null
-  }
-
-  if (
-    state.kind === 'deadline' ||
-    state.kind === 'lease_expired' ||
-    state.kind === 'owner_recovery' ||
-    state.kind === 'owner_disconnected'
-  ) {
-    if (actions.onContinue) {
-      return {
-        label: 'Continue session',
-        pending: actions.continuePending,
-        onClick: actions.onContinue,
-        icon: <Play size={14} aria-hidden />,
-      }
-    }
-    if (actions.onRetry) {
-      return {
-        label: 'Retry run',
-        pending: actions.retryPending,
-        onClick: actions.onRetry,
-        icon: <ArrowClockwise size={14} aria-hidden />,
-      }
-    }
-  }
-
-  return null
+function actionForNotice(actions: LivenessActions) {
+  return actions.onRefresh ? { label: 'Refresh run', pending: actions.refreshPending, onClick: actions.onRefresh, icon: <ArrowClockwise size={14} aria-hidden /> } : null
 }
 
 export function ExecutionLivenessNotice({
   execution,
   actions = {},
   nextActionLabel,
+  offers = [],
+  taskVersion,
 }: {
   execution: Execution
   actions?: LivenessActions
+  offers?: Offer[]
+  taskVersion?: number
   nextActionLabel?: string
 }) {
   const state = getExecutionLivenessNotice(execution)
   if (!state) return null
 
   const terminal = execution.status !== 'running'
-  const action = actionForNotice(state, actions, !terminal)
+  const action = actionForNotice(actions)
   const interruption = execution.interruption
   const interruptionReason = interruptionText(execution)
   const ownerHealth = execution.owner_health
@@ -304,6 +271,7 @@ export function ExecutionLivenessNotice({
           ) : null}
         </div>
       </div>
+      {taskVersion != null ? <TaskActionButtons taskId={execution.task_id} version={taskVersion} offers={offers} /> : null}
       <span className="sr-only">
         {action
           ? `Next action: ${action.label}.`

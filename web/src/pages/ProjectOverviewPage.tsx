@@ -24,6 +24,7 @@ import {
   useReleaseProjectMilestone,
 } from '@/api/hooks'
 import { ConflictDetails } from '@/components/conflict-details'
+import { ProjectFlowHeader } from '@/components/project-flow-status'
 import { Button } from '@/components/ui/button'
 import { buttonClassName } from '@/components/ui/button-styles'
 import { Card } from '@/components/ui/card'
@@ -1876,6 +1877,9 @@ export function ProjectOverviewPage({ projectId }: { projectId: string }) {
             <h1 className="mt-2 break-words text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
               {overview.project_name}
             </h1>
+            <div className="mt-3">
+              <ProjectFlowHeader key={projectId} projectId={projectId} />
+            </div>
             <p className="mt-2 max-w-3xl break-words text-sm leading-6 text-muted-foreground">
               {overview.vision}
             </p>

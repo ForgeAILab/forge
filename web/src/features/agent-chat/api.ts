@@ -16,6 +16,7 @@ import type {
   AgentHandoffInput,
   AgentChatSwitcher,
   AgentChatTurnCancelInput,
+  AgentChatTurnRetryInput,
 } from './types'
 import type { AgentChatSwitcherResponse } from '@/types/generated/bindings/AgentChatSwitcherResponse'
 
@@ -24,6 +25,7 @@ export const agentChatApiPaths = {
   chat: (chatId: string) => `/agent-chats/${chatId}`,
   messages: (chatId: string) => `/agent-chats/${chatId}/messages`,
   turns: (chatId: string) => `/agent-chats/${chatId}/turns`,
+  retryTurn: (chatId: string, turnId: string) => `/agent-chats/${chatId}/turns/${turnId}/retry`,
   cancelTurn: (chatId: string, turnId: string) => `/agent-chats/${chatId}/turns/${turnId}/cancel`,
   turnLogs: (chatId: string, turnId: string) => `/agent-chats/${chatId}/turns/${turnId}/logs`,
   handoffs: (projectId: string) => `/projects/${projectId}/agent-handoffs`,
@@ -142,4 +144,15 @@ export function createAgentHandoff(
 
 export function getAgentHandoff(projectId: string, handoffId: string): Promise<AgentHandoff> {
   return apiFetch<AgentHandoff>(agentChatApiPaths.handoff(projectId, handoffId))
+}
+
+export function retryAgentChatTurn(
+  chatId: string,
+  turnId: string,
+  input: AgentChatTurnRetryInput,
+): Promise<AgentChatTurnJobResponse> {
+  return apiFetch<AgentChatTurnJobResponse>(agentChatApiPaths.retryTurn(chatId, turnId), {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
 }

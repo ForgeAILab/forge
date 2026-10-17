@@ -9,8 +9,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{task::JoinHandle, time::sleep};
-use tracing::Instrument;
+use tokio::time::sleep;
 
 const SHUTDOWN_ERROR_TYPE: &str = "shutdown";
 
@@ -47,18 +46,12 @@ impl GracefulShutdown {
         tracing::info!("graceful shutdown started");
         sleep(transaction_drain_wait()).await;
 
-        let rows = sqlx::query(
-            "SELECT id, project_id FROM task WHERE status = 'in_progress' AND deleted_at IS NULL",
-        )
-        .fetch_all(self.db.pool())
-        .await?;
+        let rows = self.db.shutdown_in_progress_task_sources().await?;
         let in_progress_count = rows.len();
 
         for row in rows {
-            use sqlx::Row;
-
-            let id: String = row.get("id");
-            let project_id: String = row.get("project_id");
+            let id: String = row.id();
+            let project_id: String = row.project_id();
 
             self.cancel_executor_processes_for_task(&id).await?;
             let _cancelled = cancel_running_executions(
@@ -93,14 +86,9 @@ impl GracefulShutdown {
         let Some(task_executor) = self.task_executor.as_ref() else {
             return Ok(());
         };
-        let rows = sqlx::query("SELECT id FROM execution WHERE task_id = ? AND status = 'running'")
-            .bind(task_id)
-            .fetch_all(self.db.pool())
-            .await?;
+        let rows = self.db.shutdown_running_execution_sources(task_id).await?;
         for row in rows {
-            use sqlx::Row;
-
-            let execution_id: String = row.get("id");
+            let execution_id: String = row.id();
             if let Err(error) = task_executor.cancel(&execution_id).await {
                 tracing::warn!(
                     task_id = %task_id,
@@ -112,19 +100,6 @@ impl GracefulShutdown {
         }
         Ok(())
     }
-}
-
-pub fn install_signal_handler(shutdown: Arc<GracefulShutdown>) -> JoinHandle<()> {
-    tokio::spawn(
-        async move {
-            tracing::info!("shutdown signal handler installed");
-            if tokio::signal::ctrl_c().await.is_ok() {
-                tracing::info!("shutdown signal received");
-                let _ = shutdown.shutdown().await;
-            }
-        }
-        .instrument(tracing::info_span!("shutdown.signal_handler")),
-    )
 }
 
 #[cfg(not(test))]
@@ -207,7 +182,6 @@ mod tests {
                 name: "forge".to_owned(),
                 remote_url: Some("https://example.com/forge.git".to_owned()),
                 local_path: None,
-                work_mode: db::WorkMode::DirectMerge,
                 default_branch: "main".to_owned(),
                 created_at: now.clone(),
                 updated_at: now,
@@ -243,6 +217,7 @@ mod tests {
         DaemonRepo::upsert_by_machine_id(
             db,
             UpsertDaemon {
+                max_concurrent_runs: None,
                 id: daemon_id.clone(),
                 machine_id: format!("machine-{daemon_id}"),
                 hostname: "test-host".to_owned(),

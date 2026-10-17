@@ -1,3 +1,4 @@
+import type { Task } from '@/types/generated'
 import { useEffect, useMemo, useState, type KeyboardEvent } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { toast } from 'sonner'
@@ -6,12 +7,8 @@ import { ErrorBanner } from '@/components/error-banner'
 import { cn } from '@/lib/cn'
 import {
   useAgentsQuery,
-  useApproveGate,
-  useCancelTask,
-  useRejectGate,
   useResetTaskWorkspace,
   useReviewsQuery,
-  useRecoverTask,
   useTaskDetailQuery,
   useTransitionTask,
   useUpdateTask,
@@ -33,11 +30,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getAvailableTaskTransitions } from '@/components/task-controls'
-import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
+import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
-import { getBlockingAnnotation } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
-import type { Review, WorkflowExceptionAction } from '@/types/generated'
+import type { Review } from '@/types/generated'
 
 function formatDate(value?: string | null): string {
   if (!value) return '-'
@@ -54,10 +50,10 @@ function getLatestReview(reviews: Review[]): Review | undefined {
 }
 
 function getErrorInfo(
-  task: { error_annotation?: unknown } | undefined,
+  task: Task | undefined,
 ): { tone: 'timeout' | 'crash' | 'workspace'; message: string } | undefined {
   if (!task) return undefined
-  const annotation = task.error_annotation as
+  const annotation = task.condition.details.diagnostic as
     | { blocking_reason?: unknown; kind?: unknown; type?: unknown; message?: unknown }
     | undefined
   if (!annotation) return undefined
@@ -91,10 +87,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   const agentsQuery = useAgentsQuery({ enabled: open })
   const updateTask = useUpdateTask()
   const transitionTask = useTransitionTask()
-  const approveGate = useApproveGate()
-  const rejectGate = useRejectGate()
-  const cancelTask = useCancelTask()
-  const recoverTask = useRecoverTask()
 
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
@@ -235,70 +227,17 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             toast.error(msg)
             return
           }
+          if (notifyTaskBusy(error)) return
           toast.error(getApiErrorMessage(error, 'Transition failed'))
         },
       },
     )
   }
 
-  const onRecoverTask = (
-    action: Parameters<typeof recoverTask.mutate>[0]['action'],
-    input?: { reason?: string; context?: string },
-  ) => {
-    if (!task) return
-    recoverTask.mutate(
-      { taskId: task.id, action, reason: input?.reason, context: input?.context },
-      {
-        onError: (error) => toast.error(getApiErrorMessage(error, 'Task recovery failed')),
-      },
-    )
-  }
 
-  const onOpenWorkflowExceptionAction = (action: WorkflowExceptionAction) => {
-    if (!task) return
-    onClose()
-    if (action.target_execution_id) {
-      void navigate({
-        to: '/tasks/$taskId/executions/$executionId',
-        params: { taskId: task.id, executionId: action.target_execution_id },
-        search: { followUp: true },
-      })
-      return
-    }
-    void navigate({ to: '/tasks/$taskId', params: { taskId: task.id } })
-  }
 
-  const onCancelTask = () => {
-    if (!task) return
-    cancelTask.mutate(task.id, {
-      onError: (error) => toast.error(getApiErrorMessage(error, 'Task cancellation failed')),
-    })
-  }
 
-  const onApproveGate = (stateName: string) => {
-    if (!task) return
-    const blockingAnnotation = getBlockingAnnotation(task)
-    if (
-      task.status === 'blocked' &&
-      stateName === 'blocked' &&
-      blockingAnnotation?.recovery_actions?.includes('retry_hook')
-    ) {
-      onRecoverTask('retry_hook')
-      return
-    }
-    approveGate.mutate(
-      { taskId: task.id, stateName, body: { version: task.version } },
-      { onError: (error) => toast.error(getApiErrorMessage(error, 'Gate approval failed')) },
-    )
-  }
 
-  const onRejectGate = (stateName: string, reason: string) => {
-    if (!task) return
-    rejectGate.mutate(
-      { taskId: task.id, stateName, body: { version: task.version, reason } },
-      { onError: (error) => toast.error(getApiErrorMessage(error, 'Gate rejection failed')) },
-    )
-  }
 
   const openFullPage = () => {
     onClose()
@@ -309,7 +248,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     task?.status === 'review' ||
     Boolean(task && task.role_assignments.some((r) => r.role_name === 'reviewer'))
   const cancellationState = workflow?.cancellation_state ?? 'cancelled'
-  const terminal = task?.status === 'done' || task?.status === cancellationState
   const hiddenTransitions = [cancellationState, 'merging']
   const availableTransitions = (
     workflow && task
@@ -375,7 +313,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                     <ModalWorkspaceErrorBanner
                       taskId={taskId}
                       errorInfo={errorInfo}
-                      needsReset={task.error_annotation?.type === 'workspace_reset_required'}
+                      needsReset={task.condition.details.diagnostic?.type === 'workspace_reset_required'}
                     />
                   ) : (
                     <div
@@ -391,16 +329,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   )
                 ) : null}
 
-                <WorkflowExceptionPanel
-                  task={task}
-                  actions={task.workflow_exception?.actions ?? []}
-                  recoverPending={recoverTask.isPending}
-                  terminal={terminal}
-                  cancelPending={cancelTask.isPending}
-                  onRecover={onRecoverTask}
-                  onOpenInteractive={onOpenWorkflowExceptionAction}
-                  onCancelTask={onCancelTask}
-                />
+                <WorkflowExceptionPanel task={task} />
                 {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
                 <div>
@@ -541,7 +470,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             agents={agents}
             agentName={agentName}
             availableTransitions={availableTransitions}
-            cancelTask={cancelTask}
             executions={executions}
             formatDate={formatDate}
             isLoading={taskDetailQuery.isLoading}
@@ -550,11 +478,9 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             setPriorityDraft={setPriorityDraft}
             task={task}
             transitionPending={
-              transitionTask.isPending || approveGate.isPending || rejectGate.isPending
+              transitionTask.isPending
             }
             workflow={workflow}
-            onApproveGate={onApproveGate}
-            onRejectGate={onRejectGate}
             onStatusChange={onStatusChange}
           />
         </div>

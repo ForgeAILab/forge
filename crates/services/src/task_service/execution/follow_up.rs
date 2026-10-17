@@ -66,6 +66,17 @@ impl TaskService {
         prompt: String,
         trigger: &str,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up",
+                    serde_json::json!([task_id, role, parent_execution_id, prompt, trigger]),
+                    false,
+                )
+                .await;
+        }
+
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),
@@ -92,6 +103,23 @@ impl TaskService {
         trigger: &str,
         admission: db::ExecutionAdmission,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up_with_admission",
+                    serde_json::json!([
+                        task_id,
+                        role,
+                        parent_execution_id,
+                        prompt,
+                        trigger,
+                        admission
+                    ]),
+                    false,
+                )
+                .await;
+        }
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),
@@ -114,6 +142,23 @@ impl TaskService {
         prompt: String,
         trigger: &str,
     ) -> Result<Execution> {
+        if !db::task_writer::owns_task(task_id) {
+            return self
+                .request_task_command(
+                    task_id,
+                    "dispatch_role_follow_up_with_agent",
+                    serde_json::json!([
+                        task_id,
+                        role,
+                        parent_execution_id,
+                        agent_id,
+                        prompt,
+                        trigger
+                    ]),
+                    false,
+                )
+                .await;
+        }
         dispatch_role_follow_up_impl(
             self.clone(),
             task_id.to_owned(),
@@ -256,7 +301,7 @@ fn dispatch_role_follow_up_impl(
         let agent = AgentRepo::get_by_id(&*service.db, &agent_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("agent", agent_id.clone()))?;
-        let admission = if let Some(admission) = admission_override {
+        let mut admission = if let Some(admission) = admission_override {
             // The dispatch action can pass the same Task/assignment/Review
             // snapshot that produced its prompt. Never replace those facts
             // with a later repository read here.
@@ -318,6 +363,10 @@ fn dispatch_role_follow_up_impl(
             }
             admission
         };
+        // Purpose is established at admission, never inferred from summary or
+        // inherited from the parent's attempt.
+        admission.purpose = (trigger == "automatic_review_recovery")
+            .then_some(api_types::ExecutionPurpose::AutomaticReviewRecovery);
         let durable_parent_execution_id = if role == crate::workflow::default_roles::REVIEWER {
             admission
                 .expected_reviewer_parent_execution_id
@@ -381,6 +430,7 @@ fn dispatch_role_follow_up_impl(
                 },
                 false,
                 Some(admission),
+                None,
             )
             .await?;
 
@@ -420,8 +470,12 @@ pub(super) async fn assigned_agent_for_role(
     task_id: &str,
     role: &str,
 ) -> Result<Option<String>> {
-    let assignment =
-        TaskRoleAssignmentRepo::get_by_task_and_role(&*service.db, task_id, role).await?;
+    let task = TaskRepo::get_by_id(&*service.db, task_id, false)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
+    let assignment = crate::task_hierarchy::effective_role_assignment(&service.db, &task, role)
+        .await?
+        .map(|resolved| resolved.assignment);
     Ok(assignment.and_then(|assignment| {
         (assignment.assignee_type == Some(AssigneeKind::Agent))
             .then_some(assignment.assignee_id)

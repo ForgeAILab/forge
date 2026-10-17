@@ -290,16 +290,6 @@ pub fn resolve_git_repository(path: &Path) -> Result<GitRepository> {
     })
 }
 
-/// Resolve a repository and read/create its stable Solo identifier.
-pub fn resolve_repository(path: &Path) -> Result<SoloRepository> {
-    let git = resolve_git_repository(path)?;
-    let marker = read_or_create_marker(&git.git_common_dir)?;
-    Ok(SoloRepository {
-        git,
-        repository_id: marker.repository_id,
-    })
-}
-
 /// Return the marker path for a canonical Git common directory.
 #[must_use]
 pub fn marker_path(git_common_dir: &Path) -> PathBuf {
@@ -446,12 +436,6 @@ fn validate_marker_file_metadata(path: &Path, metadata: &fs::Metadata) -> Result
     Ok(())
 }
 
-/// Read/create the stable repository identifier when callers do not need the
-/// marker version in the result.
-pub fn read_or_create_repository_id(git_common_dir: &Path) -> Result<Uuid> {
-    Ok(read_or_create_marker(git_common_dir)?.repository_id)
-}
-
 fn parse_marker(path: &Path, contents: &str) -> Result<SoloIdMarker> {
     if !contents.ends_with('\n') {
         return Err(RepositoryError::MarkerMalformed {
@@ -582,15 +566,6 @@ fn primary_worktree_from_list(path: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn managed_worktree_root(worktree: &Path) -> Option<PathBuf> {
-    if let Some(configured_root) = std::env::var_os("FORGE_WORKSPACE_ROOT") {
-        let configured_root = PathBuf::from(configured_root);
-        if let Ok(configured_root) = fs::canonicalize(configured_root) {
-            if worktree.starts_with(&configured_root) && worktree != configured_root {
-                return Some(configured_root);
-            }
-        }
-    }
-
     // WorkspaceManager places `.forge.lock` beside each task worktree. Walk
     // only ancestors of the resolved root so a tracked `.forge.lock` inside
     // the source checkout cannot trigger this check accidentally.
@@ -742,23 +717,6 @@ mod tests {
         );
         let second = read_or_create_marker(&resolved.git_common_dir).expect("marker resumes");
         assert_eq!(first, second);
-    }
-
-    #[test]
-    fn resolve_repository_returns_stable_id() {
-        let (_root, repo) = repository();
-        let first = resolve_repository(&repo).expect("first resolve");
-        let second = resolve_repository(&repo).expect("second resolve");
-        assert_eq!(first.repository_id, second.repository_id);
-        assert_eq!(first.git, second.git);
-    }
-
-    #[test]
-    fn non_git_path_fails_before_marker_creation() {
-        let root = TempDir::new().expect("temporary root");
-        let error = resolve_repository(root.path()).expect_err("not a git repository");
-        assert!(matches!(error, RepositoryError::NotGitRepository { .. }));
-        assert!(!root.path().join(SOLO_ID_MARKER_FILE).exists());
     }
 
     #[test]

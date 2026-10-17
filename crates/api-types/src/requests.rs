@@ -7,8 +7,7 @@ use crate::{
     LifecycleEvent,
 };
 use crate::{
-    InitialRoleAssignment, RecoveryAction, ReviewConfig, TaskGovernanceRequest, TaskStatus,
-    TaskType, WorkMode,
+    InitialRoleAssignment, ReviewConfig, TaskAction, TaskGovernanceRequest, TaskStatus, TaskType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,32 +117,11 @@ pub enum TransitionSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct RecoverTaskRequest {
-    /// Applied immediately, or queued for dispatch when agent capacity is full.
-    pub action: RecoveryAction,
-    pub reason: Option<String>,
-    pub context: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct TaskActionRequest {
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    pub version: Option<i64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApproveGateRequest {
-    pub reason: Option<String>,
-    pub version: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectGateRequest {
-    pub reason: String,
+    pub action: TaskAction,
+    #[ts(type = "number")]
     pub version: i64,
 }
 
@@ -184,18 +162,17 @@ pub struct TestLifecycleHookRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct CreateRepoRequest {
     pub remote_url: Option<String>,
     pub local_path: Option<String>,
     pub name: Option<String>,
     pub default_branch: Option<String>,
-    pub work_mode: Option<WorkMode>,
-    pub pr_provider: Option<String>,
-    pub pr_provider_config: Option<PrProviderConfigRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct UpdateRepoRequest {
     #[ts(optional = nullable)]
@@ -214,8 +191,6 @@ pub struct UpdateRepoRequest {
     pub local_path: Option<Option<String>>,
     #[ts(optional = nullable)]
     pub default_branch: Option<String>,
-    #[ts(optional = nullable)]
-    pub work_mode: Option<WorkMode>,
 }
 
 fn deserialize_optional_update_field<'de, D, T>(
@@ -243,10 +218,12 @@ where
         .map_err(serde::de::Error::custom)
 }
 
+/// Stop exactly one execution, including an interactive side session.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
 #[ts(export)]
-pub struct PrProviderConfigRequest {
-    pub base_url: Option<String>,
-    pub polling_interval_seconds: Option<i64>,
-    pub token: Option<String>,
+pub struct StopExecutionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reason: Option<String>,
 }

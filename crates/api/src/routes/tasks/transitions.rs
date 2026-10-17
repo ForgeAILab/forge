@@ -4,9 +4,17 @@ use api_types::{Actor, UserActionSource};
 
 pub async fn transition_task(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<TransitionTaskRequest>,
 ) -> ApiResult<Json<TransitionTaskResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let mut options = TransitionOptions::from((request.version, request.reason));
     if request.source == Some(TransitionSource::BoardDrag) {
         options.triggered_by = Actor::user(UserActionSource::BoardDrag);
@@ -20,9 +28,15 @@ pub async fn transition_task(
         .task_service
         .is_task_awaiting_human(&result.task)
         .await?;
-    let response =
-        task_response_with_awaiting_human(&state.db, result.task, awaiting_human).await?;
+    let response = task_response_with_awaiting_human(
+        &state.db,
+        &state.workspace_backend_router,
+        result.task,
+        awaiting_human,
+    )
+    .await?;
     Ok(Json(TransitionTaskResponse {
+        pending_steps: result.pending_steps,
         task: response,
         review: result
             .review
@@ -33,8 +47,16 @@ pub async fn transition_task(
 
 pub async fn list_transitions(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TransitionLogListResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let entries = TransitionLogRepo::list_by_task(&*state.db, &id)
         .await?
         .into_iter()

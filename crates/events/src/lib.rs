@@ -6,6 +6,9 @@ use tokio::sync::broadcast;
 pub const PROJECT_HOOK_RUN_CHANGED_EVENT: &str = "project_hook.run_changed";
 pub const OPERATIONS_STATUS_CHANGED_EVENT: &str = "operations.status_changed";
 pub const TASK_MOVED_EVENT: &str = "task.moved";
+/// Cache invalidation only: a merge queue, or one member of it, changed.
+/// Never recorded in the domain-event ledger and never an Attention input.
+pub const INTEGRATION_UPDATED_EVENT: &str = "integration.updated";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForgeEvent {
@@ -304,10 +307,12 @@ pub enum EventContext {
         guard_name: String,
         reason: String,
     },
-    TransitionCascadeDepthExceeded {
+    TransitionLoopDetected {
         task_id: String,
         state: String,
-        depth: u8,
+        chain_id: String,
+        chain_position: i64,
+        reason: String,
     },
     TaskRoleNotified {
         task_id: String,
@@ -326,6 +331,16 @@ pub enum EventContext {
     },
     OperationsStatusChanged {
         trigger: String,
+    },
+    /// One per queue and read of the projector. `task_id` is the one member
+    /// whose summary changed; `null` when several did or the queue itself
+    /// did. `project_ids` are the Projects of the members concerned. Ids
+    /// only: no title, branch or machine name travels on the bus.
+    IntegrationUpdated {
+        repo_id: String,
+        queue_id: String,
+        task_id: Option<String>,
+        project_ids: Vec<String>,
     },
     ProjectHookRunChanged {
         project_id: String,

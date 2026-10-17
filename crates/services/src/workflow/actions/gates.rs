@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use db::{TaskDependencyRepo, TaskRepo, TaskRoleAssignmentRepo, TransitionLogRepo, WorkspaceRepo};
+use db::{TaskDependencyRepo, TaskRepo, TransitionLogRepo, WorkspaceRepo};
 
 use crate::workflow::{
     default_states, effective_role, engine::WorkflowEngine, HookAction, HookContext, HookResult,
@@ -40,6 +40,8 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             Ok(assignment) => assignment,
             Err(reason) => return HookResult::Failed { reason },
         };
+        // The resolver decides who holds the role (a subtask's step check:
+        // its root's lead); an Agent or a person with an id holds it.
         if assignment
             .as_ref()
             .is_some_and(|assignment| assignment.assignee_id.is_some())
@@ -49,22 +51,19 @@ impl HookAction for AutoCascadeOnUnassignedRole {
             };
         }
 
-        let target = ctx
-            .workflow
-            .outgoing_trigger_targets(&ctx.to_state)
-            .filter(|(trigger, _)| !trigger.system_only())
-            .find_map(|(_, to)| {
-                ctx.workflow
-                    .states
-                    .iter()
-                    .find(|state| state.name == to && state.kind == api_types::StateKind::Active)
-                    .map(|state| state.name.clone())
-            });
+        // An implementation state, or the terminal state the gate accepts
+        // into (a step check in front of `done`); never cancellation.
+        let target = crate::workflow::optional_gate_skip_target(&ctx.workflow, &ctx.to_state)
+            .map(|state| state.name.clone());
 
         match target {
             Some(to) => HookResult::Cascade {
                 to,
-                reason: format!("gate skipped: no {role_name} role assigned"),
+                reason: format!("No {role_name} role assigned; optional gate skipped"),
+
+                bridge: api_types::TransitionBridge::new(
+                    api_types::TransitionBridgeKind::GateSkipped,
+                ),
             },
             None => HookResult::Skipped {
                 reason: format!("no active transition for unassigned {role_name} role"),
@@ -78,72 +77,86 @@ pub struct CheckRetryBudget;
 #[async_trait]
 impl HookAction for CheckRetryBudget {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let (max_rejections, count) = if ctx.to_state == default_states::REVIEW {
+        let is_review = ctx
+            .workflow
+            .states
+            .iter()
+            .any(|state| state.name == ctx.to_state && db::budget::is_review_state(state));
+        let (max_rejections, count) = if is_review {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },
             };
-            let budget = match crate::task_service::config::runtime_retry_budget(
+            let budget = match db::budget::limit(
                 &task,
-                crate::task_service::config::RetryBudgetKind::Review,
+                db::budget::Kind::Review,
                 Some(&ctx.state_config),
                 ctx.gate_config.as_ref(),
             ) {
                 Ok(budget) => budget,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     };
                 }
             };
-            let entries = match TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id).await {
-                Ok(entries) => entries,
+            let count = match db::budget::spent(
+                ctx.db.pool(),
+                &ctx.task_id,
+                db::budget::Kind::Review.key(),
+            )
+            .await
+            {
+                Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("retry budget unavailable: {error}"),
-                    };
+                        reason: crate::workflow::hook_error_reason(error),
+                    }
                 }
             };
-            let count = crate::task_diagnostics::count_gate_rejections_since_boundary(
-                &entries,
-                default_states::REVIEW,
-            );
             (budget, count)
         } else {
             let Some(gate_config) = &ctx.gate_config else {
                 return HookResult::Ok;
             };
-            let Some(max_rejections) = gate_config.max_rejections else {
+            let Some(_) = gate_config.max_rejections else {
                 return HookResult::Ok;
             };
-            let count = match crate::task_diagnostics::count_gate_rejections_for_task(
-                &ctx.db,
+            let budget_task = match task(ctx).await {
+                Ok(t) => t,
+                Err(reason) => return HookResult::Failed { reason },
+            };
+            let max_rejections = match db::budget::limit(
+                &budget_task,
+                db::budget::Kind::GateRejection,
+                Some(&ctx.state_config),
+                Some(gate_config),
+            ) {
+                Ok(n) => n,
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: crate::workflow::hook_error_reason(error),
+                    }
+                }
+            };
+            let count = match db::budget::spent(
+                ctx.db.pool(),
                 &ctx.task_id,
-                &ctx.to_state,
+                &db::budget::gate_key(&ctx.to_state),
             )
             .await
             {
-                Ok(count) => count,
+                Ok(n) => n,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("retry budget unavailable: {error}"),
-                    };
+                        reason: crate::workflow::hook_error_reason(error),
+                    }
                 }
             };
             (max_rejections, count)
         };
 
-        if count >= i64::from(max_rejections) {
-            if ctx.to_state == default_states::REVIEW {
-                tracing::debug!(
-                    task_id = %ctx.task_id,
-                    state = %ctx.to_state,
-                    rejections = count,
-                    budget = i64::from(max_rejections),
-                    "review retry budget exhausted on gate entry; deferring enforcement until review failure"
-                );
-                return HookResult::Ok;
-            }
+        if db::budget::gate_entry_exhausted(is_review, i64::from(max_rejections), count) {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },
@@ -172,7 +185,7 @@ impl HookAction for CheckRetryBudget {
             .await
             {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
             return HookResult::Ok;
@@ -203,7 +216,7 @@ impl HookAction for RequirePlanChecklistComplete {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         };
@@ -217,7 +230,7 @@ impl HookAction for RequirePlanChecklistComplete {
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }
@@ -235,27 +248,55 @@ impl HookAction for RequirePlanChecklistComplete {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("workspace unavailable: {error}"),
+                    reason: format!(
+                        "workspace unavailable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
 
-        let artifact = match crate::plan_artifact::read_plan_artifact(
-            std::path::Path::new(&workspace.worktree_path),
-            None,
-        ) {
-            Ok(artifact) => artifact,
-            Err(crate::plan_artifact::PlanArtifactError::NotFound) => {
+        let resolved = match super::review::resolve_workspace(ctx, &workspace).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: format!(
+                        "plan checklist unreadable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
+                };
+            }
+        };
+        let bytes = match resolved
+            .backend
+            .read(&resolved.placement, "../plan.md", 1_048_576)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(crate::workspace_backend::WorkspaceBackendError::Other(error)) if matches!(&*error, crate::ServiceError::InvalidOperation { message } if message == "plan artifact not found") =>
+            {
                 return HookResult::Skipped {
                     reason: "no plan checklist".to_string(),
                 };
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: format!("plan checklist unreadable: {error}"),
+                    reason: format!(
+                        "plan checklist unreadable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
+        let content = match String::from_utf8(bytes) {
+            Ok(content) => content,
+            Err(_) => {
+                return HookResult::Failed {
+                    reason: "plan checklist unreadable: failed to read plan artifact: stream did not contain valid UTF-8".to_owned(),
+                };
+            }
+        };
+        let artifact = crate::plan_artifact::parse_plan_markdown(&content);
         let summary = crate::plan_artifact::to_plan_progress_summary(&artifact);
         if summary.total == 0 || summary.remaining == 0 {
             return HookResult::Ok;
@@ -316,7 +357,10 @@ impl HookAction for DependencyGate {
                 Ok(deps) => deps,
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("dependency check failed: {error}"),
+                        reason: format!(
+                            "dependency check failed: {}",
+                            crate::workflow::hook_error_reason(error)
+                        ),
                     };
                 }
             };
@@ -337,7 +381,10 @@ impl HookAction for DependencyGate {
                 Ok(_) => {}
                 Err(error) => {
                     return HookResult::Failed {
-                        reason: format!("dependency check failed: {error}"),
+                        reason: format!(
+                            "dependency check failed: {}",
+                            crate::workflow::hook_error_reason(error)
+                        ),
                     };
                 }
             }
@@ -359,7 +406,7 @@ impl HookAction for DependencyGate {
                 .await
                 {
                     return HookResult::Failed {
-                        reason: error.to_string(),
+                        reason: crate::workflow::hook_error_reason(error),
                     };
                 }
             }
@@ -391,7 +438,10 @@ impl HookAction for RequireUpstreamRolesCompleted {
             Ok(logs) => logs,
             Err(error) => {
                 return HookResult::Skipped {
-                    reason: format!("transition log unavailable: {error}"),
+                    reason: format!(
+                        "transition log unavailable: {}",
+                        crate::workflow::hook_error_reason(error)
+                    ),
                 };
             }
         };
@@ -407,17 +457,14 @@ impl HookAction for RequireUpstreamRolesCompleted {
                 continue;
             };
 
-            let assignment =
-                match TaskRoleAssignmentRepo::get_by_task_and_role(&*ctx.db, &ctx.task_id, role)
-                    .await
-                {
-                    Ok(assignment) => assignment,
-                    Err(error) => {
-                        return HookResult::Skipped {
-                            reason: format!("role assignment unavailable: {error}"),
-                        };
-                    }
-                };
+            let assignment = match get_role_assignment(ctx, role).await {
+                Ok(assignment) => assignment,
+                Err(error) => {
+                    return HookResult::Skipped {
+                        reason: format!("role assignment unavailable: {error}"),
+                    };
+                }
+            };
 
             if assignment.is_some() && !transition_logs.iter().any(|log| log.to_state == gate.name)
             {

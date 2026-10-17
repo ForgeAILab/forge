@@ -41,9 +41,17 @@ fn integration_response(model: db::ProjectIntegration) -> IntegrationResponse {
 
 pub async fn create_integration(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Json(body): Json<CreateIntegrationRequest>,
 ) -> ApiResult<(StatusCode, Json<IntegrationResponse>)> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let platform = body
         .platform
         .parse::<db::IntegrationPlatform>()
@@ -82,8 +90,16 @@ pub async fn create_integration(
 
 pub async fn get_integration(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Option<IntegrationResponse>>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let row = IntegrationRepo::get_by_project_id(&*state.db, &project_id).await?;
 
     Ok(Json(row.map(integration_response)))
@@ -91,9 +107,17 @@ pub async fn get_integration(
 
 pub async fn update_integration(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
     Json(body): Json<PatchIntegrationRequest>,
 ) -> ApiResult<Json<IntegrationResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id.clone()))?;
@@ -132,8 +156,16 @@ pub async fn update_integration(
 
 pub async fn delete_integration(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id))?;
@@ -145,8 +177,16 @@ pub async fn delete_integration(
 
 pub async fn trigger_sync(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Response> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let existing = IntegrationRepo::get_by_project_id(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("integration", project_id))?;

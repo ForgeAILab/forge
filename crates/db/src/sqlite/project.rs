@@ -1,6 +1,20 @@
 use super::*;
 use crate::{new_uuid_v4, now_rfc3339};
 
+pub struct WorkflowProjectAuthorityRow {
+    row: SqliteRow,
+}
+
+impl WorkflowProjectAuthorityRow {
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+
+    pub fn workflow_definition(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("workflow_definition")?)
+    }
+}
+
 const DEFAULT_PROJECT_AGENT_PERMISSION_CEILING: &str = r#"{"allowed":["read_project","read_agent_chat","read_task","read_memory","propose_task","propose_project","propose_message","propose_review","propose_commitment","propose_memory","propose_decision","propose_session"]}"#;
 
 const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXISTS (
@@ -8,10 +22,60 @@ const PROJECT_VISIBLE_TO_USER: &str = "(owner_id IS NULL OR owner_id = ? OR EXIS
       AND project_member.user_id = ?
 ))";
 
+// These projections add a revision only for API Project responses. General
+// Project reads and dispatcher reads keep their existing column set.
+impl SqliteDb {
+    pub async fn get_visible_project_slot_read(
+        &self,
+        id: &str,
+        user_id: &str,
+    ) -> Result<Option<crate::ProjectSlotRead>> {
+        sqlx::query(&format!("SELECT {PROJECT_COLUMNS}, list_revision FROM project WHERE id = ? AND {PROJECT_VISIBLE_TO_USER}"))
+            .bind(id).bind(user_id).bind(user_id).fetch_optional(self.pool()).await?
+            .map(map_project_slot_read).transpose()
+    }
+
+    pub async fn list_visible_project_slot_reads(
+        &self,
+        user_id: &str,
+        page: PageRequest,
+    ) -> Result<Page<crate::ProjectSlotRead>> {
+        let offset = decode_offset(&page.cursor)?;
+        let rows = sqlx::query(&format!("SELECT {PROJECT_COLUMNS}, list_revision FROM project WHERE {PROJECT_VISIBLE_TO_USER} ORDER BY {} LIMIT ? OFFSET ?", order_clause_without_priority(&page)))
+            .bind(user_id).bind(user_id).bind(limit(&page) + 1).bind(offset).fetch_all(self.pool()).await?;
+        let items = rows
+            .into_iter()
+            .map(map_project_slot_read)
+            .collect::<Result<Vec<_>>>()?;
+        let total = if page.include_total {
+            Some(
+                sqlx::query_scalar::<_, i64>(&format!(
+                    "SELECT COUNT(*) FROM project WHERE {PROJECT_VISIBLE_TO_USER}"
+                ))
+                .bind(user_id)
+                .bind(user_id)
+                .fetch_one(self.pool())
+                .await?,
+            )
+        } else {
+            None
+        };
+        page_from_items(items, &page, offset, total)
+    }
+}
+
+fn map_project_slot_read(row: SqliteRow) -> Result<crate::ProjectSlotRead> {
+    let list_revision = row.try_get("list_revision")?;
+    Ok(crate::ProjectSlotRead {
+        project: map_project(row)?,
+        list_revision,
+    })
+}
+
 async fn project_in_use_counts(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     project_id: &str,
-) -> Result<(i64, i64)> {
+) -> Result<(i64, i64, i64)> {
     sqlx::query_as(
         "SELECT
             ((SELECT COUNT(*) FROM execution e
@@ -24,8 +88,12 @@ async fn project_in_use_counts(
                 AND (json_type(t.metadata_json, '$.plan_publication_claim') IS NOT NULL
                   OR json_type(t.metadata_json, '$.plan_publication_cleanup') IS NOT NULL))),
             (SELECT COUNT(*) FROM workspace_lease wl
-              WHERE wl.project_id = ? AND wl.status = 'active')",
+              WHERE wl.project_id = ? AND wl.status = 'active'),
+            (SELECT COUNT(*) FROM check_run r
+              WHERE r.project_id = ?
+                AND r.state IN ('queued','running','cancelling','cleaning','uncertain'))",
     )
+    .bind(project_id)
     .bind(project_id)
     .bind(project_id)
     .bind(project_id)
@@ -409,15 +477,42 @@ impl ProjectRepo for SqliteDb {
         if let Some(paused_at) = input.paused_at {
             project.paused_at = paused_at;
             project.system_pause_reason = None;
+            project.environment_pause_json = None;
         }
         if let Some(project_hooks_json) = project_hooks_json {
             project.project_hooks_json = project_hooks_json;
         }
         project.updated_at = input.updated_at;
+        let before = crate::environment_readiness::settings_environment(&original_settings).ok();
+        let after = crate::environment_readiness::settings_environment(&project.settings).ok();
+        let digest_changed = before.as_ref().map(crate::environment_checks_digest)
+            != after.as_ref().map(crate::environment_checks_digest);
+        if original_settings != project.settings
+            && digest_changed
+            && after
+                .as_ref()
+                .is_some_and(|environment| !environment.checks.is_empty())
+            && project
+                .environment_pause_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .is_some_and(|pause| {
+                    pause["checks"]
+                        .as_array()
+                        .is_some_and(|checks| !checks.is_empty())
+                })
+            && project.system_pause_reason.as_deref() == Some("environment_not_ready")
+        {
+            // The old digest's pause cannot veto its unknown replacement facts,
+            // especially on a daemon where only the next launch can check them.
+            project.paused_at = None;
+            project.system_pause_reason = None;
+            project.environment_pause_json = None;
+        }
         let result = sqlx::query(
             "UPDATE project
              SET name = ?, settings = ?, primary_repo_id = ?, paused_at = ?,
-                 system_pause_reason = ?, project_hooks_json = ?, version = version + 1, updated_at = ?
+                 system_pause_reason = ?, environment_pause_json = ?, project_hooks_json = ?, version = version + 1, updated_at = ?
              WHERE id = ? AND version = ?",
         )
         .bind(&project.name)
@@ -425,6 +520,7 @@ impl ProjectRepo for SqliteDb {
         .bind(project.primary_repo_id.as_deref())
         .bind(project.paused_at.as_deref())
         .bind(project.system_pause_reason.as_deref())
+        .bind(project.environment_pause_json.as_deref())
         .bind(&project.project_hooks_json)
         .bind(&project.updated_at)
         .bind(&project.id)
@@ -438,9 +534,44 @@ impl ProjectRepo for SqliteDb {
             || original_primary_repo_id != project.primary_repo_id
             || original_paused_at != project.paused_at
             || original_system_pause_reason != project.system_pause_reason;
+        if original_settings != project.settings {
+            if after.is_none() {
+                tracing::warn!(project_id=%project.id, "invalid settings on Project update; retaining unknown readiness");
+            }
+            if after
+                .as_ref()
+                .is_some_and(|environment| environment.checks.is_empty())
+            {
+                sqlx::query("DELETE FROM project_machine_readiness WHERE project_id = ?")
+                    .bind(&project.id)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id = ?)")
+                    .bind(&project.updated_at).bind(&project.updated_at).bind(&project.id).execute(&mut *transaction).await?;
+                crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
+                    .bind(&project.id).execute_in_tx(&mut transaction).await?;
+            } else if digest_changed || after.is_none() {
+                sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', check_results_json = '[]', output_tail = '', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
+                    .bind(after.as_ref().map(crate::environment_checks_digest).unwrap_or_else(|| "invalid_settings".into())).bind(&project.id)
+                    .execute(&mut *transaction).await?;
+            }
+        }
+        if original_paused_at.is_some() && project.paused_at.is_none() {
+            super::environment_readiness::reset_readiness_in_tx(
+                self,
+                &mut transaction,
+                &project.id,
+            )
+            .await?;
+        }
         if project_authority_changed {
-            wake_dispatch_for_project_in_tx(&mut transaction, &project.id, &project.updated_at)
-                .await?;
+            wake_dispatch_for_project_in_tx(
+                self,
+                &mut transaction,
+                &project.id,
+                &project.updated_at,
+            )
+            .await?;
         }
         let updated_row = sqlx::query(&format!(
             "SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?"
@@ -462,11 +593,12 @@ impl ProjectRepo for SqliteDb {
         updated_at: &str,
     ) -> Result<()> {
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let current_version: i64 = sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .ok_or(DbError::NotFound)?;
+        let (current_version, previous_workflow): (i64, String) =
+            sqlx::query_as("SELECT version, workflow_definition FROM project WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or(DbError::NotFound)?;
         if current_version != expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -486,7 +618,8 @@ impl ProjectRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, id, updated_at).await?;
+        wake_dispatch_for_project_in_tx(self, &mut transaction, id, updated_at).await?;
+        crate::task_condition::workflow_changed(&mut transaction, id, &previous_workflow).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -535,7 +668,7 @@ impl ProjectRepo for SqliteDb {
         let updated_at = now_rfc3339();
         let result = sqlx::query(
             "UPDATE project
-             SET paused_at = ?, system_pause_reason = NULL, version = version + 1,
+             SET paused_at = ?, system_pause_reason = NULL, environment_pause_json = NULL, version = version + 1,
                  updated_at = ?
              WHERE id = ?",
         )
@@ -547,7 +680,10 @@ impl ProjectRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+        if paused_at.is_none() {
+            super::environment_readiness::reset_readiness_in_tx(self, &mut transaction, id).await?;
+        }
+        wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -595,10 +731,93 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let paused = result.rows_affected() > 0;
         if paused {
-            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
         Ok(paused)
+    }
+
+    async fn set_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let detail: serde_json::Value =
+            serde_json::from_str(detail_json).map_err(|error| DbError::Check(error.to_string()))?;
+        if let Some(versions) = detail["readiness_versions"].as_array() {
+            for expected in versions {
+                let actual: Option<i64> = sqlx::query_scalar("SELECT version FROM project_machine_readiness WHERE project_id = ? AND owner_kind = ? AND daemon_id = ? AND runtime_id = ?")
+                    .bind(id).bind(expected["owner_kind"].as_str()).bind(expected["daemon_id"].as_str().unwrap_or("")).bind(expected["runtime_id"].as_str().unwrap_or("")).fetch_optional(&mut *transaction).await?;
+                if actual != expected["version"].as_i64() {
+                    return Ok(false);
+                }
+            }
+        }
+        let updated_at = now_rfc3339();
+        let result = sqlx::query(
+            "UPDATE project
+             SET paused_at = ?, system_pause_reason = 'environment_not_ready',
+                 environment_pause_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND paused_at IS NULL
+               AND system_pause_reason IS NULL",
+        )
+        .bind(paused_at)
+        .bind(detail_json)
+        .bind(&updated_at)
+        .bind(id)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        let paused = result.rows_affected() > 0;
+        if paused {
+            let normalized = super::environment_readiness::capture_pause_in_tx(
+                &mut transaction,
+                id,
+                detail_json,
+                paused_at,
+            )
+            .await?;
+            sqlx::query("UPDATE project SET environment_pause_json = ? WHERE id = ?")
+                .bind(normalized)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+            // The Project pause is the sole environment signal. Close any
+            // earlier capacity/environment wait in the same writer transaction.
+            sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id=?)")
+                .bind(&updated_at).bind(&updated_at).bind(id).execute(&mut *transaction).await?;
+            crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL")
+                .bind(id).execute_in_tx(&mut transaction).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
+        }
+        transaction.commit().await?;
+        Ok(paused)
+    }
+
+    async fn update_environment_pause_if_unchanged(
+        &self,
+        id: &str,
+        expected_version: i64,
+        expected_paused_at: &str,
+        detail_json: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE project
+             SET environment_pause_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ? AND paused_at = ?
+               AND system_pause_reason = 'environment_not_ready'",
+        )
+        .bind(detail_json)
+        .bind(now_rfc3339())
+        .bind(id)
+        .bind(expected_version)
+        .bind(expected_paused_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn clear_system_pause_if_unchanged(
@@ -613,7 +832,7 @@ impl ProjectRepo for SqliteDb {
         let updated_at = now_rfc3339();
         let result = sqlx::query(
             "UPDATE project
-             SET paused_at = NULL, system_pause_reason = NULL, version = version + 1,
+             SET paused_at = NULL, system_pause_reason = NULL, environment_pause_json = NULL, version = version + 1,
                  updated_at = ?
              WHERE id = ? AND version = ? AND primary_repo_id = ?
                AND paused_at = ? AND system_pause_reason = ?
@@ -633,7 +852,8 @@ impl ProjectRepo for SqliteDb {
         .await?;
         let cleared = result.rows_affected() > 0;
         if cleared {
-            wake_dispatch_for_project_in_tx(&mut transaction, id, &updated_at).await?;
+            super::environment_readiness::reset_readiness_in_tx(self, &mut transaction, id).await?;
+            wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }
         transaction.commit().await?;
         Ok(cleared)
@@ -650,12 +870,22 @@ impl ProjectRepo for SqliteDb {
             return Err(DbError::NotFound);
         }
 
-        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
-        if running_executions > 0 || active_leases > 0 {
+        // A merge whose result is unknown, or whose owner effect is still
+        // outstanding, is the only record that can say whether its commit
+        // landed: no force deletes it.
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut tx,
+            crate::integration_queue::IntegrationGuardScope::Project(id),
+        )
+        .await?;
+        let (running_executions, active_leases, live_check_runs) =
+            project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
             return Err(DbError::ProjectInUse {
                 project_id: id.to_owned(),
                 running_executions,
                 active_leases,
+                live_check_runs,
             });
         }
         tx.commit().await?;
@@ -678,17 +908,29 @@ impl ProjectRepo for SqliteDb {
         }
 
         // Deleting a Project destroys in-flight agent work. Force callers
-        // must obtain provider acknowledgement, terminalize executions, and
-        // revoke leases before reaching this transaction, but the database
+        // must obtain provider acknowledgement, terminalize executions,
+        // revoke leases and have every check run settled before reaching
+        // this transaction (a check run still live may be executing on a
+        // machine: deleting its row would leave that process unfenced), but the database
         // boundary remains guarded as the final admission check. Keeping the
         // guard here prevents any lower-level caller from bypassing the
         // stop protocol accidentally.
-        let (running_executions, active_leases) = project_in_use_counts(&mut tx, id).await?;
-        if running_executions > 0 || active_leases > 0 {
+        // A merge whose result is unknown, or whose owner effect is still
+        // outstanding, is the only record that can say whether its commit
+        // landed: no force deletes it.
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut tx,
+            crate::integration_queue::IntegrationGuardScope::Project(id),
+        )
+        .await?;
+        let (running_executions, active_leases, live_check_runs) =
+            project_in_use_counts(&mut tx, id).await?;
+        if running_executions > 0 || active_leases > 0 || live_check_runs > 0 {
             return Err(DbError::ProjectInUse {
                 project_id: id.to_owned(),
                 running_executions,
                 active_leases,
+                live_check_runs,
             });
         }
 
@@ -737,6 +979,14 @@ impl ProjectRepo for SqliteDb {
             .await?;
 
         for statement in [
+            "DELETE FROM pr_metadata WHERE task_id IN
+                 (SELECT id FROM task WHERE project_id = ?)",
+            "DELETE FROM pr_provider_config WHERE repo_id IN
+                 (SELECT id FROM repo WHERE project_id = ?)",
+            // Integration queues and their attempts leave with the Project's
+            // repos by cascade. Import evidence that never resolved a queue
+            // has no parent to cascade from, so it is removed here.
+            "DELETE FROM integration_attempt WHERE queue_id IS NULL AND project_ref = ?",
             "DELETE FROM agent_lcm_node WHERE timeline_id IN (
                  SELECT l.id FROM agent_lcm_timeline l
                  JOIN project_deletion_guard g ON g.project_id = ?
@@ -869,5 +1119,1011 @@ impl ProjectRepo for SqliteDb {
             workspace_paths,
             repository_paths,
         })
+    }
+}
+
+impl SqliteDb {
+    pub async fn lock_primary_milestone_project_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        expected_project_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET version = version
+             WHERE id = ? AND version = ?",
+        )
+        .bind(project_id)
+        .bind(expected_project_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn set_primary_milestone_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        primary_milestone_id: Option<&str>,
+        now: &str,
+        project_id: &str,
+        expected_project_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
+                 updated_at = ? WHERE id = ? AND version = ?",
+        )
+        .bind(primary_milestone_id)
+        .bind(now)
+        .bind(project_id)
+        .bind(expected_project_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn primary_milestone_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_one(connection)
+            .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repair_primary_milestone_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        replacement: Option<String>,
+        now: &str,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project SET primary_milestone_id = ?, version = version + 1,
+             updated_at = ? WHERE id = ? AND primary_milestone_id = ?",
+        )
+        .bind(replacement)
+        .bind(now)
+        .bind(project_id)
+        .bind(milestone_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_project_settings(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_admission_project_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn orphan_attempt_workflow_definition_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT workflow_definition FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ActionOrchestrationCharterStateRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ActionOrchestrationCharterStateRow {
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn charter_setup_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_setup_required")?)
+    }
+    pub fn current_charter_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_id")?)
+    }
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn action_orchestration_charter_state(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ActionOrchestrationCharterStateRow>> {
+        let rows = sqlx::query(
+            "SELECT charter_status, charter_setup_required,
+                    current_charter_id, current_charter_revision_id
+             FROM project WHERE id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ActionOrchestrationCharterStateRow { row }))
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectIdentitySourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectIdentitySourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn settings(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("settings")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn charter_setup_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_setup_required")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn project_work_epoch(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("project_work_epoch")?)
+    }
+    pub fn primary_milestone_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("primary_milestone_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_identity_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<EffectiveProjectIdentitySourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, settings, paused_at, charter_status, charter_setup_required,
+                version, created_at, updated_at, project_work_epoch,
+                primary_milestone_id
+         FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| EffectiveProjectIdentitySourceRow { row }))
+    }
+}
+
+pub async fn escalation_project_owner_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Option<Option<String>>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>("SELECT owner_id FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_project_settings_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_provision_repo_project_settings(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT p.settings FROM project p JOIN repo r ON r.project_id=p.id WHERE r.id=?",
+        )
+        .bind(repo_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_wait_project_state_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<(Option<String>, String)> {
+        Ok(sqlx::query_as::<_, (Option<String>, String)>(
+            "SELECT paused_at, settings FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_project_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+    ) -> crate::Result<Vec<(String,)>> {
+        Ok(
+            sqlx::query_as::<_, (String,)>("SELECT id FROM project WHERE owner_id IS NULL")
+                .fetch_all(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn bootstrap_unowned_project_owner_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        user_id: &str,
+        project_id: &str,
+    ) -> crate::Result<u64> {
+        let result =
+            sqlx::query("UPDATE project SET owner_id = ? WHERE id = ? AND owner_id IS NULL")
+                .bind(user_id)
+                .bind(project_id)
+                .execute(connection)
+                .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn adaptive_task_current_charter_revision(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT current_charter_revision_id FROM project
+             WHERE id = ? AND charter_status = 'charter_backed'
+               AND charter_setup_required = 0",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn repository_worker_project_charter_backed(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project
+                 WHERE id = ? AND charter_status = 'charter_backed'
+                   AND charter_setup_required = 0
+             )",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_assignment_project_charter_backed(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM project
+                 WHERE id = ? AND charter_status = 'charter_backed'
+                   AND charter_setup_required = 0
+             )",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MainTurnPortfolioProjectRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MainTurnPortfolioProjectRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn charter_status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_status")?)
+    }
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_portfolio_projects(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Vec<MainTurnPortfolioProjectRow>> {
+        let rows = sqlx::query(
+            "SELECT id, version, updated_at, paused_at, charter_status,
+                    current_charter_revision_id
+             FROM project
+             WHERE owner_id = ?
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 20",
+        )
+        .bind(account_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MainTurnPortfolioProjectRow { row })
+            .collect())
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeOwnedProjectSummaryRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeOwnedProjectSummaryRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn task_count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("task_count")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativePortfolioProjectRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativePortfolioProjectRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn name(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("name")?)
+    }
+    pub fn paused_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("paused_at")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_paused_project_reason(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT system_pause_reason FROM project WHERE id = ? AND paused_at IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_portfolio_projects(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativePortfolioProjectRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, paused_at, created_at, updated_at
+             FROM project WHERE owner_id = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativePortfolioProjectRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_version(&self, project_id: &str) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_owned_project_summary(
+        &self,
+        project_id: &str,
+        account_id: &str,
+    ) -> crate::Result<Option<NativeOwnedProjectSummaryRow>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.name, p.paused_at, p.created_at, p.updated_at,
+                    COUNT(t.id) AS task_count
+             FROM project AS p
+             LEFT JOIN task AS t ON t.project_id = p.id AND t.deleted_at IS NULL
+             WHERE p.id = ? AND p.owner_id = ?
+             GROUP BY p.id",
+        )
+        .bind(project_id)
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| NativeOwnedProjectSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_pause_reason(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT system_pause_reason FROM project WHERE id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_scope_summary(
+        &self,
+        id: &str,
+    ) -> crate::Result<Option<NativeScopeSummaryRow>> {
+        let rows = sqlx::query("SELECT id, name FROM project WHERE id = ?")
+            .bind(id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| NativeScopeSummaryRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_root_project_exists(&self, project_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT EXISTS (SELECT 1 FROM project WHERE id = ?)")
+                .bind(project_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn provisioning_current_project_settings_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+                .bind(project_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+pub async fn provisioning_project_settings_on_connection(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT settings FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ValidationProjectCharterSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ValidationProjectCharterSourceRow {
+    pub fn current_charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_project_charter_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ValidationProjectCharterSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT p.current_charter_revision_id FROM project p WHERE p.id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ValidationProjectCharterSourceRow { row }))
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ChatUsageProjectScopeRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ChatUsageProjectScopeRow {
+    pub fn owner_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("owner_id")?)
+    }
+    pub fn name(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("name")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_usage_project_scope(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ChatUsageProjectScopeRow>> {
+        let rows = sqlx::query("SELECT owner_id, name FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(rows.map(|row| ChatUsageProjectScopeRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_command_project_version(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn direct_project_command_project_id(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_action_target_project_id(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_action_project_owner(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>("SELECT owner_id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_eligibility_project_version(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_project_owner(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT owner_id FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_actor_permission_ceiling(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT permission_ceiling_json FROM project_agent_binding
+             WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(identity_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_project_owner(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_current_charter_revision(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar(
+            "SELECT current_charter_revision_id FROM project
+             WHERE id = ? AND charter_status = 'charter_backed'
+               AND charter_setup_required = 0 LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_proposal_primary_milestone(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(
+            sqlx::query_scalar("SELECT primary_milestone_id FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn charter_command_active_agent_binding(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar(
+                    "SELECT identity_id FROM project_agent_binding WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
+                ).bind(project_id).bind(identity_id).fetch_optional(self.pool()).await?)
+    }
+}
+
+pub struct FrozenProjectBindingPolicyRow {
+    row: SqliteRow,
+}
+impl FrozenProjectBindingPolicyRow {
+    pub fn policy_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_revision")?)
+    }
+    pub fn policy_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_digest")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn frozen_project_agent_binding_policy(
+        &self,
+        binding_id: &str,
+        project_id: &str,
+    ) -> crate::Result<FrozenProjectBindingPolicyRow> {
+        let rows = sqlx::query(
+            "SELECT policy_revision, policy_digest
+                     FROM project_agent_binding WHERE id = ? AND project_id = ?",
+        )
+        .bind(binding_id)
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(FrozenProjectBindingPolicyRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn orchestration_bound_project_target(
+        &self,
+        identity_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT p.id
+                     FROM project AS p
+                     JOIN project_agent_binding AS binding
+                       ON binding.project_id = p.id
+                      AND binding.identity_id = ?
+                      AND binding.state = 'active'
+                     WHERE p.id = ?
+                     LIMIT 1",
+        )
+        .bind(identity_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_task_project_paused(&self, task_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM task t JOIN project p ON p.id=t.project_id WHERE t.id=? AND p.paused_at IS NOT NULL)",
+        ).bind(task_id).fetch_one(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_creation_project_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT version FROM project WHERE id=?")
+            .bind(project_id)
+            .fetch_one(connection)
+            .await?)
+    }
+}
+
+pub async fn execution_admission_project_owner_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+) -> crate::Result<Option<Option<String>>> {
+    Ok(
+        sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ?")
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?,
+    )
+}
+
+impl SqliteDb {
+    pub async fn review_ci_project_authority_valid_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        version: i64,
+        workflow_definition: Option<&str>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ? AND version = ? AND workflow_definition IS ?)").bind(project_id).bind(version).bind(workflow_definition).fetch_one(connection).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_agent_workspace_project_live_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM project WHERE id = ? LIMIT 1")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct ProjectAgentWorkspaceAuthoritySourceRow {
+    pub project_id: String,
+    pub project_created_at: String,
+    pub primary_repo_id: Option<String>,
+    pub provisioning_operation_id: Option<String>,
+    pub repository_id: Option<String>,
+    pub remote_url: Option<String>,
+    pub local_path: Option<String>,
+    pub default_branch: Option<String>,
+}
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ProjectAgentWorkspaceAuthoritySourceRow {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            project_id: row.try_get(0)?,
+            project_created_at: row.try_get(1)?,
+            primary_repo_id: row.try_get(2)?,
+            provisioning_operation_id: row.try_get(3)?,
+            repository_id: row.try_get(4)?,
+            remote_url: row.try_get(5)?,
+            local_path: row.try_get(6)?,
+            default_branch: row.try_get(7)?,
+        })
+    }
+}
+
+pub async fn project_agent_workspace_authority_source<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    project_id: &str,
+) -> crate::Result<Option<ProjectAgentWorkspaceAuthoritySourceRow>> {
+    Ok(
+        sqlx::query_as::<_, ProjectAgentWorkspaceAuthoritySourceRow>(
+            "SELECT p.id, p.created_at, p.primary_repo_id,
+                operation.id,
+                repo.id, CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END,
+                repo.local_path, repo.default_branch
+         FROM project p
+         LEFT JOIN project_provisioning_operation operation
+           ON operation.project_id = p.id
+         LEFT JOIN repo
+           ON repo.id = p.primary_repo_id AND repo.project_id = p.id
+         WHERE p.id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(executor)
+        .await?,
+    )
+}
+
+impl SqliteDb {
+    pub async fn project_hook_current_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn integration_gate_project_paused(&self, project_id: &str) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM project WHERE id=? AND paused_at IS NOT NULL)",
+        )
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn notification_project_exists(&self, project_id: &str) -> crate::Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM project WHERE id = ?)")
+                .bind(project_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workflow_transition_project_authority_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<WorkflowProjectAuthorityRow>> {
+        Ok(
+            sqlx::query("SELECT version, workflow_definition FROM project WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(connection)
+                .await?
+                .map(|row| WorkflowProjectAuthorityRow { row }),
+        )
     }
 }

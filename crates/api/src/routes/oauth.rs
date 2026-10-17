@@ -579,9 +579,10 @@ mod tests {
     }
 
     async fn trusted_origin_state() -> AppState {
-        let mut config = config::ForgeConfig::default();
+        let state = crate::test_state().await;
+        let mut config = (*state.effective_config).clone();
         config.server.public_base_url = Some("https://forge.example.com/app".to_string());
-        crate::test_state().await.with_effective_config(config)
+        state.with_effective_config(config)
     }
 
     async fn state_with_seed_user() -> AppState {

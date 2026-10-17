@@ -1,6 +1,5 @@
 use api_types::StateKind;
 use async_trait::async_trait;
-use sqlx::Row;
 
 use crate::{
     project_hooks::triggers::{HookTrigger, TriggerContext, TriggerMatch},
@@ -15,36 +14,13 @@ pub struct AllWorkCompletedTrigger;
 #[async_trait]
 impl HookTrigger for AllWorkCompletedTrigger {
     async fn evaluate(&self, context: &TriggerContext<'_>) -> Result<Option<TriggerMatch>> {
-        let rows = sqlx::query(
-            "SELECT id, status, parent_task_id \
-             FROM task \
-             WHERE project_id = ? \
-               AND is_automation = 0 \
-               AND archived_at IS NULL \
-               AND deleted_at IS NULL",
-        )
-        .bind(&context.project.id)
-        .fetch_all(context.db.pool())
-        .await?;
+        let rows = context
+            .db
+            .project_work_completion_sources(&context.project.id)
+            .await?;
 
-        if rows.is_empty() {
+        if !all_work_completed(context.project, rows)? {
             return Ok(None);
-        }
-
-        let project_workflow =
-            WorkflowEngine::resolve_workflow(&context.project.workflow_definition);
-        let subtask_workflow = WorkflowEngine::resolve_subtask_workflow();
-        for row in rows {
-            let status: String = row.try_get("status")?;
-            let parent_task_id: Option<String> = row.try_get("parent_task_id")?;
-            let workflow = if parent_task_id.is_some() {
-                &subtask_workflow
-            } else {
-                &project_workflow
-            };
-            if workflow.state_kind(&status) != Some(StateKind::Terminal) {
-                return Ok(None);
-            }
         }
 
         let epoch = context.project.project_work_epoch;
@@ -58,4 +34,38 @@ impl HookTrigger for AllWorkCompletedTrigger {
             )),
         }))
     }
+}
+
+pub(crate) async fn all_work_completed_in_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    project: &db::Project,
+) -> Result<bool> {
+    let rows = db::project_work_completion_sources_in_tx(transaction, &project.id).await?;
+    all_work_completed(project, rows)
+}
+
+fn all_work_completed(
+    project: &db::Project,
+    rows: Vec<db::ProjectWorkCompletionSourceRow>,
+) -> Result<bool> {
+    if rows.is_empty() {
+        return Ok(false);
+    }
+
+    let project_workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+    let subtask_workflow = WorkflowEngine::resolve_subtask_workflow();
+    for row in rows {
+        let status: String = row.status()?;
+        let parent_task_id: Option<String> = row.parent_task_id()?;
+        let workflow = if parent_task_id.is_some() {
+            &subtask_workflow
+        } else {
+            &project_workflow
+        };
+        if workflow.state_kind(&status) != Some(StateKind::Terminal) {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }

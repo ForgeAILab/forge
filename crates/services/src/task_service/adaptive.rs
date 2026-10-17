@@ -15,7 +15,7 @@ use db::{
     ApplyAdaptiveTaskCommand, CommandReceipt, CommandReceiptRepo, CreateCommandReceipt,
     ProjectOrchestrationRepo, Task,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub use db::{AdaptiveTaskChild, AdaptiveTaskOperation};
@@ -26,7 +26,7 @@ pub const TASK_ADAPTIVE_COMMAND: &str = "task.adaptive";
 /// closed enum so an adapter cannot smuggle a fourth mutation path around the
 /// shared governance gate.  The actor/rationale fields are persisted in both
 /// the event and inherited child provenance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveTaskCommand {
     pub project_id: String,
     pub source_task_id: String,
@@ -86,7 +86,7 @@ impl AdaptiveTaskCommand {
 /// Frozen result returned by the adaptive command. A replay returns the
 /// receipt's original snapshots and `replayed = true`, never a live row that
 /// may have changed after the original commit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdaptiveTaskCommandResult {
     pub source_task: Task,
     pub tasks: Vec<Task>,
@@ -112,6 +112,16 @@ impl TaskService {
         &self,
         command: AdaptiveTaskCommand,
     ) -> Result<AdaptiveTaskCommandResult> {
+        if !db::task_writer::owns_task(&command.source_task_id) {
+            return self
+                .request_task_command(
+                    &command.source_task_id,
+                    "execute_adaptive_task_command",
+                    serde_json::json!([command]),
+                    false,
+                )
+                .await;
+        }
         validate_adaptive_command(&command)?;
         let mut expected_state = ExpectedCommandState::default();
         expected_state

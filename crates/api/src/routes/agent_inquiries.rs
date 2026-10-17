@@ -4,7 +4,7 @@
 //! flow, no state machine, and the only user verb is cancel. This module is
 //! deliberately thin -- all authorization (an inquiry is reachable only
 //! through the chat that dispatched it) lives in
-//! `services::agent_inquiry_service::AgentInquiryService`.
+//! `services_agents::agent_inquiry_service::AgentInquiryService`.
 
 use api_types::{
     AgentInquiryListResponse, AgentInquiryResponse, AgentInquiryStatus, AgentInquiryTokenUsage,
@@ -42,6 +42,14 @@ pub async fn list_agent_chat_inquiries(
     Path(chat_id): Path<String>,
     Query(query): Query<ListAgentInquiriesQuery>,
 ) -> ApiResult<Json<AgentInquiryListResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
@@ -62,6 +70,17 @@ pub async fn get_agent_inquiry(
     user: AuthenticatedUser,
     Path(inquiry_id): Path<String>,
 ) -> ApiResult<Json<AgentInquiryResponse>> {
+    let addressed_inquiry = db::AgentInquiryRepo::get_agent_inquiry(&*state.db, &inquiry_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("agent_inquiry", inquiry_id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &addressed_inquiry.chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let inquiry = state
         .agent_inquiry_service
         .get(&user.user_id, &inquiry_id)
@@ -75,6 +94,17 @@ pub async fn cancel_agent_inquiry(
     Path(inquiry_id): Path<String>,
     Json(request): Json<CancelAgentInquiryRequest>,
 ) -> ApiResult<Json<AgentInquiryResponse>> {
+    let addressed_inquiry = db::AgentInquiryRepo::get_agent_inquiry(&*state.db, &inquiry_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("agent_inquiry", inquiry_id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &addressed_inquiry.chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let inquiry = state
         .agent_inquiry_service
         .cancel(&user.user_id, &inquiry_id, request.expected_version)
@@ -93,6 +123,17 @@ pub async fn get_agent_inquiry_logs(
     Path(inquiry_id): Path<String>,
     Query(params): Query<LogsQuery>,
 ) -> ApiResult<Json<Value>> {
+    let addressed_inquiry = db::AgentInquiryRepo::get_agent_inquiry(&*state.db, &inquiry_id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("agent_inquiry", inquiry_id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &addressed_inquiry.chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     // Authorized exactly like the record itself: an inquiry is reachable only
     // through the chat that dispatched it.
     let inquiry = state

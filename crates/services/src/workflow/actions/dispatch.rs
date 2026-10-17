@@ -5,7 +5,7 @@ use db::ReviewStatus;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
-    agent_capacity::has_running_execution_capacity,
+    agent_capacity::has_execution_capacity,
     workflow::{
         dispatch::{
             build_effective_prompt, dispatch_intent_from_workflow_dispatch,
@@ -29,6 +29,31 @@ pub struct DispatchRoleAgent;
 #[async_trait]
 impl HookAction for DispatchRoleAgent {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
+        if let Some(attempt) = crate::workflow::engine::durable::current_hook(&ctx.task_id) {
+            match ctx
+                .db
+                .hook_checkpoint_execution_id(&attempt.step.id, attempt.index)
+                .await
+            {
+                Ok(Some(execution_id)) => {
+                    // The admission transaction already durably launched this
+                    // transition's execution, even if it has since terminalised.
+                    return match ensure_review_record_for_dispatch(ctx, &execution_id).await {
+                        Ok(()) => HookResult::Ok,
+                        Err(reason) => HookResult::Failed { reason },
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return HookResult::Failed {
+                        reason: match error {
+                            db::DbError::Sqlx(error) => error.to_string(),
+                            error => error.to_string(),
+                        },
+                    }
+                }
+            }
+        }
         let Some(state) = ctx
             .workflow
             .states
@@ -54,7 +79,7 @@ impl HookAction for DispatchRoleAgent {
             }
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         };
@@ -79,16 +104,18 @@ impl HookAction for DispatchRoleAgent {
                 };
                 return HookResult::Cascade {
                     to: target,
-                    reason: format!(
-                        "{} mechanical merge contention resolved; fresh review required",
-                        crate::workflow::REVIEW_REFRESH_MARKER
+                    reason: "Mechanical merge contention resolved; fresh review required"
+                        .to_owned(),
+
+                    bridge: api_types::TransitionBridge::new(
+                        api_types::TransitionBridgeKind::ReviewRefresh,
                     ),
                 };
             }
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }
@@ -103,21 +130,43 @@ impl HookAction for DispatchRoleAgent {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        match crate::placement::machine_precheck::retire_wait(&ctx.db, &current_task).await {
+            Ok(true) => {
+                return HookResult::Skipped {
+                    reason: "project capacity".to_owned(),
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return HookResult::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        }
+        if crate::TaskService::automatic_review_recovery_owns_dispatch(&ctx.task_id) {
+            return HookResult::Skipped {
+                reason: "explicit automatic review recovery owns dispatch".to_owned(),
+            };
+        }
         if current_task.blocked_json.is_some() {
             return HookResult::Skipped {
                 reason: "task is blocked".to_string(),
             };
         }
-        match crate::task_hierarchy::coordination_root_has_subtasks(&ctx.db, &current_task).await {
-            Ok(true)
-                if !crate::task_hierarchy::RootRolePolicy::for_workflow(&ctx.workflow)
-                    .allows_execution(&state.name, role_name) =>
-            {
+        match crate::task_hierarchy::root_runs_role(
+            &ctx.db,
+            &current_task,
+            &ctx.workflow,
+            role_name,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
                 return HookResult::Skipped {
                     reason: "root task is a subtask coordination container".to_string(),
                 };
             }
-            Ok(_) => {}
             Err(error) => {
                 return HookResult::Failed {
                     reason: error.to_string(),
@@ -149,6 +198,11 @@ impl HookAction for DispatchRoleAgent {
                     && assignment.assignee_id.is_some()
             })
         {
+            match super::review::prepare_review_entry(ctx, &current_task).await {
+                Ok(Some(result)) => return result,
+                Ok(None) => {}
+                Err(reason) => return HookResult::Failed { reason },
+            }
             // A CI hook that just failed is still in the same transition and
             // must not immediately mint a replacement reviewer attempt. On
             // the next review cycle the implementation candidate differs (or
@@ -227,13 +281,16 @@ impl HookAction for DispatchRoleAgent {
                     state_dispatch.as_ref(),
                 );
                 let dispatch_ctx = match load_agent_dispatch_context(
-                    Arc::clone(&ctx.db),
-                    &ctx.task_id,
-                    role_name,
-                    &ctx.to_state,
-                    ctx.state_config.clone(),
-                    Some(selection.execution_policy.as_str()),
-                    &ctx.workflow,
+                    crate::workflow::dispatch::loader::DispatchContextParams {
+                        db: Arc::clone(&ctx.db),
+                        router: &ctx.workspace_backend_router,
+                        task_id: &ctx.task_id,
+                        role: role_name,
+                        state_name: &ctx.to_state,
+                        state_config: ctx.state_config.clone(),
+                        execution_policy: Some(selection.execution_policy.as_str()),
+                        workflow: &ctx.workflow,
+                    },
                 )
                 .await
                 {
@@ -263,6 +320,7 @@ impl HookAction for DispatchRoleAgent {
                     "target_role": role_name,
                     "builder_id": selection.builder_id,
                     "execution_policy": selection.execution_policy,
+                    "carried_finding": dispatch_ctx.carried_repair,
                 });
 
                 ctx.event_bus.publish(ForgeEvent {
@@ -305,7 +363,7 @@ impl HookAction for DispatchRoleAgent {
                         reason: "agent paused".to_string(),
                     };
                 }
-                match has_running_execution_capacity(&ctx.db, &agent).await {
+                match has_execution_capacity(&ctx.db, &agent).await {
                     Ok(true) => {}
                     Ok(false) => {
                         return HookResult::Skipped {
@@ -418,14 +476,14 @@ impl HookAction for DispatchRoleAgent {
                         Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                             reason: "project paused".to_string(),
                         },
-                        Err(error) => HookResult::Failed {
-                            reason: error.to_string(),
-                        },
+                        Err(error) => dispatch_refusal(ctx, error).await,
                     };
                 }
 
                 let service = ctx.task_service.clone();
 
+                let service = service
+                    .with_workspace_backend_router(Arc::clone(&ctx.workspace_backend_router));
                 let dispatch_result = match reviewer_admission {
                     Some(admission) => {
                         service
@@ -464,9 +522,7 @@ impl HookAction for DispatchRoleAgent {
                     Err(crate::ServiceError::ProjectPaused { .. }) => HookResult::Skipped {
                         reason: "project paused".to_string(),
                     },
-                    Err(error) => HookResult::Failed {
-                        reason: error.to_string(),
-                    },
+                    Err(error) => dispatch_refusal(ctx, error).await,
                 }
             }
             Some(assignment)
@@ -555,7 +611,7 @@ impl HookAction for NotifyRoleHolder {
             Ok(false) => {}
             Err(error) => {
                 return HookResult::Failed {
-                    reason: error.to_string(),
+                    reason: crate::workflow::hook_error_reason(error),
                 };
             }
         }
@@ -646,5 +702,48 @@ impl HookAction for NotifyRoleHolder {
                 reason: "role not assigned".to_string(),
             },
         }
+    }
+}
+
+/// Leave an admitted Task on the scheduler's retry path during owner outages.
+async fn dispatch_refusal(ctx: &HookContext, error: crate::ServiceError) -> HookResult {
+    let reason = error.to_string();
+    let result = async {
+        let task = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false)
+            .await?
+            .ok_or_else(|| crate::ServiceError::not_found("task", &ctx.task_id))?;
+        ctx.task_service
+            .defer_placement_refusal(&task, &error)
+            .await
+    }
+    .await;
+    match result {
+        Ok(true) => HookResult::Skipped { reason },
+        Ok(false) => {
+            if let Ok(Some(task)) = db::TaskRepo::get_by_id(&*ctx.db, &ctx.task_id, false).await {
+                if let Err(annotation_error) = ctx
+                    .task_service
+                    .record_placement_dispatch_refusal(&task, &error)
+                    .await
+                {
+                    tracing::warn!(task_id=%ctx.task_id, %annotation_error, "failed to record placement refusal");
+                }
+            }
+            if let Err(annotation_error) =
+                crate::workflow::engine::annotate_upgrade_dispatch_refusal(
+                    &ctx.db,
+                    &ctx.task_id,
+                    &ctx.to_state,
+                    &error,
+                )
+                .await
+            {
+                tracing::warn!(task_id = %ctx.task_id, %annotation_error, "failed to record daemon upgrade refusal");
+            }
+            HookResult::Failed { reason }
+        }
+        Err(error) => HookResult::Failed {
+            reason: error.to_string(),
+        },
     }
 }

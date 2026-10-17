@@ -151,21 +151,6 @@ pub async fn auth_middleware(
     }
 }
 
-pub async fn mcp_user_bridge(mut req: Request, next: Next) -> Response {
-    if req.uri().path().starts_with("/mcp") {
-        if let Some(auth_user) = req
-            .extensions()
-            .get::<crate::routes::auth::AuthenticatedUser>()
-            .cloned()
-        {
-            req.extensions_mut().insert(mcp_server::McpUser {
-                user_id: auth_user.user_id,
-            });
-        }
-    }
-    next.run(req).await
-}
-
 pub async fn mcp_auth_middleware(
     state: axum::extract::State<crate::state::AppState>,
     mut req: Request,

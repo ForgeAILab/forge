@@ -16,7 +16,6 @@ impl TaskDispatcher {
             "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
             "blocked_at": db::now_rfc3339(),
             "message": error.to_string(),
-            "recovery_actions": ["reset_to_initial", "cancel_task"],
         });
         TaskRepo::update(
             &*self.db,
@@ -59,7 +58,6 @@ impl TaskDispatcher {
             "blocked_by": api_types::Actor::system(api_types::SystemComponent::TaskDispatcher).display(),
             "blocked_at": db::now_rfc3339(),
             "message": error.to_string(),
-            "recovery_actions": ["reexecute", "reset_to_initial", "cancel_task"],
         });
         TaskRepo::update(
             &*self.db,

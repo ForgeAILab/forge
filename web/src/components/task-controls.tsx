@@ -29,6 +29,8 @@ type MemberAssignee = {
 export const taskStatusTransitions: Record<string, string[]> = {
   todo: ['in_progress', 'cancelled'],
   in_progress: ['todo', 'review', 'cancelled'],
+  // The step check of a subtask: accept, return to the worker, or cancel.
+  lead_check: ['done', 'in_progress', 'cancelled'],
   review: ['merging', 'in_progress', 'cancelled'],
   merging: ['review', 'in_progress', 'done', 'merge_failed', 'cancelled'],
   merge_failed: ['in_progress', 'cancelled'],
@@ -45,6 +47,11 @@ export const taskStatusColors: Record<string, { dot: string; bg: string; text: s
   in_progress: {
     dot: 'bg-orange-500',
     bg: 'bg-orange-500/12',
+    text: 'text-orange-700 dark:text-orange-300',
+  },
+  lead_check: {
+    dot: 'bg-orange-400',
+    bg: 'bg-orange-400/12',
     text: 'text-orange-700 dark:text-orange-300',
   },
   review: {
@@ -189,6 +196,8 @@ export function AgentAssigneeDropdown({
   variant = 'full',
   roleLabel,
   requiredNow,
+  agentsOnly,
+  agentDisabledReason,
 }: {
   agents: Agent[]
   members?: MemberAssignee[]
@@ -201,6 +210,10 @@ export function AgentAssigneeDropdown({
   variant?: 'full' | 'chip'
   roleLabel?: string
   requiredNow?: boolean
+  /** Offer Agents only: no person and no manual work. */
+  agentsOnly?: boolean
+  /** Why an Agent cannot be picked for this role; it is listed, disabled, with the reason. */
+  agentDisabledReason?: (agent: Agent) => string | undefined
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -280,7 +293,9 @@ export function AgentAssigneeDropdown({
     ? availableAgents.filter((a) => a.name.toLowerCase().includes(normalizedQuery))
     : availableAgents
 
-  const filteredMembers = members
+  const filteredMembers = agentsOnly
+    ? undefined
+    : members
     ? normalizedQuery
       ? members.filter((member) => {
           const displayName = member.display_name ?? ''
@@ -293,6 +308,7 @@ export function AgentAssigneeDropdown({
     : undefined
 
   const showHuman =
+    !agentsOnly &&
     !members &&
     (!normalizedQuery || 'human'.includes(normalizedQuery) || 'manual'.includes(normalizedQuery))
   const manualSelected = value?.type === 'user' && (!selectedUserId || selectedUserId === 'manual')
@@ -439,14 +455,18 @@ export function AgentAssigneeDropdown({
                 filtered.map((agent) => {
                   const selected = agent.id === selectedAgentId
                   const runningExecutions = agent.running_execution_count ?? 0
+                  const disabledReason = agentDisabledReason?.(agent)
                   return (
                     <button
                       key={agent.id}
                       type="button"
                       role="option"
                       aria-selected={selected}
+                      aria-disabled={disabledReason ? true : undefined}
+                      disabled={Boolean(disabledReason)}
+                      title={disabledReason}
                       className={cn(
-                        'flex w-full cursor-pointer items-center gap-2 rounded-sm p-2 text-left outline-none transition-colors hover:bg-accent',
+                        'flex w-full cursor-pointer items-center gap-2 rounded-sm p-2 text-left outline-none transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent',
                         selected && 'bg-accent/50',
                       )}
                       onClick={() => select({ type: 'agent', agentId: agent.id })}
@@ -465,6 +485,11 @@ export function AgentAssigneeDropdown({
                           <span aria-hidden="true">/</span>
                           {runningExecutions}/{agent.max_concurrent_tasks}
                         </span>
+                        {disabledReason ? (
+                          <span className="mt-0.5 block text-xs text-muted-foreground">
+                            {disabledReason}
+                          </span>
+                        ) : null}
                       </span>
                       {selected ? <Check size={14} className="shrink-0 text-primary" /> : null}
                     </button>

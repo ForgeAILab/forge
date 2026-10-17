@@ -77,8 +77,149 @@ pub struct OperatorStatusResponse {
     pub workspace_cleanup: Vec<WorkspaceCleanupSummary>,
     pub retry_pressure: Vec<RetryPressureSummary>,
     pub usage_summary: Option<UsageSummary>,
+    pub usage_index: UsageIndexStatus,
     pub recent_errors: Vec<RecentErrorSummary>,
+    pub event_consumers: Vec<EventConsumerStatus>,
+    pub periodic_workers: Vec<PeriodicWorkerStatus>,
+    pub task_steps: TaskStepQueueStatus,
+    pub integration_queues: IntegrationQueueStatus,
+    pub checks: ChecksStatus,
+    #[ts(type = "number")]
+    pub pending_remote_cancels: i64,
+    pub event_relay: EventRelayStatus,
+    pub database: DatabaseStorageStatus,
     pub computed_at: String,
+}
+
+/// How many, and how long the oldest has been there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationBacklog {
+    #[ts(type = "number")]
+    pub count: i64,
+    /// Whole seconds; `null` when `count` is 0.
+    #[ts(type = "number | null")]
+    pub oldest_age_seconds: Option<i64>,
+}
+
+/// Nearest-rank percentiles of one duration over the sampled merges, in
+/// milliseconds. All `null` when no sampled merge measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationPercentiles {
+    /// Merges that measured this duration.
+    #[ts(type = "number")]
+    pub samples: i64,
+    #[ts(type = "number | null")]
+    pub p50_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub p95_ms: Option<i64>,
+    #[ts(type = "number | null")]
+    pub max_ms: Option<i64>,
+}
+
+/// Where merges that completed in the window spent their time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationTimingStatus {
+    #[ts(type = "number")]
+    pub window_seconds: i64,
+    /// Completed merges read, newest first; at most `sample_limit`.
+    #[ts(type = "number")]
+    pub completed: i64,
+    #[ts(type = "number")]
+    pub sample_limit: i64,
+    /// From entering the queue to taking its head.
+    pub queue_wait: IntegrationPercentiles,
+    /// At the head, over every round of the merge.
+    pub head_time: IntegrationPercentiles,
+    /// The split of the head time: the three effects.
+    pub rebase: IntegrationPercentiles,
+    pub check: IntegrationPercentiles,
+    pub fast_forward: IntegrationPercentiles,
+}
+
+/// The merge queues, as counts, ages and timings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IntegrationQueueStatus {
+    #[ts(type = "Record<string, number>")]
+    pub queues_by_state: std::collections::BTreeMap<String, i64>,
+    #[ts(type = "Record<string, number>")]
+    pub current_attempts_by_state: std::collections::BTreeMap<String, i64>,
+    #[ts(type = "number")]
+    pub quarantined_imports: i64,
+    /// Members in line, aged from when they entered the queue.
+    #[serde(default)]
+    pub waiting: IntegrationBacklog,
+    /// Members being merged, aged from when they took the head.
+    #[serde(default)]
+    pub heads: IntegrationBacklog,
+    /// Members whose merge stopped, aged from when it did.
+    #[serde(default)]
+    pub parked: IntegrationBacklog,
+    #[serde(default)]
+    pub timings: IntegrationTimingStatus,
+    /// Finished merge attempts whose owner receipts and observations are
+    /// still stored. The hourly retention pass empties them once the attempt
+    /// finished more than `server.check_retention_days` ago (`0` keeps them);
+    /// it never touches a current attempt, an unsettled effect or the
+    /// evidence of a quarantined queue, and it deletes no attempt row. A
+    /// number that keeps growing past the retention period means the pass is
+    /// not running or a guard holds the rows.
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub finished_with_receipts: i64,
+}
+
+/// Cascade queue health, separate from durable consumer dead letters.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TaskStepQueueStatus {
+    pub worker_name: String,
+    #[ts(type = "number")]
+    pub pending: i64,
+    #[ts(type = "number")]
+    pub claimed: i64,
+    /// Failed steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub failed: i64,
+    /// Parked (loop-detected) steps whose Task annotation still references them.
+    #[ts(type = "number")]
+    pub parked: i64,
+    #[ts(type = "number")]
+    pub in_flight: usize,
+    #[ts(type = "number | null")]
+    pub oldest_pending_age_seconds: Option<f64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
+}
+
+/// Source-free workers use the same health identity, bounded errors and
+/// persisted restart count as durable workers, without a cursor or quarantine.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PeriodicWorkerStatus {
+    pub worker_name: String,
+    pub running: bool,
+    pub last_tick_at: Option<String>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+    #[ts(type = "number")]
+    pub restart_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct UsageIndexStatus {
+    /// Conservative index charge, including allocator and read reserves; not RSS.
+    #[ts(type = "number")]
+    pub current_size_bytes: u64,
+    #[ts(type = "number")]
+    pub budget_bytes: u64,
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -132,9 +273,19 @@ pub struct DaemonIssueSummary {
 pub struct DaemonPressureSummary {
     pub daemon_id: String,
     pub hostname: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: Option<u32>,
+    pub active_runs: u32,
+    pub check_runs: u32,
+    pub borrowed_check_runs: u32,
+    #[ts(type = "number | null")]
+    pub max_concurrent_runs: Option<i64>,
+    pub logical_cores: Option<u32>,
+    pub build_jobs_per_run: Option<u32>,
+    pub run_nice: Option<u32>,
     pub at_capacity: bool,
+    /// The machine's last disk reading with the floor applied. While
+    /// `disk.pressure` is set the machine starts no new worktree or check.
+    #[serde(default)]
+    pub disk: Option<crate::MachineDisk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -143,8 +294,8 @@ pub struct AgentPressureSummary {
     pub agent_id: String,
     pub agent_name: String,
     pub daemon_id: Option<String>,
-    pub active_sessions: u32,
-    pub max_sessions: u32,
+    pub active_tasks: u32,
+    pub max_concurrent_tasks: u32,
     pub at_capacity: bool,
 }
 
@@ -243,4 +394,202 @@ pub struct PlanProgressSummary {
     pub remaining: u32,
     pub available: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventConsumerStatus {
+    pub consumer_name: String,
+    #[ts(type = "number")]
+    pub last_sequence: i64,
+    /// Pending events matching the worker subscription.
+    #[ts(type = "number")]
+    pub lag: i64,
+    pub oldest_unprocessed_at: Option<String>,
+    pub oldest_unprocessed_age_seconds: Option<f64>,
+    /// Null when an expected consumer has never established its cursor.
+    pub last_advanced_at: Option<String>,
+    pub stalled: bool,
+    #[ts(type = "number")]
+    pub dead_letter_count: i64,
+    pub recent_dead_letters: Vec<WorkerDeadLetterSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WorkerDeadLetterSummary {
+    pub id: String,
+    pub item_key: String,
+    pub consumer_name: String,
+    pub event_type: String,
+    #[ts(type = "number")]
+    pub attempts: i64,
+    #[ts(type = "number | null")]
+    pub event_sequence: Option<i64>,
+    // Only canonical bare event sequence keys may be replayed.
+    pub replayable: bool,
+    pub event_created_at: Option<String>,
+    // Later subscribed ledger events acknowledged by the current checkpoint.
+    #[ts(type = "number")]
+    pub events_since: i64,
+    pub reason: String,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct EventRelayStatus {
+    pub running: bool,
+    #[ts(type = "number | null")]
+    pub position: Option<i64>,
+    #[ts(type = "number | null")]
+    pub head: Option<i64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DatabaseStorageStatus {
+    pub incremental_vacuum: bool,
+    #[ts(type = "number")]
+    pub free_pages: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterState {
+    #[default]
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterResponse {
+    pub summary: WorkerDeadLetterSummary,
+    pub state: DeadLetterState,
+    pub error_kind: String,
+    pub first_failed_at: String,
+    pub last_failed_at: String,
+    pub resolved_at: Option<String>,
+    pub resolved_by: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterListResponse {
+    pub items: Vec<DeadLetterResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DeadLetterActionResponse {
+    pub dead_letter: DeadLetterResponse,
+    /// replayed, skipped, replay_failed, or dismissed. Failure is an audited
+    /// action result, with the dead letter still open; it is never auto-retried.
+    pub outcome: DeadLetterOutcome,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DismissDeadLetterRequest {
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DeadLetterOutcome {
+    Replayed,
+    Skipped,
+    ReplayFailed,
+    Dismissed,
+}
+impl DeadLetterOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Replayed => "replayed",
+            Self::Skipped => "skipped",
+            Self::ReplayFailed => "replay_failed",
+            Self::Dismissed => "dismissed",
+        }
+    }
+}
+impl std::fmt::Display for DeadLetterOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::fmt::Display for DeadLetterState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Resolved => "resolved",
+        })
+    }
+}
+
+/// The check runner, for an operator: its runs by state, what holds a
+/// machine slot, how much waits where and for how long, how much work reuse
+/// saved in the last day, and whether the worker is failing. The one section
+/// about checks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ChecksStatus {
+    /// Check runs by state; all eight states are present, zeros included.
+    /// History older than `server.check_retention_days` is deleted.
+    #[ts(type = "Record<string, number>")]
+    pub by_state: std::collections::BTreeMap<String, i64>,
+    /// Certified passing results a later request with the same identity
+    /// would be answered from.
+    #[ts(type = "number")]
+    pub reusable_results: i64,
+    /// Runs that hold a machine slot (a run admitted past its queue deadline
+    /// holds none and is counted in `running` only).
+    #[ts(type = "number")]
+    pub admitted_runs: i64,
+    /// Of those, runs that share the slot of their own Task's run.
+    #[ts(type = "number")]
+    pub borrowed_runs: i64,
+    /// Queued runs the worker has not refused a slot: about to be admitted.
+    pub queued: CheckBacklog,
+    /// Admitted runs: running, being cancelled, cleaning up, or uncertain
+    /// (their owner did not answer). The age is that of the oldest admission.
+    pub running: CheckBacklog,
+    /// Queued runs waiting behind a full machine, by the start of the wait.
+    pub waiting_for_slot: CheckBacklog,
+    /// Review entries whose check has not been asked for yet because the
+    /// Task worktree cannot be made again under the disk floor, by the time
+    /// the entry was queued.
+    pub waiting_for_disk: CheckBacklog,
+    /// Requests of the last 24 hours answered by a stored result: no run.
+    #[ts(type = "number")]
+    pub reuse_hits_24h: i64,
+    /// Runs scheduled in the last 24 hours.
+    #[ts(type = "number")]
+    pub runs_24h: i64,
+    /// The `check-runs` worker's most recent error, if it has one.
+    pub last_worker_error: Option<CheckWorkerError>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckBacklog {
+    #[ts(type = "number")]
+    pub count: i64,
+    /// Age of the oldest one, in seconds. Absent when there is none.
+    #[ts(type = "number | null")]
+    pub oldest_age_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CheckWorkerError {
+    pub error: String,
+    pub occurred_at: String,
 }

@@ -1,16 +1,6 @@
 use db::{Agent, AgentProfile, AgentSession, Execution, Page, Project, Task, TaskRoleAssignment};
 use serde_json::{json, Value};
 
-pub(crate) fn task_page_value(page: Page<Task>) -> Value {
-    let has_more = page.next_cursor.is_some();
-    json!({
-        "data": page.items.into_iter().map(task_value).collect::<Vec<_>>(),
-        "next_cursor": page.next_cursor,
-        "has_more": has_more,
-        "total_count": page.total_count,
-    })
-}
-
 pub(crate) fn execution_page_value(page: Page<Execution>) -> Value {
     let has_more = page.next_cursor.is_some();
     json!({
@@ -46,6 +36,7 @@ pub(crate) fn project_page_value(page: Page<Project>) -> Value {
 }
 
 pub(crate) fn task_value(task: Task) -> Value {
+    let condition = task.condition.public();
     json!({
         "id": task.id,
         "project_id": task.project_id,
@@ -59,7 +50,7 @@ pub(crate) fn task_value(task: Task) -> Value {
         "priority": task.priority,
         "merge_config": json_string(task.merge_config),
         "plan": task.plan,
-        "error_annotation": json_string(task.error_annotation),
+        "condition": condition,
         "deleted_at": task.deleted_at,
         "version": task.version,
         "created_at": task.created_at,
@@ -221,5 +212,114 @@ fn redact_sensitive(value: Value) -> Value {
         ),
         Value::Array(values) => Value::Array(values.into_iter().map(redact_sensitive).collect()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod condition_serialization_snapshots {
+    use super::*;
+    use db::{
+        ConditionContinuation, ConditionEvidence, ConditionSource, LegacyConditionField,
+        ParkReason, RetryCause, TaskCondition, TerminalOutcome, UnknownConditionProblem,
+    };
+    #[test]
+    fn every_task_condition_kind_has_one_public_shape_without_legacy_fields() {
+        let e = ConditionEvidence::default();
+        let reason = ParkReason::UnknownCondition {
+            source: ConditionSource {
+                field: LegacyConditionField::EntryBarrierJson,
+                key: None,
+            },
+            problem: UnknownConditionProblem::UnownedEntry,
+        };
+        for (kind, condition) in [
+            (
+                "clear",
+                TaskCondition::Clear {
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "entering",
+                TaskCondition::Entering {
+                    state: "review".into(),
+                    epoch: 2,
+                    step_id: "step".into(),
+                    phase: "post_commit_hooks".into(),
+                    since: "now".into(),
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "running",
+                TaskCondition::Running {
+                    execution_id: "run".into(),
+                    role: "coder".into(),
+                    epoch: 2,
+                    since: "now".into(),
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "deferred",
+                TaskCondition::Deferred {
+                    until: Some("2099-01-01T00:00:00Z".into()),
+                    reason: RetryCause::ExecutionFailure,
+                    resume: ConditionContinuation::Dispatch {
+                        target_state: "in_progress".into(),
+                    },
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "parked",
+                TaskCondition::Parked {
+                    primary: reason.clone(),
+                    additional: vec![],
+                    resume: ConditionContinuation::Reconcile,
+                    since: None,
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "failed",
+                TaskCondition::Failed {
+                    failure: reason,
+                    additional: vec![],
+                    resume: ConditionContinuation::Reconcile,
+                    since: None,
+                    evidence: e.clone(),
+                },
+            ),
+            (
+                "settled",
+                TaskCondition::Settled {
+                    outcome: TerminalOutcome::Completed,
+                    evidence: e,
+                },
+            ),
+        ] {
+            let task: Task = serde_json::from_value(json!({"id":"task","project_id":"project","parent_task_id":null,"assignee_type":null,"assignee_id":null,"title":"Wire snapshot","description":null,"task_type":"task","status":"in_progress","is_automation":false,"priority":0,"board_position":0.0,"subtask_order":null,"task_state_config":null,"merge_config":null,"metadata_json":"{\"secret\":true}","plan":null,"error_annotation":"legacy poison","blocked_json":"legacy poison","failed_json":"legacy poison","entry_barrier_json":null,"review_passed_at":null,"archived_at":null,"deleted_at":null,"version":1,"created_at":"now","updated_at":"now","condition":condition})).unwrap();
+            let expected = serde_json::to_value(task.condition.public()).unwrap();
+            let value = task_value(task);
+            assert_eq!(value["condition"], expected, "{kind}");
+            assert_eq!(value["condition"]["kind"], kind);
+            for field in [
+                "error_annotation",
+                "blocked",
+                "failed",
+                "blocked_json",
+                "failed_json",
+                "metadata_json",
+                "entry_barrier_json",
+            ] {
+                assert!(value.get(field).is_none(), "{kind}: {field}");
+            }
+            assert!(value["condition"].get("evidence").is_none());
+            // JSON decoded by forge-ctl uses the same api-types enum.
+            let decoded: api_types::TaskCondition =
+                serde_json::from_value(value["condition"].clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
+        }
     }
 }

@@ -107,6 +107,18 @@ impl PromptBuilder for ReviewerPromptBuilder {
             }
         }
 
+        if let Some(verify) = ctx
+            .prior_reviews
+            .iter()
+            .filter(|r| r.status == db::ReviewStatus::Running)
+            .max_by_key(|r| r.attempt_number)
+            .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.step_results_json).ok())
+            .and_then(|v| {
+                serde_json::from_value::<api_types::ReviewVerifyDetails>(v["verify"].clone()).ok()
+            })
+        {
+            user.push_str(&review::verify::prompt(&verify));
+        }
         if !ctx.prior_reviews.is_empty() {
             user.push_str("\nPrior reviews:\n");
             for review in &ctx.prior_reviews {
@@ -126,7 +138,7 @@ impl PromptBuilder for ReviewerPromptBuilder {
 
         AgentPrompt {
             system: format!(
-                "You are the reviewer agent for this Forge workflow task. Decide whether the change works by exercising it: build it, run its tests, and drive the changed behavior programmatically or visually the way a user or caller would. Reading code tells you what to run and explains a failure you observed; it does not prove correctness on its own. If you fail the review, your feedback goes to the coder agent to fix in a follow-up attempt.\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
+                "You are the reviewer agent for this Forge workflow task. Decide whether the change works by exercising it: build it, run its tests, and drive the changed behavior programmatically or visually the way a user or caller would. Reading code tells you what to run and explains a failure you observed; it does not prove correctness on its own. Coder-fixable failures go to the coder; owner-only or repeated findings may park for the owner.\n\n{REVIEWER_ROLE_BOUNDARY}\n\n{REVIEWER_FINDINGS_CONTRACT}\n\n{}",
                 read_only_report_contract(ctx.delivery)
             ),
             user,
@@ -159,6 +171,19 @@ fn current_ci_results(ctx: &AgentDispatchContext) -> Option<String> {
             .and_then(serde_json::Value::as_i64)
             .map_or_else(|| "unknown".to_owned(), |code| code.to_string());
         rendered.push_str(&format!("- `{command}` exited {exit_code}\n"));
+        if let Some(triage) = step.get("triage") {
+            let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+            for failure in triage["failures"].as_array().into_iter().flatten() {
+                if let Some(class) = failure["class"].as_str() {
+                    *counts.entry(class).or_default() += 1;
+                }
+            }
+            let summary = serde_json::json!({"mode":triage["mode"],"base_status":triage["base_status"],"class":triage["class"],"blocking":triage["blocking"],"counts":counts,"reason":triage["reason"]});
+            rendered.push_str(&format!("  Forge CI triage: {summary}.\n"));
+            if triage["blocking"] == false {
+                rendered.push_str("  These flaky/pre-existing failures are non-blocking. Assess the Task's own changes; do not require it to repair these Project CI incidents.\n");
+            }
+        }
         let output = step
             .get("output_tail")
             .and_then(|v| v.as_str())

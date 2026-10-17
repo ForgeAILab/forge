@@ -6,6 +6,9 @@ import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
 import type { AgentChatTurn } from '@/features/agent-chat/types'
 import { qk } from '@/api/query-keys'
+import { taskListItem } from '@/test-utils/task-list-item'
+import type { TasksResponse } from '@/types/generated'
+import type { InfiniteData } from '@tanstack/react-query'
 
 function createMocks() {
   const invalidateQueries = vi.fn()
@@ -15,6 +18,158 @@ function createMocks() {
 }
 
 describe('routeSsePayload', () => {
+  it.each([
+    ['done', 'in_progress', 'lead_check'],
+    ['lead_check', 'done', 'in_progress'],
+  ])('keeps the newest no-lead subtask version when events arrive %s → %s → %s', (...statuses) => {
+    vi.useFakeTimers()
+    const client = new QueryClient()
+    const key = [...qk.projectTasks('proj-1'), JSON.stringify({ limit: 200 })]
+    const subtask = taskListItem({
+      id: 'subtask',
+      project_id: 'proj-1',
+      parent_task_id: 'root',
+      status: 'todo',
+      version: 1,
+    })
+    const unrelated = taskListItem({ id: 'other', project_id: 'proj-1', version: 12 })
+    client.setQueryData<InfiniteData<TasksResponse>>(key, {
+      pages: [
+        { items: [subtask, unrelated], board_revision: 1, has_more: false, next_cursor: null },
+      ],
+      pageParams: [undefined],
+    })
+    const newest = { ...subtask, status: 'done', version: 4 }
+    client.setQueryData(qk.task('subtask'), newest)
+    client.setQueryData(qk.taskDetail('subtask'), { task: newest })
+    const versions: Record<string, number> = { in_progress: 2, lead_check: 3, done: 4 }
+    let highestVersion = 1
+    try {
+      for (const status of statuses) {
+        const version = versions[status]
+        highestVersion = Math.max(highestVersion, version)
+        routeSsePayload(
+          {
+            event_type: 'task.moved',
+            entity_id: subtask.id,
+            task_id: subtask.id,
+            project_id: 'proj-1',
+            new_status: status,
+            new_board_position: 0,
+            task_version: version,
+            board_revision: version,
+            timestamp: `2026-10-13T00:00:0${version}Z`,
+          },
+          client,
+          { dispatch: vi.fn() },
+        )
+        const cached = client.getQueryData<InfiniteData<TasksResponse>>(key)!.pages[0].items
+        expect(cached.find((task) => task.id === subtask.id)).toMatchObject({
+          status: highestVersion === 4 ? 'done' : 'lead_check',
+          version: highestVersion,
+        })
+        expect(cached.find((task) => task.id === unrelated.id)).toEqual(unrelated)
+        expect(client.getQueryData(qk.task('subtask'))).toEqual(newest)
+        expect(client.getQueryData(qk.taskDetail('subtask'))).toEqual({ task: newest })
+      }
+      vi.advanceTimersByTime(1500)
+      expect(
+        client
+          .getQueryData<InfiniteData<TasksResponse>>(key)!
+          .pages[0].items.find((task) => task.id === subtask.id)?.status,
+      ).toBe('done')
+    } finally {
+      client.clear()
+      vi.useRealTimers()
+    }
+  })
+  it('refetches unversioned status events instead of overwriting a newer cached no-lead subtask', () => {
+    vi.useFakeTimers()
+    const client = new QueryClient()
+    const key = [...qk.projectTasks('proj-1'), JSON.stringify({ limit: 200 })]
+    const newest = taskListItem({
+      id: 'subtask',
+      project_id: 'proj-1',
+      parent_task_id: 'root',
+      status: 'done',
+      version: 4,
+    })
+    client.setQueryData<InfiniteData<TasksResponse>>(key, {
+      pages: [{ items: [newest], board_revision: 4, has_more: false, next_cursor: null }],
+      pageParams: [undefined],
+    })
+    try {
+      // The ordinary status envelope has no Task version. Its timestamp is
+      // insufficient to order the cascaded events against an authoritative read.
+      for (const status of ['lead_check', 'in_progress', 'done']) {
+        routeSsePayload(
+          {
+            event_type: 'task.status_changed',
+            entity_id: newest.id,
+            project_id: 'proj-1',
+            new_status: status,
+            timestamp: '2026-10-13T00:00:00Z',
+          },
+          client,
+          { dispatch: vi.fn() },
+        )
+        expect(client.getQueryData<InfiniteData<TasksResponse>>(key)!.pages[0].items[0]).toEqual(
+          newest,
+        )
+      }
+      vi.advanceTimersByTime(1500)
+      expect(client.getQueryState(key)?.isInvalidated).toBe(true)
+    } finally {
+      client.clear()
+      vi.useRealTimers()
+    }
+  })
+  it.each(['task.status_changed', 'task.blocked', 'task.recovered'])(
+    'refreshes slot usage for %s in the affected project',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.project('proj-2'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'task-1',
+          project_id: 'proj-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.project('proj-2'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
+  it.each(['task.awaiting_human', 'review.passed'])(
+    'refreshes slot summaries when %s omits the project id',
+    (eventType) => {
+      const client = new QueryClient()
+      client.setQueryData(qk.project('proj-1'), {})
+      client.setQueryData(qk.projectPages(20), {})
+      client.setQueryData(qk.repos('proj-1'), {})
+      routeSsePayload(
+        {
+          event_type: eventType,
+          entity_id: 'review-1',
+          task_id: 'task-1',
+          timestamp: '2026-09-30T12:00:00Z',
+        },
+        client,
+        { dispatch: vi.fn() },
+      )
+      expect(client.getQueryState(qk.project('proj-1'))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.projectPages(20))?.isInvalidated).toBe(true)
+      expect(client.getQueryState(qk.repos('proj-1'))?.isInvalidated).toBe(false)
+      client.clear()
+    },
+  )
+
   it('does not invalidate broad queries for execution.log', () => {
     const { queryClient, invalidateQueries, dispatch } = createMocks()
     routeSsePayload(
@@ -76,6 +231,67 @@ describe('routeSsePayload', () => {
         [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
+  })
+
+  it('refetches on integration.updated only what shows that queue', () => {
+    const client = new QueryClient()
+    client.setQueryData(qk.task('task-1'), {})
+    client.setQueryData(qk.task('task-2'), { integration: { queue_id: 'queue-1' } })
+    client.setQueryData(qk.task('task-3'), { integration: { queue_id: 'queue-2' } })
+    client.setQueryData(qk.task('task-4'), { integration: null })
+    client.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    client.setQueryData(qk.projectTasks('proj-2'), { items: [] })
+    client.setQueryData(qk.agents, [])
+    routeSsePayload(
+      {
+        event_type: 'integration.updated',
+        entity_id: 'queue-1',
+        repo_id: 'repo-1',
+        queue_id: 'queue-1',
+        task_id: 'task-1',
+        project_ids: ['proj-1'],
+        timestamp: '2026-10-11T00:00:00Z',
+      } as Parameters<typeof routeSsePayload>[0],
+      client,
+      { dispatch: vi.fn() },
+    )
+    // The Task the event names, and the open detail of another member of
+    // the same queue: its place in line may have moved.
+    expect(client.getQueryState(qk.task('task-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-3'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.task('task-4'))?.isInvalidated).toBe(false)
+    // The lists of the Project concerned, and of no other.
+    expect(client.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.projectTasks('proj-2'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.agents)?.isInvalidated).toBe(false)
+    client.clear()
+  })
+
+  it('refetches the members of the queue when integration.updated names no Task', () => {
+    const client = new QueryClient()
+    client.setQueryData(qk.task('task-1'), { integration: { queue_id: 'queue-1' } })
+    client.setQueryData(qk.task('task-2'), {})
+    client.setQueryData(qk.projectTasks('proj-1'), { items: [] })
+    client.setQueryData(qk.projectTasks('proj-2'), { items: [] })
+    routeSsePayload(
+      {
+        event_type: 'integration.updated',
+        entity_id: 'queue-1',
+        repo_id: 'repo-1',
+        queue_id: 'queue-1',
+        task_id: null,
+        project_ids: ['proj-1'],
+        timestamp: '2026-10-11T00:00:00Z',
+      } as unknown as Parameters<typeof routeSsePayload>[0],
+      client,
+      { dispatch: vi.fn() },
+    )
+    expect(client.getQueryState(qk.task('task-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(false)
+    expect(client.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(true)
+    expect(client.getQueryState(qk.projectTasks('proj-2'))?.isInvalidated).toBe(false)
+    client.clear()
   })
 
   it('invalidates task and project task list on task.status_changed', () => {
@@ -198,10 +414,8 @@ describe('routeSsePayload', () => {
     expect(dispatch).not.toHaveBeenCalled()
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['agent-handoffs', 'proj-1'] }],
       ]),
     )
@@ -331,10 +545,8 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['agent-handoffs', 'proj-1'] }],
       ]),
     )
@@ -453,9 +665,9 @@ describe('routeSsePayload', () => {
     expect(queryClient.getQueryState(qk.task('task-2'))?.isInvalidated).toBe(false)
     expect(queryClient.getQueryState(qk.projectTasks('proj-1'))?.isInvalidated).toBe(false)
     expect(queryClient.getQueryState(qk.projectAgents('proj-1'))?.isInvalidated).toBe(false)
-    expect(
-      queryClient.getQueryState(['projects', 'proj-1', 'analytics'])?.isInvalidated,
-    ).toBe(false)
+    expect(queryClient.getQueryState(['projects', 'proj-1', 'analytics'])?.isInvalidated).toBe(
+      false,
+    )
     expect(queryClient.getQueryState(qk.agents)?.isInvalidated).toBe(false)
   })
 
@@ -547,10 +759,8 @@ describe('routeSsePayload', () => {
     )
     expect(invalidateQueries.mock.calls).toEqual(
       expect.arrayContaining([
-        [{ queryKey: ['agent-chats'] }],
+        [{ queryKey: ['agent-chats'], exact: true }],
         [{ queryKey: ['agent-chats', 'chat-1'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'messages'] }],
-        [{ queryKey: ['agent-chats', 'chat-1', 'turns'] }],
         [{ queryKey: ['analytics', 'usage'] }],
       ]),
     )
@@ -629,6 +839,10 @@ function turn(overrides: Partial<AgentChatTurn> = {}): AgentChatTurn {
     response_message_id: null,
     error_code: null,
     error_message: null,
+    failure_class: null,
+    retry_decision: null,
+    pre_provider_failure_count: 0n,
+    retry_action: null,
     error: null,
     correlation_id: 'corr-1',
     version: 1n,
@@ -773,7 +987,8 @@ describe('useSSE', () => {
   // Bounded fallback for a chat turn's completion frame that never arrives
   // — dropped connection, or delivery throttled while the tab was
   // backgrounded. Correctness cannot depend on the frame showing up.
-  it('actively refetches a stale pending turn in a hidden tab', () => {
+  it('pauses the stale-turn watchdog while hidden and checks immediately on becoming visible', () => {
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden')
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-05-05T00:00:10.000Z'))
     vi.stubGlobal('EventSource', FakeEventSource as unknown as typeof EventSource)
@@ -788,11 +1003,17 @@ describe('useSSE', () => {
         turn({ status: 'leased', created_at: '2026-05-05T00:00:00.000Z' }),
       ])
 
-    renderHook(() => useSSE(queryClient, 'test-token'))
+    const { unmount } = renderHook(() => useSSE(queryClient, 'test-token'))
     refetchSpy.mockClear()
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(15_000)
+    })
+    expect(refetchSpy).not.toHaveBeenCalled()
+    visibility.mockReturnValue('visible')
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
     })
     expect(refetchSpy.mock.calls).toEqual(
       expect.arrayContaining([
@@ -800,6 +1021,10 @@ describe('useSSE', () => {
         [{ queryKey: ['agent-chats', 'chat-1', 'turns'], type: 'active' }],
       ]),
     )
+    unmount()
+    refetchSpy.mockClear()
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(refetchSpy).not.toHaveBeenCalled()
   })
 
   it('keeps refetching a cached retrying turn after optimism clears, then stops at terminal', () => {
@@ -817,7 +1042,7 @@ describe('useSSE', () => {
     refetchSpy.mockClear()
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      vi.advanceTimersByTime(15_000)
     })
     expect(refetchSpy.mock.calls).toEqual(
       expect.arrayContaining([
@@ -833,7 +1058,7 @@ describe('useSSE', () => {
     )
 
     act(() => {
-      vi.advanceTimersByTime(3_000)
+      vi.advanceTimersByTime(15_000)
     })
     expect(refetchSpy).not.toHaveBeenCalled()
   })

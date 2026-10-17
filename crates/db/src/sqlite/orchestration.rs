@@ -307,6 +307,44 @@ pub(super) async fn resolve_command_replay(
     Ok(existing)
 }
 
+/// A fresh command of a coordination root's lead (principal `task_lead`):
+/// the execution it names as its correlation is still running for this
+/// identity in the lead's role ON the command's source root, and the root's
+/// own row of that role still names this identity. Both names come from the
+/// service (`TaskService::lead_adaptive_command`), never from a tool payload;
+/// they are checked here against the rows, so a lead removed, replaced or
+/// stopped between the service's boundary check and this transaction writes
+/// nothing, and neither does a run that is not the root's planning run.
+async fn reauthorize_task_lead_command_in_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    receipt: &CreateCommandReceipt,
+) -> Result<()> {
+    let leads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM execution e
+         JOIN task root ON root.id = e.task_id
+              AND root.parent_task_id IS NULL AND root.deleted_at IS NULL
+         JOIN task_role_assignment a ON a.task_id = root.id AND a.role_name = e.role
+              AND a.assignee_type = 'agent' AND a.assignee_id = e.agent_id
+         WHERE e.id = ? AND e.agent_id = ? AND e.status = 'running' AND e.role = ?
+           AND root.project_id = ?
+           AND root.id = json_extract(?, '$.source_task_id')",
+    )
+    .bind(&receipt.correlation_id)
+    .bind(&receipt.principal_id)
+    .bind(crate::inherited_subtask::STEP_CHECK_ROLE)
+    .bind(&receipt.scope_id)
+    .bind(&receipt.outcome_json)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if receipt.scope_type != "project" || receipt.operation != "task.adaptive" || leads == 0 {
+        return Err(DbError::Check(
+            "the command's principal does not lead this coordination root".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Recheck the durable authorization boundary for a fresh direct Project
 /// command.  The native adapter performs a friendly preflight, but that read
 /// is not an authority boundary: a binding can be revoked between the
@@ -318,6 +356,11 @@ pub(crate) async fn reauthorize_direct_project_command_in_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     receipt: &CreateCommandReceipt,
 ) -> Result<()> {
+    // A root's lead is authorized by its running execution, not by a Project
+    // binding: repeat that, and only that, under the writer transaction.
+    if receipt.principal_type == crate::inherited_subtask::TASK_LEAD_PRINCIPAL {
+        return reauthorize_task_lead_command_in_tx(transaction, receipt).await;
+    }
     // User/REST commands and action-backed executions have their own
     // authorization provenance.  Only the receipt-only native Project path
     // needs this binding check here.
@@ -435,22 +478,7 @@ pub(crate) async fn reauthorize_direct_project_command_in_tx(
 }
 
 fn permission_ceiling_contains(value: &str, permission: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(value)
-        .ok()
-        .and_then(|value| match value {
-            serde_json::Value::Array(values) => Some(values),
-            serde_json::Value::Object(map) => map
-                .get("permissions")
-                .or_else(|| map.get("allowed"))
-                .and_then(serde_json::Value::as_array)
-                .cloned(),
-            _ => None,
-        })
-        .is_some_and(|values| {
-            values
-                .iter()
-                .any(|value| value.as_str() == Some(permission))
-        })
+    operation_registry::authority::permission_set(value).contains(permission)
 }
 
 fn is_direct_project_command_operation(operation: &str) -> bool {
@@ -1298,23 +1326,7 @@ async fn recheck_task_proposal_authorization_in_tx(
     {
         return Err(DbError::IdempotencyConflict);
     }
-    let permits_task_proposal = !permission_ceiling.is_empty() && {
-        let json = permission_ceiling.as_str();
-        serde_json::from_str::<serde_json::Value>(json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("allowed")
-                    .or_else(|| value.get("permissions"))
-                    .cloned()
-            })
-            .and_then(|value| value.as_array().cloned())
-            .is_some_and(|permissions| {
-                permissions
-                    .iter()
-                    .any(|permission| permission.as_str() == Some("propose_task"))
-            })
-    };
+    let permits_task_proposal = permission_ceiling_contains(&permission_ceiling, "propose_task");
     if !permits_task_proposal {
         return Err(DbError::InvalidTransition);
     }
@@ -1623,6 +1635,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(&task.project_id)
             .execute(&mut *transaction)
             .await?;
+            crate::task_condition::produce(
+                &mut transaction,
+                &task.id,
+                crate::ConditionChange::Legacy,
+            )
+            .await?;
         }
         if !task.is_automation {
             ProjectRepo::increment_project_work_epoch(self, &mut transaction, &task.project_id, 1)
@@ -1643,6 +1661,12 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .execute(&mut *transaction)
             .await
             .map_err(orchestration_write_error)?;
+        }
+        if !input.depends_on_task_ids.is_empty()
+            && super::task_dependency::dependency_cycle_in_tx(&mut transaction, &task.id, None)
+                .await?
+        {
+            return Err(DbError::CycleDetected);
         }
         for assignment in &input.role_assignments {
             sqlx::query(
@@ -3707,7 +3731,10 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .bind(identity_id)
             .bind(profile_id)
             .bind(&binding_policy)
-            .bind(&binding_ceiling)
+            .bind({
+                operation_registry::authority::parse_permissions(&binding_ceiling)?;
+                &binding_ceiling
+            })
             .bind(&binding_subscriptions)
             .bind(binding_wake_budget)
             .bind(binding_version)
@@ -3876,6 +3903,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
             .execute(&mut *tx)
             .await
             .map_err(orchestration_write_error)?;
+            super::chat_read_events::append(
+                self,
+                &mut tx,
+                super::chat_read_events::ChatReadEvent {
+                    event_type: "agent_chat.message.appended",
+                    entity_type: "agent_chat_message",
+                    entity_id: &message_id,
+                    chat_id: &project_chat_id,
+                    status: Some("complete"),
+                    dedupe_key: Some(format!("chat-message:{message_id}")),
+                    created_at: &now_rfc3339(),
+                },
+            )
+            .await?;
             Some(message_id)
         } else {
             if input.bootstrap_message_id.is_some()
@@ -9799,6 +9840,20 @@ impl ProjectOrchestrationRepo for SqliteDb {
         .execute(&mut *tx)
         .await
         .map_err(orchestration_write_error)?;
+        super::chat_read_events::append(
+            self,
+            &mut tx,
+            super::chat_read_events::ChatReadEvent {
+                event_type: "agent_chat.message.appended",
+                entity_type: "agent_chat_message",
+                entity_id: &input.target_message_id,
+                chat_id: &project_chat_id,
+                status: Some("complete"),
+                dedupe_key: Some(format!("chat-message:{}", input.target_message_id)),
+                created_at: &now_rfc3339(),
+            },
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO agent_chat_turn_job (
                 id, chat_id, triggering_message_id, responder_identity_id, profile_id,
@@ -10405,5 +10460,4920 @@ impl ProjectOrchestrationRepo for SqliteDb {
             map_reconciliation_resolution,
         )
         .await
+    }
+}
+
+fn milestone_record_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> crate::Result<ProjectMilestoneRecord> {
+    Ok(ProjectMilestoneRecord {
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        milestone_sequence: row.try_get("milestone_sequence")?,
+        milestone_key: row.try_get("milestone_key")?,
+        display_label: row.try_get("display_label")?,
+        current_definition_revision_id: row.try_get("current_definition_revision_id")?,
+        lifecycle: row.try_get("lifecycle")?,
+        blocker_reason_json: row.try_get("blocker_reason_json")?,
+        stale_reason_json: row.try_get("stale_reason_json")?,
+        reconciliation_reason_json: row.try_get("reconciliation_reason_json")?,
+        version: row.try_get("version")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn milestone_revision_record_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> crate::Result<ProjectMilestoneRevisionRecord> {
+    Ok(ProjectMilestoneRevisionRecord {
+        id: row.try_get("id")?,
+        milestone_id: row.try_get("milestone_id")?,
+        revision: row.try_get("revision")?,
+        base_revision: row.try_get("base_revision")?,
+        base_revision_id: row.try_get("base_revision_id")?,
+        lifecycle: row.try_get("lifecycle")?,
+        display_label: row.try_get("display_label")?,
+        outcome: row.try_get("outcome")?,
+        included_scope_json: row.try_get("included_scope_json")?,
+        excluded_scope_json: row.try_get("excluded_scope_json")?,
+        charter_revision_id: row.try_get("charter_revision_id")?,
+        document_revisions_json: row.try_get("document_revisions_json")?,
+        task_selection_json: row.try_get("task_selection_json")?,
+        dependencies_json: row.try_get("dependencies_json")?,
+        risks_json: row.try_get("risks_json")?,
+        acceptance_checks_json: row.try_get("acceptance_checks_json")?,
+        evidence_requirements_json: row.try_get("evidence_requirements_json")?,
+        known_issues_json: row.try_get("known_issues_json")?,
+        change_summary: row.try_get("change_summary")?,
+        schema_version: row.try_get("schema_version")?,
+        render_version: row.try_get("render_version")?,
+        rendered_view: row.try_get("rendered_view")?,
+        content_digest: row.try_get("content_digest")?,
+        rendered_digest: row.try_get("rendered_digest")?,
+        author_type: row.try_get("author_type")?,
+        author_id: row.try_get("author_id")?,
+        source_refs_json: row.try_get("source_refs_json")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn readiness_record_from_row(
+    row: sqlx::sqlite::SqliteRow,
+) -> crate::Result<ProjectReadinessSnapshotRecord> {
+    Ok(ProjectReadinessSnapshotRecord {
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        milestone_id: row.try_get("milestone_id")?,
+        definition_revision_id: row.try_get("definition_revision_id")?,
+        input_manifest_json: row.try_get("input_manifest_json")?,
+        event_watermark: row.try_get("event_watermark")?,
+        outcome: row.try_get("outcome")?,
+        blocking_reasons_json: row.try_get("blocking_reasons_json")?,
+        check_results_json: row.try_get("check_results_json")?,
+        waiver_manifest_json: row.try_get("waiver_manifest_json")?,
+        evidence_manifest_json: row.try_get("evidence_manifest_json")?,
+        commit_context_json: row.try_get("commit_context_json")?,
+        computing_policy_revision: row.try_get("computing_policy_revision")?,
+        readiness_digest: row.try_get("readiness_digest")?,
+        principal_type: row.try_get("principal_type")?,
+        principal_id: row.try_get("principal_id")?,
+        authorization_basis: row.try_get("authorization_basis")?,
+        authorization_action: row.try_get("authorization_action")?,
+        expected_milestone_version: row.try_get("expected_milestone_version")?,
+        explicit_event: row.try_get("explicit_event")?,
+        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+fn release_record_from_row(row: sqlx::sqlite::SqliteRow) -> crate::Result<ProjectReleaseRecord> {
+    Ok(ProjectReleaseRecord {
+        id: row.try_get("id")?,
+        project_id: row.try_get("project_id")?,
+        milestone_id: row.try_get("milestone_id")?,
+        release_sequence: row.try_get("release_sequence")?,
+        release_revision: row.try_get("release_revision")?,
+        release_identifier: row.try_get("release_identifier")?,
+        milestone_revision_id: row.try_get("milestone_revision_id")?,
+        readiness_snapshot_id: row.try_get("readiness_snapshot_id")?,
+        readiness_digest: row.try_get("readiness_digest")?,
+        summary: row.try_get("summary")?,
+        changelog: row.try_get("changelog")?,
+        known_issues_json: row.try_get("known_issues_json")?,
+        charter_revision_id: row.try_get("charter_revision_id")?,
+        document_revisions_json: row.try_get("document_revisions_json")?,
+        decision_ids_json: row.try_get("decision_ids_json")?,
+        task_references_json: row.try_get("task_references_json")?,
+        validation_references_json: row.try_get("validation_references_json")?,
+        git_references_json: row.try_get("git_references_json")?,
+        evidence_references_json: row.try_get("evidence_references_json")?,
+        waivers_json: row.try_get("waivers_json")?,
+        releasing_principal_type: row.try_get("releasing_principal_type")?,
+        releasing_principal_id: row.try_get("releasing_principal_id")?,
+        releasing_principal_display_name: row.try_get("releasing_principal_display_name")?,
+        authorization_basis: row.try_get("authorization_basis")?,
+        authorization_action: row.try_get("authorization_action")?,
+        explicit_event: row.try_get("explicit_event")?,
+        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
+        schema_version: row.try_get("schema_version")?,
+        snapshot_digest: row.try_get("snapshot_digest")?,
+        idempotency_key: row.try_get("idempotency_key")?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+impl SqliteDb {
+    pub async fn lock_milestone_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+        expected_milestone_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project_milestone SET version = version
+             WHERE id = ? AND project_id = ? AND version = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(expected_milestone_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn readiness_by_idempotency_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        key: &str,
+    ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_readiness_snapshot
+             WHERE project_id = ? AND idempotency_key = ?",
+        )
+        .bind(project_id)
+        .bind(key)
+        .fetch_optional(connection)
+        .await?
+        .map(readiness_record_from_row)
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_version_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        let result = sqlx::query_scalar(
+            "SELECT version FROM project_milestone WHERE id = ? AND project_id = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+pub struct UpdateMilestoneReadinessProjectionInput<'a> {
+    pub lifecycle: &'a str,
+    pub blocker_json: &'a str,
+    pub stale_json: &'a str,
+    pub reconciliation_json: &'a str,
+    pub now: &'a str,
+    pub milestone_id: &'a str,
+    pub project_id: &'a str,
+    pub expected_milestone_version: i64,
+}
+
+impl SqliteDb {
+    pub async fn update_milestone_readiness_projection_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &UpdateMilestoneReadinessProjectionInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project_milestone
+             SET lifecycle = ?, blocker_reason_json = ?, stale_reason_json = ?,
+                 reconciliation_reason_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND project_id = ? AND version = ?
+               AND lifecycle IN ('active', 'ready_for_release', 'released')",
+        )
+        .bind(input.lifecycle)
+        .bind(input.blocker_json)
+        .bind(input.stale_json)
+        .bind(input.reconciliation_json)
+        .bind(input.now)
+        .bind(input.milestone_id)
+        .bind(input.project_id)
+        .bind(input.expected_milestone_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn release_by_idempotency_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        key: &str,
+    ) -> crate::Result<Option<ProjectReleaseRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_release
+             WHERE project_id = ? AND idempotency_key = ?",
+        )
+        .bind(project_id)
+        .bind(key)
+        .fetch_optional(connection)
+        .await?
+        .map(release_record_from_row)
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_readiness_by_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        snapshot_id: &str,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_readiness_snapshot
+             WHERE id = ? AND project_id = ? AND milestone_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_optional(connection)
+        .await?
+        .map(readiness_record_from_row)
+        .transpose()
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertMilestoneReleaseInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub milestone_id: &'a str,
+    pub release_revision: i64,
+    pub release_identifier: &'a str,
+    pub milestone_revision_id: &'a str,
+    pub readiness_snapshot_id: &'a str,
+    pub readiness_digest: &'a str,
+    pub summary: &'a str,
+    pub changelog: &'a str,
+    pub known_issues_json: &'a str,
+    pub charter_revision_id: Option<&'a str>,
+    pub document_revisions_json: &'a str,
+    pub decision_ids_json: &'a str,
+    pub task_references_json: &'a str,
+    pub validation_references_json: &'a str,
+    pub git_references_json: &'a str,
+    pub evidence_references_json: &'a str,
+    pub waivers_json: &'a str,
+    pub principal_type: &'a str,
+    pub principal_id: &'a str,
+    pub principal_display_name: Option<&'a str>,
+    pub authorization_basis: &'a str,
+    pub authorization_action: &'a str,
+    pub explicit_event: &'a str,
+    pub authorization_occurred_at: &'a str,
+    pub schema_version: &'a str,
+    pub snapshot_digest: &'a str,
+    pub idempotency_key: &'a str,
+    pub created_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_milestone_release_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertMilestoneReleaseInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO project_release (
+                id, project_id, milestone_id, release_sequence, release_revision,
+                release_identifier, milestone_revision_id, readiness_snapshot_id,
+                readiness_digest, summary, changelog,
+                known_issues_json, charter_revision_id, document_revisions_json, decision_ids_json,
+                task_references_json, validation_references_json, git_references_json,
+                evidence_references_json, waivers_json, releasing_principal_type,
+                releasing_principal_id, releasing_principal_display_name,
+                authorization_basis, authorization_action,
+                explicit_event, authorization_occurred_at, schema_version,
+                snapshot_digest, idempotency_key, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(input.id)
+            .bind(input.project_id)
+            .bind(input.milestone_id)
+            .bind(input.release_revision)
+            .bind(input.release_revision)
+            .bind(input.release_identifier)
+            .bind(input.milestone_revision_id)
+            .bind(input.readiness_snapshot_id)
+            .bind(input.readiness_digest)
+            .bind(input.summary)
+            .bind(input.changelog)
+            .bind(input.known_issues_json)
+            .bind(input.charter_revision_id)
+            .bind(input.document_revisions_json)
+            .bind(input.decision_ids_json)
+            .bind(input.task_references_json)
+            .bind(input.validation_references_json)
+            .bind(input.git_references_json)
+            .bind(input.evidence_references_json)
+            .bind(input.waivers_json)
+            .bind(input.principal_type)
+            .bind(input.principal_id)
+            .bind(input.principal_display_name)
+            .bind(input.authorization_basis)
+            .bind(input.authorization_action)
+            .bind(input.explicit_event)
+            .bind(input.authorization_occurred_at)
+            .bind(input.schema_version)
+            .bind(input.snapshot_digest)
+            .bind(input.idempotency_key)
+            .bind(input.created_at)
+            .execute(connection).await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseTaskReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub record_version: &'a str,
+    pub record_state: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_task_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseTaskReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'task', ?, ?, ?, NULL, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(input.record_version)
+        .bind(input.record_state)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseValidationReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub record_version: &'a str,
+    pub record_state: &'a str,
+    pub record_digest: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_validation_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseValidationReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'validation', ?, ?, ?, ?, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(input.record_version)
+        .bind(input.record_state)
+        .bind(input.record_digest)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseDocumentReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub record_digest: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_document_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseDocumentReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'document', ?, NULL, 'approved', ?, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(input.record_digest)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseDecisionReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub record_state: &'a str,
+    pub record_digest: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_decision_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseDecisionReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'decision', ?, NULL, ?, ?, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(input.record_state)
+        .bind(input.record_digest)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseGitReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub record_version: &'a str,
+    pub execution_status: Option<&'a str>,
+    pub record_digest: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_git_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseGitReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'git_ref', ?, ?, ?, ?, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(input.record_version)
+        .bind(input.execution_status)
+        .bind(input.record_digest)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertReleaseReviewReferenceInput<'a> {
+    pub release_id: &'a str,
+    pub ordinal: i64,
+    pub record_id: &'a str,
+    pub review_version: Option<String>,
+    pub record_state: Option<&'a str>,
+    pub record_digest: &'a str,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_review_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseReviewReferenceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                        release_id, ordinal, reference_kind, record_id,
+                        record_version, record_state, record_digest, metadata_json
+                     ) VALUES (?, ?, 'review', ?, ?, ?, ?, ?)",
+        )
+        .bind(input.release_id)
+        .bind(input.ordinal)
+        .bind(input.record_id)
+        .bind(&input.review_version)
+        .bind(input.record_state)
+        .bind(input.record_digest)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_release_known_issue_reference_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        release_id: &str,
+        ordinal: i64,
+        record_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_reference (
+                    release_id, ordinal, reference_kind, record_id,
+                    record_version, record_state, record_digest, metadata_json
+                 ) VALUES (?, ?, 'known_issue', ?, NULL, NULL, NULL, '{}')",
+        )
+        .bind(release_id)
+        .bind(ordinal)
+        .bind(record_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn mark_milestone_released_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        milestone_id: &str,
+        project_id: &str,
+        expected_milestone_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE project_milestone SET lifecycle = 'released', version = version + 1,
+                 updated_at = ? WHERE id = ? AND project_id = ? AND version = ?
+                 AND lifecycle IN ('ready_for_release', 'released')",
+        )
+        .bind(now)
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(expected_milestone_version)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn release_record_by_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        release_id: &str,
+    ) -> crate::Result<ProjectReleaseRecord> {
+        release_record_from_row(
+            sqlx::query("SELECT * FROM project_release WHERE id = ?")
+                .bind(release_id)
+                .fetch_one(connection)
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn active_milestone_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_milestone
+             WHERE project_id = ? AND lifecycle = 'active'",
+        )
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn active_milestone_exists_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        let result = sqlx::query_scalar(
+            "SELECT 1 FROM project_milestone
+                 WHERE id = ? AND project_id = ? AND lifecycle = 'active'",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_release_record_by_id(
+        &self,
+        release_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectReleaseRecord>> {
+        sqlx::query("SELECT * FROM project_release WHERE id = ? AND project_id = ?")
+            .bind(release_id)
+            .bind(project_id)
+            .fetch_optional(self.pool())
+            .await?
+            .map(release_record_from_row)
+            .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_readiness_record_by_id(
+        &self,
+        snapshot_id: &str,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_readiness_snapshot
+             WHERE id = ? AND project_id = ? AND milestone_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_optional(self.pool())
+        .await?
+        .map(readiness_record_from_row)
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn releases_pinning_readiness_count_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+        snapshot_id: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_release
+             WHERE project_id = ? AND milestone_id = ? AND readiness_snapshot_id = ?",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(snapshot_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_readiness_records(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Vec<ProjectReadinessSnapshotRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_readiness_snapshot
+             WHERE project_id = ? AND milestone_id = ?
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(readiness_record_from_row)
+        .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_release_records(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Vec<ProjectReleaseRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_release
+             WHERE project_id = ? AND milestone_id = ?
+             ORDER BY release_revision ASC, id ASC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_all(self.pool())
+        .await?
+        .into_iter()
+        .map(release_record_from_row)
+        .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_milestone_record_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectMilestoneRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_milestone
+             WHERE id = ? AND project_id = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?
+        .map(milestone_record_from_row)
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_readiness_record_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_readiness_snapshot
+             WHERE project_id = ? AND id = ?",
+        )
+        .bind(project_id)
+        .bind(snapshot_id)
+        .fetch_optional(connection)
+        .await?
+        .map(readiness_record_from_row)
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_definition_record_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        revision_id: &str,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectMilestoneRevisionRecord>> {
+        sqlx::query(
+            "SELECT r.* FROM project_milestone_revision r
+             JOIN project_milestone m ON m.id = r.milestone_id
+             WHERE r.id = ? AND r.milestone_id = ? AND m.project_id = ?",
+        )
+        .bind(revision_id)
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?
+        .map(milestone_revision_record_from_row)
+        .transpose()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneCharterAuthorityRow {
+    pub charter_id: String,
+    pub current_approved_revision_id: Option<String>,
+    pub revision_id: String,
+    pub lifecycle: String,
+    pub content_digest: String,
+    pub render_version: String,
+    pub rendered_digest: String,
+}
+
+impl SqliteDb {
+    pub async fn milestone_charter_authority_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        revision_id: &str,
+    ) -> crate::Result<Option<MilestoneCharterAuthorityRow>> {
+        let row = sqlx::query(
+            "SELECT c.id AS charter_id,
+                    c.current_approved_revision_id,
+                    cr.id AS revision_id,
+                    cr.lifecycle,
+                    cr.content_digest,
+                    cr.render_version,
+                    cr.rendered_digest
+             FROM project_charter c
+             JOIN project_charter_revision cr ON cr.charter_id = c.id
+             WHERE c.project_id = ? AND cr.id = ?",
+        )
+        .bind(project_id)
+        .bind(revision_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(MilestoneCharterAuthorityRow {
+                charter_id: row.try_get("charter_id")?,
+                current_approved_revision_id: row.try_get("current_approved_revision_id")?,
+                revision_id: row.try_get("revision_id")?,
+                lifecycle: row.try_get("lifecycle")?,
+                content_digest: row.try_get("content_digest")?,
+                render_version: row.try_get("render_version")?,
+                rendered_digest: row.try_get("rendered_digest")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneCheckResultRow {
+    pub check_id: String,
+    pub source_kind: String,
+    pub id: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub created_at: String,
+    pub outcome: String,
+    pub input_digest: String,
+    pub source_manifest_json: String,
+    pub definition_revision_id: String,
+    pub governing_charter_revision_id: Option<String>,
+    pub authorization_basis: String,
+    pub authorization_action: String,
+    pub explicit_event: String,
+    pub authorization_occurred_at: String,
+    pub expected_version: i64,
+}
+
+impl SqliteDb {
+    pub async fn milestone_check_result_rows_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Vec<MilestoneCheckResultRow>> {
+        let rows = sqlx::query(
+            "SELECT r.* FROM project_milestone_check_result r
+             JOIN project_milestone_check c ON c.id = r.check_id
+             WHERE r.project_id = ? AND r.milestone_id = ?
+               AND r.definition_revision_id = c.definition_revision_id
+             ORDER BY r.check_id ASC, r.created_at DESC, r.id DESC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_all(connection)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MilestoneCheckResultRow {
+                    check_id: row.try_get("check_id")?,
+                    source_kind: row.try_get("source_kind")?,
+                    id: row.try_get("id")?,
+                    principal_type: row.try_get("principal_type")?,
+                    principal_id: row.try_get("principal_id")?,
+                    created_at: row.try_get("created_at")?,
+                    outcome: row.try_get("outcome")?,
+                    input_digest: row.try_get("input_digest")?,
+                    source_manifest_json: row.try_get("source_manifest_json")?,
+                    definition_revision_id: row.try_get("definition_revision_id")?,
+                    governing_charter_revision_id: row.try_get("governing_charter_revision_id")?,
+                    authorization_basis: row.try_get("authorization_basis")?,
+                    authorization_action: row.try_get("authorization_action")?,
+                    explicit_event: row.try_get("explicit_event")?,
+                    authorization_occurred_at: row.try_get("authorization_occurred_at")?,
+                    expected_version: row.try_get("expected_version")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneWaiverAffectedRow {
+    pub id: String,
+    pub affected_records_json: String,
+}
+
+impl SqliteDb {
+    pub async fn active_milestone_waiver_rows_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Vec<MilestoneWaiverAffectedRow>> {
+        let rows = sqlx::query(
+            "SELECT id, affected_records_json
+             FROM project_decision
+             WHERE project_id = ? AND decision_class = 'waiver' AND state = 'active'
+               AND length(trim(authorization_action)) > 0
+               AND length(trim(authorization_occurred_at)) > 0",
+        )
+        .bind(project_id)
+        .fetch_all(connection)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MilestoneWaiverAffectedRow {
+                    id: row.try_get("id")?,
+                    affected_records_json: row.try_get("affected_records_json")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneDecisionRow {
+    pub id: String,
+    pub state: String,
+    pub decision_class: String,
+    pub question: String,
+    pub context_json: String,
+    pub options_json: String,
+    pub selected_outcome: String,
+    pub rationale: String,
+    pub principal_type: String,
+    pub principal_id: String,
+    pub authority_basis: String,
+    pub authorization_action: String,
+    pub explicit_event: String,
+    pub authorization_occurred_at: String,
+    pub charter_revision_id: Option<String>,
+    pub source_refs_json: String,
+    pub affected_records_json: String,
+    pub supersedes_decision_id: Option<String>,
+    pub created_at: String,
+}
+
+impl SqliteDb {
+    pub async fn effective_milestone_decision_rows_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+        charter_revision_id: Option<&str>,
+    ) -> crate::Result<Vec<MilestoneDecisionRow>> {
+        let rows = sqlx::query(
+            "SELECT id, state, decision_class, question, context_json,
+                    options_json, selected_outcome, rationale,
+                    principal_type, principal_id, authority_basis,
+                    authorization_action, explicit_event,
+                    authorization_occurred_at, charter_revision_id,
+                    source_refs_json,
+                    affected_records_json, supersedes_decision_id, created_at
+             FROM project_decision
+             WHERE project_id = ? AND state = 'active'
+               AND (
+                    json_extract(affected_records_json, '$.milestone_id') = ?
+                    OR (? IS NOT NULL AND charter_revision_id = ?)
+               )
+             ORDER BY id ASC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(charter_revision_id)
+        .bind(charter_revision_id)
+        .fetch_all(connection)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MilestoneDecisionRow {
+                    id: row.try_get("id")?,
+                    state: row.try_get("state")?,
+                    decision_class: row.try_get("decision_class")?,
+                    question: row.try_get("question")?,
+                    context_json: row.try_get("context_json")?,
+                    options_json: row.try_get("options_json")?,
+                    selected_outcome: row.try_get("selected_outcome")?,
+                    rationale: row.try_get("rationale")?,
+                    principal_type: row.try_get("principal_type")?,
+                    principal_id: row.try_get("principal_id")?,
+                    authority_basis: row.try_get("authority_basis")?,
+                    authorization_action: row.try_get("authorization_action")?,
+                    explicit_event: row.try_get("explicit_event")?,
+                    authorization_occurred_at: row.try_get("authorization_occurred_at")?,
+                    charter_revision_id: row.try_get("charter_revision_id")?,
+                    source_refs_json: row.try_get("source_refs_json")?,
+                    affected_records_json: row.try_get("affected_records_json")?,
+                    supersedes_decision_id: row.try_get("supersedes_decision_id")?,
+                    created_at: row.try_get("created_at")?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_lifecycle_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        let result = sqlx::query_scalar(
+            "SELECT lifecycle FROM project_milestone WHERE id = ? AND project_id = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn replacement_active_milestone_id_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = sqlx::query_scalar(
+            "SELECT id FROM project_milestone
+             WHERE project_id = ? AND lifecycle = 'active' AND id != ?
+             ORDER BY milestone_sequence ASC, id ASC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneReadinessSourceRow {
+    pub version: i64,
+    pub updated_at: String,
+    pub milestone_key: String,
+    pub display_label: Option<String>,
+    pub lifecycle: String,
+    pub current_definition_revision_id: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn milestone_readiness_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<MilestoneReadinessSourceRow> {
+        let row = sqlx::query(
+            "SELECT version, updated_at, milestone_key, display_label, lifecycle,
+                    current_definition_revision_id
+             FROM project_milestone
+             WHERE id = ? AND project_id = ?",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(MilestoneReadinessSourceRow {
+            version: row.try_get("version")?,
+            updated_at: row.try_get("updated_at")?,
+            milestone_key: row.try_get("milestone_key")?,
+            display_label: row.try_get("display_label")?,
+            lifecycle: row.try_get("lifecycle")?,
+            current_definition_revision_id: row.try_get("current_definition_revision_id")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneDefinitionReadinessSourceRow {
+    pub revision: i64,
+    pub content_digest: String,
+    pub rendered_digest: String,
+    pub render_version: String,
+    pub lifecycle: String,
+    pub created_at: String,
+}
+
+impl SqliteDb {
+    pub async fn milestone_definition_readiness_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        revision_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<MilestoneDefinitionReadinessSourceRow> {
+        let row = sqlx::query(
+            "SELECT revision, content_digest, rendered_digest, render_version,
+                    lifecycle, created_at
+             FROM project_milestone_revision
+             WHERE id = ? AND milestone_id = ?",
+        )
+        .bind(revision_id)
+        .bind(milestone_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(MilestoneDefinitionReadinessSourceRow {
+            revision: row.try_get("revision")?,
+            content_digest: row.try_get("content_digest")?,
+            rendered_digest: row.try_get("rendered_digest")?,
+            render_version: row.try_get("render_version")?,
+            lifecycle: row.try_get("lifecycle")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CharterReadinessSourceRow {
+    pub revision: i64,
+    pub created_at: String,
+    pub content_digest: String,
+    pub render_version: String,
+    pub rendered_digest: String,
+}
+
+impl SqliteDb {
+    pub async fn charter_readiness_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        revision_id: &str,
+        charter_id: &str,
+    ) -> crate::Result<CharterReadinessSourceRow> {
+        let row = sqlx::query(
+            "SELECT revision, created_at, content_digest, render_version, rendered_digest
+                 FROM project_charter_revision
+                 WHERE id = ? AND charter_id = ?",
+        )
+        .bind(revision_id)
+        .bind(charter_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(CharterReadinessSourceRow {
+            revision: row.try_get("revision")?,
+            created_at: row.try_get("created_at")?,
+            content_digest: row.try_get("content_digest")?,
+            render_version: row.try_get("render_version")?,
+            rendered_digest: row.try_get("rendered_digest")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveCheckWaiverSourceRow {
+    pub id: String,
+    pub rationale: String,
+    pub authority_basis: String,
+    pub authorization_action: String,
+    pub principal_type: String,
+    pub principal_id: Option<String>,
+    pub explicit_event: String,
+    pub authorization_occurred_at: String,
+    pub affected_records_json: String,
+    pub created_at: String,
+}
+
+impl SqliteDb {
+    pub async fn active_check_waiver_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+        check_id: &str,
+    ) -> crate::Result<Option<ActiveCheckWaiverSourceRow>> {
+        let row = sqlx::query(
+            "SELECT id, rationale, authority_basis, authorization_action,
+                        principal_type, principal_id, explicit_event,
+                        authorization_occurred_at,
+                        affected_records_json, created_at
+                 FROM project_decision
+                 WHERE project_id = ? AND decision_class = 'waiver' AND state = 'active'
+                   AND json_extract(affected_records_json, '$.milestone_id') = ?
+                   AND json_extract(affected_records_json, '$.check_id') = ?
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(check_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(ActiveCheckWaiverSourceRow {
+                id: row.try_get("id")?,
+                rationale: row.try_get("rationale")?,
+                authority_basis: row.try_get("authority_basis")?,
+                authorization_action: row.try_get("authorization_action")?,
+                principal_type: row.try_get("principal_type")?,
+                principal_id: row.try_get("principal_id")?,
+                explicit_event: row.try_get("explicit_event")?,
+                authorization_occurred_at: row.try_get("authorization_occurred_at")?,
+                affected_records_json: row.try_get("affected_records_json")?,
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn governed_milestone_task_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        let result = sqlx::query_scalar(
+            "SELECT g.task_id FROM project_task_governance g
+             JOIN task t ON t.id = g.task_id
+             WHERE g.milestone_id = ? AND t.project_id = ?
+               AND t.deleted_at IS NULL AND t.archived_at IS NULL
+               AND t.status != 'cancelled'
+             ORDER BY g.task_id",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_all(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneDocumentSourceRow {
+    pub version: i64,
+    pub updated_at: String,
+    pub current_approved_revision_id: Option<String>,
+    pub revision_id: String,
+    pub lifecycle: String,
+    pub content_digest: String,
+}
+
+impl SqliteDb {
+    pub async fn milestone_document_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        revision_id: &str,
+        document_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneDocumentSourceRow>> {
+        let row = sqlx::query(
+            "SELECT d.version, d.updated_at, d.current_approved_revision_id,
+                        r.id AS revision_id, r.lifecycle, r.content_digest
+                 FROM project_document d
+                 JOIN project_document_revision r
+                   ON r.id = ? AND r.document_id = d.id
+                 WHERE d.id = ? AND d.project_id = ?",
+        )
+        .bind(revision_id)
+        .bind(document_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(MilestoneDocumentSourceRow {
+                version: row.try_get("version")?,
+                updated_at: row.try_get("updated_at")?,
+                current_approved_revision_id: row.try_get("current_approved_revision_id")?,
+                revision_id: row.try_get("revision_id")?,
+                lifecycle: row.try_get("lifecycle")?,
+                content_digest: row.try_get("content_digest")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectAgentIdentityRow {
+    pub identity_id: String,
+}
+
+impl SqliteDb {
+    pub async fn active_project_agent_identity_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectAgentIdentityRow>> {
+        let row = sqlx::query(
+            "SELECT identity_id FROM project_agent_binding
+             WHERE project_id = ? AND state = 'active'
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        row.map(|row| {
+            Ok(ProjectAgentIdentityRow {
+                identity_id: row.try_get("identity_id")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn next_milestone_release_revision_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        milestone_id: &str,
+    ) -> crate::Result<i64> {
+        let result = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(release_revision), 0) + 1
+             FROM project_release WHERE milestone_id = ?",
+        )
+        .bind(milestone_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_readiness_record(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> crate::Result<Option<ProjectReadinessSnapshotRecord>> {
+        sqlx::query("SELECT * FROM project_readiness_snapshot WHERE project_id = ? AND id = ?")
+            .bind(project_id)
+            .bind(snapshot_id)
+            .fetch_optional(self.pool())
+            .await?
+            .map(readiness_record_from_row)
+            .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_release_by_idempotency(
+        &self,
+        project_id: &str,
+        key: &str,
+    ) -> crate::Result<Option<ProjectReleaseRecord>> {
+        sqlx::query("SELECT * FROM project_release WHERE project_id = ? AND idempotency_key = ?")
+            .bind(project_id)
+            .bind(key)
+            .fetch_optional(self.pool())
+            .await?
+            .map(release_record_from_row)
+            .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_release_by_readiness_target(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        snapshot_id: &str,
+        digest: &str,
+    ) -> crate::Result<Option<ProjectReleaseRecord>> {
+        sqlx::query(
+            "SELECT * FROM project_release
+             WHERE project_id = ? AND milestone_id = ?
+               AND readiness_snapshot_id = ? AND readiness_digest = ?
+             ORDER BY release_revision ASC, id ASC LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(snapshot_id)
+        .bind(digest)
+        .fetch_optional(self.pool())
+        .await?
+        .map(release_record_from_row)
+        .transpose()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseCharterRevisionSourceRow {
+    pub charter_id: String,
+    pub revision: i64,
+    pub content_digest: String,
+    pub render_version: String,
+    pub rendered_digest: String,
+}
+
+impl SqliteDb {
+    pub async fn release_charter_revision_source(
+        &self,
+        revision_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ReleaseCharterRevisionSourceRow>> {
+        let row = sqlx::query(
+            "SELECT cr.charter_id, cr.revision, cr.content_digest,
+                            cr.render_version, cr.rendered_digest
+                     FROM project_charter_revision cr
+                     JOIN project_charter c ON c.id = cr.charter_id
+                     WHERE cr.id = ? AND c.project_id = ?",
+        )
+        .bind(revision_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.map(|row| {
+            Ok(ReleaseCharterRevisionSourceRow {
+                charter_id: row.try_get("charter_id")?,
+                revision: row.try_get("revision")?,
+                content_digest: row.try_get("content_digest")?,
+                render_version: row.try_get("render_version")?,
+                rendered_digest: row.try_get("rendered_digest")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseReferenceRow {
+    pub reference_kind: String,
+    pub record_id: String,
+    pub record_version: Option<String>,
+    pub record_state: Option<String>,
+    pub record_digest: Option<String>,
+    pub metadata_json: String,
+}
+
+impl SqliteDb {
+    pub async fn release_reference_rows(
+        &self,
+        release_id: &str,
+    ) -> crate::Result<Vec<ReleaseReferenceRow>> {
+        let rows = sqlx::query(
+            "SELECT reference_kind, record_id, record_version, record_state,
+                    record_digest, metadata_json
+             FROM project_release_reference
+             WHERE release_id = ? ORDER BY ordinal ASC",
+        )
+        .bind(release_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ReleaseReferenceRow {
+                    reference_kind: row.try_get("reference_kind")?,
+                    record_id: row.try_get("record_id")?,
+                    record_version: row.try_get("record_version")?,
+                    record_state: row.try_get("record_state")?,
+                    record_digest: row.try_get("record_digest")?,
+                    metadata_json: row.try_get("metadata_json")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertMilestoneReadinessInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub milestone_id: &'a str,
+    pub definition_revision_id: &'a str,
+    pub input_manifest_json: &'a str,
+    pub event_watermark: &'a str,
+    pub outcome: &'a str,
+    pub blocking_reasons_json: &'a str,
+    pub check_results_json: &'a str,
+    pub waiver_manifest_json: &'a str,
+    pub evidence_manifest_json: &'a str,
+    pub commit_context_json: &'a str,
+    pub computing_policy_revision: &'a str,
+    pub readiness_digest: &'a str,
+    pub principal_type: &'a str,
+    pub principal_id: &'a str,
+    pub authorization_basis: &'a str,
+    pub authorization_action: &'a str,
+    pub expected_milestone_version: i64,
+    pub explicit_event: &'a str,
+    pub authorization_occurred_at: &'a str,
+    pub idempotency_key: &'a str,
+    pub created_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_milestone_readiness_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertMilestoneReadinessInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_readiness_snapshot (
+            id, project_id, milestone_id, definition_revision_id,
+            input_manifest_json, event_watermark, outcome, blocking_reasons_json,
+            check_results_json, waiver_manifest_json, evidence_manifest_json,
+            commit_context_json, computing_policy_revision, readiness_digest,
+            principal_type, principal_id, authorization_basis, authorization_action,
+            expected_milestone_version, explicit_event, authorization_occurred_at,
+            idempotency_key, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.project_id)
+        .bind(input.milestone_id)
+        .bind(input.definition_revision_id)
+        .bind(input.input_manifest_json)
+        .bind(input.event_watermark)
+        .bind(input.outcome)
+        .bind(input.blocking_reasons_json)
+        .bind(input.check_results_json)
+        .bind(input.waiver_manifest_json)
+        .bind(input.evidence_manifest_json)
+        .bind(input.commit_context_json)
+        .bind(input.computing_policy_revision)
+        .bind(input.readiness_digest)
+        .bind(input.principal_type)
+        .bind(input.principal_id)
+        .bind(input.authorization_basis)
+        .bind(input.authorization_action)
+        .bind(input.expected_milestone_version)
+        .bind(input.explicit_event)
+        .bind(input.authorization_occurred_at)
+        .bind(input.idempotency_key)
+        .bind(input.created_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertMilestoneReadinessSourceInput<'a> {
+    pub snapshot_id: &'a str,
+    pub ordinal: i64,
+    pub source_kind: &'a str,
+    pub source_id: &'a str,
+    pub source_version: &'a str,
+    pub source_digest: &'a str,
+    pub availability: Option<&'a str>,
+    pub metadata_json: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_milestone_readiness_input_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertMilestoneReadinessSourceInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_readiness_input (
+                readiness_snapshot_id, ordinal, source_kind, source_id,
+                source_version, source_digest, availability, disposition, metadata_json
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'included', ?)",
+        )
+        .bind(input.snapshot_id)
+        .bind(input.ordinal)
+        .bind(input.source_kind)
+        .bind(input.source_id)
+        .bind(input.source_version)
+        .bind(input.source_digest)
+        .bind(input.availability)
+        .bind(input.metadata_json)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ProjectAdoptionCharterSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ProjectAdoptionCharterSourceRow {
+    pub fn charter_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn charter_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_version")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn content_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_json")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectGoverningCharterSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectGoverningCharterSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectApprovedDocumentSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectApprovedDocumentSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn title(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("title")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectDecisionSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectDecisionSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("state")?)
+    }
+    pub fn decision_class(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("decision_class")?)
+    }
+    pub fn question(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("question")?)
+    }
+    pub fn selected_outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("selected_outcome")?)
+    }
+    pub fn rationale(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rationale")?)
+    }
+    pub fn principal_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_type")?)
+    }
+    pub fn principal_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_id")?)
+    }
+    pub fn authority_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authority_basis")?)
+    }
+    pub fn authorization_action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_action")?)
+    }
+    pub fn explicit_event(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("explicit_event")?)
+    }
+    pub fn authorization_occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_occurred_at")?)
+    }
+    pub fn charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn source_refs_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_refs_json")?)
+    }
+    pub fn affected_records_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("affected_records_json")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectReconciliationSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectReconciliationSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn conflict_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflict_id")?)
+    }
+    pub fn record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_type")?)
+    }
+    pub fn record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_id")?)
+    }
+    pub fn record_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_revision")?)
+    }
+    pub fn record_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_digest")?)
+    }
+    pub fn state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("state")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectCanonicalConflictSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectCanonicalConflictSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn domain(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("domain")?)
+    }
+    pub fn governing_record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_type")?)
+    }
+    pub fn governing_record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_id")?)
+    }
+    pub fn governing_record_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_revision")?)
+    }
+    pub fn governing_record_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_digest")?)
+    }
+    pub fn conflicting_record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflicting_record_type")?)
+    }
+    pub fn conflicting_record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflicting_record_id")?)
+    }
+    pub fn conflicting_record_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflicting_record_revision")?)
+    }
+    pub fn conflicting_record_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflicting_record_digest")?)
+    }
+    pub fn affected_paths_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("affected_paths_json")?)
+    }
+    pub fn conflict_code(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflict_code")?)
+    }
+    pub fn description(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("description")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectValidationOutcomeCountRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectValidationOutcomeCountRow {
+    pub fn key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("key")?)
+    }
+    pub fn count(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("count")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectMilestoneSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectMilestoneSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn milestone_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_key")?)
+    }
+    pub fn display_label(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("display_label")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn current_definition_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_definition_revision_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn blocker_reason_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("blocker_reason_json")?)
+    }
+    pub fn stale_reason_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("stale_reason_json")?)
+    }
+    pub fn reconciliation_reason_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("reconciliation_reason_json")?)
+    }
+    pub fn definition_digest(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("definition_digest")?)
+    }
+    pub fn acceptance_checks_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("acceptance_checks_json")?)
+    }
+    pub fn evidence_requirements_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("evidence_requirements_json")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectReadinessSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectReadinessSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn milestone_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_id")?)
+    }
+    pub fn definition_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("definition_revision_id")?)
+    }
+    pub fn event_watermark(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("event_watermark")?)
+    }
+    pub fn outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("outcome")?)
+    }
+    pub fn blocking_reasons_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("blocking_reasons_json")?)
+    }
+    pub fn readiness_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("readiness_digest")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectReleaseSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectReleaseSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn milestone_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_id")?)
+    }
+    pub fn release_sequence(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("release_sequence")?)
+    }
+    pub fn release_revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("release_revision")?)
+    }
+    pub fn release_identifier(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("release_identifier")?)
+    }
+    pub fn readiness_snapshot_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("readiness_snapshot_id")?)
+    }
+    pub fn readiness_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("readiness_digest")?)
+    }
+    pub fn snapshot_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("snapshot_digest")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_adoption_charter_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectAdoptionCharterSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS charter_id, c.version AS charter_version,
+                r.id AS revision_id, r.revision, r.content_digest,
+                r.rendered_digest, r.content_json
+         FROM project AS p
+         JOIN project_charter AS c ON c.project_id = p.id
+         JOIN project_charter_revision AS r
+           ON r.id = c.current_draft_revision_id
+          AND r.charter_id = c.id
+         WHERE p.id = ?
+           AND p.charter_status = 'legacy_unverified'
+           AND p.charter_setup_required = 1
+           AND c.current_approved_revision_id IS NULL
+           AND r.lifecycle IN ('draft', 'proposed')
+         ORDER BY c.updated_at DESC, c.id DESC
+         LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectAdoptionCharterSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_governing_charter_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<EffectiveProjectGoverningCharterSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.version, r.id AS revision_id, r.revision,
+                r.content_digest, r.render_version, r.rendered_digest
+         FROM project_charter c
+         JOIN project_charter_revision r
+           ON r.id = c.current_approved_revision_id
+          AND r.charter_id = c.id
+         WHERE c.project_id = ?
+           AND c.lifecycle = 'attached'
+           AND r.lifecycle = 'approved'
+         ORDER BY c.updated_at DESC, c.id DESC LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| EffectiveProjectGoverningCharterSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_approved_document_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectApprovedDocumentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT d.id, d.kind, d.title, d.current_approved_revision_id AS revision_id,
+                d.version, d.lifecycle, r.revision, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project_document d
+         JOIN project_document_revision r
+           ON r.id = d.current_approved_revision_id AND r.document_id = d.id
+         WHERE d.project_id = ? AND r.lifecycle = 'approved'
+         ORDER BY d.updated_at DESC, d.id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectApprovedDocumentSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_decision_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectDecisionSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, state, decision_class, question, selected_outcome,
+                rationale, principal_type, principal_id, authority_basis,
+                authorization_action, explicit_event, authorization_occurred_at,
+                charter_revision_id, source_refs_json,
+                affected_records_json, created_at
+         FROM project_decision
+         WHERE project_id = ? AND state IN ('active', 'invalidated')
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectDecisionSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_required_reconciliation_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectReconciliationSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, conflict_id, record_type, record_id, record_revision,
+                record_digest, state, version, updated_at
+         FROM project_reconciliation_record
+         WHERE project_id = ? AND state = 'required'
+         ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectReconciliationSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_canonical_conflict_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectCanonicalConflictSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, domain, governing_record_type, governing_record_id,
+                governing_record_revision, governing_record_digest,
+                conflicting_record_type, conflicting_record_id,
+                conflicting_record_revision, conflicting_record_digest,
+                affected_paths_json, conflict_code, description, created_at
+         FROM project_canonical_conflict
+         WHERE project_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectCanonicalConflictSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_validation_outcome_counts(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<EffectiveProjectValidationOutcomeCountRow>> {
+        let rows = sqlx::query(
+            "SELECT COALESCE(r.outcome, 'missing') AS key, COUNT(*) AS count
+         FROM project_milestone_check c
+         JOIN project_milestone m
+           ON m.id = c.milestone_id AND m.project_id = c.project_id
+          AND m.current_definition_revision_id = c.definition_revision_id
+         LEFT JOIN project_milestone_check_result r
+           ON r.id = c.current_result_id
+          AND r.definition_revision_id = c.definition_revision_id
+         WHERE c.project_id = ?
+         GROUP BY COALESCE(r.outcome, 'missing') ORDER BY key ASC",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectValidationOutcomeCountRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_milestone_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectMilestoneSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.milestone_key, m.display_label, m.lifecycle,
+                m.current_definition_revision_id, m.version,
+                m.blocker_reason_json, m.stale_reason_json,
+                m.reconciliation_reason_json,
+                r.content_digest AS definition_digest,
+                r.acceptance_checks_json, r.evidence_requirements_json
+         FROM project_milestone m
+         LEFT JOIN project_milestone_revision r
+           ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
+         WHERE m.project_id = ?
+           AND (
+                m.lifecycle IN ('planned', 'active', 'ready_for_release')
+                OR m.id = (SELECT primary_milestone_id FROM project WHERE id = ?)
+           )
+         ORDER BY m.milestone_sequence ASC, m.id ASC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectMilestoneSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_readiness_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectReadinessSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, milestone_id, definition_revision_id,
+                event_watermark, outcome,
+                blocking_reasons_json, readiness_digest, created_at
+         FROM project_readiness_snapshot
+         WHERE project_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectReadinessSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_release_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectReleaseSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, milestone_id, release_sequence, release_revision,
+                release_identifier, readiness_snapshot_id, readiness_digest,
+                snapshot_digest,
+                created_at
+         FROM project_release
+         WHERE project_id = ?
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectReleaseSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_unreleased_document_ids(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM project_document
+         WHERE project_id = ? AND current_draft_revision_id IS NOT NULL
+           AND (current_approved_revision_id IS NULL
+                OR current_draft_revision_id != current_approved_revision_id)
+         ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_decision_candidate_ids(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM project_decision_candidate
+         WHERE project_id = ? AND lifecycle IN ('draft', 'proposed')
+         ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct AdaptiveTaskGovernanceSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl AdaptiveTaskGovernanceSourceRow {
+    pub fn charter_revision_id_unchecked(&self) -> Option<String> {
+        self.row.get("charter_revision_id")
+    }
+    pub fn plan_item_id_unchecked(&self) -> Option<String> {
+        self.row.get("plan_item_id")
+    }
+    pub fn milestone_id_unchecked(&self) -> Option<String> {
+        self.row.get("milestone_id")
+    }
+    pub fn document_revisions_json_unchecked(&self) -> String {
+        self.row.get("document_revisions_json")
+    }
+    pub fn capability_class_unchecked(&self) -> Option<String> {
+        self.row.get("capability_class")
+    }
+    pub fn risk_class_unchecked(&self) -> Option<String> {
+        self.row.get("risk_class")
+    }
+    pub fn provenance_json_unchecked(&self) -> String {
+        self.row.get("provenance_json")
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct TaskExecutionCharterGovernanceSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl TaskExecutionCharterGovernanceSourceRow {
+    pub fn charter_status_unchecked(&self) -> String {
+        self.row.get("charter_status")
+    }
+    pub fn charter_setup_required_unchecked(&self) -> i64 {
+        self.row.get("charter_setup_required")
+    }
+    pub fn current_charter_revision_id_unchecked(&self) -> Option<String> {
+        self.row.get("current_charter_revision_id")
+    }
+    pub fn task_type_unchecked(&self) -> String {
+        self.row.get("task_type")
+    }
+    pub fn charter_revision_id_unchecked(&self) -> Option<String> {
+        self.row.get("charter_revision_id")
+    }
+    pub fn capability_class_unchecked(&self) -> Option<String> {
+        self.row.get("capability_class")
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct WorkspaceLeaseCharterGateRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl WorkspaceLeaseCharterGateRow {
+    pub fn charter_status_unchecked(&self) -> String {
+        self.row.get("charter_status")
+    }
+    pub fn charter_setup_required_unchecked(&self) -> i64 {
+        self.row.get("charter_setup_required")
+    }
+    pub fn current_charter_revision_id_unchecked(&self) -> Option<String> {
+        self.row.get("current_charter_revision_id")
+    }
+    pub fn charter_revision_id_unchecked(&self) -> Option<String> {
+        self.row.get("charter_revision_id")
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct TaskGovernanceDocumentRevisionSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl TaskGovernanceDocumentRevisionSourceRow {
+    pub fn project_id_unchecked(&self) -> String {
+        self.row.get("project_id")
+    }
+    pub fn lifecycle_unchecked(&self) -> String {
+        self.row.get("lifecycle")
+    }
+}
+
+impl SqliteDb {
+    pub async fn adaptive_task_governance_source(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<AdaptiveTaskGovernanceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT g.project_id, g.charter_revision_id, g.plan_item_id,
+                    g.milestone_id, g.document_revisions_json,
+                    g.capability_class, g.risk_class, g.runnable,
+                    g.provenance_json
+             FROM project_task_governance g
+             WHERE g.task_id = ? AND g.project_id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| AdaptiveTaskGovernanceSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_governance_milestone_project(
+        &self,
+        milestone_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar::<_, String>(
+                "SELECT project_id FROM project_milestone WHERE id = ?",
+            )
+            .bind(milestone_id)
+            .fetch_optional(self.pool())
+            .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_execution_charter_governance_source(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<TaskExecutionCharterGovernanceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT p.charter_status, p.charter_setup_required,
+                    p.current_charter_revision_id,
+                    t.task_type,
+                    g.charter_revision_id,
+                    g.capability_class
+             FROM project p
+             JOIN task t ON t.id = ? AND t.project_id = p.id
+                 AND t.deleted_at IS NULL
+             LEFT JOIN project_task_governance g ON g.project_id = p.id
+                 AND g.task_id = t.id
+             WHERE p.id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| TaskExecutionCharterGovernanceSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_lease_task_capability_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT capability_class FROM project_task_governance
+             WHERE task_id = ? AND project_id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_lease_charter_gate_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<WorkspaceLeaseCharterGateRow>> {
+        let rows = sqlx::query(
+            "SELECT p.charter_status, p.charter_setup_required,
+                    p.current_charter_revision_id, g.charter_revision_id
+             FROM project p
+             LEFT JOIN project_task_governance g
+               ON g.project_id = p.id AND g.task_id = ?
+             WHERE p.id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(rows.map(|row| WorkspaceLeaseCharterGateRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_lease_task_capability(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT capability_class FROM project_task_governance
+             WHERE task_id = ? AND project_id = ?",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub async fn task_governance_document_revision_source_on_pool(
+    pool: &SqlitePool,
+    revision_id: &str,
+) -> crate::Result<Option<TaskGovernanceDocumentRevisionSourceRow>> {
+    let rows = sqlx::query(
+        "SELECT d.project_id, r.lifecycle
+             FROM project_document_revision r
+             JOIN project_document d ON d.id = r.document_id
+             WHERE r.id = ?",
+    )
+    .bind(revision_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(rows.map(|row| TaskGovernanceDocumentRevisionSourceRow { row }))
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectTurnAdmissionReceiptRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectTurnAdmissionReceiptRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn source_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_kind")?)
+    }
+    pub fn handoff_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("handoff_id")?)
+    }
+    pub fn initial_charter_approval_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("initial_charter_approval_id")?)
+    }
+    pub fn initial_charter_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("initial_charter_id")?)
+    }
+    pub fn initial_charter_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("initial_charter_revision_id")?)
+    }
+    pub fn payload_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("payload_digest")?)
+    }
+    pub fn validation_schema_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("validation_schema_version")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectTurnApprovalEventRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectTurnApprovalEventRow {
+    pub fn authorization_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_basis")?)
+    }
+    pub fn action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("action")?)
+    }
+    pub fn explicit_event(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("explicit_event")?)
+    }
+    pub fn occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("occurred_at")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectTurnCharterApprovalRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectTurnCharterApprovalRow {
+    pub fn charter_id_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn charter_account_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_account_id")?)
+    }
+    pub fn charter_revision_id_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn current_approved_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_approved_revision_id")?)
+    }
+    pub fn charter_revision_lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_revision_lifecycle")?)
+    }
+    pub fn charter_version_required(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_version")?)
+    }
+    pub fn expected_charter_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("expected_charter_version")?)
+    }
+    pub fn approval_lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_lifecycle")?)
+    }
+    pub fn approval_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_id")?)
+    }
+    pub fn approval_content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_content_digest")?)
+    }
+    pub fn approval_render_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_render_digest")?)
+    }
+    pub fn charter_content_digest_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_content_digest")?)
+    }
+    pub fn charter_render_digest_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_render_digest")?)
+    }
+    pub fn consumed_project_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("consumed_project_id")?)
+    }
+    pub fn selected_operating_skill_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("selected_operating_skill_revision_id")?)
+    }
+    pub fn approval_event_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("approval_event_id")?)
+    }
+    pub fn approving_principal_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approving_principal_type")?)
+    }
+    pub fn approving_principal_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approving_principal_id")?)
+    }
+    pub fn approval_authorization_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_authorization_basis")?)
+    }
+    pub fn approval_authorization_action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_authorization_action")?)
+    }
+    pub fn approval_authorization_event_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_authorization_event_id")?)
+    }
+    pub fn approval_authorization_occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_authorization_occurred_at")?)
+    }
+    pub fn approval_created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("approval_created_at")?)
+    }
+    pub fn project_mode(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_mode")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectTurnOperatingSkillRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectTurnOperatingSkillRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("skill_key")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn schema_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("schema_version")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn canonical_body(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("canonical_body")?)
+    }
+    pub fn policy_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_json")?)
+    }
+    pub fn policy_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_digest")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn current_revision_id_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_revision_id")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MainTurnOperatingSkillRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MainTurnOperatingSkillRow {
+    pub fn current_revision_id_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("current_revision_id")?)
+    }
+    pub fn skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("skill_key")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn schema_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("schema_version")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn canonical_body(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("canonical_body")?)
+    }
+    pub fn policy_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_json")?)
+    }
+    pub fn policy_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("policy_digest")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MainTurnGenesisInstructionRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MainTurnGenesisInstructionRow {
+    pub fn instruction_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("instruction_id")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn body(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("body")?)
+    }
+    pub fn genesis_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("genesis_id")?)
+    }
+    pub fn genesis_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("genesis_version")?)
+    }
+    pub fn genesis_lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("genesis_lifecycle")?)
+    }
+    pub fn charter_id_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn charter_revision_id_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn charter_version_optional(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("charter_version")?)
+    }
+    pub fn charter_content_digest_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_content_digest")?)
+    }
+    pub fn charter_render_digest_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_render_digest")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct FrozenTurnOperatingSkillRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl FrozenTurnOperatingSkillRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("skill_key")?)
+    }
+    pub fn canonical_body(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("canonical_body")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn frozen_turn_operating_skill(
+        &self,
+        revision_id: &str,
+    ) -> crate::Result<Option<FrozenTurnOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT id, skill_key, canonical_body, content_digest
+             FROM operating_skill_revision WHERE id = ?",
+        )
+        .bind(revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| FrozenTurnOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_genesis_instruction_at_admission(
+        &self,
+        chat_id: &str,
+        admitted_at: &str,
+    ) -> crate::Result<Option<MainTurnGenesisInstructionRow>> {
+        let rows = sqlx::query("SELECT instruction.id AS instruction_id, instruction.revision,
+                                instruction.body,
+                                genesis.id AS genesis_id, genesis.version AS genesis_version,
+                                genesis.lifecycle AS genesis_lifecycle,
+                                genesis.charter_id, genesis.charter_revision_id, genesis.charter_version,
+                                revision.content_digest AS charter_content_digest,
+                                revision.rendered_digest AS charter_render_digest
+                         FROM agent_chat_instruction_revision AS instruction
+                         JOIN product_genesis_session AS genesis
+                           ON genesis.id = instruction.source_id
+                          AND genesis.main_chat_id = instruction.chat_id
+                         LEFT JOIN project_charter_revision AS revision
+                           ON revision.id = genesis.charter_revision_id
+                         WHERE instruction.chat_id = ?
+                           AND instruction.source_type = 'native'
+                           AND instruction.created_at <= ?
+                           AND genesis.lifecycle IN (
+                               'discovering', 'ready_for_project', 'handed_off', 'cancelled'
+                           )
+                         ORDER BY instruction.revision DESC, instruction.id DESC
+                         LIMIT 1",)
+.bind(chat_id)
+.bind(admitted_at)
+.fetch_optional(self.pool()).await?;
+        Ok(rows.map(|row| MainTurnGenesisInstructionRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_active_genesis_instruction(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<MainTurnGenesisInstructionRow>> {
+        let rows = sqlx::query("SELECT instruction.id AS instruction_id, instruction.revision,
+                                instruction.body,
+                                genesis.id AS genesis_id, genesis.version AS genesis_version,
+                                genesis.lifecycle AS genesis_lifecycle,
+                                genesis.charter_id, genesis.charter_revision_id, genesis.charter_version,
+                                revision.content_digest AS charter_content_digest,
+                                revision.rendered_digest AS charter_render_digest
+                         FROM agent_chat_instruction_revision AS instruction
+                         JOIN product_genesis_session AS genesis
+                           ON genesis.id = instruction.source_id
+                          AND genesis.main_chat_id = instruction.chat_id
+                         LEFT JOIN project_charter_revision AS revision
+                           ON revision.id = genesis.charter_revision_id
+                         WHERE instruction.chat_id = ?
+                           AND instruction.source_type = 'native'
+                           AND genesis.lifecycle IN ('discovering', 'ready_for_project')
+                         ORDER BY instruction.revision DESC, instruction.id DESC
+                         LIMIT 1",)
+.bind(chat_id)
+.fetch_optional(self.pool()).await?;
+        Ok(rows.map(|row| MainTurnGenesisInstructionRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_frozen_operating_skill(
+        &self,
+        revision_id: &str,
+    ) -> crate::Result<Option<MainTurnOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT sr.id AS current_revision_id,
+                                    sr.id, sr.skill_key, sr.revision,
+                                    sr.schema_version, sr.render_version,
+                                    sr.canonical_body, sr.policy_json,
+                                    sr.policy_digest, sr.content_digest
+                             FROM operating_skill_revision AS sr
+                             WHERE sr.id = ?",
+        )
+        .bind(revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MainTurnOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_active_operating_skill(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<MainTurnOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT os.current_revision_id,
+                                    sr.id, sr.skill_key, sr.revision,
+                                    sr.schema_version, sr.render_version,
+                                    sr.canonical_body, sr.policy_json,
+                                    sr.policy_digest, sr.content_digest
+                             FROM operating_skill AS os
+                             JOIN operating_skill_revision AS sr
+                               ON sr.id = os.current_revision_id
+                             WHERE os.id = ? AND os.lifecycle = 'active'",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MainTurnOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_turn_active_genesis_id(
+        &self,
+        chat_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT id
+                             FROM product_genesis_session
+                             WHERE main_chat_id = ?
+                               AND lifecycle IN ('discovering', 'ready_for_project')
+                             ORDER BY version DESC, id DESC
+                             LIMIT 1",
+        )
+        .bind(chat_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_setup_operating_skill(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<ProjectTurnOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT sr.id, sr.skill_key, sr.revision,
+                        sr.schema_version, sr.render_version, sr.canonical_body,
+                        sr.policy_json, sr.policy_digest, sr.content_digest,
+                        os.current_revision_id
+                 FROM operating_skill_revision AS sr
+                 JOIN operating_skill AS os ON os.id = sr.operating_skill_id
+                  AND os.current_revision_id = sr.id
+                 WHERE os.lifecycle = 'active' AND sr.skill_key = ?
+                 ORDER BY sr.revision DESC, sr.id DESC LIMIT 1",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_charter_approval(
+        &self,
+        project_id: &str,
+        charter_id: &str,
+        revision_id: &str,
+        approval_id: Option<&str>,
+    ) -> crate::Result<Option<ProjectTurnCharterApprovalRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS charter_id, c.account_id AS charter_account_id,
+                    c.current_approved_revision_id,
+                    c.project_mode, c.version AS charter_version,
+                    r.id AS charter_revision_id, r.lifecycle AS charter_revision_lifecycle,
+                    r.content_digest AS charter_content_digest,
+                    r.rendered_digest AS charter_render_digest,
+                    a.id AS approval_id, a.lifecycle AS approval_lifecycle,
+                    a.content_digest AS approval_content_digest,
+                    a.rendered_digest AS approval_render_digest,
+                    a.expected_charter_version,
+                    a.selected_identity_id, a.selected_profile_id,
+                    a.selected_operating_skill_revision_id,
+                    a.selected_policy_revision, a.selected_policy_digest,
+                    a.approval_event_id,
+                    a.consumed_project_id,
+                    a.approving_principal_type,
+                    a.approving_principal_id,
+                    a.authorization_basis AS approval_authorization_basis,
+                    a.authorization_action AS approval_authorization_action,
+                    a.explicit_event AS approval_authorization_event_id,
+                    a.authorization_occurred_at AS approval_authorization_occurred_at,
+                    a.created_at AS approval_created_at
+             FROM project_charter AS c
+             JOIN project_charter_revision AS r
+               ON r.id = c.current_approved_revision_id
+              AND r.lifecycle = 'approved'
+             JOIN project_charter_approval AS a
+               ON a.charter_id = c.id AND a.revision_id = r.id
+              AND a.lifecycle IN ('active', 'consumed')
+             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND a.id = ?
+             ORDER BY a.created_at DESC, a.id DESC
+             LIMIT 1",
+        )
+        .bind(project_id)
+        .bind(charter_id)
+        .bind(revision_id)
+        .bind(approval_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnCharterApprovalRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_selected_operating_skill(
+        &self,
+        revision_id: &str,
+    ) -> crate::Result<Option<ProjectTurnOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT sr.id, sr.skill_key, sr.revision,
+                    sr.schema_version, sr.render_version, sr.canonical_body,
+                    sr.policy_json, sr.policy_digest, sr.content_digest,
+                    os.current_revision_id
+             FROM operating_skill_revision AS sr
+             JOIN operating_skill AS os ON os.id = sr.operating_skill_id
+             WHERE sr.id = ?",
+        )
+        .bind(revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_approval_event(
+        &self,
+        approval_id: &str,
+        event_id: &str,
+        owner_id: &str,
+    ) -> crate::Result<Option<ProjectTurnApprovalEventRow>> {
+        let rows = sqlx::query(
+            "SELECT principal_type, principal_id, authorization_basis, action,
+                    explicit_event, occurred_at
+             FROM project_charter_approval_event
+             WHERE approval_id = ? AND id = ? AND principal_type = 'user'
+               AND principal_id = ? LIMIT 1",
+        )
+        .bind(approval_id)
+        .bind(event_id)
+        .bind(owner_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnApprovalEventRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_admission_receipt(
+        &self,
+        receipt_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectTurnAdmissionReceiptRow>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, source_kind, handoff_id,
+                        initial_charter_approval_id, initial_charter_id,
+                        initial_charter_revision_id, payload_digest,
+                        validation_schema_version
+                 FROM project_admission_receipt
+                 WHERE id = ? AND project_id = ?",
+        )
+        .bind(receipt_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectTurnAdmissionReceiptRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_turn_adoption_approval_digest(
+        &self,
+        approval_id: &str,
+        charter_id: &str,
+        revision_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT content_digest FROM project_charter_approval
+                         WHERE id = ? AND charter_id = ? AND revision_id = ?
+                           AND approval_type = 'adoption' AND lifecycle = 'consumed'
+                           AND consumed_project_id = ?",
+        )
+        .bind(approval_id)
+        .bind(charter_id)
+        .bind(revision_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeApprovedProjectCharterRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeApprovedProjectCharterRow {
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn content_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_json")?)
+    }
+    pub fn charter_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn revision(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("revision")?)
+    }
+    pub fn charter_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_version")?)
+    }
+    pub fn project_mode(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_mode")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn rendered_view(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_view")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeDiscoverySessionRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeDiscoverySessionRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn maturity(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("maturity")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn project_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn handoff_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("handoff_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_discovery_sessions(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeDiscoverySessionRow>> {
+        let rows = sqlx::query(
+            "SELECT id, maturity, lifecycle, project_id, handoff_id, version,
+                    created_at, updated_at
+             FROM product_genesis_session
+             WHERE account_id = ?
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeDiscoverySessionRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_approved_project_charter(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<NativeApprovedProjectCharterRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS charter_id, c.project_mode, c.version AS charter_version,
+                    r.id AS revision_id, r.revision, r.content_digest, r.rendered_digest,
+                    r.rendered_view, r.content_json
+             FROM project_charter AS c
+             JOIN project_charter_revision AS r
+               ON r.id = c.current_approved_revision_id AND r.lifecycle = 'approved'
+             WHERE c.project_id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| NativeApprovedProjectCharterRow { row }))
+    }
+}
+
+pub struct InsertNativeProjectCommandObservationInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub actor_identity_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub session_id: &'a str,
+    pub turn_id: Option<&'a str>,
+    pub program: &'a str,
+    pub args_json: String,
+    pub exit_code: Option<i32>,
+    pub success: i64,
+    pub output_digest: &'a str,
+    pub stdout_excerpt: &'a str,
+    pub stderr_excerpt: &'a str,
+    pub created_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_native_project_command_observation(
+        &self,
+        input: InsertNativeProjectCommandObservationInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO project_command_observation (
+                id, project_id, actor_identity_id, scope_type, scope_id, session_id, turn_id,
+                program, args_json, exit_code, success, output_digest, stdout_excerpt,
+                stderr_excerpt, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.project_id)
+        .bind(input.actor_identity_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.session_id)
+        .bind(input.turn_id)
+        .bind(input.program)
+        .bind(input.args_json)
+        .bind(input.exit_code)
+        .bind(input.success)
+        .bind(input.output_digest)
+        .bind(input.stdout_excerpt)
+        .bind(input.stderr_excerpt)
+        .bind(input.created_at)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_start_active_session_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        account_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM product_genesis_session
+             WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(connection)
+        .await?)
+    }
+}
+
+pub struct InsertMainGenesisSessionInTxInput<'a> {
+    pub session_id: &'a str,
+    pub account_id: &'a str,
+    pub chat_id: &'a str,
+    pub prompt_revision: &'a str,
+    pub prompt_body: &'a str,
+    pub maturity: &'a str,
+    pub initial_idea: &'a str,
+    pub source_message_ids_json: &'a str,
+    pub preferred_identity_id: Option<&'a str>,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_main_genesis_session_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertMainGenesisSessionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO product_genesis_session (
+                id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+                initial_idea, lifecycle, source_message_ids_json,
+                preferred_project_agent_identity_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'discovering', ?, ?, 1, ?, ?)",
+        )
+        .bind(input.session_id)
+        .bind(input.account_id)
+        .bind(input.chat_id)
+        .bind(input.prompt_revision)
+        .bind(input.prompt_body)
+        .bind(input.maturity)
+        .bind(input.initial_idea)
+        .bind(input.source_message_ids_json)
+        .bind(input.preferred_identity_id)
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_active_main_skill_revision_id(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT current_revision_id FROM operating_skill
+             WHERE id = ? AND lifecycle = 'active'",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_discovering_session_id(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM product_genesis_session
+                 WHERE account_id = ? AND lifecycle = 'discovering'
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct SetGenesisPreferredProjectIdentityInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub updated_at: &'a str,
+    pub session_id: &'a str,
+    pub account_id: &'a str,
+    pub version: i64,
+}
+
+impl SqliteDb {
+    pub async fn set_genesis_preferred_project_identity_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: SetGenesisPreferredProjectIdentityInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE product_genesis_session
+             SET preferred_project_agent_identity_id = ?, version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND account_id = ? AND lifecycle = 'discovering'
+               AND version = ?",
+        )
+        .bind(input.identity_id)
+        .bind(input.updated_at)
+        .bind(input.session_id)
+        .bind(input.account_id)
+        .bind(input.version)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn genesis_current_active_session_id(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM product_genesis_session
+                 WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                 ORDER BY updated_at DESC, id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ArtifactDocumentApprovalSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ArtifactDocumentApprovalSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn document_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("document_id")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn principal_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_type")?)
+    }
+    pub fn principal_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_id")?)
+    }
+    pub fn authorization_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_basis")?)
+    }
+    pub fn authorization_action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_action")?)
+    }
+    pub fn explicit_event(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("explicit_event")?)
+    }
+    pub fn authorization_occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_occurred_at")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn idempotency_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("idempotency_key")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ValidationCommandObservationSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ValidationCommandObservationSourceRow {
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn args_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("args_json")?)
+    }
+    pub fn program(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("program")?)
+    }
+    pub fn exit_code(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("exit_code")?)
+    }
+    pub fn success(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("success")?)
+    }
+    pub fn output_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("output_digest")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ValidationAcceptanceCheckSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ValidationAcceptanceCheckSourceRow {
+    pub fn source_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_kind")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_acceptance_check_source(
+        &self,
+        check_id: &str,
+        project_id: &str,
+        milestone_id: &str,
+        definition_revision_id: &str,
+    ) -> crate::Result<Option<ValidationAcceptanceCheckSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT version, source_kind FROM project_milestone_check
+             WHERE id = ? AND project_id = ? AND milestone_id = ?
+               AND definition_revision_id = ?",
+        )
+        .bind(check_id)
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(definition_revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ValidationAcceptanceCheckSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_latest_delivered_task_at(
+        &self,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT MAX(t.updated_at) FROM project_task_governance g
+             JOIN task t ON t.id = g.task_id
+             WHERE g.milestone_id = ? AND t.project_id = ? AND t.status = 'done'
+               AND t.deleted_at IS NULL",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_milestone_definition_created_at(
+        &self,
+        definition_revision_id: &str,
+    ) -> crate::Result<String> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT created_at FROM project_milestone_revision WHERE id = ?",
+        )
+        .bind(definition_revision_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_command_observation_source(
+        &self,
+        observation_id: &str,
+        project_id: &str,
+        actor_identity_id: &str,
+    ) -> crate::Result<Option<ValidationCommandObservationSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT program, args_json, exit_code, success, output_digest, created_at
+                 FROM project_command_observation
+                 WHERE id = ? AND project_id = ? AND actor_identity_id = ?",
+        )
+        .bind(observation_id)
+        .bind(project_id)
+        .bind(actor_identity_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ValidationCommandObservationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn artifact_next_document_revision(&self, document_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(MAX(revision), 0) + 1
+             FROM project_document_revision WHERE document_id = ?",
+        )
+        .bind(document_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn artifact_document_approval_source(
+        &self,
+        approval_id: &str,
+    ) -> crate::Result<Option<ArtifactDocumentApprovalSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, document_id, revision_id, principal_type, principal_id,
+                authorization_basis, authorization_action, explicit_event,
+                authorization_occurred_at, content_digest, rendered_digest,
+                lifecycle, idempotency_key, version, created_at, updated_at
+         FROM project_document_approval WHERE id = ?",
+        )
+        .bind(approval_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ArtifactDocumentApprovalSourceRow { row }))
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProductGenesisSourceMessagesRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProductGenesisSourceMessagesRow {
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn source_message_ids_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_message_ids_json")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProductGenesisSessionSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProductGenesisSessionSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn account_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("account_id")?)
+    }
+    pub fn main_chat_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("main_chat_id")?)
+    }
+    pub fn prompt_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("prompt_revision")?)
+    }
+    pub fn initial_idea(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("initial_idea")?)
+    }
+    pub fn preferred_project_agent_identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("preferred_project_agent_identity_id")?)
+    }
+    pub fn charter_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_id")?)
+    }
+    pub fn charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn charter_approval_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_approval_id")?)
+    }
+    pub fn charter_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("charter_version")?)
+    }
+    pub fn project_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn handoff_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("handoff_id")?)
+    }
+    pub fn failure_reason(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("failure_reason")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+    pub fn maturity(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("maturity")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn source_message_ids_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_message_ids_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn product_genesis_session_source(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<Option<ProductGenesisSessionSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+                    initial_idea, lifecycle, source_message_ids_json,
+                    preferred_project_agent_identity_id, charter_id,
+                    charter_revision_id, charter_approval_id, charter_version,
+                    project_id, handoff_id,
+                    failure_reason, version, created_at, updated_at
+             FROM product_genesis_session WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProductGenesisSessionSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn product_genesis_active_session_source(
+        &self,
+        account_id: &str,
+    ) -> crate::Result<Option<ProductGenesisSessionSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+                    initial_idea, lifecycle, source_message_ids_json,
+                    preferred_project_agent_identity_id, charter_id,
+                    charter_revision_id, charter_approval_id, charter_version,
+                    project_id, handoff_id,
+                    failure_reason, version, created_at, updated_at
+             FROM product_genesis_session
+             WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProductGenesisSessionSourceRow { row }))
+    }
+}
+
+pub struct InsertProductGenesisSessionInTxInput<'a> {
+    pub id: &'a str,
+    pub account_id: &'a str,
+    pub chat_id: &'a str,
+    pub prompt_revision: &'a str,
+    pub prompt_body: &'a str,
+    pub maturity: &'a str,
+    pub initial_idea: Option<&'a str>,
+    pub preferred_identity_id: Option<&'a str>,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_product_genesis_session_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertProductGenesisSessionInTxInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "INSERT INTO product_genesis_session (
+                id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
+                initial_idea, lifecycle, source_message_ids_json,
+                preferred_project_agent_identity_id, version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'discovering', '[]', ?, 1, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.account_id)
+        .bind(input.chat_id)
+        .bind(input.prompt_revision)
+        .bind(input.prompt_body)
+        .bind(input.maturity)
+        .bind(input.initial_idea)
+        .bind(input.preferred_identity_id)
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn cancel_active_product_genesis(
+        &self,
+        reason: Option<&str>,
+        updated_at: String,
+        session_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE product_genesis_session
+             SET lifecycle = 'cancelled', failure_reason = ?,
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?
+               AND lifecycle IN ('discovering', 'ready_for_project')",
+        )
+        .bind(reason)
+        .bind(updated_at)
+        .bind(session_id)
+        .bind(version)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+pub struct TransitionProductGenesisSessionInput<'a> {
+    pub lifecycle: &'a str,
+    pub project_id: Option<&'a str>,
+    pub handoff_id: Option<&'a str>,
+    pub failure_reason: Option<&'a str>,
+    pub updated_at: String,
+    pub session_id: &'a str,
+    pub version: i64,
+    pub discovering_target: &'a str,
+    pub ready_target: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn transition_product_genesis_session(
+        &self,
+        input: TransitionProductGenesisSessionInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE product_genesis_session
+             SET lifecycle = ?, project_id = COALESCE(?, project_id),
+                 handoff_id = COALESCE(?, handoff_id), failure_reason = ?,
+                 version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?
+               AND ((lifecycle = 'discovering' AND ? IN ('ready_for_project', 'cancelled'))
+                 OR (lifecycle = 'ready_for_project' AND ? IN ('handed_off', 'cancelled'))) ",
+        )
+        .bind(input.lifecycle)
+        .bind(input.project_id)
+        .bind(input.handoff_id)
+        .bind(input.failure_reason)
+        .bind(input.updated_at)
+        .bind(input.session_id)
+        .bind(input.version)
+        .bind(input.discovering_target)
+        .bind(input.ready_target)
+        .execute(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn product_genesis_source_messages_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        session_id: &str,
+    ) -> crate::Result<Option<ProductGenesisSourceMessagesRow>> {
+        let rows = sqlx::query(
+            "SELECT version, source_message_ids_json
+             FROM product_genesis_session WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(connection)
+        .await?;
+        Ok(rows.map(|row| ProductGenesisSourceMessagesRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_product_genesis_source_messages_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        source_ids_json: String,
+        updated_at: String,
+        session_id: &str,
+        version: i64,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE product_genesis_session
+             SET source_message_ids_json = ?, version = version + 1, updated_at = ?
+             WHERE id = ? AND version = ?
+               AND lifecycle IN ('discovering', 'ready_for_project')",
+        )
+        .bind(source_ids_json)
+        .bind(updated_at)
+        .bind(session_id)
+        .bind(version)
+        .execute(connection)
+        .await?)
+    }
+}
+
+pub struct ApplyProductGenesisSetupInput<'a> {
+    pub maturity: Option<&'a str>,
+    pub preferred_identity_id: Option<&'a str>,
+    pub setup_applied_at: &'a str,
+    pub updated_at: &'a str,
+    pub session_id: &'a str,
+    pub version: i64,
+}
+
+impl SqliteDb {
+    pub async fn apply_product_genesis_setup(
+        &self,
+        input: ApplyProductGenesisSetupInput<'_>,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query("UPDATE product_genesis_session
+             SET maturity = COALESCE(?, maturity),
+                 preferred_project_agent_identity_id = COALESCE(?, preferred_project_agent_identity_id),
+                 setup_applied_at = ?,
+                 version = version + 1,
+                 updated_at = ?
+             WHERE id = ? AND version = ? AND lifecycle = 'discovering' AND setup_applied_at IS NULL",)
+.bind(input.maturity)
+.bind(input.preferred_identity_id)
+.bind(input.setup_applied_at)
+.bind(input.updated_at)
+.bind(input.session_id)
+.bind(input.version)
+.execute(self.pool()).await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn product_genesis_current_version(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT version FROM product_genesis_session WHERE id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(self.pool())
+            .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_usage_active_genesis_exists(
+        &self,
+        chat_id: &str,
+        account_id: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                   SELECT 1 FROM product_genesis_session
+                   WHERE main_chat_id = ?
+                     AND account_id = ?
+                     AND lifecycle IN ('discovering', 'ready_for_project')
+                )",
+        )
+        .bind(chat_id)
+        .bind(account_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+pub struct ChatUsageHandedOffProjectIdInput<'a> {
+    pub chat_id: &'a str,
+    pub account_id: &'a str,
+    pub turn_id: &'a str,
+    pub source_message_id: &'a str,
+    pub cited_message_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn chat_usage_handed_off_project_id(
+        &self,
+        input: ChatUsageHandedOffProjectIdInput<'_>,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT g.project_id
+                 FROM product_genesis_session g
+                 JOIN agent_handoff h ON h.id = g.handoff_id
+                 JOIN project p
+                   ON p.id = g.project_id
+                  AND p.owner_id = g.account_id
+                 JOIN project_admission_receipt receipt
+                   ON receipt.project_id = g.project_id
+                  AND receipt.source_kind = 'genesis_handoff'
+                  AND receipt.handoff_id = g.handoff_id
+                 JOIN agent_chat target ON target.id = h.target_chat_id
+                 JOIN agent_handoff_delivery delivery
+                   ON delivery.handoff_id = h.id
+                  AND delivery.delivery_sequence = 1
+                  AND delivery.status = 'delivered'
+                  AND delivery.target_message_id IS h.target_message_id
+                  AND delivery.target_turn_job_id IS h.target_turn_job_id
+                 WHERE g.main_chat_id = ? AND g.lifecycle = 'handed_off'
+                   AND g.project_id IS NOT NULL AND h.target_chat_id = target.id
+                   AND g.account_id = ? AND h.source_chat_id = g.main_chat_id
+                   AND h.status = 'delivered'
+                   AND target.kind = 'project' AND target.project_id = g.project_id
+                   AND json_valid(h.source_revisions_json)
+                   AND json_extract(
+                       h.source_revisions_json,
+                       '$.request.source_revisions_digest'
+                   ) = receipt.payload_digest
+                   AND (h.source_turn_job_id = ? OR h.source_message_id = ?
+                        OR EXISTS (
+                            SELECT 1
+                            FROM json_each(
+                                json_extract(h.source_revisions_json, '$.source.message_ids')
+                            )
+                            WHERE json_each.value = ?
+                        ))
+                 ORDER BY h.created_at DESC, h.id DESC LIMIT 1",
+        )
+        .bind(input.chat_id)
+        .bind(input.account_id)
+        .bind(input.turn_id)
+        .bind(input.source_message_id)
+        .bind(input.cited_message_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MilestoneArtifactReferenceSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MilestoneArtifactReferenceSourceRow {
+    pub fn artifact_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("artifact_id")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn render_version_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn render_version_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest_required(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn rendered_digest_optional(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn current_approved_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_approved_revision_id")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MilestoneReleaseReadinessCandidateRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MilestoneReleaseReadinessCandidateRow {
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn milestone_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_id")?)
+    }
+    pub fn readiness_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("readiness_digest")?)
+    }
+    pub fn outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("outcome")?)
+    }
+    pub fn blocking_reasons_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("blocking_reasons_json")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct MilestoneReplayReadinessSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl MilestoneReplayReadinessSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn milestone_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_id")?)
+    }
+    pub fn definition_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("definition_revision_id")?)
+    }
+    pub fn input_manifest_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("input_manifest_json")?)
+    }
+    pub fn event_watermark(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("event_watermark")?)
+    }
+    pub fn outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("outcome")?)
+    }
+    pub fn blocking_reasons_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("blocking_reasons_json")?)
+    }
+    pub fn check_results_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("check_results_json")?)
+    }
+    pub fn waiver_manifest_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("waiver_manifest_json")?)
+    }
+    pub fn evidence_manifest_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("evidence_manifest_json")?)
+    }
+    pub fn commit_context_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("commit_context_json")?)
+    }
+    pub fn computing_policy_revision(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("computing_policy_revision")?)
+    }
+    pub fn readiness_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("readiness_digest")?)
+    }
+    pub fn principal_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_type")?)
+    }
+    pub fn principal_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_id")?)
+    }
+    pub fn authorization_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_basis")?)
+    }
+    pub fn authorization_action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_action")?)
+    }
+    pub fn authorization_occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_occurred_at")?)
+    }
+    pub fn expected_milestone_version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("expected_milestone_version")?)
+    }
+    pub fn explicit_event(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("explicit_event")?)
+    }
+    pub fn idempotency_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("idempotency_key")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_replay_readiness_source(
+        &self,
+        snapshot_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneReplayReadinessSourceRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM project_readiness_snapshot WHERE id = ? AND project_id = ?")
+                .bind(snapshot_id)
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| MilestoneReplayReadinessSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_release_readiness_candidate(
+        &self,
+        snapshot_id: &str,
+    ) -> crate::Result<Option<MilestoneReleaseReadinessCandidateRow>> {
+        let rows = sqlx::query(
+            "SELECT project_id, milestone_id, readiness_digest, outcome,
+                blocking_reasons_json
+         FROM project_readiness_snapshot WHERE id = ?",
+        )
+        .bind(snapshot_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MilestoneReleaseReadinessCandidateRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_inherited_charter_reference(
+        &self,
+        milestone_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneArtifactReferenceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project_milestone m
+         JOIN project_milestone_revision d
+           ON d.id = COALESCE(
+                m.current_definition_revision_id,
+                (SELECT id FROM project_milestone_revision
+                 WHERE milestone_id = m.id ORDER BY revision DESC LIMIT 1)
+              )
+          AND d.milestone_id = m.id
+         JOIN project_charter_revision r ON r.id = d.charter_revision_id
+         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = m.project_id
+         WHERE m.id = ? AND m.project_id = ?
+         LIMIT 1",
+        )
+        .bind(milestone_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MilestoneArtifactReferenceSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_current_charter_reference(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneArtifactReferenceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project p
+         JOIN project_charter_revision r ON r.id = p.current_charter_revision_id
+         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = p.id
+         WHERE p.id = ?",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MilestoneArtifactReferenceSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_charter_reference_source(
+        &self,
+        revision_id: &str,
+        charter_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneArtifactReferenceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS artifact_id, c.current_approved_revision_id,
+                r.id AS revision_id, r.lifecycle, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project_charter_revision r
+         JOIN project_charter c ON c.id = r.charter_id
+         WHERE r.id = ? AND r.charter_id = ? AND c.project_id = ?
+         LIMIT 1",
+        )
+        .bind(revision_id)
+        .bind(charter_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MilestoneArtifactReferenceSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn milestone_document_reference_source(
+        &self,
+        revision_id: &str,
+        document_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneArtifactReferenceSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT d.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                r.render_version, r.rendered_digest
+         FROM project_document_revision r
+         JOIN project_document d ON d.id = r.document_id
+         WHERE r.id = ? AND r.document_id = ? AND d.project_id = ?
+         LIMIT 1",
+        )
+        .bind(revision_id)
+        .bind(document_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| MilestoneArtifactReferenceSourceRow { row }))
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct ProjectDecisionCommandSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl ProjectDecisionCommandSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn state(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("state")?)
+    }
+    pub fn decision_class(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("decision_class")?)
+    }
+    pub fn question(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("question")?)
+    }
+    pub fn context_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("context_json")?)
+    }
+    pub fn options_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("options_json")?)
+    }
+    pub fn selected_outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("selected_outcome")?)
+    }
+    pub fn rationale(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rationale")?)
+    }
+    pub fn principal_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_type")?)
+    }
+    pub fn principal_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("principal_id")?)
+    }
+    pub fn authority_basis(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authority_basis")?)
+    }
+    pub fn authorization_action(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_action")?)
+    }
+    pub fn explicit_event(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("explicit_event")?)
+    }
+    pub fn authorization_occurred_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_occurred_at")?)
+    }
+    pub fn charter_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("charter_revision_id")?)
+    }
+    pub fn source_refs_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_refs_json")?)
+    }
+    pub fn affected_records_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("affected_records_json")?)
+    }
+    pub fn supersedes_decision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("supersedes_decision_id")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct DecisionArtifactRenderSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl DecisionArtifactRenderSourceRow {
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct DecisionGoverningDocumentSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl DecisionGoverningDocumentSourceRow {
+    pub fn artifact_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("artifact_id")?)
+    }
+    pub fn revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("revision_id")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct DecisionGoverningCharterSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl DecisionGoverningCharterSourceRow {
+    pub fn artifact_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("artifact_id")?)
+    }
+    pub fn current_charter_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("current_charter_revision_id")?)
+    }
+    pub fn content_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_digest")?)
+    }
+    pub fn render_version(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("render_version")?)
+    }
+    pub fn rendered_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("rendered_digest")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_governing_charter_source(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Option<DecisionGoverningCharterSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id AS artifact_id, p.current_charter_revision_id,
+                    r.content_digest, r.render_version, r.rendered_digest,
+                    r.lifecycle
+             FROM project AS p
+             JOIN project_charter AS c ON c.project_id = p.id
+             JOIN project_charter_revision AS r
+               ON r.id = p.current_charter_revision_id AND r.charter_id = c.id
+             WHERE p.id = ? LIMIT 1",
+        )
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| DecisionGoverningCharterSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_governing_document_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<DecisionGoverningDocumentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT d.id AS artifact_id, r.id AS revision_id, r.content_digest,
+                    r.render_version, r.rendered_digest
+             FROM project_document AS d
+             JOIN project_document_revision AS r
+               ON r.id = d.current_approved_revision_id AND r.document_id = d.id
+             WHERE d.project_id = ? AND r.lifecycle = 'approved'",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DecisionGoverningDocumentSourceRow { row })
+            .collect())
+    }
+}
+
+pub struct DecisionArtifactRenderSourceInput<'a> {
+    pub document_project_id: &'a str,
+    pub document_id: &'a str,
+    pub document_revision_id: &'a str,
+    pub document_digest: &'a str,
+    pub charter_project_id: &'a str,
+    pub charter_id: &'a str,
+    pub charter_revision_id: &'a str,
+    pub charter_digest: &'a str,
+    pub milestone_project_id: &'a str,
+    pub milestone_id: &'a str,
+    pub milestone_revision_id: &'a str,
+    pub milestone_digest: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn decision_artifact_render_source(
+        &self,
+        input: DecisionArtifactRenderSourceInput<'_>,
+    ) -> crate::Result<Option<DecisionArtifactRenderSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT render_version, rendered_digest
+             FROM project_document_revision r JOIN project_document d ON d.id = r.document_id
+             WHERE d.project_id = ? AND d.id = ? AND r.id = ? AND r.content_digest = ?
+             UNION ALL
+             SELECT r.render_version, r.rendered_digest
+             FROM project_charter_revision r JOIN project_charter c ON c.id = r.charter_id
+             WHERE c.project_id = ? AND c.id = ? AND r.id = ? AND r.content_digest = ?
+             UNION ALL
+             SELECT r.render_version, r.rendered_digest
+             FROM project_milestone_revision r JOIN project_milestone m ON m.id = r.milestone_id
+             WHERE m.project_id = ? AND m.id = ? AND r.id = ? AND r.content_digest = ? LIMIT 1",
+        )
+        .bind(input.document_project_id)
+        .bind(input.document_id)
+        .bind(input.document_revision_id)
+        .bind(input.document_digest)
+        .bind(input.charter_project_id)
+        .bind(input.charter_id)
+        .bind(input.charter_revision_id)
+        .bind(input.charter_digest)
+        .bind(input.milestone_project_id)
+        .bind(input.milestone_id)
+        .bind(input.milestone_revision_id)
+        .bind(input.milestone_digest)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| DecisionArtifactRenderSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_governing_charter_reference(
+        &self,
+        revision_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM project_charter_revision r
+             JOIN project_charter c ON c.id = r.charter_id
+             WHERE r.id = ? AND c.project_id = ? LIMIT 1",
+        )
+        .bind(revision_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_decision_command_source(
+        &self,
+        decision_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectDecisionCommandSourceRow>> {
+        let rows =
+            sqlx::query("SELECT * FROM project_decision WHERE id = ? AND project_id = ? LIMIT 1")
+                .bind(decision_id)
+                .bind(project_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(rows.map(|row| ProjectDecisionCommandSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn decision_milestone_reference(
+        &self,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM project_milestone WHERE id = ? AND project_id = ? LIMIT 1",
+        )
+        .bind(id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn charter_command_revision_version(&self, charter_id: &str) -> crate::Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT version FROM project_charter WHERE id = ? LIMIT 1")
+                .bind(charter_id)
+                .fetch_one(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn published_handoff_charter_approval_id(
+        &self,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT json_extract(source_revisions_json, '$.approval_id')
+         FROM agent_handoff WHERE dedupe_key = ? LIMIT 1",
+        )
+        .bind(dedupe_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct ProjectCreationOperatingSkillRow {
+    row: SqliteRow,
+}
+impl ProjectCreationOperatingSkillRow {
+    pub fn skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("skill_key")?)
+    }
+    pub fn operating_skill_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("operating_skill_key")?)
+    }
+    pub fn current_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_revision_id")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_creation_operating_skill_source(
+        &self,
+        skill_revision_id: &str,
+    ) -> crate::Result<Option<ProjectCreationOperatingSkillRow>> {
+        let rows = sqlx::query(
+            "SELECT sr.skill_key, os.skill_key AS operating_skill_key, os.current_revision_id
+         FROM operating_skill_revision sr
+         JOIN operating_skill os ON os.id = sr.operating_skill_id
+           AND os.skill_key = sr.skill_key
+         WHERE sr.id = ? AND os.lifecycle = 'active'
+         LIMIT 1",
+        )
+        .bind(skill_revision_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| ProjectCreationOperatingSkillRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_governed_milestone_ids(
+        &self,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT g.milestone_id FROM project_task_governance g
+                 WHERE g.task_id = ? AND g.project_id = ? AND g.milestone_id IS NOT NULL",
+        )
+        .bind(task_id)
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+pub struct DeliveryFollowupMilestoneRow {
+    row: SqliteRow,
+}
+impl DeliveryFollowupMilestoneRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn milestone_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("milestone_key")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn definition_revision_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("definition_revision_id")?)
+    }
+    pub fn task_selection_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_selection_json")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_milestone_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<DeliveryFollowupMilestoneRow>> {
+        let rows = sqlx::query(
+            "SELECT m.id, m.milestone_key, m.version,
+                    m.current_definition_revision_id AS definition_revision_id,
+                    r.task_selection_json
+             FROM project_milestone m
+             JOIN project_milestone_revision r
+               ON r.id = m.current_definition_revision_id AND r.milestone_id = m.id
+             WHERE m.project_id = ?
+               AND m.lifecycle IN ('planned', 'active', 'ready_for_release')
+             ORDER BY m.milestone_sequence ASC, m.id ASC",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DeliveryFollowupMilestoneRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_open_task_count(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        task_selection_json: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM task t
+                 WHERE t.project_id = ?
+                   AND t.deleted_at IS NULL AND t.archived_at IS NULL
+                   AND t.status NOT IN ('done', 'cancelled')
+                   AND (
+                        t.id IN (SELECT g.task_id FROM project_task_governance g
+                                 WHERE g.milestone_id = ? AND g.project_id = ?)
+                     OR t.id IN (SELECT value FROM json_each(?))
+                   )",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(task_selection_json)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct DeliveryFollowupCheckRow {
+    row: SqliteRow,
+}
+impl DeliveryFollowupCheckRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn source_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("source_kind")?)
+    }
+    pub fn outcome(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("outcome")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn delivery_followup_outstanding_check_sources(
+        &self,
+        project_id: &str,
+        milestone_id: &str,
+        definition_revision_id: &str,
+    ) -> crate::Result<Vec<DeliveryFollowupCheckRow>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.source_kind, COALESCE(r.outcome, 'missing') AS outcome
+                 FROM project_milestone_check c
+                 LEFT JOIN project_milestone_check_result r
+                   ON r.id = c.current_result_id
+                  AND r.definition_revision_id = c.definition_revision_id
+                 WHERE c.project_id = ? AND c.milestone_id = ?
+                   AND c.definition_revision_id = ? AND c.required = 1
+                   AND COALESCE(r.outcome, 'missing') NOT IN ('passed', 'waived')
+                 ORDER BY c.check_key ASC
+                 LIMIT 64",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(definition_revision_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DeliveryFollowupCheckRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn chat_has_active_product_genesis(&self, chat_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                     SELECT 1 FROM product_genesis_session
+                     WHERE main_chat_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                 )",
+        )
+        .bind(chat_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn admission_current_operating_skill_revision(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT revision.id
+         FROM operating_skill AS skill
+         JOIN operating_skill_revision AS revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+         WHERE skill.skill_key = ? AND skill.lifecycle = 'active'
+         LIMIT 1",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_agent_active_operating_skill_revision(
+        &self,
+        skill_key: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>(
+            "SELECT revision.id
+         FROM operating_skill AS skill
+         JOIN operating_skill_revision AS revision
+           ON revision.id = skill.current_revision_id
+          AND revision.operating_skill_id = skill.id
+          AND revision.skill_key = skill.skill_key
+         WHERE skill.skill_key = ?
+           AND skill.lifecycle = 'active'
+           AND skill.current_revision_id IS NOT NULL
+         LIMIT 1",
+        )
+        .bind(skill_key)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+pub struct ExecutionSetupReconciliationConflictRow {
+    row: SqliteRow,
+}
+impl ExecutionSetupReconciliationConflictRow {
+    pub fn reconciliation_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("reconciliation_id")?)
+    }
+    pub fn conflict_code(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("conflict_code")?)
+    }
+    pub fn description(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("description")?)
+    }
+    pub fn record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_type")?)
+    }
+    pub fn record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("record_id")?)
+    }
+    pub fn governing_record_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_type")?)
+    }
+    pub fn governing_record_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("governing_record_id")?)
+    }
+    pub fn affected_paths_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("affected_paths_json")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn execution_setup_reconciliation_conflict_sources(
+        &self,
+        project_id: &str,
+    ) -> crate::Result<Vec<ExecutionSetupReconciliationConflictRow>> {
+        let rows = sqlx::query(
+            "SELECT r.id AS reconciliation_id, c.conflict_code, c.description,
+                r.record_type, r.record_id,
+                r.governing_record_type, r.governing_record_id,
+                c.affected_paths_json, r.updated_at
+         FROM project_reconciliation_record r
+         JOIN project_canonical_conflict c ON c.id = r.conflict_id
+         WHERE r.project_id = ? AND r.state = 'required'
+         ORDER BY r.updated_at DESC, r.id DESC",
+        )
+        .bind(project_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ExecutionSetupReconciliationConflictRow { row })
+            .collect())
+    }
+}
+
+pub struct MainCharterReadSourceRow {
+    row: SqliteRow,
+}
+impl MainCharterReadSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn genesis_session_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("genesis_session_id")?)
+    }
+    pub fn current_draft_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_draft_revision_id")?)
+    }
+    pub fn current_approved_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("current_approved_revision_id")?)
+    }
+    pub fn project_mode(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_mode")?)
+    }
+    pub fn maturity(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("maturity")?)
+    }
+    pub fn lifecycle(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("lifecycle")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_unowned_charter_read_sources(
+        &self,
+        account_id: String,
+        charter_id: &Option<String>,
+        genesis_session_id: &Option<String>,
+        revision_id: &Option<String>,
+        limit: i64,
+    ) -> crate::Result<Vec<MainCharterReadSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, genesis_session_id, current_draft_revision_id,
+                    current_approved_revision_id, project_mode, maturity,
+                    lifecycle, version, updated_at
+             FROM project_charter
+             WHERE account_id = ? AND project_id IS NULL
+               AND (? IS NULL OR id = ?)
+               AND (? IS NULL OR genesis_session_id = ?)
+               AND (? IS NULL OR current_draft_revision_id = ?
+                    OR current_approved_revision_id = ?)
+             ORDER BY updated_at DESC, id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(charter_id)
+        .bind(charter_id)
+        .bind(genesis_session_id)
+        .bind(genesis_session_id)
+        .bind(revision_id)
+        .bind(revision_id)
+        .bind(revision_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| MainCharterReadSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn main_active_genesis_session_id(
+        &self,
+        account_id: &str,
+        charter_id: Option<&str>,
+    ) -> crate::Result<Option<String>> {
+        let query = if charter_id.is_some() {
+            "SELECT id FROM product_genesis_session
+                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                     ORDER BY CASE WHEN charter_id = ? THEN 0
+                                   WHEN charter_id IS NULL THEN 1
+                                   ELSE 2 END,
+                              updated_at DESC, id DESC LIMIT 1"
+        } else {
+            "SELECT id FROM product_genesis_session
+                     WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
+                     ORDER BY updated_at DESC, id DESC LIMIT 1"
+        };
+        let mut request = sqlx::query_scalar::<_, String>(query).bind(account_id);
+        if let Some(charter_id) = charter_id {
+            request = request.bind(charter_id);
+        }
+        Ok(request.fetch_optional(self.pool()).await?)
     }
 }

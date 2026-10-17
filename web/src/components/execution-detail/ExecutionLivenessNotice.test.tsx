@@ -5,6 +5,9 @@ import type { Execution } from '@/types/generated'
 
 import { ExecutionLivenessNotice } from './ExecutionLivenessNotice'
 
+const { mutate } = vi.hoisted(() => ({ mutate: vi.fn() }))
+vi.mock('@/api/hooks', () => ({ useTaskAction: () => ({ mutate, isPending: false }) }))
+
 const baseExecution: Execution = {
   id: 'execution-1',
   task_id: 'task-1',
@@ -17,7 +20,7 @@ const baseExecution: Execution = {
 
 describe('ExecutionLivenessNotice', () => {
   it('separates an expired owner lease from semantic progress and offers bounded recovery', () => {
-    const onRetry = vi.fn()
+    const onRetry = mutate
     render(
       <ExecutionLivenessNotice
         execution={{
@@ -33,7 +36,8 @@ describe('ExecutionLivenessNotice', () => {
             created_at: '2026-08-21T12:01:05Z',
           },
         }}
-        actions={{ onRetry }}
+        taskVersion={3}
+        offers={[{ action: { verb: 'retry' }, parameters: [], authority: ['owner'], reason: 'role_retry', label: 'Retry run', target_execution_id: null, propagates: false }]}
         nextActionLabel="Retry run"
       />,
     )

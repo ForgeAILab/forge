@@ -5,13 +5,12 @@ use crate::now_rfc3339;
 impl RepoRepo for SqliteDb {
     async fn create(&self, input: CreateRepo) -> Result<Repo> {
         let remote_url = normalize_repo_remote_url(input.remote_url);
-        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
             .bind(&remote_url)
             .bind(&input.local_path)
-            .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
             .bind(&input.created_at)
             .bind(&input.updated_at)
@@ -26,19 +25,9 @@ impl RepoRepo for SqliteDb {
     async fn create_primary_for_project(
         &self,
         input: CreateRepo,
-        provider_config: Option<CreatePrProviderConfig>,
         expected_project_version: i64,
         project_updated_at: String,
     ) -> Result<Repo> {
-        if provider_config
-            .as_ref()
-            .is_some_and(|config| config.repo_id != input.id)
-        {
-            return Err(DbError::Check(
-                "PR provider configuration must belong to the created repository".to_owned(),
-            ));
-        }
-
         let remote_url = normalize_repo_remote_url(input.remote_url);
         let mut transaction = crate::begin_immediate(&self.pool).await?;
         let project_row = sqlx::query("SELECT version, primary_repo_id FROM project WHERE id = ?")
@@ -52,36 +41,18 @@ impl RepoRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, work_mode, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO repo (id, project_id, name, remote_url, local_path, default_branch, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&input.id)
             .bind(&input.project_id)
             .bind(&input.name)
             .bind(&remote_url)
             .bind(&input.local_path)
-            .bind(input.work_mode.to_string())
             .bind(&input.default_branch)
             .bind(&input.created_at)
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await
             .map_err(check_error)?;
-
-        if let Some(config) = provider_config {
-            sqlx::query(
-                "INSERT INTO pr_provider_config (id, repo_id, provider_type, base_url, polling_interval_seconds, token_secret_ref, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&config.id)
-            .bind(&config.repo_id)
-            .bind(&config.provider_type)
-            .bind(&config.base_url)
-            .bind(config.polling_interval_seconds)
-            .bind(&config.token_secret_ref)
-            .bind(&config.created_at)
-            .bind(&config.updated_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(check_error)?;
-        }
 
         let result = sqlx::query(
             "UPDATE project
@@ -98,8 +69,13 @@ impl RepoRepo for SqliteDb {
             return Err(DbError::VersionConflict);
         }
 
-        wake_dispatch_for_project_in_tx(&mut transaction, &input.project_id, &project_updated_at)
-            .await?;
+        wake_dispatch_for_project_in_tx(
+            self,
+            &mut transaction,
+            &input.project_id,
+            &project_updated_at,
+        )
+        .await?;
         let repo_row = sqlx::query("SELECT * FROM repo WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *transaction)
@@ -161,27 +137,23 @@ impl RepoRepo for SqliteDb {
         if let Some(remote_url) = input.remote_url {
             repo.remote_url = normalize_repo_remote_url(remote_url);
         }
-        if let Some(work_mode) = input.work_mode {
-            repo.work_mode = work_mode;
-        }
         if let Some(default_branch) = input.default_branch {
             repo.default_branch = default_branch;
         }
         repo.updated_at = input.updated_at;
         sqlx::query(
-            "UPDATE repo SET name = ?, remote_url = ?, local_path = ?, work_mode = ?, default_branch = ?, updated_at = ? WHERE id = ?",
+            "UPDATE repo SET name = ?, remote_url = ?, local_path = ?, default_branch = ?, updated_at = ? WHERE id = ?",
         )
         .bind(&repo.name)
         .bind(&repo.remote_url)
         .bind(&repo.local_path)
-        .bind(repo.work_mode.to_string())
         .bind(&repo.default_branch)
         .bind(&repo.updated_at)
         .bind(&repo.id)
         .execute(&mut *transaction)
         .await
         .map_err(check_error)?;
-        wake_dispatch_for_project_in_tx(&mut transaction, &repo.project_id, &repo.updated_at)
+        wake_dispatch_for_project_in_tx(self, &mut transaction, &repo.project_id, &repo.updated_at)
             .await?;
         transaction.commit().await?;
         Ok(repo)
@@ -194,6 +166,11 @@ impl RepoRepo for SqliteDb {
             .fetch_optional(&mut *transaction)
             .await?
             .ok_or(DbError::NotFound)?;
+        crate::integration_queue::refuse_unresolved_integration(
+            &mut transaction,
+            crate::integration_queue::IntegrationGuardScope::Repo(id),
+        )
+        .await?;
         let in_use: bool = sqlx::query_scalar(
             "SELECT
                 EXISTS(
@@ -227,6 +204,10 @@ impl RepoRepo for SqliteDb {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query("DELETE FROM pr_provider_config WHERE repo_id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
         let result = sqlx::query("DELETE FROM repo WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)
@@ -234,8 +215,219 @@ impl RepoRepo for SqliteDb {
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        wake_dispatch_for_project_in_tx(&mut transaction, &project_id, &project_updated_at).await?;
+        wake_dispatch_for_project_in_tx(self, &mut transaction, &project_id, &project_updated_at)
+            .await?;
         transaction.commit().await?;
         Ok(())
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_cleanup_repo_ids_after(
+        &self,
+        after: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<String>> {
+        let result = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM repo WHERE id > ?
+             UNION SELECT repo_id AS id FROM workspace WHERE repo_id > ?
+             ORDER BY id LIMIT ?",
+        )
+        .bind(after)
+        .bind(after)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneRepositoryContextRow {
+    pub repo_id: String,
+    pub repository_name: String,
+    pub repository_kind: String,
+    pub remote_url: Option<String>,
+    pub default_branch: String,
+    pub execution_id: Option<String>,
+    pub execution_status: Option<String>,
+    pub execution_role: Option<String>,
+    pub before_sha: Option<String>,
+    pub after_sha: Option<String>,
+    pub execution_summary: Option<String>,
+    pub execution_created_at: Option<String>,
+    pub execution_updated_at: Option<String>,
+    pub review_id: Option<String>,
+    pub review_status: Option<String>,
+    pub ci_results: Option<String>,
+    pub audit_result: Option<String>,
+    pub human_decision: Option<String>,
+    pub review_created_at: Option<String>,
+    pub review_updated_at: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn milestone_repository_context_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        task_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<MilestoneRepositoryContextRow>> {
+        let row = sqlx::query("SELECT repo.id AS repo_id, repo.name AS repository_name, repo.work_mode AS repository_kind,
+                        CASE WHEN trim(repo.remote_url) = '' THEN NULL ELSE repo.remote_url END AS remote_url,
+                        repo.default_branch,
+                        e.id AS execution_id, e.status AS execution_status, e.role AS execution_role,
+                        e.before_sha, e.after_sha, e.summary AS execution_summary,
+                        e.created_at AS execution_created_at, e.updated_at AS execution_updated_at,
+                        r.id AS review_id, r.status AS review_status,
+                        r.step_results_json AS ci_results, NULL AS audit_result,
+                        NULL AS human_decision,
+                        r.created_at AS review_created_at, r.updated_at AS review_updated_at
+                 FROM task t
+                 JOIN project p ON p.id = t.project_id
+                 LEFT JOIN execution e ON e.id = (
+                     SELECT e2.id FROM execution e2
+                     WHERE e2.task_id = t.id
+                     ORDER BY e2.updated_at DESC, e2.id DESC LIMIT 1
+                 )
+                 LEFT JOIN workspace w ON w.id = e.workspace_id
+                 JOIN repo ON repo.id = CASE
+                     WHEN e.id IS NULL THEN p.primary_repo_id
+                     ELSE w.repo_id
+                 END AND repo.project_id = t.project_id
+                 LEFT JOIN review r ON r.id = (
+                     SELECT r2.id FROM review r2
+                     WHERE r2.execution_id = e.id
+                     ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1
+                 )
+                 WHERE t.id = ? AND t.project_id = ?
+                 LIMIT 1")
+.bind(task_id)
+.bind(project_id)
+.fetch_optional(connection).await?;
+        row.map(|row| {
+            Ok(MilestoneRepositoryContextRow {
+                repo_id: row.try_get("repo_id")?,
+                repository_name: row.try_get("repository_name")?,
+                repository_kind: row.try_get("repository_kind")?,
+                remote_url: row.try_get("remote_url")?,
+                default_branch: row.try_get("default_branch")?,
+                execution_id: row.try_get("execution_id")?,
+                execution_status: row.try_get("execution_status")?,
+                execution_role: row.try_get("execution_role")?,
+                before_sha: row.try_get("before_sha")?,
+                after_sha: row.try_get("after_sha")?,
+                execution_summary: row.try_get("execution_summary")?,
+                execution_created_at: row.try_get("execution_created_at")?,
+                execution_updated_at: row.try_get("execution_updated_at")?,
+                review_id: row.try_get("review_id")?,
+                review_status: row.try_get("review_status")?,
+                ci_results: row.try_get("ci_results")?,
+                audit_result: row.try_get("audit_result")?,
+                human_decision: row.try_get("human_decision")?,
+                review_created_at: row.try_get("review_created_at")?,
+                review_updated_at: row.try_get("review_updated_at")?,
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_probe_retained_server_repo_path(
+        &self,
+        project_id: &str,
+        primary_repo_id: Option<&str>,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar::<_, Option<String>>("SELECT local_path FROM repo WHERE project_id = ? ORDER BY (id = ?) DESC, created_at, id LIMIT 1")
+            .bind(project_id)
+            .bind(primary_repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn environment_provision_repo_remote_url(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(
+            sqlx::query_scalar::<_, Option<String>>("SELECT remote_url FROM repo WHERE id=?")
+                .bind(repo_id)
+                .fetch_optional(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_gc_repository_paths(
+        &self,
+    ) -> crate::Result<Vec<(String, Option<String>)>> {
+        Ok(
+            sqlx::query_as::<_, (String, Option<String>)>("SELECT id, local_path FROM repo")
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+}
+
+impl SqliteDb {
+    pub async fn placement_refusal_repo_remote_url(
+        &self,
+        repo_id: &str,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar("SELECT remote_url FROM repo WHERE id=?")
+            .bind(repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_repository_count(&self, repo_id: &str) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM repo WHERE id = ?")
+            .bind(repo_id)
+            .fetch_one(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn workspace_root_repair_repository_paths(&self) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT local_path FROM repo WHERE local_path IS NOT NULL AND local_path != ''
+         UNION SELECT path FROM repo_location WHERE owner_kind = 'server'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_environment_primary_checkout(
+        &self,
+        repo_id: &Option<String>,
+    ) -> crate::Result<Option<Option<String>>> {
+        Ok(sqlx::query_scalar("SELECT local_path FROM repo WHERE id=?")
+            .bind(repo_id)
+            .fetch_optional(self.pool())
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_agent_workspace_repo_live_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        repo_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT 1 FROM repo WHERE id = ? LIMIT 1")
+                .bind(repo_id)
+                .fetch_optional(connection)
+                .await?,
+        )
     }
 }

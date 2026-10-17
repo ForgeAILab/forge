@@ -70,18 +70,8 @@ impl SoloDataPaths {
     }
 
     #[must_use]
-    pub fn protected_store_path(&self) -> &Path {
-        &self.protected_store
-    }
-
-    #[must_use]
     pub fn logs_path(&self) -> &Path {
         &self.logs
-    }
-
-    #[must_use]
-    pub fn media_path(&self) -> &Path {
-        &self.media
     }
 
     #[must_use]
@@ -89,19 +79,9 @@ impl SoloDataPaths {
         &self.credentials
     }
 
-    #[must_use]
-    pub fn worktrees_path(&self) -> &Path {
-        &self.worktrees
-    }
-
-    #[must_use]
-    pub fn runtime_lock_path(&self) -> &Path {
-        &self.runtime_lock
-    }
-
     /// Check an existing root before acquiring the runtime lock or publishing
-    /// the repository binding. Missing roots and existing empty private
-    /// directories are safe first-run targets; an existing root is otherwise
+    /// the repository binding. Missing roots and private directories containing
+    /// only forge.yaml (or nothing) are safe first-run targets; an existing root is otherwise
     /// accepted only when its binding already names `repository_id`.
     pub fn preflight_existing_root(&self, repository_id: Uuid) -> Result<DataRootPreflight> {
         preflight_data_root(&self.root, repository_id)
@@ -241,7 +221,7 @@ pub enum DataDirError {
     DataRootPermissions { path: PathBuf },
 
     #[error(
-        "Solo data root {path} is non-empty but has no repository binding; choose an empty directory or an existing bound Solo data root"
+        "Solo data root {path} is non-empty but has no repository binding; choose an empty directory, one containing only forge.yaml, or an existing bound Solo data root"
     )]
     UnboundNonEmptyDataRoot { path: PathBuf },
 
@@ -287,6 +267,8 @@ pub enum DataRootPreflight {
     Absent,
     /// The root exists, is private, and contains no entries.
     Empty,
+    /// The private root contains only a regular forge.yaml and no runtime state.
+    Configured,
     /// The root is already bound to the requested repository identifier.
     Bound,
 }
@@ -297,39 +279,6 @@ pub fn default_solo_data_root(forge_data_root: &Path, repository_id: Uuid) -> Pa
     forge_data_root
         .join(SOLO_DATA_DIR_NAME)
         .join(repository_id.to_string())
-}
-
-/// Resolve the exact root selected by `--data-dir`, or the configured Forge
-/// root's repository-scoped default when the option is absent.
-#[must_use]
-pub fn resolve_solo_data_root(
-    forge_data_root: &Path,
-    repository_id: Uuid,
-    data_dir_override: Option<&Path>,
-) -> PathBuf {
-    let root = data_dir_override
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_solo_data_root(forge_data_root, repository_id));
-    absolute_path(
-        &root,
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    )
-}
-
-/// Resolve paths using `FORGE_DATA_DIR`/the normal Forge default as the parent
-/// of `solo/<repository-id>` when no explicit override is supplied.
-pub fn resolve_data_paths(
-    repository_root: &Path,
-    repository_id: Uuid,
-    data_dir_override: Option<&Path>,
-) -> Result<SoloDataPaths> {
-    let forge_data_root = config::data_dir_from_env();
-    resolve_data_paths_with_forge_root(
-        repository_root,
-        repository_id,
-        &forge_data_root,
-        data_dir_override,
-    )
 }
 
 /// Resolve and validate the state root against a repository using an explicit
@@ -429,8 +378,24 @@ pub fn preflight_data_root(data_root: &Path, repository_id: Uuid) -> Result<Data
         path: data_root.clone(),
         source,
     })?;
-    if entries.next().is_none() {
+    let first = entries
+        .next()
+        .transpose()
+        .map_err(|source| DataDirError::Io {
+            path: data_root.clone(),
+            source,
+        })?;
+    let Some(first) = first else {
         return Ok(DataRootPreflight::Empty);
+    };
+    if first.file_name() == "forge.yaml" && entries.next().is_none() {
+        let kind = first.file_type().map_err(|source| DataDirError::Io {
+            path: first.path(),
+            source,
+        })?;
+        if kind.is_file() {
+            return Ok(DataRootPreflight::Configured);
+        }
     }
 
     let paths = SoloDataPaths::new(data_root.clone());
@@ -838,15 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn default_root_is_repository_scoped_and_exact_override_is_not_nested() {
+    fn default_root_is_repository_scoped() {
         let forge_root = Path::new("/tmp/forge");
         assert_eq!(
             default_solo_data_root(forge_root, id()),
             PathBuf::from("/tmp/forge/solo/00000000-0000-4000-8000-000000000001")
-        );
-        assert_eq!(
-            resolve_solo_data_root(forge_root, id(), Some(Path::new("/tmp/custom"))),
-            PathBuf::from("/tmp/custom")
         );
     }
 
@@ -888,6 +849,30 @@ mod tests {
             preflight_data_root(&root, id()).unwrap(),
             DataRootPreflight::Empty
         );
+    }
+
+    #[test]
+    fn preflight_accepts_only_config_before_first_launch_but_rejects_foreign_state() {
+        let outer = TempDir::new().unwrap();
+        let root = outer.path().join("configured-state");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config_path = root.join("forge.yaml");
+        let config = "server:\n  bind: 127.0.0.1:9104\n";
+        fs::write(&config_path, config).unwrap();
+        assert!(preflight_data_root(&root, id()).is_ok());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        fs::write(root.join(DATABASE_FILE), "foreign state").unwrap();
+        assert!(matches!(
+            preflight_data_root(&root, id()),
+            Err(DataDirError::UnboundNonEmptyDataRoot { .. })
+        ));
     }
 
     #[test]

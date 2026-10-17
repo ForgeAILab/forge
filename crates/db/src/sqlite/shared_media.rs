@@ -2702,3 +2702,432 @@ async fn reconcile_media_asset_in_tx(
     .await?;
     map_media_asset(&row)
 }
+
+#[derive(Debug)]
+pub struct InsertReleaseEvidencePinInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub release_id: &'a str,
+    pub asset_id: &'a str,
+    pub attachment_id: &'a str,
+    pub task_media_id: Option<&'a str>,
+    pub asset_checksum: &'a str,
+    pub attachment_digest: &'a str,
+    pub availability: &'a str,
+    pub pin_digest: &'a str,
+    pub created_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn insert_release_evidence_pin_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: &InsertReleaseEvidencePinInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO project_release_media_pin (
+                    id, project_id, release_id, asset_id, attachment_id,
+                    legacy_task_media_id, asset_checksum, attachment_digest,
+                    availability, pin_digest, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(input.id)
+        .bind(input.project_id)
+        .bind(input.release_id)
+        .bind(input.asset_id)
+        .bind(input.attachment_id)
+        .bind(input.task_media_id)
+        .bind(input.asset_checksum)
+        .bind(input.attachment_digest)
+        .bind(input.availability)
+        .bind(input.pin_digest)
+        .bind(input.created_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneEvidenceRow {
+    pub author_type: String,
+    pub author_id: Option<String>,
+    pub authorization_json: String,
+    pub id: String,
+    pub asset_id: String,
+    pub task_id: Option<String>,
+    pub source_task_id: Option<String>,
+    pub source_execution_id: Option<String>,
+    pub source_validation_id: Option<String>,
+    pub source_context_digest: Option<String>,
+    pub source_definition_revision_id: Option<String>,
+    pub milestone_id: Option<String>,
+    pub acceptance_check_ids_json: String,
+    pub caption: Option<String>,
+    pub evidence_kind: Option<String>,
+    pub checksum: Option<String>,
+    pub availability: String,
+    pub created_at: String,
+    pub version: i64,
+    pub deleted_at: Option<String>,
+    pub source_task_version: Option<i64>,
+}
+
+impl SqliteDb {
+    pub async fn milestone_evidence_rows_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Vec<MilestoneEvidenceRow>> {
+        let rows = sqlx::query(
+            "SELECT a.*, m.legacy_task_media_id, m.checksum AS asset_checksum
+             FROM project_media_attachment a
+             JOIN media_asset m ON m.id = a.asset_id AND m.project_id = a.project_id
+             WHERE a.project_id = ? AND a.milestone_id = ?
+               AND a.attachment_kind = 'evidence' AND a.deleted_at IS NULL
+             ORDER BY a.id ASC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_all(connection)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MilestoneEvidenceRow {
+                    author_type: row.try_get("author_type")?,
+                    author_id: row.try_get("author_id")?,
+                    authorization_json: row.try_get("authorization_json")?,
+                    id: row.try_get("id")?,
+                    asset_id: row.try_get("asset_id")?,
+                    task_id: row.try_get("task_id")?,
+                    source_task_id: row.try_get("source_task_id")?,
+                    source_execution_id: row.try_get("source_execution_id")?,
+                    source_validation_id: row.try_get("source_validation_id")?,
+                    source_context_digest: row.try_get("source_context_digest")?,
+                    source_definition_revision_id: row.try_get("source_definition_revision_id")?,
+                    milestone_id: row.try_get("milestone_id")?,
+                    acceptance_check_ids_json: row.try_get("acceptance_check_ids_json")?,
+                    caption: row.try_get("caption")?,
+                    evidence_kind: row.try_get("evidence_kind")?,
+                    checksum: row.try_get("checksum")?,
+                    availability: row.try_get("availability")?,
+                    created_at: row.try_get("created_at")?,
+                    version: row.try_get("version")?,
+                    deleted_at: row.try_get("deleted_at")?,
+                    source_task_version: row.try_get("source_task_version")?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MilestoneReleasePinMetadataRow {
+    pub id: String,
+    pub asset_id: String,
+    pub task_media_id: Option<String>,
+    pub project_url: Option<String>,
+    pub attachment_digest: Option<String>,
+    pub asset_checksum: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn milestone_release_pin_metadata_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        milestone_id: &str,
+    ) -> crate::Result<Vec<MilestoneReleasePinMetadataRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.asset_id, a.task_media_id, a.project_url,
+                    a.checksum AS attachment_digest, m.checksum AS asset_checksum
+             FROM project_media_attachment a
+             JOIN media_asset m ON m.id = a.asset_id AND m.project_id = a.project_id
+             WHERE a.project_id = ? AND a.milestone_id = ?
+               AND a.attachment_kind = 'evidence' AND a.deleted_at IS NULL
+             ORDER BY a.id ASC",
+        )
+        .bind(project_id)
+        .bind(milestone_id)
+        .fetch_all(connection)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MilestoneReleasePinMetadataRow {
+                    id: row.try_get("id")?,
+                    asset_id: row.try_get("asset_id")?,
+                    task_media_id: row.try_get("task_media_id")?,
+                    project_url: row.try_get("project_url")?,
+                    attachment_digest: row.try_get("attachment_digest")?,
+                    asset_checksum: row.try_get("asset_checksum")?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl SqliteDb {
+    pub async fn evidence_authorization_json_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attachment_id: &str,
+        project_id: &str,
+    ) -> crate::Result<String> {
+        let result = sqlx::query_scalar::<_, String>(
+            "SELECT authorization_json FROM project_media_attachment
+                     WHERE id = ? AND project_id = ?",
+        )
+        .bind(attachment_id)
+        .bind(project_id)
+        .fetch_one(connection)
+        .await?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReleaseEvidencePinRow {
+    pub id: String,
+    pub release_id: String,
+    pub attachment_id: Option<String>,
+    pub asset_id: String,
+    pub asset_checksum: Option<String>,
+    pub attachment_digest: Option<String>,
+    pub availability: String,
+    pub pin_digest: Option<String>,
+    pub created_at: String,
+    pub live_asset_checksum: Option<String>,
+    pub tombstone_availability: Option<String>,
+}
+
+impl SqliteDb {
+    pub async fn release_evidence_pin_rows(
+        &self,
+        project_id: &str,
+        release_id: &str,
+    ) -> crate::Result<Vec<ReleaseEvidencePinRow>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.release_id, p.attachment_id, p.asset_id,
+                    p.asset_checksum, p.attachment_digest, p.availability,
+                    p.pin_digest, p.created_at, m.checksum AS live_asset_checksum,
+                    (SELECT t.availability FROM media_asset_tombstone t
+                     WHERE t.asset_id = p.asset_id
+                       AND (t.release_pin_id = p.id OR
+                            (t.release_pin_id IS NULL AND t.release_id = p.release_id))
+                     ORDER BY t.created_at DESC, t.id DESC LIMIT 1) AS tombstone_availability
+             FROM project_release_media_pin p
+             JOIN media_asset m ON m.id = p.asset_id
+             WHERE p.project_id = ? AND p.release_id = ? ORDER BY p.id ASC",
+        )
+        .bind(project_id)
+        .bind(release_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ReleaseEvidencePinRow {
+                    id: row.try_get("id")?,
+                    release_id: row.try_get("release_id")?,
+                    attachment_id: row.try_get("attachment_id")?,
+                    asset_id: row.try_get("asset_id")?,
+                    asset_checksum: row.try_get("asset_checksum")?,
+                    attachment_digest: row.try_get("attachment_digest")?,
+                    availability: row.try_get("availability")?,
+                    pin_digest: row.try_get("pin_digest")?,
+                    created_at: row.try_get("created_at")?,
+                    live_asset_checksum: row.try_get("live_asset_checksum")?,
+                    tombstone_availability: row.try_get("tombstone_availability")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct NativeProjectArtifactRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl NativeProjectArtifactRow {
+    pub fn content_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("content_type")?)
+    }
+    pub fn byte_size(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("byte_size")?)
+    }
+    pub fn storage_key(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("storage_key")?)
+    }
+    pub fn asset_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("asset_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn display_filename(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("display_filename")?)
+    }
+    pub fn checksum(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("checksum")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn native_project_artifacts(
+        &self,
+        project_id: &str,
+        task_filter: Option<&str>,
+        task_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<NativeProjectArtifactRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id AS asset_id, m.task_id, a.display_filename, a.content_type,
+                    a.byte_size, a.checksum, a.storage_key, m.created_at
+             FROM task_media m
+             JOIN media_asset a ON a.legacy_task_media_id = m.id
+             JOIN task t ON t.id = m.task_id
+             WHERE t.project_id = ? AND t.deleted_at IS NULL AND m.deleted_at IS NULL
+               AND (? IS NULL OR m.task_id = ?)
+             ORDER BY m.created_at DESC, m.id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(task_filter)
+        .bind(task_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NativeProjectArtifactRow { row })
+            .collect())
+    }
+}
+
+/// Typed projection accessors retain the caller's decoding order and error handling.
+pub struct EvidenceAttachmentSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+impl EvidenceAttachmentSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn asset_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("asset_id")?)
+    }
+    pub fn attachment_kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("attachment_kind")?)
+    }
+    pub fn task_media_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("task_media_id")?)
+    }
+    pub fn task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("task_id")?)
+    }
+    pub fn milestone_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("milestone_id")?)
+    }
+    pub fn milestone_check_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("milestone_check_id")?)
+    }
+    pub fn source_task_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_task_id")?)
+    }
+    pub fn source_execution_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_execution_id")?)
+    }
+    pub fn source_validation_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_validation_id")?)
+    }
+    pub fn source_task_version(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("source_task_version")?)
+    }
+    pub fn source_context_digest(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_context_digest")?)
+    }
+    pub fn source_definition_revision_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_definition_revision_id")?)
+    }
+    pub fn acceptance_check_ids_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("acceptance_check_ids_json")?)
+    }
+    pub fn caption(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("caption")?)
+    }
+    pub fn evidence_kind(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("evidence_kind")?)
+    }
+    pub fn checksum(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("checksum")?)
+    }
+    pub fn availability(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("availability")?)
+    }
+    pub fn project_url(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("project_url")?)
+    }
+    pub fn author_type(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("author_type")?)
+    }
+    pub fn author_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("author_id")?)
+    }
+    pub fn authorization_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("authorization_json")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn deleted_at(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("deleted_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn validation_evidence_asset_in_project(
+        &self,
+        asset_id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM media_asset
+                 WHERE id = ? AND project_id = ? AND deleted_at IS NULL",
+        )
+        .bind(asset_id)
+        .bind(project_id)
+        .fetch_optional(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn evidence_attachment_source(
+        &self,
+        attachment_id: &str,
+    ) -> crate::Result<Option<EvidenceAttachmentSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, asset_id, attachment_kind, task_media_id, task_id,
+                milestone_id, milestone_check_id, source_task_id, source_execution_id,
+                source_validation_id, source_task_version, source_context_digest,
+                source_definition_revision_id, acceptance_check_ids_json, caption, evidence_kind,
+                checksum, availability, project_url, author_type, author_id,
+                authorization_json, version, created_at, deleted_at, updated_at
+         FROM project_media_attachment WHERE id = ? AND attachment_kind = 'evidence'",
+        )
+        .bind(attachment_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(rows.map(|row| EvidenceAttachmentSourceRow { row }))
+    }
+}

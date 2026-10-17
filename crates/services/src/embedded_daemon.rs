@@ -20,8 +20,7 @@ use std::{
 };
 use tokio::process::Command;
 use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 
 const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -31,6 +30,7 @@ const TEMP_FILE_ATTEMPTS: usize = 8;
 
 #[derive(Clone)]
 pub struct EmbeddedDaemon {
+    server_run_cap: Arc<db::machine_capacity::MachineRunCap>,
     service: DaemonService,
     adapter_registry: Arc<AdapterRegistry>,
     forge_home: PathBuf,
@@ -73,6 +73,7 @@ impl EmbeddedDaemon {
         report_interval: Duration,
     ) -> Self {
         Self {
+            server_run_cap: Arc::clone(&db.server_run_cap),
             service: DaemonService::new(db, event_bus),
             adapter_registry,
             forge_home,
@@ -83,19 +84,32 @@ impl EmbeddedDaemon {
         }
     }
 
-    pub fn start(self: Arc<Self>) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            while !self.stop_requested.load(Ordering::SeqCst) {
-                if let Err(error) = self.scan_and_report().await {
-                    tracing::warn!(%error, "embedded daemon report failed");
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+    ) -> tokio::task::JoinHandle<()> {
+        let stop = Arc::clone(&self);
+        workers.worker("embedded-daemon").start_stoppable(
+            move || stop.stop_requested.load(Ordering::SeqCst),
+            move |worker| {
+                let monitor = Arc::clone(&self);
+                async move {
+                    worker
+                        .run(
+                            || monitor.stop_requested.load(Ordering::SeqCst),
+                            "embedded daemon report failed",
+                            || monitor.scan_and_report(),
+                            || async {
+                                tokio::select! {
+                                    _ = tokio::time::sleep(monitor.report_interval) => {}
+                                    _ = monitor.stop_notify.notified() => {}
+                                }
+                            },
+                        )
+                        .await
                 }
-
-                tokio::select! {
-                    () = sleep(self.report_interval) => {}
-                    () = self.stop_notify.notified() => {}
-                }
-            }
-        })
+            },
+        )
     }
 
     pub fn stop(&self) {
@@ -116,6 +130,7 @@ impl EmbeddedDaemon {
             .ingest_report(
                 &credentials.daemon_id,
                 DaemonReportInput {
+                    max_concurrent_runs: Some(self.server_run_cap.effective().unwrap_or(0) as u32),
                     detected_clis,
                     runtimes,
                     labels: None,
@@ -186,6 +201,7 @@ impl EmbeddedDaemon {
     fn registration_input(&self) -> DaemonRegisterInput {
         let hostname = local_hostname();
         DaemonRegisterInput {
+            max_concurrent_runs: Some(self.server_run_cap.effective().unwrap_or(0) as u32),
             machine_id: embedded_machine_id(),
             hostname,
             os: std::env::consts::OS.to_owned(),
@@ -231,12 +247,7 @@ impl EmbeddedDaemon {
 }
 
 pub fn embedded_machine_id() -> String {
-    format!(
-        "embedded:{}:{}:{}",
-        local_hostname(),
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    config::embedded_machine_id()
 }
 
 pub fn is_embedded_daemon_machine(machine_id: &str) -> bool {

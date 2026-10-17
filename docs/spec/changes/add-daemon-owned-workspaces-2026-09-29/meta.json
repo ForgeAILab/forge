@@ -1,0 +1,10 @@
+{
+  "id": "add-daemon-owned-workspaces",
+  "created_at": "2026-09-29T00:00:00Z",
+  "updated_at": "2026-09-30T00:41:29Z",
+  "status": "implementing",
+  "change_id": "add-daemon-owned-workspaces",
+  "change_ref": "add-daemon-owned-workspaces-2026-09-29",
+  "completed_at": null,
+  "implementation_started_at": "2026-09-30T00:41:29Z"
+}

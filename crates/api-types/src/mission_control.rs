@@ -41,6 +41,10 @@ pub enum AttentionCategory {
     RuntimeOffline,
     BudgetThreshold,
     CommitmentOverdue,
+    /// Repeated conflict handoffs indicate a shared file needs clearer module ownership.
+    ConflictHotspot,
+    FlakyCheck,
+    BaseCheckFailing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]
@@ -85,7 +89,7 @@ pub struct AttentionConsumerHealthResponse {
     pub last_success_at: Option<String>,
     pub last_error_code: Option<String>,
     pub stale: bool,
-    pub processed_events: i64,
+    pub last_error_message: Option<String>,
     pub updated_at: String,
 }
 
@@ -93,6 +97,18 @@ pub struct AttentionConsumerHealthResponse {
 #[ts(export)]
 pub struct AttentionMutationRequest {
     pub expected_version: i64,
+}
+
+/// Resolve an Attention item. `answer` is the owner's reply to an item that
+/// asks a question (`recommended_action: answer_lead_input`): it is required
+/// there, at most 4000 characters, and refused on any other item.
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct AttentionResolveRequest {
+    pub expected_version: i64,
+    #[serde(default)]
+    #[ts(optional)]
+    pub answer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]

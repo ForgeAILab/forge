@@ -37,6 +37,7 @@ impl ProjectExecutionSetupCommandRepo for SqliteDb {
 
         if let Some(receipt) = existing {
             wake_dispatch_for_project_in_tx(
+                self,
                 &mut transaction,
                 &input.project_id,
                 &input.receipt.committed_at,
@@ -229,6 +230,7 @@ impl ProjectExecutionSetupCommandRepo for SqliteDb {
         // Task forever. The service-level wake remains an idempotent repair
         // for callers that use this boundary through older replay paths.
         wake_dispatch_for_project_in_tx(
+            self,
             &mut transaction,
             &input.project_id,
             &input.receipt.committed_at,

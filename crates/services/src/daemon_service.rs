@@ -22,6 +22,7 @@ pub struct DaemonService {
 
 #[derive(Debug, Clone)]
 pub struct DaemonRegisterInput {
+    pub max_concurrent_runs: Option<u32>,
     pub machine_id: String,
     pub hostname: String,
     pub os: String,
@@ -41,6 +42,7 @@ pub struct DaemonRegistration {
 
 #[derive(Debug, Clone)]
 pub struct DaemonReportInput {
+    pub max_concurrent_runs: Option<u32>,
     pub detected_clis: Vec<DetectedCliInput>,
     pub runtimes: Vec<RuntimeReportInput>,
     pub labels: Option<Value>,
@@ -94,6 +96,7 @@ impl DaemonService {
         let daemon = DaemonRepo::upsert_by_machine_id(
             &*self.db,
             UpsertDaemon {
+                max_concurrent_runs: input.max_concurrent_runs,
                 id: new_uuid_v4(),
                 machine_id: input.machine_id,
                 hostname: input.hostname,
@@ -134,6 +137,9 @@ impl DaemonService {
         let daemon = DaemonRepo::get_by_id(&*self.db, daemon_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("daemon", daemon_id.to_owned()))?;
+        if self.db.daemon_removed(daemon_id).await? {
+            return Err(ServiceError::not_found("daemon", daemon_id));
+        }
         let Some(expected_hash) = daemon.registration_token_hash.as_deref() else {
             return Err(ServiceError::invalid_operation(
                 "daemon has no registration token",
@@ -162,6 +168,7 @@ impl DaemonService {
         let daemon = DaemonRepo::update_report(
             &*self.db,
             UpdateDaemonReport {
+                max_concurrent_runs: input.max_concurrent_runs,
                 id: daemon_id.to_owned(),
                 last_report_at: now.clone(),
                 status: DaemonStatus::Online,
@@ -263,32 +270,19 @@ impl DaemonService {
         validate_required("retained_machine_id", retained_machine_id)?;
         validate_required("reason", reason)?;
 
-        let daemon_ids = sqlx::query_scalar::<_, String>(
-            "SELECT id
-             FROM daemon
-             WHERE status = 'online'
-               AND machine_id != ?",
-        )
-        .bind(retained_machine_id)
-        .fetch_all(self.db.pool())
-        .await?;
+        let daemon_ids = self
+            .db
+            .external_online_daemon_ids(retained_machine_id)
+            .await?;
         if daemon_ids.is_empty() {
             return Ok(0);
         }
 
         let now = now_rfc3339();
-        let result = sqlx::query(
-            "UPDATE daemon
-             SET status = 'offline',
-                 updated_at = ?,
-                 version = version + 1
-             WHERE status = 'online'
-               AND machine_id != ?",
-        )
-        .bind(&now)
-        .bind(retained_machine_id)
-        .execute(self.db.pool())
-        .await?;
+        let result = self
+            .db
+            .mark_external_online_daemons_offline(&now, retained_machine_id)
+            .await?;
 
         for daemon_id in daemon_ids {
             self.publish(ForgeEvent {
@@ -382,21 +376,10 @@ impl DaemonService {
         executor_type: &str,
         owner_id: &str,
     ) -> Result<bool> {
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM agent_current
-                WHERE daemon_id = ?
-                  AND executor_type = ?
-                  AND owner_id = ?
-                LIMIT 1
-            )",
-        )
-        .bind(daemon_id)
-        .bind(executor_type)
-        .bind(owner_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let exists = self
+            .db
+            .daemon_owned_executor_agent_exists(daemon_id, executor_type, owner_id)
+            .await?;
 
         Ok(exists != 0)
     }
@@ -417,9 +400,65 @@ impl DaemonService {
             .map_err(Into::into)
     }
 
+    pub async fn remove(
+        &self,
+        id: &str,
+        actor_id: &str,
+        is_admin: bool,
+    ) -> Result<api_types::RemoveDaemonResponse> {
+        let connected = self
+            .task_service
+            .as_ref()
+            .and_then(|service| service.daemon_connections.as_ref())
+            .and_then(|registry| registry.get(id))
+            .is_some_and(|connection| !connection.is_stale());
+        self.db
+            .remove_daemon(
+                id,
+                actor_id,
+                is_admin,
+                &crate::embedded_daemon::embedded_machine_id(),
+                connected,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// What removal would change; same visibility as the removal itself.
+    pub async fn removal_preview(
+        &self,
+        id: &str,
+        actor_id: &str,
+        is_admin: bool,
+    ) -> Result<api_types::RemoveDaemonPreview> {
+        self.db
+            .daemon_removal_preview(id, actor_id, is_admin)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn update_run_limit(
+        &self,
+        id: &str,
+        version: i64,
+        run_limit: Option<u32>,
+    ) -> Result<Daemon> {
+        if run_limit == Some(0) {
+            return Err(ServiceError::invalid_operation(
+                "run_limit must be positive or null",
+            ));
+        }
+        DaemonRepo::update_run_limit(&*self.db, id, version, run_limit)
+            .await
+            .map_err(Into::into)
+    }
+
     #[tracing::instrument(skip(self), fields(daemon_id = %id))]
     pub async fn get(&self, id: &str) -> Result<Option<Daemon>> {
         validate_required("daemon_id", id)?;
+        if self.db.daemon_removed(id).await? {
+            return Ok(None);
+        }
         DaemonRepo::get_by_id(&*self.db, id)
             .await
             .map_err(Into::into)
@@ -558,6 +597,7 @@ mod tests {
 
     fn register_input(machine_id: &str) -> DaemonRegisterInput {
         DaemonRegisterInput {
+            max_concurrent_runs: None,
             machine_id: machine_id.to_owned(),
             hostname: "test-host".to_owned(),
             os: "linux".to_owned(),
@@ -637,6 +677,7 @@ mod tests {
         let registration = service.register(input).await.expect("register succeeds");
 
         let report = || DaemonReportInput {
+            max_concurrent_runs: None,
             detected_clis: [
                 "claude_code",
                 "codex",
@@ -699,5 +740,48 @@ mod tests {
             .expect("embedded daemon exists");
         assert_eq!(external.status, DaemonStatus::Offline);
         assert_eq!(embedded.status, DaemonStatus::Online);
+    }
+    #[tokio::test]
+    async fn removed_credential_cannot_authenticate_or_revive_on_registration() {
+        let service = service().await;
+        let original = service
+            .register(register_input("removed-host"))
+            .await
+            .unwrap();
+        service
+            .mark_disconnected(&original.daemon_id)
+            .await
+            .unwrap();
+        service
+            .remove(&original.daemon_id, "admin", true)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate(&original.daemon_id, &original.plaintext_token)
+            .await
+            .is_err());
+        assert!(service.mark_connected(&original.daemon_id).await.is_err());
+        assert!(service.get(&original.daemon_id).await.unwrap().is_none());
+        let fresh = service
+            .register(register_input("removed-host"))
+            .await
+            .unwrap();
+        assert_ne!(original.daemon_id, fresh.daemon_id);
+        service
+            .authenticate(&fresh.daemon_id, &fresh.plaintext_token)
+            .await
+            .unwrap();
+        assert!(service
+            .authenticate(&original.daemon_id, &fresh.plaintext_token)
+            .await
+            .is_err());
+        assert!(service
+            .authenticate(&fresh.daemon_id, &original.plaintext_token)
+            .await
+            .is_err());
+        assert!(service
+            .remove(&original.daemon_id, "admin", true)
+            .await
+            .is_err());
     }
 }

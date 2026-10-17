@@ -93,11 +93,32 @@ describe('inquiry discovery', () => {
       const { result } = renderHook(() => useAgentInquiriesQuery('chat-1'), { wrapper: Wrapper })
       await advance()
       expect(api.listAgentInquiries).toHaveBeenCalledTimes(1)
-      await advance(3_000)
+      await advance(15_000)
       expect(result.current.data?.pages[0].items[0].status).toBe('running')
       expect(api.listAgentInquiries).toHaveBeenCalledTimes(2)
     },
   )
+})
+
+describe('live inquiry activity', () => {
+  it('polls at 1.5 seconds only while live', async () => {
+    api.listAgentInquiryLogs.mockResolvedValue(page([]))
+    const { rerender } = renderHook(
+      ({ live }) => useAgentInquiryLogsQuery('inquiry-1', { live }),
+      { wrapper: Wrapper, initialProps: { live: true } },
+    )
+    await advance()
+    expect(api.listAgentInquiryLogs).toHaveBeenCalledTimes(1)
+    await advance(1_498)
+    expect(api.listAgentInquiryLogs).toHaveBeenCalledTimes(1)
+    await advance(1)
+    expect(api.listAgentInquiryLogs).toHaveBeenCalledTimes(2)
+    rerender({ live: false })
+    await advance()
+    const terminalCalls = api.listAgentInquiryLogs.mock.calls.length
+    await advance(15_000)
+    expect(api.listAgentInquiryLogs).toHaveBeenCalledTimes(terminalCalls)
+  })
 })
 
 describe('inquiry final activity', () => {
@@ -122,7 +143,7 @@ describe('inquiry final activity', () => {
         from_sequence: 1,
         limit: 1_000,
       })
-      await advance(3_000)
+      await advance(15_000)
       expect(api.listAgentInquiryLogs).toHaveBeenCalledTimes(2)
     },
   )

@@ -1,5 +1,7 @@
+import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
+import type { Offer } from '@/types/generated'
 import { useState } from 'react'
-import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info, Play, Spinner, StopCircle } from '@phosphor-icons/react'
+import { ArrowBendUpLeft, Check, Clock, Copy, GitBranch, Info,   } from '@phosphor-icons/react'
 
 import { PlanChecklist } from '@/components/plan-checklist'
 import {
@@ -10,7 +12,6 @@ import { ExecutionObservabilitySection } from '@/components/execution-detail/Exe
 import { ExecutionStatusBadge } from '@/components/execution-detail/ExecutionStatusBadge'
 import { formatDate, formatRelativeDate, shortHash } from '@/components/execution-detail/execution-detail-format'
 import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip } from '@/components/ui/tooltip'
@@ -59,14 +60,8 @@ type HookLogEntry = {
 }
 
 type SidebarActions = {
-  onStop?: () => void
-  stopPending?: boolean
   onRefresh?: () => void
   refreshPending?: boolean
-  onContinue?: () => void
-  continuePending?: boolean
-  onRetry?: () => void
-  retryPending?: boolean
 }
 
 export function ExecutionDetailSidebar({
@@ -79,6 +74,8 @@ export function ExecutionDetailSidebar({
   taskId,
   onNavigateParent,
   actions,
+  offers = [],
+  taskVersion,
 }: {
   isLoading: boolean
   execution: Execution | null
@@ -89,18 +86,13 @@ export function ExecutionDetailSidebar({
   taskId: string
   onNavigateParent: (taskId: string, executionId: string) => void
   actions?: SidebarActions
+  offers?: Offer[]
+  taskVersion?: number
 }) {
   const remainingPlanItems = execution?.plan_progress?.remaining ?? 0
   const completedWithOpenPlan =
     execution?.status === 'completed' && execution.role !== 'planner' && remainingPlanItems > 0
   const livenessNotice = execution ? getExecutionLivenessNotice(execution) : null
-  const terminalRecoveryLabel = actions?.onContinue
-    ? 'Continue session'
-    : actions?.onRetry
-      ? 'Retry run'
-      : undefined
-
-  const hasActions = Boolean(actions?.onStop || actions?.onContinue || actions?.onRetry)
 
   return (
     <aside className="flex h-full flex-col">
@@ -179,7 +171,7 @@ export function ExecutionDetailSidebar({
                       }
                     : undefined
                 }
-                nextActionLabel={terminalRecoveryLabel}
+                nextActionLabel={offers[0]?.label}
               />
             ) : null}
 
@@ -328,64 +320,7 @@ export function ExecutionDetailSidebar({
         )}
       </div>
 
-      {hasActions && (
-        <div className="shrink-0 border-t px-4 py-3 flex flex-wrap gap-2">
-          {actions?.onStop && (
-            <Tooltip content={`Stop this ${productTerm('run').toLowerCase()} without cancelling the task`}>
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5 text-red-600 hover:text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/30"
-                disabled={actions.stopPending}
-                onClick={actions.onStop}
-              >
-                {actions.stopPending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <StopCircle className="h-3.5 w-3.5" />
-                )}
-                Stop {productTerm('run')}
-              </Button>
-            </Tooltip>
-          )}
-          {actions?.onContinue && (
-            <Tooltip content="Resume the same agent context in a side session; this does not update task or review state">
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5"
-                disabled={actions.continuePending}
-                onClick={actions.onContinue}
-              >
-                {actions.continuePending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Play className="h-3.5 w-3.5" />
-                )}
-                Continue Side Session
-              </Button>
-            </Tooltip>
-          )}
-          {actions?.onRetry && (
-            <Tooltip content={`Retry this ${productTerm('run').toLowerCase()} with a new bounded attempt`}>
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5"
-                disabled={actions.retryPending}
-                onClick={actions.onRetry}
-              >
-                {actions.retryPending ? (
-                  <Spinner className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ArrowBendUpLeft className="h-3.5 w-3.5" />
-                )}
-                {actions.retryPending ? 'Retrying…' : `Retry ${productTerm('run')}`}
-              </Button>
-            </Tooltip>
-          )}
-        </div>
-      )}
+      {taskVersion != null ? <div className="shrink-0 border-t px-4 py-3"><TaskActionButtons taskId={taskId} version={taskVersion} offers={offers} /></div> : null}
     </aside>
   )
 }

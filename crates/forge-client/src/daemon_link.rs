@@ -326,6 +326,9 @@ where
                         tracing::warn!(%id, "unexpected daemon command response received");
                     }
                     Ok(DaemonFrame::Error { id, error }) => {
+                        if error.code == api_types::DAEMON_UPGRADE_REQUIRED {
+                            eprintln!("{}", error.message);
+                        }
                         tracing::warn!(
                             id = ?id,
                             code = %error.code,

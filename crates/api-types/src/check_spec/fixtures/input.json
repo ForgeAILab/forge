@@ -1,0 +1,68 @@
+{
+  "spec": {
+    "schema_revision": 2,
+    "scope": {
+      "kind": "workspace",
+      "workspace_id": "workspace-1",
+      "generation": 3
+    },
+    "commands": [
+      {
+        "id": "ci:0",
+        "shell_text": "cargo test",
+        "shell": "bash -lc",
+        "working_directory": "task_root",
+        "environment_keys": [
+          "LANG",
+          "TOKEN"
+        ],
+        "timeout_seconds": 1800,
+        "failure_policy": "stop_bundle",
+        "cacheability": "declared_controlled_inputs",
+        "requirement_ids": [
+          "task:acceptance"
+        ]
+      },
+      {
+        "id": "linked:1",
+        "shell_text": "cargo check",
+        "shell": "bash -lc",
+        "working_directory": "task_root",
+        "environment_keys": [
+          "LANG",
+          "TOKEN"
+        ],
+        "timeout_seconds": 1800,
+        "failure_policy": "continue",
+        "cacheability": "declared_controlled_inputs",
+        "requirement_ids": [
+          "scope:r1"
+        ]
+      }
+    ],
+    "declares_cleanup": false,
+    "configured_commands": 3,
+    "blank_commands": [
+      1
+    ],
+    "execution_policy": "controlled-server/1"
+  },
+  "environment": {
+    "TOKEN": {
+      "kind": "secret_revision",
+      "value": "opaque-secret-r3"
+    },
+    "LANG": {
+      "kind": "controlled_value",
+      "value": "C.UTF-8"
+    }
+  },
+  "environment_identity": {
+    "kind": "attested",
+    "input_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "execution_revision": {
+    "number": 7,
+    "audit_ref": "owner-action-7"
+  }
+}

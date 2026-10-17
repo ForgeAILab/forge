@@ -1,6 +1,7 @@
 import { useEffect } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError } from '@/api/client'
+import type { AttentionResolveRequest } from '@/types/generated/bindings/AttentionResolveRequest'
 import {
   cancelAgentSessionTurn,
   cancelProviderAuthorization,
@@ -32,6 +33,8 @@ import {
   deleteProviderPricing,
   removeProviderEntry,
   renameProviderEntry,
+  resolveAttentionItem,
+  answerProjectEscalation,
   rotateAgentSession,
   setMainAgentBinding,
   setCliRuntimeAvailability,
@@ -595,6 +598,49 @@ export function useMissionControlQuery() {
     queryFn: getMissionControl,
     staleTime: 15_000,
     refetchInterval: (query) => (query.state.status === 'error' ? false : 30_000),
+  })
+}
+
+export function useResolveAttentionMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      id,
+      expectedVersion,
+      answer,
+    }: {
+      id: string
+      expectedVersion: number
+      answer?: AttentionResolveRequest['answer']
+    }) => resolveAttentionItem(id, expectedVersion, answer),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
+    onSuccess: (item, input) => {
+      if (input.answer === undefined) return
+      const taskId = item.scope_type === 'task' ? item.scope_id : item.details.task_id
+      if (typeof taskId === 'string') {
+        void queryClient.invalidateQueries({ queryKey: ['tasks', taskId] })
+      }
+    },
+  })
+}
+
+export function useAnswerEscalationMutation() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({
+      projectId,
+      escalationId,
+      answer,
+    }: {
+      projectId: string
+      escalationId: string
+      answer: string
+    }) => answerProjectEscalation(projectId, escalationId, answer),
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: federationQueryKeys.missionControl })
+    },
   })
 }
 

@@ -1,3 +1,185 @@
+/// Planning role of the built-in workflow, including legacy empty workflow settings.
+pub const DEFAULT_WORKFLOW_PLANNING_ROLE: &str = "planner";
+
+/// Durable classification of a mechanical transition or accepted gate action.
+/// Human reason text is never an input to this classification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum TransitionBridgeKind {
+    ReviewRefresh,
+    TargetMovedRebase,
+    ConflictHandoff,
+    RetryWindowReset,
+    Recovery,
+    GateSkipped,
+    GateApproved,
+    GateRejected,
+    CiOnlyReviewPassed,
+    ReviewCarry,
+    /// A coordination root with a lead goes back to its planning state: its
+    /// aggregate review was rejected, or its current subtask parked needing
+    /// a decision. The payload names the trigger.
+    Replan,
+}
+
+impl TransitionBridgeKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewRefresh => "review_refresh",
+            Self::TargetMovedRebase => "target_moved_rebase",
+            Self::ConflictHandoff => "conflict_handoff",
+            Self::RetryWindowReset => "retry_window_reset",
+            Self::Recovery => "recovery",
+            Self::GateSkipped => "gate_skipped",
+            Self::GateApproved => "gate_approved",
+            Self::GateRejected => "gate_rejected",
+            Self::CiOnlyReviewPassed => "ci_only_review_passed",
+            Self::ReviewCarry => "review_carry",
+            Self::Replan => "replan",
+        }
+    }
+    pub const fn is_review_refresh(self) -> bool {
+        matches!(self, Self::ReviewRefresh | Self::TargetMovedRebase)
+    }
+    pub const fn is_mechanical(self) -> bool {
+        matches!(
+            self,
+            Self::ReviewRefresh | Self::TargetMovedRebase | Self::ConflictHandoff
+        )
+    }
+}
+
+impl std::str::FromStr for TransitionBridgeKind {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "review_refresh" => Ok(Self::ReviewRefresh),
+            "target_moved_rebase" => Ok(Self::TargetMovedRebase),
+            "conflict_handoff" => Ok(Self::ConflictHandoff),
+            "retry_window_reset" => Ok(Self::RetryWindowReset),
+            "recovery" => Ok(Self::Recovery),
+            "gate_skipped" => Ok(Self::GateSkipped),
+            "gate_approved" => Ok(Self::GateApproved),
+            "gate_rejected" => Ok(Self::GateRejected),
+            "ci_only_review_passed" => Ok(Self::CiOnlyReviewPassed),
+            "review_carry" => Ok(Self::ReviewCarry),
+            "replan" => Ok(Self::Replan),
+            _ => Err(format!("unknown transition bridge kind: {value}")),
+        }
+    }
+}
+
+/// Structured companion to audit prose; flattened in persisted command inputs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[ts(export)]
+pub struct TransitionBridge {
+    pub bridge_kind: Option<TransitionBridgeKind>,
+    #[ts(type = "unknown | null")]
+    pub bridge_payload: Option<serde_json::Value>,
+}
+
+impl TransitionBridge {
+    pub fn new(kind: TransitionBridgeKind) -> Self {
+        Self {
+            bridge_kind: Some(kind),
+            bridge_payload: None,
+        }
+    }
+    pub fn conflict_handoff(paths: &[String]) -> Self {
+        Self {
+            bridge_kind: Some(TransitionBridgeKind::ConflictHandoff),
+            bridge_payload: Some(serde_json::json!({"paths": paths})),
+        }
+    }
+    pub fn recovery(verb: &str, reset: bool) -> Self {
+        Self {
+            bridge_kind: Some(if reset {
+                TransitionBridgeKind::RetryWindowReset
+            } else {
+                TransitionBridgeKind::Recovery
+            }),
+            bridge_payload: Some(serde_json::json!({"verb": verb})),
+        }
+    }
+    /// A review re-run: the Task re-enters `review` on request. The entry is
+    /// routed as the workflow's own, so who asked travels here; an owner's
+    /// request makes the entry spend no review retry budget.
+    pub fn review_rerun(requested_by: &crate::Actor) -> Self {
+        Self {
+            bridge_kind: Some(TransitionBridgeKind::Recovery),
+            bridge_payload: Some(
+                serde_json::json!({"verb": Self::REVIEW_RERUN, "requested_by": requested_by}),
+            ),
+        }
+    }
+    pub const REVIEW_RERUN: &'static str = "review_rerun";
+    /// Who asked for the review re-run this bridge records, if it is one.
+    pub fn review_rerun_requester(&self) -> Option<crate::Actor> {
+        let payload = self.bridge_payload.as_ref()?;
+        if self.bridge_kind != Some(TransitionBridgeKind::Recovery)
+            || payload.get("verb").and_then(serde_json::Value::as_str) != Some(Self::REVIEW_RERUN)
+        {
+            return None;
+        }
+        serde_json::from_value(payload.get("requested_by")?.clone()).ok()
+    }
+    /// The no-change guard's reminder: Forge returns an unchanged repair to
+    /// the gate's reject target without a Review or a rejection.
+    pub fn repair_no_change() -> Self {
+        Self::recovery(Self::REPAIR_NO_CHANGE, false)
+    }
+    pub const REPAIR_NO_CHANGE: &'static str = "repair_no_change";
+    pub fn is_repair_no_change(&self) -> bool {
+        self.bridge_kind == Some(TransitionBridgeKind::Recovery)
+            && self
+                .bridge_payload
+                .as_ref()
+                .and_then(|payload| payload.get("verb"))
+                .and_then(serde_json::Value::as_str)
+                == Some(Self::REPAIR_NO_CHANGE)
+    }
+    pub fn is_review_refresh(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_review_refresh)
+    }
+    pub fn is_mechanical(&self) -> bool {
+        self.bridge_kind
+            .is_some_and(TransitionBridgeKind::is_mechanical)
+    }
+    pub fn conflict_paths(&self) -> Option<Vec<String>> {
+        if self.bridge_kind != Some(TransitionBridgeKind::ConflictHandoff) {
+            return None;
+        }
+        serde_json::from_value(self.bridge_payload.as_ref()?.get("paths")?.clone()).ok()
+    }
+}
+
+/// Execution purpose is independent of mutable summary/prompt text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ExecutionPurpose {
+    AutomaticReviewRecovery,
+}
+impl ExecutionPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AutomaticReviewRecovery => "automatic_review_recovery",
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionPurpose {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "automatic_review_recovery" => Ok(Self::AutomaticReviewRecovery),
+            _ => Err(format!("unknown execution purpose: {value}")),
+        }
+    }
+}
+
 use crate::assignee::AssigneeKind;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,6 +207,12 @@ fn default_execution_retry_budget() -> i32 {
 #[ts(export)]
 pub struct RetryBudgets {
     pub review: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_progress: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub review_verify_rerun: Option<i32>,
     pub merge_fix: Option<i32>,
     pub execution: Option<i32>,
 }
@@ -93,6 +281,16 @@ pub type LifecycleHooks = std::collections::HashMap<LifecycleEvent, Vec<Lifecycl
 #[serde(rename_all = "snake_case")]
 #[ts(export)]
 pub struct ProjectSettings {
+    /// How failed review and queue-head CI is triaged. Existing Projects default to full.
+    #[serde(default)]
+    pub review_ci_triage: ReviewCiTriage,
+    /// Use the next configured fallback for a carried-finding repair only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub repair_switch_model_when_stuck: bool,
+    /// Maximum unparked Tasks in active/gate states; 0 disables the limit.
+    #[serde(default = "default_max_active_tasks")]
+    pub max_active_tasks: u32,
     #[serde(default)]
     pub retry_budgets: RetryBudgets,
     #[serde(default)]
@@ -103,6 +301,64 @@ pub struct ProjectSettings {
     pub automatic_recovery: AutomaticRecoverySettings,
     #[serde(default)]
     pub environment: ProjectEnvironment,
+    #[serde(default)]
+    pub placement: ProjectPlacementSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum ReviewCiTriage {
+    #[default]
+    Full,
+    Report,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum PlacementProvision {
+    #[default]
+    WhenVerified,
+    Never,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[ts(export)]
+pub struct ProjectPlacementSettings {
+    #[serde(default)]
+    pub provision: PlacementProvision,
+    #[serde(default = "default_provision_timeout_seconds")]
+    #[ts(type = "number")]
+    pub provision_timeout_seconds: u64,
+}
+
+/// Total clone/fetch budget; 1–86400 seconds, default 30 minutes.
+pub fn default_provision_timeout_seconds() -> u64 {
+    1800
+}
+impl Default for ProjectPlacementSettings {
+    fn default() -> Self {
+        Self {
+            provision: PlacementProvision::default(),
+            provision_timeout_seconds: default_provision_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum EnvironmentCheckScope {
+    #[default]
+    Workspace,
+    Machine,
+}
+
+fn default_max_active_tasks() -> u32 {
+    5
 }
 
 fn default_environment_check_timeout() -> u64 {
@@ -115,9 +371,9 @@ fn default_environment_check_timeout() -> u64 {
 /// Forge applies it immediately before an execution launches: `env` is set on
 /// the executor process (and on review steps and lifecycle hooks), `assets`
 /// are copied into the worktree, and the `checks` for the execution's role
-/// must pass or the Task is parked as `environment_not_ready` without
+/// must pass or the Project is paused as `environment_not_ready` without
 /// spending an agent run.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 #[ts(export)]
 pub struct ProjectEnvironment {
@@ -127,6 +383,24 @@ pub struct ProjectEnvironment {
     pub assets: Vec<EnvironmentAsset>,
     #[serde(default)]
     pub checks: Vec<EnvironmentCheck>,
+    /// Seconds between automatic re-checks while environment-paused (60–86400).
+    #[serde(default = "default_environment_recheck_interval")]
+    pub recheck_interval_seconds: u64,
+}
+
+fn default_environment_recheck_interval() -> u64 {
+    600
+}
+
+impl Default for ProjectEnvironment {
+    fn default() -> Self {
+        Self {
+            env: BTreeMap::new(),
+            assets: Vec::new(),
+            checks: Vec::new(),
+            recheck_interval_seconds: default_environment_recheck_interval(),
+        }
+    }
 }
 
 impl ProjectEnvironment {
@@ -155,6 +429,8 @@ pub struct EnvironmentAsset {
 pub struct EnvironmentCheck {
     pub name: String,
     pub command: String,
+    #[serde(default)]
+    pub scope: EnvironmentCheckScope,
     /// Execution roles the check gates (`coder`, `reviewer`, ...). Empty
     /// gates every role.
     #[serde(default)]
@@ -187,8 +463,13 @@ pub struct LifecycleHookTestResponse {
 impl Default for ProjectSettings {
     fn default() -> Self {
         Self {
+            review_ci_triage: ReviewCiTriage::default(),
+            repair_switch_model_when_stuck: false,
+            max_active_tasks: default_max_active_tasks(),
             retry_budgets: RetryBudgets {
                 review: Some(default_review_retry_budget()),
+                review_progress: Some(2),
+                review_verify_rerun: Some(1),
                 merge_fix: Some(default_merge_fix_retry_budget()),
                 execution: Some(default_execution_retry_budget()),
             },
@@ -196,6 +477,7 @@ impl Default for ProjectSettings {
             lifecycle_hooks: std::collections::HashMap::new(),
             automatic_recovery: AutomaticRecoverySettings::default(),
             environment: ProjectEnvironment::default(),
+            placement: ProjectPlacementSettings::default(),
         }
     }
 }
@@ -526,6 +808,81 @@ pub struct WorkflowDefinition {
 }
 
 impl WorkflowDefinition {
+    /// Match the service workflow resolver: empty or unreadable Project JSON
+    /// selects the built-in workflow; valid custom definitions keep their roles.
+    pub fn coordination_planning_role_from_json(raw: &str) -> Option<String> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw == "{}" {
+            return Some(DEFAULT_WORKFLOW_PLANNING_ROLE.to_owned());
+        }
+        match serde_json::from_str::<Self>(raw) {
+            Ok(workflow) => workflow
+                .coordination_planning_state()
+                .and_then(|state| state.role.clone()),
+            Err(_) => Some(DEFAULT_WORKFLOW_PLANNING_ROLE.to_owned()),
+        }
+    }
+
+    /// First planning gate before implementation, shared by routing and charging.
+    pub fn planning_state(&self) -> Option<&StateDefinition> {
+        for initial in self
+            .states
+            .iter()
+            .filter(|state| state.kind == StateKind::Initial)
+        {
+            let mut cursor = initial.name.as_str();
+            for _ in 0..self.states.len() {
+                let Some(next) = self
+                    .outgoing_trigger_targets(cursor)
+                    .filter(|(trigger, _)| !trigger.system_only())
+                    .find_map(|(_, target)| {
+                        self.states.iter().find(|state| {
+                            state.name == target
+                                && matches!(state.kind, StateKind::Active | StateKind::Gate)
+                        })
+                    })
+                else {
+                    break;
+                };
+                if next.kind == StateKind::Active {
+                    break;
+                }
+                if next.canonical_phase != Some(CanonicalPhase::Review) && next.role.is_some() {
+                    return Some(next);
+                }
+                cursor = next.name.as_str();
+            }
+        }
+        None
+    }
+
+    /// Implementation roles cannot lead coordination roots.
+    pub fn coordination_planning_state(&self) -> Option<&StateDefinition> {
+        fn role(state: &StateDefinition) -> Option<&str> {
+            state
+                .role
+                .as_deref()
+                .or((state.kind == StateKind::Active).then_some("assignee"))
+        }
+        let implementation = self
+            .states
+            .iter()
+            .find(|state| state.name == "in_progress")
+            .and_then(role)
+            .or_else(|| {
+                self.states
+                    .iter()
+                    .find(|state| state.kind == StateKind::Active)
+                    .and_then(role)
+            });
+        self.planning_state().filter(|state| {
+            state
+                .role
+                .as_deref()
+                .is_some_and(|role| role != "coder" && implementation != Some(role))
+        })
+    }
+
     fn state_index(&self, status: &str) -> Option<usize> {
         self.states.iter().position(|state| state.name == status)
     }
@@ -705,7 +1062,11 @@ fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
     match name {
         "backlog" => Some(CanonicalPhase::Backlog),
         "todo" => Some(CanonicalPhase::Ready),
-        "planning" | "in_progress" => Some(CanonicalPhase::Working),
+        // `lead_check` is a state of the inherited subtask workflow only: a
+        // reader that resolves a subtask's status against the Project
+        // workflow finds no such state there and lands here. The step check
+        // is part of the work, never a review.
+        "planning" | "in_progress" | "lead_check" => Some(CanonicalPhase::Working),
         "review" | "merging" | "merge_failed" => Some(CanonicalPhase::Review),
         "done" | "cancelled" => Some(CanonicalPhase::Done),
         _ => None,
@@ -714,10 +1075,47 @@ fn canonical_phase_for_legacy_state_name(name: &str) -> Option<CanonicalPhase> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn environment_scope_and_provision_defaults_and_validation() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"cargo --version"}]}})).unwrap();
+        assert!(<super::ProjectPlacementSettings as ts_rs::TS>::decl()
+            .contains("provision_timeout_seconds: number"));
+        assert_eq!(
+            settings.environment.checks[0].scope,
+            super::EnvironmentCheckScope::Workspace
+        );
+        assert_eq!(
+            settings.placement.provision,
+            super::PlacementProvision::WhenVerified
+        );
+        for invalid in [
+            serde_json::json!({"environment":{"checks":[{"name":"cargo","command":"true","scope":"host"}]}}),
+            serde_json::json!({"placement":{"provision":"always"}}),
+        ] {
+            assert!(serde_json::from_value::<super::ProjectSettings>(invalid).is_err());
+        }
+    }
+
     use super::{
         CanonicalPhase, StateDefinition, StateHooks, StateKind, WorkflowDefinition,
         WorkflowTrigger, WorkflowTriggerDefinition,
     };
+
+    #[test]
+    fn project_settings_default_active_task_limit() {
+        let settings: super::ProjectSettings = serde_json::from_value(serde_json::json!({
+            "default_review_config": {"ci_steps": []},
+            "environment": {"env": {"TOKEN": "value"}}
+        }))
+        .expect("stored settings without a limit deserialize");
+        assert_eq!(settings.max_active_tasks, 5);
+        assert_eq!(super::ProjectSettings::default().max_active_tasks, 5);
+
+        let unlimited: super::ProjectSettings =
+            serde_json::from_value(serde_json::json!({"max_active_tasks": 0}))
+                .expect("unlimited settings deserialize");
+        assert_eq!(unlimited.max_active_tasks, 0);
+    }
 
     fn state(name: &str, kind: StateKind) -> StateDefinition {
         StateDefinition {
@@ -841,6 +1239,21 @@ mod tests {
         );
     }
 
+    /// A subtask's `lead_check` resolved against a Project workflow (which
+    /// has no such state) is working, by name and not by the unknown-state
+    /// default.
+    #[test]
+    fn the_step_check_state_is_working_under_a_workflow_that_does_not_define_it() {
+        assert_eq!(
+            super::canonical_phase_for_legacy_state_name("lead_check"),
+            Some(CanonicalPhase::Working)
+        );
+        assert_eq!(
+            workflow(Vec::new()).canonical_phase_for_state("lead_check"),
+            CanonicalPhase::Working
+        );
+    }
+
     #[test]
     fn unknown_state_defaults_to_working() {
         let workflow = workflow(Vec::new());
@@ -902,7 +1315,7 @@ pub struct DefaultRoleAssignment {
     pub assignee_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct InitialRoleAssignment {
@@ -914,6 +1327,9 @@ pub struct InitialRoleAssignment {
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
 #[ts(export)]
 pub struct TransitionLogEntry {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub bridge: TransitionBridge,
     pub id: String,
     pub task_id: String,
     pub from_state: String,

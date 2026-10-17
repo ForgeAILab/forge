@@ -37,6 +37,7 @@ import {
   formatTokens,
 } from '@/components/settings/project-settings-utils'
 import { formatMoneyAmount } from '@/lib/money-format'
+import { AgentMachines } from './AgentMachines'
 import { PricingSettingsEditor } from './PricingSettingsEditor'
 import {
   DEFAULT_CEILING,
@@ -113,6 +114,7 @@ export function AgentDetailPanel({
       </header>
 
       <div className="flex-1 space-y-6 px-6 py-5">
+        <AgentMachines agent={agent} />
         <section
           className="rounded-md border border-border-subtle bg-card p-3"
           aria-label="Agent availability"

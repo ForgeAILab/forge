@@ -19,6 +19,7 @@ import {
   useAgentChatQuery,
   useAgentChatsQuery,
   useCancelAgentChatTurnMutation,
+  useRetryAgentChatTurnMutation,
   useSendAgentChatMessageMutation,
 } from '@/features/agent-chat/hooks'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
@@ -81,6 +82,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
   const activeChatId = activeSource?.chat_id
   const chatQuery = useAgentChatQuery(activeChatId)
   const sendMutation = useSendAgentChatMessageMutation(chatQuery.data?.id)
+  const retryMutation = useRetryAgentChatTurnMutation(chatQuery.data?.id)
   const cancelMutation = useCancelAgentChatTurnMutation(chatQuery.data?.id)
   const activeGenesisQuery = useProductGenesisActiveQuery()
   const startGenesisMutation = useStartProductGenesisMutation()
@@ -161,6 +163,16 @@ export function ChatPage({ projectId }: { projectId?: string }) {
           },
         ]
   }, [projectId, hasActiveGenesis, startGenesis, approveCharter])
+
+  async function retryTurn(turnId: string, expectedVersion: number) {
+    await retryMutation.mutateAsync({
+      turnId,
+      input: {
+        expected_version: expectedVersion,
+        idempotency_key: `agent-chat-turn-retry:${turnId}:${expectedVersion}`,
+      },
+    })
+  }
 
   async function cancelTurn(turnId: string, expectedVersion: number) {
     await cancelMutation.mutateAsync({
@@ -333,6 +345,7 @@ export function ChatPage({ projectId }: { projectId?: string }) {
                 isSending={sendMutation.isPending}
                 onSend={sendMessage}
                 onCancelTurn={cancelTurn}
+                onRetryTurn={retryTurn}
                 commands={commands}
               />
             </>

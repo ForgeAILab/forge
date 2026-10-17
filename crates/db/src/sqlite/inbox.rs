@@ -3,56 +3,10 @@ use super::*;
 #[async_trait]
 impl AgentInboxRepo for SqliteDb {
     async fn create_inbox_item(&self, input: CreateAgentInboxItem) -> Result<AgentInboxItem> {
-        sqlx::query(
-            "INSERT INTO agent_inbox_item (
-                id, recipient_identity_id, scope_type, scope_id, kind, status, title, body,
-                payload_json, source_type, source_id, correlation_id, causation_id, dedupe_key,
-                version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-             ON CONFLICT(recipient_identity_id, dedupe_key) DO NOTHING",
-        )
-        .bind(&input.id)
-        .bind(&input.recipient_identity_id)
-        .bind(&input.scope_type)
-        .bind(&input.scope_id)
-        .bind(input.kind.to_string())
-        .bind(input.status.to_string())
-        .bind(&input.title)
-        .bind(&input.body)
-        .bind(&input.payload_json)
-        .bind(input.source_type.as_deref())
-        .bind(input.source_id.as_deref())
-        .bind(&input.correlation_id)
-        .bind(input.causation_id.as_deref())
-        .bind(&input.dedupe_key)
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&self.pool)
-        .await
-        .map_err(check_error)?;
-        let stored = sqlx::query(
-            "SELECT * FROM agent_inbox_item
-             WHERE recipient_identity_id = ? AND dedupe_key = ?",
-        )
-        .bind(&input.recipient_identity_id)
-        .bind(&input.dedupe_key)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(map_agent_inbox_item)
-        .transpose()?
-        .ok_or(DbError::NotFound)?;
-        if stored.scope_type != input.scope_type
-            || stored.scope_id != input.scope_id
-            || stored.kind != input.kind
-            || stored.body != input.body
-            || stored.payload_json != input.payload_json
-            || stored.correlation_id != input.correlation_id
-        {
-            return Err(DbError::Check(
-                "inbox dedupe key was reused with different content".to_owned(),
-            ));
-        }
-        Ok(stored)
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let result = self.create_inbox_item_in_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(result)
     }
 
     async fn get_inbox_item(&self, id: &str) -> Result<Option<AgentInboxItem>> {
@@ -77,6 +31,9 @@ impl AgentInboxRepo for SqliteDb {
         }
         if let Some(scope_id) = &query.scope_id {
             builder.push(" AND scope_id = ").push_bind(scope_id);
+        }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_inbox_item", user_id);
         }
         builder
             .push(" ORDER BY created_at DESC, id DESC LIMIT ")
@@ -276,6 +233,9 @@ impl AgentInboxRepo for SqliteDb {
         if let Some(scope_id) = &query.scope_id {
             builder.push(" AND scope_id = ").push_bind(scope_id);
         }
+        if let Some(user_id) = query.visible_to_user_id.as_deref() {
+            super::push_coordination_visibility(&mut builder, "agent_question", user_id);
+        }
         builder
             .push(" ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, created_at DESC, id DESC LIMIT ")
             .push_bind(query.limit.clamp(1, 500));
@@ -359,4 +319,168 @@ fn map_agent_question(row: SqliteRow) -> Result<AgentQuestion> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+impl SqliteDb {
+    pub async fn create_inbox_item_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        input: CreateAgentInboxItem,
+    ) -> Result<AgentInboxItem> {
+        sqlx::query(
+            "INSERT INTO agent_inbox_item (
+                id, recipient_identity_id, scope_type, scope_id, kind, status, title, body,
+                payload_json, source_type, source_id, correlation_id, causation_id, dedupe_key,
+                version, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(recipient_identity_id, dedupe_key) DO NOTHING",
+        )
+        .bind(&input.id)
+        .bind(&input.recipient_identity_id)
+        .bind(&input.scope_type)
+        .bind(&input.scope_id)
+        .bind(input.kind.to_string())
+        .bind(input.status.to_string())
+        .bind(&input.title)
+        .bind(&input.body)
+        .bind(&input.payload_json)
+        .bind(input.source_type.as_deref())
+        .bind(input.source_id.as_deref())
+        .bind(&input.correlation_id)
+        .bind(input.causation_id.as_deref())
+        .bind(&input.dedupe_key)
+        .bind(&input.created_at)
+        .bind(&input.updated_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(check_error)?;
+        let stored = sqlx::query(
+            "SELECT * FROM agent_inbox_item
+             WHERE recipient_identity_id = ? AND dedupe_key = ?",
+        )
+        .bind(&input.recipient_identity_id)
+        .bind(&input.dedupe_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(map_agent_inbox_item)
+        .transpose()?
+        .ok_or(DbError::NotFound)?;
+        if stored.scope_type != input.scope_type
+            || stored.scope_id != input.scope_id
+            || stored.kind != input.kind
+            || stored.body != input.body
+            || stored.payload_json != input.payload_json
+            || stored.correlation_id != input.correlation_id
+        {
+            return Err(DbError::Check(
+                "inbox dedupe key was reused with different content".to_owned(),
+            ));
+        }
+        Ok(stored)
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EffectiveProjectInboxSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EffectiveProjectInboxSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn kind(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("kind")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn source_type(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_type")?)
+    }
+    pub fn source_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("source_id")?)
+    }
+    pub fn correlation_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("correlation_id")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn effective_project_inbox_sources(
+        &self,
+        project_id: &str,
+        limit: i64,
+    ) -> crate::Result<Vec<EffectiveProjectInboxSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT i.id, i.kind, i.status, i.source_type, i.source_id,
+                i.correlation_id, i.version, i.created_at, i.updated_at
+         FROM agent_inbox_item i
+         JOIN project_agent_binding b
+           ON b.project_id = i.scope_id
+          AND b.identity_id = i.recipient_identity_id
+          AND b.state = 'active'
+         WHERE i.scope_type = 'project' AND i.scope_id = ?
+           AND i.status <> 'dismissed'
+         ORDER BY i.updated_at DESC, i.id DESC LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| EffectiveProjectInboxSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn task_outcome_originating_inbox_ids_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        source_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT id FROM agent_inbox_item
+                 WHERE source_id = ? AND COALESCE(source_type, '') <> 'task_outcome'",
+        )
+        .bind(source_id)
+        .fetch_all(connection)
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn acknowledge_task_outcome_originating_inbox_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        now: &str,
+        id: String,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(sqlx::query(
+            "UPDATE agent_inbox_item SET
+                        status = 'acknowledged',
+                        read_at = COALESCE(read_at, ?),
+                        acknowledged_at = COALESCE(acknowledged_at, ?),
+                        version = version + 1,
+                        updated_at = ?
+                     WHERE id = ? AND status IN ('unread', 'read')",
+        )
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(id)
+        .execute(connection)
+        .await?)
+    }
 }

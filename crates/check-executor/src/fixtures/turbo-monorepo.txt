@@ -1,0 +1,82 @@
+
+   • Packages in scope: alpha, beta
+   • Running test in 2 packages
+   • Remote caching disabled
+
+alpha:test: cache bypass, force executing 9247c5de513b0a99
+beta:test: cache bypass, force executing f46bb05bc4275622
+beta:test: $ /forge/web/node_modules/.bin/vitest run --globals --root /task packages/beta/beta.test.js --reporter=verbose
+alpha:test: $ /forge/web/node_modules/.bin/vitest run --globals --root /task packages/alpha/alpha.test.js --reporter=verbose
+beta:test: 
+alpha:test: 
+beta:test:  RUN  v4.1.11 /task
+beta:test: 
+alpha:test:  RUN  v4.1.11 /task
+alpha:test: 
+beta:test:  × packages/beta/beta.test.js > monorepo suite > rejects invalid input 3ms
+beta:test:    → expected 1 to be 2 // Object.is equality
+alpha:test:  × packages/alpha/alpha.test.js > monorepo suite > rejects invalid input 3ms
+alpha:test:    → expected 1 to be 2 // Object.is equality
+beta:test: 
+beta:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+beta:test: 
+beta:test:  FAIL  packages/beta/beta.test.js > monorepo suite > rejects invalid input
+alpha:test: 
+alpha:test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+alpha:test: 
+alpha:test:  FAIL  packages/alpha/alpha.test.js > monorepo suite > rejects invalid input
+beta:test: AssertionError: expected 1 to be 2 // Object.is equality
+beta:test: 
+beta:test: - Expected
+beta:test: + Received
+beta:test: 
+beta:test: - 2
+beta:test: + 1
+beta:test: 
+beta:test:  ❯ packages/beta/beta.test.js:1:82
+alpha:test: AssertionError: expected 1 to be 2 // Object.is equality
+alpha:test: 
+alpha:test: - Expected
+alpha:test: + Received
+alpha:test: 
+alpha:test: - 2
+alpha:test: + 1
+alpha:test: 
+alpha:test:  ❯ packages/alpha/alpha.test.js:1:82
+beta:test:       1| describe('monorepo suite', () => { it('rejects invalid input', () => {…
+beta:test:        |                                                                                  ^
+beta:test:       2|
+beta:test: 
+beta:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+beta:test: 
+alpha:test:       1| describe('monorepo suite', () => { it('rejects invalid input', () => {…
+alpha:test:        |                                                                                  ^
+alpha:test:       2|
+alpha:test: 
+beta:test: 
+alpha:test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+alpha:test: 
+beta:test:  Test Files  1 failed (1)
+beta:test:       Tests  1 failed (1)
+alpha:test: 
+beta:test:    Start at  21:06:18
+beta:test:    Duration  85ms (transform 6ms, setup 0ms, import 9ms, tests 3ms, environment 0ms)
+beta:test: 
+alpha:test:  Test Files  1 failed (1)
+alpha:test:       Tests  1 failed (1)
+alpha:test:    Start at  21:06:18
+alpha:test:    Duration  86ms (transform 6ms, setup 0ms, import 10ms, tests 4ms, environment 0ms)
+alpha:test: 
+alpha:test: [ELIFECYCLE] Test failed. See above for more details.
+beta:test: [ELIFECYCLE] Test failed. See above for more details.
+alpha#test:  WARNING  command finished with error, but continuing...
+beta#test:  WARNING  command finished with error, but continuing...
+alpha#test:  ERROR  command (/task/packages/alpha) /tools/pnpm run test exited (1)
+beta#test:  ERROR  command (/task/packages/beta) /tools/pnpm run test exited (1)
+
+ Tasks:    0 successful, 2 total
+Cached:    0 cached, 2 total
+  Time:    634ms 
+Failed:    alpha#test, beta#test
+
+ ERROR  run failed: command  exited (1)

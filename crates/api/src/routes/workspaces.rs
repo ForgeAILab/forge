@@ -12,12 +12,40 @@ use crate::{
 
 pub async fn get_workspace_diff(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<DiffEnvelope>> {
-    let diff = DiffService::new(std::sync::Arc::clone(&state.db))
-        .workspace_diff(&id)
-        .await
-        .map_err(map_diff_error)?;
+    let addressed_workspace = db::WorkspaceRepo::get_by_id(&*state.db, &id)
+        .await?
+        .ok_or_else(|| {
+            crate::errors::ApiError::not_found_with_code(
+                "workspace.not_found",
+                "workspace",
+                id.clone(),
+            )
+        })?;
+    crate::routes::authorization::require_task_access(
+        &state,
+        &addressed_workspace.task_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found_with_code(
+            "workspace.not_found",
+            "workspace",
+            id.clone(),
+        ))
+    })?;
+
+    let diff = DiffService::new_with_router(
+        std::sync::Arc::clone(&state.db),
+        std::sync::Arc::clone(&state.workspace_backend_router),
+    )
+    .workspace_diff(&id)
+    .await
+    .map_err(map_diff_error)?;
     Ok(Json(DiffEnvelope { data: diff }))
 }
 

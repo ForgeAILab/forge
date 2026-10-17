@@ -403,16 +403,10 @@ impl ProjectExecutionSetupService {
         if project.owner_id.as_deref() == Some(actor_user_id) {
             return Ok(());
         }
-        let member: i64 = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM project_member
-                 WHERE project_id = ? AND user_id = ? AND role IN ('owner', 'admin')
-             )",
-        )
-        .bind(&project.id)
-        .bind(actor_user_id)
-        .fetch_one(self.db.pool())
-        .await?;
+        let member: i64 = self
+            .db
+            .execution_setup_project_admin_member(&project.id, actor_user_id)
+            .await?;
         if member == 0 {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Project owner or admin role is required".to_owned(),

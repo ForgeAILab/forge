@@ -1,32 +1,18 @@
 use super::*;
 use crate::routes::reviews::review_response_server_checked;
 
-pub async fn trigger_review(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<TransitionTaskResponse>> {
-    let task = TaskRepo::get_by_id(&*state.db, &id, false)
-        .await?
-        .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
-    if task.status != default_states::REVIEW {
-        return Err(ApiError::invalid_operation_conflict(format!(
-            "task {id} is in {} state; expected review",
-            task.status
-        )));
-    }
-    let task_id = Uuid::parse_str(&id)
-        .map_err(|error| ApiError::bad_request(format!("invalid task id: {error}")))?;
-    let (task, review) = state.task_service.rerun_review(task_id).await?;
-    Ok(Json(TransitionTaskResponse {
-        task: task_response(&state.db, task).await?,
-        review: Some(review_response_server_checked(review)?),
-    }))
-}
-
 pub async fn list_reviews(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<api_types::ReviewResponse>>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let reviews = db::ReviewRepo::list_by_task(&*state.db, &id).await?;
     let responses = reviews
         .into_iter()
@@ -35,33 +21,39 @@ pub async fn list_reviews(
     Ok(Json(responses))
 }
 
-pub async fn approve_review(
+pub async fn list_findings(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
-) -> ApiResult<Json<ReviewDecisionResponse>> {
-    let (task, review) = state
-        .task_service
-        .approve_review(id)
-        .await
-        .map_err(map_manual_review_error)?;
-    Ok(Json(ReviewDecisionResponse {
-        task: task_response(&state.db, task).await?,
-        review: review_response_server_checked(review)?,
-    }))
-}
-
-pub async fn reject_review(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(request): Json<RejectReviewRequest>,
-) -> ApiResult<Json<ReviewDecisionResponse>> {
-    let (task, review) = state
-        .task_service
-        .reject_review(id, request.reason)
-        .await
-        .map_err(map_manual_review_error)?;
-    Ok(Json(ReviewDecisionResponse {
-        task: task_response(&state.db, task).await?,
-        review: review_response_server_checked(review)?,
+) -> ApiResult<Json<api_types::TaskFindingsResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    let window = state.db.review_window(&id).await?;
+    // Match /reviews' corruption handling as well as its read authority.
+    for review in &window.reviews {
+        review_response_server_checked(review.clone())?;
+    }
+    let mut items =
+        db::review_findings::finding_ledger(&window.reviews).map_err(ApiError::internal)?;
+    // Preserve the ledger's natural ordering within each priority group.
+    // Open blockers, including verify findings, must survive the read cap.
+    items.sort_by_key(|entry| {
+        let blocking =
+            entry.status.is_open() && entry.severity == api_types::ReviewFindingSeverity::Blocking;
+        (
+            !blocking,
+            blocking && entry.source != api_types::ReviewFindingSource::Verify,
+        )
+    });
+    items.truncate(200);
+    Ok(Json(api_types::TaskFindingsResponse {
+        items,
+        window_started_at: window.window_started_at,
+        review_attempts: window.reviews.len(),
     }))
 }

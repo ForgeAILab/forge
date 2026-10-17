@@ -18,11 +18,13 @@ use db::{
 use executors::ExecutorKind;
 use executors::{UsageCounters, UsageReport, UsageTelemetryState as ExecutorTelemetryState};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{Result, ServiceError};
 
 const CHAT_CANDIDATE: &str = "chat";
+/// Candidate key of a topic-rotation summary call: its own invocation on the
+/// chat's surface, distinct from every turn's provider calls.
+const TOPIC_SUMMARY_CANDIDATE: &str = "topic_summary";
 #[derive(Debug, Clone)]
 struct ScopeSnapshot {
     owner_user_id: String,
@@ -40,6 +42,10 @@ enum AdmissionGuard<'a> {
     Inquiry {
         id: &'a str,
         expected_version: i64,
+    },
+    /// An unsettled rotation-summary outbox row (no turn owns the call).
+    TopicSummary {
+        id: &'a str,
     },
 }
 
@@ -78,12 +84,11 @@ async fn scope_snapshot(
                 .project_id
                 .clone()
                 .ok_or_else(|| ServiceError::invalid_operation("Project Chat has no project"))?;
-            let row = sqlx::query("SELECT owner_id, name FROM project WHERE id = ?")
-                .bind(&project_id)
-                .fetch_optional(db.pool())
+            let row = db
+                .chat_usage_project_scope(&project_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("project", project_id.clone()))?;
-            let owner_user_id: Option<String> = row.try_get("owner_id")?;
+            let owner_user_id: Option<String> = row.owner_id()?;
             let owner_user_id = owner_user_id
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
@@ -92,7 +97,7 @@ async fn scope_snapshot(
             Ok(ScopeSnapshot {
                 owner_user_id,
                 project_id: Some(project_id),
-                project_name: row.try_get("name")?,
+                project_name: row.name()?,
                 surface: UsageSurface::ProjectChat,
             })
         }
@@ -118,64 +123,19 @@ async fn scope_snapshot(
             // An active Genesis session identifies the Main turn as Genesis
             // work.  A project is attached only after the immutable handoff
             // boundary proves the exact source turn/message belongs to it.
-            let active = sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(
-                   SELECT 1 FROM product_genesis_session
-                   WHERE main_chat_id = ?
-                     AND account_id = ?
-                     AND lifecycle IN ('discovering', 'ready_for_project')
-                )",
-            )
-            .bind(&chat.id)
-            .bind(&owner_user_id)
-            .fetch_one(db.pool())
-            .await?
+            let active = db
+                .chat_usage_active_genesis_exists(&chat.id, &owner_user_id)
+                .await?
                 != 0;
-            let handed_off_project: Option<String> = sqlx::query_scalar(
-                "SELECT g.project_id
-                 FROM product_genesis_session g
-                 JOIN agent_handoff h ON h.id = g.handoff_id
-                 JOIN project p
-                   ON p.id = g.project_id
-                  AND p.owner_id = g.account_id
-                 JOIN project_admission_receipt receipt
-                   ON receipt.project_id = g.project_id
-                  AND receipt.source_kind = 'genesis_handoff'
-                  AND receipt.handoff_id = g.handoff_id
-                 JOIN agent_chat target ON target.id = h.target_chat_id
-                 JOIN agent_handoff_delivery delivery
-                   ON delivery.handoff_id = h.id
-                  AND delivery.delivery_sequence = 1
-                  AND delivery.status = 'delivered'
-                  AND delivery.target_message_id IS h.target_message_id
-                  AND delivery.target_turn_job_id IS h.target_turn_job_id
-                 WHERE g.main_chat_id = ? AND g.lifecycle = 'handed_off'
-                   AND g.project_id IS NOT NULL AND h.target_chat_id = target.id
-                   AND g.account_id = ? AND h.source_chat_id = g.main_chat_id
-                   AND h.status = 'delivered'
-                   AND target.kind = 'project' AND target.project_id = g.project_id
-                   AND json_valid(h.source_revisions_json)
-                   AND json_extract(
-                       h.source_revisions_json,
-                       '$.request.source_revisions_digest'
-                   ) = receipt.payload_digest
-                   AND (h.source_turn_job_id = ? OR h.source_message_id = ?
-                        OR EXISTS (
-                            SELECT 1
-                            FROM json_each(
-                                json_extract(h.source_revisions_json, '$.source.message_ids')
-                            )
-                            WHERE json_each.value = ?
-                        ))
-                 ORDER BY h.created_at DESC, h.id DESC LIMIT 1",
-            )
-            .bind(&chat.id)
-            .bind(&owner_user_id)
-            .bind(&job.id)
-            .bind(trigger_id)
-            .bind(trigger_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let handed_off_project: Option<String> = db
+                .chat_usage_handed_off_project_id(db::ChatUsageHandedOffProjectIdInput {
+                    chat_id: &chat.id,
+                    account_id: &owner_user_id,
+                    turn_id: &job.id,
+                    source_message_id: trigger_id,
+                    cited_message_id: trigger_id,
+                })
+                .await?;
             if !active && handed_off_project.is_none() {
                 return Ok(ScopeSnapshot {
                     owner_user_id,
@@ -341,14 +301,15 @@ async fn create_chat_invocation(
     scope: &ScopeSnapshot,
     agent: &Agent,
     profile: &AgentProfile,
+    candidate: &str,
     guard: AdmissionGuard<'_>,
 ) -> Result<UsageInvocation> {
     let (provider_id, runtime_model) = provider_model(profile);
     let admitted_at = now_rfc3339();
     let provider_entry = profile.credential_ref.clone();
     let daemon_id = profile.daemon_id.clone();
-    let selection_id = stable_id("pricing-selection", source_id, CHAT_CANDIDATE, ordinal)?;
-    let invocation_id = stable_id("usage-invocation", source_id, CHAT_CANDIDATE, ordinal)?;
+    let selection_id = stable_id("pricing-selection", source_id, candidate, ordinal)?;
+    let invocation_id = stable_id("usage-invocation", source_id, candidate, ordinal)?;
     let mut transaction = db::begin_immediate(db.pool()).await?;
     match guard {
         AdmissionGuard::ChatTurn {
@@ -356,17 +317,15 @@ async fn create_chat_invocation(
             expected_version,
             lease_owner,
         } => {
-            let valid = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM agent_chat_turn_job
-                 WHERE id = ? AND version = ? AND status = 'leased'
-                   AND lease_owner = ?",
-            )
-            .bind(id)
-            .bind(expected_version)
-            .bind(lease_owner)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
+            let valid = db
+                .chat_usage_admitted_turn_guard_in_tx(
+                    &mut transaction,
+                    id,
+                    expected_version,
+                    lease_owner,
+                )
+                .await?
+                .is_some();
             if !valid {
                 return Err(db::DbError::VersionConflict.into());
             }
@@ -375,32 +334,37 @@ async fn create_chat_invocation(
             id,
             expected_version,
         } => {
-            let valid = sqlx::query_scalar::<_, i64>(
-                "SELECT 1 FROM agent_inquiry
-                 WHERE id = ? AND version = ? AND status = 'running'",
-            )
-            .bind(id)
-            .bind(expected_version)
-            .fetch_optional(&mut *transaction)
-            .await?
-            .is_some();
+            let valid = db
+                .chat_usage_admitted_inquiry_guard_in_tx(&mut transaction, id, expected_version)
+                .await?
+                .is_some();
+            if !valid {
+                return Err(db::DbError::VersionConflict.into());
+            }
+        }
+        AdmissionGuard::TopicSummary { id } => {
+            let valid = db
+                .chat_usage_unsettled_topic_summary_guard_in_tx(&mut transaction, id)
+                .await?
+                .is_some();
             if !valid {
                 return Err(db::DbError::VersionConflict.into());
             }
         }
     }
     let resolved = if let Some(runtime_model) = runtime_model.as_deref() {
-        let scope_key = crate::pricing_auto::prepare_price_in_tx(
+        let scope_key = pricing::auto::prepare_price_in_tx(
             db,
             &mut transaction,
             &scope.owner_user_id,
-            &crate::pricing_auto::SubjectRef {
+            &pricing::auto::SubjectRef {
                 provider_entry_id: provider_entry.clone(),
                 daemon_id: daemon_id.clone(),
                 executor_type: Some(profile.executor_type.clone()),
             },
             Some(agent.id.as_str()),
             runtime_model,
+            crate::provider_credentials::provider_entry_endpoint,
             &admitted_at,
         )
         .await?;
@@ -452,7 +416,7 @@ async fn create_chat_invocation(
             let catalog_freshness = match source_kind {
                 PricingRateSourceKind::ManualOverride => Some("not_applicable".to_owned()),
                 PricingRateSourceKind::ModelsDevCatalog => Some(
-                    crate::pricing_db::catalog_freshness_for_snapshot_in_tx(
+                    pricing::sqlite::catalog_freshness_for_snapshot_in_tx(
                         &mut transaction,
                         rate.catalog_snapshot_id.as_deref().ok_or_else(|| {
                             ServiceError::invalid_operation(
@@ -525,7 +489,7 @@ async fn create_chat_invocation(
         source_id: source_id.to_owned(),
         execution_id: None,
         task_id: None,
-        candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+        candidate_key: Some(candidate.to_owned()),
         attempt_ordinal: ordinal,
         invocation_id: None,
         subject_id: subject_id.clone(),
@@ -567,7 +531,7 @@ async fn create_chat_invocation(
             source_id: source_id.to_owned(),
             execution_id: None,
             task_id: None,
-            candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+            candidate_key: Some(candidate.to_owned()),
             attempt_ordinal: ordinal,
             subject_id,
             subject_revision_id,
@@ -602,7 +566,7 @@ async fn create_chat_invocation(
             execution_id: None,
             task_id: None,
             domain_idempotency_key: format!("chat-provider-call:{invocation_id}"),
-            candidate_key: Some(CHAT_CANDIDATE.to_owned()),
+            candidate_key: Some(candidate.to_owned()),
             attempt_ordinal: ordinal,
             pricing_selection_id: selection.id.clone(),
             admitted_provider_id: selection.admitted_provider_id.clone(),
@@ -689,11 +653,12 @@ pub(crate) async fn admit_chat_usage(
     create_chat_invocation(
         db,
         &job.id,
-        chat_attempt_ordinal(job.attempt_count)?,
+        chat_attempt_ordinal(job.invocation_count)?,
         PricingDomainKind::Chat,
         &scope,
         &agent,
         &profile,
+        CHAT_CANDIDATE,
         AdmissionGuard::ChatTurn {
             id: &job.id,
             expected_version: job.version,
@@ -751,6 +716,7 @@ pub(crate) async fn admit_inquiry_usage(
         &scope,
         &agent,
         profile,
+        CHAT_CANDIDATE,
         AdmissionGuard::Inquiry {
             id: &inquiry.id,
             expected_version: inquiry.version,
@@ -885,6 +851,104 @@ pub(crate) async fn settle_late_chat_usage(
         db::UsageLedgerRepo::settle_usage_invocations_with_events(db, settlements).await?;
     }
     Ok(())
+}
+
+/// Settles one rotation-summary usage outbox row into the usage ledger.
+///
+/// The summary call is its own invocation (source = the outbox row id,
+/// candidate `topic_summary`) on the chat's usage surface, admitted and
+/// settled in one step: no turn owns it, so it is charged even if the new
+/// topic never runs one. Idempotent by row id: the invocation and selection
+/// ids are stable, settlement skips an already settled invocation, and the
+/// row is marked settled last. `false` when there was nothing to settle.
+pub(crate) async fn settle_topic_summary_usage(db: &SqliteDb, row_id: &str) -> Result<bool> {
+    let Some(row) = db.chat_topic_summary_usage_source(row_id).await? else {
+        return Ok(false);
+    };
+    if row.settled_at()?.is_some() {
+        return Ok(false);
+    }
+    let runtime_session_id: String = row.runtime_session_id()?;
+    let session: Option<(String, String, String)> = db
+        .chat_topic_summary_session_scope(&runtime_session_id)
+        .await?;
+    let chat_id = row
+        .chat_id()?
+        .or_else(|| session.as_ref().map(|session| session.2.clone()));
+    let chat = match chat_id {
+        Some(chat_id) => AgentChatRepo::get_agent_chat(db, &chat_id).await?,
+        None => None,
+    };
+    let (Some(chat), Some((identity_id, profile_id, _))) = (chat, session) else {
+        // The chat (and with it the session) is gone: there is no surface
+        // left to attribute the call to. Stop retrying it.
+        tracing::warn!(
+            row_id,
+            "topic summary usage has no chat or session left to attribute; dropping it"
+        );
+        db.settle_unattributed_chat_topic_summary_usage(now_rfc3339(), row_id)
+            .await?;
+        return Ok(false);
+    };
+    let scope = scope_snapshot(db, &chat, None).await?;
+    let (agent, profile) = load_agent_profile(db, Some(&identity_id), Some(&profile_id)).await?;
+    create_chat_invocation(
+        db,
+        row_id,
+        0,
+        PricingDomainKind::Chat,
+        &scope,
+        &agent,
+        &profile,
+        TOPIC_SUMMARY_CANDIDATE,
+        AdmissionGuard::TopicSummary { id: row_id },
+    )
+    .await?;
+    let input = u64::try_from(row.input_tokens()?).unwrap_or(0);
+    let output = u64::try_from(row.output_tokens()?).unwrap_or(0);
+    let report = UsageReport {
+        report_id: row_id.to_owned(),
+        request_id: Some(row_id.to_owned()),
+        report_sequence: 0,
+        candidate_key: Some(TOPIC_SUMMARY_CANDIDATE.to_owned()),
+        attempt_ordinal: 0,
+        provider_id: row.provider()?,
+        model_id: row.model()?,
+        counters: UsageCounters {
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+        },
+        telemetry_state: ExecutorTelemetryState::Metered,
+        context_tokens: Some(input),
+        selected_tier: None,
+        reported_cost_usd: None,
+        outcome: None,
+        partial: row.failed()?,
+    };
+    let now = now_rfc3339();
+    settle_late_chat_usage(db, row_id, &[report], &now).await?;
+    db.settle_pending_chat_topic_summary_usage(&now, row_id)
+        .await?;
+    Ok(true)
+}
+
+/// Drains rotation-summary usage the rotation itself could not settle (a
+/// crash between the summary and its settlement). Bounded per pass.
+pub(crate) async fn settle_unsettled_topic_summary_usage(db: &SqliteDb) -> Result<usize> {
+    let ids: Vec<String> = db.unsettled_chat_topic_summary_usage_ids().await?;
+    let mut settled = 0;
+    for id in ids {
+        match settle_topic_summary_usage(db, &id).await {
+            Ok(true) => settled += 1,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(row_id = %id, %error, "topic summary usage settlement deferred");
+            }
+        }
+    }
+    Ok(settled)
 }
 
 #[cfg(test)]

@@ -39,25 +39,12 @@ pub fn project_agent_policy_digest(tool_policy_json: &str) -> String {
 
 /// Current active revision of the Project Agent operating skill.
 pub async fn current_project_agent_operating_skill_revision(db: &SqliteDb) -> Result<String> {
-    sqlx::query_scalar::<_, Option<String>>(
-        "SELECT revision.id
-         FROM operating_skill AS skill
-         JOIN operating_skill_revision AS revision
-           ON revision.id = skill.current_revision_id
-          AND revision.operating_skill_id = skill.id
-          AND revision.skill_key = skill.skill_key
-         WHERE skill.skill_key = ?
-           AND skill.lifecycle = 'active'
-           AND skill.current_revision_id IS NOT NULL
-         LIMIT 1",
-    )
-    .bind(PROJECT_OPERATING_SKILL_KEY)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten()
-    .ok_or_else(|| {
-        ServiceError::conflict("the Project Agent operating skill has no active revision")
-    })
+    db.project_agent_active_operating_skill_revision(PROJECT_OPERATING_SKILL_KEY)
+        .await?
+        .flatten()
+        .ok_or_else(|| {
+            ServiceError::conflict("the Project Agent operating skill has no active revision")
+        })
 }
 
 /// Resolve the Project Agent selection for a Genesis session.
@@ -137,26 +124,9 @@ pub async fn list_genesis_project_agents(
     session: &ProductGenesisSession,
 ) -> Result<Vec<GenesisAgentSelection>> {
     let operating_skill_revision = current_project_agent_operating_skill_revision(db).await?;
-    let ids = sqlx::query_scalar::<_, String>(
-        "SELECT identity.id
-         FROM agent_identity AS identity
-         JOIN agent_profile AS profile
-           ON profile.id = identity.selected_profile_id
-          AND profile.identity_id = identity.id
-         WHERE identity.owner_id = ?
-           AND identity.paused = 0
-           AND identity.archived_at IS NULL
-           AND (profile.credential_ref IS NULL OR EXISTS (
-               SELECT 1 FROM credential_handle AS credential
-               WHERE credential.id = profile.credential_ref
-                 AND credential.status = 'configured'
-                 AND credential.enabled = 1
-           ))
-         ORDER BY identity.created_at ASC, identity.id ASC",
-    )
-    .bind(&session.account_id)
-    .fetch_all(db.pool())
-    .await?;
+    let ids = db
+        .genesis_eligible_project_agent_ids(&session.account_id)
+        .await?;
     let mut selections = Vec::with_capacity(ids.len());
     for id in ids {
         if let Some(selection) =
@@ -178,36 +148,7 @@ pub async fn list_genesis_project_agents(
 /// daemon-discovered agent sorted first and was bound as Project Agent, where
 /// its first turn could only fail.
 async fn auto_pick_candidate(db: &SqliteDb, account_id: &str) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT identity.id
-         FROM agent_identity AS identity
-         JOIN agent_profile AS profile
-           ON profile.id = identity.selected_profile_id
-          AND profile.identity_id = identity.id
-         WHERE identity.owner_id = ?
-           AND identity.paused = 0
-           AND identity.archived_at IS NULL
-           AND (identity.is_default = 0 OR profile.credential_ref IS NOT NULL)
-           AND (profile.credential_ref IS NULL OR EXISTS (
-               SELECT 1 FROM credential_handle AS credential
-               WHERE credential.id = profile.credential_ref
-                 AND credential.status = 'configured'
-                 AND credential.enabled = 1
-           ))
-           AND profile.model IS NOT NULL
-           AND trim(profile.model) <> ''
-         ORDER BY EXISTS (
-               SELECT 1 FROM project_agent_binding AS project_binding
-               WHERE project_binding.identity_id = identity.id
-                 AND project_binding.state = 'active'
-           ) ASC,
-           identity.created_at ASC,
-           identity.id ASC
-         LIMIT 1",
-    )
-    .bind(account_id)
-    .fetch_optional(db.pool())
-    .await?)
+    Ok(db.project_agent_auto_pick_candidate(account_id).await?)
 }
 
 async fn eligible_selection(

@@ -204,10 +204,76 @@ async fn decode_empty(response: reqwest::Response) -> Result<()> {
     Err(request_error(status, String::from_utf8_lossy(&body).into()))
 }
 
+#[derive(Debug)]
+pub struct ActionUnavailable {
+    pub response: serde_json::Value,
+}
+impl std::fmt::Display for ActionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "action_unavailable")
+    }
+}
+impl std::error::Error for ActionUnavailable {}
+
 fn request_error(status: StatusCode, body: String) -> anyhow::Error {
+    if status == StatusCode::CONFLICT {
+        if let Ok(response) = serde_json::from_str::<serde_json::Value>(&body) {
+            let code = response.get("code").and_then(serde_json::Value::as_str);
+            if code == Some("action_unavailable") {
+                return ActionUnavailable { response }.into();
+            }
+            if code == Some(api_types::TASK_BUSY) {
+                if let Ok(busy) = serde_json::from_value::<api_types::TaskBusyDetails>(
+                    response["details"].clone(),
+                ) {
+                    return anyhow!(
+                        "Task is busy: the request was accepted and stays queued behind {} pending step(s). {}; retry after {} ms.",
+                        busy.pending_steps,
+                        busy.retry_hint,
+                        busy.retry_after_ms
+                    );
+                }
+            }
+        }
+    }
     if body.trim().is_empty() {
         anyhow!("request failed with status {status}")
     } else {
         anyhow!("request failed with status {status}: {body}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_actions_are_typed_but_stale_versions_remain_generic() {
+        let unavailable = request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"action_unavailable","details":{"available_actions":[]}}"#.into(),
+        );
+        assert!(unavailable.is::<ActionUnavailable>());
+        assert!(!request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"version_conflict"}"#.into()
+        )
+        .is::<ActionUnavailable>());
+    }
+    #[test]
+    fn task_busy_prints_the_queued_steps_and_retry_hint() {
+        let message = request_error(
+            StatusCode::CONFLICT,
+            r#"{"code":"task_busy","message":"Task has pending steps; accepted work remains queued","details":{"pending_steps":2,"retry_after_ms":250,"retry_hint":"Refetch the Task after pending steps settle"},"request_id":"r"}"#.into(),
+        )
+        .to_string();
+        assert!(
+            message.contains("accepted and stays queued behind 2 pending step(s)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Refetch the Task after pending steps settle"),
+            "{message}"
+        );
+        assert!(message.contains("retry after 250 ms"), "{message}");
     }
 }

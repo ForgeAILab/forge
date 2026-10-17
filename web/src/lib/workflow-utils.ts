@@ -1,5 +1,6 @@
 import type { TaskListItem as Task } from '@/types/generated'
 import type {
+  CheckWait,
   StateKind,
   TaskBlockingAnnotation,
   TaskExecutionObservability,
@@ -14,6 +15,12 @@ export interface BoardColumn {
   columnName: string
   states: string[]
   stateLabels?: Record<string, string>
+  /**
+   * States of this column that the Project workflow does not define: the
+   * inherited subtask states (`lead_check`). A card in one always shows its
+   * state, and they do not make the column a multi-state column.
+   */
+  inheritedStates?: string[]
   isTerminal: boolean
   kind: StateKind | null
   dotColor: string
@@ -42,13 +49,13 @@ export function groupByColumns(tasks: Task[], cols: BoardColumn[]): Record<strin
   return result
 }
 
-type TaskAnnotationSummary = Pick<TaskResponse, 'blocked' | 'failed' | 'error_annotation'> & {
+type TaskAnnotationSummary = Pick<TaskResponse, 'condition'> & {
   execution_observability?: Pick<TaskExecutionObservability, 'latest_execution_id'>
 }
 
 export function taskHasError(task: TaskAnnotationSummary): boolean {
-  if (task.blocked || task.failed) return true
-  if (!task.error_annotation) return false
+  if (task.condition.details.failed || task.condition.details.blocked) return true
+  if (!task.condition.details.diagnostic) return false
   return !isStaleBlockingAnnotation(task)
 }
 
@@ -57,6 +64,16 @@ export function getTaskWorkflowWarning(
 ): { title: string; message: string } | null {
   const remaining = task.plan_progress?.remaining ?? 0
   const latest = task.execution_observability
+  // A coordination root in `in_progress` waits on its subtasks, not on a
+  // checklist: its lead's plan run completing is not a stalled Task.
+  if (
+    task.condition.kind === 'parked' &&
+    [task.condition.primary, ...task.condition.additional].some(
+      (reason) => reason.kind === 'children',
+    )
+  ) {
+    return null
+  }
   if (
     task.status !== 'in_progress' ||
     remaining <= 0 ||
@@ -73,21 +90,178 @@ export function getTaskWorkflowWarning(
   }
 }
 
+/** The durable check this Task waits on, as primary or secondary reason. */
+export function checkWait(task: TaskAnnotationSummary): CheckWait | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
+  const first = condition.kind === 'parked' ? condition.primary : condition.failure
+  for (const reason of [first, ...condition.additional]) {
+    if (reason.kind === 'check') return reason.wait
+  }
+  return null
+}
+
+/**
+ * How a check wait reads. Waiting for a result or a slot is the check
+ * runner's own work, not a failure; only exhausted infrastructure retries
+ * need the owner (Retry or Cancel), and they are no verdict on the change.
+ */
+export function checkWaitNotice(
+  task: TaskAnnotationSummary,
+): { title: string; message: string; needsOwner: boolean } | null {
+  const wait = checkWait(task)
+  if (!wait) return null
+  switch (wait.phase) {
+    case 'result':
+      return {
+        title: 'Waiting for checks',
+        message: 'The checks for this change are running. The Task continues when their result arrives.',
+        needsOwner: false,
+      }
+    case 'slot':
+      return {
+        title: 'Waiting for a check slot',
+        message: 'The machine that holds this checkout is at its run limit. The checks start when a slot frees.',
+        needsOwner: false,
+      }
+    case 'infrastructure_exhausted':
+      return {
+        title: 'Checks could not run',
+        message:
+          'The checks produced no result after the automatic retries. This is not a failure of the change: retry the checks or cancel the Task.',
+        needsOwner: true,
+      }
+  }
+}
+
+const PARENT_WAIT_CAUSES: Record<string, string> = {
+  held: 'is on hold',
+  blocked: 'is blocked',
+  not_coordinating: 'is not running subtasks yet',
+}
+
+const BUDGET_EXHAUSTED_NOTICES: Record<string, { title: string; message: string }> = {
+  replan: {
+    title: 'Re-plan budget spent',
+    message:
+      'The lead has re-planned this task as many times as one budget window allows, and its subtasks are held. Retry with a new budget to let the lead plan again, or settle the parked subtask yourself.',
+  },
+}
+
+/**
+ * A spent budget the web names itself. Other budget kinds are explained by
+ * the server's own blocked record; `null` for them.
+ */
+export function budgetExhaustedNotice(
+  task: Pick<TaskResponse, 'condition'>,
+): { title: string; message: string } | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked' && condition.kind !== 'failed') return null
+  const first = condition.kind === 'parked' ? condition.primary : condition.failure
+  for (const reason of [first, ...condition.additional]) {
+    if (reason.kind === 'budget_exhausted' && reason.budget_kind) {
+      const notice = BUDGET_EXHAUSTED_NOTICES[reason.budget_kind]
+      if (notice) return notice
+    }
+  }
+  return null
+}
+
+const AGENT_WAIT_STATUSES: Record<string, string> = {
+  paused: 'is paused',
+  daemon_offline: 'is offline',
+}
+
+/**
+ * What a parked Task waits for when the wait is on something other than the
+ * Task itself: its parent Task, its Agent, or unfinished dependencies. These
+ * are waits, not failures, so they carry no blocked or failed record.
+ */
+export function getTaskWaitNotice(
+  task: Pick<TaskResponse, 'condition'>,
+): { title: string; message: string } | null {
+  const condition = task.condition
+  if (condition.kind !== 'parked') return null
+  const reason = [condition.primary, ...condition.additional].find(
+    (candidate) =>
+      candidate.kind === 'parent' ||
+      candidate.kind === 'children' ||
+      candidate.kind === 'agent' ||
+      (candidate.kind === 'project_paused' && candidate.state === null) ||
+      (candidate.kind === 'dependencies' && !candidate.cancelled),
+  )
+  if (!reason) return null
+  if (reason.kind === 'parent' && reason.cause === 'planning') {
+    return {
+      title: "Waiting for the lead's plan",
+      message:
+        "The parent task's lead is planning. This subtask runs when the plan is done and the parent starts its subtasks.",
+    }
+  }
+  if (reason.kind === 'parent' && reason.cause === 'sequence') {
+    return {
+      title: 'Waiting for an earlier subtask',
+      message:
+        'Subtasks run in order. This subtask runs when the ones before it are done or cancelled.',
+    }
+  }
+  if (reason.kind === 'project_paused') {
+    return {
+      title: 'Project paused',
+      message:
+        'This task waits for its Project to resume. Resume the Project in its settings; nothing on the task needs repair.',
+    }
+  }
+  if (reason.kind === 'children') {
+    const count = reason.remaining.length
+    return {
+      title: 'Running subtasks',
+      message:
+        count === 1
+          ? 'One subtask is unfinished. This task goes to review when it is done.'
+          : `${count > 1 ? count : 'Some'} subtasks are unfinished. This task goes to review when they are done.`,
+    }
+  }
+  if (reason.kind === 'parent') {
+    const cause = PARENT_WAIT_CAUSES[reason.cause] ?? 'does not let it run yet'
+    return {
+      title: 'Waiting for parent task',
+      message: `The parent task ${cause}. This subtask runs when the parent lets its subtasks run.`,
+    }
+  }
+  if (reason.kind === 'agent') {
+    const status = AGENT_WAIT_STATUSES[reason.status] ?? `is ${reason.status.replace(/_/g, ' ')}`
+    return {
+      title: 'Waiting for agent',
+      message: `The assigned agent ${status}. This task runs when the agent can take work.`,
+    }
+  }
+  if (reason.kind === 'dependencies') {
+    const count = reason.dependency_ids.length
+    return {
+      title: 'Waiting for dependencies',
+      message:
+        count === 1
+          ? 'One dependency is unfinished. This task runs when it finishes or the dependency is removed.'
+          : `${count > 1 ? count : 'Some'} dependencies are unfinished. This task runs when they finish or are removed.`,
+    }
+  }
+  return null
+}
+
+/** The Task's blocked record. A failure record alone is not a block. */
+export function blockedInterruption(task: TaskAnnotationSummary) {
+  return task.condition.details.blocked ? task.condition.details.interruption : null
+}
+
 export function isTaskBlocked(task: TaskAnnotationSummary): boolean {
-  if (task.blocked) return true
+  if (task.condition.details.blocked) return true
+  if (checkWait(task)?.phase === 'infrastructure_exhausted') return true
   return Boolean(getBlockingAnnotation(task))
 }
 
 function rawBlockingAnnotation(task: TaskAnnotationSummary): TaskBlockingAnnotation | null {
-  if (
-    !task.error_annotation ||
-    typeof task.error_annotation !== 'object' ||
-    task.error_annotation === null ||
-    !('blocking_reason' in task.error_annotation)
-  ) {
-    return null
-  }
-  return task.error_annotation as TaskBlockingAnnotation
+  return task.condition.details.diagnostic
 }
 
 export function isStaleBlockingAnnotation(task: TaskAnnotationSummary): boolean {
@@ -111,7 +285,13 @@ export function matchesFilters(
   task: Task,
   filters: { priorityMax?: number; priorityMin?: number; types: string[]; blockedOnly?: boolean },
 ): boolean {
-  if (filters.blockedOnly && !task.blocked) return false
+  if (
+    filters.blockedOnly &&
+    !task.condition.details.blocked &&
+    checkWait(task)?.phase !== 'infrastructure_exhausted'
+  ) {
+    return false
+  }
   if (filters.priorityMin !== undefined && task.priority < filters.priorityMin) return false
   if (filters.priorityMax !== undefined && task.priority > filters.priorityMax) return false
   if (filters.types.length > 0 && !filters.types.includes(task.task_type)) return false
@@ -130,6 +310,15 @@ export function patchTaskIntoStatus(
   const beforeIndex = withoutTask.findIndex((candidate) => candidate.id === beforeTaskId)
   if (beforeIndex === -1) return [...withoutTask, updatedTask]
   return [...withoutTask.slice(0, beforeIndex), updatedTask, ...withoutTask.slice(beforeIndex)]
+}
+
+/** The step check of the inherited subtask workflow (`db::inherited_subtask`). */
+export const INHERITED_STEP_CHECK_STATE = 'lead_check'
+
+/** Whether a card in `status` shows its state on a column. */
+export function showsSubState(column: BoardColumn, status: string): boolean {
+  const inherited = column.inheritedStates ?? []
+  return inherited.includes(status) || column.states.length - inherited.length > 1
 }
 
 export function isInitialKind(kind: StateKind | null | undefined): boolean {
@@ -165,6 +354,20 @@ export function deriveColumns(workflow: WorkflowDefinition, tasks: Task[] = []):
     columnStates[state.column].push(state.name)
   }
 
+  // A subtask runs the inherited subtask workflow, which has one state the
+  // Project workflow does not: the step check. It belongs to the working
+  // column, or a subtask in it would be on no column at all.
+  const inherited: Record<string, string[]> = {}
+  if (!workflow.states.some((state) => state.name === INHERITED_STEP_CHECK_STATE)) {
+    const home =
+      workflow.states.find((state) => state.name === 'in_progress') ??
+      workflow.states.find((state) => state.kind === 'active')
+    if (home) {
+      columnStates[home.column].push(INHERITED_STEP_CHECK_STATE)
+      inherited[home.column] = [INHERITED_STEP_CHECK_STATE]
+    }
+  }
+
   return columnOrder.map((col) => {
     const states = columnStates[col]
     const columnTasks = tasks.filter((task) => states.includes(task.status))
@@ -189,6 +392,7 @@ export function deriveColumns(workflow: WorkflowDefinition, tasks: Task[] = []):
       columnName: col,
       states,
       stateLabels,
+      ...(inherited[col] ? { inheritedStates: inherited[col] } : {}),
       subStates: Array.from(new Set(columnTasks.map((task) => task.status))),
       taskCount: columnTasks.length,
       isTerminal,
@@ -263,10 +467,13 @@ export function workflowTriggerTargets(workflow: WorkflowDefinition, fromState: 
   return outgoingWorkflowEdges(workflow, fromState).map((edge) => edge.to)
 }
 
-export function getValidDropColumns(workflow: WorkflowDefinition, fromState: string): string[] {
+export function getValidDropColumns(
+  workflow: WorkflowDefinition,
+  fromState: string,
+  columns: BoardColumn[] = deriveColumns(workflow),
+): string[] {
   const userAgentTargets = workflowTriggerTargets(workflow, fromState)
 
-  const columns = deriveColumns(workflow)
   const result = new Set<string>()
   for (const target of userAgentTargets) {
     const col = columns.find((c) => c.states.includes(target))
@@ -303,6 +510,14 @@ export function getStateColors(
       bg: 'bg-orange-50 dark:bg-orange-500/10',
       text: 'text-orange-700 dark:text-orange-300',
       accent: 'border-l-orange-500',
+    },
+    // The step check of a subtask: the root's lead checks the finished step.
+    // Still work in progress, so it keeps the working colour family.
+    lead_check: {
+      dot: 'bg-orange-400',
+      bg: 'bg-orange-50 dark:bg-orange-500/10',
+      text: 'text-orange-700 dark:text-orange-300',
+      accent: 'border-l-orange-400',
     },
     review: {
       dot: 'bg-violet-400',
@@ -398,7 +613,7 @@ export function formatStateName(name: string): string {
   return name.replace(/_/g, ' ')
 }
 
-const ACTIVE_STATES = new Set(['in_progress', 'planning'])
+const ACTIVE_STATES = new Set(['in_progress', 'planning', 'lead_check'])
 const TERMINAL_STATES = new Set(['done', 'cancelled'])
 
 export function isActiveStatus(status: string): boolean {

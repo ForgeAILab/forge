@@ -1,10 +1,14 @@
 use anyhow::{bail, Result};
-use api_types::{CreateRepoRequest, PaginatedResponse, RepoResponse};
+use api_types::{
+    CreateRepoLocationRequest, CreateRepoRequest, PaginatedResponse, RepoLocationKind,
+    RepoLocationOwnerKind, RepoLocationResponse, RepoResponse, UpdateRepoLocationRequest,
+    VerifyRepoLocationRequest,
+};
 use clap::Subcommand;
 
 use crate::{
     client::ForgeClient,
-    output::{print_json, print_table_repos},
+    output::{print_json, print_table_repo_locations, print_table_repos},
     OutputFormat,
 };
 
@@ -34,6 +38,16 @@ enum RepoCmd {
         #[arg(long)]
         project_id: String,
     },
+    /// List the repository's merge queues: who is merging, who waits, and why.
+    Queue {
+        repo_id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Register and manage machine-local checkouts of a repository.
+    Location(RepoLocationArgs),
 }
 
 impl RepoArgs {
@@ -53,9 +67,6 @@ impl RepoArgs {
                     local_path: local_path.clone(),
                     name: Some(name.clone()),
                     default_branch: default_branch.clone(),
-                    work_mode: None,
-                    pr_provider: None,
-                    pr_provider_config: None,
                 };
                 let repo: RepoResponse = client
                     .post(&format!("/api/v1/projects/{project_id}/repos"), &request)
@@ -74,6 +85,240 @@ impl RepoArgs {
                     }
                 }
             }
+            RepoCmd::Queue {
+                repo_id,
+                cursor,
+                limit,
+            } => {
+                // `--json` is the API's own answer, field for field: it is
+                // not read into this build's types and written back.
+                let raw: serde_json::Value = client
+                    .get(&queue_path(repo_id, cursor.as_deref(), *limit))
+                    .await?;
+                match output {
+                    OutputFormat::Json => print_json(&raw),
+                    OutputFormat::Table => {
+                        let response: api_types::IntegrationQueuesResponse =
+                            serde_json::from_value(raw)?;
+                        print!("{}", crate::integration_queue::queues_text(&response.items));
+                        if let Some(cursor) = &response.next_cursor {
+                            println!("More queues: --cursor {cursor}");
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            RepoCmd::Location(args) => args.run(client, output).await,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct RepoLocationArgs {
+    #[command(subcommand)]
+    cmd: RepoLocationCmd,
+}
+
+#[derive(Subcommand)]
+enum RepoLocationCmd {
+    List {
+        #[arg(long)]
+        repo_id: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        limit: Option<i64>,
+        #[arg(long)]
+        include_total: bool,
+    },
+    /// Register a checkout and record its verification result.
+    Add {
+        #[arg(long)]
+        repo_id: String,
+        #[arg(long, value_enum, default_value = "server")]
+        owner: CliLocationOwner,
+        #[arg(long)]
+        daemon_id: Option<String>,
+        #[arg(long)]
+        runtime_id: Option<String>,
+        #[arg(long)]
+        path: String,
+        #[arg(long, value_enum, default_value = "primary_checkout")]
+        kind: CliLocationKind,
+        #[arg(long)]
+        default: bool,
+    },
+    Verify {
+        #[arg(long)]
+        repo_id: String,
+        location_id: String,
+        /// Current location version from `repo location list`.
+        #[arg(long)]
+        version: i64,
+    },
+    SetDefault {
+        #[arg(long)]
+        repo_id: String,
+        location_id: String,
+        #[arg(long)]
+        version: i64,
+    },
+    Remove {
+        #[arg(long)]
+        repo_id: String,
+        location_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum CliLocationOwner {
+    Server,
+    Daemon,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum CliLocationKind {
+    PrimaryCheckout,
+    ManagedClone,
+    SharedMount,
+}
+
+impl RepoLocationArgs {
+    async fn run(&self, client: &ForgeClient, output: &OutputFormat) -> Result<()> {
+        let repo_id = match &self.cmd {
+            RepoLocationCmd::List { repo_id, .. }
+            | RepoLocationCmd::Add { repo_id, .. }
+            | RepoLocationCmd::Verify { repo_id, .. }
+            | RepoLocationCmd::SetDefault { repo_id, .. }
+            | RepoLocationCmd::Remove { repo_id, .. } => repo_id,
+        };
+        let base = format!("/api/v1/repos/{repo_id}/locations");
+        match &self.cmd {
+            RepoLocationCmd::List {
+                cursor,
+                limit,
+                include_total,
+                ..
+            } => {
+                let mut query = url::form_urlencoded::Serializer::new(String::new());
+                if let Some(cursor) = cursor {
+                    query.append_pair("cursor", cursor);
+                }
+                if let Some(limit) = limit {
+                    query.append_pair("limit", &limit.to_string());
+                }
+                if *include_total {
+                    query.append_pair("include_total", "true");
+                }
+                let query = query.finish();
+                let path = if query.is_empty() {
+                    base
+                } else {
+                    format!("{base}?{query}")
+                };
+                let response: PaginatedResponse<RepoLocationResponse> = client.get(&path).await?;
+                match output {
+                    OutputFormat::Json => print_json(&response),
+                    OutputFormat::Table => {
+                        print_table_repo_locations(&response.items);
+                        if let Some(cursor) = response.next_cursor {
+                            println!("Next cursor: {cursor}");
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            RepoLocationCmd::Add {
+                owner,
+                daemon_id,
+                runtime_id,
+                path,
+                kind,
+                default,
+                ..
+            } => {
+                let request = CreateRepoLocationRequest {
+                    owner_kind: match owner {
+                        CliLocationOwner::Server => RepoLocationOwnerKind::Server,
+                        CliLocationOwner::Daemon => RepoLocationOwnerKind::Daemon,
+                    },
+                    daemon_id: daemon_id.clone(),
+                    runtime_id: runtime_id.clone(),
+                    path: path.clone(),
+                    kind: match kind {
+                        CliLocationKind::PrimaryCheckout => RepoLocationKind::PrimaryCheckout,
+                        CliLocationKind::ManagedClone => RepoLocationKind::ManagedClone,
+                        CliLocationKind::SharedMount => RepoLocationKind::SharedMount,
+                    },
+                    is_default: Some(*default),
+                };
+                let location = client.post(&base, &request).await?;
+                print_location(output, &location)
+            }
+            RepoLocationCmd::Verify {
+                location_id,
+                version,
+                ..
+            } => {
+                let location = client
+                    .post(
+                        &format!("{base}/{location_id}/verify"),
+                        &VerifyRepoLocationRequest { version: *version },
+                    )
+                    .await?;
+                print_location(output, &location)
+            }
+            RepoLocationCmd::SetDefault {
+                location_id,
+                version,
+                ..
+            } => {
+                let location = client
+                    .patch(
+                        &format!("{base}/{location_id}"),
+                        &UpdateRepoLocationRequest {
+                            version: *version,
+                            is_default: true,
+                        },
+                    )
+                    .await?;
+                print_location(output, &location)
+            }
+            RepoLocationCmd::Remove { location_id, .. } => {
+                client.delete(&format!("{base}/{location_id}")).await
+            }
+        }
+    }
+}
+
+fn queue_path(repo_id: &str, cursor: Option<&str>, limit: Option<i64>) -> String {
+    let mut url = url::Url::parse("http://localhost/api/v1/repos/").expect("static URL");
+    url.path_segments_mut()
+        .expect("hierarchical URL")
+        .pop_if_empty()
+        .push(repo_id)
+        .push("integration-queues");
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut().append_pair("cursor", cursor);
+    }
+    if let Some(limit) = limit {
+        url.query_pairs_mut()
+            .append_pair("limit", &limit.to_string());
+    }
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    }
+}
+
+fn print_location(output: &OutputFormat, location: &RepoLocationResponse) -> Result<()> {
+    match output {
+        OutputFormat::Json => print_json(location),
+        OutputFormat::Table => {
+            print_table_repo_locations(std::slice::from_ref(location));
+            Ok(())
         }
     }
 }
@@ -115,5 +360,132 @@ fn print_repo(output: &OutputFormat, repo: &RepoResponse) -> Result<()> {
             print_table_repos(std::slice::from_ref(repo));
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        cmd: TestCommand,
+    }
+
+    #[derive(clap::Subcommand)]
+    enum TestCommand {
+        Repo(super::RepoArgs),
+    }
+
+    #[test]
+    fn repo_queue_parses_and_builds_its_path() {
+        TestCli::command().debug_assert();
+        let parsed =
+            TestCli::try_parse_from(["ctl", "repo", "queue", "repo 1", "--limit", "2"]).unwrap();
+        let TestCommand::Repo(args) = parsed.cmd;
+        assert!(matches!(
+            args.cmd,
+            super::RepoCmd::Queue {
+                limit: Some(2),
+                cursor: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            super::queue_path("repo 1", None, None),
+            "/api/v1/repos/repo%201/integration-queues"
+        );
+        assert_eq!(
+            super::queue_path("repo", Some("a b"), Some(2)),
+            "/api/v1/repos/repo/integration-queues?cursor=a+b&limit=2"
+        );
+    }
+
+    #[test]
+    fn repo_location_commands_parse() {
+        TestCli::command().debug_assert();
+        for arguments in [
+            vec![
+                "repo",
+                "location",
+                "list",
+                "--repo-id",
+                "repo",
+                "--cursor",
+                "opaque",
+                "--limit",
+                "1",
+                "--include-total",
+            ],
+            vec![
+                "repo",
+                "location",
+                "add",
+                "--repo-id",
+                "repo",
+                "--owner",
+                "daemon",
+                "--daemon-id",
+                "daemon",
+                "--runtime-id",
+                "runtime",
+                "--path",
+                "/remote/repo",
+                "--kind",
+                "primary_checkout",
+                "--default",
+            ],
+            vec![
+                "repo",
+                "location",
+                "verify",
+                "--repo-id",
+                "repo",
+                "location",
+                "--version",
+                "2",
+            ],
+            vec![
+                "repo",
+                "location",
+                "set-default",
+                "--repo-id",
+                "repo",
+                "location",
+                "--version",
+                "2",
+            ],
+            vec![
+                "repo",
+                "location",
+                "remove",
+                "--repo-id",
+                "repo",
+                "location",
+            ],
+        ] {
+            let result = TestCli::try_parse_from(
+                std::iter::once("forge-ctl").chain(arguments.iter().copied()),
+            );
+            assert!(
+                result.is_ok(),
+                "failed to parse {arguments:?}: {}",
+                result
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_default()
+            );
+        }
+        assert!(TestCli::try_parse_from([
+            "forge-ctl",
+            "repo",
+            "location",
+            "verify",
+            "--repo-id",
+            "repo",
+            "location"
+        ])
+        .is_err());
     }
 }

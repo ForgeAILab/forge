@@ -7,6 +7,13 @@ pub async fn assign_task_role(
     Path((id, role_name)): Path<(String, String)>,
     Json(request): Json<AssignRoleRequest>,
 ) -> ApiResult<Json<TaskRoleAssignmentResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let project_id = validate_role_name(&state.db, &id, &role_name).await?;
     let assignee_id = required_body_field(request.assignee_id.clone(), "assignee_id")?;
     match request.assignee_type.as_str() {
@@ -45,8 +52,16 @@ pub async fn assign_task_role(
 
 pub async fn list_task_roles(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskRoleAssignmentListResponse>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let items = TaskRoleAssignmentRepo::list_by_task(&*state.db, &id)
         .await?
         .into_iter()
@@ -57,9 +72,17 @@ pub async fn list_task_roles(
 
 pub async fn remove_task_role(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path((id, role_name)): Path<(String, String)>,
     body: Option<Json<RoleResetRequest>>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     validate_role_name(&state.db, &id, &role_name).await?;
     let reset = body.map(|Json(request)| request).unwrap_or_default();
     state

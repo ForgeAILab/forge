@@ -1,0 +1,1129 @@
+{
+  "base": "33e2a9740adfd69e29850dcde9c9cde28575d874",
+  "charter.draft": {
+    "actor": "main-command-identity",
+    "arguments": {
+      "correlation_id": "e2-charter.draft",
+      "dedupe_key": "e2-charter.draft",
+      "operation": "charter.draft",
+      "payload": {
+        "action": "save_revision",
+        "charter_id": "e2-main-charter",
+        "content": {
+          "constraints_and_risks": {
+            "accessibility": [],
+            "agent_authority": [
+              "Project Agent remains Project-scoped"
+            ],
+            "data": [
+              "Do not copy hidden Main Chat history"
+            ],
+            "integrations": [],
+            "launch": [],
+            "migration": [],
+            "operations": [],
+            "product": [
+              "Local-first single-user operation"
+            ],
+            "risks": [],
+            "security_privacy_compliance": [
+              "Require explicit approval"
+            ],
+            "technology": [
+              "SQLite"
+            ],
+            "time_and_budget": []
+          },
+          "core_experience": {
+            "core_loop": "approve, create, replay",
+            "primary_outcome": "One approved command creates one exact Project handoff.",
+            "principal_journeys": [
+              "User retries after response loss"
+            ]
+          },
+          "handoff_note": {
+            "bounded_summary": "Continue from the exact Charter.",
+            "recommended_first_action": "Validate the approved outcome.",
+            "unresolved_item_ids": []
+          },
+          "identity": {
+            "lifecycle_intent": "validate the command boundary",
+            "maturity": "mvp",
+            "one_line_vision": "A Project created by one exact Main command.",
+            "project_type": "product",
+            "slug_proposal": "main-command-project",
+            "value_proposition": "Make the Main-to-Project handoff durable.",
+            "working_name": "Main Command Project"
+          },
+          "knowledge_ledger": {
+            "items": []
+          },
+          "problem_and_people": {
+            "beneficiaries": [
+              "Project collaborators"
+            ],
+            "current_alternatives": [
+              "Manual handoff"
+            ],
+            "excluded_audiences": [
+              "Unrelated accounts"
+            ],
+            "jobs_pains_opportunity": [
+              "Continue from an approved Charter."
+            ],
+            "problem_or_opportunity": "A lost command response must not duplicate a Project.",
+            "stakeholders": [
+              "Project owner"
+            ],
+            "target_users": [
+              "Forge users"
+            ]
+          },
+          "scope": {
+            "explicit_non_goals": [
+              "Managing another account"
+            ],
+            "later_possibilities": [
+              "Project-local planning"
+            ],
+            "must_have_outcomes": [
+              "Persist Project and handoff."
+            ],
+            "required_deliverables": [
+              "One Project Chat and one queued turn."
+            ]
+          },
+          "success": {
+            "acceptance_statements": [
+              "A retry creates no duplicate Project."
+            ],
+            "non_claims": [
+              "This does not prove implementation quality."
+            ],
+            "qualitative_outcome": "The handoff is exact.",
+            "required_evidence": [
+              "Durable receipt and event"
+            ],
+            "success_signals": [
+              "Replay returns the same identifiers."
+            ]
+          }
+        },
+        "expected_charter_version": 1,
+        "genesis_session_id": "96f1c2a7-8916-4628-acbb-23fb7b5d59d2",
+        "maturity": "mvp",
+        "project_mode": "compact",
+        "provenance": {
+          "author": {
+            "id": "main-command-identity",
+            "kind": "agent"
+          },
+          "change_summary": "Draft the next Project Charter"
+        }
+      }
+    },
+    "authority": {
+      "e2-unbound/granted/paused/account": false,
+      "e2-unbound/granted/paused/main_chat": false,
+      "e2-unbound/granted/paused/project": false,
+      "e2-unbound/granted/paused/project_chat": false,
+      "e2-unbound/granted/paused/task": false,
+      "e2-unbound/granted/ready/account": false,
+      "e2-unbound/granted/ready/main_chat": false,
+      "e2-unbound/granted/ready/project": false,
+      "e2-unbound/granted/ready/project_chat": false,
+      "e2-unbound/granted/ready/task": false,
+      "e2-unbound/restricted/paused/account": false,
+      "e2-unbound/restricted/paused/main_chat": false,
+      "e2-unbound/restricted/paused/project": false,
+      "e2-unbound/restricted/paused/project_chat": false,
+      "e2-unbound/restricted/paused/task": false,
+      "e2-unbound/restricted/ready/account": false,
+      "e2-unbound/restricted/ready/main_chat": false,
+      "e2-unbound/restricted/ready/project": false,
+      "e2-unbound/restricted/ready/project_chat": false,
+      "e2-unbound/restricted/ready/task": false,
+      "main-command-identity/granted/paused/account": false,
+      "main-command-identity/granted/paused/main_chat": false,
+      "main-command-identity/granted/paused/project": false,
+      "main-command-identity/granted/paused/project_chat": false,
+      "main-command-identity/granted/paused/task": false,
+      "main-command-identity/granted/ready/account": true,
+      "main-command-identity/granted/ready/main_chat": true,
+      "main-command-identity/granted/ready/project": false,
+      "main-command-identity/granted/ready/project_chat": false,
+      "main-command-identity/granted/ready/task": false,
+      "main-command-identity/restricted/paused/account": false,
+      "main-command-identity/restricted/paused/main_chat": false,
+      "main-command-identity/restricted/paused/project": false,
+      "main-command-identity/restricted/paused/project_chat": false,
+      "main-command-identity/restricted/paused/task": false,
+      "main-command-identity/restricted/ready/account": false,
+      "main-command-identity/restricted/ready/main_chat": false,
+      "main-command-identity/restricted/ready/project": false,
+      "main-command-identity/restricted/ready/project_chat": false,
+      "main-command-identity/restricted/ready/task": false,
+      "main-command-project-identity/granted/paused/account": false,
+      "main-command-project-identity/granted/paused/main_chat": false,
+      "main-command-project-identity/granted/paused/project": false,
+      "main-command-project-identity/granted/paused/project_chat": false,
+      "main-command-project-identity/granted/paused/task": false,
+      "main-command-project-identity/granted/ready/account": false,
+      "main-command-project-identity/granted/ready/main_chat": false,
+      "main-command-project-identity/granted/ready/project": false,
+      "main-command-project-identity/granted/ready/project_chat": false,
+      "main-command-project-identity/granted/ready/task": false,
+      "main-command-project-identity/restricted/paused/account": false,
+      "main-command-project-identity/restricted/paused/main_chat": false,
+      "main-command-project-identity/restricted/paused/project": false,
+      "main-command-project-identity/restricted/paused/project_chat": false,
+      "main-command-project-identity/restricted/paused/task": false,
+      "main-command-project-identity/restricted/ready/account": false,
+      "main-command-project-identity/restricted/ready/main_chat": false,
+      "main-command-project-identity/restricted/ready/project": false,
+      "main-command-project-identity/restricted/ready/project_chat": false,
+      "main-command-project-identity/restricted/ready/task": false
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "e2-charter.draft",
+      "event_id": "51b764e9-5a8d-4c1e-ba16-40aa4f79f4f4",
+      "operation": "charter.draft",
+      "receipt_id": "cd362115-164f-4795-88f6-5025e5746f79",
+      "replayed": false,
+      "result": {
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "e2-main-charter",
+          "content_digest": "5476b34be88ca3461a5958613ab59bebb88983bf1d5fe6d7df66193a131b9637",
+          "genesis_session_id": "96f1c2a7-8916-4628-acbb-23fb7b5d59d2",
+          "operation": "charter.draft",
+          "readiness": {
+            "evaluated_at": "2026-10-09T07:01:11.347495+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "89482fbe80becee8d0ba10cfff0abd3d241fbfd012a0d127a029ca9f245c7888",
+            "status": "ready"
+          },
+          "render_digest": "ed02848508b2fbd3ea0863922ad00072efa07ecc1b6d9e509ce81e6bdea38b85",
+          "revision": 1,
+          "revision_id": "50f63687-edaa-4214-a955-5f02ac349311"
+        },
+        "event_id": "51b764e9-5a8d-4c1e-ba16-40aa4f79f4f4",
+        "materialized": true,
+        "operation": "charter.draft",
+        "receipt_id": "cd362115-164f-4795-88f6-5025e5746f79",
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+        "scope_type": "agent_chat"
+      },
+      "status": "succeeded"
+    },
+    "replay": {
+      "code": "ok",
+      "correlation_id": "e2-charter.draft",
+      "event_id": "51b764e9-5a8d-4c1e-ba16-40aa4f79f4f4",
+      "operation": "charter.draft",
+      "receipt_id": "cd362115-164f-4795-88f6-5025e5746f79",
+      "replayed": false,
+      "result": {
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "e2-main-charter",
+          "content_digest": "5476b34be88ca3461a5958613ab59bebb88983bf1d5fe6d7df66193a131b9637",
+          "genesis_session_id": "96f1c2a7-8916-4628-acbb-23fb7b5d59d2",
+          "operation": "charter.draft",
+          "readiness": {
+            "evaluated_at": "2026-10-09T07:01:11.347495+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "89482fbe80becee8d0ba10cfff0abd3d241fbfd012a0d127a029ca9f245c7888",
+            "status": "ready"
+          },
+          "render_digest": "ed02848508b2fbd3ea0863922ad00072efa07ecc1b6d9e509ce81e6bdea38b85",
+          "revision": 1,
+          "revision_id": "50f63687-edaa-4214-a955-5f02ac349311"
+        },
+        "event_id": "51b764e9-5a8d-4c1e-ba16-40aa4f79f4f4",
+        "materialized": true,
+        "operation": "charter.draft",
+        "receipt_id": "cd362115-164f-4795-88f6-5025e5746f79",
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+        "scope_type": "agent_chat"
+      },
+      "status": "succeeded"
+    },
+    "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+    "scope_type": "agent_chat"
+  },
+  "genesis.start": {
+    "actor": "main-command-identity",
+    "arguments": {
+      "correlation_id": "e2-genesis.start",
+      "dedupe_key": "e2-genesis.start",
+      "operation": "genesis.start",
+      "payload": {
+        "action": "start",
+        "maturity": "mvp",
+        "preferred_project_agent_identity_id": "main-command-project-identity"
+      }
+    },
+    "authority": {
+      "e2-unbound/granted/paused/account": false,
+      "e2-unbound/granted/paused/main_chat": false,
+      "e2-unbound/granted/paused/project": false,
+      "e2-unbound/granted/paused/project_chat": false,
+      "e2-unbound/granted/paused/task": false,
+      "e2-unbound/granted/ready/account": false,
+      "e2-unbound/granted/ready/main_chat": false,
+      "e2-unbound/granted/ready/project": false,
+      "e2-unbound/granted/ready/project_chat": false,
+      "e2-unbound/granted/ready/task": false,
+      "e2-unbound/restricted/paused/account": false,
+      "e2-unbound/restricted/paused/main_chat": false,
+      "e2-unbound/restricted/paused/project": false,
+      "e2-unbound/restricted/paused/project_chat": false,
+      "e2-unbound/restricted/paused/task": false,
+      "e2-unbound/restricted/ready/account": false,
+      "e2-unbound/restricted/ready/main_chat": false,
+      "e2-unbound/restricted/ready/project": false,
+      "e2-unbound/restricted/ready/project_chat": false,
+      "e2-unbound/restricted/ready/task": false,
+      "main-command-identity/granted/paused/account": false,
+      "main-command-identity/granted/paused/main_chat": false,
+      "main-command-identity/granted/paused/project": false,
+      "main-command-identity/granted/paused/project_chat": false,
+      "main-command-identity/granted/paused/task": false,
+      "main-command-identity/granted/ready/account": true,
+      "main-command-identity/granted/ready/main_chat": true,
+      "main-command-identity/granted/ready/project": false,
+      "main-command-identity/granted/ready/project_chat": false,
+      "main-command-identity/granted/ready/task": false,
+      "main-command-identity/restricted/paused/account": false,
+      "main-command-identity/restricted/paused/main_chat": false,
+      "main-command-identity/restricted/paused/project": false,
+      "main-command-identity/restricted/paused/project_chat": false,
+      "main-command-identity/restricted/paused/task": false,
+      "main-command-identity/restricted/ready/account": false,
+      "main-command-identity/restricted/ready/main_chat": false,
+      "main-command-identity/restricted/ready/project": false,
+      "main-command-identity/restricted/ready/project_chat": false,
+      "main-command-identity/restricted/ready/task": false,
+      "main-command-project-identity/granted/paused/account": false,
+      "main-command-project-identity/granted/paused/main_chat": false,
+      "main-command-project-identity/granted/paused/project": false,
+      "main-command-project-identity/granted/paused/project_chat": false,
+      "main-command-project-identity/granted/paused/task": false,
+      "main-command-project-identity/granted/ready/account": false,
+      "main-command-project-identity/granted/ready/main_chat": false,
+      "main-command-project-identity/granted/ready/project": false,
+      "main-command-project-identity/granted/ready/project_chat": false,
+      "main-command-project-identity/granted/ready/task": false,
+      "main-command-project-identity/restricted/paused/account": false,
+      "main-command-project-identity/restricted/paused/main_chat": false,
+      "main-command-project-identity/restricted/paused/project": false,
+      "main-command-project-identity/restricted/paused/project_chat": false,
+      "main-command-project-identity/restricted/paused/task": false,
+      "main-command-project-identity/restricted/ready/account": false,
+      "main-command-project-identity/restricted/ready/main_chat": false,
+      "main-command-project-identity/restricted/ready/project": false,
+      "main-command-project-identity/restricted/ready/project_chat": false,
+      "main-command-project-identity/restricted/ready/task": false
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "e2-genesis.start",
+      "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+      "operation": "genesis.start",
+      "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+      "replayed": false,
+      "result": {
+        "control_transfer": true,
+        "domain_committed": true,
+        "domain_result": {
+          "admitted_turn_id": "b775e9a9-8fd0-4cd7-add4-47caac1bb317",
+          "control_transfer": true,
+          "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+          "main_chat_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+          "operation": "genesis.start",
+          "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+          "replayed": false,
+          "session_id": "baa48b41-ec97-4d50-b514-a68ddac0a553",
+          "source_message_id": "main-command-source-message",
+          "source_turn_id": "main-command-source-turn"
+        },
+        "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+        "materialized": true,
+        "operation": "genesis.start",
+        "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+        "scope_type": "agent_chat"
+      },
+      "status": "succeeded"
+    },
+    "replay": {
+      "code": "ok",
+      "correlation_id": "e2-genesis.start",
+      "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+      "operation": "genesis.start",
+      "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+      "replayed": false,
+      "result": {
+        "control_transfer": true,
+        "domain_committed": true,
+        "domain_result": {
+          "admitted_turn_id": "b775e9a9-8fd0-4cd7-add4-47caac1bb317",
+          "control_transfer": true,
+          "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+          "main_chat_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+          "operation": "genesis.start",
+          "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+          "replayed": true,
+          "session_id": "baa48b41-ec97-4d50-b514-a68ddac0a553",
+          "source_message_id": "main-command-source-message",
+          "source_turn_id": "main-command-source-turn"
+        },
+        "event_id": "ed39711b-87dd-4135-a8ac-465de45e705f",
+        "materialized": true,
+        "operation": "genesis.start",
+        "receipt_id": "1a073dfe-ae30-408d-b422-8026566fcc0f",
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+        "scope_type": "agent_chat"
+      },
+      "status": "succeeded"
+    },
+    "scope_id": "64e2dab6-5236-4963-9227-46f999355f0a",
+    "scope_type": "agent_chat"
+  },
+  "milestone_id": "ead76c6d-e15e-4b30-a00c-c659f9cdde04",
+  "project.charter.adoption": {
+    "actor": "main-command-project-identity",
+    "arguments": {
+      "correlation_id": "e2-project.charter.adoption",
+      "dedupe_key": "e2-project.charter.adoption",
+      "operation": "project.charter.adoption",
+      "payload": {
+        "action": "draft_revision",
+        "base_revision_id": "main-command-charter-revision",
+        "charter_id": "main-command-charter",
+        "content": {
+          "constraints_and_risks": {
+            "accessibility": [],
+            "agent_authority": [
+              "Project Agent remains Project-scoped"
+            ],
+            "data": [
+              "Do not copy hidden Main Chat history"
+            ],
+            "integrations": [],
+            "launch": [],
+            "migration": [],
+            "operations": [],
+            "product": [
+              "Local-first single-user operation"
+            ],
+            "risks": [],
+            "security_privacy_compliance": [
+              "Require explicit approval"
+            ],
+            "technology": [
+              "SQLite"
+            ],
+            "time_and_budget": []
+          },
+          "core_experience": {
+            "core_loop": "approve, create, replay",
+            "primary_outcome": "One approved command creates one exact Project handoff.",
+            "principal_journeys": [
+              "User retries after response loss"
+            ]
+          },
+          "handoff_note": {
+            "bounded_summary": "Continue from the exact Charter.",
+            "recommended_first_action": "Validate the approved outcome.",
+            "unresolved_item_ids": []
+          },
+          "identity": {
+            "lifecycle_intent": "validate the command boundary",
+            "maturity": "mvp",
+            "one_line_vision": "A Project created by one exact Main command.",
+            "project_type": "product",
+            "slug_proposal": "main-command-project",
+            "value_proposition": "Retain verified evidence for the durable Main-to-Project handoff.",
+            "working_name": "Main Command Project"
+          },
+          "knowledge_ledger": {
+            "items": []
+          },
+          "problem_and_people": {
+            "beneficiaries": [
+              "Project collaborators"
+            ],
+            "current_alternatives": [
+              "Manual handoff"
+            ],
+            "excluded_audiences": [
+              "Unrelated accounts"
+            ],
+            "jobs_pains_opportunity": [
+              "Continue from an approved Charter."
+            ],
+            "problem_or_opportunity": "A lost command response must not duplicate a Project.",
+            "stakeholders": [
+              "Project owner"
+            ],
+            "target_users": [
+              "Forge users"
+            ]
+          },
+          "scope": {
+            "explicit_non_goals": [
+              "Managing another account"
+            ],
+            "later_possibilities": [
+              "Project-local planning"
+            ],
+            "must_have_outcomes": [
+              "Persist Project and handoff."
+            ],
+            "required_deliverables": [
+              "One Project Chat and one queued turn."
+            ]
+          },
+          "success": {
+            "acceptance_statements": [
+              "A retry creates no duplicate Project."
+            ],
+            "non_claims": [
+              "This does not prove implementation quality."
+            ],
+            "qualitative_outcome": "The handoff is exact.",
+            "required_evidence": [
+              "Durable receipt and event"
+            ],
+            "success_signals": [
+              "Replay returns the same identifiers."
+            ]
+          }
+        },
+        "expected_charter_version": 3,
+        "maturity": "mvp",
+        "project_mode": "compact",
+        "provenance": {
+          "author": {
+            "id": "main-command-project-identity",
+            "kind": "agent"
+          },
+          "change_summary": "Draft evidence-retention amendment"
+        }
+      }
+    },
+    "authority": {
+      "e2-unbound/granted/paused/account": false,
+      "e2-unbound/granted/paused/main_chat": false,
+      "e2-unbound/granted/paused/project": false,
+      "e2-unbound/granted/paused/project_chat": false,
+      "e2-unbound/granted/paused/task": false,
+      "e2-unbound/granted/ready/account": false,
+      "e2-unbound/granted/ready/main_chat": false,
+      "e2-unbound/granted/ready/project": false,
+      "e2-unbound/granted/ready/project_chat": false,
+      "e2-unbound/granted/ready/task": false,
+      "e2-unbound/restricted/paused/account": false,
+      "e2-unbound/restricted/paused/main_chat": false,
+      "e2-unbound/restricted/paused/project": false,
+      "e2-unbound/restricted/paused/project_chat": false,
+      "e2-unbound/restricted/paused/task": false,
+      "e2-unbound/restricted/ready/account": false,
+      "e2-unbound/restricted/ready/main_chat": false,
+      "e2-unbound/restricted/ready/project": false,
+      "e2-unbound/restricted/ready/project_chat": false,
+      "e2-unbound/restricted/ready/task": false,
+      "main-command-identity/granted/paused/account": false,
+      "main-command-identity/granted/paused/main_chat": false,
+      "main-command-identity/granted/paused/project": false,
+      "main-command-identity/granted/paused/project_chat": false,
+      "main-command-identity/granted/paused/task": false,
+      "main-command-identity/granted/ready/account": false,
+      "main-command-identity/granted/ready/main_chat": false,
+      "main-command-identity/granted/ready/project": false,
+      "main-command-identity/granted/ready/project_chat": false,
+      "main-command-identity/granted/ready/task": false,
+      "main-command-identity/restricted/paused/account": false,
+      "main-command-identity/restricted/paused/main_chat": false,
+      "main-command-identity/restricted/paused/project": false,
+      "main-command-identity/restricted/paused/project_chat": false,
+      "main-command-identity/restricted/paused/task": false,
+      "main-command-identity/restricted/ready/account": false,
+      "main-command-identity/restricted/ready/main_chat": false,
+      "main-command-identity/restricted/ready/project": false,
+      "main-command-identity/restricted/ready/project_chat": false,
+      "main-command-identity/restricted/ready/task": false,
+      "main-command-project-identity/granted/paused/account": false,
+      "main-command-project-identity/granted/paused/main_chat": false,
+      "main-command-project-identity/granted/paused/project": true,
+      "main-command-project-identity/granted/paused/project_chat": false,
+      "main-command-project-identity/granted/paused/task": false,
+      "main-command-project-identity/granted/ready/account": false,
+      "main-command-project-identity/granted/ready/main_chat": false,
+      "main-command-project-identity/granted/ready/project": true,
+      "main-command-project-identity/granted/ready/project_chat": false,
+      "main-command-project-identity/granted/ready/task": false,
+      "main-command-project-identity/restricted/paused/account": false,
+      "main-command-project-identity/restricted/paused/main_chat": false,
+      "main-command-project-identity/restricted/paused/project": true,
+      "main-command-project-identity/restricted/paused/project_chat": false,
+      "main-command-project-identity/restricted/paused/task": false,
+      "main-command-project-identity/restricted/ready/account": false,
+      "main-command-project-identity/restricted/ready/main_chat": false,
+      "main-command-project-identity/restricted/ready/project": true,
+      "main-command-project-identity/restricted/ready/project_chat": false,
+      "main-command-project-identity/restricted/ready/task": false
+    },
+    "first": {
+      "approval_target": {
+        "content_digest": null,
+        "operation": "project.charter.adoption",
+        "rendered_digest": null,
+        "requires_user_authorization": true,
+        "revision": null,
+        "revision_id": null,
+        "target_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "target_type": "project",
+        "version": 4
+      },
+      "code": "approval_required",
+      "correlation_id": "e2-project.charter.adoption",
+      "event_id": "8bb748f5-e0f5-4f82-9900-01105165eed3",
+      "operation": "project.charter.adoption",
+      "receipt_id": "b62015cc-2cde-48f1-9e7a-c81592f679b5",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "main-command-charter",
+          "charter_version": 4,
+          "content_digest": "46a949e4840ef3f8d77aef486e257f29c2d391eed522da0426d85eb9b3e935c9",
+          "domain_committed": true,
+          "operation": "project.charter.adoption",
+          "project_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+          "readiness": {
+            "evaluated_at": "2026-10-09T06:37:24.711992+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "3a926e8bf03c9be8767e8bb785d7d020fdc7140ef94bd2afea36b17b74862a79",
+            "status": "ready"
+          },
+          "render_digest": "92d9ff89d2555cdd150d97b055ad2c5e8751f5c8ebe4d7aa9c3e95e785cf1e76",
+          "requires_user_authorization": true,
+          "revision": 2,
+          "revision_id": "a3111d7d-833d-4ca4-a836-40c5f8db137d"
+        },
+        "event_id": "8bb748f5-e0f5-4f82-9900-01105165eed3",
+        "materialized": true,
+        "operation": "project.charter.adoption",
+        "receipt_id": "b62015cc-2cde-48f1-9e7a-c81592f679b5",
+        "replayed": false,
+        "requires_user_authorization": true,
+        "status": "succeeded"
+      },
+      "safe_message": "approval is required before this operation is committed",
+      "scope": {
+        "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "scope_type": "project"
+      },
+      "status": "approval_required"
+    },
+    "replay": {
+      "approval_target": {
+        "content_digest": null,
+        "operation": "project.charter.adoption",
+        "rendered_digest": null,
+        "requires_user_authorization": true,
+        "revision": null,
+        "revision_id": null,
+        "target_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "target_type": "project",
+        "version": 4
+      },
+      "code": "approval_required",
+      "correlation_id": "e2-project.charter.adoption",
+      "event_id": "8bb748f5-e0f5-4f82-9900-01105165eed3",
+      "operation": "project.charter.adoption",
+      "receipt_id": "b62015cc-2cde-48f1-9e7a-c81592f679b5",
+      "replayed": true,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "main-command-charter",
+          "charter_version": 4,
+          "content_digest": "46a949e4840ef3f8d77aef486e257f29c2d391eed522da0426d85eb9b3e935c9",
+          "domain_committed": true,
+          "operation": "project.charter.adoption",
+          "project_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+          "readiness": {
+            "evaluated_at": "2026-10-09T06:37:24.711992+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "3a926e8bf03c9be8767e8bb785d7d020fdc7140ef94bd2afea36b17b74862a79",
+            "status": "ready"
+          },
+          "render_digest": "92d9ff89d2555cdd150d97b055ad2c5e8751f5c8ebe4d7aa9c3e95e785cf1e76",
+          "requires_user_authorization": true,
+          "revision": 2,
+          "revision_id": "a3111d7d-833d-4ca4-a836-40c5f8db137d"
+        },
+        "event_id": "8bb748f5-e0f5-4f82-9900-01105165eed3",
+        "materialized": true,
+        "operation": "project.charter.adoption",
+        "receipt_id": "b62015cc-2cde-48f1-9e7a-c81592f679b5",
+        "replayed": true,
+        "requires_user_authorization": true,
+        "status": "succeeded"
+      },
+      "safe_message": "approval is required before this operation is committed",
+      "scope": {
+        "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "scope_type": "project"
+      },
+      "status": "approval_required"
+    },
+    "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+    "scope_type": "project"
+  },
+  "project.charter.adoption.setup": {
+    "actor": "main-command-project-identity",
+    "arguments": {
+      "correlation_id": "e2-project.charter.adoption",
+      "dedupe_key": "e2-adoption-setup",
+      "operation": "project.charter.adoption",
+      "payload": {
+        "action": "draft_revision",
+        "content": {
+          "constraints_and_risks": {
+            "accessibility": [],
+            "agent_authority": [
+              "Project Agent remains Project-scoped"
+            ],
+            "data": [
+              "Do not copy hidden Main Chat history"
+            ],
+            "integrations": [],
+            "launch": [],
+            "migration": [],
+            "operations": [],
+            "product": [
+              "Local-first single-user operation"
+            ],
+            "risks": [],
+            "security_privacy_compliance": [
+              "Require explicit approval"
+            ],
+            "technology": [
+              "SQLite"
+            ],
+            "time_and_budget": []
+          },
+          "core_experience": {
+            "core_loop": "approve, create, replay",
+            "primary_outcome": "One approved command creates one exact Project handoff.",
+            "principal_journeys": [
+              "User retries after response loss"
+            ]
+          },
+          "handoff_note": {
+            "bounded_summary": "Continue from the exact Charter.",
+            "recommended_first_action": "Validate the approved outcome.",
+            "unresolved_item_ids": []
+          },
+          "identity": {
+            "lifecycle_intent": "validate the command boundary",
+            "maturity": "mvp",
+            "one_line_vision": "A Project created by one exact Main command.",
+            "project_type": "product",
+            "slug_proposal": "main-command-project",
+            "value_proposition": "Make the Main-to-Project handoff durable.",
+            "working_name": "Main Command Project"
+          },
+          "knowledge_ledger": {
+            "items": []
+          },
+          "problem_and_people": {
+            "beneficiaries": [
+              "Project collaborators"
+            ],
+            "current_alternatives": [
+              "Manual handoff"
+            ],
+            "excluded_audiences": [
+              "Unrelated accounts"
+            ],
+            "jobs_pains_opportunity": [
+              "Continue from an approved Charter."
+            ],
+            "problem_or_opportunity": "A lost command response must not duplicate a Project.",
+            "stakeholders": [
+              "Project owner"
+            ],
+            "target_users": [
+              "Forge users"
+            ]
+          },
+          "scope": {
+            "explicit_non_goals": [
+              "Managing another account"
+            ],
+            "later_possibilities": [
+              "Project-local planning"
+            ],
+            "must_have_outcomes": [
+              "Persist Project and handoff."
+            ],
+            "required_deliverables": [
+              "One Project Chat and one queued turn."
+            ]
+          },
+          "success": {
+            "acceptance_statements": [
+              "A retry creates no duplicate Project."
+            ],
+            "non_claims": [
+              "This does not prove implementation quality."
+            ],
+            "qualitative_outcome": "The handoff is exact.",
+            "required_evidence": [
+              "Durable receipt and event"
+            ],
+            "success_signals": [
+              "Replay returns the same identifiers."
+            ]
+          }
+        },
+        "expected_charter_version": 0,
+        "maturity": "mvp",
+        "project_mode": "compact",
+        "provenance": {
+          "author": {
+            "id": "main-command-project-identity",
+            "kind": "agent"
+          },
+          "change_summary": "Draft legacy adoption"
+        }
+      }
+    },
+    "first": {
+      "approval_target": {
+        "content_digest": null,
+        "operation": "project.charter.adoption",
+        "rendered_digest": null,
+        "requires_user_authorization": true,
+        "revision": null,
+        "revision_id": null,
+        "target_id": "e2-legacy",
+        "target_type": "project",
+        "version": 2
+      },
+      "code": "approval_required",
+      "correlation_id": "e2-project.charter.adoption",
+      "event_id": "cc3925c2-8b7e-4d68-a037-686a5418e8aa",
+      "operation": "project.charter.adoption",
+      "receipt_id": "9a0814ee-7cff-4801-b8b0-5be3ec311c68",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "d5c97c0a-7c96-4a13-9719-6e90f7587625",
+          "charter_version": 2,
+          "content_digest": "5476b34be88ca3461a5958613ab59bebb88983bf1d5fe6d7df66193a131b9637",
+          "domain_committed": true,
+          "operation": "project.charter.adoption",
+          "project_id": "e2-legacy",
+          "readiness": {
+            "evaluated_at": "2026-10-09T06:37:24.724686+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "89482fbe80becee8d0ba10cfff0abd3d241fbfd012a0d127a029ca9f245c7888",
+            "status": "ready"
+          },
+          "render_digest": "ed02848508b2fbd3ea0863922ad00072efa07ecc1b6d9e509ce81e6bdea38b85",
+          "requires_user_authorization": true,
+          "revision": 1,
+          "revision_id": "5acfbdfd-4e5d-448e-9ba2-7ddeb4b70a3c"
+        },
+        "event_id": "cc3925c2-8b7e-4d68-a037-686a5418e8aa",
+        "materialized": true,
+        "operation": "project.charter.adoption",
+        "receipt_id": "9a0814ee-7cff-4801-b8b0-5be3ec311c68",
+        "replayed": false,
+        "requires_user_authorization": true,
+        "status": "succeeded"
+      },
+      "safe_message": "approval is required before this operation is committed",
+      "scope": {
+        "scope_id": "e2-legacy",
+        "scope_type": "project"
+      },
+      "status": "approval_required"
+    },
+    "replay": {
+      "approval_target": {
+        "content_digest": null,
+        "operation": "project.charter.adoption",
+        "rendered_digest": null,
+        "requires_user_authorization": true,
+        "revision": null,
+        "revision_id": null,
+        "target_id": "e2-legacy",
+        "target_type": "project",
+        "version": 2
+      },
+      "code": "approval_required",
+      "correlation_id": "e2-project.charter.adoption",
+      "event_id": "cc3925c2-8b7e-4d68-a037-686a5418e8aa",
+      "operation": "project.charter.adoption",
+      "receipt_id": "9a0814ee-7cff-4801-b8b0-5be3ec311c68",
+      "replayed": true,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "charter_id": "d5c97c0a-7c96-4a13-9719-6e90f7587625",
+          "charter_version": 2,
+          "content_digest": "5476b34be88ca3461a5958613ab59bebb88983bf1d5fe6d7df66193a131b9637",
+          "domain_committed": true,
+          "operation": "project.charter.adoption",
+          "project_id": "e2-legacy",
+          "readiness": {
+            "evaluated_at": "2026-10-09T06:37:24.724686+00:00",
+            "gaps": [],
+            "maturity": "mvp",
+            "policy_revision": "forge.project-charter-readiness/v1",
+            "project_mode": "compact",
+            "readiness_digest": "89482fbe80becee8d0ba10cfff0abd3d241fbfd012a0d127a029ca9f245c7888",
+            "status": "ready"
+          },
+          "render_digest": "ed02848508b2fbd3ea0863922ad00072efa07ecc1b6d9e509ce81e6bdea38b85",
+          "requires_user_authorization": true,
+          "revision": 1,
+          "revision_id": "5acfbdfd-4e5d-448e-9ba2-7ddeb4b70a3c"
+        },
+        "event_id": "cc3925c2-8b7e-4d68-a037-686a5418e8aa",
+        "materialized": true,
+        "operation": "project.charter.adoption",
+        "receipt_id": "9a0814ee-7cff-4801-b8b0-5be3ec311c68",
+        "replayed": true,
+        "requires_user_authorization": true,
+        "status": "succeeded"
+      },
+      "safe_message": "approval is required before this operation is committed",
+      "scope": {
+        "scope_id": "e2-legacy",
+        "scope_type": "project"
+      },
+      "status": "approval_required"
+    },
+    "scope_id": "e2-legacy",
+    "scope_type": "project"
+  },
+  "project.evidence": {
+    "actor": "main-command-project-identity",
+    "arguments": {
+      "correlation_id": "e2-project.evidence",
+      "dedupe_key": "e2-project.evidence",
+      "operation": "project.evidence",
+      "payload": {
+        "acceptance_check_ids": [
+          "delivery"
+        ],
+        "action": "capture",
+        "caption": "Observed delivery",
+        "content": "Delivered",
+        "expected_milestone_version": 2,
+        "filename": "proof.txt",
+        "kind": "report",
+        "milestone_id": "ead76c6d-e15e-4b30-a00c-c659f9cdde04"
+      }
+    },
+    "authority": {
+      "e2-unbound/granted/paused/account": false,
+      "e2-unbound/granted/paused/main_chat": false,
+      "e2-unbound/granted/paused/project": false,
+      "e2-unbound/granted/paused/project_chat": false,
+      "e2-unbound/granted/paused/task": false,
+      "e2-unbound/granted/ready/account": false,
+      "e2-unbound/granted/ready/main_chat": false,
+      "e2-unbound/granted/ready/project": false,
+      "e2-unbound/granted/ready/project_chat": false,
+      "e2-unbound/granted/ready/task": false,
+      "e2-unbound/restricted/paused/account": false,
+      "e2-unbound/restricted/paused/main_chat": false,
+      "e2-unbound/restricted/paused/project": false,
+      "e2-unbound/restricted/paused/project_chat": false,
+      "e2-unbound/restricted/paused/task": false,
+      "e2-unbound/restricted/ready/account": false,
+      "e2-unbound/restricted/ready/main_chat": false,
+      "e2-unbound/restricted/ready/project": false,
+      "e2-unbound/restricted/ready/project_chat": false,
+      "e2-unbound/restricted/ready/task": false,
+      "main-command-identity/granted/paused/account": false,
+      "main-command-identity/granted/paused/main_chat": false,
+      "main-command-identity/granted/paused/project": false,
+      "main-command-identity/granted/paused/project_chat": false,
+      "main-command-identity/granted/paused/task": false,
+      "main-command-identity/granted/ready/account": false,
+      "main-command-identity/granted/ready/main_chat": false,
+      "main-command-identity/granted/ready/project": false,
+      "main-command-identity/granted/ready/project_chat": false,
+      "main-command-identity/granted/ready/task": false,
+      "main-command-identity/restricted/paused/account": false,
+      "main-command-identity/restricted/paused/main_chat": false,
+      "main-command-identity/restricted/paused/project": false,
+      "main-command-identity/restricted/paused/project_chat": false,
+      "main-command-identity/restricted/paused/task": false,
+      "main-command-identity/restricted/ready/account": false,
+      "main-command-identity/restricted/ready/main_chat": false,
+      "main-command-identity/restricted/ready/project": false,
+      "main-command-identity/restricted/ready/project_chat": false,
+      "main-command-identity/restricted/ready/task": false,
+      "main-command-project-identity/granted/paused/account": false,
+      "main-command-project-identity/granted/paused/main_chat": false,
+      "main-command-project-identity/granted/paused/project": true,
+      "main-command-project-identity/granted/paused/project_chat": false,
+      "main-command-project-identity/granted/paused/task": false,
+      "main-command-project-identity/granted/ready/account": false,
+      "main-command-project-identity/granted/ready/main_chat": false,
+      "main-command-project-identity/granted/ready/project": true,
+      "main-command-project-identity/granted/ready/project_chat": false,
+      "main-command-project-identity/granted/ready/task": false,
+      "main-command-project-identity/restricted/paused/account": false,
+      "main-command-project-identity/restricted/paused/main_chat": false,
+      "main-command-project-identity/restricted/paused/project": true,
+      "main-command-project-identity/restricted/paused/project_chat": false,
+      "main-command-project-identity/restricted/paused/task": false,
+      "main-command-project-identity/restricted/ready/account": false,
+      "main-command-project-identity/restricted/ready/main_chat": false,
+      "main-command-project-identity/restricted/ready/project": true,
+      "main-command-project-identity/restricted/ready/project_chat": false,
+      "main-command-project-identity/restricted/ready/task": false
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "e2-project.evidence",
+      "event_id": "a9d53656-10ac-44d7-be23-b50f3e819ceb",
+      "operation": "project.evidence",
+      "receipt_id": "c45b55e5-ee24-4e9f-88ff-5e5a247fceab",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "asset_id": "94451c2f-5b7d-4f38-953b-2896b50219d4",
+          "attachment_id": "cf9e69da-0b72-41a9-acb7-2d7446e814ef",
+          "domain_committed": true,
+          "milestone_id": "ead76c6d-e15e-4b30-a00c-c659f9cdde04",
+          "operation": "project.evidence",
+          "project_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6"
+        },
+        "event_id": "a9d53656-10ac-44d7-be23-b50f3e819ceb",
+        "materialized": true,
+        "operation": "project.evidence",
+        "receipt_id": "c45b55e5-ee24-4e9f-88ff-5e5a247fceab",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+    "scope_type": "project"
+  },
+  "project.evidence.attach": {
+    "actor": "main-command-project-identity",
+    "arguments": {
+      "correlation_id": "e2-project.evidence",
+      "dedupe_key": "e2-evidence-attach",
+      "operation": "project.evidence",
+      "payload": {
+        "acceptance_check_ids": [
+          "delivery"
+        ],
+        "action": "attach",
+        "asset_id": "94451c2f-5b7d-4f38-953b-2896b50219d4",
+        "caption": "Observed delivery",
+        "checksum": "906115657390f3675639f46a572eee069155214169a45be4046933527a95c67b",
+        "expected_milestone_version": 2,
+        "kind": "report",
+        "milestone_id": "ead76c6d-e15e-4b30-a00c-c659f9cdde04"
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "e2-project.evidence",
+      "event_id": "da880ed3-7d16-4bc0-8fa9-7e674b8dac66",
+      "operation": "project.evidence",
+      "receipt_id": "1c35b44a-5333-4277-8ab6-53a660cc4b93",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "asset_id": "94451c2f-5b7d-4f38-953b-2896b50219d4",
+          "attachment_id": "28d41bc4-37e0-4b55-95a5-496dea1b7898",
+          "domain_committed": true,
+          "milestone_id": "ead76c6d-e15e-4b30-a00c-c659f9cdde04",
+          "operation": "project.evidence",
+          "project_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6"
+        },
+        "event_id": "da880ed3-7d16-4bc0-8fa9-7e674b8dac66",
+        "materialized": true,
+        "operation": "project.evidence",
+        "receipt_id": "1c35b44a-5333-4277-8ab6-53a660cc4b93",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "scope_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6",
+    "scope_type": "project"
+  },
+  "project_id": "7ba37a3e-5bd4-4ab1-b3c7-faf9c62315a6"
+}

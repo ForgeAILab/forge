@@ -21,7 +21,6 @@ use db::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{
     AuthorizationProvenance as CommandAuthorizationProvenance, CommandContext, CommandPrincipal,
@@ -109,7 +108,52 @@ pub struct CreateProjectFromCharterApprovalInput {
 /// approval and returns the committed receipt. The retry is admitted only
 /// when the approval is consumed *and* the committed handoff carries this
 /// exact idempotency key, so a real conflict is never retried into success.
+///
+/// One creation per approval runs at a time in this process. The response
+/// carries the Project as it stands once this call's provisioning pass is
+/// over, so an overlapping submission that ran beside the first one's
+/// provisioning could read the Project before its repository was linked
+/// while the first read it after (or fail the replay's own Project
+/// comparison). The later submission therefore waits for the earlier one to
+/// finish and then replays its receipt against the settled Project.
 pub async fn create_project_from_charter_approval(
+    db: Arc<SqliteDb>,
+    input: CreateProjectFromCharterApprovalInput,
+) -> Result<CreatedProjectFromCharterApproval> {
+    let flight = creation_flight(&db, &input.approval_id);
+    let _one_creation_per_approval = flight.lock().await;
+    let mut created = create_project_from_charter_approval_once(Arc::clone(&db), input).await?;
+    // Provisioning links the repository after the atomic create commits; the
+    // caller is told about the Project that exists now, not the row as it
+    // was inside the create transaction.
+    created.project = ProjectRepo::get_by_id(&*db, &created.project.id)
+        .await?
+        .ok_or_else(|| ServiceError::not_found("project", created.project.id.clone()))?;
+    Ok(created)
+}
+
+type CreationFlights = std::sync::Mutex<
+    std::collections::HashMap<(usize, String), std::sync::Weak<tokio::sync::Mutex<()>>>,
+>;
+
+/// The in-process lock of one approval's creation, per database.
+fn creation_flight(db: &Arc<SqliteDb>, approval_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static FLIGHTS: std::sync::OnceLock<CreationFlights> = std::sync::OnceLock::new();
+    let mut flights = FLIGHTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    flights.retain(|_, flight| flight.strong_count() > 0);
+    let key = (Arc::as_ptr(db) as usize, approval_id.to_owned());
+    if let Some(flight) = flights.get(&key).and_then(std::sync::Weak::upgrade) {
+        return flight;
+    }
+    let flight = Arc::new(tokio::sync::Mutex::new(()));
+    flights.insert(key, Arc::downgrade(&flight));
+    flight
+}
+
+async fn create_project_from_charter_approval_once(
     db: Arc<SqliteDb>,
     input: CreateProjectFromCharterApprovalInput,
 ) -> Result<CreatedProjectFromCharterApproval> {
@@ -156,14 +200,10 @@ async fn concurrent_create_receipt_committed(
     if approval.lifecycle != "consumed" {
         return Ok(false);
     }
-    let stored_approval_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT json_extract(source_revisions_json, '$.approval_id')
-         FROM agent_handoff WHERE dedupe_key = ? LIMIT 1",
-    )
-    .bind(&input.idempotency_key)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let stored_approval_id = db
+        .published_handoff_charter_approval_id(&input.idempotency_key)
+        .await?
+        .flatten();
     Ok(stored_approval_id.as_deref() == Some(input.approval_id.as_str()))
 }
 
@@ -254,14 +294,10 @@ async fn create_project_from_charter_approval_attempt(
     // reported as an idempotency conflict, not as a fresh 400/403.  The
     // packet stores the approval id so reusing a create key for another
     // receipt cannot turn into a not-found response.
-    let stored_approval_id = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT json_extract(source_revisions_json, '$.approval_id')
-         FROM agent_handoff WHERE dedupe_key = ? LIMIT 1",
-    )
-    .bind(&idempotency_key)
-    .fetch_optional(db.pool())
-    .await?
-    .flatten();
+    let stored_approval_id = db
+        .published_handoff_charter_approval_id(&idempotency_key)
+        .await?
+        .flatten();
     let has_matching_published_handoff =
         stored_approval_id.as_deref() == Some(approval_id.as_str());
     if let Some(stored_approval_id) = stored_approval_id.as_deref() {
@@ -532,27 +568,15 @@ async fn create_project_from_charter_approval_attempt(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ServiceError::conflict("the approval has no operating skill revision"))?;
-    let selected_skill = sqlx::query(
-        "SELECT sr.skill_key, os.skill_key AS operating_skill_key, os.current_revision_id
-         FROM operating_skill_revision sr
-         JOIN operating_skill os ON os.id = sr.operating_skill_id
-           AND os.skill_key = sr.skill_key
-         WHERE sr.id = ? AND os.lifecycle = 'active'
-         LIMIT 1",
-    )
-    .bind(&skill_revision)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| {
-        ServiceError::conflict("selected Project Agent operating skill is unavailable")
-    })?;
-    if selected_skill.try_get::<String, _>("skill_key")? != PROJECT_OPERATING_SKILL_KEY
-        || selected_skill.try_get::<String, _>("operating_skill_key")?
-            != PROJECT_OPERATING_SKILL_KEY
-        || selected_skill
-            .try_get::<Option<String>, _>("current_revision_id")?
-            .as_deref()
-            != Some(skill_revision.as_str())
+    let selected_skill = db
+        .project_creation_operating_skill_source(&skill_revision)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict("selected Project Agent operating skill is unavailable")
+        })?;
+    if selected_skill.skill_key()? != PROJECT_OPERATING_SKILL_KEY
+        || selected_skill.operating_skill_key()? != PROJECT_OPERATING_SKILL_KEY
+        || selected_skill.current_revision_id()?.as_deref() != Some(skill_revision.as_str())
     {
         return Err(ServiceError::conflict(
             "selected Project Agent operating skill revision is stale",
@@ -629,32 +653,16 @@ async fn create_project_from_charter_approval_attempt(
     // Historical turn provenance is intentionally read before the atomic
     // create. The active Main binding may rotate after discovery and is not a
     // valid substitute for the identity/profile that produced the Genesis.
-    let (source_turn_id, source_identity_id, source_profile_id): (String, String, String) =
-        sqlx::query_as(
-            "SELECT id, responder_identity_id, profile_id
-             FROM agent_chat_turn_job
-             WHERE chat_id = ? AND triggering_message_id = ?
-               AND responder_identity_id IS NOT NULL AND profile_id IS NOT NULL
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(&genesis.main_chat_id)
-        .bind(source_message_id)
-        .fetch_optional(db.pool())
+    let (source_turn_id, source_identity_id, source_profile_id): (String, String, String) = db
+        .project_creation_genesis_source_turn(&genesis.main_chat_id, source_message_id)
         .await?
         .ok_or_else(|| {
             ServiceError::conflict(
                 "the immutable Product Genesis source turn has no responder provenance",
             )
         })?;
-    let (source_instruction_revision_id, source_instruction_revision): (String, i64) =
-        sqlx::query_as(
-            "SELECT id, revision FROM agent_chat_instruction_revision
-             WHERE chat_id = ? AND source_type = 'native' AND source_id = ?
-             ORDER BY revision DESC, id DESC LIMIT 1",
-        )
-        .bind(&genesis.main_chat_id)
-        .bind(&genesis.id)
-        .fetch_optional(db.pool())
+    let (source_instruction_revision_id, source_instruction_revision): (String, i64) = db
+        .project_creation_genesis_instruction_revision(&genesis.main_chat_id, &genesis.id)
         .await?
         .ok_or_else(|| {
             ServiceError::conflict("the immutable Main Agent instruction revision is unavailable")
@@ -824,8 +832,13 @@ async fn create_project_from_charter_approval_attempt(
             created.project.name, identity.name
         ),
     );
-    if let Err(error) =
-        crate::append_system_chat_message(&db, &genesis.main_chat_id, &message_id, &content).await
+    if let Err(error) = crate::chat_notices::append_system_chat_message(
+        &db,
+        &genesis.main_chat_id,
+        &message_id,
+        &content,
+    )
+    .await
     {
         tracing::warn!(%error, project_id = %created.project.id, "Project-created chat anchor failed");
     }

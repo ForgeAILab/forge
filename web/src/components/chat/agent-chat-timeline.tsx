@@ -466,7 +466,6 @@ function WakeMessage({ message }: { message: AgentChatMessage }) {
 function TurnActivity({
   chatId,
   turn,
-  inputContent,
   onCancel,
   canceling,
   onRetry,
@@ -475,10 +474,9 @@ function TurnActivity({
 }: {
   chatId: string
   turn: AgentChatTurn
-  inputContent: string
   onCancel?: (turn: AgentChatTurn) => Promise<void>
   canceling?: boolean
-  onRetry: (content: string) => Promise<void>
+  onRetry: () => Promise<void>
   canRetry: boolean
   onActivityChange?: () => void
 }) {
@@ -510,7 +508,7 @@ function TurnActivity({
     setRetryError(null)
     setRetrying(true)
     try {
-      await onRetry(inputContent)
+      await onRetry()
     } catch (cause) {
       setRetryError(cause instanceof Error ? cause.message : 'The turn could not be retried.')
     } finally {
@@ -554,24 +552,26 @@ function TurnActivity({
             {turn.error_message ?? turn.error}
           </p>
         ) : null}
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <Button
-            type="button"
-            size="sm"
-            variant="outline"
-            onClick={() => void retry()}
-            disabled={retrying || !canRetry}
-            aria-label="Retry turn"
-          >
-            {retrying ? <CircleNotch size={13} className="animate-spin" aria-hidden /> : null}
-            {retrying ? 'Retrying…' : 'Retry turn'}
-          </Button>
-          {!canRetry && !retrying ? (
-            <span className="text-micro text-muted-foreground">
-              Retry becomes available when no other turn is active.
-            </span>
-          ) : null}
-        </div>
+        {turn.retry_action ? (
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => void retry()}
+              disabled={retrying || !canRetry}
+              aria-label="Retry turn"
+            >
+              {retrying ? <CircleNotch size={13} className="animate-spin" aria-hidden /> : null}
+              {retrying ? 'Retrying…' : 'Retry turn'}
+            </Button>
+            {!canRetry && !retrying ? (
+              <span className="text-micro text-muted-foreground">
+                Retry becomes available when no other turn is active.
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         {retryError ? (
           <p className="mt-2 text-xs text-destructive" role="alert">
             {retryError}
@@ -593,6 +593,11 @@ function TurnActivity({
     )
   }
 
+  const deferredForUsage =
+    turn.retry_decision === 'defer' && turn.failure_class?.kind === 'usage_limit'
+  const deferredLabel = deferredForUsage
+    ? `Usage limit reached${turn.next_attempt_at ? ` · Resumes ${formatDate(turn.next_attempt_at)}` : ''}`
+    : null
   const detailRows = [
     `Status: ${turnLabel(state).replace('…', '')} · attempt ${Math.max(attemptCount, 1)}/${maxAttempts}`,
     turn.next_attempt_at ? `Next attempt ${formatDate(turn.next_attempt_at)}` : null,
@@ -613,7 +618,7 @@ function TurnActivity({
         >
           <LoadingState
             compact
-            label={currentActivityLabel(entries) ?? turnLabel(state)}
+            label={deferredLabel ?? currentActivityLabel(entries) ?? turnLabel(state)}
             status={state}
             startedAt={turn.created_at}
           />
@@ -870,6 +875,7 @@ export function AgentChatTimeline({
   isSending,
   onSend,
   onCancelTurn,
+  onRetryTurn,
   commands,
 }: {
   chat: AgentChat
@@ -879,6 +885,7 @@ export function AgentChatTimeline({
   isSending?: boolean
   onSend: (content: string) => Promise<void>
   onCancelTurn?: (turnId: string, expectedVersion: number) => Promise<void>
+  onRetryTurn?: (turnId: string, expectedVersion: number) => Promise<void>
   commands?: ChatCommand[]
 }) {
   const messagesQuery = useAgentChatMessagesQuery(chat.id)
@@ -983,10 +990,11 @@ export function AgentChatTimeline({
     }
   }
 
-  async function retrySend(content: string) {
+  async function retryTurn(turn: AgentChatTurn) {
+    if (!onRetryTurn || !turn.retry_action) return
     setRetrying(true)
     try {
-      await onSend(content)
+      await onRetryTurn(turn.id, toNumber(turn.retry_action.expected_version))
     } finally {
       setRetrying(false)
     }
@@ -1021,17 +1029,16 @@ export function AgentChatTimeline({
     )
   }
 
-  function renderTurn(turn: AgentChatTurn, inputContent: string) {
+  function renderTurn(turn: AgentChatTurn) {
     return (
       <TurnActivity
         key={turn.id}
         chatId={chat.id}
         turn={turn}
-        inputContent={inputContent}
         onCancel={onCancelTurn && isLiveTurn(turn) ? cancelTurn : undefined}
         canceling={cancelingTurnId === turn.id}
-        onRetry={retrySend}
-        canRetry={canRetry && !cancelingTurnId}
+        onRetry={() => retryTurn(turn)}
+        canRetry={canRetry && !!onRetryTurn && !!turn.retry_action && !cancelingTurnId}
         onActivityChange={bumpActivity}
       />
     )
@@ -1097,12 +1104,10 @@ export function AgentChatTimeline({
                   prefetchActivity={recentAgentMessageIds.has(message.id)}
                 />
               )}
-              {(turnsByMessage.get(message.id) ?? []).map((turn) =>
-                renderTurn(turn, message.content),
-              )}
+              {(turnsByMessage.get(message.id) ?? []).map((turn) => renderTurn(turn))}
             </Fragment>
           ))}
-          {orphanTurns.map((turn) => renderTurn(turn, ''))}
+          {orphanTurns.map((turn) => renderTurn(turn))}
           {isSending && !turnInFlight ? (
             <LoadingState compact label="Sending…" status="sending" />
           ) : null}

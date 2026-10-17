@@ -160,8 +160,9 @@ impl McpToolError {
     }
 
     /// Render a known-tool failure as an MCP in-band tool result. The error's
-    /// raw message and data are deliberately not forwarded: model-facing
-    /// clients receive only stable codes and safe, bounded guidance.
+    /// raw message and data are deliberately not forwarded. Registry contract
+    /// corrections alone carry bounded caller-input detail; other failures
+    /// expose only stable codes and safe guidance.
     pub(crate) fn into_tool_response(self, id: Value) -> McpResponse {
         let outcome = self.into_outcome();
         let text = serde_json::to_string(&outcome).unwrap_or_else(|_| {
@@ -183,12 +184,65 @@ impl McpToolError {
     }
 
     fn into_outcome(self) -> Value {
+        // Only registry-generated contract corrections may carry input detail.
+        // Other failures retain their existing protected-data redaction.
+        let contract_details = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| {
+                data["code"] == "mcp_contract_invalid"
+                    && data["operation"]
+                        .as_str()
+                        .is_some_and(|name| operation_registry::mcp::lookup(name).is_some())
+                    && self.details.operation.as_deref() == data["operation"].as_str()
+            })
+            .and_then(|data| {
+                data["details"].as_str().map(|detail| {
+                    json!({
+                        "code":"mcp_contract_invalid", "operation":data["operation"],
+                        "details": detail.chars().take(4096).collect::<String>()
+                    })
+                })
+            });
         let execution_already_running_details = self
             .details
             .data
             .as_ref()
             .and_then(safe_execution_already_running_details);
-        let (outcome_code, safe_message, retry_action, retryable) = self.outcome_classification();
+        let action_unavailable_offers = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| {
+                serde_json::from_value::<Vec<api_types::Offer>>(data["available_actions"].clone())
+                    .ok()
+            });
+        let wait_cause = self
+            .details
+            .data
+            .as_ref()
+            .filter(|data| data["code"] == "action_unavailable")
+            .and_then(|data| data["denied_by"].as_str())
+            .and_then(|value| value.parse::<api_types::DeniedBy>().ok())
+            .filter(|cause| {
+                matches!(
+                    cause,
+                    api_types::DeniedBy::TargetAgentPaused | api_types::DeniedBy::ProjectPaused(_)
+                )
+            });
+        let (outcome_code, safe_message, retry_action, retryable) =
+            if action_unavailable_offers.is_some() {
+                (
+                    OutcomeCode::ActionUnavailable,
+                    "the requested Task action is unavailable; use the current offers",
+                    Some(RetryAction::CorrectInput),
+                    false,
+                )
+            } else {
+                self.outcome_classification()
+            };
         let mut outcome = OrchestrationOutcome::new(
             outcome_code,
             OrchestrationOutcome::status_for_code(outcome_code),
@@ -218,7 +272,17 @@ impl McpToolError {
             }
             outcome.retry = Some(retry);
         }
-        outcome.details = execution_already_running_details;
+        if let Some(cause) = wait_cause {
+            outcome.safe_message = format!("Task action is unavailable while {cause}");
+            outcome.denied_by = Some(cause);
+            let mut retry = RetryInstruction::new(RetryAction::None, false);
+            retry.scope = Some(api_types::RetryScope::Turn);
+            outcome.retry = Some(retry);
+        }
+        outcome.details = action_unavailable_offers
+            .map(|offers| json!({"available_actions": offers}))
+            .or(execution_already_running_details)
+            .or(contract_details);
         serde_json::to_value(outcome).unwrap_or_else(|_| {
             json!({
                 "code": "internal_failure",
@@ -344,6 +408,25 @@ impl From<ServiceError> for McpToolError {
     fn from(error: ServiceError) -> Self {
         let protected_cause = error.to_string();
         let mapped = match error {
+            ServiceError::TaskBusy {pending_steps,retry_after_ms} => Self::new(-32010,"Task has pending steps; accepted work remains queued").with_data(json!({"code":api_types::TASK_BUSY,"pending_steps":pending_steps,"retry_after_ms":retry_after_ms,"retry_hint":"Refetch the Task after pending steps settle"})),
+            ServiceError::TaskConditionQuarantined { task_id } => Self::new(-32010, "Task condition was written by a newer Forge build and is quarantined; nothing was changed").with_data(json!({"code":api_types::TASK_CONDITION_QUARANTINED,"task_id":task_id})),
+            ServiceError::TurnFailure { error, .. } => return Self::from(*error),
+
+            ServiceError::PlacementUnavailable(error) => {
+                Self::new(-32029, if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE } else { "workspace placement unavailable" }).with_data(json!({
+                    "code": if error.needs_daemon_upgrade() { api_types::DAEMON_UPGRADE_REQUIRED } else { "placement_unavailable" },
+                    "task_id": error.task_id,
+                    "repo_id": error.repo_id,
+                    "rejected_candidates": error.rejected_candidates,
+                }))
+            }
+            ServiceError::PrepareFailed { placement_id, .. } => {
+                Self::new(-32029, "workspace preparation failed").with_data(json!({
+                    "code": "prepare_failed",
+                    "placement_id": placement_id,
+                    "failure_cause": "prepare_failed",
+                }))
+            }
             ServiceError::ExecutionSetupRequired {
                 message,
                 requirements,
@@ -369,9 +452,13 @@ impl From<ServiceError> for McpToolError {
             ServiceError::TaskActionUnavailable {
                 available_actions,
                 reason,
-            } => Self::new(-32029, reason.clone()).with_data(json!({
+                wait_cause,
+            } => Self::new(-32010, reason.clone()).with_data(json!({
+                "code": "action_unavailable",
                 "available_actions": available_actions,
                 "reason": reason,
+                    "denied_by": wait_cause.as_ref().map(ToString::to_string),
+                    "retry": wait_cause.map(|_| json!({"action":"none", "scope":"turn", "retryable":false})),
             })),
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.
@@ -389,18 +476,71 @@ impl From<ServiceError> for McpToolError {
             }
             ServiceError::MissingPrimaryRepo { .. }
             | ServiceError::PrimaryRepoNotFound { .. }
-            | ServiceError::RepoMismatch { .. }
-            | ServiceError::PrProviderMissing { .. }
-            | ServiceError::PrProviderTokenMissing { .. } => {
+            | ServiceError::RepoMismatch { .. } => {
                 Self::new(-32029, "required repository setup is missing")
                     .with_data(json!({ "code": "setup_required" }))
             }
-            ServiceError::PrSyncFailure { .. } => Self::new(-32603, "PR sync failed"),
             ServiceError::NestedSubtaskUnsupported => {
                 Self::new(-32602, "nested subtasks are unsupported").with_data(json!({
                     "code": "NESTED_SUBTASK_UNSUPPORTED"
                 }))
             }
+            ServiceError::LeadRequiresNativeProfile { task_id, role } => Self::new(
+                -32602,
+                format!(
+                    "the lead of coordination root {task_id} must be a native Agent; assign a native Agent to its `{role}` role"
+                ),
+            )
+            .with_data(json!({
+                "code": "LEAD_REQUIRES_NATIVE_PROFILE",
+                "task_id": task_id,
+                "role": role
+            })),
+            ServiceError::LeadRoleNotSupported { task_id, role } => Self::new(
+                -32602,
+                format!(
+                    "the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported"
+                ),
+            )
+            .with_data(json!({
+                "code": "LEAD_ROLE_NOT_SUPPORTED",
+                "task_id": task_id,
+                "role": role
+            })),
+            ServiceError::StepCheckRoleHeldByRoot {
+                task_id,
+                root_task_id,
+                role,
+            } => Self::new(
+                -32602,
+                format!(
+                    "the `{role}` role of subtask {task_id} is held by the lead of its root {root_task_id}; assign `{role}` on the root"
+                ),
+            )
+            .with_data(json!({
+                "code": "STEP_CHECK_ROLE_HELD_BY_ROOT",
+                "task_id": task_id,
+                "root_task_id": root_task_id,
+                "role": role
+            })),
+            ServiceError::LeadOperationRefused { refusal, message } => {
+                Self::new(-32602, message).with_data(json!({
+                    "code": "LEAD_OPERATION_REFUSED",
+                    "refusal": refusal.code()
+                }))
+            }
+            ServiceError::SubtaskParentClosed {
+                parent_task_id,
+                state,
+            } => Self::new(
+                -32602,
+                format!("task {parent_task_id} is in `{state}` and no longer accepts subtasks"),
+            )
+            .with_data(json!({
+                "code": "SUBTASK_PARENT_CLOSED",
+                "parent_task_id": parent_task_id,
+                "state": state,
+            })),
             ServiceError::ParentWorkspaceRequired { parent_task_id } => Self::new(
                 -32602,
                 format!("parent workspace required for task {parent_task_id}"),
@@ -481,6 +621,10 @@ impl From<ServiceError> for McpToolError {
                     "code": TERMINAL_INVALID_INPUT
                 }))
             }
+            ServiceError::DaemonNotReady { daemon_id } => Self::new(-32029, "daemon command handshake is not ready")
+                .with_data(json!({"code":"daemon_not_ready", "daemon_id":daemon_id})),
+            ServiceError::DaemonUpgradeRequired { daemon_id } => Self::new(-32029, api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE)
+                .with_data(json!({"code":api_types::DAEMON_UPGRADE_REQUIRED, "daemon_id":daemon_id, "needs_human":true})),
             ServiceError::DaemonUnavailable { daemon_id } => {
                 Self::new(-32029, format!("daemon {daemon_id} unavailable"))
                     .with_data(json!({"code": "daemon_unavailable", "daemon_id": daemon_id}))
@@ -535,6 +679,13 @@ impl From<DbError> for McpToolError {
         let protected_cause = error.to_string();
         let mapped = match error {
             DbError::NotFound => Self::new(-32004, "not found"),
+            DbError::TurnNotRetryable => Self::new(-32009, "Agent Chat turn is not retryable")
+                .with_data(json!({"code":"turn_not_retryable"})),
+            DbError::ChatTurnLive => Self::new(-32009, "another Agent Chat turn is live")
+                .with_data(json!({"code":"another_turn_live"})),
+            DbError::PermissionDocument(error) => {
+                Self::new(-32602, error.to_string()).with_data(json!({"code":error.code()}))
+            }
             DbError::VersionConflict => Self::new(-32009, "version conflict"),
             DbError::TaskVersionConflict {
                 expected: _,
@@ -556,6 +707,8 @@ impl From<DbError> for McpToolError {
                 .with_data(json!({ "code": "idempotency_conflict" })),
             DbError::InvalidTransition => Self::new(-32010, "invalid transition"),
             DbError::InvalidSoftDelete => Self::new(-32010, "invalid soft delete"),
+            DbError::MachineAtCapacity => Self::new(-32029, "machine at capacity")
+                .with_data(json!({ "code": "machine_capacity" })),
             DbError::AgentAtCapacity => Self::new(-32029, "agent at capacity"),
             DbError::ExecutionAlreadyRunning {
                 scope,
@@ -570,7 +723,10 @@ impl From<DbError> for McpToolError {
             DbError::DependencyGate => Self::new(-32029, "dependency gate").with_data(json!({
                 "code": "setup_required"
             })),
-            DbError::CycleDetected => Self::new(-32602, "dependency cycle detected")
+            DbError::CycleDetected => Self::new(
+                -32602,
+                "dependency cycle detected: the Tasks would wait on each other through their dependencies, sibling order or parentage",
+            )
                 .with_data(json!({ "code": "cycle_detected" })),
             _ => Self::new(-32603, "internal error"),
         };
@@ -580,5 +736,33 @@ impl From<DbError> for McpToolError {
             "MCP database failure mapped to a safe tool outcome"
         );
         mapped
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn chat_retry_and_daemon_target_errors_keep_specific_codes() {
+        for (error, code) in [
+            (DbError::TurnNotRetryable, "turn_not_retryable"),
+            (DbError::ChatTurnLive, "another_turn_live"),
+        ] {
+            let mapped = McpToolError::from(error);
+            assert_eq!(mapped.code, -32009);
+            assert_eq!(mapped.details.data.unwrap()["code"], code);
+        }
+        let mapped = McpToolError::from(ServiceError::TurnFailure {
+            failure: api_types::TurnFailure::Unclassified,
+            error: Box::new(ServiceError::DaemonUpgradeRequired {
+                daemon_id: "owner".into(),
+            }),
+        });
+        assert_eq!(mapped.code, -32029);
+        assert_eq!(
+            mapped.details.data.unwrap()["code"],
+            api_types::DAEMON_UPGRADE_REQUIRED
+        );
     }
 }

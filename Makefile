@@ -1,6 +1,6 @@
 .PHONY: dev dev-demo dev-no-daemon frontend types test build install-local install-ctl ci ci-rust ci-web clean-test
 
-# Start the server using ./test as the data directory (safe for manual/agent testing)
+# Start the server with ./test data and ./test/forge.yaml config (manual/agent testing)
 dev:
 	cargo run -p forge-cli -- --data-dir ./test
 
@@ -16,13 +16,16 @@ dev-no-daemon:
 frontend:
 	cd web && pnpm run dev
 
-# Regenerate the web client's TypeScript bindings from api-types
+# Regenerate the web client's TypeScript bindings from api-types: the
+# `#[ts(export)]` types (ts-rs `export_bindings_*` tests) and the explicit
+# list in `export_typescript` (ignored by default).
 types:
-	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_bindings
+	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_ -- --include-ignored
 
-# Run all Rust tests
+# Run all Rust tests. The features build the services and db integration
+# targets, which declare `required-features` (see docs/ci.md).
 test:
-	FORGE_SKIP_WEB_BUILD=1 cargo test --workspace --all-targets
+	FORGE_SKIP_WEB_BUILD=1 cargo test --workspace --all-targets --features db/test-template,services/test-support
 
 # Build everything
 build:

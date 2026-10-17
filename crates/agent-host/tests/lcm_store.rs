@@ -29,6 +29,32 @@ use forge_agent_host::{
     SqliteLcmStore, SqliteProtectedRuntimeStore, TaskLcmProjectionPolicy,
 };
 
+/// Opens the adapter for one canonical scope's timeline.
+async fn open_store(
+    db: &Arc<SqliteDb>,
+    identity_id: &str,
+    scope_type: &str,
+    scope_id: &str,
+    authorization_revision: &str,
+    now: &str,
+) -> SqliteLcmStore {
+    let timeline = AgentLcmRepo::create_or_get_lcm_timeline(
+        &**db,
+        db::CreateAgentLcmTimeline {
+            id: db::new_uuid_v4(),
+            identity_id: identity_id.to_owned(),
+            scope_type: scope_type.to_owned(),
+            scope_id: scope_id.to_owned(),
+            authorization_revision: authorization_revision.to_owned(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("timeline");
+    SqliteLcmStore::new(Arc::clone(db), timeline)
+}
+
 #[tokio::test]
 async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -67,22 +93,20 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     .await
     .expect("identity");
 
-    let store = SqliteLcmStore::open_for_binding(
-        Arc::clone(&db),
+    let store = open_store(
+        &db,
         "lcm-agent",
         "account",
         "account-1",
         "test-auth",
-        None,
         "2026-08-12T00:00:00Z",
     )
-    .await
-    .expect("store");
+    .await;
     let view = store.view();
     assert_eq!(store.store_revision().as_str(), "forge-sqlite-lcm-1");
     assert_eq!(
         AGENT_RUNTIME_REVISION,
-        "b3f966b0e108e6d4683c0a9c94055aaa6aa7d919"
+        "5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
     );
 
     let entry = LcmEntry::new(
@@ -141,17 +165,15 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     assert!(expanded.complete);
     assert_eq!(expanded.items.len(), 1);
 
-    let restarted = SqliteLcmStore::open_for_binding(
-        Arc::clone(&db),
+    let restarted = open_store(
+        &db,
         "lcm-agent",
         "account",
         "account-1",
         "test-auth",
-        None,
         "2026-08-12T00:00:00Z",
     )
-    .await
-    .expect("restart adapter");
+    .await;
     let restarted_view = restarted.view();
     assert_eq!(
         restarted
@@ -212,17 +234,15 @@ async fn task_projection_preserves_tool_pairs_and_provenance() {
     )
     .await
     .expect("identity");
-    let store = SqliteLcmStore::open_for_binding(
-        Arc::clone(&db),
+    let store = open_store(
+        &db,
         "task-lcm-agent",
         "task",
         "task-1",
         "task-auth-1",
-        None,
         "2026-08-12T00:00:00Z",
     )
-    .await
-    .expect("store");
+    .await;
     let view = store.view();
     let call_id = agent_runtime::core::ids::ToolCallId::new("call-1");
     let history = vec![
@@ -778,17 +798,15 @@ async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entr
     .await
     .expect("identity");
 
-    let store = SqliteLcmStore::open_for_binding(
-        Arc::clone(&db),
+    let store = open_store(
+        &db,
         "truncate-agent",
         "account",
         "account-1",
         "test-auth",
-        None,
         "2026-08-12T00:00:00Z",
     )
-    .await
-    .expect("store");
+    .await;
     let view = store.view();
 
     let classification = || {
@@ -875,7 +893,7 @@ async fn provisional_tail_truncation_removes_orphans_but_never_node_covered_entr
 }
 
 #[tokio::test]
-async fn replacement_runtime_session_retires_a_summarized_timeline() {
+async fn populated_timeline_requires_an_explicit_fenced_adoption() {
     let pool = db::create_sqlite_pool("sqlite::memory:")
         .await
         .expect("pool");
@@ -912,20 +930,15 @@ async fn replacement_runtime_session_retires_a_summarized_timeline() {
     .await
     .expect("identity");
 
-    let store = SqliteLcmStore::open_for_binding(
-        Arc::clone(&db),
+    let store = open_store(
+        &db,
         "replacement-agent",
         "account",
         "account-1",
         "test-auth",
-        Some(db::AgentLcmSessionClaim {
-            runtime_session_id: "runtime-a".to_owned(),
-            session_created_at: "2026-08-12T00:00:00Z".to_owned(),
-        }),
         "2026-08-12T00:00:00Z",
     )
-    .await
-    .expect("store");
+    .await;
     let view = store.view();
     let entry = LcmEntry::new(
         LcmTimelineId::new(store.timeline_id()),
@@ -974,57 +987,76 @@ async fn replacement_runtime_session_retires_a_summarized_timeline() {
         .expect("leaf");
     let original = store.timeline_id().to_owned();
 
-    let open = |runtime_session_id: &str, session_created_at: &str| {
-        SqliteLcmStore::open_for_binding(
-            Arc::clone(&db),
+    let open = || {
+        open_store(
+            &db,
             "replacement-agent",
             "account",
             "account-1",
             "test-auth",
-            Some(db::AgentLcmSessionClaim {
-                runtime_session_id: runtime_session_id.to_owned(),
-                session_created_at: session_created_at.to_owned(),
-            }),
             "2026-08-13T00:00:00Z",
         )
     };
 
-    // The owning session keeps its timeline across reopen.
-    let same = open("runtime-a", "2026-08-12T00:00:00Z")
-        .await
-        .expect("owner reopens");
+    // Reopening the scope keeps its timeline.
+    let same = open().await;
     assert_eq!(same.timeline_id(), original);
 
-    // A replacement session cannot continue a summarized timeline it did not
-    // write: it gets a fresh one, and the old one keeps its rows.
-    let replacement = open("runtime-b", "2026-08-13T00:00:00Z")
+    // U7 replaces automatic retirement with explicit adoption and writer fences.
+    let replacement = open().await;
+    assert_eq!(replacement.timeline_id(), original);
+    let replacement_view = replacement.view();
+    let owner = agent_runtime::core::ids::SessionId::new("runtime-b");
+    assert!(matches!(
+        replacement.claim(&replacement_view, &owner, 0).await,
+        Err(agent_runtime::lcm::LcmError::TimelineOwned { .. })
+    ));
+    replacement
+        .claim(&replacement_view, &owner, 1)
         .await
-        .expect("replacement opens");
-    assert_ne!(replacement.timeline_id(), original);
+        .unwrap();
+    let before = replacement
+        .current_revision(&replacement_view)
+        .await
+        .unwrap();
+    replacement
+        .claim(&replacement_view, &owner, 1)
+        .await
+        .unwrap();
     assert_eq!(
         replacement
-            .current_revision(&replacement.view())
+            .current_revision(&replacement_view)
             .await
-            .expect("revision")
-            .get(),
-        0
+            .unwrap(),
+        before,
+        "claim replay does not bump revision"
     );
-    let retired = AgentLcmRepo::get_lcm_timeline(&*db, &original)
-        .await
-        .expect("read retired")
-        .expect("retired timeline kept");
-    assert_eq!(retired.scope_id, format!("account-1#retired:{original}"));
+    let append = LcmAppendRequest::new(LcmOperationId::new("append-0"), vec![entry]);
+    assert!(matches!(
+        replacement.append(&replacement_view, append.clone()).await,
+        Err(agent_runtime::lcm::LcmError::TimelineOwned { .. })
+    ));
+    let fenced = replacement_view.with_owner(owner, 1);
+    assert!(
+        replacement
+            .append(&fenced, append)
+            .await
+            .unwrap()
+            .already_committed
+    );
+    assert_eq!(
+        AgentLcmRepo::get_lcm_timeline(&*db, &original)
+            .await
+            .unwrap()
+            .unwrap()
+            .scope_id,
+        "account-1"
+    );
     assert_eq!(
         AgentLcmRepo::list_lcm_entries(&*db, &original, 0, 0, 8)
             .await
-            .expect("retired entries")
+            .unwrap()
             .len(),
         1
     );
-
-    // The replacement then owns the scope; reopening does not retire again.
-    let reopened = open("runtime-b", "2026-08-13T00:00:00Z")
-        .await
-        .expect("replacement reopens");
-    assert_eq!(reopened.timeline_id(), replacement.timeline_id());
 }

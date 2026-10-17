@@ -7,7 +7,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::app::{
-    AppInput, AppState, FocusTarget, PrimaryView, ProjectTab, RuntimeState, SetupState,
+    AppInput, AppState, FocusTarget, ModalState, PrimaryView, ProjectTab, RuntimeState, SetupState,
 };
 
 /// A small configurable keymap.  The defaults are documented by
@@ -79,6 +79,26 @@ impl Keymap {
 
         if self.cancel.matches(event) {
             return state.modal.as_ref().map(|_| AppInput::Cancel);
+        }
+
+        // A review text field owns printable keys before modal shortcuts/help.
+        // Keep the global interrupt and Escape handling above unchanged.
+        if matches!(&state.modal, Some(ModalState::Review(card)) if card.editing_guidance) {
+            return match (code, modifiers) {
+                (KeyCode::Char(character), mods)
+                    if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    Some(AppInput::Insert(character))
+                }
+                (KeyCode::Enter, mods) if mods.contains(KeyModifiers::SHIFT) => {
+                    Some(AppInput::NewLine)
+                }
+                (KeyCode::Enter, _) => Some(AppInput::Confirm),
+                (KeyCode::Backspace, _) => Some(AppInput::Backspace),
+                (KeyCode::F(1), _) => Some(AppInput::ToggleHelp),
+                (KeyCode::Up | KeyCode::Down, _) => self.map_modal(code, modifiers),
+                _ => None,
+            };
         }
 
         // `?` is printable composer input. F1 remains a global help key,
@@ -401,6 +421,37 @@ mod tests {
         assert_eq!(
             map_key(&state, key(KeyCode::Enter, KeyModifiers::NONE)),
             Some(AppInput::Submit)
+        );
+    }
+    #[test]
+    fn review_guidance_owns_printable_shortcuts_and_editing_keys() {
+        let mut state = AppState::new();
+        let task =
+            crate::app::TaskSummary::new("task", "Review", crate::app::TaskState::AwaitingReview);
+        let mut card = crate::app::ReviewCard::from_task_summary(&task);
+        card.editing_guidance = true;
+        state.modal = Some(ModalState::Review(card));
+        for character in ['y', 'n', 'a', 'r', '?', 'Q'] {
+            assert_eq!(
+                map_key(&state, key(KeyCode::Char(character), KeyModifiers::NONE)),
+                Some(AppInput::Insert(character))
+            );
+        }
+        assert_eq!(
+            map_key(&state, key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Some(AppInput::Backspace)
+        );
+        assert_eq!(
+            map_key(&state, key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Some(AppInput::NewLine)
+        );
+        assert_eq!(
+            map_key(&state, key(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(AppInput::Confirm)
+        );
+        assert_eq!(
+            map_key(&state, key(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(AppInput::Cancel)
         );
     }
 }

@@ -129,7 +129,7 @@ mod tests {
             .await
             .expect("setting writes");
 
-        let registry = cli_adapters::default_registry();
+        let registry = cli_adapters::test_support::test_registry();
         let agents = ensure_default_agents(&db, &registry)
             .await
             .expect("ensure succeeds");

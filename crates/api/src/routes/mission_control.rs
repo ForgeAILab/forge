@@ -1,13 +1,16 @@
 use api_types::{
     AgentDetailResponse, AttentionItem, AttentionListResponse, AttentionMutationRequest,
-    AttentionSnoozeRequest, MissionControlHomeResponse, MissionControlQuery,
+    AttentionResolveRequest, AttentionSnoozeRequest, MissionControlHomeResponse,
+    MissionControlQuery,
 };
 use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use std::sync::Arc;
+
 use db::{PageRequest, SortBy, SortOrder};
-use services::{attention_service, AttentionService};
+use services::{attention_service, AttentionService, WakeTurnConsumer};
 
 use crate::{errors::ApiResult, routes::auth::AuthenticatedUser, state::AppState};
 
@@ -20,7 +23,19 @@ pub async fn home(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<MissionControlHomeResponse>> {
-    let service = AttentionService::new(state.db);
+    if let Some(project_id) = query.project_id.as_deref() {
+        crate::routes::authorization::require_project_access(
+            &state,
+            project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(
         service
             .mission_control_home(
@@ -37,7 +52,19 @@ pub async fn list_attention(
     user: AuthenticatedUser,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<AttentionListResponse>> {
-    let service = AttentionService::new(state.db);
+    if let Some(project_id) = query.project_id.as_deref() {
+        crate::routes::authorization::require_project_access(
+            &state,
+            project_id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await?;
+    }
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let (page, consumer_health) = service
         .list_for_user(
@@ -75,7 +102,24 @@ pub async fn acknowledge(
     Path(id): Path<String>,
     Json(body): Json<AttentionMutationRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
             .acknowledge(&user.user_id, &id, body.expected_version)
@@ -89,7 +133,24 @@ pub async fn snooze(
     Path(id): Path<String>,
     Json(body): Json<AttentionSnoozeRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
             .snooze(
@@ -106,12 +167,34 @@ pub async fn resolve(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(id): Path<String>,
-    Json(body): Json<AttentionMutationRequest>,
+    Json(body): Json<AttentionResolveRequest>,
 ) -> ApiResult<Json<AttentionItem>> {
-    let service = AttentionService::new(state.db);
+    let attention = db::AttentionRepo::get_attention(&*state.db, &id)
+        .await?
+        .ok_or_else(|| crate::errors::ApiError::not_found("attention", id.clone()))?;
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &attention.scope_type,
+        &attention.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(crate::errors::ApiError::not_found("attention", id.clone()))
+    })?;
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(attention_service::attention_item(
         service
-            .resolve(&user.user_id, &id, body.expected_version)
+            .resolve_with_answer(
+                &user.user_id,
+                &id,
+                body.expected_version,
+                body.answer.as_deref(),
+            )
             .await?,
     )?))
 }
@@ -122,7 +205,10 @@ pub async fn agent_detail(
     Path(identity_id): Path<String>,
     Query(query): Query<MissionControlQuery>,
 ) -> ApiResult<Json<AgentDetailResponse>> {
-    let service = AttentionService::new(state.db);
+    let service = AttentionService::new(
+        Arc::clone(&state.db),
+        Arc::new(WakeTurnConsumer::new(state.db)),
+    );
     Ok(Json(
         service
             .agent_detail(&user.user_id, &identity_id, query.limit.unwrap_or(20))

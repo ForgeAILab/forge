@@ -13,8 +13,16 @@ use crate::{
 
 pub async fn list_external_links(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
 ) -> ApiResult<Json<Vec<ExternalLinkResponse>>> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
@@ -27,9 +35,17 @@ pub async fn list_external_links(
 
 pub async fn create_external_link(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path(id): Path<String>,
     Json(request): Json<CreateExternalLinkRequest>,
 ) -> ApiResult<(StatusCode, Json<ExternalLinkResponse>)> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let task = TaskRepo::get_by_id(&*state.db, &id, false)
         .await?
         .ok_or_else(|| ApiError::not_found("task", id.clone()))?;
@@ -78,8 +94,16 @@ pub async fn create_external_link(
 
 pub async fn delete_external_link(
     State(state): State<AppState>,
+    user: crate::routes::auth::AuthenticatedUser,
     Path((id, link_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_task_access(
+        &state,
+        &id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let link = ExternalLinkRepo::get_by_id(&*state.db, &link_id)
         .await?
         .ok_or_else(|| ApiError::not_found("external link", link_id.clone()))?;

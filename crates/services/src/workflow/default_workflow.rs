@@ -144,7 +144,6 @@ pub fn default_workflow() -> WorkflowDefinition {
             CanonicalPhase::Review,
             StateHooks {
                 on_enter: vec![hook("run_merge")],
-                after_enter: vec![hook("auto_cascade_on_merge_result")],
                 ..StateHooks::default()
             },
         ),

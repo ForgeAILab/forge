@@ -337,7 +337,9 @@ Your inquiry id is {inquiry_id}."
             // An inquiry works in a scratch directory that holds no
             // repository, so it takes the configured baseline with no Project
             // to layer over it.
+            server_state_card: None,
             command_allowlist: Some(embedded_agents.effective_command_allowlist(None).await),
+            environment: Default::default(),
             cancellation: turn_cancellation.clone(),
         };
 
@@ -351,6 +353,7 @@ Your inquiry id is {inquiry_id}."
                     Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
                         message,
                         usage_reports,
+                        ..
                     }) => {
                         let mapped = usage_reports
                             .iter()

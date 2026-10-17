@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use db::{new_uuid_v4, now_rfc3339, DbError, SqliteDb};
-use sqlx::Row;
 
 use crate::{Result, ServiceError};
 
@@ -370,58 +369,27 @@ pub struct SqliteProductGenesisStore {
 #[async_trait]
 impl ProductGenesisStore for SqliteProductGenesisStore {
     async fn validate_main_chat(&self, account_id: &str, main_chat_id: &str) -> Result<bool> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM agent_chat
-             JOIN account_main_agent_binding AS binding
-               ON binding.account_id = agent_chat.account_id
-              AND binding.state = 'active'
-             WHERE agent_chat.id = ?
-               AND agent_chat.account_id = ?
-               AND agent_chat.kind = 'account_main'
-               AND agent_chat.status = 'ready'",
-        )
-        .bind(main_chat_id)
-        .bind(account_id)
-        .fetch_one(self.db.pool())
-        .await
-        .map(|count| count > 0)
-        .map_err(db_error)
+        self.db
+            .product_genesis_ready_main_binding_count(main_chat_id, account_id)
+            .await
+            .map(|count| count > 0)
+            .map_err(db_error)
     }
 
     async fn get(&self, id: &str) -> Result<Option<ProductGenesisSession>> {
-        sqlx::query(
-            "SELECT id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-                    initial_idea, lifecycle, source_message_ids_json,
-                    preferred_project_agent_identity_id, charter_id,
-                    charter_revision_id, charter_approval_id, charter_version,
-                    project_id, handoff_id,
-                    failure_reason, version, created_at, updated_at
-             FROM product_genesis_session WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_error)
-        .and_then(|row| row.map(map_genesis_row).transpose())
+        self.db
+            .product_genesis_session_source(id)
+            .await
+            .map_err(db_error)
+            .and_then(|row| row.map(map_genesis_row).transpose())
     }
 
     async fn get_active(&self, account_id: &str) -> Result<Option<ProductGenesisSession>> {
-        sqlx::query(
-            "SELECT id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-                    initial_idea, lifecycle, source_message_ids_json,
-                    preferred_project_agent_identity_id, charter_id,
-                    charter_revision_id, charter_approval_id, charter_version,
-                    project_id, handoff_id,
-                    failure_reason, version, created_at, updated_at
-             FROM product_genesis_session
-             WHERE account_id = ? AND lifecycle IN ('discovering', 'ready_for_project')
-             ORDER BY created_at DESC, id DESC LIMIT 1",
-        )
-        .bind(account_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_error)
-        .and_then(|row| row.map(map_genesis_row).transpose())
+        self.db
+            .product_genesis_active_session_source(account_id)
+            .await
+            .map_err(db_error)
+            .and_then(|row| row.map(map_genesis_row).transpose())
     }
 
     async fn create(&self, input: NewProductGenesisSession) -> Result<ProductGenesisSession> {
@@ -431,65 +399,54 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
         let mut transaction = db::begin_immediate(self.db.pool())
             .await
             .map_err(db_error)?;
-        sqlx::query(
-            "INSERT INTO product_genesis_session (
-                id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-                initial_idea, lifecycle, source_message_ids_json,
-                preferred_project_agent_identity_id, version, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'discovering', '[]', ?, 1, ?, ?)",
-        )
-        .bind(&input.id)
-        .bind(&input.account_id)
-        .bind(&input.main_chat_id)
-        .bind(&input.prompt_revision)
-        .bind(&input.prompt_body)
-        .bind(input.maturity.as_str())
-        .bind(input.initial_idea.as_deref())
-        .bind(input.preferred_project_agent_identity_id.as_deref())
-        .bind(&input.created_at)
-        .bind(&input.updated_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db_error)?;
+        self.db
+            .insert_product_genesis_session_in_tx(
+                &mut transaction,
+                db::InsertProductGenesisSessionInTxInput {
+                    id: &input.id,
+                    account_id: &input.account_id,
+                    chat_id: &input.main_chat_id,
+                    prompt_revision: &input.prompt_revision,
+                    prompt_body: &input.prompt_body,
+                    maturity: input.maturity.as_str(),
+                    initial_idea: input.initial_idea.as_deref(),
+                    preferred_identity_id: input.preferred_project_agent_identity_id.as_deref(),
+                    created_at: &input.created_at,
+                    updated_at: &input.updated_at,
+                },
+            )
+            .await
+            .map_err(db_error)?;
 
-        let revision = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(MAX(revision), 0) + 1
-             FROM agent_chat_instruction_revision
-             WHERE chat_id = ?",
-        )
-        .bind(&input.main_chat_id)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(db_error)?;
-        sqlx::query(
-            "INSERT INTO agent_chat_instruction_revision (
-                id, chat_id, source_type, source_id, revision, body,
-                content_guard_json, sensitivity, created_by_type, created_by_id,
-                created_at
-             ) VALUES (?, ?, 'native', ?, ?, ?, '{}', 'internal',
-                       'product_genesis', ?, ?)",
-        )
-        .bind(new_uuid_v4())
-        .bind(&input.main_chat_id)
-        .bind(&input.id)
-        .bind(revision)
-        .bind(&input.prompt_body)
-        .bind(&input.account_id)
-        .bind(&input.created_at)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db_error)?;
-        sqlx::query(
-            "UPDATE agent_chat
-             SET instruction_revision = ?, version = version + 1, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(revision)
-        .bind(&input.updated_at)
-        .bind(&input.main_chat_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db_error)?;
+        let revision = self
+            .db
+            .product_genesis_next_instruction_revision_in_tx(&mut transaction, &input.main_chat_id)
+            .await
+            .map_err(db_error)?;
+        self.db
+            .insert_product_genesis_instruction_in_tx(
+                &mut transaction,
+                db::InsertProductGenesisInstructionInTxInput {
+                    id: new_uuid_v4(),
+                    chat_id: &input.main_chat_id,
+                    source_id: &input.id,
+                    revision,
+                    body: &input.prompt_body,
+                    account_id: &input.account_id,
+                    created_at: &input.created_at,
+                },
+            )
+            .await
+            .map_err(db_error)?;
+        self.db
+            .set_product_genesis_chat_instruction_in_tx(
+                &mut transaction,
+                revision,
+                &input.updated_at,
+                &input.main_chat_id,
+            )
+            .await
+            .map_err(db_error)?;
         transaction.commit().await.map_err(db_error)?;
         self.get(&input.id)
             .await?
@@ -502,20 +459,11 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
         expected_version: i64,
         reason: Option<String>,
     ) -> Result<ProductGenesisSession> {
-        let result = sqlx::query(
-            "UPDATE product_genesis_session
-             SET lifecycle = 'cancelled', failure_reason = ?,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?
-               AND lifecycle IN ('discovering', 'ready_for_project')",
-        )
-        .bind(reason.as_deref())
-        .bind(now_rfc3339())
-        .bind(id)
-        .bind(expected_version)
-        .execute(self.db.pool())
-        .await
-        .map_err(db_error)?;
+        let result = self
+            .db
+            .cancel_active_product_genesis(reason.as_deref(), now_rfc3339(), id, expected_version)
+            .await
+            .map_err(db_error)?;
         if result.rows_affected() == 0 {
             return Err(version_or_not_found(&self.db, id, expected_version).await?);
         }
@@ -526,27 +474,21 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
 
     async fn transition(&self, input: TransitionProductGenesis) -> Result<ProductGenesisSession> {
         let target = input.lifecycle.as_str();
-        let result = sqlx::query(
-            "UPDATE product_genesis_session
-             SET lifecycle = ?, project_id = COALESCE(?, project_id),
-                 handoff_id = COALESCE(?, handoff_id), failure_reason = ?,
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?
-               AND ((lifecycle = 'discovering' AND ? IN ('ready_for_project', 'cancelled'))
-                 OR (lifecycle = 'ready_for_project' AND ? IN ('handed_off', 'cancelled'))) ",
-        )
-        .bind(target)
-        .bind(input.project_id.as_deref())
-        .bind(input.handoff_id.as_deref())
-        .bind(input.failure_reason.as_deref())
-        .bind(now_rfc3339())
-        .bind(&input.id)
-        .bind(input.expected_version)
-        .bind(target)
-        .bind(target)
-        .execute(self.db.pool())
-        .await
-        .map_err(db_error)?;
+        let result = self
+            .db
+            .transition_product_genesis_session(db::TransitionProductGenesisSessionInput {
+                lifecycle: target,
+                project_id: input.project_id.as_deref(),
+                handoff_id: input.handoff_id.as_deref(),
+                failure_reason: input.failure_reason.as_deref(),
+                updated_at: now_rfc3339(),
+                session_id: &input.id,
+                version: input.expected_version,
+                discovering_target: target,
+                ready_target: target,
+            })
+            .await
+            .map_err(db_error)?;
         if result.rows_affected() == 0 {
             return Err(version_or_not_found(&self.db, &input.id, input.expected_version).await?);
         }
@@ -564,20 +506,15 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
         let mut transaction = db::begin_immediate(self.db.pool())
             .await
             .map_err(db_error)?;
-        let row = sqlx::query(
-            "SELECT version, source_message_ids_json
-             FROM product_genesis_session WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(db_error)?
-        .ok_or_else(|| ServiceError::not_found("product_genesis_session", id))?;
-        let version = row.try_get::<i64, _>("version").map_err(db_error)?;
+        let row = self
+            .db
+            .product_genesis_source_messages_in_tx(&mut transaction, id)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| ServiceError::not_found("product_genesis_session", id))?;
+        let version = row.version().map_err(db_error)?;
         let mut source_ids = serde_json::from_str::<Vec<String>>(
-            row.try_get::<String, _>("source_message_ids_json")
-                .map_err(db_error)?
-                .as_str(),
+            row.source_message_ids_json().map_err(db_error)?.as_str(),
         )
         .map_err(|error| ServiceError::InvalidOperation {
             message: format!("invalid Genesis source references: {error}"),
@@ -596,23 +533,21 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
             return Err(ServiceError::Db(DbError::VersionConflict));
         }
         source_ids.push(source_message_id.to_owned());
-        let result = sqlx::query(
-            "UPDATE product_genesis_session
-             SET source_message_ids_json = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND version = ?
-               AND lifecycle IN ('discovering', 'ready_for_project')",
-        )
-        .bind(serde_json::to_string(&source_ids).map_err(|error| {
-            ServiceError::InvalidOperation {
-                message: format!("serialize Genesis source references: {error}"),
-            }
-        })?)
-        .bind(now_rfc3339())
-        .bind(id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
-        .map_err(db_error)?;
+        let result = self
+            .db
+            .record_product_genesis_source_messages_in_tx(
+                &mut transaction,
+                serde_json::to_string(&source_ids).map_err(|error| {
+                    ServiceError::InvalidOperation {
+                        message: format!("serialize Genesis source references: {error}"),
+                    }
+                })?,
+                now_rfc3339(),
+                id,
+                expected_version,
+            )
+            .await
+            .map_err(db_error)?;
         if result.rows_affected() == 0 {
             return Err(ServiceError::Db(DbError::VersionConflict));
         }
@@ -632,24 +567,18 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
     ) -> Result<ProductGenesisSession> {
         let now = now_rfc3339();
         let maturity_str = maturity.map(|m| m.as_str().to_owned());
-        let changed = sqlx::query(
-            "UPDATE product_genesis_session
-             SET maturity = COALESCE(?, maturity),
-                 preferred_project_agent_identity_id = COALESCE(?, preferred_project_agent_identity_id),
-                 setup_applied_at = ?,
-                 version = version + 1,
-                 updated_at = ?
-             WHERE id = ? AND version = ? AND lifecycle = 'discovering' AND setup_applied_at IS NULL",
-        )
-        .bind(maturity_str.as_deref())
-        .bind(preferred_project_agent_identity_id.as_deref())
-        .bind(&now)
-        .bind(&now)
-        .bind(id)
-        .bind(expected_version)
-        .execute(self.db.pool())
-        .await
-        .map_err(db_error)?;
+        let changed = self
+            .db
+            .apply_product_genesis_setup(db::ApplyProductGenesisSetupInput {
+                maturity: maturity_str.as_deref(),
+                preferred_identity_id: preferred_project_agent_identity_id.as_deref(),
+                setup_applied_at: &now,
+                updated_at: &now,
+                session_id: id,
+                version: expected_version,
+            })
+            .await
+            .map_err(db_error)?;
 
         if changed.rows_affected() == 0 {
             let current = self.get(id).await?;
@@ -679,7 +608,8 @@ impl ProductGenesisStore for SqliteProductGenesisStore {
     }
 }
 
-fn db_error(error: sqlx::Error) -> ServiceError {
+fn db_error(error: impl Into<DbError>) -> ServiceError {
+    let error = error.into();
     let message = error.to_string();
     if message.contains("UNIQUE constraint failed: product_genesis_session") {
         return ServiceError::Conflict(
@@ -687,7 +617,7 @@ fn db_error(error: sqlx::Error) -> ServiceError {
                 .to_owned(),
         );
     }
-    ServiceError::Db(DbError::from(error))
+    ServiceError::Db(error)
 }
 
 async fn version_or_not_found(
@@ -695,12 +625,10 @@ async fn version_or_not_found(
     id: &str,
     expected_version: i64,
 ) -> Result<ServiceError> {
-    let current =
-        sqlx::query_scalar::<_, i64>("SELECT version FROM product_genesis_session WHERE id = ?")
-            .bind(id)
-            .fetch_optional(db.pool())
-            .await
-            .map_err(db_error)?;
+    let current = db
+        .product_genesis_current_version(id)
+        .await
+        .map_err(db_error)?;
     Ok(match current {
         None => ServiceError::not_found("product_genesis_session", id),
         Some(actual) if actual != expected_version => ServiceError::Db(DbError::VersionConflict),
@@ -710,12 +638,8 @@ async fn version_or_not_found(
     })
 }
 
-fn map_genesis_row(row: sqlx::sqlite::SqliteRow) -> Result<ProductGenesisSession> {
-    let maturity = match row
-        .try_get::<String, _>("maturity")
-        .map_err(db_error)?
-        .as_str()
-    {
+fn map_genesis_row(row: db::ProductGenesisSessionSourceRow) -> Result<ProductGenesisSession> {
+    let maturity = match row.maturity().map_err(db_error)?.as_str() {
         "prototype" => ProductMaturity::Prototype,
         "mvp" => ProductMaturity::Mvp,
         "production" => ProductMaturity::Production,
@@ -726,11 +650,7 @@ fn map_genesis_row(row: sqlx::sqlite::SqliteRow) -> Result<ProductGenesisSession
             });
         }
     };
-    let lifecycle = match row
-        .try_get::<String, _>("lifecycle")
-        .map_err(db_error)?
-        .as_str()
-    {
+    let lifecycle = match row.lifecycle().map_err(db_error)?.as_str() {
         "discovering" => ProductGenesisLifecycle::Discovering,
         "ready_for_project" => ProductGenesisLifecycle::ReadyForProject,
         "handed_off" => ProductGenesisLifecycle::HandedOff,
@@ -741,35 +661,33 @@ fn map_genesis_row(row: sqlx::sqlite::SqliteRow) -> Result<ProductGenesisSession
             });
         }
     };
-    let source_json = row
-        .try_get::<String, _>("source_message_ids_json")
-        .map_err(db_error)?;
+    let source_json = row.source_message_ids_json().map_err(db_error)?;
     let source_message_ids =
         serde_json::from_str(&source_json).map_err(|error| ServiceError::InvalidOperation {
             message: format!("invalid persisted Genesis source references: {error}"),
         })?;
     Ok(ProductGenesisSession {
-        id: row.try_get("id").map_err(db_error)?,
-        account_id: row.try_get("account_id").map_err(db_error)?,
-        main_chat_id: row.try_get("main_chat_id").map_err(db_error)?,
-        prompt_revision: row.try_get("prompt_revision").map_err(db_error)?,
+        id: row.id().map_err(db_error)?,
+        account_id: row.account_id().map_err(db_error)?,
+        main_chat_id: row.main_chat_id().map_err(db_error)?,
+        prompt_revision: row.prompt_revision().map_err(db_error)?,
         maturity,
-        initial_idea: row.try_get("initial_idea").map_err(db_error)?,
+        initial_idea: row.initial_idea().map_err(db_error)?,
         lifecycle,
         source_message_ids,
         preferred_project_agent_identity_id: row
-            .try_get("preferred_project_agent_identity_id")
+            .preferred_project_agent_identity_id()
             .map_err(db_error)?,
-        charter_id: row.try_get("charter_id").map_err(db_error)?,
-        charter_revision_id: row.try_get("charter_revision_id").map_err(db_error)?,
-        charter_approval_id: row.try_get("charter_approval_id").map_err(db_error)?,
-        charter_version: row.try_get("charter_version").map_err(db_error)?,
-        project_id: row.try_get("project_id").map_err(db_error)?,
-        handoff_id: row.try_get("handoff_id").map_err(db_error)?,
-        failure_reason: row.try_get("failure_reason").map_err(db_error)?,
-        version: row.try_get("version").map_err(db_error)?,
-        created_at: row.try_get("created_at").map_err(db_error)?,
-        updated_at: row.try_get("updated_at").map_err(db_error)?,
+        charter_id: row.charter_id().map_err(db_error)?,
+        charter_revision_id: row.charter_revision_id().map_err(db_error)?,
+        charter_approval_id: row.charter_approval_id().map_err(db_error)?,
+        charter_version: row.charter_version().map_err(db_error)?,
+        project_id: row.project_id().map_err(db_error)?,
+        handoff_id: row.handoff_id().map_err(db_error)?,
+        failure_reason: row.failure_reason().map_err(db_error)?,
+        version: row.version().map_err(db_error)?,
+        created_at: row.created_at().map_err(db_error)?,
+        updated_at: row.updated_at().map_err(db_error)?,
     })
 }
 
@@ -846,8 +764,12 @@ pub fn render_product_genesis_prompt(
         decisions_still_required: bounded_items(&context.decisions_still_required),
         ..crate::MainOperatingSkillContext::default()
     };
-    crate::render_main_operating_skill(&operating_context)
-        .expect("discovering Product Genesis always activates the Main operating skill")
+    format!(
+        "{}\n\n{}",
+        crate::render_main_operating_skill(&operating_context)
+            .expect("discovering Product Genesis always activates the Main operating skill"),
+        crate::operating_skills::render_main_state_card(&operating_context),
+    )
 }
 
 fn bounded_text(value: &str) -> String {
@@ -1066,6 +988,9 @@ mod tests {
             let rendered = render_product_genesis_prompt(maturity, &context());
             assert!(rendered
                 .starts_with("Forge Main Agent — Project Discovery and Portfolio Protocol v2\n"));
+            assert!(rendered.contains("small modules with clear ownership"));
+            assert!(rendered
+                .contains("per-feature files discovered/registered without shared-list edits"));
             assert!(rendered.contains("Current understanding:"));
             assert!(rendered.contains("### Assumptions"));
             assert!(rendered.contains("### Decisions still required"));

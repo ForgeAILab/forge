@@ -332,14 +332,7 @@
             "on_failure": "log"
           }
         ],
-        "after_enter": [
-          {
-            "action": "auto_cascade_on_merge_result",
-            "params": {},
-            "applies_to": "all",
-            "on_failure": "log"
-          }
-        ]
+        "after_enter": []
       },
       "cleanup": null,
       "gate_config": {

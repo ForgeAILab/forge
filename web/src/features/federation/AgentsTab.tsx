@@ -447,6 +447,20 @@ function RosterRow({
       </div>
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-medium">{agent.name}</p>
+        {agent.runnable_on ? (
+          <p
+            className={
+              agent.runnable_on.count === 0
+                ? 'text-xs text-warning'
+                : 'text-xs text-muted-foreground'
+            }
+          >
+            Runs on:{' '}
+            {agent.runnable_on.machines?.map((machine) => machine.name).join(', ') ||
+              `${agent.runnable_on.count} machines`}
+            {agent.runnable_on.count === 0 ? ' · Cannot run' : ''}
+          </p>
+        ) : null}
         <p className="mt-0.5 truncate text-xs text-muted-foreground">
           {runtimeDisplayNames[runtime] ?? humanize(runtime)} · {agent.model ?? 'model not set'}
         </p>

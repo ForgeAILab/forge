@@ -13,22 +13,21 @@ use crate::{
     AgentInquiryRepo, AgentListQuery, AgentProfile, AgentProfileRepo, AgentQuestion,
     AgentQuestionListQuery, AgentRepo, AgentStatus, AgentTaskListQuery, AgentWakeDisposition,
     AgentWakeDispositionKind, AgentWakeDispositionRepo, AnswerAgentQuestion,
-    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand,
-    AttentionConsumerHealth, AttentionListQuery, AttentionProjection, AttentionRepo,
-    CancelAgentChatTurn, CancelAgentChatTurnWithUsage, CancelAgentInquiryWithUsage, CiStepStats,
-    ClaimDomainEvents, ClaimExecutionLease, ClaimTask, ClaimedTask, CommandReceiptRepo,
-    CompleteAgentChatControlTransfer, CompleteAgentChatControlTransferWithUsage,
-    CompleteAgentChatTurn, CompleteAgentChatTurnWithUsage, CompleteAgentCommitment,
-    CompleteAgentInquiry, CompleteAgentInquiryWithUsage, CompleteClaimedWake, CompleteDomainEvent,
-    CompletedAgentChatTurn, CostCoverageReasonCode, CreateAccountMainAgentBinding, CreateAgent,
-    CreateAgentAction, CreateAgentActionApproval, CreateAgentActionExecution, CreateAgentChat,
-    CreateAgentChatMessage, CreateAgentChatTurnJob, CreateAgentCommitment,
-    CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity, CreateAgentInboxItem,
-    CreateAgentInquiry, CreateAgentProfile, CreateAgentQuestion, CreateAgentWakeDisposition,
-    CreateAttentionProjection, CreateDomainEvent, CreateExecution, CreateNotification,
-    CreatePrMetadata, CreatePrProviderConfig, CreateProject, CreateProjectAdmissionReceipt,
-    CreateProjectAgentBinding, CreateProjectHookRun, CreateProjectIntegration,
-    CreateProjectMediaAsset, CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
+    AppliedProjectExecutionSetupCommand, ApplyProjectExecutionSetupCommand, AttentionListQuery,
+    AttentionProjection, AttentionRepo, CancelAgentChatTurn, CancelAgentChatTurnWithUsage,
+    CancelAgentInquiryWithUsage, CiStepStats, ClaimExecutionLease, ClaimTask, ClaimedTask,
+    CommandReceiptRepo, CompleteAgentChatControlTransfer,
+    CompleteAgentChatControlTransferWithUsage, CompleteAgentChatTurn,
+    CompleteAgentChatTurnWithUsage, CompleteAgentCommitment, CompleteAgentInquiry,
+    CompleteAgentInquiryWithUsage, CompletedAgentChatTurn, CostCoverageReasonCode,
+    CreateAccountMainAgentBinding, CreateAgent, CreateAgentAction, CreateAgentActionApproval,
+    CreateAgentActionExecution, CreateAgentChat, CreateAgentChatMessage, CreateAgentChatTurnJob,
+    CreateAgentCommitment, CreateAgentCommitmentEvidence, CreateAgentHandoff, CreateAgentIdentity,
+    CreateAgentInboxItem, CreateAgentInquiry, CreateAgentProfile, CreateAgentQuestion,
+    CreateAgentWakeDisposition, CreateAttentionProjection, CreateDomainEvent, CreateExecution,
+    CreateNotification, CreateProject, CreateProjectAdmissionReceipt, CreateProjectAgentBinding,
+    CreateProjectHookRun, CreateProjectIntegration, CreateProjectMediaAsset,
+    CreateProjectMediaAttachment, CreateProjectMediaAttachmentMutation,
     CreateProjectProvisioningError, CreateProjectProvisioningOperation,
     CreateProjectReleaseMediaPin, CreateRepo, CreateReview, CreateRuntime, CreateSkill, CreateTask,
     CreateTaskComment, CreateTaskExternalLink, CreateTaskMedia, CreateTerminalSession,
@@ -39,32 +38,31 @@ use crate::{
     ExecutionTerminalReceipt, ExpectedAttentionSnapshot, ExternalLinkRepo, FailAgentChatTurn,
     FailAgentChatTurnWithUsage, IntegrationRepo, LatestExecutionAuthority,
     MarkUsageInvocationPendingSettlement, MediaAsset, Notification, NotificationListQuery,
-    NotificationRepo, Page, PageRequest, ParkAgentChatTurn, ParkAgentChatTurnWithUsage, PrMetadata,
-    PrMetadataRepo, PrProviderConfig, PrProviderConfigRepo, Project, ProjectAdmissionReceipt,
-    ProjectAdmissionReceiptRepo, ProjectAgentBinding, ProjectAgentBindingRepo,
-    ProjectAnalyticsRepo, ProjectBindingCommandRepo, ProjectDeletionPaths,
-    ProjectDeletionRepositoryPath, ProjectExecutionSetupCommandRepo, ProjectHookRun,
-    ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration, ProjectMediaAttachment,
-    ProjectMediaTombstone, ProjectProvisioningCheckpoint, ProjectProvisioningError,
-    ProjectProvisioningOperation, ProjectProvisioningRepo, ProjectReleaseMediaPin, ProjectRepo,
-    ProjectReviewSummary, RecordExecutionProgress, RecordExecutionProgressWarning,
-    RenewExecutionLease, ReplaceAccountMainAgentBinding, ReplaceProjectAgentBinding, Repo,
-    RepoRepo, Result, RetryAgentWakeDisposition, Review, ReviewRepo, ReviewStatus, Runtime,
-    RuntimeListQuery, RuntimeRepo, SelectAgentProfile, SetProjectAgentBindingCommand,
-    SettleUsageInvocation, SharedMediaRepo, Skill, SkillRepo,
+    NotificationRepo, Page, PageRequest, ParkAgentChatTurn, ParkAgentChatTurnWithUsage,
+    PersistAgentWake, Project, ProjectAdmissionReceipt, ProjectAdmissionReceiptRepo,
+    ProjectAgentBinding, ProjectAgentBindingRepo, ProjectAnalyticsRepo, ProjectBindingCommandRepo,
+    ProjectDeletionPaths, ProjectDeletionRepositoryPath, ProjectExecutionSetupCommandRepo,
+    ProjectHookRun, ProjectHookRunRepo, ProjectHookRunStatus, ProjectIntegration,
+    ProjectMediaAttachment, ProjectMediaTombstone, ProjectProvisioningCheckpoint,
+    ProjectProvisioningError, ProjectProvisioningOperation, ProjectProvisioningRepo,
+    ProjectReleaseMediaPin, ProjectRepo, ProjectReviewSummary, RecordExecutionProgress,
+    RecordExecutionProgressWarning, RenewExecutionLease, ReplaceAccountMainAgentBinding,
+    ReplaceProjectAgentBinding, Repo, RepoRepo, Result, RetryAgentWakeDisposition, Review,
+    ReviewRepo, ReviewStatus, Runtime, RuntimeListQuery, RuntimeRepo, SelectAgentProfile,
+    SetProjectAgentBindingCommand, SettleUsageInvocation, SharedMediaRepo, Skill, SkillRepo,
     SoftDeleteProjectMediaAttachmentMutation, SortBy, SortOrder, Task, TaskComment,
     TaskCommentRepo, TaskDependencyRepo, TaskExternalLink, TaskListQuery, TaskMedia, TaskMediaRepo,
     TaskMetadata, TaskMetadataMutation, TaskRepo, TerminalSession, TerminalSessionRepo,
     TerminalSessionStatus, TerminalizeExecution, TerminalizeExecutionWithLedger,
     TransferAgentCommitment, UpdateAgent, UpdateAgentAction, UpdateAgentChat,
     UpdateAgentChatTurnJob, UpdateAgentCommitment, UpdateAgentInboxItem, UpdateAttentionLifecycle,
-    UpdateDaemonReport, UpdateExecution, UpdatePrMetadata, UpdatePrProviderConfig, UpdateProject,
-    UpdateProjectHookRun, UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo,
-    UpdateSkill, UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus,
-    UpsertAttentionConsumerHealth, UpsertDaemon, UpsertProjectProvisioningCheckpoint,
-    UsageAnalyticsRepo, UsageCostKind, UsageEventProvenanceKind, UsageInvocationLifecycle,
-    UsageLedgerRepo, UsageLedgerSettlement, UsageSurface, UsageTelemetryState, Workspace,
-    WorkspaceLease, WorkspaceLeaseRepo, WorkspaceRepo, WorkspaceStatus,
+    UpdateDaemonReport, UpdateExecution, UpdateProject, UpdateProjectHookRun,
+    UpdateProjectIntegration, UpdateProjectProvisioningOperation, UpdateRepo, UpdateSkill,
+    UpdateTask, UpdateTaskStatus, UpdateTerminalSessionStatus, UpsertDaemon,
+    UpsertProjectProvisioningCheckpoint, UsageAnalyticsRepo, UsageCostKind,
+    UsageEventProvenanceKind, UsageInvocationLifecycle, UsageLedgerRepo, UsageLedgerSettlement,
+    UsageSurface, UsageTelemetryState, Workspace, WorkspaceLease, WorkspaceLeaseRepo,
+    WorkspaceRepo, WorkspaceStatus,
 };
 use crate::{
     AppliedProjectReviewConfigCommand, ApplyProjectReviewConfigCommand,
@@ -74,12 +72,15 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sqlx::{sqlite::SqliteRow, Row, Sqlite, SqlitePool, Transaction};
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
+use tokio::sync::Notify;
 
 mod action;
 mod agent;
+pub use agent::AgentOperatorPressureRow;
 mod agent_chat;
 mod chat_ledger;
+mod chat_read_events;
 pub use agent_chat::supported_main_baseline_revision;
 mod agent_chat_topic;
 mod agent_inquiry;
@@ -89,10 +90,17 @@ mod attention;
 mod command_finalization;
 mod command_receipt;
 mod commitment;
+mod conflict_hotspot;
 mod daemon;
+pub use daemon::DaemonOperatorIssueRow;
+mod dead_letter;
+pub use dead_letter::{DeadLetter, DeadLetterAction, DeadLetterPage};
 mod domain_event;
+pub use domain_event::EventSubscription;
 mod embedded_agent;
+pub(crate) mod environment_readiness;
 mod execution;
+pub use execution::{ActiveExecutionOperatorRow, RecentFailedExecutionOperatorRow};
 mod external_link;
 mod inbox;
 mod integration;
@@ -103,11 +111,23 @@ mod oauth_authorization_code;
 mod oauth_client;
 mod oauth_refresh_token;
 mod orchestration;
+pub use orchestration::{
+    ActiveCheckWaiverSourceRow, CharterReadinessSourceRow, InsertMilestoneReadinessInput,
+    InsertMilestoneReadinessSourceInput, InsertMilestoneReleaseInput,
+    InsertReleaseDecisionReferenceInput, InsertReleaseDocumentReferenceInput,
+    InsertReleaseGitReferenceInput, InsertReleaseReviewReferenceInput,
+    InsertReleaseTaskReferenceInput, InsertReleaseValidationReferenceInput,
+    MilestoneCharterAuthorityRow, MilestoneCheckResultRow, MilestoneDecisionRow,
+    MilestoneDefinitionReadinessSourceRow, MilestoneDocumentSourceRow, MilestoneReadinessSourceRow,
+    MilestoneWaiverAffectedRow, ProjectAgentIdentityRow, ReleaseCharterRevisionSourceRow,
+    ReleaseReferenceRow, UpdateMilestoneReadinessProjectionInput,
+};
+mod outbox;
+pub use outbox::{WorkerDeadLetterIssue, WorkerDiagnostic};
 mod personal_access_token;
-mod pr_metadata;
-mod pr_provider_config;
 mod pricing;
 mod project;
+pub use project::WorkflowProjectAuthorityRow;
 mod project_execution_setup;
 mod project_hook_run;
 mod project_member;
@@ -115,26 +135,63 @@ mod project_provisioning;
 mod project_review_config;
 mod provider_authorization;
 mod repo;
+pub use repo::MilestoneRepositoryContextRow;
+mod repo_location;
 mod review;
+pub use review::AttemptCarryBase;
 mod runtime;
+mod schedule;
 mod shared_media;
+pub use shared_media::{
+    InsertReleaseEvidencePinInput, MilestoneEvidenceRow, MilestoneReleasePinMetadataRow,
+    ReleaseEvidencePinRow,
+};
 mod skill;
 mod system_setting;
 mod task;
+pub use schedule::integration_statement_in_tx;
+pub use schedule::{ScheduleRead, INTEGRATION_OWNED_SQL};
+pub use task::MilestoneTaskSourceRow;
+pub use task::{BlockedTaskOperatorRow, TaskOperatorConditionRow, TaskOperatorRetryRow};
+pub use task::{
+    ConflictHandoffHistoryRow, ConflictHandoffSourceRow, InsertWorkflowTransitionLogInput,
+    WriteWorkflowTransitionStateInput, CONFLICT_HANDOFF_QUERY,
+};
 mod task_adaptive;
 mod task_comment;
-mod task_dependency;
+pub(crate) mod task_dependency;
+mod task_list_read;
 mod task_media;
 mod task_move;
+pub use task_list_read::TaskListRead;
 mod task_terminal_session;
 mod user_auth;
 mod workflow;
 mod workspace;
+pub use workspace::OverdueWorkspaceCleanupRow;
+pub use workspace::{RecordWorkspaceCleanupFailureInput, WorkspaceCleanupAttentionRow};
 mod workspace_lease;
+mod workspace_placement;
 
 #[derive(Debug, Clone)]
 pub struct SqliteDb {
+    pub(crate) condition_checks: Arc<std::sync::Mutex<crate::ConditionCheckState>>,
+    pub(crate) task_step_controls: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Arc<crate::task_writer::TaskStepControl>>,
+        >,
+    >,
+    pub(crate) task_step_executor:
+        Arc<std::sync::Mutex<Option<std::sync::Weak<dyn crate::task_writer::TaskStepExecutor>>>>,
+    pub(crate) claimed_task_step_wait: Arc<std::sync::Mutex<std::time::Duration>>,
+    pub server_run_cap: Arc<crate::machine_capacity::MachineRunCap>,
+    /// Disk-pressure admission: off until the running server configures it.
+    pub disk_admission: Arc<crate::machine_disk::DiskAdmission>,
     pool: SqlitePool,
+    pub(crate) task_step_activity:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
+    readiness_decode_warnings: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<i64>>>,
+    domain_event_hooks: Arc<crate::connection::EventHooks>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,11 +201,32 @@ struct Cursor {
 
 impl SqliteDb {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        let domain_event_hooks = crate::connection::domain_event_hooks(&pool);
+        Self {
+            pool,
+            condition_checks: Default::default(),
+            task_step_controls: Default::default(),
+            task_step_executor: Default::default(),
+            claimed_task_step_wait: Arc::new(std::sync::Mutex::new(
+                std::time::Duration::from_secs(90),
+            )),
+            task_step_activity: Default::default(),
+            readiness_decode_warnings: Default::default(),
+            domain_event_hooks,
+            server_run_cap: Arc::new(crate::machine_capacity::MachineRunCap::default()),
+            disk_admission: Default::default(),
+        }
     }
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Pool-scoped wakeup for workers that consume committed domain events.
+    /// Durable cursors remain authoritative; a missed notification only falls
+    /// back to the worker's bounded idle poll.
+    pub fn domain_event_notify(&self) -> Arc<Notify> {
+        self.domain_event_hooks.notify()
     }
 }
 
@@ -208,8 +286,8 @@ fn order_clause_for(page: &PageRequest, supports_priority: bool) -> &'static str
     }
 }
 
-const TASK_COLUMNS: &str = "id, project_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
-const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, system_pause_reason, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
+const TASK_COLUMNS: &str = "id, project_id, parent_task_id, assignee_type, assignee_id, title, description, task_type, status, is_automation, priority, board_position, subtask_order, task_state_config, merge_config, metadata_json, plan, condition_json, error_annotation, blocked_json, failed_json, entry_barrier_json, review_passed_at, archived_at, deleted_at, version, created_at, updated_at";
+const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow_template_name, primary_repo_id, paused_at, system_pause_reason, environment_pause_json, owner_id, project_hooks_json, project_work_epoch, charter_status, charter_setup_required, current_charter_id, current_charter_revision_id, current_charter_version, primary_milestone_id, version, created_at, updated_at";
 
 /// Clear dispatch decisions that were derived from Project-level authority.
 ///
@@ -219,11 +297,13 @@ const PROJECT_COLUMNS: &str = "id, name, settings, workflow_definition, workflow
 /// `version`, forming a generation boundary that rejects an in-flight stale
 /// disposition writer after the Project authority changes.
 pub(crate) async fn wake_dispatch_for_project_in_tx(
+    db: &SqliteDb,
     transaction: &mut Transaction<'_, Sqlite>,
     project_id: &str,
     updated_at: &str,
 ) -> Result<u64> {
-    let result = sqlx::query(
+    let result = crate::task_writer::BulkTaskQuery::new(
+        db,
         "UPDATE task
          SET metadata_json = NULLIF(
                  json_remove(metadata_json, '$.dispatch_disposition', '$.deferred_dispatch'),
@@ -241,9 +321,35 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
     )
     .bind(updated_at)
     .bind(project_id)
-    .execute(&mut **transaction)
+    .execute_in_tx(transaction)
     .await?;
-    Ok(result.rows_affected())
+    // Open Tasks with nothing stored to clear are reconsidered too: the
+    // Project fact they were held on changed without touching their rows.
+    // A resumed Project: the pause records of its Tasks state nothing any
+    // more (the condition reader ignores them once `paused_at` is null), so
+    // remove them and restate those conditions in this commit. No Task shows
+    // `project_paused` after the resume commits, and the stored condition
+    // never disagrees with the Project row. The scheduler's pass over the
+    // Tasks marked below then gives each its real next step or park.
+    let resumed: Vec<String> = sqlx::query_scalar(
+        "SELECT s.task_id FROM task_schedule_park s JOIN task t ON t.id=s.task_id JOIN project p ON p.id=t.project_id WHERE t.project_id=? AND p.paused_at IS NULL AND json_valid(s.reason_json) AND json_extract(s.reason_json,'$.reason')='ProjectPaused'",
+    )
+    .bind(project_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    for task_id in &resumed {
+        sqlx::query("DELETE FROM task_schedule_park WHERE task_id=?")
+            .bind(task_id)
+            .execute(&mut **transaction)
+            .await?;
+        crate::task_condition::produce(transaction, task_id, crate::ConditionChange::Legacy)
+            .await?;
+    }
+    sqlx::query("INSERT INTO task_schedule_dirty(task_id,external) SELECT id,1 FROM task WHERE project_id=? AND deleted_at IS NULL ON CONFLICT(task_id) DO UPDATE SET generation=generation+1,dirty=1,external=1")
+        .bind(project_id)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(result.tasks())
 }
 
 fn limit(page: &PageRequest) -> i64 {
@@ -300,6 +406,7 @@ fn map_project(row: SqliteRow) -> Result<Project> {
         primary_repo_id: row.try_get("primary_repo_id")?,
         paused_at: row.try_get("paused_at")?,
         system_pause_reason: row.try_get("system_pause_reason")?,
+        environment_pause_json: row.try_get("environment_pause_json")?,
         owner_id: row.try_get("owner_id")?,
         project_hooks_json: row.try_get("project_hooks_json")?,
         project_work_epoch: row.try_get("project_work_epoch")?,
@@ -322,38 +429,7 @@ fn map_repo(row: SqliteRow) -> Result<Repo> {
         name: row.try_get("name")?,
         remote_url: normalize_repo_remote_url(row.try_get("remote_url")?),
         local_path: row.try_get("local_path")?,
-        work_mode: parse_enum(row.try_get::<String, _>("work_mode")?)?,
         default_branch: row.try_get("default_branch")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn map_pr_provider_config(row: SqliteRow) -> Result<PrProviderConfig> {
-    Ok(PrProviderConfig {
-        id: row.try_get("id")?,
-        repo_id: row.try_get("repo_id")?,
-        provider_type: row.try_get("provider_type")?,
-        base_url: row.try_get("base_url")?,
-        polling_interval_seconds: row.try_get("polling_interval_seconds")?,
-        token_secret_ref: row.try_get("token_secret_ref")?,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
-    })
-}
-
-fn map_pr_metadata(row: SqliteRow) -> Result<PrMetadata> {
-    Ok(PrMetadata {
-        id: row.try_get("id")?,
-        task_id: row.try_get("task_id")?,
-        provider_type: row.try_get("provider_type")?,
-        provider_pr_id: row.try_get("provider_pr_id")?,
-        pr_url: row.try_get("pr_url")?,
-        source_branch: row.try_get("source_branch")?,
-        target_branch: row.try_get("target_branch")?,
-        pr_state: row.try_get("pr_state")?,
-        merge_status: row.try_get("merge_status")?,
-        last_synced_at: row.try_get("last_synced_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -424,7 +500,11 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
         status: parse_enum(row.try_get::<String, _>("status")?)?,
         before_sha: row.try_get("before_sha")?,
         cleanup_after: row.try_get("cleanup_after")?,
+        cleanup_attempts: row.try_get("cleanup_attempts")?,
+        last_cleanup_error: row.try_get("last_cleanup_error")?,
         error: row.try_get("error")?,
+        disk_bytes: row.try_get("disk_bytes")?,
+        disk_measured_at: row.try_get("disk_measured_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -432,6 +512,9 @@ fn map_workspace(row: SqliteRow) -> Result<Workspace> {
 
 fn map_daemon(row: SqliteRow) -> Result<Daemon> {
     Ok(Daemon {
+        disk_json: row.try_get("disk_json").unwrap_or(None),
+        max_concurrent_runs: row.try_get("max_concurrent_runs")?,
+        run_limit: row.try_get("run_limit")?,
         id: row.try_get("id")?,
         machine_id: row.try_get("machine_id")?,
         hostname: row.try_get("hostname")?,
@@ -475,6 +558,37 @@ fn map_skill(row: SqliteRow) -> Result<Skill> {
     })
 }
 
+impl SqliteDb {
+    /// Reads a Task, including a soft-deleted one, inside the caller's
+    /// transaction.
+    pub async fn get_task_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: &str,
+    ) -> Result<Option<Task>> {
+        sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(map_task)
+            .transpose()
+    }
+
+    /// Reads a page of Tasks (soft-deleted included) in one query.
+    pub async fn get_tasks_by_ids(&self, ids: &[&str]) -> Result<Vec<Task>> {
+        let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
+        sqlx::query(&format!(
+            "SELECT {TASK_COLUMNS} FROM task WHERE id IN (SELECT value FROM json_each(?))"
+        ))
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_task)
+        .collect()
+    }
+}
+
 fn map_task(row: SqliteRow) -> Result<Task> {
     Ok(Task {
         id: row.try_get("id")?,
@@ -494,6 +608,7 @@ fn map_task(row: SqliteRow) -> Result<Task> {
         merge_config: row.try_get("merge_config")?,
         metadata_json: row.try_get("metadata_json")?,
         plan: row.try_get("plan")?,
+        condition: crate::task_condition::decode_or_unknown(row.try_get("condition_json")?),
         error_annotation: row.try_get("error_annotation")?,
         blocked_json: row.try_get("blocked_json")?,
         failed_json: row.try_get("failed_json")?,
@@ -547,7 +662,7 @@ fn map_execution(row: SqliteRow) -> Result<Execution> {
     })
 }
 
-fn map_review(row: SqliteRow) -> Result<Review> {
+pub(crate) fn map_review(row: SqliteRow) -> Result<Review> {
     Ok(Review {
         id: row.get("id"),
         task_id: row.get("task_id"),
@@ -731,10 +846,34 @@ impl SqliteDb {
     }
 
     async fn create_execution_in_tx(
+        &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
         admission: Option<&ExecutionAdmission>,
     ) -> Result<Execution> {
+        if input.status == ExecutionStatus::Running {
+            if !crate::task_writer::owns_task(&input.task_id) {
+                return Err(DbError::Check(
+                    "execution admission requires the Task step".to_owned(),
+                ));
+            }
+            self.fence_current_step_in_tx(transaction).await?;
+        }
+        if input.status == ExecutionStatus::Running {
+            if let Some(workspace_id) = &input.workspace_id {
+                let pending: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM pending_remote_cancel WHERE workspace_id=?)",
+                )
+                .bind(workspace_id)
+                .fetch_one(&mut **transaction)
+                .await?;
+                if pending {
+                    return Err(DbError::Check(
+                        "workspace has an unconfirmed remote cancellation".to_owned(),
+                    ));
+                }
+            }
+        }
         if input.status == ExecutionStatus::Running {
             if let Some(admission) = admission {
                 Self::ensure_task_execution_admission_in_tx(transaction, input, admission).await?;
@@ -807,7 +946,8 @@ impl SqliteDb {
                         matches!(
                             state.kind,
                             api_types::StateKind::Backlog | api_types::StateKind::Terminal
-                        ) || state.canonical_phase == Some(api_types::CanonicalPhase::Review)
+                        ) || (state.kind == api_types::StateKind::Gate
+                            && state.canonical_phase == Some(api_types::CanonicalPhase::Review))
                     })
                     || parsed_workflow
                         .as_ref()
@@ -815,7 +955,7 @@ impl SqliteDb {
                         == Some(parent_status.as_str())
                     || matches!(
                         parent_status.as_str(),
-                        "backlog" | "review" | "merging" | "merge_failed" | "done" | "cancelled"
+                        "backlog" | "review" | "merging" | "done" | "cancelled"
                     );
                 let parent_has_blocker = parent_row
                     .try_get::<Option<String>, _>("blocked_json")?
@@ -839,11 +979,13 @@ impl SqliteDb {
             // alias, but it must observe the same assignment CAS as `coder`.
             let assignment_role =
                 canonical_execution_role(Some(input.role.as_str())).unwrap_or(input.role.as_str());
+            let assignment_holder =
+                task::assignment_holder_in_tx(transaction, &input.task_id, assignment_role).await?;
             let role_assignment = sqlx::query(
                 "SELECT assignee_type, assignee_id
                  FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
             )
-            .bind(&input.task_id)
+            .bind(&assignment_holder)
             .bind(assignment_role)
             .fetch_optional(&mut **transaction)
             .await?;
@@ -920,18 +1062,40 @@ impl SqliteDb {
 
             // Capacity is an insertion invariant, not a dispatcher hint.
             // Recheck the selected identity's pause/current max, its running
-            // Task executions, and any configured daemon session cap while
+            // Task executions, and the effective machine run cap while
             // this BEGIN IMMEDIATE transaction still owns SQLite's writer lock.
             // This is intentionally outside the workspace branch so Task
             // claims, which may not have a Workspace row yet, use the same
             // authoritative rule as role/recovery launches.
-            Self::ensure_agent_execution_capacity_in_tx(transaction, input, admission).await?;
+            self.ensure_agent_execution_capacity_in_tx(transaction, input, admission)
+                .await?;
+        }
+        if admission.and_then(|a| a.purpose)
+            == Some(api_types::ExecutionPurpose::AutomaticReviewRecovery)
+        {
+            let settings: String = sqlx::query_scalar(
+                "SELECT settings FROM project WHERE id=(SELECT project_id FROM task WHERE id=?)",
+            )
+            .bind(&input.task_id)
+            .fetch_one(&mut **transaction)
+            .await?;
+            let maximum = crate::budget::recovery_limit(&settings);
+            crate::budget::apply(
+                transaction,
+                &input.task_id,
+                crate::budget::Mutation::Charge {
+                    key: crate::budget::Kind::AutomaticReviewRecovery.key().into(),
+                    limit: maximum,
+                    step: input.id.clone(),
+                },
+            )
+            .await?;
         }
         let stop_reason = input.stop_reason.as_ref().map(ToString::to_string);
         let resume_policy = input.resume_policy.as_ref().map(ToString::to_string);
         let prompt = input.summary.as_deref();
         sqlx::query(
-            "INSERT INTO execution (id, task_id, agent_id, role, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO execution (id, task_id, agent_id, role, status, stop_reason, stopped_by, resume_policy, stopped_at, parent_execution_id, agent_session_id, agent_message_id, last_activity_at, prompt, summary, logs_path, before_sha, after_sha, error, executor_config_snapshot_json, workspace_id, created_at, updated_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&input.id)
         .bind(&input.task_id)
@@ -956,8 +1120,22 @@ impl SqliteDb {
         .bind(input.workspace_id.as_deref())
         .bind(&input.created_at)
         .bind(&input.updated_at)
+        .bind(admission.and_then(|a| a.purpose).map(api_types::ExecutionPurpose::as_str))
         .execute(&mut **transaction)
         .await?;
+        if input.status == ExecutionStatus::Running {
+            sqlx::query(
+                "UPDATE task SET metadata_json = json_remove(metadata_json, '$.dispatch_disposition')
+                 WHERE id = ? AND json_valid(metadata_json)
+                   AND json_extract(metadata_json, '$.dispatch_disposition.capability') IN ('machine_capacity', 'project_capacity')",
+            )
+            .bind(&input.task_id)
+            .execute(&mut **transaction)
+            .await?;
+            // Admission clears are SQL-computed: sync the condition shadow.
+            // The recovery-intent consume below only runs for a Running
+            // admission too, so one sync after both covers them.
+        }
 
         if let Some(recovery_id) = admission
             .filter(|_| input.status == ExecutionStatus::Running)
@@ -975,6 +1153,26 @@ impl SqliteDb {
             .bind(&input.task_id)
             .bind(recovery_id)
             .execute(&mut **transaction)
+            .await?;
+        }
+        // Only a Running admission changes a condition: it may become the
+        // Task's running owner, and its metadata clears above are legacy
+        // writes. An interactive session is never the witnessed execution,
+        // and an execution inserted already settled is history.
+        if input.status == ExecutionStatus::Running {
+            let change = if input.role == "interactive" {
+                crate::ConditionChange::Legacy
+            } else {
+                crate::ConditionChange::Execution
+            };
+            crate::task_condition::produce(transaction, &input.task_id, change).await?;
+        }
+        if let Some(workspace_id) = input.workspace_id.as_deref() {
+            crate::task_condition::execution_joined_workspace(
+                transaction,
+                &input.task_id,
+                workspace_id,
+            )
             .await?;
         }
 
@@ -1057,7 +1255,8 @@ impl SqliteDb {
         .ok_or(DbError::NotFound)?;
         let actual_version: i64 = row.try_get("version")?;
         let actual_status: String = row.try_get("status")?;
-        if actual_version != admission.expected_task_version
+        if (!crate::task_writer::owns_task(task_id)
+            && actual_version != admission.expected_task_version)
             || actual_status != admission.expected_task_status
         {
             return Err(DbError::VersionConflict);
@@ -1236,29 +1435,9 @@ impl SqliteDb {
         } else {
             input.agent_id.clone()
         };
-        let assignment = sqlx::query(
-            "SELECT id, assignee_type, assignee_id, updated_at
-             FROM task_role_assignment
-             WHERE task_id = ? AND role_name = ?",
-        )
-        .bind(task_id)
-        .bind(assignment_role)
-        .fetch_optional(&mut **transaction)
-        .await?;
-        // ReviewRunner's CI-only pass is a deliberately synthetic reviewer:
-        // it has no Agent principal and therefore no assignment row to
-        // compare. Keep this exception scoped to the canonical reviewer
-        // role and an admission that explicitly has no selected assignment;
-        // every Agent-backed launch still requires the exact assignment CAS.
-        let allows_absent_ci_review = canonical_execution_role(Some(input.role.as_str()))
-            == Some("reviewer")
-            && input.agent_id.is_none()
-            && admission.expected_assignment_id.is_none();
-        let allows_null_assignment_ci_review = canonical_execution_role(Some(input.role.as_str()))
-            == Some("reviewer")
-            && input.agent_id.is_none()
-            && admission.expected_assignment_id.is_some()
-            && admission.expected_assignment_updated_at.is_some();
+        let assignment =
+            task::effective_execution_assignment_in_tx(transaction, task_id, assignment_role)
+                .await?;
         if let Some(assignment) = assignment {
             let actual_assignment_id: String = assignment.try_get("id")?;
             let actual_assignment_updated_at: String = assignment.try_get("updated_at")?;
@@ -1272,14 +1451,11 @@ impl SqliteDb {
             let assignee_id: Option<String> = assignment.try_get("assignee_id")?;
             let assignment_matches = (assignee_type.as_deref() == Some("agent")
                 && assignee_id.as_deref() == assignment_agent_id.as_deref())
-                || (assignee_type.as_deref() == Some("user") && input.agent_id.is_none())
-                || (allows_null_assignment_ci_review
-                    && assignee_type.is_none()
-                    && assignee_id.is_none());
+                || (assignee_type.as_deref() == Some("user") && input.agent_id.is_none());
             if !assignment_matches {
                 return Err(DbError::VersionConflict);
             }
-        } else if !allows_absent_ci_review {
+        } else {
             return Err(DbError::VersionConflict);
         }
         if canonical_execution_role(Some(input.role.as_str())) == Some("reviewer") {
@@ -1334,7 +1510,7 @@ impl SqliteDb {
                     status.as_str(),
                     updated_at.as_str(),
                 )),
-                // A ReviewRunner first attempt has no prior Review row to
+                // A first review attempt has no prior Review row to
                 // snapshot, but still binds the new child to its candidate
                 // execution. The candidate is checked separately below.
                 (None, None, None, None, None, None, None) => None,
@@ -1377,6 +1553,7 @@ impl SqliteDb {
     }
 
     async fn ensure_agent_execution_capacity_in_tx(
+        &self,
         transaction: &mut Transaction<'_, Sqlite>,
         input: &CreateExecution,
         admission: Option<&ExecutionAdmission>,
@@ -1415,55 +1592,86 @@ impl SqliteDb {
                 return Err(DbError::VersionConflict);
             }
         }
-        let running_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM execution WHERE agent_id = ? AND status = 'running'",
-        )
-        .bind(agent_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if running_count >= actual_max {
+        let occupied_slots = crate::machine_capacity::count_agent_capacity(transaction, agent_id)
+            .await?
+            .occupied_slots();
+        if occupied_slots >= actual_max {
             return Err(DbError::AgentAtCapacity);
         }
 
-        let daemon_id: Option<String> = agent_row.try_get("daemon_id")?;
-        let Some(daemon_id) = daemon_id else {
-            return Ok(());
-        };
-        let Some(daemon_row) = sqlx::query("SELECT labels_json FROM daemon WHERE id = ?")
-            .bind(&daemon_id)
+        let daemon_id = match input.workspace_id.as_deref() {
+            Some(workspace_id) => sqlx::query_scalar::<_, Option<String>>(
+                "SELECT COALESCE(execution_daemon_id, daemon_id)
+                 FROM workspace_placement WHERE workspace_id = ?",
+            )
+            .bind(workspace_id)
             .fetch_optional(&mut **transaction)
             .await?
-        else {
-            return Ok(());
+            .flatten(),
+            None => input
+                .executor_config_snapshot_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("daemon_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or(agent_row.try_get::<Option<String>, _>("daemon_id")?),
         };
-        let labels_json: String = daemon_row.try_get("labels_json")?;
-        let Some(session_cap) = daemon_session_cap_from_labels(&labels_json) else {
-            return Ok(());
+        let daemon =
+            match daemon_id.as_deref() {
+                Some(id) => sqlx::query(
+                    "SELECT machine_id, max_concurrent_runs, run_limit FROM daemon WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&mut **transaction)
+                .await?,
+                None => None,
+            };
+        let server_host = daemon_id.is_none()
+            || daemon.as_ref().is_some_and(|row| {
+                row.try_get::<String, _>("machine_id")
+                    .is_ok_and(|id| id == self.server_run_cap.embedded_machine_id())
+            });
+        let cap = if server_host {
+            crate::machine_capacity::server_machine_cap(self, transaction).await?
+        } else {
+            crate::machine_capacity::effective_machine_cap(
+                daemon
+                    .as_ref()
+                    .map(|row| row.try_get("max_concurrent_runs"))
+                    .transpose()?
+                    .flatten(),
+                daemon
+                    .as_ref()
+                    .map(|row| row.try_get("run_limit"))
+                    .transpose()?
+                    .flatten(),
+            )
         };
-        let daemon_execution_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM execution
-             JOIN agent_current AS running_agent
-               ON running_agent.id = execution.agent_id
-             WHERE running_agent.daemon_id = ?
-               AND execution.status = 'running'",
+        let machine = if server_host {
+            None
+        } else {
+            daemon_id.as_deref()
+        };
+        let embedded = self.server_run_cap.embedded_machine_id();
+        let capacity =
+            crate::machine_capacity::count_machine_capacity(transaction, machine, cap, &embedded)
+                .await?;
+        // An aged run-slot waiter stays behind the checks queued before it
+        // began to wait, and no longer behind the ones queued since.
+        let capacity = crate::machine_capacity::capacity_for_task(
+            transaction,
+            capacity,
+            machine,
+            &input.task_id,
+            &embedded,
         )
-        .bind(&daemon_id)
-        .fetch_one(&mut **transaction)
         .await?;
-        let daemon_chat_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM agent_chat_turn_job
-             JOIN agent_current AS chat_agent
-               ON chat_agent.id = agent_chat_turn_job.responder_identity_id
-             WHERE chat_agent.daemon_id = ?
-               AND agent_chat_turn_job.status IN ('leased', 'running')",
-        )
-        .bind(&daemon_id)
-        .fetch_one(&mut **transaction)
-        .await?;
-        if daemon_execution_count.saturating_add(daemon_chat_count) >= session_cap {
-            return Err(DbError::AgentAtCapacity);
+        if !capacity.admits_execution() {
+            return Err(DbError::MachineAtCapacity);
         }
         Ok(())
     }
@@ -1607,28 +1815,11 @@ impl SqliteDb {
     }
 }
 
-fn daemon_session_cap_from_labels(labels_json: &str) -> Option<i64> {
-    let labels = serde_json::from_str::<serde_json::Value>(labels_json).ok()?;
-    [
-        "max_concurrent_sessions",
-        "max_sessions",
-        "active_session_cap",
-        "max_concurrent_tasks",
-    ]
-    .into_iter()
-    .find_map(|key| {
-        labels
-            .get(key)
-            .and_then(serde_json::Value::as_i64)
-            .filter(|value| *value > 0)
-    })
-}
-
 fn canonical_execution_role(role: Option<&str>) -> Option<&str> {
     role.map(|role| match role {
         "executor" => "coder",
-        // The reviewer assignment authorizes both the ReviewRunner's CI
-        // execution and its conformance auditor child.
+        // The reviewer assignment also authorizes an `auditor` execution
+        // bound to the same review attempt.
         "auditor" => "reviewer",
         role => role,
     })
@@ -1644,12 +1835,389 @@ fn default_workflow_role(status: &str) -> Option<&'static str> {
 }
 
 fn inherited_subtask_workflow_state(status: &str) -> bool {
-    matches!(status, "todo" | "in_progress" | "done" | "cancelled")
+    crate::inherited_subtask::is_state(status)
 }
 
 fn inherited_subtask_workflow_role(status: &str) -> Option<&'static str> {
-    match status {
-        "in_progress" => Some("coder"),
-        _ => None,
-    }
+    crate::inherited_subtask::role(status)
+}
+
+pub use action::{AttentionApprovalCoordinationActionsRow, AttentionCoordinationScopesRow};
+
+pub use agent::{
+    AttentionAgentBindingRow, AttentionAgentSessionRow, AttentionIdentityOwnerRow,
+    AttentionVisibleAgentHealthRow, VisibleAttentionAgentBindingsInput,
+};
+
+pub use agent_chat::{AttentionChatScopeRow, WakeChatCanonicalScopeRow};
+
+pub use agent_wake::{
+    ActiveIncidentWakeLeaseInTxInput, ActiveIncidentWakeLeaseRow, AdmitIncidentWakeLeaseInTxInput,
+    IncrementWakeBudgetWindowInTxInput, RecordLatestAttentionWakeInTxInput,
+    StartWakeBudgetWindowInTxInput, WakeBudgetWindowRow,
+};
+
+pub use attention::{
+    AttentionWorkerHealthRow, FailedTurnIncidentRow, ResolveScopeProgressAttentionInTxInput,
+    WakeIncidentContextRow, WakeSweepCandidateRow,
+};
+
+pub use command_receipt::AttentionDirectCoordinationReceiptsRow;
+
+pub use execution::AttentionVisibleActiveExecutionCountRow;
+
+pub use memory::AttentionMemoryScopeRow;
+
+pub use repo_location::{
+    CloneVerificationLocationRow, InsertPreparedServerRepoLocationInTxInput,
+    PreparedServerRepoLocationRow, ReadyServerLocationRow,
+};
+
+pub use task::{
+    AnnotateOwnerRecoveryInTxInput, AnnotateRemovedMachineTaskInput, AttentionTaskContextRow,
+    AttentionVisibleQueuedTaskCountRow, AttentionVisibleRecentOutcomesRow,
+    AttentionVisibleWorkItemsRow, ClearRemovedMachineCancelAnnotationInput,
+    RecordPlacementRefusalInTxInput,
+};
+
+pub use workspace::{
+    InsertCreatingAdmissionWorkspaceInTxInput, InsertPreparedServerWorkspaceInTxInput,
+    MarkPreparedAdmissionWorkspaceReadyInTxInput, RecordedOwnerWorkspaceHeadInput,
+};
+
+pub use agent::{AgentStatusHealthRow, CliRuntimePolicyStatusRow};
+
+pub use daemon::DaemonExecutorStatusRow;
+
+pub use task::{TaskActionScopeAssignmentRow, TaskActionScopeRoleRow};
+
+pub use agent::{
+    ActionApproverIdentityRow, ActionApproverProjectBindingRow, TaskActionActorPolicyRow,
+};
+
+pub use agent_chat::ActionApproverChatScopeRow;
+
+pub use project::ActionOrchestrationCharterStateRow;
+
+pub use orchestration::{
+    EffectiveProjectApprovedDocumentSourceRow, EffectiveProjectCanonicalConflictSourceRow,
+    EffectiveProjectDecisionSourceRow, EffectiveProjectGoverningCharterSourceRow,
+    EffectiveProjectMilestoneSourceRow, EffectiveProjectReadinessSourceRow,
+    EffectiveProjectReconciliationSourceRow, EffectiveProjectReleaseSourceRow,
+    EffectiveProjectValidationOutcomeCountRow, ProjectAdoptionCharterSourceRow,
+};
+
+pub use project::EffectiveProjectIdentitySourceRow;
+
+pub use task::EffectiveProjectTaskStatusCountRow;
+
+pub use commitment::EffectiveProjectCommitmentSourceRow;
+
+pub use inbox::EffectiveProjectInboxSourceRow;
+
+pub use domain_event::EffectiveProjectEventWatermarkRow;
+
+pub use agent_wake::{
+    EscalationBlockerTurnSourceRow, InsertProjectEscalationInTxInput, ProjectEscalationSourceRow,
+};
+
+pub use domain_event::blocker_recovery_transition_exists_in_tx;
+pub use project::escalation_project_owner_on_connection;
+pub use project_member::escalation_project_member_exists_on_connection;
+
+pub use repo_location::EnvironmentProvisionRetryDetailRow;
+
+pub use attention::UpsertEnvironmentWaitAttentionInTxInput;
+
+pub use orchestration::{
+    AdaptiveTaskGovernanceSourceRow, TaskExecutionCharterGovernanceSourceRow,
+    TaskGovernanceDocumentRevisionSourceRow, WorkspaceLeaseCharterGateRow,
+};
+
+pub use task::{WorkspaceLeaseRoleAssignmentRow, WorkspaceLeaseTaskAssignmentRow};
+
+pub use workspace_lease::InsertIssuedWorkspaceLeaseInTxInput;
+
+pub use orchestration::task_governance_document_revision_source_on_pool;
+
+pub use agent::{FrozenProjectTurnBindingRow, ProjectTurnBindingAuthorityRow};
+
+pub use orchestration::{
+    FrozenTurnOperatingSkillRow, MainTurnGenesisInstructionRow, MainTurnOperatingSkillRow,
+    ProjectTurnAdmissionReceiptRow, ProjectTurnApprovalEventRow, ProjectTurnCharterApprovalRow,
+    ProjectTurnOperatingSkillRow,
+};
+
+pub use project::MainTurnPortfolioProjectRow;
+
+pub use agent_chat::{
+    ChatTurnProtectedInteractionRow, ClaimFifoChatTurnInTxInput, ExpiredChatTurnLeaseRow,
+    FailChatTurnExpiredInteractionInTxInput, FailChatTurnMissingInteractionInTxInput,
+    FailChatTurnWithoutInteractionInTxInput, ParkedChatTurnInteractionRow,
+    ProjectTurnAdmissionHandoffRow, RecoverExpiredChatTurnLeaseInTxInput,
+};
+
+pub use command_receipt::GenesisControlTransferReceiptRow;
+
+pub use orchestration::{
+    InsertNativeProjectCommandObservationInput, NativeApprovedProjectCharterRow,
+    NativeDiscoverySessionRow,
+};
+
+pub use project::{NativeOwnedProjectSummaryRow, NativePortfolioProjectRow};
+
+pub use task_comment::NativeProjectWorklogRow;
+
+pub use shared_media::NativeProjectArtifactRow;
+
+pub use task::NativeWorkTaskRow;
+
+pub use domain_event::NativeScopeEventRow;
+
+pub use task_dependency::NativeTaskDependencyRow;
+
+pub use execution::NativeLatestTaskExecutionRow;
+
+pub use agent::{NativeScopeSummaryField, NativeScopeSummaryRow};
+
+pub use agent_chat_topic::TopicRotationIntentRow;
+
+pub use embedded_agent::{
+    ReserveTopicRotationSuccessorSessionInTxInput, TopicRotationScopeWorkspaceRow,
+};
+
+pub use agent_chat::TopicRotationHistoryMessageRow;
+
+pub use repo_location::{
+    ApplyRepositoryProvisionLocationInTxInput, ClaimRepositoryProvisionAttemptInTxInput,
+    InsertRepositoryProvisionLocationInTxInput, RecordRepositoryProvisionFailureInTxInput,
+    ReleaseStaleRepositoryProvisionAttemptInput, RepositoryProvisionAttemptFailureInput,
+    RepositoryProvisionAttemptIsCurrentInput,
+};
+
+pub use project::provisioning_project_settings_on_connection;
+
+pub use environment_readiness::RepositoryProvisionReadinessIsCurrentInTxInput;
+
+pub use task::RepositoryProvisionTaskWaitInput;
+
+pub use orchestration::{
+    InsertMainGenesisSessionInTxInput, SetGenesisPreferredProjectIdentityInTxInput,
+};
+
+pub use agent_chat::{
+    GenesisDraftMainChatScopeRow, GenesisStartLeasedMainTurnRow,
+    InsertGenesisChatInstructionInTxInput,
+};
+
+pub use agent::GenesisDraftIdentityOwnerRow;
+
+pub use orchestration::{
+    ArtifactDocumentApprovalSourceRow, ValidationAcceptanceCheckSourceRow,
+    ValidationCommandObservationSourceRow,
+};
+
+pub use project::ValidationProjectCharterSourceRow;
+
+pub use command_receipt::{
+    ArtifactCommandConflictingInputDigestInput, ArtifactReplayCommandInputDigestInput,
+};
+
+pub use shared_media::EvidenceAttachmentSourceRow;
+
+pub use orchestration::{
+    ApplyProductGenesisSetupInput, InsertProductGenesisSessionInTxInput,
+    ProductGenesisSessionSourceRow, ProductGenesisSourceMessagesRow,
+    TransitionProductGenesisSessionInput,
+};
+
+pub use agent_chat::InsertProductGenesisInstructionInTxInput;
+
+pub use pricing::{
+    usage_index_actual_rowids_on_connection, usage_index_affected_agents_on_connection,
+    usage_index_changed_estimates_on_connection, usage_index_changed_invocations_on_connection,
+    usage_index_citation_event_ids_on_connection,
+    usage_index_effective_event_sources_on_connection, usage_index_watermarks_on_connection,
+    UsageIndexActualRowidsRow, UsageIndexAffectedAgentRow,
+    UsageIndexAffectedAgentsOnConnectionInput, UsageIndexCitationEventIdsOnConnectionInput,
+    UsageIndexEffectiveEventRow, UsageIndexEstimateChangeRow, UsageIndexInvocationChangeRow,
+    UsageIndexWatermarksRow,
+};
+
+pub use execution::{
+    usage_index_agent_execution_stats_on_connection, usage_index_changed_executions_on_connection,
+    usage_index_execution_domains_on_connection, usage_index_inserted_executions_on_connection,
+    UsageIndexAgentExecutionStatsRow, UsageIndexChangedExecutionsOnConnectionInput,
+    UsageIndexExecutionDomainRow, UsageIndexExecutionRow,
+};
+
+pub use pricing::usage_index_source_batch_on_connection;
+
+pub use pricing::{UsageEventSourceMetadataRead, UsageIndexAffectedAgentField};
+
+pub use execution::UsageIndexExecutionTextField;
+
+pub use project::ChatUsageProjectScopeRow;
+
+pub use orchestration::ChatUsageHandedOffProjectIdInput;
+
+pub use chat_ledger::ChatTopicSummaryUsageRow;
+
+pub use orchestration::{
+    MilestoneArtifactReferenceSourceRow, MilestoneReleaseReadinessCandidateRow,
+    MilestoneReplayReadinessSourceRow,
+};
+
+pub use orchestration::{
+    DecisionArtifactRenderSourceInput, DecisionArtifactRenderSourceRow,
+    DecisionGoverningCharterSourceRow, DecisionGoverningDocumentSourceRow,
+    ProjectDecisionCommandSourceRow,
+};
+
+pub use agent::DirectProjectActorStatusRow;
+
+pub use agent_chat::DirectProjectChatScopeRow;
+
+pub use repo_location::SetRepositoryLocationDefaultInTxInput;
+
+pub use repo_location::{RepoLocationPageSort, VisibleRepositoryLocationPageInput};
+
+pub use attention::UpsertPlacementRefusalAttentionInTxInput;
+pub use repo_location::PlacementEligibilityLocationRow;
+pub use repo_location::PlacementEligibilityProvisionRetryRow;
+pub use task::ClearPlacementDispatchRefusalInput;
+pub use task::PlacementEligibilityAssignmentRow;
+pub use task::RecordPlacementDispatchRefusalInput;
+
+mod workspace_root;
+pub use system_setting::record_workspace_root_setting;
+pub use workspace_root::WorkspaceRootEntity;
+pub use workspace_root::WorkspaceRootPathRemaining;
+pub use workspace_root::WorkspaceRootPathRewrite;
+pub use workspace_root::WorkspaceRootStoredPath;
+pub use workspace_root::WorkspaceRootTextPredicate;
+pub use workspace_root::WORKSPACE_ROOT_STORED_PATHS;
+
+pub use execution::RecordExecutionPlanTransportRetryInTxInput;
+pub use execution::RememberExecutionPlanSeedInput;
+pub use task::RecordExecutionPlanTaskWaitInTxInput;
+
+pub use action::TaskOutcomeActionOriginSourceRow;
+
+pub use execution::ExecutionTerminalAuthorityRow;
+
+pub use execution::LeadSubtaskExecutionRow;
+pub use task_comment::LeadSubtaskCommentRow;
+
+pub use agent_chat::TaskProposalChatScopeRow;
+pub use command_receipt::TaskProposalReceiptDigestInput;
+
+pub use command_receipt::WorkspaceMutationOutstandingIntentInput;
+pub use execution::RecordWorkspaceMergeEvidenceInTxInput;
+
+pub use agent::CharterSelectedAgentEligibilityRow;
+
+pub use task::TaskRoleAssignmentSourceRow;
+
+pub use agent::AgentRunnableProfileHealthRow;
+pub use daemon::AgentRunnableCliPolicyRow;
+pub use daemon::AgentRunnableMachineSourceRow;
+pub use environment_readiness::EnvironmentReadinessJsonField;
+pub use environment_readiness::ProjectEnvironmentReadinessSourceRow;
+pub use workspace_placement::EnvironmentMachineCatalogRow;
+
+pub use project::FrozenProjectBindingPolicyRow;
+
+pub use agent_chat::OrchestrationBoundProjectChatScopeRow;
+pub use agent_chat::OrchestrationMainChatScopeRow;
+
+pub use attention::RecordWorkspaceWaitAttentionInTxInput;
+pub use attention::ResolveWorkspaceAdmissionAttentionInTxInput;
+pub use workspace_placement::expired_workspace_reservations_in_tx;
+pub use workspace_placement::fail_expired_workspace_reservation_in_tx;
+pub use workspace_placement::ExpiredWorkspaceReservationRow;
+
+pub use daemon::PlacementExecutionDaemonSourceRow;
+pub use repo_location::PlacementRepoLocationSourceRow;
+pub use runtime::PlacementProvisionRuntimeSourceRow;
+
+pub use task::InsertInitialExplicitTaskRoleInTxInput;
+pub use task::TaskCreationParentRoleRow;
+
+pub use execution::AgentUsageDomainRunRow;
+pub use execution::OperationsUsageDomainRunRow;
+pub use execution::TaskUsageDomainRunRow;
+pub use pricing::AgentUsageSourceRow;
+pub use pricing::EffectiveUsageEventMetadataRow;
+pub use pricing::OperationsUsageSourceRow;
+pub use pricing::TaskUsageSourceRow;
+pub use pricing::TASK_USAGE_SOURCES_SQL;
+
+pub use orchestration::ProjectCreationOperatingSkillRow;
+
+pub use pricing::execution_pricing_selection_count_in_tx;
+pub use project::execution_admission_project_owner_in_tx;
+pub use user_auth::execution_admission_account_in_tx;
+pub use user_auth::execution_admission_default_account_in_tx;
+
+pub use repo_location::InsertEmbeddedWorkspaceRepoLocationInTxInput;
+
+pub use memory::MemoryBackfillCommentRow;
+pub use memory::MemoryBackfillExecutionRow;
+pub use memory::MemoryBackfillReviewRow;
+pub use memory::MemoryBackfillTransitionRow;
+
+pub use repo_location::IntegrationTransferOwedReleaseRow;
+
+pub use orchestration::DeliveryFollowupCheckRow;
+pub use orchestration::DeliveryFollowupMilestoneRow;
+
+pub use project::project_agent_workspace_authority_source;
+pub use project::ProjectAgentWorkspaceAuthoritySourceRow;
+
+pub use execution::ExecutionSetupTaskEvidenceRow;
+pub use orchestration::ExecutionSetupReconciliationConflictRow;
+
+pub use repo_location::IntegrationTargetLocationRow;
+
+pub use agent_chat::MainActionChatAccountRow;
+
+pub use orchestration::MainCharterReadSourceRow;
+
+pub use project_hook_run::ProjectHookCooldownRunRow;
+
+pub use task::project_work_completion_sources_in_tx;
+pub use task::ProjectWorkCompletionSourceRow;
+
+pub use execution::ShutdownExecutionSourceRow;
+pub use task::ShutdownTaskSourceRow;
+
+pub use agent::WakeBlockerProjectResponderRow;
+pub use agent_wake::WakeBlockerTurnSourceRow;
+
+pub use task::coordination_root_visible_children_in_connection;
+
+pub use task::TaskRepositoryAuthoritySourceRow;
+
+pub use task::LatestTaskStateEntrySourceRow;
+
+pub use workflow::LatestWorkflowTransitionSourceRow;
+
+pub use task::RecordReviewCiFailureInTxInput;
+
+pub use task::ClearDaemonUpgradeDispatchRefusalInput;
+
+/// Restrict human coordination reads before their bound, while native identity
+/// reads use their separately admitted canonical scope.
+fn push_coordination_visibility<'a>(
+    builder: &mut sqlx::QueryBuilder<'a, Sqlite>,
+    table: &str,
+    user_id: &'a str,
+) {
+    builder.push(format!(" AND (({table}.scope_type = 'account' AND {table}.scope_id = ")).push_bind(user_id)
+        .push(format!(") OR ({table}.scope_type = 'agent' AND EXISTS (SELECT 1 FROM agent_identity WHERE agent_identity.id = {table}.scope_id AND agent_identity.owner_id = ")).push_bind(user_id)
+        .push(format!(")) OR EXISTS (SELECT 1 FROM project WHERE (({table}.scope_type = 'project' AND project.id = {table}.scope_id) OR ({table}.scope_type = 'task' AND EXISTS (SELECT 1 FROM task WHERE task.id = {table}.scope_id AND task.deleted_at IS NULL AND task.project_id = project.id)) OR ({table}.scope_type = 'agent_chat' AND EXISTS (SELECT 1 FROM agent_chat WHERE agent_chat.id = {table}.scope_id AND agent_chat.project_id = project.id))) AND (project.owner_id IS NULL OR project.owner_id = ")).push_bind(user_id)
+        .push(" OR EXISTS (SELECT 1 FROM project_member WHERE project_member.project_id = project.id AND project_member.user_id = ").push_bind(user_id)
+        .push(format!("))) OR ({table}.scope_type = 'agent_chat' AND EXISTS (SELECT 1 FROM agent_chat WHERE agent_chat.id = {table}.scope_id AND agent_chat.kind = 'account_main' AND agent_chat.account_id = ")).push_bind(user_id)
+        .push(")))");
 }

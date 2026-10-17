@@ -51,6 +51,13 @@ pub async fn list_members(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Vec<ProjectMemberResponse>>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let service = ProjectMemberService::new(state.db.clone());
     let members = service
         .list_members(&project_id, &user.user_id)
@@ -79,6 +86,13 @@ pub async fn add_member(
     Path(project_id): Path<String>,
     Json(body): Json<AddMemberRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectMemberResponse>)> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let valid_roles = ["owner", "admin", "member", "viewer"];
     if !valid_roles.contains(&body.role.as_str()) {
         return Err(ApiError::bad_request(format!(
@@ -134,6 +148,13 @@ pub async fn update_member_role(
     Path((project_id, user_id)): Path<(String, String)>,
     Json(body): Json<UpdateMemberRoleRequest>,
 ) -> ApiResult<Json<ProjectMemberResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let valid_roles = ["owner", "admin", "member", "viewer"];
     if !valid_roles.contains(&body.role.as_str()) {
         return Err(ApiError::bad_request(format!(
@@ -168,6 +189,13 @@ pub async fn remove_member(
     user: AuthenticatedUser,
     Path((project_id, user_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     let service = ProjectMemberService::new(state.db.clone());
     service
         .remove_member(&project_id, &user.user_id, &user_id)

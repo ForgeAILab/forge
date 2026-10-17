@@ -10,14 +10,19 @@ import {
 import { Link } from '@tanstack/react-router'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
+import { TaskPlacementDiagnostics } from '@/components/task-detail/task-placement-diagnostics'
+import { TaskWorkspacePlacement } from '@/components/task-detail/task-workspace-placement'
 import { cn } from '@/lib/cn'
 import { productTerm } from '@/lib/i18n'
+import { integrationLabel } from '@/lib/integration-queue'
 import type { Task, TaskStatus } from '@/types/generated'
 import { stripRunSuffix } from './utils'
 
 const statusClassNames: Record<TaskStatus, string> = {
   todo: 'bg-slate-100 text-slate-800',
+  planning: 'bg-sky-100 text-sky-900',
   in_progress: 'bg-sky-100 text-sky-900',
+  lead_check: 'bg-sky-100 text-sky-900',
   review: 'bg-amber-100 text-amber-900',
   merging: 'bg-indigo-100 text-indigo-900',
   merge_failed: 'bg-red-100 text-red-900',
@@ -27,7 +32,13 @@ const statusClassNames: Record<TaskStatus, string> = {
 }
 
 function statusBadge(status: TaskStatus) {
-  return <Badge className={cn('border-transparent', statusClassNames[status])}>{status}</Badge>
+  return (
+    <Badge
+      className={cn('border-transparent', statusClassNames[status] ?? 'bg-zinc-100 text-zinc-700')}
+    >
+      {status.replace(/_/g, ' ')}
+    </Badge>
+  )
 }
 
 type ActiveTab = 'overview' | 'executions' | 'review' | 'diff' | 'terminal' | 'comments' | 'history'
@@ -117,9 +128,23 @@ export function TaskDetailSidebar({
               {statusBadge(task.status)}
               {task.task_type ? <Badge variant="secondary">{task.task_type}</Badge> : null}
             </div>
+            {task.integration ? (
+              <p className="mt-1.5 text-xs text-muted-foreground" data-testid="integration-label">
+                {integrationLabel(task.integration)}
+              </p>
+            ) : null}
           </>
         ) : null}
       </div>
+      {task && (task.placement ?? task.workspace?.placement) ? (
+        <div className="border-b p-4">
+          <TaskWorkspacePlacement placement={task.placement ?? task.workspace?.placement} />
+          <TaskPlacementDiagnostics
+                  diagnostics={task.placement_diagnostics ?? []}
+                  hasLead={task.effective_lead?.source === 'own'}
+                />
+        </div>
+      ) : null}
       <nav className="flex gap-0.5 overflow-x-auto p-2 md:flex-1 md:flex-col md:overflow-x-visible">
         {navItems.map(({ id, label, Icon: NavIcon, badge }) => (
           <Link

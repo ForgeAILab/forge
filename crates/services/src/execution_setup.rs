@@ -144,11 +144,6 @@ pub struct ExecutionRoleResolution {
 
 impl ExecutionRoleResolution {
     #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.requirements.is_empty()
-    }
-
-    #[must_use]
     pub fn default_role_assignments(&self) -> Vec<Value> {
         let mut assignments = Vec::new();
         if let (Some(role), Some(identity_id)) = (
@@ -312,6 +307,27 @@ pub async fn ensure_execution_role_principal(
         let project = ProjectRepo::get_by_id(db, project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
+        // A visible assigned principal remains valid during an owner outage.
+        // Return a transient transport refusal before lease admission, rather
+        // than asking the user to replace an otherwise valid role assignment.
+        if let Some(agent) = db
+            .list_agents_usable_in_project(
+                project_id,
+                project.owner_id.as_deref().unwrap_or_default(),
+            )
+            .await?
+            .into_iter()
+            .find(|agent| agent.id == identity_id)
+        {
+            if matches!(
+                compute_effective_status(db, &agent, None).await?,
+                EffectiveStatus::DaemonOffline
+            ) {
+                return Err(ServiceError::DaemonUnavailable {
+                    daemon_id: agent.daemon_id.unwrap_or_default(),
+                });
+            }
+        }
         let workflow =
             crate::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
         let required = required_execution_roles(&workflow);
@@ -360,7 +376,7 @@ pub async fn eligible_project_execution_agents(
         // hold the role at all, so only unhealthy or unavailable states
         // disqualify it.
         if !matches!(
-            compute_effective_status(db, &agent).await?,
+            compute_effective_status(db, &agent, None).await?,
             EffectiveStatus::Active | EffectiveStatus::Busy
         ) {
             continue;

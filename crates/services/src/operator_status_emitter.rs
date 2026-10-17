@@ -18,67 +18,77 @@ impl OperatorStatusEmitter {
         Self { event_bus }
     }
 
-    pub fn start(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
-        let task_event_bus = Arc::clone(&self.event_bus);
-        tokio::spawn(async move {
-            if *shutdown.borrow_and_update() {
-                return;
-            }
+    pub fn start(
+        self: Arc<Self>,
+        workers: &crate::worker_runtime::PeriodicWorkers,
+        shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
+        workers.worker("operator-status-emitter").start(shutdown, || false, move |worker, mut shutdown| {
+            let task_event_bus = Arc::clone(&self.event_bus);
+            async move {
+                if *shutdown.borrow_and_update() {
+                    return Ok(());
+                }
 
-            let mut rx = task_event_bus.subscribe();
-            let mut dirty = false;
-            let mut activity_dirty = false;
-            let mut last_publish = tokio::time::Instant::now();
-            let mut last_event_type: Option<String> = None;
-            let mut interval = tokio::time::interval(Duration::from_millis(500));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
+                let mut rx = task_event_bus.subscribe();
+                let mut dirty = false;
+                let mut activity_dirty = false;
+                let mut last_publish = tokio::time::Instant::now();
+                let mut last_event_type: Option<String> = None;
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await;
 
-            loop {
-                tokio::select! {
-                    event = rx.recv() => {
-                        match event {
-                            Ok(event) => {
-                                let event_type = event.event_type;
-                                if is_status_affecting_event(&event_type) {
-                                    last_event_type = Some(event_type);
-                                    dirty = true;
-                                } else if event_type == "execution.log" {
-                                    activity_dirty = true;
+                loop {
+                    tokio::select! {
+                        event = rx.recv() => {
+                            match event {
+                                Ok(event) => {
+                                    let event_type = event.event_type;
+                                    if is_status_affecting_event(&event_type) {
+                                        last_event_type = Some(event_type);
+                                        dirty = true;
+                                    } else if event_type == "execution.log" {
+                                        activity_dirty = true;
+                                    }
                                 }
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    // Lost notifications require a reconciliation, not silence.
+                                    dirty = true;
+                                    last_event_type = Some("events.resync_required".to_owned());
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                // Lost notifications require a reconciliation, not silence.
-                                dirty = true;
-                                last_event_type = Some("events.resync_required".to_owned());
+                        }
+                        _ = interval.tick() => {
+                            let _ = worker.tick(async {
+                                if refresh_due(dirty, activity_dirty, last_publish.elapsed()) {
+                                    let trigger = if dirty {
+                                        last_event_type.take().unwrap_or_else(|| "unknown".to_owned())
+                                    } else {
+                                        "execution.log".to_owned()
+                                    };
+                                    dirty = false;
+                                    activity_dirty = false;
+                                    last_publish = tokio::time::Instant::now();
+                                    task_event_bus.publish(ForgeEvent {
+                                        event_type: OPERATIONS_STATUS_CHANGED_EVENT.to_string(),
+                                        entity_id: "operations".to_string(),
+                                        timestamp: event_timestamp(),
+                                        context: EventContext::OperationsStatusChanged { trigger },
+                                    });
+                                }
+                                Ok(())
+                            }).await;
+                        }
+                        result = shutdown.changed() => {
+                            if result.is_err() || *shutdown.borrow() {
+                                break;
                             }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if refresh_due(dirty, activity_dirty, last_publish.elapsed()) {
-                            let trigger = if dirty {
-                                last_event_type.take().unwrap_or_else(|| "unknown".to_owned())
-                            } else {
-                                "execution.log".to_owned()
-                            };
-                            dirty = false;
-                            activity_dirty = false;
-                            last_publish = tokio::time::Instant::now();
-                            task_event_bus.publish(ForgeEvent {
-                                event_type: OPERATIONS_STATUS_CHANGED_EVENT.to_string(),
-                                entity_id: "operations".to_string(),
-                                timestamp: event_timestamp(),
-                                context: EventContext::OperationsStatusChanged { trigger },
-                            });
-                        }
-                    }
-                    result = shutdown.changed() => {
-                        if result.is_err() || *shutdown.borrow() {
-                            break;
                         }
                     }
                 }
+                Ok(())
             }
         })
     }
@@ -140,12 +150,17 @@ mod tests {
 
     #[tokio::test]
     async fn coalesces_status_changed_events() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let workers =
+            crate::worker_runtime::PeriodicWorkers::new(Arc::new(db::SqliteDb::new(pool)));
+
         tokio::time::pause();
 
         let event_bus = Arc::new(EventBus::new(64));
         let emitter = Arc::new(OperatorStatusEmitter::new(Arc::clone(&event_bus)));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let emitter_handle = Arc::clone(&emitter).start(shutdown_rx);
+        let emitter_handle = Arc::clone(&emitter).start(&workers, shutdown_rx);
         let mut rx = event_bus.subscribe();
 
         tokio::task::yield_now().await;

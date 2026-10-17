@@ -134,3 +134,36 @@ fn map_provider_authorization(row: SqliteRow) -> Result<ProviderAuthorizationOpe
         completed_at: row.try_get("completed_at")?,
     })
 }
+
+impl SqliteDb {
+    pub async fn recent_provider_authorization_count(
+        &self,
+        owner_user_id: &str,
+        since: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM provider_authorization_operation
+             WHERE owner_user_id = ? AND created_at >= ?",
+        )
+        .bind(owner_user_id)
+        .bind(since)
+        .fetch_one(self.pool())
+        .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn update_provider_device_authorization_expiry(
+        &self,
+        expires_at: String,
+        operation_id: &str,
+    ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
+        Ok(
+            sqlx::query("UPDATE provider_authorization_operation SET expires_at = ? WHERE id = ?")
+                .bind(expires_at)
+                .bind(operation_id)
+                .execute(self.pool())
+                .await?,
+        )
+    }
+}

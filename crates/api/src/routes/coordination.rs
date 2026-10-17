@@ -51,6 +51,7 @@ pub async fn list_commitments(
     let commitments = state
         .commitment_service
         .list(AgentCommitmentListQuery {
+            visible_to_user_id: Some(user.user_id.clone()),
             owner_identity_id: Some(identity_id),
             scope_type: query.scope_type.clone(),
             scope_id: query.scope_id.clone(),
@@ -279,6 +280,7 @@ pub async fn list_inbox(
     let items = state
         .agent_inbox_service
         .list(AgentInboxListQuery {
+            visible_to_user_id: Some(user.user_id.clone()),
             recipient_identity_id: identity_id,
             status: parse_inbox_status(query.status.as_deref())?,
             scope_type: query.scope_type.clone(),
@@ -317,7 +319,7 @@ pub async fn update_inbox_item(
 ) -> ApiResult<Json<InboxItemResponse>> {
     let item = state.agent_inbox_service.get(&id).await?;
     require_owned_identity(&state, &item.recipient_identity_id, &user.user_id).await?;
-    authorize_scope_member(&state, &item.scope_type, &item.scope_id, &user.user_id).await?;
+    authorize_scope_write(&state, &item.scope_type, &item.scope_id, &user.user_id).await?;
     let updated = state
         .agent_inbox_service
         .set_status(
@@ -345,6 +347,7 @@ pub async fn list_questions(
     let questions = state
         .agent_inbox_service
         .list_questions(AgentQuestionListQuery {
+            visible_to_user_id: Some(user.user_id.clone()),
             recipient_identity_id: identity_id,
             status: parse_question_status(query.status.as_deref())?,
             scope_type: query.scope_type.clone(),
@@ -445,6 +448,7 @@ pub async fn list_actions(
     let actions = state
         .agent_action_service
         .list(AgentActionListQuery {
+            visible_to_user_id: Some(user.user_id.clone()),
             actor_identity_id: Some(identity_id),
             scope_type: query.scope_type.clone(),
             scope_id: query.scope_id.clone(),
@@ -519,7 +523,7 @@ pub async fn propose_task(
     // retry can still resolve its frozen receipt after a binding is paused or
     // rotated.
     require_owned_identity(&state, &identity_id, &user.user_id).await?;
-    authorize_scope_member(&state, "project", &request.project_id, &user.user_id).await?;
+    authorize_scope_write(&state, "project", &request.project_id, &user.user_id).await?;
     let task_type = request.task_type.map(|task_type| {
         match task_type {
             api_types::TaskType::Task => "task",
@@ -595,7 +599,8 @@ pub async fn propose_task(
         correlation_id: result.receipt.correlation_id,
         replayed: result.replayed,
         requires_user_authorization: false,
-        task: crate::routes::task_response(&state.db, result.task).await?,
+        task: crate::routes::task_response(&state.db, &state.workspace_backend_router, result.task)
+            .await?,
     };
     Ok((status, Json(response)))
 }
@@ -618,6 +623,7 @@ pub async fn approve_action(
 ) -> ApiResult<Json<AgentActionResponse>> {
     let action = state.agent_action_service.get(&id).await?;
     authorize_action_read(&state, &action, &user.user_id).await?;
+    authorize_scope_write(&state, &action.scope_type, &action.scope_id, &user.user_id).await?;
     require_owned_identity(&state, &request.approver_identity_id, &user.user_id).await?;
     let decision = AgentActionApprovalDecision::from_str(&request.decision)
         .map_err(|_| ApiError::bad_request("decision must be approved or denied"))?;
@@ -718,6 +724,7 @@ async fn require_identity_scope(
     user_id: &str,
 ) -> ApiResult<()> {
     require_owned_identity(state, identity_id, user_id).await?;
+    authorize_scope_write(state, scope_type, scope_id, user_id).await?;
     match scope_type {
         "account" => {
             if scope_id != user_id {
@@ -725,7 +732,13 @@ async fn require_identity_scope(
             }
         }
         "project" => {
-            crate::routes::project_agents::require_project_member(state, scope_id, user_id).await?;
+            crate::routes::authorization::require_project_access(
+                state,
+                scope_id,
+                user_id,
+                crate::routes::authorization::ProjectAccess::Read,
+            )
+            .await?;
             let binding = ProjectAgentBindingRepo::get_active_project_binding(&*state.db, scope_id)
                 .await?
                 .filter(|binding| {
@@ -774,8 +787,16 @@ async fn require_identity_scope(
             let task = TaskRepo::get_by_id(&*state.db, scope_id, false)
                 .await?
                 .ok_or_else(|| ApiError::not_found("task", scope_id.to_owned()))?;
-            crate::routes::project_agents::require_project_member(state, &task.project_id, user_id)
-                .await?;
+            crate::routes::authorization::require_project_access(
+                state,
+                &task.project_id,
+                user_id,
+                crate::routes::authorization::ProjectAccess::Read,
+            )
+            .await
+            .map_err(|error| {
+                error.mask_not_found(ApiError::not_found("task", scope_id.to_owned()))
+            })?;
             let assigned_directly = task.assignee_type.as_deref() == Some("agent")
                 && task.assignee_id.as_deref() == Some(identity_id);
             let assigned_role = TaskRoleAssignmentRepo::list_by_task(&*state.db, scope_id)
@@ -822,6 +843,7 @@ async fn authorize_commitment_mutation(
     user_id: &str,
 ) -> ApiResult<()> {
     authorize_commitment_read(state, commitment, user_id).await?;
+    authorize_scope_write(state, &commitment.scope_type, &commitment.scope_id, user_id).await?;
     let owns_identity = AgentRepo::get_by_id(&*state.db, &commitment.owner_identity_id)
         .await?
         .is_some_and(|agent| agent.owner_id.as_deref() == Some(user_id));
@@ -874,6 +896,7 @@ async fn authorize_question_mutation(
     user_id: &str,
 ) -> ApiResult<()> {
     authorize_question_read(state, question, user_id).await?;
+    authorize_scope_write(state, &question.scope_type, &question.scope_id, user_id).await?;
     let owns_identity = AgentRepo::get_by_id(&*state.db, &question.recipient_identity_id)
         .await?
         .is_some_and(|agent| agent.owner_id.as_deref() == Some(user_id));
@@ -923,6 +946,7 @@ async fn authorize_action_mutation(
     user_id: &str,
 ) -> ApiResult<()> {
     authorize_action_read(state, action, user_id).await?;
+    authorize_scope_write(state, &action.scope_type, &action.scope_id, user_id).await?;
     let owns_identity = AgentRepo::get_by_id(&*state.db, &action.actor_identity_id)
         .await?
         .is_some_and(|agent| agent.owner_id.as_deref() == Some(user_id));
@@ -960,11 +984,14 @@ async fn authorize_scope_member(
 ) -> ApiResult<()> {
     match scope_type {
         "account" if scope_id == user_id => Ok(()),
-        "project" => {
-            crate::routes::project_agents::require_project_member(state, scope_id, user_id)
-                .await
-                .map(|_| ())
-        }
+        "project" => crate::routes::authorization::require_project_access(
+            state,
+            scope_id,
+            user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await
+        .map(|_| ()),
         "agent_chat" => state
             .agent_chat_service
             .get_authorized_chat(user_id, scope_id)
@@ -975,9 +1002,14 @@ async fn authorize_scope_member(
             let task = TaskRepo::get_by_id(&*state.db, scope_id, false)
                 .await?
                 .ok_or_else(|| ApiError::not_found("task", scope_id.to_owned()))?;
-            crate::routes::project_agents::require_project_member(state, &task.project_id, user_id)
-                .await
-                .map(|_| ())
+            crate::routes::authorization::require_project_access(
+                state,
+                &task.project_id,
+                user_id,
+                crate::routes::authorization::ProjectAccess::Read,
+            )
+            .await
+            .map(|_| ())
         }
         "agent" => require_owned_identity(state, scope_id, user_id)
             .await
@@ -1005,22 +1037,6 @@ async fn authorize_agent_chat_mutation(
             "only the canonical agent chat owner may mutate this item",
         ))
     }
-}
-
-async fn require_coordination_project_admin(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    let member =
-        crate::routes::project_agents::require_project_member(state, project_id, user_id).await?;
-    if member.role == "owner" || member.role == "admin" {
-        return Ok(());
-    }
-    Err(ApiError::forbidden_with_code(
-        "coordination_mutation_forbidden",
-        "only the coordination owner or canonical scope owner may mutate this record",
-    ))
 }
 
 fn requested_permission_for_operation(operation: &str) -> ApiResult<&'static str> {
@@ -1274,6 +1290,59 @@ fn execution_response(value: AgentActionExecution) -> ActionExecutionResponse {
 
 fn parse_json(value: &str) -> Value {
     serde_json::from_str(value).unwrap_or(Value::Null)
+}
+
+async fn require_coordination_project_admin(
+    state: &AppState,
+    project_id: &str,
+    user_id: &str,
+) -> ApiResult<()> {
+    crate::routes::authorization::require_project_access(
+        state,
+        project_id,
+        user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await
+    .map_err(|error| {
+        error.map_forbidden(
+            "coordination_mutation_forbidden",
+            "only the coordination owner or canonical scope owner may mutate this record",
+        )
+    })?;
+    Ok(())
+}
+
+async fn authorize_scope_write(
+    state: &AppState,
+    scope_type: &str,
+    scope_id: &str,
+    user_id: &str,
+) -> ApiResult<()> {
+    use crate::routes::authorization::{
+        require_project_access, require_task_access, ProjectAccess,
+    };
+    match scope_type {
+        "project" => {
+            require_project_access(state, scope_id, user_id, ProjectAccess::Write).await?;
+        }
+        "task" => {
+            require_task_access(state, scope_id, user_id, ProjectAccess::Write).await?;
+        }
+        "agent_chat" => {
+            let chat = state
+                .agent_chat_service
+                .get_authorized_chat(user_id, scope_id)
+                .await?;
+            if let Some(project_id) = chat.project_id.as_deref() {
+                require_project_access(state, project_id, user_id, ProjectAccess::Write).await?;
+            }
+        }
+        _ => {
+            authorize_scope_member(state, scope_type, scope_id, user_id).await?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

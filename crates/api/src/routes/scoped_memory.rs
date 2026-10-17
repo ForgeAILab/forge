@@ -16,7 +16,7 @@ use axum::{
 };
 use db::{
     AgentContextScopeRepo, AgentRepo, MemoryGetQuery, MemoryItem, MemoryLifecycleAssertion,
-    MemoryScopeGrant, ProjectMemberRepo, ProjectRepo, ScopedMemoryRepository, TaskRepo,
+    MemoryScopeGrant, ProjectRepo, ScopedMemoryRepository, TaskRepo,
 };
 use services::{
     ContextManifestService, MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput,
@@ -42,6 +42,14 @@ pub async fn publish_memory(
     Path(memory_id): Path<String>,
     Json(request): Json<MemoryPublicationRequest>,
 ) -> ApiResult<(StatusCode, Json<MemoryProvenanceResponse>)> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &request.target_scope_type,
+        &request.target_scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let source_id = parse_uuid(&memory_id, "memory_id")?;
     require_owned_identity(&state, &user, &request.actor_identity_id).await?;
     let source_grant = authorized_scope_grant(
@@ -103,6 +111,14 @@ pub async fn assert_memory_lifecycle(
     Path(memory_id): Path<String>,
     Json(request): Json<MemoryLifecycleRequest>,
 ) -> ApiResult<Json<MemoryLifecycleResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        &request.scope_type,
+        &request.scope_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let memory_id = parse_uuid(&memory_id, "memory_id")?;
     require_owned_identity(&state, &user, &request.actor_identity_id).await?;
     let grant =
@@ -287,13 +303,6 @@ pub async fn list_context_manifests(
         authorized_scope_grant(&state, &user, &scope.scope_type, &scope.scope_id).await?;
     }
     let service = ContextManifestService::new(Arc::clone(&state.db));
-    let manifests = service
-        .list_authorized(
-            identity,
-            requested_scope,
-            query.limit.unwrap_or(20).clamp(1, 50),
-        )
-        .await?;
     let allowed_scope_ids = if requested_scope.is_none() {
         let mut allowed = HashSet::new();
         for scope in &context_scopes {
@@ -308,6 +317,32 @@ pub async fn list_context_manifests(
     } else {
         None
     };
+    let limit = query.limit.unwrap_or(20).clamp(1, 50);
+    let mut manifests = Vec::new();
+    if let Some(scope_id) = requested_scope {
+        manifests = service
+            .list_authorized(identity, Some(scope_id), limit)
+            .await?;
+    } else if let Some(allowed) = &allowed_scope_ids {
+        for scope_id in allowed {
+            manifests.extend(
+                service
+                    .list_authorized(
+                        identity,
+                        Some(parse_uuid(scope_id, "context_scope_id")?),
+                        limit,
+                    )
+                    .await?,
+            );
+        }
+        manifests.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        manifests.truncate(limit as usize);
+    }
     let context_scopes = context_scopes
         .into_iter()
         .map(|scope| (scope.id.clone(), scope))
@@ -388,7 +423,13 @@ async fn authorized_scope_grant(
             vec!["account".to_owned()]
         }
         "project" => {
-            require_project_visible(state, scope_id, user).await?;
+            crate::routes::authorization::require_project_access(
+                state,
+                scope_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Read,
+            )
+            .await?;
             vec!["project".to_owned()]
         }
         "agent_chat" => {
@@ -405,7 +446,16 @@ async fn authorized_scope_grant(
             let task = TaskRepo::get_by_id(&*state.db, scope_id, false)
                 .await?
                 .ok_or_else(|| ApiError::not_found("task", scope_id.to_owned()))?;
-            require_project_visible(state, &task.project_id, user).await?;
+            crate::routes::authorization::require_project_access(
+                state,
+                &task.project_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Read,
+            )
+            .await
+            .map_err(|error| {
+                error.mask_not_found(ApiError::not_found("task", scope_id.to_owned()))
+            })?;
             vec!["project".to_owned()]
         }
         _ => {
@@ -485,26 +535,6 @@ fn validate_target_linkage(request: &MemoryPublicationRequest) -> ApiResult<()> 
         return Err(ApiError::bad_request(
             "task target scopes cannot carry Agent Chat linkage",
         ));
-    }
-    Ok(())
-}
-
-async fn require_project_visible(
-    state: &AppState,
-    project_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<()> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.is_none() {
-        return Ok(());
-    }
-    if ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id)
-        .await?
-        .is_none()
-    {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
     }
     Ok(())
 }

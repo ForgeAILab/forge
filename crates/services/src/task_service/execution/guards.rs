@@ -1,11 +1,135 @@
 use super::*;
 
+/// The error an execution carries when its launch was deferred for free
+/// disk ([`TaskService::defer_launch_for_disk`]).
+pub(crate) const DISK_PRE_DISPATCH_ERROR_PREFIX: &str = "waiting for free disk before launch: ";
+/// Error prefix of a run that was admitted and then not launched because its
+/// Agent was paused in between. The Task's Agent wait is its recovery.
+pub(crate) const AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX: &str = "Agent paused before launch: ";
+pub(in crate::task_service) const WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX: &str =
+    "WorkspaceLease launch contention: ";
+/// Launches of one Task role refused in a row for lease contention before
+/// the Task parks behind the dispatch-failure blocker (no retry budget).
+/// Each launch already retried its reissue; this bounds the re-dispatches.
+const MAX_LAUNCH_CONTENTION_REFUSALS: usize = 3;
+
+/// Like environment/disk/Agent waits, contention before the executor starts
+/// is an infrastructure refusal, not a failed attempt by the worker.
+pub(super) fn is_workspace_lease_pre_dispatch_failure(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Failed
+        && execution.stopped_by.as_deref() == Some("system:dispatch")
+        && execution.error.as_deref().is_some_and(|error| {
+            error.contains(WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX)
+                || error.contains("version conflict")
+        })
+}
+
+fn launch_state_epoch(task: &Task) -> Option<i64> {
+    task.condition
+        .evidence()
+        .witnesses
+        .iter()
+        .find_map(|witness| match witness {
+            db::ConditionWitness::Entry { epoch, .. } => Some(*epoch),
+            _ => None,
+        })
+}
+
+/// A run ended by [`TaskService::defer_launch_for_paused_agent`]. It is not
+/// an execution failure of the Task: it takes no retry and no block.
+pub(crate) fn is_agent_paused_pre_dispatch_failure(execution: &db::Execution) -> bool {
+    execution.status == ExecutionStatus::Failed
+        && execution
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with(AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX))
+}
+
 impl TaskService {
+    pub(in crate::task_service) async fn ensure_execution_launch_preconditions(
+        &self,
+        task: &Task,
+        admitted_task: &Task,
+        role: &str,
+        execution_id: &str,
+    ) -> Result<()> {
+        // An explicitly admitted interactive recovery session may inspect an
+        // already held Task. A new hold during launch still stops that session.
+        let admitted_hold = role == "interactive"
+            && admitted_task
+                .condition
+                .reasons()
+                .chain(admitted_task.condition.evidence().observations.iter())
+                .any(|reason| matches!(reason, db::ParkReason::Held { .. }));
+        if !admitted_hold
+            && task
+                .condition
+                .reasons()
+                .chain(task.condition.evidence().observations.iter())
+                .any(|reason| matches!(reason, db::ParkReason::Held { .. }))
+        {
+            return Err(ServiceError::conflict(format!(
+                "Task '{}' is held; execution launch stopped",
+                task.id
+            )));
+        }
+        let execution = ExecutionRepo::get_by_id(&*self.db, execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", execution_id.to_owned()))?;
+        if execution.status != ExecutionStatus::Running {
+            return Err(ServiceError::conflict(format!(
+                "execution '{}' is {}; it is no longer running",
+                execution_id, execution.status
+            )));
+        }
+        if task.status != admitted_task.status
+            || launch_state_epoch(task)
+                .zip(launch_state_epoch(admitted_task))
+                .is_some_and(|(current, admitted)| current != admitted)
+        {
+            return Err(ServiceError::conflict(format!(
+                "Task '{}' changed state or state entry to '{}'; execution launch stopped",
+                task.id, task.status
+            )));
+        }
+        let roles: &[&str] = match role {
+            "coder" | "executor" | "worker" => &["coder", "executor", "worker"],
+            "reviewer" | "auditor" => &["reviewer", "auditor"],
+            _ => &[role],
+        };
+        if ExecutionRepo::latest_execution_by_task_and_roles(&*self.db, &task.id, roles)
+            .await?
+            .is_none_or(|latest| latest.id != execution_id)
+        {
+            return Err(ServiceError::conflict(format!(
+                "execution '{execution_id}' was superseded by a newer Task run"
+            )));
+        }
+        Ok(())
+    }
+    /// Refuse paused Projects before placement or launch side effects. The
+    /// execution INSERT still rechecks admission atomically for concurrent pauses.
+    pub(in crate::task_service) async fn ensure_project_not_paused(
+        &self,
+        task: &Task,
+    ) -> Result<()> {
+        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+        if project.paused_at.is_some() {
+            return Err(ServiceError::ProjectPaused {
+                project_id: project.id,
+            });
+        }
+        Ok(())
+    }
+
     /// Admit an execution attempt against the coordination hierarchy before a
     /// caller transitions a Task or prepares a workspace.  A root with
-    /// children is a container: only its aggregate reviewer may run after
-    /// every child is terminal.  A child must be the first incomplete sibling,
-    /// and its root must still be live and unblocked.
+    /// children is a container: its lead may run in the planning state, and
+    /// its aggregate reviewer after every child is terminal.  A child must be
+    /// the first incomplete sibling, and its root must be unblocked and in
+    /// its implementation state.
     pub(super) async fn ensure_ordered_execution_admission(
         &self,
         task: &Task,
@@ -31,19 +155,24 @@ impl TaskService {
                 &project.workflow_definition,
                 &api_types::Actor::system(api_types::SystemComponent::Executor),
             );
+            // The policy names the one role that may run on a root in each
+            // state: its lead in the planning state, its aggregate reviewer
+            // in the review phase.
+            let assignments = db::TaskRoleAssignmentRepo::list_by_task(&*self.db, &task.id).await?;
+            if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow).runs_role(
+                &task.id,
+                &task.status,
+                role,
+                &assignments,
+            ) {
+                return Err(ServiceError::invalid_operation(
+                    "root tasks with subtasks are coordination containers; only their lead may execute in the planning state and their aggregate review role in review",
+                ));
+            }
             if workflow.canonical_phase_for_state(&task.status) != api_types::CanonicalPhase::Review
             {
-                return Err(ServiceError::invalid_operation(format!(
-                    "coordination root {} is not in its aggregate review state",
-                    task.id
-                )));
-            }
-            if !crate::task_hierarchy::RootRolePolicy::for_workflow(&workflow)
-                .allows_execution(&task.status, role)
-            {
-                return Err(ServiceError::invalid_operation(
-                    "root tasks with subtasks are coordination containers; only their aggregate review role may execute",
-                ));
+                // The lead plans while subtasks are still to run.
+                return Ok(());
             }
 
             let subtasks = crate::task_hierarchy::ordered_children(&self.db, &task.id).await?;
@@ -64,9 +193,11 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", parent_task_id.to_owned()))?;
         if crate::task_hierarchy::root_blocked(&parent) {
-            return Err(ServiceError::invalid_operation(format!(
-                "subtask {} cannot execute while coordination root {} is blocked or has an error",
-                task.id, parent.id
+            return Err(crate::task_hierarchy::subtask_wait_refusal(format!(
+                "subtask {} {ROOT_BLOCKED_REFUSAL} {} is blocked or has an error",
+                task.id,
+                parent.id,
+                ROOT_BLOCKED_REFUSAL = crate::task_hierarchy::ROOT_BLOCKED_REFUSAL,
             )));
         }
 
@@ -81,8 +212,9 @@ impl TaskService {
         if matches!(
             workflow.state_kind(&parent.status),
             Some(api_types::StateKind::Backlog | api_types::StateKind::Terminal)
-        ) || workflow.canonical_phase_for_state(&parent.status)
-            == api_types::CanonicalPhase::Review
+        ) || (workflow.state_kind(&parent.status) == Some(api_types::StateKind::Gate)
+            && workflow.canonical_phase_for_state(&parent.status)
+                == api_types::CanonicalPhase::Review)
         {
             return Err(ServiceError::invalid_operation(format!(
                 "subtask {} cannot execute while coordination root {} is in {}",
@@ -118,7 +250,30 @@ impl TaskService {
             let agent = AgentRepo::get_by_id(&*self.db, agent_id)
                 .await?
                 .ok_or_else(|| ServiceError::not_found("agent", agent_id.to_owned()))?;
-            let status = compute_effective_status(&self.db, &agent).await?;
+            let placed = match current_execution.workspace_id.as_deref() {
+                Some(id) => db::WorkspacePlacementRepo::get_by_workspace_id(&*self.db, id)
+                    .await?
+                    .is_some(),
+                None => false,
+            };
+            let status = if placed && agent.backend_kind == "cli" {
+                // Admission already chose the executor owner. Availability
+                // display resolves Agent pins and must not change that route.
+                if agent.paused {
+                    EffectiveStatus::Paused
+                } else if agent.status == db::AgentStatus::Error {
+                    EffectiveStatus::Error
+                } else if crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id)
+                    .await?
+                    >= agent.max_concurrent_tasks
+                {
+                    EffectiveStatus::Busy
+                } else {
+                    EffectiveStatus::Active
+                }
+            } else {
+                compute_effective_status(&self.db, &agent, None).await?
+            };
             if status == EffectiveStatus::Active
                 || self
                     .busy_only_because_current_execution(&status, &agent, execution)
@@ -162,27 +317,35 @@ impl TaskService {
             return Ok(false);
         }
         let running_count = count_running_executions(&self.db, &agent.id).await?;
-        if running_count <= agent.max_concurrent_tasks {
+        let occupied_slots =
+            crate::agent_capacity::count_occupied_agent_slots(&self.db, &agent.id).await?;
+        if running_count > 0 && occupied_slots <= agent.max_concurrent_tasks {
             return Ok(true);
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", execution.task_id.clone()))?;
-        let role_assignment = match execution.role.as_str() {
-            "executor" | crate::workflow::default_roles::CODER => {
-                self.coder_assignment(&task.id).await?
-            }
-            role => TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, role).await?,
-        };
-        if !matches!(
-            role_assignment.as_ref(),
+        let resolved_assignment =
+            crate::task_hierarchy::effective_role_assignment(&self.db, &task, &execution.role)
+                .await?;
+        let assignment_matches = matches!(
+            resolved_assignment.as_ref().map(|resolved| &resolved.assignment),
             Some(assignment)
                 if assignment.assignee_type == Some(AssigneeKind::Agent)
                     && assignment.assignee_id.as_deref() == Some(&agent.id)
-        ) {
+        );
+        let admitted_inherited_attempt = matches!(
+            execution.role.as_str(),
+            "executor" | crate::workflow::default_roles::CODER
+        ) && task.parent_task_id.is_some()
+            && !resolved_assignment
+                .as_ref()
+                .is_some_and(|resolved| resolved.source == api_types::EffectiveCoderSource::Own)
+            && execution.agent_id.as_deref() == Some(&agent.id);
+        if !assignment_matches && !admitted_inherited_attempt {
             return Ok(false);
         }
-        Ok(running_count <= agent.max_concurrent_tasks)
+        Ok(running_count > 0 && occupied_slots <= agent.max_concurrent_tasks)
     }
 
     pub(super) async fn ensure_no_running_interactive_execution(
@@ -211,14 +374,9 @@ impl TaskService {
         let workspace_task_id = task.parent_task_id.as_deref().unwrap_or(&task.id);
         let workspace = WorkspaceRepo::get_by_task_id(&*self.db, workspace_task_id).await?;
         let running_execution_id = if let Some(workspace) = workspace {
-            sqlx::query_scalar::<_, String>(
-                "SELECT id FROM execution
-                 WHERE workspace_id = ? AND status = 'running'
-                 ORDER BY created_at DESC, id DESC LIMIT 1",
-            )
-            .bind(&workspace.id)
-            .fetch_optional(self.db.pool())
-            .await?
+            self.db
+                .repository_running_execution_id(&workspace.id)
+                .await?
         } else {
             None
         };
@@ -267,20 +425,128 @@ impl TaskService {
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
-        self.fail_execution_before_dispatch_inner(execution_id, error, true)
+        self.fail_execution_before_dispatch_inner(execution_id, error, true, false)
             .await
     }
 
+    /// A paused assigned Agent can revoke launch eligibility after admission.
+    /// The Agent wait owns recovery: the run ends auto-resumable under
+    /// [`AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX`], which keeps it out of the
+    /// Task's execution-failure handling (no retry spent, no block), and the
+    /// dispatcher parks the Task on the Agent until it is resumed.
+    pub(super) async fn defer_launch_for_paused_agent(
+        &self,
+        execution: &db::Execution,
+        error: &ServiceError,
+    ) -> Result<Option<db::Execution>> {
+        let ServiceError::ExecutionSetupRequired { requirements, .. } = error else {
+            return Ok(None);
+        };
+        if !requirements
+            .iter()
+            .any(|requirement| requirement.requirement_type == "role_assignment")
+        {
+            return Ok(None);
+        }
+        let Some(agent_id) = execution.agent_id.as_deref() else {
+            return Ok(None);
+        };
+        if !AgentRepo::get_by_id(&*self.db, agent_id)
+            .await?
+            .is_some_and(|agent| agent.paused)
+        {
+            return Ok(None);
+        }
+        self.fail_execution_before_dispatch_inner(
+            &execution.id,
+            format!("{AGENT_PAUSED_PRE_DISPATCH_ERROR_PREFIX}{error}"),
+            false,
+            true,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Terminalize a pre-dispatch execution while leaving its Task projection
-    /// to the caller. Environment failures use their own typed blocking
-    /// annotation and must not briefly publish the generic executor-failed
-    /// projection first.
+    /// to the caller. Environment failures pause the Project and must not
+    /// publish a generic executor-failed Task blocker.
+    /// A launch found its worktree gone and may not make it again while the
+    /// disk is under its free-space floor. That is the wait a claim takes
+    /// for the same reason, not a failed run: the execution ends before
+    /// dispatch without blocking the Task and auto-resumable, and the Task
+    /// takes the disk capacity wait (`Capacity{disk}`), which the
+    /// dispatcher looks at again every 30 s. `false` for any other error:
+    /// the caller handles it as before.
+    pub async fn defer_launch_for_disk(&self, execution_id: &str, error: &ServiceError) -> bool {
+        if crate::placement::capacity_wait_of(error) != Some(crate::placement::CapacityWait::Disk) {
+            return false;
+        }
+        let ended = match self
+            .fail_execution_before_dispatch_without_task_block(
+                execution_id,
+                format!("{DISK_PRE_DISPATCH_ERROR_PREFIX}{error}"),
+            )
+            .await
+        {
+            Ok(execution) => Some(execution),
+            Err(mark_error) => {
+                tracing::warn!(%execution_id, %mark_error, "failed to end an execution that waits for disk before launch");
+                None
+            }
+        };
+        let task_id = match ended {
+            Some(execution) => Some(execution.task_id),
+            None => ExecutionRepo::get_by_id(&*self.db, execution_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|execution| execution.task_id),
+        };
+        if let Some(task_id) = task_id {
+            match TaskRepo::get_by_id(&*self.db, &task_id, false).await {
+                Ok(Some(task)) => {
+                    if let Err(defer_error) = self.defer_placement_refusal(&task, error).await {
+                        tracing::warn!(%task_id, %defer_error, "the disk wait of a launch could not be recorded");
+                    }
+                }
+                Ok(None) => {}
+                Err(read_error) => {
+                    tracing::warn!(%task_id, %read_error, "the Task of a launch that waits for disk could not be read");
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether this refusal and the ones just before it, of the same Task
+    /// role, are all lease-contention refusals up to the bound.
+    async fn launch_contention_bound_spent(&self, execution: &db::Execution) -> Result<bool> {
+        let recent = ExecutionRepo::list_by_task_and_role(
+            &*self.db,
+            &execution.task_id,
+            &execution.role,
+            db::PageRequest {
+                cursor: None,
+                limit: MAX_LAUNCH_CONTENTION_REFUSALS as i64,
+                include_total: false,
+                sort_by: db::SortBy::CreatedAt,
+                sort_order: db::SortOrder::Desc,
+            },
+        )
+        .await?;
+        Ok(recent.items.len() == MAX_LAUNCH_CONTENTION_REFUSALS
+            && recent
+                .items
+                .iter()
+                .all(is_workspace_lease_pre_dispatch_failure))
+    }
+
     pub(super) async fn fail_execution_before_dispatch_without_task_block(
         &self,
         execution_id: &str,
         error: String,
     ) -> Result<db::Execution> {
-        self.fail_execution_before_dispatch_inner(execution_id, error, false)
+        self.fail_execution_before_dispatch_inner(execution_id, error, false, false)
             .await
     }
 
@@ -289,6 +555,7 @@ impl TaskService {
         execution_id: &str,
         error: String,
         block_task: bool,
+        auto_resume: bool,
     ) -> Result<db::Execution> {
         // A WorkspaceLease or optimistic-version mismatch here is the
         // in-transition dispatch race: the lease was pinned to the Task
@@ -297,7 +564,18 @@ impl TaskService {
         // so these stay auto-resumable; anything else waits for a human.
         let transient_authority_race =
             error.contains("WorkspaceLease") || error.contains("version conflict");
-        let resume_policy = if transient_authority_race {
+        // Environment preflights recover through the Project pause rather
+        // than a Task recovery action or execution retry budget.
+        let environment_pre_dispatch =
+            error.starts_with(crate::project_environment::ENVIRONMENT_PRE_DISPATCH_ERROR_PREFIX);
+        // So does a launch that waits for free disk: the Task's disk
+        // capacity wait is its recovery.
+        let disk_pre_dispatch = error.starts_with(DISK_PRE_DISPATCH_ERROR_PREFIX);
+        let resume_policy = if auto_resume
+            || transient_authority_race
+            || environment_pre_dispatch
+            || disk_pre_dispatch
+        {
             db::ResumePolicy::Auto
         } else {
             db::ResumePolicy::Manual
@@ -375,7 +653,19 @@ impl TaskService {
         match outcome {
             ExecutionTerminalOutcome::Committed { execution, .. } => {
                 super::publish_terminal_execution_event(self, &execution);
-                if block_task && should_block_task_for_failed_execution(&execution) {
+                let contention_bound_spent = block_task
+                    && is_workspace_lease_pre_dispatch_failure(&execution)
+                    && self
+                        .launch_contention_bound_spent(&execution)
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(execution_id = %execution.id, %error, "failed to count launch contention refusals");
+                            false
+                        });
+                if block_task
+                    && (should_block_task_for_failed_execution(&execution)
+                        || contention_bound_spent)
+                {
                     if let Err(error) = self.annotate_dispatch_failure_block(&execution).await {
                         tracing::warn!(
                             execution_id = %execution.id,

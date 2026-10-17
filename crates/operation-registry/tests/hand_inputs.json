@@ -1,0 +1,122 @@
+{
+  "charter.draft": {
+    "action": "save_revision",
+    "charter_id": "e2-main-charter",
+    "content": {
+      "constraints_and_risks": {
+        "accessibility": [],
+        "agent_authority": [
+          "Project Agent remains Project-scoped"
+        ],
+        "data": [
+          "Do not copy hidden Main Chat history"
+        ],
+        "integrations": [],
+        "launch": [],
+        "migration": [],
+        "operations": [],
+        "product": [
+          "Local-first single-user operation"
+        ],
+        "risks": [],
+        "security_privacy_compliance": [
+          "Require explicit approval"
+        ],
+        "technology": [
+          "SQLite"
+        ],
+        "time_and_budget": []
+      },
+      "core_experience": {
+        "core_loop": "approve, create, replay",
+        "primary_outcome": "One approved command creates one exact Project handoff.",
+        "principal_journeys": [
+          "User retries after response loss"
+        ]
+      },
+      "handoff_note": {
+        "bounded_summary": "Continue from the exact Charter.",
+        "recommended_first_action": "Validate the approved outcome.",
+        "unresolved_item_ids": []
+      },
+      "identity": {
+        "lifecycle_intent": "validate the command boundary",
+        "maturity": "mvp",
+        "one_line_vision": "A Project created by one exact Main command.",
+        "project_type": "product",
+        "slug_proposal": "main-command-project",
+        "value_proposition": "Make the Main-to-Project handoff durable.",
+        "working_name": "Main Command Project"
+      },
+      "knowledge_ledger": {
+        "items": []
+      },
+      "problem_and_people": {
+        "beneficiaries": [
+          "Project collaborators"
+        ],
+        "current_alternatives": [
+          "Manual handoff"
+        ],
+        "excluded_audiences": [
+          "Unrelated accounts"
+        ],
+        "jobs_pains_opportunity": [
+          "Continue from an approved Charter."
+        ],
+        "problem_or_opportunity": "A lost command response must not duplicate a Project.",
+        "stakeholders": [
+          "Project owner"
+        ],
+        "target_users": [
+          "Forge users"
+        ]
+      },
+      "scope": {
+        "explicit_non_goals": [
+          "Managing another account"
+        ],
+        "later_possibilities": [
+          "Project-local planning"
+        ],
+        "must_have_outcomes": [
+          "Persist Project and handoff."
+        ],
+        "required_deliverables": [
+          "One Project Chat and one queued turn."
+        ]
+      },
+      "success": {
+        "acceptance_statements": [
+          "A retry creates no duplicate Project."
+        ],
+        "non_claims": [
+          "This does not prove implementation quality."
+        ],
+        "qualitative_outcome": "The handoff is exact.",
+        "required_evidence": [
+          "Durable receipt and event"
+        ],
+        "success_signals": [
+          "Replay returns the same identifiers."
+        ]
+      }
+    },
+    "expected_charter_version": 1,
+    "genesis_session_id": "96f1c2a7-8916-4628-acbb-23fb7b5d59d2",
+    "maturity": "mvp",
+    "project_mode": "compact",
+    "provenance": {
+      "author": {
+        "id": "main-command-identity",
+        "kind": "agent"
+      },
+      "change_summary": "Draft the next Project Charter"
+    }
+  },
+  "genesis.start": {
+    "action": "start",
+    "maturity": "mvp",
+    "preferred_project_agent_identity_id": "main-command-project-identity"
+  }
+}

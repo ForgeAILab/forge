@@ -1,0 +1,648 @@
+{
+  "genesis.project_agent.select:prepared": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "48ebda4070140d1da5c52438861adcdd",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "local_action_prepared",
+        "request_id": "request",
+        "call": {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 1,
+              "causation_id": "pre-change-cause",
+              "correlation_id": "pre-change-correlation",
+              "dedupe_key": "pre-change-selection",
+              "operation": "genesis.project_agent.select",
+              "payload": {
+                "action": "select",
+                "expected_session_version": 1,
+                "genesis_session_id": "scope-composition-genesis",
+                "project_agent_identity_id": "scope-composition-project-agent-candidate"
+              }
+            }
+          }
+        },
+        "prepared": {
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 1,
+            "causation_id": "pre-change-cause",
+            "correlation_id": "pre-change-correlation",
+            "dedupe_key": "pre-change-selection",
+            "operation": "genesis.project_agent.select",
+            "payload": {
+              "action": "select",
+              "expected_session_version": 1,
+              "genesis_session_id": "scope-composition-genesis",
+              "project_agent_identity_id": "scope-composition-project-agent-candidate"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "account:scope-composition-user"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "34f1e100a2fdce61ab429bace20327a7"
+        }
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"select\",\"expected_session_version\":1,\"genesis_session_id\":\"scope-composition-genesis\",\"project_agent_identity_id\":\"scope-composition-project-agent-candidate\"}",
+    "payload_hash": "24d0b28428ba52c59abb39bc80c53e7a249224b7ac7a1d9d006db5b52f42bb62"
+  },
+  "genesis.project_agent.select:approval_pending": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "678927db89eead96f38e10248b60168c",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "awaiting_approval",
+        "request_id": "request",
+        "source_calls": [
+          {
+            "id": "call",
+            "name": "forge_main_orchestration_propose",
+            "arguments": {
+              "parameters": {
+                "causation_depth": 1,
+                "causation_id": "pre-change-cause",
+                "correlation_id": "pre-change-correlation",
+                "dedupe_key": "pre-change-selection",
+                "operation": "genesis.project_agent.select",
+                "payload": {
+                  "action": "select",
+                  "expected_session_version": 1,
+                  "genesis_session_id": "scope-composition-genesis",
+                  "project_agent_identity_id": "scope-composition-project-agent-candidate"
+                }
+              }
+            }
+          }
+        ],
+        "slots": [
+          {
+            "slot": "prepared",
+            "call_id": "call",
+            "tool": "forge_main_orchestration_propose",
+            "canonical_arguments": {
+              "causation_depth": 1,
+              "causation_id": "pre-change-cause",
+              "correlation_id": "pre-change-correlation",
+              "dedupe_key": "pre-change-selection",
+              "operation": "genesis.project_agent.select",
+              "payload": {
+                "action": "select",
+                "expected_session_version": 1,
+                "genesis_session_id": "scope-composition-genesis",
+                "project_agent_identity_id": "scope-composition-project-agent-candidate"
+              }
+            },
+            "required_permissions": [
+              {
+                "other": "forge.scope.propose"
+              }
+            ],
+            "resource": {
+              "resource_kind": "other",
+              "kind": "forge.scope",
+              "id": "account:scope-composition-user"
+            },
+            "effects": [],
+            "display": {
+              "title": "Propose Forge action"
+            },
+            "preparation_fingerprint": "34f1e100a2fdce61ab429bace20327a7"
+          }
+        ],
+        "step": 0
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Continue the recorded Main action."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_call",
+                "id": "call",
+                "name": "forge_main_orchestration_propose",
+                "arguments": {
+                  "parameters": {
+                    "causation_depth": 1,
+                    "causation_id": "pre-change-cause",
+                    "correlation_id": "pre-change-correlation",
+                    "dedupe_key": "pre-change-selection",
+                    "operation": "genesis.project_agent.select",
+                    "payload": {
+                      "action": "select",
+                      "expected_session_version": 1,
+                      "genesis_session_id": "scope-composition-genesis",
+                      "project_agent_identity_id": "scope-composition-project-agent-candidate"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"select\",\"expected_session_version\":1,\"genesis_session_id\":\"scope-composition-genesis\",\"project_agent_identity_id\":\"scope-composition-project-agent-candidate\"}",
+    "payload_hash": "24d0b28428ba52c59abb39bc80c53e7a249224b7ac7a1d9d006db5b52f42bb62"
+  },
+  "genesis.project_agent.select:approval_edited": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "736295e32f025bda9c7ef6d94829ee24",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "awaiting_approval",
+        "request_id": "request",
+        "source_calls": [
+          {
+            "id": "call",
+            "name": "forge_main_orchestration_propose",
+            "arguments": {
+              "parameters": {
+                "causation_depth": 1,
+                "causation_id": "pre-change-cause",
+                "correlation_id": "pre-change-correlation",
+                "dedupe_key": "pre-change-selection",
+                "operation": "genesis.project_agent.select",
+                "payload": {
+                  "action": "select",
+                  "expected_session_version": 1,
+                  "genesis_session_id": "scope-composition-genesis",
+                  "project_agent_identity_id": "scope-composition-project-agent-candidate"
+                }
+              }
+            }
+          }
+        ],
+        "slots": [
+          {
+            "slot": "prepared",
+            "call_id": "call",
+            "tool": "forge_main_orchestration_propose",
+            "canonical_arguments": {
+              "causation_depth": 1,
+              "causation_id": "pre-change-cause",
+              "correlation_id": "pre-change-correlation",
+              "dedupe_key": "pre-change-selection",
+              "operation": "genesis.project_agent.select",
+              "payload": {
+                "action": "select",
+                "expected_session_version": 1,
+                "genesis_session_id": " scope-composition-genesis ",
+                "project_agent_identity_id": "scope-composition-project-agent-candidate"
+              }
+            },
+            "required_permissions": [
+              {
+                "other": "forge.scope.propose"
+              }
+            ],
+            "resource": {
+              "resource_kind": "other",
+              "kind": "forge.scope",
+              "id": "account:scope-composition-user"
+            },
+            "effects": [],
+            "display": {
+              "title": "Propose Forge action"
+            },
+            "preparation_fingerprint": "9d5f615034a0aa0fd28ecf8d5796b381"
+          }
+        ],
+        "step": 0
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Continue the recorded Main action."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_call",
+                "id": "call",
+                "name": "forge_main_orchestration_propose",
+                "arguments": {
+                  "parameters": {
+                    "causation_depth": 1,
+                    "causation_id": "pre-change-cause",
+                    "correlation_id": "pre-change-correlation",
+                    "dedupe_key": "pre-change-selection",
+                    "operation": "genesis.project_agent.select",
+                    "payload": {
+                      "action": "select",
+                      "expected_session_version": 1,
+                      "genesis_session_id": "scope-composition-genesis",
+                      "project_agent_identity_id": "scope-composition-project-agent-candidate"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"select\",\"expected_session_version\":1,\"genesis_session_id\":\" scope-composition-genesis \",\"project_agent_identity_id\":\"scope-composition-project-agent-candidate\"}",
+    "payload_hash": "da50dbbc92063869b1548459dd772be3706759fd9c585255583213e82c5d5534"
+  },
+  "project.create:prepared": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "9fa94fc3f108586f53d2ce12abadedf6",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "local_action_prepared",
+        "request_id": "request",
+        "call": {
+          "id": "call",
+          "name": "forge_main_orchestration_propose",
+          "arguments": {
+            "parameters": {
+              "causation_depth": 0,
+              "causation_id": null,
+              "correlation_id": "main-command-correlation",
+              "dedupe_key": "main-command-action-dedupe",
+              "operation": "project.create",
+              "payload": {
+                "action": "create_from_approval",
+                "approval_id": "main-command-approval"
+              }
+            }
+          }
+        },
+        "prepared": {
+          "call_id": "call",
+          "tool": "forge_main_orchestration_propose",
+          "canonical_arguments": {
+            "causation_depth": 0,
+            "causation_id": null,
+            "correlation_id": "main-command-correlation",
+            "dedupe_key": "main-command-action-dedupe",
+            "operation": "project.create",
+            "payload": {
+              "action": "create_from_approval",
+              "approval_id": "main-command-approval"
+            }
+          },
+          "required_permissions": [
+            {
+              "other": "forge.scope.propose"
+            }
+          ],
+          "resource": {
+            "resource_kind": "other",
+            "kind": "forge.scope",
+            "id": "account:main-command-account"
+          },
+          "effects": [],
+          "display": {
+            "title": "Propose Forge action"
+          },
+          "preparation_fingerprint": "ac0d57a1a0ab51fd7656e4c457d23322"
+        }
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"create_from_approval\",\"approval_id\":\"main-command-approval\"}",
+    "payload_hash": "1e8203cd6f2b81aff6b071617d40be4dc2d93bee0f3e2d2b88f8d1532d2f123d"
+  },
+  "project.create:approval_pending": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "fab2c42706d2fe6ed88916be14417d8d",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "awaiting_approval",
+        "request_id": "request",
+        "source_calls": [
+          {
+            "id": "call",
+            "name": "forge_main_orchestration_propose",
+            "arguments": {
+              "parameters": {
+                "causation_depth": 0,
+                "causation_id": null,
+                "correlation_id": "main-command-correlation",
+                "dedupe_key": "main-command-action-dedupe",
+                "operation": "project.create",
+                "payload": {
+                  "action": "create_from_approval",
+                  "approval_id": "main-command-approval",
+                  "ignored": "pre-change"
+                }
+              }
+            }
+          }
+        ],
+        "slots": [
+          {
+            "slot": "prepared",
+            "call_id": "call",
+            "tool": "forge_main_orchestration_propose",
+            "canonical_arguments": {
+              "causation_depth": 0,
+              "causation_id": null,
+              "correlation_id": "main-command-correlation",
+              "dedupe_key": "main-command-action-dedupe",
+              "operation": "project.create",
+              "payload": {
+                "action": "create_from_approval",
+                "approval_id": "main-command-approval",
+                "ignored": "pre-change"
+              }
+            },
+            "required_permissions": [
+              {
+                "other": "forge.scope.propose"
+              }
+            ],
+            "resource": {
+              "resource_kind": "other",
+              "kind": "forge.scope",
+              "id": "account:main-command-account"
+            },
+            "effects": [],
+            "display": {
+              "title": "Propose Forge action"
+            },
+            "preparation_fingerprint": "1062dbe2c4861e58c9d43ec3abf6688e"
+          }
+        ],
+        "step": 0
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Continue the recorded Main action."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_call",
+                "id": "call",
+                "name": "forge_main_orchestration_propose",
+                "arguments": {
+                  "parameters": {
+                    "causation_depth": 0,
+                    "causation_id": null,
+                    "correlation_id": "main-command-correlation",
+                    "dedupe_key": "main-command-action-dedupe",
+                    "operation": "project.create",
+                    "payload": {
+                      "action": "create_from_approval",
+                      "approval_id": "main-command-approval",
+                      "ignored": "pre-change"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"create_from_approval\",\"approval_id\":\"main-command-approval\",\"ignored\":\"pre-change\"}",
+    "payload_hash": "fdc5b3f7bcffde9b9caf26b6f5d68bfc26fc0eccffe4ccdab091c096853a4c8e"
+  },
+  "project.create:approval_edited": {
+    "checkpoint": {
+      "schema_version": 3,
+      "transition_revision": 4,
+      "session": "session",
+      "turn": "turn",
+      "state_revision": 1,
+      "operation_fingerprint": "0fca77dcb00926cbaea2b695358b1166",
+      "active_history_start": 0,
+      "visible_output": false,
+      "state": {
+        "state": "awaiting_approval",
+        "request_id": "request",
+        "source_calls": [
+          {
+            "id": "call",
+            "name": "forge_main_orchestration_propose",
+            "arguments": {
+              "parameters": {
+                "causation_depth": 0,
+                "causation_id": null,
+                "correlation_id": "main-command-correlation",
+                "dedupe_key": "main-command-action-dedupe",
+                "operation": "project.create",
+                "payload": {
+                  "action": "create_from_approval",
+                  "approval_id": "main-command-approval",
+                  "ignored": "pre-change"
+                }
+              }
+            }
+          }
+        ],
+        "slots": [
+          {
+            "slot": "prepared",
+            "call_id": "call",
+            "tool": "forge_main_orchestration_propose",
+            "canonical_arguments": {
+              "causation_depth": 0,
+              "causation_id": null,
+              "correlation_id": "main-command-correlation",
+              "dedupe_key": "main-command-action-dedupe",
+              "operation": "project.create",
+              "payload": {
+                "action": "create_from_approval",
+                "approval_id": "main-command-approval",
+                "ignored": "approved edit"
+              }
+            },
+            "required_permissions": [
+              {
+                "other": "forge.scope.propose"
+              }
+            ],
+            "resource": {
+              "resource_kind": "other",
+              "kind": "forge.scope",
+              "id": "account:main-command-account"
+            },
+            "effects": [],
+            "display": {
+              "title": "Propose Forge action"
+            },
+            "preparation_fingerprint": "c3d0f264b36e3eff8c1240b70d7f8dcc"
+          }
+        ],
+        "step": 0
+      },
+      "snapshot": {
+        "id": "session",
+        "history": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Continue the recorded Main action."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_call",
+                "id": "call",
+                "name": "forge_main_orchestration_propose",
+                "arguments": {
+                  "parameters": {
+                    "causation_depth": 0,
+                    "causation_id": null,
+                    "correlation_id": "main-command-correlation",
+                    "dedupe_key": "main-command-action-dedupe",
+                    "operation": "project.create",
+                    "payload": {
+                      "action": "create_from_approval",
+                      "approval_id": "main-command-approval",
+                      "ignored": "pre-change"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ],
+        "updated": 0
+      },
+      "deadline": {
+        "at": null
+      },
+      "watermark": {
+        "checkpoint_sequence": 2,
+        "event_sequence": 0
+      },
+      "updated": 0
+    },
+    "payload_json": "{\"action\":\"create_from_approval\",\"approval_id\":\"main-command-approval\",\"ignored\":\"approved edit\"}",
+    "payload_hash": "6fe91ded936a217018cacbdc2d02f417547b4e26ac2a1fe3b684f3180728ca21"
+  }
+}

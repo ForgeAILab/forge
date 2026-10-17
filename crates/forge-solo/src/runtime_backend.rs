@@ -9,25 +9,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::bootstrap::{
+    SoloAgentAvailability, SoloAgentCandidate, SoloAgentCandidateInput,
+    SoloAuthenticatedAgentRegistration, SoloBootstrapReadiness, SoloBootstrapRequest,
+    SoloBootstrapResult, SoloBootstrapService,
+};
+use crate::session::{
+    SoloActivityCursor, SoloActivityKind, SoloActivityPage, SoloAttentionSnapshot,
+    SoloCharterApprovalAuthorization, SoloCharterApprovalInput, SoloCharterApprovalTarget,
+    SoloInteractionAnswerInput, SoloInteractionAnswerValue, SoloMessageAuthor, SoloMessageStatus,
+    SoloOperationOutcome, SoloProjectReadiness, SoloRetryTurnInput, SoloReviewDecision,
+    SoloReviewDecisionInput, SoloSendMessageInput, SoloSessionService, SoloSessionSnapshot,
+    SoloTaskSnapshot, SoloTurnSnapshot, SoloTurnStatus,
+};
 use db::DbError;
 use events::ForgeEvent;
 use executors::{AdapterRegistry, AvailabilityStatus, ExecutorKind};
-use services::{
-    solo_bootstrap::{
-        SoloAgentAvailability, SoloAgentCandidate, SoloAgentCandidateInput,
-        SoloAuthenticatedAgentRegistration, SoloBootstrapReadiness, SoloBootstrapRequest,
-        SoloBootstrapResult, SoloBootstrapService,
-    },
-    solo_session::{
-        SoloActivityCursor, SoloActivityKind, SoloActivityPage, SoloAttentionSnapshot,
-        SoloCharterApprovalAuthorization, SoloCharterApprovalInput, SoloCharterApprovalTarget,
-        SoloInteractionAnswerInput, SoloInteractionAnswerValue, SoloMessageAuthor,
-        SoloMessageStatus, SoloOperationOutcome, SoloProjectReadiness, SoloRetryTurnInput,
-        SoloReviewDecision, SoloReviewDecisionInput, SoloSendMessageInput, SoloSessionService,
-        SoloSessionSnapshot, SoloTaskSnapshot, SoloTurnSnapshot, SoloTurnStatus,
-    },
-    EmbeddedDaemon, RuntimeSupervisor, ServiceError,
-};
+use services::{EmbeddedDaemon, ServiceError};
+use services_agents::RuntimeSupervisor;
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
 use crate::backend::{
@@ -566,7 +565,7 @@ impl SoloBackend for RuntimeBackend {
                             task_id: request.task_id.clone(),
                             expected_task_version: request.expected_version,
                             decision,
-                            reason: None,
+                            reason: request.guidance,
                         })
                         .await
                         .map_err(map_service_error)?;
@@ -856,7 +855,7 @@ fn to_backend_snapshot(
 /// approved revision. Approval finalization intentionally leaves both
 /// pointers on the approved revision, so projecting `approval_target` by
 /// itself would create a phantom amendment card after a successful adoption.
-fn has_pending_charter_approval(charter: &services::solo_session::SoloCharterSnapshot) -> bool {
+fn has_pending_charter_approval(charter: &crate::session::SoloCharterSnapshot) -> bool {
     charter.approval_target.is_some()
         && charter.current_draft_revision_id.as_deref()
             != charter.current_approved_revision_id.as_deref()
@@ -995,9 +994,7 @@ fn to_setup_agent_snapshot(candidate: &SoloAgentCandidate) -> SetupAgentSnapshot
     }
 }
 
-fn to_message_snapshot(
-    message: &services::solo_session::SoloChatMessageSnapshot,
-) -> MessageSnapshot {
+fn to_message_snapshot(message: &crate::session::SoloChatMessageSnapshot) -> MessageSnapshot {
     MessageSnapshot {
         id: message.id.clone(),
         sequence: message.sequence,
@@ -1021,10 +1018,7 @@ fn to_message_snapshot(
 }
 
 fn to_turn_snapshot(turn: &SoloTurnSnapshot) -> TurnSnapshot {
-    let retryable = matches!(
-        turn.status,
-        SoloTurnStatus::RetryWait | SoloTurnStatus::Failed
-    );
+    let retryable = turn.status == SoloTurnStatus::RetryWait || turn.retry_action.is_some();
     TurnSnapshot {
         id: turn.id.clone(),
         triggering_message_id: turn.triggering_message_id.clone(),
@@ -1127,10 +1121,14 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
                 .unwrap_or_else(|| "blocked".to_owned()),
             headline: "Task blocked".to_owned(),
             detail,
-            retryable: !interruption.recovery_actions.is_empty(),
+            retryable: task
+                .available_actions
+                .iter()
+                .any(|offer| matches!(offer.action.verb(), "retry" | "restart" | "send_back")),
         })
     });
     TaskSnapshot {
+        review_actions: task.available_actions.clone(),
         id: task.id.clone(),
         title: task.title.clone(),
         state: task_state(&task.status),
@@ -1140,12 +1138,10 @@ fn to_task_snapshot(task: &SoloTaskSnapshot) -> TaskSnapshot {
         checks,
         commit,
         blocker,
-        retryable: task.available_actions.iter().any(|action| {
-            matches!(
-                action,
-                services::solo_session::SoloTaskAction::RequestChanges
-            )
-        }),
+        retryable: task
+            .available_actions
+            .iter()
+            .any(|action| matches!(action.action, api_types::TaskAction::SendBack { .. })),
     }
 }
 
@@ -1237,7 +1233,9 @@ fn map_service_error(error: ServiceError) -> BackendError {
     match error {
         ServiceError::Db(DbError::VersionConflict)
         | ServiceError::Db(DbError::TaskVersionConflict { .. })
-        | ServiceError::Db(DbError::BoardRevisionConflict { .. }) => {
+        | ServiceError::Db(DbError::BoardRevisionConflict { .. })
+        | ServiceError::Db(DbError::TurnNotRetryable)
+        | ServiceError::Db(DbError::ChatTurnLive) => {
             BackendError::conflict("the durable record changed; refresh and retry", None)
         }
         ServiceError::Conflict(message) => BackendError::conflict(
@@ -1298,11 +1296,11 @@ fn safe_public_service_detail(detail: String, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use services::solo_session::SoloTaskExecutionSnapshot;
+    use crate::session::SoloTaskExecutionSnapshot;
 
     fn approval_target() -> SoloCharterApprovalTarget {
         SoloCharterApprovalTarget {
-            kind: services::solo_session::SoloCharterApprovalKind::Adoption,
+            kind: crate::session::SoloCharterApprovalKind::Adoption,
             project_id: "project".to_owned(),
             charter_id: "charter".to_owned(),
             revision_id: "revision".to_owned(),
@@ -1324,8 +1322,8 @@ mod tests {
         draft: Option<&str>,
         approved: Option<&str>,
         with_target: bool,
-    ) -> services::solo_session::SoloCharterSnapshot {
-        services::solo_session::SoloCharterSnapshot {
+    ) -> crate::session::SoloCharterSnapshot {
+        crate::session::SoloCharterSnapshot {
             id: "charter".to_owned(),
             project_id: Some("project".to_owned()),
             version: 3,
@@ -1420,6 +1418,14 @@ mod tests {
         assert_eq!(commit.summary.as_deref(), Some("newest summary"));
     }
 
+    #[test]
+    fn retry_refusals_are_conflicts() {
+        for refusal in [DbError::TurnNotRetryable, DbError::ChatTurnLive] {
+            let error = map_service_error(ServiceError::Db(refusal));
+            assert_eq!(error.kind, backend::BackendErrorKind::Conflict);
+        }
+    }
+
     fn turn(id: &str, state: TurnState, version: i64, retryable: bool) -> TurnSnapshot {
         TurnSnapshot {
             id: id.into(),
@@ -1473,6 +1479,49 @@ mod tests {
         assert!(!has_pending_charter_approval(&charter_snapshot(
             None, None, true,
         )));
+    }
+
+    #[test]
+    fn failed_and_cancelled_turns_keep_manual_retry_without_a_failure_class() {
+        for status in [SoloTurnStatus::Failed, SoloTurnStatus::Cancelled] {
+            let turn = SoloTurnSnapshot {
+                id: "turn".into(),
+                chat_id: "chat".into(),
+                triggering_message_id: "message".into(),
+                responder_identity_id: None,
+                profile_id: None,
+                status,
+                pending_interaction_id: None,
+                attempt_count: 3,
+                max_attempts: 3,
+                lease_expires_at: None,
+                next_attempt_at: None,
+                response_message_id: None,
+                error_code: None,
+                error_message: None,
+                retry_action: Some(api_types::RetryTurnAction {
+                    kind: api_types::RetryTurnActionKind::RetryTurn,
+                    chat_id: "chat".into(),
+                    turn_id: "turn".into(),
+                    expected_version: 4,
+                }),
+                correlation_id: "correlation".into(),
+                version: 4,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            };
+            assert!(to_turn_snapshot(&turn).retryable);
+            let superseded = SoloTurnSnapshot {
+                retry_action: None,
+                ..turn
+            };
+            assert!(!to_turn_snapshot(&superseded).retryable);
+            let waiting = SoloTurnSnapshot {
+                status: SoloTurnStatus::RetryWait,
+                ..superseded
+            };
+            assert!(to_turn_snapshot(&waiting).retryable);
+        }
     }
 
     #[test]

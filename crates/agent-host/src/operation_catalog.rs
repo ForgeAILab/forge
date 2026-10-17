@@ -9,6 +9,7 @@
 //! at the service boundary.
 
 use serde_json::Value;
+use std::sync::LazyLock;
 
 use crate::CanonicalScopeType;
 
@@ -36,6 +37,7 @@ pub const PROJECT_CURRENT_STATE_OPERATION: &str = "project.current_state";
 /// artifacts it captured. This is how a Project Agent checks an observation
 /// before citing it, and how it decides whether the outcome needs a fix Task.
 pub const PROJECT_OBSERVATIONS_OPERATION: &str = "project.observations";
+pub const REPO_INTEGRATION_QUEUE_OPERATION: &str = "repo.integration_queue";
 /// Read the current approved Charter's full rendered text on demand. The
 /// Charter is Project data, not resident prompt content: the handoff packet
 /// and the operating skill carry only its identity and digests, so this read
@@ -45,17 +47,10 @@ pub const PROJECT_CHARTER_READ_OPERATION: &str = "project.charter";
 /// operating skill keeps only an index of these sections so the detailed
 /// doctrine stops occupying every turn's fixed prompt budget.
 pub const PROJECT_SKILL_SECTION_OPERATION: &str = "skill.section";
-/// The canonical doctrine section names. The read schema exposes this enum
-/// and the services provider must serve exactly these names; a drift between
-/// the two is caught by a services-side test.
-pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = &[
-    "research",
-    "documents",
-    "scope_change",
-    "tasks",
-    "milestones",
-    "release",
-];
+/// The canonical doctrine section names, owned by the `skill.section`
+/// operation spec. The services provider must serve exactly these names; a
+/// drift between the two is caught by a services-side test.
+pub const PROJECT_SKILL_SECTION_NAMES: &[&str] = operation_registry::project_reads::SECTION_NAMES;
 pub const PROJECT_CHARTER_ADOPTION_OPERATION: &str = "project.charter.adoption";
 /// Replace the Project's default independent review commands while
 /// preserving every other Project review-policy field.
@@ -65,16 +60,11 @@ pub const PROJECT_DECISION_OPERATION: &str = "project.decision";
 pub const PROJECT_MILESTONE_OPERATION: &str = "project.milestone";
 pub const PROJECT_EVIDENCE_OPERATION: &str = "project.evidence";
 pub const PROJECT_VALIDATION_OPERATION: &str = "project.validation";
+pub const PROJECT_ESCALATE_OPERATION: &str = "project.escalate";
 pub const PROJECT_READINESS_OPERATION: &str = "project.readiness";
 pub const PROJECT_RELEASE_OPERATION: &str = "project.release.request";
 pub const TASK_PROPOSE_OPERATION: &str = "task.propose";
 pub const TASK_ADAPTIVE_OPERATION: &str = "task.adaptive";
-pub const TASK_REVIEW_OPERATION: &str = "task.review";
-/// Cancel a non-terminal Task in the bound Project at an exact Task version.
-/// This is a normal lifecycle command, including for a healthy queued or
-/// running Task; `task.recover` remains reserved for work that has stopped.
-pub const TASK_CANCEL_OPERATION: &str = "task.cancel";
-
 /// Add or remove one prerequisite edge between two Tasks in the bound
 /// Project.
 ///
@@ -87,7 +77,7 @@ pub const TASK_DEPENDENCY_OPERATION: &str = "task.dependency";
 /// an expired lease, a lost runtime, a dispatch race -- leaves a perfectly good
 /// Task stranded; recovering it is what the Project Agent's own protocol asks
 /// for, and without this the only reachable remedy is a duplicate Task.
-pub const TASK_RECOVER_OPERATION: &str = "task.recover";
+pub const TASK_ACTION_OPERATION: &str = "task.action";
 /// Write the current execution's plan candidate. Forge publishes the
 /// candidate only after the execution completes successfully; this operation
 /// never edits the Task's canonical plan directly.
@@ -126,7 +116,6 @@ pub enum OperationExposure {
 pub enum OperationInputContract {
     ReadArguments,
     ProposalEnvelope,
-    CoordinationEnvelope,
 }
 
 /// Whether an operation is available in a legacy Project setup session, a
@@ -140,77 +129,27 @@ pub enum OperationSetupExposure {
     ReadyOnly,
 }
 
-/// The canonical permission family. The concrete persisted permission name
-/// is selected by `permission_for_scope`, so the same operation can safely be
-/// used by an Account/Agent Chat or Project/Project Chat scope without a
-/// second operation declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationPermission {
-    ReadAccountOrAgentChat,
-    ReadAccount,
-    ReadAgentChat,
-    ReadProjectOrAgentChat,
-    ReadProject,
-    ProposeDiscovery,
-    ProposeProject,
-    ProposeTask,
-    /// Task-scoped execution records are gated on the Task read permission.
-    /// Role-specific tool composition narrows the individual operations:
-    /// Workers and reviewers may capture observations, while only planners
-    /// and Workers may write an execution-scoped plan candidate. None of
-    /// these operations writes repository content or mutates Task workflow.
-    CaptureTaskEvidence,
-}
-
+/// Permission projection of the registry's authority rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationPermission(pub operation_registry::AuthorityRule);
 impl OperationPermission {
-    /// Whether this contract's permission is the one a caller asked for, in
-    /// any scope that carries it.
-    ///
-    /// The mapping is per scope (`ProposeTask` is `propose_task` for a
-    /// Project and an Agent Chat, and nothing for a Task), so admission has
-    /// to ask the enum rather than compare a string it guessed.
     #[must_use]
     pub fn admits_permission(self, permission: &str) -> bool {
-        [
-            CanonicalScopeType::Account,
-            CanonicalScopeType::Project,
-            CanonicalScopeType::AgentChat,
-            CanonicalScopeType::Task,
-        ]
-        .into_iter()
-        .any(|scope_type| self.for_scope(scope_type) == Some(permission))
+        self.0
+            .permissions
+            .iter()
+            .any(|(_, name)| *name == permission)
     }
-
-    pub const fn for_scope(self, scope_type: CanonicalScopeType) -> Option<&'static str> {
-        match (self, scope_type) {
-            (Self::ReadAccountOrAgentChat, CanonicalScopeType::Account) => Some("read_account"),
-            (Self::ReadAccountOrAgentChat, CanonicalScopeType::AgentChat) => {
-                Some("read_agent_chat")
-            }
-            (Self::ReadAccount, CanonicalScopeType::Account) => Some("read_account"),
-            (Self::ReadAgentChat, CanonicalScopeType::AgentChat) => Some("read_agent_chat"),
-            (Self::ReadProjectOrAgentChat, CanonicalScopeType::Project) => Some("read_project"),
-            (Self::ReadProjectOrAgentChat, CanonicalScopeType::AgentChat) => {
-                Some("read_agent_chat")
-            }
-            (Self::ReadProject, CanonicalScopeType::Project) => Some("read_project"),
-            (
-                Self::ProposeDiscovery,
-                CanonicalScopeType::Account | CanonicalScopeType::AgentChat,
-            ) => Some("propose_discovery"),
-            (
-                Self::ProposeProject,
-                CanonicalScopeType::Account
-                | CanonicalScopeType::Project
-                | CanonicalScopeType::AgentChat,
-            ) => Some("propose_project"),
-            (Self::ProposeTask, CanonicalScopeType::Project | CanonicalScopeType::AgentChat) => {
-                Some("propose_task")
-            }
-            (Self::CaptureTaskEvidence, CanonicalScopeType::Task) => Some("task_read"),
-            _ => None,
-        }
+    pub fn for_scope(self, scope: CanonicalScopeType) -> Option<&'static str> {
+        self.0.permission(scope_name(scope))
+    }
+}
+fn scope_name(scope: CanonicalScopeType) -> &'static str {
+    match scope {
+        CanonicalScopeType::Account => "account",
+        CanonicalScopeType::Project => "project",
+        CanonicalScopeType::AgentChat => "agent_chat",
+        CanonicalScopeType::Task => "task",
     }
 }
 
@@ -246,376 +185,99 @@ pub struct OperationContract {
     pub output: OperationOutputContract,
 }
 
-const MAIN_SCOPES: &[CanonicalScopeType] =
-    &[CanonicalScopeType::Account, CanonicalScopeType::AgentChat];
-const PROJECT_SCOPES: &[CanonicalScopeType] =
-    &[CanonicalScopeType::Project, CanonicalScopeType::AgentChat];
+#[cfg(test)]
 const TASK_SCOPES: &[CanonicalScopeType] = &[CanonicalScopeType::Task];
 
-pub const MIGRATED_OPERATION_CONTRACTS: &[OperationContract] = &[
-    OperationContract {
-        operation: MAIN_GENESIS_START_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeDiscovery,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_GENESIS_PROJECT_AGENTS_READ_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadAccountOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeDiscovery,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_CHARTER_READ_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadAccountOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_CHARTER_DRAFT_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeDiscovery,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_CHARTER_READINESS_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadAccountOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_CHARTER_DIFF_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadAccountOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_CHARTER_APPROVAL_TARGET_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadAccountOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_PROJECT_CREATE_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: MAIN_INQUIRY_RUN_OPERATION,
-        surface: OperationSurface::MainOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: MAIN_SCOPES,
-        // A Query runs directly instead of queueing an approval envelope: the
-        // caller is blocked on the answer, so an Action round trip would only
-        // strand the turn. Authority is bounded by the sub-agent's read-only
-        // surface, not by a gate.
-        classification: OperationClassification::Query,
-        // Gated on research authority rather than a plain read: this spends
-        // provider tokens, so it should be revocable independently of the
-        // bounded Main reads.
-        permission: OperationPermission::ProposeDiscovery,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_CURRENT_STATE_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::Always,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadProjectOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_OBSERVATIONS_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadProjectOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_CHARTER_READ_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadProjectOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_SKILL_SECTION_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedRead,
-        input: OperationInputContract::ReadArguments,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::Query,
-        permission: OperationPermission::ReadProjectOrAgentChat,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_CHARTER_ADOPTION_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::SetupOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_REVIEW_CONFIG_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_DOCUMENT_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_DECISION_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_MILESTONE_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_EVIDENCE_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_VALIDATION_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_READINESS_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: PROJECT_RELEASE_OPERATION,
-        surface: OperationSurface::ProjectOrchestration,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::ApprovalRequiredAction,
-        permission: OperationPermission::ProposeProject,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_PROPOSE_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_ADAPTIVE_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_REVIEW_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_CANCEL_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_DEPENDENCY_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::CoordinationEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_RECOVER_OPERATION,
-        surface: OperationSurface::Coordination,
-        // Coordination composes GenericProposal operations into
-        // `forge_scope_propose`; a TypedProposal here would leave the
-        // operation dispatchable but invisible to the Agent.
-        exposure: OperationExposure::GenericProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: PROJECT_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::ProposeTask,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_PLAN_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: TASK_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::CaptureTaskEvidence,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_WORKLOG_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: TASK_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::CaptureTaskEvidence,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-    OperationContract {
-        operation: TASK_EVIDENCE_OPERATION,
-        surface: OperationSurface::Coordination,
-        exposure: OperationExposure::TypedProposal,
-        input: OperationInputContract::ProposalEnvelope,
-        setup: OperationSetupExposure::ReadyOnly,
-        supported_scopes: TASK_SCOPES,
-        classification: OperationClassification::DirectCommand,
-        permission: OperationPermission::CaptureTaskEvidence,
-        output: SHARED_ORCHESTRATION_OUTCOME,
-    },
-];
+/// Generated host metadata. Input, permission, effect and availability are
+/// projected from the registry; the host adds only its outcome envelope.
+pub static MIGRATED_OPERATION_CONTRACTS: LazyLock<Vec<OperationContract>> = LazyLock::new(|| {
+    operation_registry::READ_CATALOG
+        .iter()
+        .chain(operation_registry::PROPOSAL_CATALOG.iter())
+        .filter_map(|spec| {
+            let aggregate = spec.surfaces.first()?.native_aggregate;
+            let (surface, exposure, input) = match aggregate {
+                "forge_main_orchestration_read" => (
+                    OperationSurface::MainOrchestration,
+                    OperationExposure::TypedRead,
+                    OperationInputContract::ReadArguments,
+                ),
+                "forge_main_orchestration_propose" => (
+                    OperationSurface::MainOrchestration,
+                    OperationExposure::TypedProposal,
+                    OperationInputContract::ProposalEnvelope,
+                ),
+                "forge_project_orchestration_read" => (
+                    OperationSurface::ProjectOrchestration,
+                    OperationExposure::TypedRead,
+                    OperationInputContract::ReadArguments,
+                ),
+                "forge_project_orchestration_propose" => (
+                    OperationSurface::ProjectOrchestration,
+                    OperationExposure::TypedProposal,
+                    OperationInputContract::ProposalEnvelope,
+                ),
+                "forge_scope_propose"
+                    if spec.effect == operation_registry::EffectClass::DirectCommand =>
+                {
+                    (
+                        OperationSurface::Coordination,
+                        if spec.authority.permission("task").is_some() {
+                            OperationExposure::TypedProposal
+                        } else {
+                            OperationExposure::GenericProposal
+                        },
+                        OperationInputContract::ProposalEnvelope,
+                    )
+                }
+                _ => return None,
+            };
+            let scopes = spec
+                .authority
+                .permissions
+                .iter()
+                .map(|(scope, _)| match *scope {
+                    "account" => CanonicalScopeType::Account,
+                    "project" => CanonicalScopeType::Project,
+                    "agent_chat" => CanonicalScopeType::AgentChat,
+                    "task" => CanonicalScopeType::Task,
+                    _ => unreachable!("native registry scope"),
+                })
+                .collect::<Vec<_>>();
+            Some(OperationContract {
+                operation: spec.id,
+                surface,
+                exposure,
+                input,
+                setup: match spec.availability {
+                    operation_registry::AvailabilityRule::Always
+                    | operation_registry::AvailabilityRule::MainChatOnly => {
+                        OperationSetupExposure::Always
+                    }
+                    operation_registry::AvailabilityRule::SetupOnly => {
+                        OperationSetupExposure::SetupOnly
+                    }
+                    operation_registry::AvailabilityRule::ReadyOnly => {
+                        OperationSetupExposure::ReadyOnly
+                    }
+                },
+                supported_scopes: Box::leak(scopes.into_boxed_slice()),
+                classification: effect_classification(spec.effect),
+                permission: OperationPermission(spec.authority),
+                output: SHARED_ORCHESTRATION_OUTCOME,
+            })
+        })
+        .collect::<Vec<_>>()
+});
+fn effect_classification(effect: operation_registry::EffectClass) -> OperationClassification {
+    match effect {
+        operation_registry::EffectClass::Query => OperationClassification::Query,
+        operation_registry::EffectClass::DirectCommand => OperationClassification::DirectCommand,
+        operation_registry::EffectClass::ApprovalRequired => {
+            OperationClassification::ApprovalRequiredAction
+        }
+    }
+}
 
 #[must_use]
 pub fn operation_contract(operation: &str) -> Option<&'static OperationContract> {
@@ -719,6 +381,12 @@ pub fn classify_operation(operation: &str, payload: Option<&Value>) -> Operation
         }
         return contract.classification;
     }
+    if let Some(spec) = operation_registry::READ_CATALOG
+        .lookup(operation)
+        .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+    {
+        return effect_classification(spec.effect);
+    }
     if is_query_operation(operation) {
         return OperationClassification::Query;
     }
@@ -756,39 +424,21 @@ pub fn operation_permission(
     scope_type: CanonicalScopeType,
     operation: &str,
 ) -> Option<&'static str> {
+    if let Some(spec) = operation_registry::READ_CATALOG
+        .lookup(operation)
+        .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+    {
+        return spec.authority.permission(match scope_type {
+            CanonicalScopeType::Account => "account",
+            CanonicalScopeType::Project => "project",
+            CanonicalScopeType::AgentChat => "agent_chat",
+            CanonicalScopeType::Task => "task",
+        });
+    }
     if let Some(permission) = operation_contract_permission(scope_type, operation) {
         return Some(permission);
     }
-    let permission = match (scope_type, operation) {
-        (
-            CanonicalScopeType::Account,
-            "account.summary" | "discovery.read" | "portfolio.read" | "inbox.read"
-            | "commitments.read" | "delivery.read",
-        ) => "read_account",
-        (
-            CanonicalScopeType::Project,
-            "project.summary" | "work.read" | "events.read" | "inbox.read" | "commitments.read"
-            | "delivery.read",
-        ) => "read_project",
-        (
-            CanonicalScopeType::AgentChat,
-            "agent_chat.summary" | "discovery.read" | "portfolio.read" | "project.summary"
-            | "work.read" | "events.read" | "inbox.read" | "commitments.read" | "delivery.read",
-        ) => "read_agent_chat",
-        (
-            CanonicalScopeType::Task,
-            "task.summary" | "work.read" | "events.read" | "inbox.read" | "commitments.read"
-            | "delivery.read",
-        ) => "read_task",
-        (_, "memory.read" | "decisions.read") => "read_memory",
-        (_, "message.propose" | "message.send") => "propose_message",
-        (_, "commitment.propose" | "commitment.update") => "propose_commitment",
-        (_, "memory.publish" | "memory.supersede") => "propose_memory",
-        (_, "review.propose" | "review.request") => "propose_review",
-        (_, "session.action") => "propose_session",
-        _ => return None,
-    };
-    Some(permission)
+    None
 }
 
 /// Whether `operation` is a coordination command an Agent may execute
@@ -827,26 +477,7 @@ pub fn is_coordination_generic_proposal(operation: &str) -> bool {
 
 #[must_use]
 pub fn is_query_operation(operation: &str) -> bool {
-    if let Some(contract) = operation_contract(operation) {
-        return contract.classification == OperationClassification::Query;
-    }
-    matches!(
-        operation,
-        "web.search"
-            | "account.summary"
-            | "project.summary"
-            | "agent_chat.summary"
-            | "task.summary"
-            | "discovery.read"
-            | "portfolio.read"
-            | "work.read"
-            | "decisions.read"
-            | "events.read"
-            | "memory.read"
-            | "inbox.read"
-            | "commitments.read"
-            | "delivery.read"
-    )
+    operation_registry::READ_CATALOG.lookup(operation).is_some() || operation == "web.search"
 }
 
 #[must_use]
@@ -865,21 +496,9 @@ pub fn is_denied_operation(operation: &str) -> bool {
 
 #[must_use]
 pub fn is_approval_required_operation(operation: &str) -> bool {
-    if let Some(contract) = operation_contract(operation) {
-        return contract.classification == OperationClassification::ApprovalRequiredAction;
-    }
-    matches!(
-        operation,
-        "message.propose"
-            | "message.send"
-            | "commitment.propose"
-            | "commitment.update"
-            | "memory.publish"
-            | "memory.supersede"
-            | "review.propose"
-            | "review.request"
-            | "session.action"
-    )
+    operation_registry::PROPOSAL_CATALOG
+        .lookup(operation)
+        .is_some_and(|spec| spec.effect == operation_registry::EffectClass::ApprovalRequired)
 }
 
 #[must_use]
@@ -899,136 +518,73 @@ pub fn is_allowed_project_direct_payload(operation: &str, payload: &Value) -> bo
     if contains_authority_override(payload) {
         return false;
     }
-    let action = payload.get("action").and_then(Value::as_str);
-    match operation {
-        PROJECT_CHARTER_ADOPTION_OPERATION => action == Some("draft_revision"),
-        PROJECT_REVIEW_CONFIG_OPERATION => action == Some("set_ci_steps"),
-        PROJECT_DOCUMENT_OPERATION => matches!(
-            action,
-            Some("draft_revision") | Some("propose_approval") | Some("approve")
-        ),
-        PROJECT_DECISION_OPERATION => {
-            matches!(action, Some("record_candidate") | Some("record_effective"))
-                && payload.get("decision_class").and_then(Value::as_str)
-                    == Some("project_implementation")
+    if let Some(spec) = operation_registry::PROPOSAL_CATALOG.lookup(operation) {
+        if spec.effect != operation_registry::EffectClass::DirectCommand {
+            return false;
         }
-        PROJECT_MILESTONE_OPERATION => {
-            matches!(
-                action,
-                Some("define") | Some("revise") | Some("set_primary")
-            )
+        let properties = &spec.input.schema["properties"];
+        if let Some(action_schema) = properties.get("action") {
+            let Some(action) = payload.get("action") else {
+                return false;
+            };
+            if let Some(values) = action_schema["enum"].as_array() {
+                if !values.contains(action) {
+                    return false;
+                }
+            } else if (action_schema["type"] == "object" || action_schema["oneOf"].is_array())
+                && serde_json::from_value::<api_types::TaskAction>(action.clone()).is_err()
+            {
+                return false;
+            }
         }
-        // `capture` is the Project Agent's own verification artifact: the
-        // provider stores the bytes as a Project media asset and the call
-        // continues as the same bounded attach. Both forms are append-only
-        // and carry no authority beyond the milestone they bind to.
-        PROJECT_EVIDENCE_OPERATION => matches!(action, Some("attach") | Some("capture")),
-        // Recording an agent-observed validation result is bounded and
-        // append-only: it names one immutable check on the current definition
-        // revision and carries its own receipt. The `manual` source kind stays
-        // outside this path -- a user attestation is only ever a user's.
-        PROJECT_VALIDATION_OPERATION => action == Some("record"),
-        PROJECT_READINESS_OPERATION => action == Some("evaluate"),
-        // Capturing an artifact the run produced is append-only and carries no
-        // authority beyond the Task it is bound to.
-        TASK_EVIDENCE_OPERATION => action == Some("capture"),
-        TASK_WORKLOG_OPERATION => action == Some("append"),
-        // `cancel_task` is bounded repair authority within the adaptive
-        // envelope: the doctrine directs the Agent to absorb a
-        // verification-shaped Task by cancelling it and settling its checks
-        // itself.
-        TASK_RECOVER_OPERATION => matches!(
-            action,
-            Some("resume_session")
-                | Some("reexecute")
-                | Some("reset_to_initial")
-                | Some("reset_retry_window")
-                | Some("cancel_task")
-        ),
-        // A release candidate is a consequential approval/audit proposal even
-        // though it does not perform the final immutable release itself.  It
-        // must retain an AgentAction until the user-facing approval contract
-        // consumes it.
-        PROJECT_RELEASE_OPERATION => false,
-        _ => false,
+        if let Some(values) = properties["decision_class"]["enum"].as_array() {
+            if !payload
+                .get("decision_class")
+                .is_some_and(|value| values.contains(value))
+            {
+                return false;
+            }
+        }
+        if properties.get("action").is_none() {
+            return spec.validate_arguments(payload).is_ok();
+        }
+        return true;
     }
+    false
 }
+
+/// Field names whose values Forge derives from the authenticated binding.
+/// Every authority guard starts from this one list: the dispatch guard below
+/// adds `project_id`, and native preparation adds its prompt-injection names
+/// (`typed_tools::reject_authority_overrides`).
+pub(crate) const SERVER_DERIVED_FIELDS: &[&str] = &[
+    "actor_identity_id",
+    "identity_id",
+    "scope_type",
+    "scope_id",
+    "authority",
+    "permission",
+    "workspace",
+    "workspace_path",
+    "workspace_lease",
+    "repository_path",
+    "repository_url",
+    "credential",
+    "target_type",
+    "target_id",
+];
 
 /// Return whether a payload attempts to supply authority or scope that Forge
 /// must derive from the authenticated binding.
 #[must_use]
 pub fn contains_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor_identity_id",
-        "identity_id",
-        "scope_type",
-        "scope_id",
-        "project_id",
-        "authority",
-        "permission",
-        "workspace",
-        "workspace_path",
-        "workspace_lease",
-        "repository_path",
-        "repository_url",
-        "credential",
-        "target_type",
-        "target_id",
-    ];
     match value {
         Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_authority_override(nested)
+            key == "project_id"
+                || SERVER_DERIVED_FIELDS.contains(&key.as_str())
+                || contains_authority_override(nested)
         }),
         Value::Array(values) => values.iter().any(contains_authority_override),
-        _ => false,
-    }
-}
-
-/// Return whether an adaptive task payload attempts to provide a value that
-/// Forge must derive from the authenticated Project/Project-chat binding or
-/// the active execution governance.  These fields are operation-specific:
-/// they are intentionally not part of the generic authority list because
-/// some older proposal payloads still carry their own domain fields.
-#[must_use]
-pub fn contains_adaptive_authority_override(value: &Value) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "actor",
-        "actor_id",
-        "actor_identity_id",
-        "authority",
-        "charter_revision_id",
-        "credential",
-        "elevated_operations",
-        "executor",
-        "fixed_acceptance",
-        "fixed_boundary",
-        "fixed_boundary_digest",
-        "fixed_outcomes",
-        "fixed_risk_classes",
-        "forbidden_side_effects",
-        "governance",
-        "identity_id",
-        "permission",
-        "plan_item_id",
-        "project_id",
-        "provenance",
-        "repository_path",
-        "repository_url",
-        "risk_class",
-        "scope_id",
-        "scope_type",
-        "target_id",
-        "target_type",
-        "workspace",
-        "workspace_lease",
-        "workspace_path",
-    ];
-
-    match value {
-        Value::Object(object) => object.iter().any(|(key, nested)| {
-            FORBIDDEN_FIELDS.contains(&key.as_str()) || contains_adaptive_authority_override(nested)
-        }),
-        Value::Array(values) => values.iter().any(contains_adaptive_authority_override),
         _ => false,
     }
 }
@@ -1041,40 +597,14 @@ fn leaked_operation_name(operation: &str) -> &'static str {
     if let Some(contract) = operation_contract(operation) {
         return contract.operation;
     }
+    if let Some(spec) = operation_registry::READ_CATALOG
+        .lookup(operation)
+        .or_else(|| operation_registry::PROPOSAL_CATALOG.lookup(operation))
+    {
+        return spec.id;
+    }
     match operation {
-        // Generic operation names are only used by the built-in catalog.
-        "account.summary" => "account.summary",
-        "project.summary" => "project.summary",
-        "agent_chat.summary" => "agent_chat.summary",
-        "task.summary" => "task.summary",
-        "discovery.read" => "discovery.read",
-        "portfolio.read" => "portfolio.read",
-        "work.read" => "work.read",
-        "decisions.read" => "decisions.read",
-        "events.read" => "events.read",
-        "memory.read" => "memory.read",
-        "inbox.read" => "inbox.read",
-        "commitments.read" => "commitments.read",
-        "delivery.read" => "delivery.read",
         "web.search" => "web.search",
-        TASK_PROPOSE_OPERATION => TASK_PROPOSE_OPERATION,
-        TASK_REVIEW_OPERATION => TASK_REVIEW_OPERATION,
-        "message.propose" => "message.propose",
-        "message.send" => "message.send",
-        "commitment.propose" => "commitment.propose",
-        "commitment.update" => "commitment.update",
-        "memory.publish" => "memory.publish",
-        "memory.supersede" => "memory.supersede",
-        "review.propose" => "review.propose",
-        "review.request" => "review.request",
-        "session.action" => "session.action",
-        "project.lifecycle" => "project.lifecycle",
-        "handoff.publish" => "handoff.publish",
-        "decision.request" => "decision.request",
-        "project.release" => "project.release",
-        "project.milestone.release" => "project.milestone.release",
-        "waiver.create" => "waiver.create",
-        "release.execute" => "release.execute",
         _ => "unknown",
     }
 }
@@ -1099,12 +629,10 @@ mod tests {
         assert_eq!(
             admitted,
             vec![
-                TASK_PROPOSE_OPERATION,
+                TASK_ACTION_OPERATION,
                 TASK_ADAPTIVE_OPERATION,
-                TASK_REVIEW_OPERATION,
-                TASK_CANCEL_OPERATION,
                 TASK_DEPENDENCY_OPERATION,
-                TASK_RECOVER_OPERATION,
+                TASK_PROPOSE_OPERATION,
             ]
         );
 
@@ -1122,7 +650,7 @@ mod tests {
 
         // The permission is part of the decision, not decoration.
         assert!(!is_coordination_direct_command(
-            TASK_CANCEL_OPERATION,
+            TASK_ACTION_OPERATION,
             "read_project"
         ));
         assert!(!is_coordination_direct_command(
@@ -1135,7 +663,7 @@ mod tests {
     fn migrated_contracts_have_unique_complete_metadata() {
         let mut operations = BTreeSet::new();
 
-        for contract in MIGRATED_OPERATION_CONTRACTS {
+        for contract in MIGRATED_OPERATION_CONTRACTS.iter() {
             assert!(
                 operations.insert(contract.operation),
                 "duplicate migrated operation contract: {}",
@@ -1234,7 +762,10 @@ mod tests {
         assert_eq!(contract.surface, OperationSurface::ProjectOrchestration);
         assert_eq!(contract.exposure, OperationExposure::TypedProposal);
         assert_eq!(contract.setup, OperationSetupExposure::ReadyOnly);
-        assert_eq!(contract.permission, OperationPermission::ProposeProject);
+        assert_eq!(
+            contract.permission.for_scope(CanonicalScopeType::Project),
+            Some("propose_project")
+        );
         assert_eq!(
             classify_operation(
                 PROJECT_REVIEW_CONFIG_OPERATION,
@@ -1261,7 +792,7 @@ mod tests {
         let contract = operation_contract(TASK_ADAPTIVE_OPERATION).expect("adaptive contract");
         assert_eq!(contract.surface, OperationSurface::Coordination);
         assert_eq!(contract.exposure, OperationExposure::GenericProposal);
-        assert_eq!(contract.input, OperationInputContract::CoordinationEnvelope);
+        assert_eq!(contract.input, OperationInputContract::ProposalEnvelope);
         assert_eq!(contract.setup, OperationSetupExposure::ReadyOnly);
         assert_eq!(
             contract.classification,
@@ -1305,15 +836,15 @@ mod tests {
         assert_eq!(contract.surface, OperationSurface::Coordination);
         assert_eq!(contract.exposure, OperationExposure::TypedProposal);
         assert_eq!(contract.input, OperationInputContract::ProposalEnvelope);
-        assert_eq!(contract.setup, OperationSetupExposure::ReadyOnly);
+        assert_eq!(contract.setup, OperationSetupExposure::Always);
         assert_eq!(contract.supported_scopes, TASK_SCOPES);
         assert_eq!(
             contract.classification,
             OperationClassification::DirectCommand
         );
         assert_eq!(
-            contract.permission,
-            OperationPermission::CaptureTaskEvidence
+            contract.permission.for_scope(CanonicalScopeType::Task),
+            Some("task_read")
         );
         assert_eq!(
             operation_contract_permission(CanonicalScopeType::Task, TASK_PLAN_OPERATION),
@@ -1329,7 +860,7 @@ mod tests {
             .any(|operation| operation == TASK_PLAN_OPERATION)
         );
         assert!(
-            !operation_names_for_surface(
+            operation_names_for_surface(
                 OperationSurface::Coordination,
                 true,
                 OperationExposure::TypedProposal,
@@ -1348,20 +879,5 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[test]
-    fn adaptive_task_rejects_scope_and_governance_overrides() {
-        let payload = serde_json::json!({
-            "action": "split",
-            "source_task_id": "task-1",
-            "expected_task_version": 1,
-            "expected_board_revision": 1,
-            "rationale": "decompose",
-            "items": [{"title": "child"}],
-            "project_id": "other-project",
-            "governance": {"fixed_boundary_digest": "forged"}
-        });
-        assert!(contains_adaptive_authority_override(&payload));
     }
 }

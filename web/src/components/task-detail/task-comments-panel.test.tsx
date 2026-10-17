@@ -10,7 +10,7 @@ import { qk } from '@/api/query-keys'
 import { routeSsePayload } from '@/api/sse'
 import type { useCreateComment, useDeleteComment } from '@/api/hooks'
 import type { Comment, Task, TaskMediaResponse } from '@/types/generated'
-import { TaskCommentsPanel } from './task-comments-panel'
+import { TaskCommentsPanel, TaskEvidencePreview } from './task-comments-panel'
 
 const now = '2026-05-19T12:00:00Z'
 const originalCreateObjectURL = URL.createObjectURL
@@ -18,6 +18,18 @@ const originalRevokeObjectURL = URL.revokeObjectURL
 let objectUrlCounter = 0
 
 const task = {
+  condition: {
+    kind: 'clear',
+    details: {
+      failure_kind: null,
+      diagnostic: null,
+      interruption: null,
+      failed: false,
+      blocked: false,
+      human_wait: false,
+      entry_wait: false,
+    },
+  },
   id: 'task-1',
   project_id: 'project-1',
   title: 'Task',
@@ -26,7 +38,11 @@ const task = {
   priority: 0,
   board_position: 0,
   role_assignments: [],
+  effective_coder: null,
+  effective_coder_source: null,
   remaining_retries: {},
+  retry_limits: {},
+  placement: null,
   version: 1,
   created_at: now,
   updated_at: now,
@@ -82,7 +98,12 @@ function mockMediaFetch(items: TaskMediaResponse[]) {
   })
 }
 
-function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
+function renderPanel(
+  content: string,
+  mediaItems: TaskMediaResponse[] = [],
+  entry: Partial<Comment> = {},
+  taskOverrides: Partial<Task> = {},
+) {
   mockMediaFetch(mediaItems)
   const queryClient = new QueryClient({
     defaultOptions: {
@@ -102,8 +123,8 @@ function renderPanel(content: string, mediaItems: TaskMediaResponse[] = []) {
   const view = render(
     <QueryClientProvider client={queryClient}>
       <TaskCommentsPanel
-        task={task}
-        comments={[comment(content)]}
+        task={{ ...task, ...taskOverrides }}
+        comments={[{ ...comment(content), ...entry }]}
         commentDraft=""
         setCommentDraft={vi.fn()}
         createComment={createComment}
@@ -136,12 +157,68 @@ describe('TaskCommentsPanel', () => {
     restoreUrlObjectMethod('revokeObjectURL', originalRevokeObjectURL)
   })
 
+  it('renders review finding task lists as disabled open and resolved checkboxes', () => {
+    renderPanel(
+      'Review failed (attempt 2): empty input crashes\n\n- [ ] F1 Still open\n- [x] F2 Resolved\n- F3 Not re-checked\n\nFull review: Review tab, attempt 2',
+      [],
+      { author_type: 'system', author_name: 'Forge' },
+    )
+    const boxes = screen.getAllByRole('checkbox') as HTMLInputElement[]
+    expect(boxes).toHaveLength(2)
+    expect(boxes[0].checked).toBe(false)
+    expect(boxes[1].checked).toBe(true)
+    expect(boxes.every((box) => box.disabled)).toBe(true)
+    expect(screen.getByText('F3 Not re-checked')).toBeTruthy()
+  })
+
   it('preserves Markdown rendering for text comments', () => {
     renderPanel('**Bold** text with [Forge docs](https://example.com/docs).')
 
     expect(screen.getByText('Bold').closest('strong')).not.toBeNull()
     const link = screen.getByRole('link', { name: 'Forge docs' }) as HTMLAnchorElement
     expect(link.href).toBe('https://example.com/docs')
+  })
+
+  it('attributes a handoff to the lead and tells the subtask worker it is shown first', () => {
+    renderPanel(
+      'Start with **the parser**.',
+      [],
+      { kind: 'handoff', author_type: 'agent', author_name: 'Ada', author_id: 'lead-agent' },
+      { parent_task_id: 'root-1' },
+    )
+    const card = screen.getByText('Handoff').closest('div.rounded-md')!
+    expect(screen.getByText('Lead · Ada')).toBeTruthy()
+    expect(card.className).toContain('bg-muted/30')
+    expect(
+      screen.getByText(/Shown first to the worker in its next implementation run/),
+    ).toBeTruthy()
+    expect(screen.getByText('the parser').closest('strong')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull()
+  })
+
+  it('gives a lead question a distinct quiet style and keeps its Markdown', () => {
+    renderPanel('Should we use **parser A**?', [], {
+      kind: 'request_input',
+      author_type: 'agent',
+      author_name: 'lead',
+    })
+    const card = screen.getByText('Question for the owner').closest('div.rounded-md')!
+    expect(screen.getByText('Lead')).toBeTruthy()
+    expect(card.className).toContain('border-warning/30')
+    expect(card.className).toContain('bg-warning/5')
+    expect(screen.getByText('parser A').closest('strong')).toBeTruthy()
+    expect(screen.queryByText(/Shown first to the worker/)).toBeNull()
+  })
+
+  it('keeps ordinary worklog comments styled and attributed as before', () => {
+    renderPanel('Working on the parser.', [], {
+      kind: 'progress',
+      author_type: 'agent',
+      author_name: 'Worker',
+    })
+    expect(screen.getByText('Worker')).toBeTruthy()
+    expect(screen.queryByText('Handoff')).toBeNull()
+    expect(screen.queryByText('Question for the owner')).toBeNull()
   })
 
   it('renders task-owned image previews inline', async () => {
@@ -233,6 +310,25 @@ describe('TaskCommentsPanel', () => {
       expect.arrayContaining([[{ queryKey: qk.taskMedia(task.id) }]]),
     )
     expect(dispatch).not.toHaveBeenCalled()
+  })
+  it('reuses authenticated Task media previews for recorded verify evidence', async () => {
+    mockMediaFetch([
+      media({
+        id: 'evidence-1',
+        filename: 'smoke.png',
+        content_type: 'image/png',
+        url: '/api/v1/media/evidence-1',
+      }),
+    ])
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    render(
+      <QueryClientProvider client={client}>
+        <TaskEvidencePreview taskId={task.id} mediaIds={['evidence-1']} />
+      </QueryClientProvider>,
+    )
+    const preview = (await screen.findByRole('img', { name: 'smoke.png' })) as HTMLImageElement
+    expect(preview.src).toMatch(/^blob:/)
+    expect(preview.dataset.mediaUrl).toBe('/api/v1/media/evidence-1')
   })
 })
 

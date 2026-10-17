@@ -1,0 +1,1705 @@
+//! Forge-hosted native Task execution.
+//!
+//! This adapter deliberately implements the existing `TaskExecutor` contract
+//! instead of creating a second Task mutation path.  `TaskService::run_execution`
+//! remains responsible for claims, execution rows, workspace locking, reviewer
+//! restoration, outcome persistence, workflow transitions, and delivery.  The
+//! adapter only translates one admitted Task execution into a native runtime
+//! turn and returns the normal executor result.
+
+use services::task_service::execution::embedded_task_executor::is_read_only_task_role;
+use services::task_service::execution::{execution_lease_for, UNCOMMITTED_WORKTREE_FAILURE};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex as StdMutex},
+};
+
+use async_trait::async_trait;
+use db::{
+    AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo, WorkspaceRepo,
+};
+use executors::{
+    ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
+    LogKind, ProviderCallAdmission, TaskExecutor, UsageCounters, UsageReport, UsageTelemetryState,
+};
+use forge_agent_host::{
+    AgentHostError, AgentSessionBackend, AgentTurnLimit, AgentTurnRequest, AgentTurnTelemetryState,
+    CanonicalScope, CanonicalScopeType, NativeAgentRuntimeBackend, NativeProviderConfig,
+    RuntimeContextManifestLink, WorkspaceAccess,
+};
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
+
+use services::{
+    embedded_agent_service::{CreateScopedSession, EmbeddedAgentService, RequestedCanonicalScope},
+    turn_log_sink::{TurnLogSink, TurnProgressObserver},
+    ContextManifestInput, ContextManifestService, ContextSourceInput, Result, ServiceError,
+};
+
+mod review_correction;
+
+const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
+const TASK_ROLE_MARKER: &str = executors::TASK_ROLE_CONFIG_KEY;
+/// The native Task adapter used by the existing Task execution supervisor.
+#[derive(Clone)]
+pub struct EmbeddedTaskExecutor {
+    db: Arc<SqliteDb>,
+    embedded_agents: Arc<EmbeddedAgentService>,
+    backend: Arc<NativeAgentRuntimeBackend>,
+    workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
+    active: Arc<RwLock<HashMap<String, ActiveTaskTurn>>>,
+    provider_admissions: Arc<StdMutex<HashMap<String, Arc<dyn ProviderCallAdmission>>>>,
+}
+
+#[derive(Clone)]
+struct ActiveTaskTurn {
+    cancellation: CancellationToken,
+    runtime_session_id: String,
+}
+
+#[derive(Clone, Copy)]
+struct ReviewCorrectionProvider<'a> {
+    runtime_session_id: &'a str,
+    credential_ref: &'a str,
+}
+
+impl std::fmt::Debug for EmbeddedTaskExecutor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EmbeddedTaskExecutor")
+            .field(
+                "active",
+                &self.active.try_read().map(|active| active.len()).ok(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl EmbeddedTaskExecutor {
+    pub fn new_with_router(
+        db: Arc<SqliteDb>,
+        embedded_agents: Arc<EmbeddedAgentService>,
+        workspace_backend_router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
+        let backend = embedded_agents.native_backend();
+        Self {
+            db,
+            embedded_agents,
+            backend,
+            workspace_backend_router,
+            active: Arc::new(RwLock::new(HashMap::new())),
+            provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        Self::new_for_test(db, embedded_agents)
+    }
+
+    /// Embedded-only fixture constructor.
+    pub fn new_for_test(db: Arc<SqliteDb>, embedded_agents: Arc<EmbeddedAgentService>) -> Self {
+        let backend = embedded_agents.native_backend();
+        let workspace_backend_router =
+            services::lifecycle::context::embedded_workspace_router_for_test(
+                Arc::clone(&db),
+                services::workspace_root::fixture_root(),
+                None,
+            );
+        Self {
+            db,
+            embedded_agents,
+            backend,
+            workspace_backend_router,
+            active: Arc::new(RwLock::new(HashMap::new())),
+            provider_admissions: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn with_workspace_backend_router(
+        mut self,
+        router: Arc<services::workspace_backend::WorkspaceBackendRouter>,
+    ) -> Self {
+        self.workspace_backend_router = router;
+        self
+    }
+
+    async fn run_native_turn(
+        &self,
+        ctx: &ExecutionContext,
+        agent: db::Agent,
+        task_role: &str,
+        log_sink: Arc<TurnLogSink>,
+        cancellation: CancellationToken,
+    ) -> Result<executors::ExecutionResult> {
+        let owner_user_id = agent.owner_id.clone().ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "embedded Task identity has no owner for protected credential access",
+            )
+        })?;
+        let snapshot_profile_id = ctx
+            .agent_config
+            .get("profile_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("embedded snapshot has no profile_id")
+            })?;
+        let profile = AgentProfileRepo::get_profile(&*self.db, snapshot_profile_id)
+            .await?
+            .filter(|profile| {
+                profile.identity_id == agent.id
+                    && profile.backend_kind == "native"
+                    && profile.executor_type == EMBEDDED_EXECUTOR_TYPE
+            })
+            .ok_or_else(|| {
+                ServiceError::invalid_operation(
+                    "embedded snapshot profile is unavailable or no longer native",
+                )
+            })?;
+        let credential_ref = profile
+            .credential_ref
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("embedded profile has no credential handle")
+            })?;
+        let config = ctx
+            .agent_config
+            .get("config")
+            .cloned()
+            .ok_or_else(|| {
+                ServiceError::invalid_operation("embedded snapshot has no profile config")
+            })
+            .and_then(|value| {
+                serde_json::from_value::<NativeTaskProfileConfig>(value).map_err(|_| {
+                    ServiceError::invalid_operation("embedded profile config is invalid")
+                })
+            })?;
+        let provider = ctx
+            .agent_config
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ServiceError::invalid_operation("embedded profile has no provider"))?;
+        let model = ctx
+            .agent_config
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ServiceError::invalid_operation("embedded profile has no model"))?;
+        let system_prompt = ctx
+            .agent_config
+            .get("prompt_template")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+
+        let role = canonical_task_role(task_role)?;
+        let execution = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("execution", ctx.execution_id.clone()))?;
+        let workspace = match execution.workspace_id.as_deref() {
+            Some(workspace_id) => WorkspaceRepo::get_by_id(&*self.db, workspace_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", workspace_id.to_owned()))?,
+            None => WorkspaceRepo::get_by_task_id(&*self.db, &ctx.task_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("workspace", ctx.task_id.clone()))?,
+        };
+        // The claim checked this workspace a moment ago; the turn starts
+        // now. Check it again here so a directory that vanished in between is
+        // recreated from the Task branch instead of failing the execution
+        // with Git's "not a git repository".
+        let task = TaskRepo::get_by_id(&*self.db, &ctx.task_id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", ctx.task_id.clone()))?;
+        // The Task service's own root and repository-cache locks, so a
+        // recreate here is serialized with every other user of that cache.
+        let task_service = self.embedded_agents.task_service_handle();
+        let workspace_root = match task_service.as_ref() {
+            Some(service) => service.workspace_root().to_path_buf(),
+            None => services::workspace_root::root_of(&self.db)
+                .await
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+        };
+        let valid = services::workspace_manager::WorkspaceManager::new(
+            &self.db,
+            &workspace_root,
+            task_service
+                .as_ref()
+                .and_then(|service| service.repo_cache_locks()),
+            &self.workspace_backend_router,
+        )
+        .waiting_for_disk()
+        .ensure_valid(
+            &task,
+            workspace,
+            services::workspace_manager::Purpose::Execute,
+        )
+        .await;
+        let valid = match valid {
+            Ok(valid) => valid,
+            Err(unavailable) => {
+                // Under the disk floor the worktree is not made again: the
+                // turn does not start and the Task takes the claim's disk
+                // wait instead of a failed run.
+                let error = ServiceError::from(unavailable);
+                if let Some(service) = task_service.as_ref() {
+                    service
+                        .defer_launch_for_disk(&ctx.execution_id, &error)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+        let worktree_path = valid.path().map(Path::to_path_buf).ok_or_else(|| {
+            ServiceError::from(
+                services::workspace_backend::WorkspaceBackendError::OwnerUnsupported {
+                    owner_kind: valid.resolved().placement.owner_kind.clone(),
+                },
+            )
+        })?;
+        let worktree_read_only =
+            is_read_only_task_role(role) || executors::is_worktree_read_only(&ctx.agent_config);
+        let before_sha = if worktree_read_only {
+            None
+        } else {
+            Some(
+                git::get_current_sha(&worktree_path)
+                    .await
+                    .map_err(ServiceError::from)?,
+            )
+        };
+        let session = self
+            .embedded_agents
+            .create_or_resume_session(CreateScopedSession {
+                actor_user_id: owner_user_id.clone(),
+                identity_id: agent.id.clone(),
+                profile_id: Some(profile.id.clone()),
+                scope: RequestedCanonicalScope::Task {
+                    task_id: ctx.task_id.clone(),
+                    role: role.to_owned(),
+                },
+            })
+            .await?;
+        let runtime_session_id = session
+            .runtime_session_id
+            .clone()
+            .ok_or_else(|| ServiceError::invalid_operation("Task session has no runtime id"))?;
+        let provider_account_id = self
+            .embedded_agents
+            .credential_provider_account_id(credential_ref)
+            .await?;
+
+        self.active.write().await.insert(
+            ctx.execution_id.clone(),
+            ActiveTaskTurn {
+                cancellation: cancellation.clone(),
+                runtime_session_id: runtime_session_id.clone(),
+            },
+        );
+
+        let provider_admission = self
+            .provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .get(&ctx.execution_id)
+            .cloned();
+        if let Some(admission) = provider_admission {
+            let candidate_key = executors::candidate_key_from_snapshot(
+                &executors::ExecutorKind::Embedded,
+                &ctx.agent_config,
+            );
+            if let Err(error) = admission.before_provider_call(ctx, &candidate_key, 0).await {
+                // The callback is the last durable boundary before the
+                // native provider call. If it fails, no provider work has
+                // started; clear the in-memory active turn as well so a
+                // failed start write cannot strand a cancellation handle.
+                self.active.write().await.remove(&ctx.execution_id);
+                return Err(ServiceError::invalid_operation(error.to_string()));
+            }
+        }
+
+        // A Task worker's commands run in the Task worktree, so the owning
+        // Project's settings layer over the configured baseline.
+        let command_allowlist = match TaskRepo::get_by_id(&*self.db, &ctx.task_id, true).await {
+            Ok(Some(task)) => {
+                self.embedded_agents
+                    .effective_command_allowlist(Some(&task.project_id))
+                    .await
+            }
+            _ => self.embedded_agents.effective_command_allowlist(None).await,
+        };
+
+        let native_provider = {
+            let (context_tokens, max_input_tokens, max_output_tokens) =
+                services::embedded_agent_service::effective_native_limits(
+                    &provider,
+                    config.context_tokens,
+                    config.max_input_tokens,
+                    config.max_output_tokens,
+                );
+            NativeProviderConfig {
+                provider: provider.clone(),
+                base_url: config.base_url,
+                model: model.clone(),
+                reasoning_effort: profile.reasoning_effort.clone(),
+                credential_handle_id: credential_ref.to_owned(),
+                owner_user_id: owner_user_id.clone(),
+                provider_account_id,
+                context_tokens,
+                max_input_tokens,
+                max_output_tokens,
+            }
+        };
+        // One request shape for the turn and any report-correction turns.
+        let turn_request = |input: String| AgentTurnRequest {
+            forge_session_id: session.id.clone(),
+            runtime_session_id: runtime_session_id.clone(),
+            scope: CanonicalScope {
+                scope_type: CanonicalScopeType::Task,
+                scope_id: ctx.task_id.clone(),
+                workspace_access: if worktree_read_only {
+                    WorkspaceAccess::TaskRead
+                } else {
+                    WorkspaceAccess::TaskWrite
+                },
+            },
+            workspace_path: Some(worktree_path.to_string_lossy().into_owned()),
+            provider: native_provider.clone(),
+            system_prompt: system_prompt.clone(),
+            history: Vec::new(),
+            input,
+            server_state_card: None,
+            command_allowlist: Some(command_allowlist.clone()),
+            environment: executors::environment::task_environment(&ctx.agent_config),
+            cancellation: cancellation.clone(),
+        };
+        let output = self
+            .backend
+            .run_turn(turn_request(ctx.description.clone()), log_sink.clone())
+            .await;
+        self.active.write().await.remove(&ctx.execution_id);
+        if !cancellation.is_cancelled() {
+            let error_text = output.as_ref().err().map(ToString::to_string);
+            if let Err(error) = services::provider_health::record_entry_outcome(
+                &self.db,
+                credential_ref,
+                error_text.as_deref().map_or(Ok(()), Err),
+            )
+            .await
+            {
+                tracing::warn!(execution_id = %ctx.execution_id, error = %error, "provider health could not be recorded");
+            }
+        }
+
+        let output = match output {
+            Ok(output) => output,
+            Err(AgentHostError::RuntimeWithUsage {
+                message,
+                usage_reports,
+                ..
+            }) => {
+                let status = if cancellation.is_cancelled() {
+                    ExecutionOutcome::Cancelled
+                } else {
+                    ExecutionOutcome::Failed
+                };
+                let outcome = match status {
+                    ExecutionOutcome::Cancelled => executors::RouteAttemptOutcome::Cancelled,
+                    ExecutionOutcome::Failed => executors::RouteAttemptOutcome::Failed,
+                    ExecutionOutcome::Completed => unreachable!("terminal status is not running"),
+                };
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
+                return Ok(ExecutionResult {
+                    status,
+                    agent_session_id: Some(runtime_session_id),
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &usage_reports,
+                        outcome,
+                        &candidate_key,
+                    ),
+                    error: Some(message),
+                    failure_class: Some(ExecutionFailureClass::TaskFailed),
+                    ..ExecutionResult::default()
+                });
+            }
+            Err(AgentHostError::TurnLimitReached { limit }) if cancellation.is_cancelled() => {
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Cancelled,
+                    agent_session_id: Some(runtime_session_id),
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &[],
+                        executors::RouteAttemptOutcome::Cancelled,
+                        &candidate_key,
+                    ),
+                    error: Some(format!("runtime turn limit reached: {limit}")),
+                    ..ExecutionResult::default()
+                });
+            }
+            Err(_error) if cancellation.is_cancelled() => {
+                let candidate_key = executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                );
+                return Ok(ExecutionResult {
+                    status: ExecutionOutcome::Cancelled,
+                    usage_reports: native_usage_reports_from_records(
+                        &ctx.execution_id,
+                        &provider,
+                        &model,
+                        &[],
+                        executors::RouteAttemptOutcome::Cancelled,
+                        &candidate_key,
+                    ),
+                    ..ExecutionResult::default()
+                });
+            }
+            Err(AgentHostError::TurnLimitReached { limit }) => {
+                return Ok(native_turn_limit_result(
+                    &ctx.execution_id,
+                    runtime_session_id,
+                    &provider,
+                    &model,
+                    &executors::candidate_key_from_snapshot(
+                        &executors::ExecutorKind::Embedded,
+                        &ctx.agent_config,
+                    ),
+                    limit,
+                ));
+            }
+            Err(error) => return native_dispatch_failure(error),
+        };
+        let output = if role == services::workflow::default_roles::REVIEWER
+            && !cancellation.is_cancelled()
+        {
+            self.correct_review_report(
+                ctx,
+                output,
+                &turn_request,
+                &log_sink,
+                ReviewCorrectionProvider {
+                    runtime_session_id: &runtime_session_id,
+                    credential_ref,
+                },
+                &cancellation,
+            )
+            .await
+        } else {
+            output
+        };
+        if cancellation.is_cancelled() {
+            let usage_reports = native_usage_reports(
+                &ctx.execution_id,
+                &provider,
+                &model,
+                &output,
+                executors::RouteAttemptOutcome::Cancelled,
+                &executors::candidate_key_from_snapshot(
+                    &executors::ExecutorKind::Embedded,
+                    &ctx.agent_config,
+                ),
+            );
+            return Ok(ExecutionResult {
+                status: ExecutionOutcome::Cancelled,
+                agent_session_id: Some(output.runtime_session_id),
+                usage_reports,
+                ..ExecutionResult::default()
+            });
+        }
+
+        if let Some(manifest) = output.context_manifest.as_ref() {
+            self.persist_runtime_context_manifest(ctx, &agent, &session, manifest)
+                .await?;
+        }
+
+        if !output.text.trim().is_empty() {
+            log_sink
+                .write(
+                    LogKind::Assistant,
+                    serde_json::json!({"text": output.text.clone()}),
+                )
+                .await
+                .map_err(|error| {
+                    ServiceError::invalid_operation(format!("Task log write failed: {error}"))
+                })?;
+            log_sink.record_progress().await;
+        }
+        let candidate_key = executors::candidate_key_from_snapshot(
+            &executors::ExecutorKind::Embedded,
+            &ctx.agent_config,
+        );
+        let mut usage_reports = native_usage_reports(
+            &ctx.execution_id,
+            &provider,
+            &model,
+            &output,
+            executors::RouteAttemptOutcome::Completed,
+            &candidate_key,
+        );
+        let agent_session_id = output.runtime_session_id;
+        let summary = output.text;
+        let after_sha = if let Some(before_sha) = before_sha.as_deref() {
+            match validate_write_capable_delivery(&worktree_path, before_sha).await {
+                Ok(after_sha) => after_sha,
+                Err(error) => {
+                    return Ok(ExecutionResult {
+                        status: ExecutionOutcome::Failed,
+                        after_sha: git::get_current_sha(&worktree_path).await.ok(),
+                        agent_session_id: Some(agent_session_id),
+                        summary: Some(summary),
+                        error: Some(error.to_string()),
+                        usage_reports: {
+                            for report in &mut usage_reports {
+                                report.outcome = Some(executors::RouteAttemptOutcome::Failed);
+                            }
+                            usage_reports
+                        },
+                        ..ExecutionResult::default()
+                    });
+                }
+            }
+        } else {
+            git::get_current_sha(&worktree_path)
+                .await
+                .map_err(ServiceError::from)?
+        };
+        Ok(ExecutionResult {
+            status: ExecutionOutcome::Completed,
+            after_sha: Some(after_sha),
+            agent_session_id: Some(agent_session_id),
+            summary: Some(summary),
+            usage_reports,
+            ..ExecutionResult::default()
+        })
+    }
+
+    /// Give a reviewer whose reply has no readable result block up to
+    /// two follow-up turns to add
+    /// one, checked by the same parser the review cascade applies. Only
+    /// review executions (those with a frozen contract) are corrected.
+    async fn correct_review_report(
+        &self,
+        ctx: &ExecutionContext,
+        output: forge_agent_host::AgentTurnOutput,
+        turn_request: &impl Fn(String) -> AgentTurnRequest,
+        log_sink: &Arc<TurnLogSink>,
+        provider: ReviewCorrectionProvider<'_>,
+        cancellation: &CancellationToken,
+    ) -> forge_agent_host::AgentTurnOutput {
+        if !matches!(
+            db::ReviewConformanceRepo::review_contract(&*self.db, &ctx.execution_id).await,
+            Ok(Some(_))
+        ) {
+            return output;
+        }
+        // Keep the run cancellable while a correction turn is in flight.
+        self.active.write().await.insert(
+            ctx.execution_id.clone(),
+            ActiveTaskTurn {
+                cancellation: cancellation.clone(),
+                runtime_session_id: provider.runtime_session_id.to_owned(),
+            },
+        );
+        let original_text = output.text.clone();
+        let corrected = review_correction::correct_report(
+            output,
+            |text| ::review::contract::parse_assessment(text).err(),
+            |problem, report| {
+                let request = turn_request(review_correction::correction_prompt(&problem));
+                let log_sink = Arc::clone(log_sink);
+                async move {
+                    let _ = log_sink
+                        .write(LogKind::Assistant, serde_json::json!({ "text": report }))
+                        .await;
+                    let _ = log_sink
+                        .write(
+                            LogKind::System,
+                            serde_json::json!({
+                                "text": format!(
+                                    "Forge could not read this review's result ({problem}) \
+                                     and asked the reviewer for its result block."
+                                )
+                            }),
+                        )
+                        .await;
+                    let result = self.backend.run_turn(request, log_sink).await;
+                    if !cancellation.is_cancelled() {
+                        let error_text = result.as_ref().err().map(ToString::to_string);
+                        if let Err(error) = services::provider_health::record_entry_outcome(
+                            &self.db,
+                            provider.credential_ref,
+                            error_text.as_deref().map_or(Ok(()), Err),
+                        )
+                        .await
+                        {
+                            tracing::warn!(execution_id = %ctx.execution_id, error = %error, "review correction provider health could not be recorded");
+                        }
+                    }
+                    result
+                }
+            },
+        )
+        .await;
+        self.active.write().await.remove(&ctx.execution_id);
+        if corrected.text != original_text {
+            // The review cascade reads the last assistant entry. Record the
+            // whole reply — the first turn's Markdown review plus the result
+            // block the correction supplied — so the review is not reduced
+            // to its block.
+            let _ = log_sink
+                .write(
+                    LogKind::Assistant,
+                    serde_json::json!({ "text": corrected.text }),
+                )
+                .await;
+        }
+        corrected
+    }
+
+    /// Links the final Agent Runtime manifest to Forge's immutable Task
+    /// context-admission record.  The runtime remains the only component
+    /// deciding order, token budgets, serialization, and LCM compaction; this
+    /// method only records final segment/coverage dispositions and hashes.
+    async fn persist_runtime_context_manifest(
+        &self,
+        ctx: &ExecutionContext,
+        agent: &db::Agent,
+        session: &db::AgentSession,
+        runtime_manifest: &RuntimeContextManifestLink,
+    ) -> Result<()> {
+        let source_revision = runtime_manifest.context_fingerprint.clone();
+        let covered = runtime_manifest
+            .summaries
+            .iter()
+            .flat_map(|summary| summary.covered.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>();
+        let summary_ids = runtime_manifest
+            .summaries
+            .iter()
+            .map(|summary| summary.summary.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let segment_ids = runtime_manifest
+            .segments
+            .iter()
+            .map(|segment| segment.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut sources = Vec::new();
+        let mut source_ids = std::collections::BTreeSet::new();
+        let mut ordinal = 0_i64;
+        if let Some(timeline_id) = runtime_manifest.lcm_timeline_id.as_deref() {
+            source_ids.insert(timeline_id.to_owned());
+            sources.push(ContextSourceInput {
+                ordinal,
+                source_id: timeline_id.to_owned(),
+                source_type: "runtime_lcm_timeline".to_owned(),
+                source_revision: runtime_manifest
+                    .lcm_binding_revision
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                selection_reason: "agent_runtime_lcm_binding".to_owned(),
+                disposition: "included".to_owned(),
+                retention_priority: 100,
+                fragment_fingerprint: fingerprint_id(timeline_id),
+                sensitivity: "internal".to_owned(),
+            });
+            ordinal = ordinal.saturating_add(1);
+        }
+        for segment in &runtime_manifest.segments {
+            if !source_ids.insert(segment.id.clone()) {
+                continue;
+            }
+            sources.push(ContextSourceInput {
+                ordinal,
+                source_id: segment.id.clone(),
+                source_type: "runtime_segment".to_owned(),
+                source_revision: source_revision.clone(),
+                selection_reason: "agent_runtime_final_segment".to_owned(),
+                disposition: if covered.contains(&segment.id) && !summary_ids.contains(&segment.id)
+                {
+                    "summarized"
+                } else {
+                    "included"
+                }
+                .to_owned(),
+                retention_priority: if summary_ids.contains(&segment.id) {
+                    100
+                } else {
+                    10
+                },
+                fragment_fingerprint: segment.content_hash.clone(),
+                sensitivity: segment.sensitivity.clone(),
+            });
+            ordinal = ordinal.saturating_add(1);
+        }
+        for summary in &runtime_manifest.summaries {
+            if source_ids.insert(summary.summary.clone()) && !segment_ids.contains(&summary.summary)
+            {
+                sources.push(ContextSourceInput {
+                    ordinal,
+                    source_id: summary.summary.clone(),
+                    source_type: "runtime_lcm_summary".to_owned(),
+                    source_revision: source_revision.clone(),
+                    selection_reason: "agent_runtime_summary_coverage".to_owned(),
+                    disposition: "included".to_owned(),
+                    retention_priority: 100,
+                    fragment_fingerprint: fingerprint_id(&summary.summary),
+                    sensitivity: "sensitive".to_owned(),
+                });
+                ordinal = ordinal.saturating_add(1);
+            }
+            for covered_id in &summary.covered {
+                if source_ids.insert(covered_id.clone()) {
+                    sources.push(ContextSourceInput {
+                        ordinal,
+                        source_id: covered_id.clone(),
+                        source_type: "runtime_lcm_covered".to_owned(),
+                        source_revision: source_revision.clone(),
+                        selection_reason: "agent_runtime_summary_coverage".to_owned(),
+                        disposition: "summarized".to_owned(),
+                        retention_priority: 10,
+                        fragment_fingerprint: fingerprint_id(covered_id),
+                        sensitivity: "sensitive".to_owned(),
+                    });
+                    ordinal = ordinal.saturating_add(1);
+                }
+            }
+        }
+        let manifest_id =
+            runtime_manifest_id(&agent.id, &session.id, &ctx.execution_id, runtime_manifest);
+        let identity_id = uuid::Uuid::parse_str(&agent.id)
+            .map_err(|_| ServiceError::invalid_operation("embedded identity id is invalid"))?;
+        let context_scope_id = uuid::Uuid::parse_str(&session.context_scope_id)
+            .map_err(|_| ServiceError::invalid_operation("Task context scope id is invalid"))?;
+        let request_fingerprint = runtime_request_fingerprint(ctx, runtime_manifest);
+        let service = ContextManifestService::new(Arc::clone(&self.db));
+        if let Some(existing) = service
+            .get_authorized(manifest_id, identity_id, context_scope_id)
+            .await?
+        {
+            if existing.runtime_manifest_fingerprint.as_deref()
+                != Some(runtime_manifest.runtime_manifest_fingerprint.as_str())
+                || existing.request_fingerprint != request_fingerprint
+            {
+                return Err(ServiceError::invalid_operation(
+                    "Task runtime context manifest idempotency conflict",
+                ));
+            }
+            let existing_sources = service
+                .sources(manifest_id, identity_id, context_scope_id)
+                .await?;
+            for source in &sources {
+                if existing_sources.iter().any(|stored| {
+                    stored.ordinal == source.ordinal
+                        && stored.source_id == source.source_id
+                        && stored.source_revision == source.source_revision
+                }) {
+                    continue;
+                }
+                service
+                    .append_source(manifest_id, identity_id, context_scope_id, source.clone())
+                    .await?;
+            }
+            return Ok(());
+        }
+        let created = service
+            .create(
+                ContextManifestInput {
+                    id: manifest_id,
+                    identity_id,
+                    agent_session_id: Some(uuid::Uuid::parse_str(&session.id).map_err(|_| {
+                        ServiceError::invalid_operation("Task agent session id is invalid")
+                    })?),
+                    context_scope_id,
+                    scope_type: "task".to_owned(),
+                    scope_id: ctx.task_id.clone(),
+                    policy_revision: "forge-task-context-policy-1".to_owned(),
+                    domain_revision: "forge-task-runtime-link-1".to_owned(),
+                    lcm_binding_revision: runtime_manifest.lcm_binding_revision.clone(),
+                    runtime_manifest_id: Some(runtime_manifest.turn_id.clone()),
+                    runtime_manifest_fingerprint: Some(
+                        runtime_manifest.runtime_manifest_fingerprint.clone(),
+                    ),
+                    request_fingerprint,
+                },
+                &sources,
+            )
+            .await?;
+        for source in sources {
+            service
+                .append_source(
+                    manifest_uuid(&created)?,
+                    identity_id,
+                    context_scope_id,
+                    source,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn manifest_uuid(manifest: &db::ContextManifest) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(&manifest.id)
+        .map_err(|_| ServiceError::invalid_operation("persisted context manifest id is invalid"))
+}
+
+/// Identity of one runtime turn's context manifest.
+///
+/// The execution is part of the identity because a runtime turn id is only
+/// unique within one runtime session instance, while a Forge `agent_session`
+/// row outlives several of them: a reviewer retry rebuilds the runtime session
+/// with clean context and its first turn carries the same runtime turn id as
+/// the previous attempt's. Keying on the session alone made the second review
+/// of any Task collide with the first and fail as an idempotency conflict,
+/// which is also why `runtime_request_fingerprint` already includes the
+/// execution.
+fn runtime_manifest_id(
+    identity_id: &str,
+    session_id: &str,
+    execution_id: &str,
+    runtime_manifest: &RuntimeContextManifestLink,
+) -> uuid::Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"forge-task-context-manifest-v2\0");
+    digest.update(identity_id.as_bytes());
+    digest.update([0]);
+    digest.update(session_id.as_bytes());
+    digest.update([0]);
+    digest.update(execution_id.as_bytes());
+    digest.update([0]);
+    digest.update(runtime_manifest.turn_id.as_bytes());
+    let bytes = digest.finalize();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&bytes[..16]);
+    // RFC 4122 version/variant bits make this deterministic digest a valid
+    // UUID without adding a new dependency feature.
+    id[6] = (id[6] & 0x0f) | 0x50;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(id)
+}
+
+fn fingerprint_id(value: &str) -> String {
+    hex::encode(Sha256::digest(value.as_bytes()))
+}
+
+fn runtime_request_fingerprint(
+    ctx: &ExecutionContext,
+    runtime_manifest: &RuntimeContextManifestLink,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-task-runtime-request-v1\0");
+    hasher.update(ctx.task_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(ctx.execution_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(runtime_manifest.turn_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(runtime_manifest.context_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(runtime_manifest.cache_plan_fingerprint.as_bytes());
+    hasher.update([0]);
+    hasher.update(runtime_manifest.runtime_manifest_fingerprint.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[async_trait]
+impl TaskExecutor for EmbeddedTaskExecutor {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .insert(ctx.execution_id.clone(), admission);
+        let result = self.execute(ctx.clone()).await;
+        self.provider_admissions
+            .lock()
+            .expect("provider admission lock poisoned")
+            .remove(&ctx.execution_id);
+        result
+    }
+
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        let executor_type = ctx
+            .agent_config
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                ctx.agent_config
+                    .get("config")
+                    .and_then(|config| config.get("executor_type"))
+                    .and_then(serde_json::Value::as_str)
+            });
+        if executor_type != Some(EMBEDDED_EXECUTOR_TYPE) {
+            return Err(ExecutorError::Other(
+                "embedded Task executor received a non-embedded snapshot".to_owned(),
+            ));
+        }
+        let task_role = ctx
+            .agent_config
+            .get(TASK_ROLE_MARKER)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("worker");
+        let agent_id = ctx
+            .agent_config
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ExecutorError::Other("embedded snapshot has no agent_id".to_owned()))?;
+        let agent = AgentRepo::get_by_id(&*self.db, agent_id)
+            .await
+            .map_err(|error| ExecutorError::Other(error.to_string()))?
+            .ok_or_else(|| ExecutorError::Other("embedded identity no longer exists".to_owned()))?;
+        let snapshot_profile_id = ctx
+            .agent_config
+            .get("profile_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                ExecutorError::Other("embedded snapshot has no profile_id".to_owned())
+            })?;
+        let _snapshot_profile = AgentProfileRepo::get_profile(&*self.db, snapshot_profile_id)
+            .await
+            .map_err(|error| ExecutorError::Other(error.to_string()))?
+            .filter(|profile| {
+                profile.identity_id == agent.id
+                    && profile.backend_kind == "native"
+                    && profile.executor_type == EMBEDDED_EXECUTOR_TYPE
+            })
+            .ok_or_else(|| {
+                ExecutorError::Other(
+                    "embedded Task snapshot does not reference an available native profile"
+                        .to_owned(),
+                )
+            })?;
+        let execution = ExecutionRepo::get_by_id(&*self.db, &ctx.execution_id)
+            .await
+            .map_err(|error| ExecutorError::Other(error.to_string()))?
+            .ok_or_else(|| {
+                ExecutorError::Other("embedded execution no longer exists".to_owned())
+            })?;
+        let execution_role = canonical_task_role(&execution.role)
+            .map_err(|error| ExecutorError::Other(error.to_string()))?;
+        let requested_role = canonical_task_role(task_role)
+            .map_err(|error| ExecutorError::Other(error.to_string()))?;
+        if is_read_only_task_role(requested_role)
+            && !executors::is_worktree_read_only(&ctx.agent_config)
+        {
+            return Err(ExecutorError::Other(format!(
+                "embedded {requested_role} execution must use the existing read-only worktree path"
+            )));
+        }
+        if execution.status != ExecutionStatus::Running
+            || execution.task_id != ctx.task_id
+            || execution.agent_id.as_deref() != Some(agent.id.as_str())
+            || execution_role != requested_role
+        {
+            return Err(ExecutorError::Other(
+                "embedded Task execution is not the claimed role execution".to_owned(),
+            ));
+        }
+
+        let cancellation = CancellationToken::new();
+        let execution_lease = execution_lease_for(&ctx.execution_id);
+        let log_sink = Arc::new(TurnLogSink::new(
+            &ctx.logs_path,
+            &ctx.execution_id,
+            ctx.log_sender.clone(),
+            execution_lease.map(|lease| lease as Arc<dyn TurnProgressObserver>),
+        ));
+        let result = self
+            .run_native_turn(
+                &ctx,
+                agent,
+                task_role,
+                Arc::clone(&log_sink),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|error| ExecutorError::Other(error.to_string()));
+        result
+    }
+
+    async fn cancel(&self, execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        let active = self.active.read().await.get(execution_id).cloned();
+        let Some(active) = active else {
+            return Ok(());
+        };
+        active.cancellation.cancel();
+        self.backend
+            .cancel(&active.runtime_session_id)
+            .await
+            .map_err(|error| ExecutorError::Other(error.to_string()))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NativeTaskProfileConfig {
+    base_url: String,
+    #[serde(default = "default_context_tokens")]
+    context_tokens: u32,
+    #[serde(default = "default_max_input_tokens")]
+    max_input_tokens: u32,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
+}
+
+fn default_context_tokens() -> u32 {
+    128_000
+}
+
+fn default_max_input_tokens() -> u32 {
+    96_000
+}
+
+fn default_max_output_tokens() -> u32 {
+    16_000
+}
+
+fn native_usage_reports(
+    execution_id: &str,
+    provider: &str,
+    model: &str,
+    output: &forge_agent_host::AgentTurnOutput,
+    outcome: executors::RouteAttemptOutcome,
+    candidate_key: &str,
+) -> Vec<UsageReport> {
+    native_usage_reports_from_records(
+        execution_id,
+        provider,
+        model,
+        &output.usage_reports,
+        outcome,
+        candidate_key,
+    )
+}
+
+fn native_usage_reports_from_records(
+    execution_id: &str,
+    provider: &str,
+    model: &str,
+    usage_records: &[forge_agent_host::AgentTurnUsageReport],
+    outcome: executors::RouteAttemptOutcome,
+    candidate_key: &str,
+) -> Vec<UsageReport> {
+    let mut reports = usage_records
+        .iter()
+        .enumerate()
+        .map(|(sequence, report)| {
+            let telemetry_state = match report.telemetry_state {
+                AgentTurnTelemetryState::Metered => UsageTelemetryState::Metered,
+                AgentTurnTelemetryState::Unmetered => UsageTelemetryState::Unmetered,
+            };
+            let mut mapped = UsageReport {
+                report_id: report.report_id.clone(),
+                request_id: report.request_id.clone(),
+                report_sequence: sequence as u32,
+                candidate_key: Some(candidate_key.to_owned()),
+                attempt_ordinal: 0,
+                provider_id: report.provider_id.clone(),
+                model_id: report.model_id.clone(),
+                counters: UsageCounters {
+                    input_tokens: report.input_tokens,
+                    output_tokens: report.output_tokens,
+                    cache_read_tokens: report.cache_read_tokens,
+                    cache_write_tokens: report.cache_write_tokens,
+                },
+                telemetry_state,
+                context_tokens: report.prompt_tokens(),
+                selected_tier: None,
+                reported_cost_usd: None,
+                outcome: Some(outcome),
+                partial: report.failed,
+            };
+            mapped.fill_identity(Some(provider), Some(model));
+            if mapped.report_id.trim().is_empty() {
+                mapped.report_id =
+                    executors::stable_report_id(execution_id, candidate_key, 0, sequence as u32);
+            }
+            mapped.normalize_telemetry();
+            mapped
+        })
+        .collect::<Vec<_>>();
+
+    // The native runtime only records a provider ledger row when it has
+    // trustworthy counters. The provider call still happened when the turn
+    // completed without a row, so retain an unmetered report rather than
+    // fabricating zero counters or dropping the attempt entirely.
+    if reports.is_empty() {
+        reports.push(UsageReport::unmetered(executors::stable_report_id(
+            execution_id,
+            candidate_key,
+            0,
+            0,
+        )));
+        if let Some(report) = reports.last_mut() {
+            report.candidate_key = Some(candidate_key.to_owned());
+            report.fill_identity(Some(provider), Some(model));
+            report.outcome = Some(outcome);
+        }
+    }
+    reports
+}
+
+fn native_turn_limit_result(
+    execution_id: &str,
+    runtime_session_id: String,
+    provider: &str,
+    model: &str,
+    candidate_key: &str,
+    limit: AgentTurnLimit,
+) -> ExecutionResult {
+    let provider_unavailable = limit == AgentTurnLimit::ProviderAttempts;
+    let mut usage_report = UsageReport::unmetered(executors::stable_report_id(
+        execution_id,
+        candidate_key,
+        0,
+        0,
+    ));
+    usage_report.candidate_key = Some(candidate_key.to_owned());
+    usage_report.provider_id = Some(provider.to_owned());
+    usage_report.model_id = Some(model.to_owned());
+    usage_report.outcome = Some(if provider_unavailable {
+        executors::RouteAttemptOutcome::Unavailable
+    } else {
+        executors::RouteAttemptOutcome::Failed
+    });
+    ExecutionResult {
+        status: ExecutionOutcome::Failed,
+        agent_session_id: Some(runtime_session_id),
+        usage_reports: vec![usage_report],
+        error: Some(if provider_unavailable {
+            format!("provider unavailable after exhausting runtime retry attempts ({limit})")
+        } else {
+            format!("native runtime turn limit reached: {limit}")
+        }),
+        failure_class: Some(if provider_unavailable {
+            ExecutionFailureClass::ExecutorUnavailable
+        } else {
+            ExecutionFailureClass::TaskFailed
+        }),
+        retry_after: provider_unavailable.then_some(executors::DEFAULT_ACCOUNT_COOLDOWN),
+        ..ExecutionResult::default()
+    }
+}
+
+fn canonical_task_role(role: &str) -> Result<&'static str> {
+    match role {
+        "worker" | "coder" => Ok("worker"),
+        // The review runner spawns its conformance pass as an `auditor`
+        // execution. It is the reviewer role by every other measure: read-only
+        // worktree, reviewer role assignment, reviewer prompt.
+        "reviewer" | "auditor" => Ok("reviewer"),
+        // Planner keeps its own canonical identity end-to-end: the Task role
+        // assignment lookup and the workflow-state admission both match on
+        // the literal `planner` role, and the native session receives the
+        // read-only Task workspace surface.
+        "planner" => Ok("planner"),
+        other => Err(ServiceError::invalid_operation(format!(
+            "embedded Task execution is not admitted for role `{other}`"
+        ))),
+    }
+}
+
+/// Refuse to report delivery when a native worker authored files but did not
+/// commit them.
+///
+/// The dirty worktree is deliberately left untouched for inspection or retry.
+/// Forge does not stage files, choose a message, or create a commit on the
+/// worker's behalf. Clean no-op turns remain subject to the Task runner's
+/// workflow-aware no-op policy.
+async fn validate_write_capable_delivery(
+    worktree: &Path,
+    before_sha: &str,
+) -> std::result::Result<String, ExecutorError> {
+    let after_sha = git::get_current_sha(worktree).await.map_err(|error| {
+        ExecutorError::Other(format!(
+            "embedded worker could not read the final worktree HEAD: {error}"
+        ))
+    })?;
+    let worktree_clean = git::is_worktree_clean(worktree).await.map_err(|error| {
+        ExecutorError::Other(format!(
+            "embedded worker could not inspect final worktree changes: {error}"
+        ))
+    })?;
+    if after_sha == before_sha && !worktree_clean {
+        return Err(ExecutorError::Other(
+            UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
+        ));
+    }
+    Ok(after_sha)
+}
+
+/// Lifecycle failures escape dispatch, preserving the Task retry boundary.
+fn native_dispatch_failure(error: AgentHostError) -> Result<ExecutionResult> {
+    Err(ServiceError::invalid_operation(error.to_string()))
+}
+
+/// Routes embedded snapshots to the Forge-native Task adapter while keeping
+/// every existing CLI/fallback executor on its original path.
+#[derive(Clone)]
+pub struct TaskExecutorRouter {
+    cli: Arc<dyn TaskExecutor>,
+    embedded: Arc<EmbeddedTaskExecutor>,
+}
+
+impl std::fmt::Debug for TaskExecutorRouter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskExecutorRouter")
+            .field("cli", &"configured")
+            .field("embedded", &self.embedded)
+            .finish()
+    }
+}
+
+impl TaskExecutorRouter {
+    pub fn new(cli: Arc<dyn TaskExecutor>, embedded: Arc<EmbeddedTaskExecutor>) -> Self {
+        Self { cli, embedded }
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for TaskExecutorRouter {
+    async fn execute_with_provider_call_admission(
+        &self,
+        ctx: ExecutionContext,
+        admission: Arc<dyn ProviderCallAdmission>,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        if ctx
+            .agent_config
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            == Some(EMBEDDED_EXECUTOR_TYPE)
+        {
+            self.embedded
+                .execute_with_provider_call_admission(ctx, admission)
+                .await
+        } else {
+            self.cli
+                .execute_with_provider_call_admission(ctx, admission)
+                .await
+        }
+    }
+
+    async fn execute(
+        &self,
+        ctx: ExecutionContext,
+    ) -> std::result::Result<ExecutionResult, ExecutorError> {
+        if ctx
+            .agent_config
+            .get("executor_type")
+            .and_then(serde_json::Value::as_str)
+            == Some(EMBEDDED_EXECUTOR_TYPE)
+        {
+            self.embedded.execute(ctx).await
+        } else {
+            self.cli.execute(ctx).await
+        }
+    }
+
+    async fn cancel(&self, execution_id: &str) -> std::result::Result<(), ExecutorError> {
+        // Both implementations are intentionally called: a cancellation can
+        // race a route switch, and each backend owns only its own active map.
+        let embedded_result = self.embedded.cancel(execution_id).await;
+        let cli_result = self.cli.cancel(execution_id).await;
+        embedded_result.and(cli_result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn task_repo() -> (tempfile::TempDir, String) {
+        let repo = tempfile::tempdir().expect("temp repository creates");
+        git::init(repo.path())
+            .await
+            .expect("git repository initializes");
+        tokio::fs::write(repo.path().join("README.md"), "# Task\n")
+            .await
+            .expect("initial file writes");
+        let before_sha = git::commit_all(repo.path(), "initial commit")
+            .await
+            .expect("initial commit creates");
+        (repo, before_sha)
+    }
+
+    #[test]
+    fn session_open_failure_is_dispatch_error_not_task_failed_result() {
+        let outcome =
+            native_dispatch_failure(AgentHostError::Runtime("session open failed".into()));
+        assert!(
+            matches!(outcome, Err(ServiceError::InvalidOperation { message }) if message.contains("session open failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_session_open_failure_escapes_as_dispatch_error() {
+        use agent_runtime::{core::provider::Capabilities, provider::fake::FakeProvider};
+        use db::{CreateAgentIdentity, CreateAgentProfile};
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(SqliteDb::new(pool));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000001', 'task@example.test', 'test', ?, ?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let service = EmbeddedAgentService::new(db.clone(), b"task-session-open-test");
+        service
+            .protected_store()
+            .create_credential(
+                "10000000-0000-4000-8000-000000000009",
+                "10000000-0000-4000-8000-000000000001",
+                "openai",
+                "test",
+                forge_agent_host::Secret::new("unused-test-key"),
+                &now,
+            )
+            .await
+            .unwrap();
+        let agent = AgentRepo::create_identity_with_profile(
+            &*db,
+            CreateAgentIdentity {
+                id: "10000000-0000-4000-8000-000000000002".into(),
+                name: "10000000-0000-4000-8000-000000000002".into(),
+                description: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: false,
+                paused: false,
+                owner_id: Some("10000000-0000-4000-8000-000000000001".into()),
+                visibility: "account".into(),
+                account_permission_ceiling: "{}".into(),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+            CreateAgentProfile {
+                id: "10000000-0000-4000-8000-000000000003".into(),
+                identity_id: "10000000-0000-4000-8000-000000000002".into(),
+                backend_kind: "native".into(),
+                executor_type: "embedded".into(),
+                provider: Some("openai".into()),
+                model: Some("fake".into()),
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "{}".into(),
+                tool_policy_json: "{}".into(),
+                config_json: r#"{"base_url":"https://unused.invalid/v1"}"#.into(),
+                credential_ref: Some("10000000-0000-4000-8000-000000000009".into()),
+                daemon_id: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO project (id, name, owner_id, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000004', 'test', '10000000-0000-4000-8000-000000000001', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO project_member (project_id, user_id, role, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000001', 'owner', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000004', 'review', 'planning_task', 'in_progress', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO task_role_assignment (id, task_id, role_name, assignee_type, assignee_id, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000007', '10000000-0000-4000-8000-000000000005', 'worker', 'agent', '10000000-0000-4000-8000-000000000002', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+             INSERT INTO execution (id, task_id, agent_id, role, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000006', '10000000-0000-4000-8000-000000000005', '10000000-0000-4000-8000-000000000002', 'worker', 'running', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');"
+        ).execute(db.pool()).await.unwrap();
+        let (worktree, _) = task_repo().await;
+        sqlx::query("INSERT INTO workspace (id, task_id, repo_id, worktree_path, branch, status, created_at, updated_at) VALUES ('10000000-0000-4000-8000-000000000008', '10000000-0000-4000-8000-000000000005', 'historical-repo', ?, 'test', 'ready', ?, ?)")
+            .bind(worktree.path().to_string_lossy().as_ref()).bind(&now).bind(&now)
+            .execute(db.pool()).await.unwrap();
+        let session = service
+            .create_or_resume_session(CreateScopedSession {
+                actor_user_id: "10000000-0000-4000-8000-000000000001".into(),
+                identity_id: agent.id.clone(),
+                profile_id: Some("10000000-0000-4000-8000-000000000003".into()),
+                scope: RequestedCanonicalScope::Task {
+                    task_id: "10000000-0000-4000-8000-000000000005".into(),
+                    role: "worker".into(),
+                },
+            })
+            .await
+            .unwrap();
+        // An unreadable persisted snapshot fails inside runtime.start_session,
+        // after the executor has admitted the Task and called its backend.
+        sqlx::query("INSERT INTO protected_agent_session_state (session_id, snapshot_ciphertext, snapshot_nonce, key_revision, updated_at) VALUES (?, ?, ?, 1, ?)")
+            .bind(&session.id).bind(vec![0u8; 32]).bind(vec![0u8; 12]).bind(&now)
+            .execute(db.pool()).await.unwrap();
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![],
+        ));
+        let backend = NativeAgentRuntimeBackend::new(service.protected_store())
+            .with_provider_override(provider.clone());
+        let executor = EmbeddedTaskExecutor::new(
+            db.clone(),
+            Arc::new(service.with_native_backend(Arc::new(backend))),
+        );
+        let logs = tempfile::tempdir().unwrap();
+        let mut config = serde_json::json!({
+            "executor_type": "embedded", "agent_id": agent.id,
+            "profile_id": "10000000-0000-4000-8000-000000000003", "provider": "openai", "model": "fake",
+            "config": {"base_url": "https://unused.invalid/v1"},
+        });
+        config[TASK_ROLE_MARKER] = serde_json::json!("worker");
+        executors::mark_worktree_read_only(&mut config);
+        let outcome = executor
+            .execute(ExecutionContext {
+                task_id: "10000000-0000-4000-8000-000000000005".into(),
+                execution_id: "10000000-0000-4000-8000-000000000006".into(),
+                worktree_path: worktree.path().to_string_lossy().into_owned(),
+                description: "review".into(),
+                agent_config: config,
+                logs_path: logs.path().to_string_lossy().into_owned(),
+                heartbeat_interval_seconds: 30,
+                max_turns: None,
+                log_sender: None,
+            })
+            .await;
+        assert!(
+            matches!(outcome, Err(ExecutorError::Other(ref message))
+            if message.contains("runtime failed:") && message.contains("protected state nonce is invalid")),
+            "{outcome:?}"
+        );
+        assert!(provider.requests().is_empty());
+        assert!(executor.active.read().await.is_empty());
+    }
+
+    #[test]
+    fn only_known_task_roles_receive_task_authority() {
+        assert_eq!(canonical_task_role("worker").unwrap(), "worker");
+        assert_eq!(canonical_task_role("coder").unwrap(), "worker");
+        assert_eq!(canonical_task_role("reviewer").unwrap(), "reviewer");
+        assert_eq!(canonical_task_role("planner").unwrap(), "planner");
+        assert!(canonical_task_role("merge_fixer").is_err());
+        assert!(canonical_task_role("").is_err());
+    }
+
+    #[test]
+    fn a_retry_of_the_same_turn_gets_its_own_context_manifest() {
+        // A rebuilt runtime session restarts its turn numbering, so the second
+        // review attempt on a Task presents the same runtime turn id under the
+        // same reused Forge session. Only the execution tells the two apart.
+        let manifest = RuntimeContextManifestLink {
+            turn_id: "turn-1".to_owned(),
+            schema_version: 1,
+            context_fingerprint: "ctx".to_owned(),
+            cache_plan_fingerprint: "cache".to_owned(),
+            runtime_manifest_fingerprint: "runtime".to_owned(),
+            segments: Vec::new(),
+            summaries: Vec::new(),
+            lossless_summaries: Vec::new(),
+            lcm_timeline_id: None,
+            lcm_binding_revision: None,
+            lcm_store_revision: None,
+        };
+
+        let first = runtime_manifest_id("identity", "session", "execution-1", &manifest);
+        let second = runtime_manifest_id("identity", "session", "execution-2", &manifest);
+        assert_ne!(first, second);
+
+        // The same execution re-entering the same turn must still be idempotent.
+        assert_eq!(
+            first,
+            runtime_manifest_id("identity", "session", "execution-1", &manifest)
+        );
+    }
+
+    #[test]
+    fn planner_and_reviewer_are_read_only_task_roles() {
+        assert!(is_read_only_task_role("planner"));
+        assert!(is_read_only_task_role("reviewer"));
+        assert!(!is_read_only_task_role("worker"));
+        assert!(!is_read_only_task_role("coder"));
+    }
+
+    #[test]
+    fn dispatch_marker_overrides_profile_supplied_task_role() {
+        let mut config = serde_json::json!({
+            "executor_type": "embedded",
+            TASK_ROLE_MARKER: "reviewer",
+        });
+        executors::mark_task_role(&mut config, "coder");
+        assert_eq!(config[TASK_ROLE_MARKER], "coder");
+    }
+
+    #[test]
+    fn provider_attempt_limit_is_executor_unavailability() {
+        let result = native_turn_limit_result(
+            "execution",
+            "runtime-session".to_owned(),
+            "anthropic",
+            "claude-sonnet",
+            "embedded:provider=anthropic",
+            AgentTurnLimit::ProviderAttempts,
+        );
+
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(
+            result.failure_class,
+            Some(ExecutionFailureClass::ExecutorUnavailable)
+        );
+        assert_eq!(
+            result.retry_after,
+            Some(executors::DEFAULT_ACCOUNT_COOLDOWN)
+        );
+        assert_eq!(result.usage_reports.len(), 1);
+        assert_eq!(
+            result.usage_reports[0].telemetry_state,
+            executors::UsageTelemetryState::Unmetered
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("provider_attempts"));
+    }
+
+    #[test]
+    fn native_usage_mapping_preserves_cache_buckets_and_actual_identity() {
+        let output = forge_agent_host::AgentTurnOutput {
+            runtime_session_id: "runtime-session".to_owned(),
+            text: "done".to_owned(),
+            input_tokens: 4,
+            output_tokens: 5,
+            cache_read_tokens: 6,
+            cache_write_tokens: 7,
+            usage_reports: vec![forge_agent_host::AgentTurnUsageReport {
+                report_id: "provider-report".to_owned(),
+                request_id: Some("provider-request".to_owned()),
+                attempt_id: Some("provider-attempt".to_owned()),
+                provider_id: Some("openai".to_owned()),
+                model_id: Some("gpt-5.6".to_owned()),
+                input_tokens: Some(4),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(6),
+                cache_write_tokens: Some(7),
+                telemetry_state: AgentTurnTelemetryState::Metered,
+                failed: true,
+            }],
+            telemetry_state: AgentTurnTelemetryState::Metered,
+            context_manifest: None,
+            pending_interaction_id: None,
+        };
+
+        let reports = native_usage_reports(
+            "execution",
+            "configured-provider",
+            "configured-model",
+            &output,
+            executors::RouteAttemptOutcome::Failed,
+            "embedded:configured-provider",
+        );
+        assert_eq!(reports.len(), 1);
+        let report = &reports[0];
+        assert_eq!(report.report_id, "provider-report");
+        assert_eq!(report.request_id.as_deref(), Some("provider-request"));
+        assert_eq!(report.provider_id.as_deref(), Some("openai"));
+        assert_eq!(report.model_id.as_deref(), Some("gpt-5.6"));
+        assert_eq!(report.counters.input_tokens, Some(4));
+        assert_eq!(report.counters.output_tokens, Some(5));
+        assert_eq!(report.counters.cache_read_tokens, Some(6));
+        assert_eq!(report.counters.cache_write_tokens, Some(7));
+        assert_eq!(report.telemetry_state, UsageTelemetryState::Metered);
+        assert!(report.partial);
+    }
+
+    #[test]
+    fn output_limit_remains_a_task_execution_failure() {
+        let result = native_turn_limit_result(
+            "execution",
+            "runtime-session".to_owned(),
+            "anthropic",
+            "claude-sonnet",
+            "embedded:provider=anthropic",
+            AgentTurnLimit::Output,
+        );
+
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(
+            result.failure_class,
+            Some(ExecutionFailureClass::TaskFailed)
+        );
+        assert_eq!(result.retry_after, None);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("native runtime turn limit reached: output")
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_native_worker_changes_fail_loud_and_remain_uncommitted() {
+        let (repo, before_sha) = task_repo().await;
+        tokio::fs::write(repo.path().join("app.ts"), "export const ready = true;\n")
+            .await
+            .expect("worker output writes");
+
+        let error = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect_err("dirty uncommitted output cannot complete");
+
+        assert!(error.to_string().contains("uncommitted worktree changes"));
+        assert_eq!(
+            git::get_current_sha(repo.path())
+                .await
+                .expect("final HEAD reads"),
+            before_sha
+        );
+        assert!(!git::is_worktree_clean(repo.path())
+            .await
+            .expect("worktree cleanliness reads"));
+        assert!(repo.path().join("app.ts").exists());
+    }
+
+    #[tokio::test]
+    async fn clean_unchanged_native_worker_is_left_to_workflow_noop_policy() {
+        let (repo, before_sha) = task_repo().await;
+
+        let after_sha = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect("a clean no-op has no authored files to lose");
+
+        assert_eq!(after_sha, before_sha);
+    }
+
+    #[tokio::test]
+    async fn native_worker_commit_is_accepted_without_mutation() {
+        let (repo, before_sha) = task_repo().await;
+        tokio::fs::write(repo.path().join("app.ts"), "export const ready = true;\n")
+            .await
+            .expect("worker output writes");
+        let worker_sha = git::commit_all(repo.path(), "worker-authored commit")
+            .await
+            .expect("worker commit creates");
+
+        let after_sha = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .expect("an existing worker commit is delivered");
+
+        assert_eq!(after_sha, worker_sha);
+        assert!(git::is_worktree_clean(repo.path())
+            .await
+            .expect("worktree cleanliness reads"));
+    }
+}

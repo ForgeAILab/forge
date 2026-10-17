@@ -21,9 +21,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
-use db::{
-    new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo, ProjectMemberRepo, ProjectRepo,
-};
+use db::{new_uuid_v4, now_rfc3339, CreateDomainEvent, DomainEventRepo};
 use serde::Deserialize;
 use serde_json::json;
 use services::MilestoneRuntime;
@@ -59,7 +57,20 @@ pub async fn create_milestone(
     Path(project_id): Path<String>,
     Json(request): Json<CreateMilestoneRequest>,
 ) -> ApiResult<(StatusCode, Json<ProjectMilestone>)> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -100,27 +111,26 @@ pub async fn create_milestone(
     Ok((StatusCode::CREATED, Json(milestone)))
 }
 
-pub async fn list_milestone_revisions(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path((project_id, milestone_id)): Path<(String, String)>,
-) -> ApiResult<Json<MilestoneDefinitionRevisionListResponse>> {
-    list_milestone_revisions_with_query(
-        State(state),
-        user,
-        Path((project_id, milestone_id)),
-        Query(MilestoneListQuery::default()),
-    )
-    .await
-}
-
 pub async fn list_milestone_revisions_with_query(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((project_id, milestone_id)): Path<(String, String)>,
     Query(query): Query<MilestoneListQuery>,
 ) -> ApiResult<Json<MilestoneDefinitionRevisionListResponse>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let rows = if let Some((revision, id)) = cursor.as_ref() {
@@ -184,7 +194,20 @@ pub async fn get_milestone_revision(
     user: AuthenticatedUser,
     Path((project_id, milestone_id, revision_id)): Path<(String, String, String)>,
 ) -> ApiResult<Json<MilestoneDefinitionRevision>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let revision = runtime
         .definition_revision(&project_id, &milestone_id, &revision_id)
@@ -200,7 +223,20 @@ pub async fn transition_milestone_revision(
     Path((project_id, milestone_id, revision_id)): Path<(String, String, String)>,
     Json(request): Json<TransitionMilestoneRevisionRequest>,
 ) -> ApiResult<Json<MilestoneDefinitionRevision>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -408,7 +444,20 @@ pub async fn save_milestone_revision(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<SaveMilestoneRevisionRequest>,
 ) -> ApiResult<(axum::http::StatusCode, Json<MilestoneDefinitionRevision>)> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -454,27 +503,26 @@ pub async fn save_milestone_revision(
     Ok((StatusCode::CREATED, Json(revision)))
 }
 
-pub async fn list_milestones(
-    State(state): State<AppState>,
-    user: AuthenticatedUser,
-    Path(project_id): Path<String>,
-) -> ApiResult<Json<ProjectMilestoneListResponse>> {
-    list_milestones_with_query(
-        State(state),
-        user,
-        Path(project_id),
-        Query(MilestoneListQuery::default()),
-    )
-    .await
-}
-
 pub async fn list_milestones_with_query(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
     Query(query): Query<MilestoneListQuery>,
 ) -> ApiResult<Json<ProjectMilestoneListResponse>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
     let rows = if let Some((sequence, id)) = cursor.as_ref() {
@@ -534,7 +582,20 @@ pub async fn get_milestone(
     user: AuthenticatedUser,
     Path((project_id, milestone_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ProjectMilestone>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let milestone = runtime
         .get(&project_id, &milestone_id)
@@ -554,7 +615,20 @@ pub async fn transition_milestone(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<TransitionMilestoneRequest>,
 ) -> ApiResult<Json<ProjectMilestone>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -781,8 +855,21 @@ pub async fn record_milestone_check(
     Path((project_id, milestone_id, check_id)): Path<(String, String, String)>,
     Json(request): Json<RecordMilestoneCheckRequest>,
 ) -> ApiResult<Json<ValidationResult>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let storage_idempotency_key = scoped_idempotency_key(
         "milestone-check",
         &project_id,
@@ -1231,6 +1318,13 @@ pub async fn waive_milestone_check(
     Path((project_id, milestone_id, check_id)): Path<(String, String, String)>,
     Json(request): Json<WaiveMilestoneCheckRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     require_idempotency_key(&request.mutation.idempotency_key)?;
     let waiver_dedupe = format!(
         "milestone.check.waived:{project_id}:{}",
@@ -1253,7 +1347,13 @@ pub async fn waive_milestone_check(
     {
         return Ok(Json(replay));
     }
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -1447,7 +1547,20 @@ pub async fn evaluate_readiness(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<EvaluateMilestoneReadinessRequest>,
 ) -> ApiResult<Json<ReadinessSnapshot>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     if request.milestone_id != milestone_id {
         return Err(ApiError::bad_request(
             "milestone_id in the path and request must match",
@@ -1487,7 +1600,20 @@ pub async fn list_readiness_snapshots(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Query(query): Query<MilestoneListQuery>,
 ) -> ApiResult<Json<ReadinessSnapshotListResponse>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let mut items = runtime
         .list_readiness(&project_id, &milestone_id)
@@ -1517,7 +1643,20 @@ pub async fn get_readiness_snapshot(
     user: AuthenticatedUser,
     Path((project_id, milestone_id, snapshot_id)): Path<(String, String, String)>,
 ) -> ApiResult<Json<ReadinessSnapshot>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let snapshot = runtime
         .get_readiness(&project_id, &milestone_id, &snapshot_id)
@@ -1533,7 +1672,20 @@ pub async fn release_milestone(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Json(request): Json<ReleaseMilestoneRequest>,
 ) -> ApiResult<Json<ProjectRelease>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     if request.milestone_id != milestone_id {
         return Err(ApiError::bad_request(
             "milestone_id in the path and request must match",
@@ -1561,7 +1713,20 @@ pub async fn get_release(
     user: AuthenticatedUser,
     Path((project_id, release_id)): Path<(String, String)>,
 ) -> ApiResult<Json<ProjectRelease>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let release = runtime
         .get_release(&project_id, &release_id)
@@ -1577,7 +1742,20 @@ pub async fn list_releases(
     Path((project_id, milestone_id)): Path<(String, String)>,
     Query(query): Query<MilestoneListQuery>,
 ) -> ApiResult<Json<ProjectReleaseListResponse>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let mut items = runtime
         .list_releases(&project_id, &milestone_id)
@@ -1609,7 +1787,20 @@ pub async fn set_primary_milestone(
     Path(project_id): Path<String>,
     Json(request): Json<SetPrimaryMilestoneRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    ensure_project_access(&state, &project_id, &user).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     validate_authorization(
         &request.mutation.authorization,
         &user.user_id,
@@ -2130,24 +2321,6 @@ fn require_idempotency_key(value: &str) -> ApiResult<()> {
         ));
     }
     Ok(())
-}
-
-async fn ensure_project_access(
-    state: &AppState,
-    project_id: &str,
-    user: &AuthenticatedUser,
-) -> ApiResult<db::Project> {
-    let project = ProjectRepo::get_by_id(&*state.db, project_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if project.owner_id.as_deref() != Some(user.user_id.as_str())
-        && ProjectMemberRepo::get_member(&*state.db, project_id, &user.user_id)
-            .await?
-            .is_none()
-    {
-        return Err(ApiError::not_found("project", project_id.to_owned()));
-    }
-    Ok(project)
 }
 
 fn user_principal(user_id: &str) -> PrincipalRef {

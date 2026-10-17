@@ -32,22 +32,41 @@ A stable `1.0` will land once the workflow engine consolidation, multi-user stor
 ```bash
 cargo build                          # Build entire workspace
 cargo test                           # Full test suite (CI only)
-cargo test -p db <test-filter>       # Run focused tests for the changed behavior
-cargo test -p api --test happy_path <test-name>  # Run one relevant end-to-end case
+cargo test -p db --features test-template --test main <module>::<test-filter> # Focused integration test
+cargo test -p db --lib <test-filter> # Focused unit test
+cargo test -p services --features test-support --test main <module>::<test-filter>
+cargo test -p api --test main happy_path::<test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings
 cargo fmt --all
 FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
 ```
 
 During local agent work, run only the focused tests directly related to the files and behavior being changed. Do not run a full crate, workspace, or all-target test suite locally; full-suite coverage belongs in CI. Expand to an adjacent focused test only when the change's impact analysis identifies that path as affected.
 
-The happy-path test (`crates/api/tests/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
+DB, services and most API integration tests are modules under `tests/suite/`, selected
+with `cargo test -p <crate> --test main <original-file-stem>::<test-name>`.
+The `services` and `db` integration targets need their test feature
+(`--features test-support` / `--features test-template`): a named target
+without it is a Cargo error, and a plain `cargo test -p services` or
+`cargo test -p db` runs the unit tests only and skips them without a message.
+The clippy command names the same features so that linting those targets does
+not depend on another crate's dev-dependencies.
+Neither crate may dev-depend on itself (it compiles the lib twice in series);
+see [docs/ci.md](docs/ci.md#test-features-and-required-features).
+Services keeps `project_provisioning_characterization` and
+`main_project_create_command` as separate targets for process isolation.
+API keeps seven process-isolated targets; see
+[docs/ci.md](docs/ci.md#api-binary-split-and-isolation) for the list.
+See [docs/ci.md](docs/ci.md#services-unit-split-and-integration-inventory) for
+inventory comparison and the services lib filter/skip partition.
+
+The happy-path test (`crates/api/tests/suite/happy_path.rs`) is the canonical end-to-end smoke and a forcing function for spec alignment. Run only the relevant named case locally; CI runs the complete test target. If you break it, you probably need to revisit the spec, not the test.
 
 ### Running the server
 
-Use the Makefile targets for local dev and manual/agent testing — they all point data at `./test/` (gitignored) instead of `~/.forge/`, so test state never pollutes real user data:
+Use the Makefile targets for local dev and manual/agent testing — they all point data at `./test/` (gitignored) and load `./test/forge.yaml`, so test state and config are isolated from the default install:
 
 ```bash
 make dev               # start server → ./test data dir (default for testing)
@@ -80,7 +99,7 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 - **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Run `make types` to regenerate bindings in `web/src/types/generated/bindings/` and commit them with the other updates in the same change.
-- **State-machine changes** must keep `crates/api/tests/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
+- **State-machine changes** must keep `crates/api/tests/suite/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
 - **Migrations** after V149 are named `V{YYYYMMDDHHMM}__{name}.sql`, using the UTC time you create the file, so parallel branches never pick the same version. Add a new file; don't edit historical migrations even during beta — users have running databases. The runner refuses to start on two files with one version, or on a database that applied a different migration under a version the build uses.
 - **Errors** flow `DbError` (db) → `ServiceError` (services) → `ApiError` (api). Map at the boundaries; don't leak lower-layer error types upward.
 - **Concurrency**: tasks and agents use a `version` column. Updates require `WHERE version = ?` and increment on success. Version mismatch → `DbError::VersionConflict` → HTTP 409.
@@ -91,29 +110,32 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 The full version lives in [docs/architecture.md](docs/architecture.md). Quick orientation:
 
 ```
-forge-cli → api → services → db
-                → events      ↑
-          → mcp-server -------┘
-          → executors → workspace → git
-          → config
-          → api-types (shared, zero internal deps)
+forge-cli → api / services-agents / services
+api → mcp-server
+api / mcp-server / forge-solo → services-agents → services → db
+api / mcp-server / forge-solo → services
+services-agents / services → events / agent-host / executors / workspace → git
+forge-cli / forge-solo → config
+api-types (shared, zero internal deps)
+api / services-agents / services → pricing → db / api-types
+forge-solo owns its Solo bootstrap and session services
 ```
 
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
-- **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, hands them to `AppState::new()` which builds `TaskService` / `AgentService` internally. `AppState` is `Clone` (all fields `Arc`) and used as Axum state.
+- **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, builds the shared graph through `services_agents::ForgeRuntimeBuilder`, and hands it to `AppState::from_runtime_arc()`. `AppState` is `Clone` (shared services use `Arc`) and used as Axum state.
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.
-- **Review** — `ReviewRunner` runs `task.review_config.ci_steps` as `bash -lc` commands in the worktree; empty steps auto-pass.
+- **Review** — workflow entry hooks run configured checks on the durable check runner and dispatch ordinary reviewers; an explicit review re-run re-enters that same entry (`TaskService::rerun_review`). There is no separate review runner.
 - **MCP server** — `POST /mcp`, JSON-RPC, has its own `McpState`, does not depend on the `api` crate.
-- **Workspace** — file-based locking via `.forge.lock`; path validation prevents traversal escapes.
-- **Config precedence** — CLI flags > env vars > config file > defaults. Default bind `127.0.0.1:8080`.
+- **Workspace** — no lock files: keyed in-process locks serialize repository-cache/integration and Workspace execution operations; path validation prevents traversal escapes. The `workspace` crate owns Task-root reclamation (permission repair, exact worktree removal, delivered-branch deletion) for the server and the daemon.
+- **Config precedence** — CLI flags > env vars > config file > defaults. Config lookup uses `<data dir>/forge.yaml`, with the directory chosen by CLI `--data-dir` > `FORGE_DATA_DIR` > `~/.forge`; a file's `forge.data_dir` does not relocate that lookup. Default bind `127.0.0.1:8080`.
 
 ## Database
 
 SQLite with WAL mode. Schema in `crates/db/migrations/V001__initial_schema.sql`. Migrations are named `V{version}__{name}.sql` (sequential up to V149, UTC timestamps `VYYYYMMDDHHMM` after that) and tracked by version and name in the `_migration` table. All primary keys are app-generated UUID v4; all timestamps are app-generated RFC3339.
 
-Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=5000` per connection.
+Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`, `busy_timeout=30000` per connection.
 
 Enum serialization uses `Display`/`FromStr` (in `db::models`) for SQLite TEXT columns. Row mapping is manual via `sqlx::Row::get()`, not compile-time checked macros — so a renamed column will fail at runtime, not at `cargo check`. Update both the migration and the row-mapper together.
 

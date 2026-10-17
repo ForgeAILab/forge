@@ -37,6 +37,21 @@ pub(crate) async fn latest_executor_execution_for_task(
 }
 
 impl TaskService {
+    pub(crate) async fn resolve_task_workspace(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<crate::workspace_backend::ResolvedWorkspace> {
+        Ok(
+            crate::workspace_backend::EmbeddedWorkspaceBackend::resolve_workspace(
+                &self.workspace_backend_router,
+                &self.db,
+                workspace,
+                &self.workspace_root,
+            )
+            .await?,
+        )
+    }
+
     pub(super) async fn latest_executor_execution(&self, task_id: &str) -> Result<Execution> {
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
@@ -120,7 +135,57 @@ impl TaskService {
             },
         )
         .await?;
-        if let Err(error) = self.index_task_comment_memory(task_id, &comment).await {
+        self.after_project_hook_comment(&comment).await;
+        Ok(())
+    }
+
+    /// Review output is replayable independently of the Task transition.
+    pub(crate) async fn create_review_comment(
+        &self,
+        review: &Review,
+        kind: &str,
+        agent_id: Option<&str>,
+        content: String,
+    ) -> Result<()> {
+        let author = match agent_id {
+            Some(id) => AgentRepo::get_by_id(&*self.db, id).await?,
+            None => None,
+        };
+        let now = now_rfc3339();
+        let id = new_uuid_v4();
+        let comment = TaskCommentRepo::create_comment(
+            &*self.db,
+            CreateTaskComment {
+                id: id.clone(),
+                task_id: review.task_id.clone(),
+                author_type: if author.is_some() {
+                    CommentAuthorType::Agent
+                } else {
+                    CommentAuthorType::System
+                },
+                author_id: author.as_ref().map(|agent| agent.id.clone()),
+                author_name: author.map_or_else(|| "Forge".to_owned(), |agent| agent.name),
+                content,
+                execution_id: None,
+                role: None,
+                worklog_kind: None,
+                idempotency_key: Some(format!("review:{}:{kind}", review.id)),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await?;
+        // The repository returns the original row on a replay. Only a new
+        // insert publishes an event or enters the memory index.
+        if comment.id == id {
+            self.after_project_hook_comment(&comment).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn after_project_hook_comment(&self, comment: &TaskComment) {
+        let task_id = &comment.task_id;
+        if let Err(error) = self.index_task_comment_memory(task_id, comment).await {
             tracing::warn!(error = %error, "memory indexing failed (non-fatal)");
         }
         self.publish(ForgeEvent {
@@ -129,12 +194,11 @@ impl TaskService {
             timestamp: event_timestamp(),
             context: EventContext::CommentCreated {
                 task_id: task_id.to_owned(),
-                comment_id: comment.id,
-                author_type: "system".to_owned(),
-                author_name: "Forge".to_owned(),
+                comment_id: comment.id.clone(),
+                author_type: comment.author_type.to_string(),
+                author_name: comment.author_name.clone(),
             },
         });
-        Ok(())
     }
 
     pub(super) async fn create_agent_comment(
@@ -194,11 +258,14 @@ impl TaskService {
     }
 
     pub async fn reset_task_workspace(&self, task_id: &str) -> Result<Workspace> {
-        let Some(_settlement_slot) = self.claim_completion_cascade(task_id) else {
+        // A queued or running step (a cascade, or hooks running CI, a merge
+        // or a dispatch in this worktree) holds the workspace it captured.
+        // Deleting it underneath fails that work and races its Task writes.
+        if db::TaskStepRepo::pending_steps(&*self.db, task_id).await? > 0 {
             return Err(ServiceError::Conflict(
-                "task completion settlement is in progress; retry the workspace reset".to_owned(),
+                "task transition steps are in progress; retry the workspace reset".to_owned(),
             ));
-        };
+        }
         let task = TaskRepo::get_by_id(&*self.db, task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
@@ -208,6 +275,7 @@ impl TaskService {
             &self.workspace_root,
             &task,
             self.repo_cache_locks.clone(),
+            &self.workspace_backend_router,
         )
         .await
     }
@@ -238,33 +306,11 @@ impl TaskService {
             .filter(|repo| repo.project_id == task.project_id)
             .ok_or_else(|| ServiceError::not_found("repo", workspace.repo_id.clone()))?;
 
-        let branch_ref = format!("{}...HEAD", repo.default_branch);
-        let output = Command::new("git")
-            .arg("diff")
-            .arg(branch_ref)
-            .current_dir(&workspace.worktree_path)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_INDEX_FILE")
-            .output()
-            .await;
-        let stdout = match output {
-            Ok(output) if output.status.success() => output.stdout,
-            _ => {
-                Command::new("git")
-                    .arg("diff")
-                    .current_dir(&workspace.worktree_path)
-                    .env_remove("GIT_DIR")
-                    .env_remove("GIT_WORK_TREE")
-                    .env_remove("GIT_INDEX_FILE")
-                    .output()
-                    .await
-                    .map_err(|error| {
-                        ServiceError::invalid_operation(format!("failed to run git diff: {error}"))
-                    })?
-                    .stdout
-            }
-        };
-        Ok(truncate_utf8_bytes(&stdout, MAX_FOLLOW_UP_DIFF_BYTES))
+        let resolved = self.resolve_task_workspace(&workspace).await?;
+        let diff = ::review::ReviewWorkspace::diff(&resolved, &repo.default_branch).await?;
+        Ok(truncate_utf8_bytes(
+            diff.as_bytes(),
+            MAX_FOLLOW_UP_DIFF_BYTES,
+        ))
     }
 }

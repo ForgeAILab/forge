@@ -280,7 +280,7 @@ Flows B and C are indistinguishable to the engine and to the audit log, yet B is
 
 ## 6. Refactor plan
 
-Phases are ordered so that **1–3 are non-behavioral** (string → typed, same matches), **4 is the intentional break**, and **5–6 are the structural payoff** that the actor model unlocks. The happy-path test (`crates/api/tests/happy_path.rs`) guards phases 1–5 throughout.
+Phases are ordered so that **1–3 are non-behavioral** (string → typed, same matches), **4 is the intentional break**, and **5–6 are the structural payoff** that the actor model unlocks. The happy-path test (`crates/api/tests/suite/happy_path.rs`) guards phases 1–5 throughout.
 
 ### Phase 1 — Define `Actor` (non-behavioral)
 
@@ -314,7 +314,7 @@ Note `System` matches **only** `All`. Regenerate the TS bindings (`web/src/types
 Replace `triggered_by: &str` with `&Actor` in:
 
 - `TransitionOptions` (`task_service.rs`) — replace the three `From` impls (`:127`, `:139`, `:151`) with explicit `Actor` fields. The `From<i64>` default-that-means-"system" is a footgun and should be removed.
-- `WorkflowEngine::transition`, `transition_with_deferred_dispatch`, `manual_override_transition`, `reset_to_initial`, `transition_inner` (`workflow/engine/mod.rs`).
+- `WorkflowEngine::transition`, `transition_with_deferred_dispatch`, `reset_to_initial`, `transition_inner` (`workflow/engine/mod.rs`).
 - `HookContext.triggered_by` (`engine/mod.rs` and `engine/context.rs`).
 
 Keep the `transition_log.triggered_by` **column** as TEXT; convert via `Actor::to_trigger_string()` at the write boundary only. Read-side code that parses the string (e.g. `is_awaiting_human`'s `starts_with("gate approved")`) is addressed in Phase 6.
@@ -367,7 +367,7 @@ Update `docs/architecture.md` "Workflow engine (in progress)" section: remove th
 
 ## 7. Testing & migration strategy
 
-- **Guardrail:** `crates/api/tests/happy_path.rs` is the forcing function called out in `AGENTS.md`. It must stay green through every phase. Phases 1–3 are verified by it alone since they preserve observed behavior.
+- **Guardrail:** `crates/api/tests/suite/happy_path.rs` is the forcing function called out in `AGENTS.md`. It must stay green through every phase. Phases 1–3 are verified by it alone since they preserve observed behavior.
 - **Phase 4 verification:** add a service-level test asserting `AgentOnly` hooks fire for `Actor::Agent` and `Actor::System` paths but **not** vice-versa; enumerate the audited `AgentOnly` hooks as cases.
 - **No data migration:** `transition_log.triggered_by` stays TEXT; historical rows keep their existing strings. The column is append-only audit data. `Actor` is an in-memory type; only newly written rows get the corrected strings from Phase 3.
 - **Public surface:** `TransitionTaskRequest.source` (`TransitionSource` enum) is unchanged; the actor is derived server-side from the auth principal / MCP caller. The MCP tool `forge_transition_task` gains agent identity plumbing but its JSON-RPC signature is stable.

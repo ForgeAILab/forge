@@ -1,0 +1,646 @@
+{
+  "message.send": {
+    "action": {
+      "payload": {
+        "content": "Pending proposal"
+      },
+      "payload_hash": "73ff868b6fa2506644ed91565760f72890540f372d868f855b9d80f59f1f4769",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-message.send",
+      "dedupe_key": "registry-message.send",
+      "operation": "message.send",
+      "payload": {
+        "content": "Pending proposal"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "message.send",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_message",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "project",
+      "version": 1
+    }
+  },
+  "memory.publish": {
+    "action": {
+      "payload": {
+        "content": "Pending proposal"
+      },
+      "payload_hash": "73ff868b6fa2506644ed91565760f72890540f372d868f855b9d80f59f1f4769",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-memory.publish",
+      "dedupe_key": "registry-memory.publish",
+      "operation": "memory.publish",
+      "payload": {
+        "content": "Pending proposal"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "memory.publish",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_memory",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "project",
+      "version": 1
+    }
+  },
+  "project.release.request": {
+    "action": {
+      "payload": {
+        "action": "propose_candidate",
+        "milestone_id": "scope-composition-milestone",
+        "milestone_version": 1,
+        "readiness_digest": "scope-composition-readiness-digest",
+        "readiness_snapshot_id": "scope-composition-readiness"
+      },
+      "payload_hash": "931dd4911c1f06a6068cb8d704cd2b89eb2915aef3baa8d1894543b8fdde60e9",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-project.release.request",
+      "dedupe_key": "registry-project.release.request",
+      "operation": "project.release.request",
+      "payload": {
+        "action": "propose_candidate",
+        "milestone_id": "scope-composition-milestone",
+        "milestone_version": 1,
+        "readiness_digest": "scope-composition-readiness-digest",
+        "readiness_snapshot_id": "scope-composition-readiness"
+      }
+    },
+    "first": {
+      "approval_target": {
+        "content_digest": null,
+        "operation": "project.release.request",
+        "rendered_digest": null,
+        "requires_user_authorization": true,
+        "revision": null,
+        "revision_id": null,
+        "target_id": "scope-composition-project",
+        "target_type": "project",
+        "version": 1
+      },
+      "code": "approval_required",
+      "correlation_id": "correlation-registry-project.release.request",
+      "operation": "project.release.request",
+      "replayed": false,
+      "safe_message": "approval is required before this operation is committed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "approval_required"
+    }
+  },
+  "memory.supersede": {
+    "action": {
+      "payload": {
+        "content": "Pending proposal"
+      },
+      "payload_hash": "73ff868b6fa2506644ed91565760f72890540f372d868f855b9d80f59f1f4769",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-memory.supersede",
+      "dedupe_key": "registry-memory.supersede",
+      "operation": "memory.supersede",
+      "payload": {
+        "content": "Pending proposal"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "memory.supersede",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_memory",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "project",
+      "version": 1
+    }
+  },
+  "project.document": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.document",
+      "dedupe_key": "registry-project.document",
+      "operation": "project.document",
+      "payload": {
+        "action": "draft_revision",
+        "base_revision_id": null,
+        "content": {
+          "affected_artifact_ids": [],
+          "affected_decision_ids": [],
+          "alternatives": [],
+          "decision_informed": "Whether adapters should validate domain fields.",
+          "evidence": [],
+          "findings": [],
+          "inferences": [],
+          "question": "Which boundary is authoritative?",
+          "recommendation": null,
+          "scope": "The Project-native boundary.",
+          "sources": [],
+          "stopping_condition": "The service returns a typed outcome.",
+          "uncertainty": [],
+          "unresolved_questions": []
+        },
+        "document_id": "registry-document",
+        "expected_document_version": 1,
+        "kind": "research",
+        "title": "Registry research"
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.document",
+      "event_id": "generated-id-1",
+      "operation": "project.document",
+      "receipt_id": "generated-id-2",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "document_id": "generated-id-3",
+          "domain_committed": true,
+          "lifecycle": "draft",
+          "operation": "project.document",
+          "project_id": "scope-composition-project",
+          "requires_user_authorization": false,
+          "revision": 1,
+          "revision_id": "generated-id-4"
+        },
+        "event_id": "generated-id-1",
+        "materialized": true,
+        "operation": "project.document",
+        "receipt_id": "generated-id-2",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "receipt": {
+      "idempotency_key": "registry-project.document",
+      "input_digest": "f792df2e95044c0db3a263e763d41efce6a421fa62829a279033cd502bd8a169",
+      "operation": "project.document",
+      "outcome": {
+        "document_id": "generated-id-3",
+        "domain_committed": true,
+        "lifecycle": "draft",
+        "operation": "project.document",
+        "project_id": "scope-composition-project",
+        "requires_user_authorization": false,
+        "revision": 1,
+        "revision_id": "generated-id-4"
+      },
+      "policy_result": "allowed",
+      "principal_id": "scope-composition-agent",
+      "principal_type": "agent",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project"
+    }
+  },
+  "project.decision": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.decision",
+      "dedupe_key": "registry-project.decision",
+      "operation": "project.decision",
+      "payload": {
+        "action": "record_effective",
+        "decision_class": "project_implementation",
+        "decision_id": "registry-decision",
+        "expected_project_version": 2,
+        "options": [
+          "A",
+          "B"
+        ],
+        "question": "Choose implementation",
+        "rationale": "Keep the scope bounded",
+        "selected_outcome": "A"
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.decision",
+      "event_id": "generated-id-1",
+      "operation": "project.decision",
+      "receipt_id": "generated-id-2",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "authority_basis": "approved_project_charter",
+          "decision_id": "registry-decision",
+          "domain_committed": true,
+          "operation": "project.decision",
+          "project_id": "scope-composition-project",
+          "requires_user_authorization": false,
+          "state": "active"
+        },
+        "event_id": "generated-id-1",
+        "materialized": true,
+        "operation": "project.decision",
+        "receipt_id": "generated-id-2",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "receipt": {
+      "idempotency_key": "registry-project.decision",
+      "input_digest": "574475bfd7e80ed2622aa569f61cc21b43802808cee0a865700c8dd63629845a",
+      "operation": "project.decision",
+      "outcome": {
+        "authority_basis": "approved_project_charter",
+        "decision_id": "registry-decision",
+        "domain_committed": true,
+        "operation": "project.decision",
+        "project_id": "scope-composition-project",
+        "requires_user_authorization": false,
+        "state": "active"
+      },
+      "policy_result": "allowed",
+      "principal_id": "scope-composition-agent",
+      "principal_type": "agent",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project"
+    }
+  },
+  "project.review_config": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.review_config",
+      "dedupe_key": "registry-project.review_config",
+      "operation": "project.review_config",
+      "payload": {
+        "action": "set_ci_steps",
+        "ci_steps": [
+          "cargo test --lib"
+        ],
+        "expected_project_version": 2
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.review_config",
+      "event_id": "generated-id-1",
+      "operation": "project.review_config",
+      "receipt_id": "generated-id-2",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "ci_steps": [
+            "cargo test --lib"
+          ],
+          "domain_committed": true,
+          "operation": "project.review_config",
+          "project_id": "scope-composition-project",
+          "project_version": 3,
+          "requires_user_authorization": false,
+          "setup_steps": []
+        },
+        "event_id": "generated-id-1",
+        "materialized": true,
+        "operation": "project.review_config",
+        "receipt_id": "generated-id-2",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "receipt": {
+      "idempotency_key": "registry-project.review_config",
+      "input_digest": "143efeda3ade393b185a6978d824a53969ee5e650172c330de7f002d37e1fb34",
+      "operation": "project.review_config",
+      "outcome": {
+        "ci_steps": [
+          "cargo test --lib"
+        ],
+        "domain_committed": true,
+        "operation": "project.review_config",
+        "project_id": "scope-composition-project",
+        "project_version": 3,
+        "requires_user_authorization": false,
+        "setup_steps": []
+      },
+      "policy_result": "allowed",
+      "principal_id": "scope-composition-agent",
+      "principal_type": "agent",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project"
+    }
+  },
+  "commitment.update": {
+    "action": {
+      "payload": {
+        "content": "Pending proposal"
+      },
+      "payload_hash": "73ff868b6fa2506644ed91565760f72890540f372d868f855b9d80f59f1f4769",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-commitment.update",
+      "dedupe_key": "registry-commitment.update",
+      "operation": "commitment.update",
+      "payload": {
+        "content": "Pending proposal"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "commitment.update",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_commitment",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "project",
+      "version": 1
+    }
+  },
+  "project.milestone": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.milestone",
+      "dedupe_key": "registry-project.milestone",
+      "operation": "project.milestone",
+      "payload": {
+        "action": "define",
+        "content": {
+          "name": "Delivery",
+          "outcome": "Deliver the requirement"
+        },
+        "expected_milestone_version": 2
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.milestone",
+      "event_id": "generated-id-1",
+      "operation": "project.milestone",
+      "receipt_id": "generated-id-2",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "domain_committed": true,
+          "lifecycle": "draft",
+          "milestone_id": "generated-id-3",
+          "operation": "project.milestone",
+          "project_id": "scope-composition-project",
+          "requires_user_authorization": false,
+          "revision": 1,
+          "revision_id": "generated-id-4"
+        },
+        "event_id": "generated-id-1",
+        "materialized": true,
+        "operation": "project.milestone",
+        "receipt_id": "generated-id-2",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "receipt": {
+      "idempotency_key": "registry-project.milestone",
+      "input_digest": "727e338f75072f8caf4b792468fc3a4ae2ae6e45f0a131997ef5c2c5430540e7",
+      "operation": "project.milestone",
+      "outcome": {
+        "domain_committed": true,
+        "lifecycle": "draft",
+        "milestone_id": "generated-id-3",
+        "operation": "project.milestone",
+        "project_id": "scope-composition-project",
+        "requires_user_authorization": false,
+        "revision": 1,
+        "revision_id": "generated-id-4"
+      },
+      "policy_result": "allowed",
+      "principal_id": "scope-composition-agent",
+      "principal_type": "agent",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project"
+    }
+  },
+  "review.request": {
+    "action": {
+      "payload": {
+        "content": "Pending proposal"
+      },
+      "payload_hash": "73ff868b6fa2506644ed91565760f72890540f372d868f855b9d80f59f1f4769",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-review.request",
+      "dedupe_key": "registry-review.request",
+      "operation": "review.request",
+      "payload": {
+        "content": "Pending proposal"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "review.request",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_review",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "project",
+      "version": 1
+    }
+  },
+  "session.action": {
+    "action": {
+      "payload": {
+        "action": "cancel",
+        "session_id": "pending-session"
+      },
+      "payload_hash": "b07d9b9a4955afa85583bb1dda2c7ff6c08ec4133c340fdf46ef847ce7caaccd",
+      "policy_result": "approval_required",
+      "status": "pending_approval"
+    },
+    "arguments": {
+      "correlation_id": "correlation-registry-session.action",
+      "dedupe_key": "registry-session.action",
+      "operation": "session.action",
+      "payload": {
+        "action": "cancel",
+        "session_id": "pending-session"
+      }
+    },
+    "first": {
+      "id": "generated-id-1",
+      "operation": "session.action",
+      "policy_result": "approval_required",
+      "requested_permission": "propose_session",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project",
+      "status": "pending_approval",
+      "target_id": "scope-composition-project",
+      "target_type": "scope",
+      "version": 1
+    }
+  },
+  "project.validation": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.validation",
+      "dedupe_key": "registry-project.validation",
+      "operation": "project.validation",
+      "payload": {
+        "action": "record",
+        "check_id": "delivery",
+        "definition_revision_id": "registry-definition",
+        "input_digest": "registry-input",
+        "milestone_id": "registry-milestone",
+        "milestone_version": 1,
+        "result": "Independent execution has not run",
+        "status": "unavailable"
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.validation",
+      "event_id": "generated-id-1",
+      "operation": "project.validation",
+      "receipt_id": "generated-id-2",
+      "replayed": false,
+      "result": {
+        "agent_action_execution_id": null,
+        "domain_committed": true,
+        "domain_result": {
+          "check_id": "delivery",
+          "domain_committed": true,
+          "milestone_id": "registry-milestone",
+          "operation": "project.validation",
+          "outcome": "missing",
+          "project_id": "scope-composition-project",
+          "result_id": "generated-id-3"
+        },
+        "event_id": "generated-id-1",
+        "materialized": true,
+        "operation": "project.validation",
+        "receipt_id": "generated-id-2",
+        "replayed": false,
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "receipt": {
+      "idempotency_key": "registry-project.validation",
+      "input_digest": "3035a0898cb1ecb19530d9a6d6ae4c3a1dd179f6fe764ea8ae7a6a0881ed82f8",
+      "operation": "project.validation",
+      "outcome": {
+        "check_id": "delivery",
+        "domain_committed": true,
+        "milestone_id": "registry-milestone",
+        "operation": "project.validation",
+        "outcome": "missing",
+        "project_id": "scope-composition-project",
+        "result_id": "generated-id-3"
+      },
+      "policy_result": "allowed",
+      "principal_id": "scope-composition-agent",
+      "principal_type": "agent",
+      "scope_id": "scope-composition-project",
+      "scope_type": "project"
+    }
+  },
+  "project.escalate": {
+    "arguments": {
+      "correlation_id": "correlation-registry-project.escalate",
+      "dedupe_key": "registry-project.escalate",
+      "operation": "project.escalate",
+      "payload": {
+        "need": "Confirm the delivery requirement",
+        "task_ids": []
+      }
+    },
+    "first": {
+      "code": "ok",
+      "correlation_id": "correlation-registry-project.escalate",
+      "operation": "project.escalate",
+      "replayed": false,
+      "result": {
+        "correlation_id": "correlation-registry-project.escalate",
+        "domain_committed": true,
+        "domain_result": {
+          "answer": null,
+          "attention_id": "generated-id-1",
+          "id": "generated-id-2",
+          "need": "Confirm the delivery requirement",
+          "notification_id": "generated-id-3",
+          "project_id": "scope-composition-project",
+          "status": "open",
+          "task_ids": [],
+          "version": 1
+        },
+        "materialized": true,
+        "operation": "project.escalate",
+        "requires_user_authorization": false,
+        "status": "succeeded"
+      },
+      "safe_message": "command completed",
+      "scope": {
+        "scope_id": "scope-composition-project",
+        "scope_type": "project"
+      },
+      "status": "succeeded"
+    },
+    "escalations": 1
+  }
+}

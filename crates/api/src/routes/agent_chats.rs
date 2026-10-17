@@ -26,15 +26,15 @@ use db::{
     AgentChatMessageAuthorType as DbMessageAuthorType, AgentChatMessageListQuery,
     AgentChatMessageRepo, AgentChatMessageStatus as DbMessageStatus, AgentChatRepo, AgentChatTopic,
     AgentChatTurnJob, AgentChatTurnJobRepo, AgentChatTurnState, AgentHandoff, AgentHandoffRepo,
-    AgentRepo, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectMemberRepo,
-    ProjectRepo, SortBy, SortOrder,
+    AgentRepo, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectRepo, SortBy,
+    SortOrder,
 };
 use serde_json::{json, Value};
 use services::{
     CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
     SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
-    StartMainChatTopicInput,
 };
+use services_agents::StartMainChatTopicInput;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -80,7 +80,13 @@ pub async fn get_project_agent(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<ProjectAgentBindingResponse>> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let binding = current_project_binding(&state, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("project_agent_binding", project_id.clone()))?;
@@ -93,7 +99,13 @@ pub async fn set_project_agent(
     Path(project_id): Path<String>,
     Json(request): Json<SetProjectAgentBindingRequest>,
 ) -> ApiResult<Json<ProjectAgentBindingResponse>> {
-    require_project_admin(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Admin,
+    )
+    .await?;
     if request.wake_budget < 0 {
         return Err(ApiError::bad_request("wake_budget must be non-negative"));
     }
@@ -142,6 +154,14 @@ pub async fn get_agent_chat(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<AgentChatDetailResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let chat = state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -180,6 +200,14 @@ pub async fn list_agent_chat_messages(
     Path(chat_id): Path<String>,
     Query(query): Query<AgentChatMessagesQuery>,
 ) -> ApiResult<Json<AgentChatMessageListResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -216,6 +244,14 @@ pub async fn send_agent_chat_message(
     Path(chat_id): Path<String>,
     Json(request): Json<SendAgentChatMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<SendAgentChatMessageResponse>)> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let actor_user_id = user.user_id;
     let source_chat_id = chat_id.clone();
     let admitted = state
@@ -260,6 +296,14 @@ pub async fn list_agent_chat_turns(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentChatTurnJobResponse>>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -278,6 +322,14 @@ pub async fn get_agent_chat_turn_logs(
     Path((chat_id, turn_id)): Path<(String, String)>,
     Query(params): Query<LogsQuery>,
 ) -> ApiResult<Json<Value>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &chat_id)
@@ -298,6 +350,14 @@ pub async fn cancel_agent_chat_turn(
     Path((chat_id, turn_id)): Path<(String, String)>,
     Json(request): Json<CancelAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let job = state
         .agent_chat_service
         .cancel_turn(CancelAgentChatTurnInput {
@@ -311,20 +371,30 @@ pub async fn cancel_agent_chat_turn(
     Ok(Json(turn_response(job)))
 }
 
-/// Re-run a failed turn from its own triggering message, with freshly
-/// resolved authority. Nothing is re-sent: the original message stays the one
-/// request it always was.
+/// Admit a fresh turn from a failed or cancelled turn’s triggering message
+/// with current authority and versioned, durable idempotency.
 pub async fn retry_agent_chat_turn(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path((chat_id, turn_id)): Path<(String, String)>,
+    Json(request): Json<api_types::RetryAgentChatTurnRequest>,
 ) -> ApiResult<Json<AgentChatTurnJobResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let job = state
         .agent_chat_service
         .retry_turn(services::RetryAgentChatTurnInput {
             actor_user_id: user.user_id,
             chat_id,
             turn_job_id: turn_id,
+            expected_version: request.expected_version,
+            idempotency_key: request.idempotency_key,
         })
         .await?;
     Ok(Json(turn_response(job)))
@@ -338,6 +408,14 @@ pub async fn list_agent_chat_topics(
     user: AuthenticatedUser,
     Path(chat_id): Path<String>,
 ) -> ApiResult<Json<AgentChatTopicListResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let topics = state
         .main_chat_topic_service
         .list_topics(&user.user_id, &chat_id)
@@ -361,6 +439,14 @@ pub async fn start_agent_chat_topic(
     Path(chat_id): Path<String>,
     Json(request): Json<StartAgentChatTopicRequest>,
 ) -> ApiResult<Json<StartAgentChatTopicResponse>> {
+    crate::routes::authorization::require_scope_access(
+        &state,
+        "agent_chat",
+        &chat_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let rotation = state
         .main_chat_topic_service
         .start_topic(StartMainChatTopicInput {
@@ -370,11 +456,13 @@ pub async fn start_agent_chat_topic(
             summary: request.summary,
         })
         .await?;
-    let divider_message_id = rotation.divider_message.id;
-    let topic_id = rotation.topic.id.clone();
     Ok(Json(StartAgentChatTopicResponse {
-        topic: topic_response(Some(topic_id.as_str()), rotation.topic),
-        divider_message_id,
+        rotation_pending: rotation.rotation_pending,
+        divider_message_id: rotation.divider_message.map(|message| message.id),
+        topic: rotation.topic.map(|topic| {
+            let id = topic.id.clone();
+            topic_response(Some(&id), topic)
+        }),
     }))
 }
 
@@ -404,7 +492,13 @@ pub async fn list_agent_handoffs(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<Vec<AgentHandoffResponse>>> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let chat = AgentChatRepo::get_project_chat(&*state.db, &project_id)
         .await?
         .ok_or_else(|| ApiError::not_found("agent_chat", project_id.clone()))?;
@@ -419,16 +513,29 @@ pub async fn list_agent_handoffs(
 pub async fn get_agent_handoff(
     State(state): State<AppState>,
     user: AuthenticatedUser,
-    Path((_project_id, handoff_id)): Path<(String, String)>,
+    Path((project_id, handoff_id)): Path<(String, String)>,
 ) -> ApiResult<Json<AgentHandoffResponse>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     let handoff = AgentHandoffRepo::get_agent_handoff(&*state.db, &handoff_id)
         .await?
         .ok_or_else(|| ApiError::not_found("agent_handoff", handoff_id.clone()))?;
+    // A handoff into a Chat the caller cannot reach reads like an unknown
+    // handoff, never as that Chat's own 404.
     let target = state
         .agent_chat_service
         .get_authorized_chat(&user.user_id, &handoff.target_chat_id)
-        .await?;
-    if target.project_id.as_deref() != Some(_project_id.as_str()) {
+        .await
+        .map_err(|error| {
+            ApiError::from(error)
+                .mask_not_found(ApiError::not_found("agent_handoff", handoff_id.clone()))
+        })?;
+    if target.project_id.as_deref() != Some(project_id.as_str()) {
         return Err(ApiError::not_found("agent_handoff", handoff_id));
     }
     Ok(Json(handoff_response(&state, handoff).await?))
@@ -440,7 +547,13 @@ pub async fn create_agent_handoff(
     Path(project_id): Path<String>,
     Json(request): Json<CreateAgentHandoffRequest>,
 ) -> ApiResult<(StatusCode, Json<AgentHandoffResponse>)> {
-    require_project_member(&state, &project_id, &user.user_id).await?;
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let source = state
         .agent_chat_service
         .ensure_main_chat(&user.user_id)
@@ -465,30 +578,6 @@ pub async fn create_agent_handoff(
         StatusCode::CREATED,
         Json(handoff_response(&state, outcome.handoff).await?),
     ))
-}
-
-async fn require_project_member(
-    state: &AppState,
-    project_id: &str,
-    user_id: &str,
-) -> ApiResult<()> {
-    ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    Ok(())
-}
-
-async fn require_project_admin(state: &AppState, project_id: &str, user_id: &str) -> ApiResult<()> {
-    let member = ProjectMemberRepo::get_member(&*state.db, project_id, user_id)
-        .await?
-        .ok_or_else(|| ApiError::not_found("project", project_id.to_owned()))?;
-    if member.role != "owner" && member.role != "admin" {
-        return Err(ApiError::forbidden_with_code(
-            "insufficient_role",
-            "project owner or admin role is required",
-        ));
-    }
-    Ok(())
 }
 
 async fn current_project_binding(
@@ -552,18 +641,7 @@ async fn switcher_item(state: &AppState, chat: AgentChat) -> ApiResult<AgentChat
             .map(|identity| identity.name),
         None => None,
     };
-    let pending_turn_count = AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, &chat.id)
-        .await?
-        .into_iter()
-        .filter(|job| {
-            matches!(
-                job.status,
-                AgentChatTurnState::Queued
-                    | AgentChatTurnState::Leased
-                    | AgentChatTurnState::RetryWait
-            )
-        })
-        .count() as i64;
+    let pending_turn_count = pending_turn_count(state, &chat.id).await?;
     Ok(AgentChatSwitcherItem {
         chat_id: chat.id,
         kind,
@@ -628,20 +706,7 @@ async fn project_binding_response(
 }
 
 async fn pending_turn_count(state: &AppState, chat_id: &str) -> ApiResult<i64> {
-    Ok(
-        AgentChatTurnJobRepo::list_agent_chat_turn_jobs(&*state.db, chat_id)
-            .await?
-            .into_iter()
-            .filter(|job| {
-                matches!(
-                    job.status,
-                    AgentChatTurnState::Queued
-                        | AgentChatTurnState::Leased
-                        | AgentChatTurnState::RetryWait
-                )
-            })
-            .count() as i64,
-    )
+    Ok(AgentChatTurnJobRepo::count_pending_agent_chat_turn_jobs(&*state.db, chat_id).await?)
 }
 
 fn chat_response(
@@ -734,6 +799,7 @@ async fn message_response(
 }
 
 fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
+    let retry_action = job.retry_action();
     let error = job.error_message.clone().or_else(|| job.error_code.clone());
     AgentChatTurnJobResponse {
         id: job.id,
@@ -758,6 +824,10 @@ fn turn_response(job: AgentChatTurnJob) -> AgentChatTurnJobResponse {
         response_message_id: job.response_message_id,
         error_code: job.error_code,
         error_message: job.error_message,
+        failure_class: job.failure_class,
+        retry_decision: job.retry_decision,
+        pre_provider_failure_count: job.pre_provider_failure_count,
+        retry_action,
         error,
         correlation_id: job.correlation_id,
         version: job.version,

@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 
 use api_types::{LifecycleEvent, LifecycleHookDef, ProjectSettings, WorkflowDefinition};
-use db::{ProjectMemberRepo, SqliteDb};
+use db::{ProjectMemberRepo, ProjectRepo, SqliteDb};
 use serde_json::Value;
 
 use crate::{Result, ServiceError};
@@ -38,8 +38,38 @@ pub async fn validate_project_settings(
     project_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Result<()> {
+    if operation_registry::mcp::contains_script_hooks(settings) {
+        if let (Some(project_id), Some(user_id)) = (project_id, user_id) {
+            let owner = ProjectRepo::get_by_id(db, project_id)
+                .await?
+                .is_some_and(|project| project.owner_id.as_deref() == Some(user_id));
+            let admin = ProjectMemberRepo::get_member(db, project_id, user_id)
+                .await?
+                .is_some_and(|member| matches!(member.role.as_str(), "owner" | "admin"));
+            if !owner && !admin {
+                return Err(ServiceError::AuthorizationDenied {
+                    message: "Script lifecycle hooks require the Project owner or admin role."
+                        .into(),
+                });
+            }
+        }
+    }
+    if let Some(review) = settings.get("default_review_config") {
+        api_types::validate_review_verify_config(review)
+            .map_err(ServiceError::invalid_operation)?;
+    }
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
+    if !(1..=86400).contains(&settings.placement.provision_timeout_seconds) {
+        return Err(ServiceError::invalid_operation(
+            "placement.provision_timeout_seconds must be between 1 and 86400",
+        ));
+    }
+    if settings.max_active_tasks > 1000 {
+        return Err(ServiceError::invalid_operation(
+            "max_active_tasks must be between 0 and 1000 (0 means unlimited)",
+        ));
+    }
     let role_names: HashSet<&str> = workflow
         .roles
         .iter()
@@ -107,6 +137,11 @@ pub async fn validate_project_settings(
 
     for (name, value) in [
         ("review", settings.retry_budgets.review),
+        ("review_progress", settings.retry_budgets.review_progress),
+        (
+            "review_verify_rerun",
+            settings.retry_budgets.review_verify_rerun,
+        ),
         ("merge_fix", settings.retry_budgets.merge_fix),
     ] {
         if value.is_some_and(|value| value < 0) {
@@ -155,4 +190,77 @@ pub async fn validate_project_settings(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn review_ci_triage_defaults_full_and_validates_values() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = SqliteDb::new(pool);
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        assert_eq!(
+            ProjectSettings::default().review_ci_triage,
+            api_types::ReviewCiTriage::Full
+        );
+        for value in ["full", "report", "off"] {
+            validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for value in [
+            serde_json::json!("unknown"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert!(validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None
+            )
+            .await
+            .is_err());
+        }
+    }
+    #[tokio::test]
+    async fn provision_timeout_defaults_to_thirty_minutes_and_is_bounded() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = SqliteDb::new(pool);
+        let default: ProjectSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.placement.provision_timeout_seconds, 1800);
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        for seconds in [0, 86401] {
+            let result = validate_project_settings(
+                &db,
+                &serde_json::json!({"placement":{"provision_timeout_seconds":seconds}}),
+                &workflow,
+                None,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(result,Err(ServiceError::InvalidOperation{message}) if message.contains("provision_timeout_seconds"))
+            );
+        }
+        for seconds in [1, 1800, 86400] {
+            validate_project_settings(
+                &db,
+                &serde_json::json!({"placement":{"provision_timeout_seconds":seconds}}),
+                &workflow,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+    }
 }

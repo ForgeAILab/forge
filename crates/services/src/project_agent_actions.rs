@@ -27,12 +27,11 @@ use forge_agent_host::{
     PROJECT_CHARTER_ADOPTION_OPERATION, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
     PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
     PROJECT_RELEASE_OPERATION, PROJECT_REVIEW_CONFIG_OPERATION, PROJECT_VALIDATION_OPERATION,
-    TASK_ADAPTIVE_OPERATION, TASK_CANCEL_OPERATION,
+    TASK_ACTION_OPERATION, TASK_ADAPTIVE_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use sqlx::Row;
 
 use crate::{
     parse_document_kind, AgentActionProvenance, AgentActionService,
@@ -129,7 +128,7 @@ impl ProjectOrchestrationActionService {
                 current.version = Some(project.version);
                 Ok(Some(current))
             }
-            TASK_CANCEL_OPERATION => {
+            TASK_ACTION_OPERATION => {
                 let Some(task_id) = payload.get("task_id").and_then(Value::as_str) else {
                     return Ok(None);
                 };
@@ -258,27 +257,23 @@ impl ProjectOrchestrationActionService {
     }
 
     async fn authorize_direct_actor(&self, input: &ExecuteDirectProjectCommandInput) -> Result<()> {
-        let actor =
-            sqlx::query("SELECT paused, archived_at FROM agent_identity WHERE id = ? LIMIT 1")
-                .bind(&input.actor_identity_id)
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::not_found("agent_identity", input.actor_identity_id.clone())
-                })?;
-        if actor.try_get::<i64, _>("paused")? != 0
-            || actor.try_get::<Option<String>, _>("archived_at")?.is_some()
-        {
+        let actor = self
+            .db
+            .direct_project_actor_status(&input.actor_identity_id)
+            .await?
+            .ok_or_else(|| {
+                ServiceError::not_found("agent_identity", input.actor_identity_id.clone())
+            })?;
+        if actor.paused()? != 0 || actor.archived_at()?.is_some() {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Project Agent is paused or archived".to_owned(),
             });
         }
 
-        let project_exists: Option<String> =
-            sqlx::query_scalar("SELECT id FROM project WHERE id = ? LIMIT 1")
-                .bind(&input.project_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+        let project_exists: Option<String> = self
+            .db
+            .direct_project_command_project_id(&input.project_id)
+            .await?;
         if project_exists.is_none() {
             return Err(ServiceError::not_found("project", input.project_id.clone()));
         }
@@ -292,20 +287,18 @@ impl ProjectOrchestrationActionService {
                 });
             }
             "agent_chat" => {
-                let chat =
-                    sqlx::query("SELECT kind, project_id FROM agent_chat WHERE id = ? LIMIT 1")
-                        .bind(&input.scope_id)
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let chat = self
+                    .db
+                    .direct_project_command_chat_scope(&input.scope_id)
+                    .await?;
                 let Some(chat) = chat else {
                     return Err(ServiceError::not_found(
                         "agent_chat",
                         input.scope_id.clone(),
                     ));
                 };
-                if chat.try_get::<String, _>("kind")? != "project"
-                    || chat.try_get::<Option<String>, _>("project_id")?.as_deref()
-                        != Some(input.project_id.as_str())
+                if chat.kind()? != "project"
+                    || chat.project_id()?.as_deref() != Some(input.project_id.as_str())
                 {
                     return Err(ServiceError::AuthorizationDenied {
                         message:
@@ -317,20 +310,41 @@ impl ProjectOrchestrationActionService {
             _ => unreachable!("direct input scope was validated before authorization"),
         }
 
-        let bound: Option<String> = sqlx::query_scalar(
-            "SELECT identity_id FROM project_agent_binding
-             WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-        )
-        .bind(&input.project_id)
-        .bind(&input.actor_identity_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let bound: Option<String> = self
+            .db
+            .direct_project_command_bound_identity(&input.project_id, &input.actor_identity_id)
+            .await?;
         if bound.is_none() {
             return Err(ServiceError::AuthorizationDenied {
                 message: "Project Agent is not actively bound to this Project".to_owned(),
             });
         }
         Ok(())
+    }
+
+    pub(crate) async fn replay_direct_input(
+        &self,
+        input: &ExecuteDirectProjectCommandInput,
+    ) -> Result<Option<DirectProjectCommandResult>> {
+        if validate_direct_input(input).is_err() {
+            return Ok(None);
+        }
+        let operation = direct_receipt_operation(&input.operation, &input.payload)?;
+        let context = direct_command_context(input, &operation, &input.payload, "allowed")?;
+        let receipt = CommandReceiptRepo::get_command_receipt_by_identity(
+            &*self.db,
+            context.principal().principal_type(),
+            context.principal().principal_id(),
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+        )
+        .await?;
+        receipt
+            .filter(|receipt| receipt.input_digest == context.input_digest())
+            .map(|receipt| direct_result_from_receipt(receipt, &input.project_id, true))
+            .transpose()
     }
 
     /// Execute one closed, automatically-allowed Project coordination
@@ -821,22 +835,19 @@ impl ProjectOrchestrationActionService {
                 .target_id
                 .clone()
                 .ok_or_else(|| ServiceError::invalid_operation("Project action has no target"))?;
-            let exists: Option<String> =
-                sqlx::query_scalar("SELECT id FROM project WHERE id = ? LIMIT 1")
-                    .bind(&project_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
+            let exists: Option<String> = self
+                .db
+                .project_action_target_project_id(&project_id)
+                .await?;
             return exists.ok_or_else(|| ServiceError::not_found("project", project_id));
         }
         if action.scope_type == "project" {
             return Ok(action.scope_id.clone());
         }
-        let project_id: Option<String> = sqlx::query_scalar(
-            "SELECT project_id FROM agent_chat WHERE id = ? AND kind = 'project' LIMIT 1",
-        )
-        .bind(&action.scope_id)
-        .fetch_optional(self.db.pool())
-        .await?;
+        let project_id: Option<String> = self
+            .db
+            .project_action_chat_project_id(&action.scope_id)
+            .await?;
         project_id
             .ok_or_else(|| ServiceError::invalid_operation("Project action has no Project scope"))
     }
@@ -853,25 +864,17 @@ impl ProjectOrchestrationActionService {
                     "only the proposing Project Agent may execute this action",
                 ));
             }
-            let bound: Option<String> = sqlx::query_scalar(
-                "SELECT project_id FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(&action.actor_identity_id)
-            .fetch_optional(self.db.pool())
-            .await?;
+            let bound: Option<String> = self
+                .db
+                .project_action_active_project_binding(project_id, &action.actor_identity_id)
+                .await?;
             if bound.as_deref() != Some(project_id) {
                 return Err(ServiceError::invalid_operation(
                     "Project Agent is not actively bound to this Project",
                 ));
             }
         } else if input.executed_by_type == "user" {
-            let owner: Option<String> =
-                sqlx::query_scalar("SELECT owner_id FROM project WHERE id = ? LIMIT 1")
-                    .bind(project_id)
-                    .fetch_optional(self.db.pool())
-                    .await?;
+            let owner: Option<String> = self.db.project_action_project_owner(project_id).await?;
             if owner.as_deref() != Some(input.executed_by_id.as_str()) {
                 return Err(ServiceError::invalid_operation(
                     "only the Project owner may execute a Project action",

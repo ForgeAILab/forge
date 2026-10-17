@@ -18,7 +18,10 @@ use std::collections::HashMap;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::{auth::AuthenticatedUser, projects::require_project_visible},
+    routes::{
+        auth::AuthenticatedUser,
+        authorization::{require_project_access, ProjectAccess},
+    },
     state::AppState,
 };
 
@@ -36,10 +39,18 @@ pub async fn get_project_overview(
     user: AuthenticatedUser,
     Path(project_id): Path<String>,
 ) -> ApiResult<Json<ProjectOverview>> {
+    crate::routes::authorization::require_project_access(
+        &state,
+        &project_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await?;
     // Authorization is intentionally before every orchestration-table query.
     // A non-member receives the same not-found response as an unknown Project
     // and cannot probe Charter, milestone, media, or release identifiers.
-    let project = require_project_visible(&state, &project_id, &user.user_id).await?;
+    let project =
+        require_project_access(&state, &project_id, &user.user_id, ProjectAccess::Read).await?;
 
     let mut stale = false;
     let (current_charter, vision, charter_stale) = load_current_charter(&state, &project).await?;
@@ -589,7 +600,7 @@ async fn load_task_counts(
 ) -> ApiResult<Value> {
     let rows = if let Some(milestone_id) = milestone_id {
         sqlx::query(
-            "SELECT t.status, t.blocked_json
+            "SELECT t.status, t.condition_json
              FROM task t
              JOIN project_task_governance g ON g.task_id = t.id
              WHERE t.project_id = ? AND g.project_id = ? AND g.milestone_id = ?
@@ -603,7 +614,7 @@ async fn load_task_counts(
         .map_err(sql_error)?
     } else {
         sqlx::query(
-            "SELECT status, blocked_json FROM task
+            "SELECT status, condition_json FROM task
              WHERE project_id = ? AND deleted_at IS NULL",
         )
         .bind(project_id)
@@ -619,10 +630,19 @@ async fn load_task_counts(
         // A Task keeps its workflow status when an execution fails, so status
         // alone reports stalled work as active. The blocked record is what the
         // user is actually waiting on, and a terminal Task has moved past it.
-        let blocked = row
-            .try_get::<Option<String>, _>("blocked_json")
-            .unwrap_or_default()
-            .is_some_and(|value| !value.trim().is_empty());
+        // An unreadable condition is the same typed unknown park every row
+        // reader shows; one such Task never fails the whole overview.
+        let condition = db::task_condition::decode_or_unknown(
+            &row.try_get::<String, _>("condition_json")
+                .map_err(sql_error)?,
+        );
+        // A blank blocked record was never counted as blocked.
+        let blocked = condition.read().interruption_present
+            && !condition
+                .evidence()
+                .blocked_json
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty());
         match classify_status(&status) {
             TaskBucket::Terminal => counts.terminal += 1,
             _ if blocked => counts.blocked += 1,
@@ -1565,7 +1585,7 @@ async fn load_failed_task_count(state: &AppState, project_id: &str) -> ApiResult
          WHERE project_id = ? AND deleted_at IS NULL
            AND (lower(status) LIKE '%failed%'
                 OR lower(status) LIKE '%error%'
-                OR failed_json IS NOT NULL)",
+                OR json_extract(condition_json, '$.evidence.presentation.hard_failure') = 1)",
     )
     .bind(project_id)
     .fetch_one(state.db.pool())
@@ -2276,7 +2296,8 @@ fn evidence_availability(value: &str) -> Option<&'static str> {
 fn principal_value(kind: &str, id: Option<&str>) -> Option<Value> {
     let kind = match kind {
         "user" => "user",
-        "agent" | "main_agent" | "project_agent" => "agent",
+        // `task_lead`: a coordination root's lead, an Agent acting from its run.
+        "agent" | "main_agent" | "project_agent" | "task_lead" => "agent",
         "worker" => "worker",
         "reviewer" => "reviewer",
         "service" => "service",

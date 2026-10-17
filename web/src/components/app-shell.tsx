@@ -19,6 +19,7 @@ import { useAgentsQuery, useCreateProject, useProjectsInfiniteQuery } from '@/ap
 import { logoutApi } from '@/api/auth'
 import { Avatar } from '@/components/ui/avatar'
 import { NotificationCenter } from '@/components/notification-center'
+import { ProjectEnvironmentPauseNotice } from '@/components/project-flow-status'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -76,21 +77,32 @@ function ProjectSwitcher({ projectId }: { projectId: string | undefined }) {
   const renderProjectMenuItems = () => (
     <div className="max-h-[70vh] overflow-y-auto pr-1" onScroll={handleProjectsScroll}>
       {projects.map((p) => (
-        <DropdownMenuItem
-          key={p.id}
-          onClick={() =>
-            void navigate({ to: '/projects/$projectId/board', params: { projectId: p.id } })
-          }
-        >
-          <Avatar name={p.name} seed={p.id} size="xs" className="mr-2 rounded" />
-          <span className="min-w-0 flex-1 truncate text-left" title={p.name}>
-            {p.name}
-          </span>
-          {p.paused ? (
-            <Pause size={12} className="ml-1 shrink-0 text-muted-foreground" weight="fill" />
-          ) : null}
-          {p.id === projectId && <Check size={14} className="ml-1 shrink-0 text-success" />}
-        </DropdownMenuItem>
+        <div key={p.id}>
+          <DropdownMenuItem
+            onClick={() =>
+              void navigate({ to: '/projects/$projectId/board', params: { projectId: p.id } })
+            }
+          >
+            <Avatar name={p.name} seed={p.id} size="xs" className="mr-2 rounded" />
+            <span className="min-w-0 flex-1 truncate text-left" title={p.name}>
+              {p.name}
+            </span>
+            {p.paused ? (
+              <Pause
+                size={12}
+                className="ml-1 shrink-0 text-muted-foreground"
+                weight="fill"
+                aria-label={
+                  p.system_pause_reason === 'environment_not_ready'
+                    ? 'Environment paused'
+                    : 'Paused'
+                }
+              />
+            ) : null}
+            {p.id === projectId && <Check size={14} className="ml-1 shrink-0 text-success" />}
+          </DropdownMenuItem>
+          <ProjectEnvironmentPauseNotice project={p} />
+        </div>
       ))}
       {projectsQuery.hasNextPage || projectsQuery.isFetchingNextPage ? (
         <DropdownMenuItem
@@ -149,7 +161,16 @@ function ProjectSwitcher({ projectId }: { projectId: string | undefined }) {
             {currentProject?.name ?? t('projectSwitcher.selectProject')}
           </span>
           {currentProject?.paused ? (
-            <Pause size={12} className="shrink-0 text-muted-foreground" weight="fill" />
+            <Pause
+              size={12}
+              className="shrink-0 text-muted-foreground"
+              weight="fill"
+              aria-label={
+                currentProject.system_pause_reason === 'environment_not_ready'
+                  ? 'Environment paused'
+                  : 'Paused'
+              }
+            />
           ) : null}
           <CaretUpDown size={14} className="shrink-0 text-muted-foreground" />
         </DropdownMenuTrigger>

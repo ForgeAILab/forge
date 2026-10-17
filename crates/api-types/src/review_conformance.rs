@@ -164,7 +164,7 @@ pub struct ReviewContract {
     pub context: ReviewGoverningContext,
     /// Results Forge recorded before dispatching the reviewer. These are
     /// immutable reviewer inputs; conformance admission reruns required checks
-    /// before accepting the assessment.
+    /// except exact CI results already classified non-blocking by entry triage.
     #[serde(default)]
     pub check_results: Vec<ConformanceCheckResult>,
     pub digest: String,
@@ -183,6 +183,154 @@ pub enum ReviewResult {
     Blocked,
 }
 
+/// Who can resolve the blocking finding within this Task.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum FixableBy {
+    Owner,
+    #[default]
+    #[serde(other)]
+    Coder,
+}
+
+impl FixableBy {
+    fn is_coder(&self) -> bool {
+        *self == Self::Coder
+    }
+}
+
+/// A problem reported by the reviewer. Forge assigns ids in the derived ledger,
+/// never in this frozen value. On re-review, `id` continues a known finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct ReviewFinding {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kind: Option<ReviewFindingKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub same_cause_as: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub id: Option<String>,
+    pub summary: String,
+    #[serde(default)]
+    pub severity: ReviewFindingSeverity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub r#where: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub observed: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingKind {
+    Regression,
+    Missed,
+    OutOfScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingSeverity {
+    Minor,
+    #[default]
+    #[serde(other)]
+    Blocking,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingSource {
+    Reviewer,
+    Ci,
+    Check,
+    Verify,
+    /// Reserved for repair briefs; merge failures never enter the ledger.
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingStatus {
+    Open,
+    Reopened,
+    OutOfScope,
+    Resolved,
+    Unconfirmed,
+    /// A step-level CI finding replaced by per-test findings.
+    Superseded,
+    Flaky,
+    PreExisting,
+}
+
+impl ReviewFindingStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Open | Self::Reopened)
+    }
+}
+
+/// Derived state of one finding in the current review-budget window.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct ReviewFindingEntry {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kind: Option<ReviewFindingKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub same_cause_as: Option<String>,
+    /// Why a new finding was downgraded by later-review anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub anchoring_note: Option<String>,
+    /// Most recent actual resolution, retained when a finding is re-broken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number", optional)]
+    pub resolved_attempt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ci_triage: Option<crate::CiFailureClass>,
+    pub id: String,
+    pub source: ReviewFindingSource,
+    pub severity: ReviewFindingSeverity,
+    pub summary: String,
+    pub r#where: Option<String>,
+    pub expected: Option<String>,
+    pub observed: Option<String>,
+    #[ts(type = "number")]
+    pub first_attempt: i64,
+    #[ts(type = "number")]
+    pub last_checked_attempt: i64,
+    pub status: ReviewFindingStatus,
+    pub streak: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct TaskFindingsResponse {
+    /// Id-ordered view, limited to 200 entries. The derivation retains all ids.
+    pub items: Vec<ReviewFindingEntry>,
+    pub window_started_at: String,
+    pub review_attempts: usize,
+}
+
 /// What Forge keeps from a reviewer's reply: the result block it ended with
 /// and the Markdown review written before it.
 ///
@@ -190,12 +338,28 @@ pub enum ReviewResult {
 /// `{"result": "...", "reason": "..."}`. Unknown keys in that object are
 /// ignored so any model can produce an acceptable review; the hard guarantee
 /// comes from the required checks Forge runs itself, not from the reviewer's
-/// citations.
+/// citations. Optional `fixable_by` and `repeat` fields route blocking findings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ReviewAssessment {
     pub result: ReviewResult,
     pub reason: String,
+    /// Owner-only findings park the Task instead of returning it to the coder.
+    /// Defaults are omitted, like `findings`, so an assessment frozen by
+    /// v0.13.12 (`{result, reason, report}`) re-serializes byte for byte.
+    #[serde(default, skip_serializing_if = "FixableBy::is_coder")]
+    #[ts(as = "Option<FixableBy>", optional)]
+    pub fixable_by: FixableBy,
+    /// The previous review raised the same finding and it remains unaddressed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub repeat: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<ReviewFinding>>", optional)]
+    pub findings: Vec<ReviewFinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub resolved: Vec<String>,
     /// The reviewer's Markdown review, without the result block.
     #[serde(default)]
     pub report: String,
@@ -218,10 +382,20 @@ pub enum ConformanceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ConformanceCheckResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub triage: Option<crate::StepCiTriage>,
     pub check_id: String,
     pub command: String,
     pub exit_code: i32,
     pub output: String,
+}
+
+impl ConformanceCheckResult {
+    /// Triage changes review routing, never the recorded process exit code.
+    pub fn is_blocking(&self) -> bool {
+        self.exit_code != 0 && self.triage.as_ref().is_none_or(|triage| triage.blocking)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -312,4 +486,30 @@ pub fn task_scope_is_read_only(source: &Value) -> bool {
             .and_then(Value::as_str),
         Some("repository_read" | "read_only" | "discovery_read" | "planning_read")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finding_attempts_are_json_numbers_in_typescript() {
+        // The wire carries JSON numbers; a `bigint` binding would not match.
+        let declaration = <ReviewFindingEntry as TS>::decl();
+        for field in ["first_attempt: number", "last_checked_attempt: number"] {
+            assert!(declaration.contains(field), "{declaration}");
+        }
+    }
+
+    #[test]
+    fn stored_assessments_default_finding_routing() {
+        for json in [
+            r#"{"result":"fail","reason":"legacy finding"}"#,
+            r#"{"result":"fail","reason":"legacy finding","fixable_by":"unknown"}"#,
+        ] {
+            let assessment: ReviewAssessment = serde_json::from_str(json).unwrap();
+            assert_eq!(assessment.fixable_by, FixableBy::Coder);
+            assert!(!assessment.repeat);
+        }
+    }
 }

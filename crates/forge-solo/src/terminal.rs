@@ -82,10 +82,6 @@ impl<W: Write> TerminalGuard<W> {
         }
     }
 
-    pub fn writer_mut(&mut self) -> Option<&mut W> {
-        self.writer.as_mut()
-    }
-
     pub fn is_active(&self) -> bool {
         self.raw_mode || self.alternate_screen
     }

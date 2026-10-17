@@ -1,52 +1,30 @@
 import { useEffect, useState } from 'react'
+import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
 import { Link } from '@tanstack/react-router'
-import { FastForwardIcon as FastForward } from '@phosphor-icons/react'
 import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
+import { budgetLabel, visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
-import {
-  type AssigneeSelection,
-  AgentAssigneeDropdown,
-  TaskStatusDropdown,
-} from '@/components/task-controls'
+import { type AssigneeSelection, TaskStatusDropdown } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
 import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
+import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-role-assignees'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { productTerm } from '@/lib/i18n'
-import { Textarea } from '@/components/ui/textarea'
-import { Tooltip } from '@/components/ui/tooltip'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { cn } from '@/lib/cn'
-import type { HumanGateActions } from '@/lib/gate-actions'
-import type {
-  Agent,
-  Execution,
-  ExecutionAction,
-  RecoveryAction,
-  RoleDefinition,
-  Task,
-  WorkflowExceptionAction,
-} from '@/types/generated'
-import { getBlockingAnnotation } from '@/lib/workflow-utils'
+import type { Agent, RoleDefinition, Task, WorkflowDefinition } from '@/types/generated'
 import {
-  assignmentAgentName,
   budgetValue,
   formatDate,
   readTaskStateConfig,
@@ -62,30 +40,22 @@ interface TaskOverviewPanelProps {
   onRetryLoad: () => void
   // pending states
   updatePending: boolean
-  recoverPending: boolean
   transitionPending: boolean
-  gateDecisionPending: boolean
-  advancePending: boolean
   rolePickerPending: boolean
-  cancelPending: boolean
   duplicatePending: boolean
-  executionActionPending: boolean
   // computed
   errorInfo: { tone: 'timeout' | 'crash' | 'workspace'; message: string } | undefined
-  gateActions: HumanGateActions | null
-  gateDecisionDisabledReason: string | undefined
   availableTransitions: string[]
   managedStatusDisabledReason: string | undefined
   reviewDisabledReason: string | undefined
-  manualAdvanceTarget: string | null
-  manualAdvanceLabel: string | null
   terminal: boolean
   currentRole: string | null
   assignableRoles: RoleDefinition[]
+  coderRole: string
+  /** A root Task with subtasks: its planning role is the lead. */
+  isCoordinationRoot: boolean
+  workflow: Pick<WorkflowDefinition, 'states'> | undefined
   agents: Agent[]
-  executions: Execution[]
-  canLaunch: boolean
-  hasAgents: boolean
   runSuffix: string
   workflowRetryBudgets: Record<string, unknown> | undefined
   agentName: (agentId?: string | null) => string | undefined
@@ -93,23 +63,15 @@ interface TaskOverviewPanelProps {
   onUpdateTitle: (title: string) => void
   onUpdateDescription: (description: string | null) => void
   onUpdatePriority: (priority: number) => void
-  onRecover: (action: RecoveryAction, input?: { reason?: string; context?: string }) => void
-  onOpenWorkflowExceptionAction: (action: WorkflowExceptionAction) => void
-  onApproveGate: (stateName: string) => void
-  onRejectGate: (stateName: string, reason: string) => void
   onStatusChange: (status: string) => void
-  onManualAdvance: () => void
   onAssigneeChange: (roleName: string, selection: AssigneeSelection) => void
-  onCancelTask: () => void
+  onOpenLaunchDialog?: () => void
   onDuplicateTask: () => void
-  onOpenLaunchDialog: () => void
-  onContinueSession: (executionId: string) => void
-  onStopExecution: (executionId: string) => void
-  onReExecuteExecution: (executionId: string) => void
   onSaveRetryBudgets: (
     review: number | undefined,
     mergeFix: number | undefined,
     execution: number | undefined,
+    reviewProgress: number | undefined,
   ) => void
 }
 
@@ -120,47 +82,29 @@ export function TaskOverviewPanel({
   error,
   onRetryLoad,
   updatePending,
-  recoverPending,
   transitionPending,
-  gateDecisionPending,
-  advancePending,
   rolePickerPending,
-  cancelPending,
   duplicatePending,
-  executionActionPending,
   errorInfo,
-  gateActions,
-  gateDecisionDisabledReason,
   availableTransitions,
   managedStatusDisabledReason,
   reviewDisabledReason,
-  manualAdvanceTarget,
-  manualAdvanceLabel,
   terminal,
   currentRole,
   assignableRoles,
-  executions,
-  canLaunch,
-  hasAgents,
+  coderRole,
+  isCoordinationRoot,
+  workflow,
   runSuffix,
   workflowRetryBudgets,
   agentName,
   onUpdateTitle,
   onUpdateDescription,
   onUpdatePriority,
-  onRecover,
-  onOpenWorkflowExceptionAction,
-  onApproveGate,
-  onRejectGate,
   onStatusChange,
-  onManualAdvance,
   onAssigneeChange,
-  onCancelTask,
   onDuplicateTask,
   onOpenLaunchDialog,
-  onContinueSession,
-  onStopExecution,
-  onReExecuteExecution,
   onSaveRetryBudgets,
 }: TaskOverviewPanelProps) {
   const [editingTitle, setEditingTitle] = useState(false)
@@ -169,20 +113,13 @@ export function TaskOverviewPanel({
   const [descriptionDraft, setDescriptionDraft] = useState('')
   const [priorityDraft, setPriorityDraft] = useState('')
   const [reviewRetryOverride, setReviewRetryOverride] = useState('')
+  const [reviewProgressOverride, setReviewProgressOverride] = useState('')
   const [mergeFixRetryOverride, setMergeFixRetryOverride] = useState('')
   const [executionRetryOverride, setExecutionRetryOverride] = useState('')
-  const [rejectingStateName, setRejectingStateName] = useState<string | null>(null)
-  const [rejectReasonDraft, setRejectReasonDraft] = useState('')
 
   const projectId = task?.project_id ?? ''
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
-  const workflowExceptionActions = task?.workflow_exception?.actions ?? []
-  const executionActions = Array.isArray(task?.execution_actions) ? task.execution_actions : null
-  const runningExecutionId =
-    executions.find((execution) => execution.status === 'running')?.id ?? null
-  const blockingAnnotation = task ? getBlockingAnnotation(task) : null
-
   useEffect(() => {
     if (!task) return
     const timeout = window.setTimeout(() => {
@@ -191,24 +128,28 @@ export function TaskOverviewPanel({
       setPriorityDraft(String(task.priority))
       const taskStateConfig = readTaskStateConfig(task)
       setReviewRetryOverride(retryBudgetFromConfig(taskStateConfig, 'review'))
+      setReviewProgressOverride(retryBudgetFromConfig(taskStateConfig, 'review_progress'))
       setMergeFixRetryOverride(retryBudgetFromConfig(taskStateConfig, 'merge_fix'))
       setExecutionRetryOverride(retryBudgetFromConfig(taskStateConfig, 'execution'))
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [task])
 
+  const remainingBudgets = task
+    ? visibleRemainingBudgets(task.remaining_retries, task.retry_limits)
+    : []
   const effectiveRetryBudget = (
-    key: 'review' | 'merge_fix' | 'execution',
+    key: 'review' | 'review_progress' | 'merge_fix' | 'execution',
     draft: string,
-    fallback: number,
   ) => {
     const taskOverride = budgetValue(Number(draft.trim()))
     if (draft.trim() && taskOverride !== undefined) {
       return `(effective: ${taskOverride} — task override)`
     }
     const workflowDefault = budgetValue(workflowRetryBudgets?.[key])
-    if (workflowDefault !== undefined) return `(effective: ${workflowDefault} — workflow default)`
-    return `(effective: ${fallback} — system default)`
+    if (workflowDefault !== undefined)
+      return `(effective: ${workflowDefault} — current server limit)`
+    return '(server limit unavailable)'
   }
 
   const handleSaveTitle = () => {
@@ -269,96 +210,14 @@ export function TaskOverviewPanel({
       return value
     }
     const review = parseDraft('Review retries', reviewRetryOverride)
+    const reviewProgress = parseDraft('Review progress rounds', reviewProgressOverride)
     const mergeFix = parseDraft('Merge-fix retries', mergeFixRetryOverride)
     const execution = parseDraft(`${productTerm('run')} retries`, executionRetryOverride)
-    if (review === null || mergeFix === null || execution === null) {
+    if (review === null || mergeFix === null || execution === null || reviewProgress === null) {
       return
     }
-    onSaveRetryBudgets(review, mergeFix, execution)
+    onSaveRetryBudgets(review, mergeFix, execution, reviewProgress)
   }
-
-  const openRejectDialog = (stateName: string) => {
-    setRejectingStateName(stateName)
-    setRejectReasonDraft('')
-  }
-
-  const closeRejectDialog = () => {
-    setRejectingStateName(null)
-    setRejectReasonDraft('')
-  }
-
-  const submitRejectDialog = () => {
-    if (!rejectingStateName) return
-    const reason = rejectReasonDraft.trim()
-    if (!reason) {
-      toast.error('Rejection reason is required')
-      return
-    }
-    onRejectGate(rejectingStateName, reason)
-    closeRejectDialog()
-  }
-
-  const runExecutionAction = (action: ExecutionAction) => {
-    if (!task || !action.enabled || executionActionPending) return
-    switch (action.action) {
-      case 'manual_launch':
-        onOpenLaunchDialog()
-        return
-      case 'session_follow_up':
-        if (action.target_execution_id) onContinueSession(action.target_execution_id)
-        return
-      case 'workflow_resume':
-        onRecover('resume_session')
-        return
-      case 're_execute':
-        if (blockingAnnotation?.recovery_actions?.includes('reexecute')) {
-          onRecover('reexecute')
-          return
-        }
-        if (action.target_execution_id) onReExecuteExecution(action.target_execution_id)
-        return
-      case 'stop_execution': {
-        const targetId = action.target_execution_id ?? runningExecutionId
-        if (targetId) onStopExecution(targetId)
-        return
-      }
-      case 'cancel_task':
-        onCancelTask()
-        return
-    }
-  }
-
-  const executionActionDisabled = (action: ExecutionAction) => {
-    if (executionActionPending || recoverPending || cancelPending) return true
-    if (!action.enabled) return true
-    if (action.action === 'manual_launch' && !hasAgents) return true
-    if (action.action === 'session_follow_up' && !action.target_execution_id) return true
-    if (action.action === 're_execute' && !action.target_execution_id) return true
-    if (action.action === 'stop_execution' && !(action.target_execution_id ?? runningExecutionId)) {
-      return true
-    }
-    return false
-  }
-
-  const executionActionDisabledReason = (action: ExecutionAction) => {
-    if (action.action === 'manual_launch' && !hasAgents) return 'No agents available'
-    if (action.action === 'stop_execution' && !(action.target_execution_id ?? runningExecutionId)) {
-      return action.disabled_reason ?? `No running ${productTerm('run').toLowerCase()}`
-    }
-    return action.disabled_reason ?? ''
-  }
-
-  // A workflow exception owns recovery. Generic execution follow-ups create a
-  // side session and cannot settle the task/review, so showing them beside the
-  // authoritative actions is both redundant and misleading. Keep only Stop
-  // while an execution is still live.
-  const visibleExecutionActions = terminal
-    ? []
-    : task?.workflow_exception
-      ? (executionActions ?? []).filter((action) => action.action === 'stop_execution')
-      : (executionActions ?? [])
-  const showFallbackActions = !terminal && !task?.workflow_exception && executionActions == null
-  const showActionsSection = visibleExecutionActions.length > 0 || showFallbackActions
 
   const onTitleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Enter') {
@@ -468,16 +327,14 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
-            <WorkflowExceptionPanel
-              task={task}
-              actions={workflowExceptionActions}
-              recoverPending={recoverPending}
-              terminal={terminal}
-              cancelPending={cancelPending}
-              onRecover={onRecover}
-              onOpenInteractive={onOpenWorkflowExceptionAction}
-              onCancelTask={onCancelTask}
-            />
+            <WorkflowExceptionPanel task={task} />
+            {onOpenLaunchDialog ? (
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={onOpenLaunchDialog}>
+                  Launch run
+                </Button>
+              </div>
+            ) : null}
             {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
             {task.plan_progress || task.plan_artifact ? (
@@ -532,68 +389,12 @@ export function TaskOverviewPanel({
               )}
             </div>
 
-            {showActionsSection ? (
-              <div>
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Actions
-                </p>
-                <div className="flex flex-wrap gap-2 rounded-md border bg-background p-3">
-                  {visibleExecutionActions.map((action) => {
-                    const disabled = executionActionDisabled(action)
-                    const disabledReason = executionActionDisabledReason(action)
-                    return (
-                      <Tooltip
-                        key={action.action}
-                        content={disabledReason}
-                        className={disabledReason ? undefined : 'hidden'}
-                      >
-                        <span>
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={disabled}
-                            className={cn(
-                              action.action === 'cancel_task' &&
-                                'text-destructive hover:bg-destructive/10 hover:text-destructive',
-                            )}
-                            onClick={() => runExecutionAction(action)}
-                          >
-                            {action.label}
-                          </Button>
-                        </span>
-                      </Tooltip>
-                    )
-                  })}
-                  {showFallbackActions ? (
-                    <>
-                      {/* An outstanding execution blocker (D16/D17) means
-                          launching would just re-enter the same gate this
-                          Task is already waiting on -- `TaskExecutionApprovalNotice`
-                          above already states the one authorized recovery, so this
-                          option is removed rather than offered only to fail (8.2.6). */}
-                      {canLaunch && !task.execution_blocker ? (
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={!hasAgents || executionActionPending}
-                          onClick={onOpenLaunchDialog}
-                        >
-                          Launch {productTerm('run')}
-                        </Button>
-                      ) : null}
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        disabled={cancelPending}
-                        className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                        onClick={onCancelTask}
-                      >
-                        Cancel Task
-                      </Button>
-                    </>
-                  ) : null}
-                </div>
-              </div>
+            {!task.workflow_exception ? (
+              <TaskActionButtons
+                taskId={task.id}
+                version={task.version}
+                offers={task.available_actions ?? []}
+              />
             ) : null}
 
             <div>
@@ -611,74 +412,16 @@ export function TaskOverviewPanel({
               <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 Status
               </p>
-              {gateActions ? (
-                <div className="mb-2 flex flex-wrap gap-2">
-                  <Tooltip
-                    content={gateDecisionDisabledReason ?? ''}
-                    className={gateDecisionDisabledReason ? undefined : 'hidden'}
-                  >
-                    <span>
-                      <Button
-                        disabled={
-                          transitionPending ||
-                          gateDecisionPending ||
-                          Boolean(gateDecisionDisabledReason)
-                        }
-                        size="sm"
-                        onClick={() => onApproveGate(gateActions.stateName)}
-                      >
-                        {gateActions.approveLabel}
-                      </Button>
-                    </span>
-                  </Tooltip>
-                  {gateActions.rejectLabel ? (
-                    <Button
-                      disabled={
-                        transitionPending ||
-                        gateDecisionPending ||
-                        Boolean(gateDecisionDisabledReason)
-                      }
-                      size="sm"
-                      variant="outline"
-                      onClick={() => openRejectDialog(gateActions.stateName)}
-                    >
-                      {gateActions.rejectLabel}
-                    </Button>
-                  ) : null}
-                </div>
-              ) : null}
               <div className="flex flex-wrap items-center gap-2">
                 <span title={managedStatusDisabledReason}>
                   <TaskStatusDropdown
                     availableStatuses={availableTransitions}
-                    disabled={
-                      transitionPending ||
-                      gateDecisionPending ||
-                      Boolean(managedStatusDisabledReason)
-                    }
+                    disabled={transitionPending || Boolean(managedStatusDisabledReason)}
                     disabledStatusReasons={{ review: reviewDisabledReason }}
                     status={task.status}
                     onChange={(status) => onStatusChange(status)}
                   />
                 </span>
-                {manualAdvanceTarget ? (
-                  <Tooltip
-                    content={`Stop any running ${productTerm('run').toLowerCase()} and advance to the next ${productTerm('phase').toLowerCase()}.`}
-                  >
-                    <Button
-                      className="gap-1.5"
-                      disabled={
-                        transitionPending || gateDecisionPending || advancePending || terminal
-                      }
-                      size="sm"
-                      variant="outline"
-                      onClick={onManualAdvance}
-                    >
-                      <FastForward size={14} />
-                      Advance to {manualAdvanceLabel}
-                    </Button>
-                  </Tooltip>
-                ) : null}
               </div>
               {managedStatusDisabledReason ? (
                 <p className="mt-1 text-xs text-muted-foreground">{managedStatusDisabledReason}</p>
@@ -693,31 +436,27 @@ export function TaskOverviewPanel({
                 className="flex flex-wrap gap-1.5"
                 title={terminal ? 'task is terminal; cannot reassign' : undefined}
               >
-                {assignableRoles.map((role) => {
-                  const assignment = task.role_assignments.find(
-                    (item) => item.role_name === role.name,
-                  )
-                  const roleDisabledReason = undefined
-                  return (
-                    <span key={role.name}>
-                      <AgentAssigneeDropdown
-                        agents={projectAgentsData ?? []}
-                        members={membersData}
-                        disabled={terminal || Boolean(roleDisabledReason) || rolePickerPending}
-                        fallbackName={assignmentAgentName(assignment, agentName)}
-                        requiredNow={currentRole === role.name}
-                        roleLabel={role.display_name || role.name}
-                        value={overviewAssignmentSelection(assignment)}
-                        variant="chip"
-                        onChange={(selection) => onAssigneeChange(role.name, selection)}
-                      />
-                    </span>
-                  )
-                })}
+                <TaskRoleAssignees
+                  task={task}
+                  roles={assignableRoles}
+                  coderRole={coderRole}
+                  currentRole={currentRole}
+                  isCoordinationRoot={isCoordinationRoot}
+                  agents={projectAgentsData ?? []}
+                  members={membersData}
+                  disabled={terminal || rolePickerPending}
+                  agentName={agentName}
+                  onSelect={(roleName, _current, selection) =>
+                    onAssigneeChange(roleName, selection)
+                  }
+                />
               </div>
               {rolePickerPending ? (
                 <p className="mt-1 text-xs text-muted-foreground">Updating assignee...</p>
               ) : null}
+              <div className="mt-2 empty:hidden">
+                <TaskStepCheck task={task} workflow={workflow} agentName={agentName} />
+              </div>
             </div>
 
             <div className="flex items-center gap-3">
@@ -754,13 +493,12 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
-            {Object.keys(task.remaining_retries).length > 0 ? (
+            {remainingBudgets.length > 0 ? (
               <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                <span className="font-medium uppercase tracking-wide">Remaining retries</span>
-                {Object.entries(task.remaining_retries).map(([key, value]) => (
+                <span className="font-medium uppercase tracking-wide">Remaining budget</span>
+                {remainingBudgets.map(([key, value]) => (
                   <span key={key}>
-                    {key.replace(/_/g, ' ')}:{' '}
-                    <span className="font-mono text-foreground">{value}</span>
+                    {budgetLabel(key)}: <span className="font-mono text-foreground">{value}</span>
                   </span>
                 ))}
               </div>
@@ -779,7 +517,7 @@ export function TaskOverviewPanel({
               </div>
               <div className="grid gap-3 sm:grid-cols-4">
                 <div className="space-y-1">
-                  <Label htmlFor="task-review-retry-budget">Review retries</Label>
+                  <Label htmlFor="task-review-retry-budget">Review failure allowance</Label>
                   <Input
                     id="task-review-retry-budget"
                     type="number"
@@ -789,7 +527,21 @@ export function TaskOverviewPanel({
                     onChange={(e) => setReviewRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('review', reviewRetryOverride, 3)}
+                    {effectiveRetryBudget('review', reviewRetryOverride)}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="task-review-progress-budget">Review progress rounds</Label>
+                  <Input
+                    id="task-review-progress-budget"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={reviewProgressOverride}
+                    onChange={(e) => setReviewProgressOverride(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {effectiveRetryBudget('review_progress', reviewProgressOverride)}
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -803,7 +555,7 @@ export function TaskOverviewPanel({
                     onChange={(e) => setMergeFixRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('merge_fix', mergeFixRetryOverride, 1)}
+                    {effectiveRetryBudget('merge_fix', mergeFixRetryOverride)}
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -817,7 +569,7 @@ export function TaskOverviewPanel({
                     onChange={(e) => setExecutionRetryOverride(e.target.value)}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {effectiveRetryBudget('execution', executionRetryOverride, 3)}
+                    {effectiveRetryBudget('execution', executionRetryOverride)}
                   </p>
                 </div>
               </div>
@@ -847,7 +599,10 @@ export function TaskOverviewPanel({
                   <p className="break-all font-mono">{task.workspace.worktree_path}</p>
                 </div>
               ) : null}
-              {task.status === 'done' ? <p>Workspace cleaned after merge.</p> : null}
+              {task.status === 'done' &&
+              (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
+                <p>Workspace cleaned after merge.</p>
+              ) : null}
             </div>
           </>
         ) : (
@@ -856,52 +611,6 @@ export function TaskOverviewPanel({
           </div>
         )}
       </div>
-      <Dialog
-        open={rejectingStateName != null}
-        onOpenChange={(open) => {
-          if (!open) closeRejectDialog()
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Reject Gate</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="gate-reject-reason">Reason</Label>
-            <Textarea
-              id="gate-reject-reason"
-              value={rejectReasonDraft}
-              onChange={(event) => setRejectReasonDraft(event.target.value)}
-              placeholder="Describe what needs to change"
-              rows={4}
-            />
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={closeRejectDialog}>
-              Cancel
-            </Button>
-            <Button
-              disabled={gateDecisionPending || !rejectReasonDraft.trim()}
-              onClick={submitRejectDialog}
-            >
-              Reject
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   )
-}
-
-function overviewAssignmentSelection(
-  assignment?: Task['role_assignments'][number],
-): AssigneeSelection {
-  if (!assignment) return { type: 'unassigned' }
-  if (assignment.assignee_type === 'agent' && assignment.assignee_id) {
-    return { type: 'agent', agentId: assignment.assignee_id }
-  }
-  if (assignment.assignee_type === 'user') {
-    return { type: 'user', userId: assignment.assignee_id ?? 'manual' }
-  }
-  return { type: 'unassigned' }
 }

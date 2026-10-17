@@ -1,14 +1,14 @@
 use crate::{
     workflow::{
         actions::{
-            AutoCascadeOnCompletion, AutoCascadeOnMergeResult, AutoCascadeOnReviewPass,
-            AutoCascadeOnUnassignedRole, AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks,
-            CarryReviewAuthority, CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow,
-            DependencyGate, DispatchExecutor, DispatchFixAgent, DispatchRoleAgent,
-            NotifyRoleHolder, PropagateDoneToSubtasks, RequireCleanWorktree,
-            RequireConflictMarkersResolved, RequirePlanChecklistComplete,
-            RequireUpstreamRolesCompleted, RunBeforeWorkHooks, RunCiSteps, RunMerge,
-            SatisfyDependents, ScheduleWorkspaceCleanup, SubtaskSequenceComplete,
+            AutoCascadeOnCompletion, AutoCascadeOnReviewPass, AutoCascadeOnUnassignedRole,
+            AutoCascadeOnUnconfiguredReview, CancelPendingSubtasks, CarryReviewAuthority,
+            CheckMergeFixBudget, CheckRetryBudget, CleanupWorkspaceNow, DependencyGate,
+            DispatchExecutor, DispatchFixAgent, DispatchRoleAgent, NotifyRoleHolder,
+            PropagateDoneToSubtasks, RequireCleanWorktree, RequireConflictMarkersResolved,
+            RequirePlanChecklistComplete, RequireUpstreamRolesCompleted, RunBeforeWorkHooks,
+            RunCiSteps, RunMerge, SatisfyDependents, ScheduleWorkspaceCleanup,
+            SubtaskSequenceComplete,
         },
         HookAction,
     },
@@ -28,7 +28,6 @@ pub fn is_known_action(name: &str) -> bool {
             | "satisfy_dependents"
             | "auto_cascade_on_review_pass"
             | "auto_cascade_on_unconfigured_review"
-            | "auto_cascade_on_merge_result"
             | "auto_cascade_on_completion"
             | "auto_cascade_on_unassigned_role"
             | "check_merge_fix_budget"
@@ -47,6 +46,16 @@ pub fn is_known_action(name: &str) -> bool {
     )
 }
 
+/// Hook actions that existed in a released version and were removed. A
+/// stored workflow that names one is rewritten by its migration; a workflow
+/// template file is rewritten when it is read
+/// (`template_service::strip_removed_hooks`). Nothing accepts these names:
+/// a workflow that still carries one is refused as an unknown action.
+///
+/// - `auto_cascade_on_merge_result` (removed with the integration queue):
+///   it only ever answered `Ok` or `Skipped`.
+pub const REMOVED_HOOK_ACTIONS: &[&str] = &["auto_cascade_on_merge_result"];
+
 /// Dispatch-style actions are the hooks that start (or hand off) role work.
 /// The engine gives their failures special treatment when they gate entry into
 /// an `active` state: a failed dispatch means no execution exists, so the task
@@ -56,6 +65,32 @@ pub fn is_dispatch_action(name: &str) -> bool {
         name,
         "dispatch_role_agent" | "dispatch_fix_agent" | "dispatch_executor"
     )
+}
+
+/// Test-only workload that keeps a hooks step running for as long as the
+/// test wants: it touches `started` in the gate directory named by the
+/// state's `test_hold_gate` and returns once `release` exists there (or the
+/// directory is gone).
+#[cfg(test)]
+pub(crate) struct TestHoldStep;
+#[cfg(test)]
+#[async_trait::async_trait]
+impl HookAction for TestHoldStep {
+    async fn execute(&self, ctx: &crate::workflow::HookContext) -> crate::workflow::HookResult {
+        let Some(gate) = ctx.state_config["test_hold_gate"]
+            .as_str()
+            .map(std::path::PathBuf::from)
+        else {
+            return crate::workflow::HookResult::Skipped {
+                reason: "no gate".to_owned(),
+            };
+        };
+        let _ = std::fs::write(gate.join("started"), "");
+        while !gate.join("release").exists() && gate.is_dir() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        crate::workflow::HookResult::Ok
+    }
 }
 
 pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
@@ -70,7 +105,6 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "satisfy_dependents" => Box::new(SatisfyDependents),
         "auto_cascade_on_review_pass" => Box::new(AutoCascadeOnReviewPass),
         "auto_cascade_on_unconfigured_review" => Box::new(AutoCascadeOnUnconfiguredReview),
-        "auto_cascade_on_merge_result" => Box::new(AutoCascadeOnMergeResult),
         "auto_cascade_on_completion" => Box::new(AutoCascadeOnCompletion),
         "auto_cascade_on_unassigned_role" => Box::new(AutoCascadeOnUnassignedRole),
         "check_merge_fix_budget" => Box::new(CheckMergeFixBudget),
@@ -86,6 +120,8 @@ pub fn resolve_action(name: &str) -> Result<Box<dyn HookAction>, ServiceError> {
         "subtask_sequence_complete" => Box::new(SubtaskSequenceComplete),
         "propagate_done_to_subtasks" => Box::new(PropagateDoneToSubtasks),
         "cancel_pending_subtasks" => Box::new(CancelPendingSubtasks),
+        #[cfg(test)]
+        "test_hold_step" => Box::new(TestHoldStep),
         _ => {
             return Err(ServiceError::InvalidOperation {
                 message: format!("unknown action: {name}"),

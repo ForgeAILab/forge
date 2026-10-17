@@ -186,10 +186,6 @@ impl ProjectReadiness {
     pub fn allows_chat(&self) -> bool {
         matches!(self, Self::Ready | Self::AwaitingAdoption)
     }
-
-    pub fn allows_mutating_tasks(&self) -> bool {
-        matches!(self, Self::Ready)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,13 +259,6 @@ impl SetupState {
                 ..
             } => candidates.get(*selected),
             _ => None,
-        }
-    }
-
-    pub fn selected_index(&self) -> usize {
-        match self {
-            Self::AgentPicker { selected, .. } => *selected,
-            _ => 0,
         }
     }
 
@@ -742,6 +731,8 @@ pub struct TaskSummary {
     pub blocker: Option<String>,
     pub version: u64,
     pub selected: bool,
+    pub review_actions: Vec<ApprovalAction>,
+    pub review_reason_required: bool,
 }
 
 impl TaskSummary {
@@ -759,15 +750,9 @@ impl TaskSummary {
             blocker: None,
             version: 0,
             selected: false,
+            review_actions: Vec::new(),
+            review_reason_required: false,
         }
-    }
-
-    pub fn checks_passed(&self) -> bool {
-        !self.checks.is_empty()
-            && self
-                .checks
-                .iter()
-                .all(|check| check.state == CheckState::Passed)
     }
 }
 
@@ -941,6 +926,9 @@ pub struct ReviewCard {
     pub expected_version: u64,
     pub permitted_actions: Vec<ApprovalAction>,
     pub selected_action: usize,
+    pub guidance: String,
+    pub editing_guidance: bool,
+    pub requires_reason: bool,
     pub visibility: ContentVisibility,
 }
 
@@ -958,8 +946,11 @@ impl ReviewCard {
             worker: task.worker.clone(),
             reviewer: task.reviewer.clone(),
             expected_version: task.version,
-            permitted_actions: vec![ApprovalAction::Accept, ApprovalAction::RequestChanges],
+            permitted_actions: task.review_actions.clone(),
             selected_action: 0,
+            guidance: String::new(),
+            editing_guidance: false,
+            requires_reason: task.review_reason_required,
             visibility: ContentVisibility::Public,
         }
     }
@@ -1278,9 +1269,6 @@ pub struct AppState {
     retryable_send: Option<Command>,
 }
 
-/// Alias used by callers that prefer the product-level name.
-pub type SoloApp = AppState;
-
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -1322,11 +1310,6 @@ impl AppState {
 
     pub fn with_limits(mut self, limits: AppLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    pub fn with_idempotency_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.idempotency_prefix = prefix.into();
         self
     }
 
@@ -1788,54 +1771,69 @@ impl AppState {
             },
             ModalState::Review(mut card) => match input {
                 AppInput::Cancel => self.close_modal(),
+                AppInput::Insert(character) if card.editing_guidance => {
+                    card.guidance.push(character);
+                    self.modal = Some(ModalState::Review(card));
+                }
+                AppInput::Backspace if card.editing_guidance => {
+                    card.guidance.pop();
+                    self.modal = Some(ModalState::Review(card));
+                }
+                AppInput::NewLine if card.editing_guidance => {
+                    card.guidance.push('\n');
+                    self.modal = Some(ModalState::Review(card));
+                }
                 AppInput::Up | AppInput::SelectPrevious => {
                     card.move_action(-1);
+                    card.editing_guidance = false;
                     self.modal = Some(ModalState::Review(card));
-                    self.focus = FocusTarget::Modal;
                 }
                 AppInput::Down | AppInput::SelectNext => {
                     card.move_action(1);
+                    card.editing_guidance = false;
                     self.modal = Some(ModalState::Review(card));
-                    self.focus = FocusTarget::Modal;
                 }
                 AppInput::Confirm | AppInput::Approve | AppInput::Accept => {
                     if let Some(action) = card.selected_action() {
-                        let request = CommandRequest::Review {
-                            review_id: card.id.clone(),
-                            task_id: card.task_id.clone(),
+                        let send_back = matches!(
                             action,
-                            expected_version: card.expected_version,
-                        };
-                        self.close_modal();
-                        self.queue_command(request, commands);
+                            ApprovalAction::Reject | ApprovalAction::RequestChanges
+                        );
+                        if (send_back || card.requires_reason)
+                            && (!card.editing_guidance || card.guidance.trim().is_empty())
+                        {
+                            card.editing_guidance = true;
+                            self.modal = Some(ModalState::Review(card));
+                        } else {
+                            let request = CommandRequest::Review {
+                                review_id: card.id.clone(),
+                                task_id: card.task_id.clone(),
+                                action,
+                                expected_version: card.expected_version,
+                                guidance: (send_back || card.requires_reason)
+                                    .then(|| card.guidance.clone()),
+                            };
+                            self.close_modal();
+                            self.queue_command(request, commands);
+                        }
                     } else {
                         self.modal = Some(ModalState::Review(card));
-                        self.focus = FocusTarget::Modal;
                     }
                 }
-                AppInput::Reject | AppInput::RequestChanges
-                    if card.permitted_actions.contains(&ApprovalAction::Reject)
-                        || card
-                            .permitted_actions
-                            .contains(&ApprovalAction::RequestChanges) =>
-                {
-                    let action = if card.permitted_actions.contains(&ApprovalAction::Reject) {
-                        ApprovalAction::Reject
-                    } else {
-                        ApprovalAction::RequestChanges
-                    };
-                    let request = CommandRequest::Review {
-                        review_id: card.id.clone(),
-                        task_id: card.task_id.clone(),
-                        action,
-                        expected_version: card.expected_version,
-                    };
-                    self.close_modal();
-                    self.queue_command(request, commands);
+                AppInput::Reject | AppInput::RequestChanges => {
+                    if let Some(index) = card.permitted_actions.iter().position(|action| {
+                        matches!(
+                            action,
+                            ApprovalAction::Reject | ApprovalAction::RequestChanges
+                        )
+                    }) {
+                        card.selected_action = index;
+                        card.editing_guidance = true;
+                    }
+                    self.modal = Some(ModalState::Review(card));
                 }
                 _ => {
                     self.modal = Some(ModalState::Review(card));
-                    self.focus = FocusTarget::Modal;
                 }
             },
             ModalState::Question(mut card) => match input {
@@ -2497,6 +2495,7 @@ pub enum CommandRequest {
     Review {
         review_id: String,
         task_id: String,
+        guidance: Option<String>,
         action: ApprovalAction,
         expected_version: u64,
     },
@@ -2913,5 +2912,22 @@ mod tests {
             .push(ReviewCard::from_task_summary(&task));
         state.reduce(AppAction::Input(AppInput::OpenSelected));
         assert!(matches!(state.modal, Some(ModalState::Review(card)) if card.task_id == "task"));
+    }
+    #[test]
+    fn request_changes_collects_guidance_before_dispatch() {
+        let mut state = ready_state();
+        let mut task = TaskSummary::new("task", "Review", TaskState::AwaitingReview);
+        task.review_actions = vec![ApprovalAction::RequestChanges];
+        task.version = 8;
+        state.modal = Some(ModalState::Review(ReviewCard::from_task_summary(&task)));
+        assert!(state
+            .reduce(AppAction::Input(AppInput::RequestChanges))
+            .is_empty());
+        assert!(state.reduce(AppAction::Input(AppInput::Confirm)).is_empty());
+        for character in "Fix the missing coverage".chars() {
+            state.reduce(AppAction::Input(AppInput::Insert(character)));
+        }
+        let commands = state.reduce(AppAction::Input(AppInput::Confirm));
+        assert!(commands.commands.iter().any(|command| matches!(&command.request, CommandRequest::Review { guidance: Some(value), expected_version: 8, .. } if value == "Fix the missing coverage")));
     }
 }

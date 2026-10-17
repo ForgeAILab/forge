@@ -28,7 +28,6 @@ use db::{
     ProjectProvisioningRepo, ProjectRepo, ReconcileProjectProvisioningCheckpoint,
     ReconcileProjectProvisioningMetadata, Repo, RepoRepo, SortBy, SortOrder, SqliteDb,
     UpdateProject, UpdateProjectProvisioningOperation, UpsertProjectProvisioningCheckpoint,
-    WorkMode,
 };
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -51,8 +50,7 @@ const CHECKPOINTS: [&str; 6] = [
     "repository_linked",
     "roles_assigned",
 ];
-/// Environment variable `forge-cli` exports from `[scaffold] command`; the
-/// services crate reads it the same way it reads `FORGE_WORKSPACE_ROOT`.
+/// Environment variable `forge-cli` exports from `[scaffold] command`.
 pub const SCAFFOLD_COMMAND_ENV: &str = "FORGE_SCAFFOLD_COMMAND";
 /// Written by create-spark into every scaffold; its presence is how a
 /// directory proves it already is one.
@@ -1411,13 +1409,14 @@ async fn resolve_repository_path(
     if let Some(path) = persisted {
         return Ok(path);
     }
+    let default_path = repos_root(db)
+        .await?
+        .join(repo_directory_name(&project.name, &project.id));
     if let Some(primary_repo_id) = project.primary_repo_id.as_deref() {
         return Ok(RepoRepo::get_by_id(&**db, primary_repo_id)
             .await?
             .and_then(|repo| repo.local_path.map(PathBuf::from))
-            .unwrap_or_else(|| {
-                repos_root().join(repo_directory_name(&project.name, &project.id))
-            }));
+            .unwrap_or(default_path));
     }
     // A repository row can be durable even when the Project link was the
     // interrupted step. Reuse its local path before deriving a name from
@@ -1438,7 +1437,7 @@ async fn resolve_repository_path(
         .items
         .into_iter()
         .find_map(|repo| repo.local_path.map(PathBuf::from))
-        .unwrap_or_else(|| repos_root().join(repo_directory_name(&project.name, &project.id))))
+        .unwrap_or(default_path))
 }
 
 enum ScaffoldStep {
@@ -1625,10 +1624,14 @@ async fn scaffold_repository(
         }
     }
 
-    let parent = repo_path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(repos_root);
+    // A repository path always has a parent: `resolve_repository_path`
+    // puts it under `<workspace root>/repos` or takes an absolute one.
+    let parent = repo_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        ServiceError::invalid_operation(format!(
+            "Project repository directory {} has no parent directory",
+            repo_path.display()
+        ))
+    })?;
     tokio::fs::create_dir_all(&parent).await.map_err(|error| {
         ServiceError::invalid_operation(format!(
             "create Project repositories directory {}: {error}",
@@ -1851,7 +1854,7 @@ async fn write_scaffold_exports(
     Ok(())
 }
 
-const FORGE_AGENTS_SECTION: &str = "## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n";
+const FORGE_AGENTS_SECTION: &str = forge_agent_host::merge_friendly_guidance!("## Forge\n\nThis repository belongs to a Forge Project. Forge owns planning and execution: the approved Charter is exported to `docs/spark/project.md`, Tasks are created, reviewed, and merged in Forge, and the Task brief you receive is the plan. Do not create `docs/spark/changes/` folders or edit a `tasks.md`; report scope discoveries as follow-up work in your Task report. The `worker-guidelines` lens is in force.\n\nFor implementation and follow-up proposals: ", " Stay inside the Task's owned repository-relative paths and put new code in a new feature file instead of growing a shared one. Report a required out-of-scope edit before widening the Task.\n");
 
 async fn find_or_register_repository(
     db: &Arc<SqliteDb>,
@@ -1900,7 +1903,6 @@ async fn find_or_register_repository(
         name: repo_directory_name(&project.name, &project.id),
         local_path: Some(local_path.clone()),
         remote_url: Some(local_path.clone()),
-        work_mode: WorkMode::DirectMerge,
         default_branch: DEFAULT_BRANCH.to_owned(),
         created_at: now.clone(),
         updated_at: now,
@@ -2067,8 +2069,12 @@ fn project_role_assignments(project: &Project) -> Value {
         .unwrap_or_else(|| Value::Array(Vec::new()))
 }
 
-fn repos_root() -> PathBuf {
-    crate::task_service::workspace::default_workspace_root().join("repos")
+/// `<workspace root>/repos`, under the root the server's start recorded.
+async fn repos_root(db: &SqliteDb) -> Result<PathBuf> {
+    Ok(crate::workspace_root::root_of(db)
+        .await
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+        .join("repos"))
 }
 
 /// Deterministic, collision-free directory name: sanitized project name plus
@@ -2096,7 +2102,15 @@ fn repo_directory_name(project_name: &str, project_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::repo_directory_name;
+    use super::{repo_directory_name, FORGE_AGENTS_SECTION};
+
+    #[test]
+    fn scaffold_exports_merge_friendly_layout_guidance_once() {
+        const RULE: &str = forge_agent_host::MERGE_FRIENDLY_LAYOUT_GUIDANCE;
+        assert_eq!(FORGE_AGENTS_SECTION.matches(RULE).count(), 1);
+        assert!(FORGE_AGENTS_SECTION.contains("For implementation and follow-up proposals:"));
+        assert!(FORGE_AGENTS_SECTION.contains("Report a required out-of-scope edit"));
+    }
 
     #[test]
     fn repo_directory_name_is_slugged_and_deterministic() {

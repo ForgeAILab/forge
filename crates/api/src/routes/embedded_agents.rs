@@ -55,7 +55,7 @@ pub async fn create_embedded_agent(
             max_output_tokens: request.max_output_tokens,
         })
         .await?;
-    let agent = response_for_agent(&state, connected.agent).await?;
+    let agent = response_for_agent(&state, connected.agent, user.is_admin).await?;
     Ok(Json(ConnectedEmbeddedAgentResponse {
         agent,
         credential_handle: credential_response(connected.credential_handle),
@@ -91,7 +91,7 @@ pub async fn connect_embedded_profile(
         })
         .await?;
     Ok(Json(ConnectedEmbeddedProfileResponse {
-        agent: response_for_agent(&state, agent).await?,
+        agent: response_for_agent(&state, agent, user.is_admin).await?,
         profile: profile_response(profile),
         credential_handle: credential_response(credential),
         health: health_response(health),
@@ -125,7 +125,9 @@ pub async fn select_profile(
         },
     )
     .await?;
-    Ok(Json(response_for_agent(&state, agent).await?))
+    Ok(Json(
+        response_for_agent(&state, agent, user.is_admin).await?,
+    ))
 }
 
 pub async fn create_session(
@@ -134,6 +136,38 @@ pub async fn create_session(
     Path(identity_id): Path<String>,
     Json(request): Json<CreateAgentSessionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    match &request.scope {
+        CanonicalScopeRequest::Account => {}
+        CanonicalScopeRequest::Project { project_id } => {
+            crate::routes::authorization::require_project_access(
+                &state,
+                project_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+        CanonicalScopeRequest::Task { task_id, .. } => {
+            crate::routes::authorization::require_task_access(
+                &state,
+                task_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+        CanonicalScopeRequest::AgentChat { chat_id } => {
+            crate::routes::authorization::require_scope_access(
+                &state,
+                "agent_chat",
+                chat_id,
+                &user.user_id,
+                crate::routes::authorization::ProjectAccess::Write,
+            )
+            .await?;
+        }
+    }
+
     let session = state
         .embedded_agent_service
         .create_or_resume_session(CreateScopedSession {
@@ -155,7 +189,21 @@ pub async fn list_sessions(
         .embedded_agent_service
         .list_sessions(&user.user_id, &identity_id)
         .await?;
-    Ok(Json(sessions.into_iter().map(session_response).collect()))
+    let mut visible = Vec::new();
+    for session in sessions {
+        if crate::routes::authorization::require_session_access(
+            &state,
+            &session.id,
+            &user.user_id,
+            crate::routes::authorization::ProjectAccess::Read,
+        )
+        .await
+        .is_ok()
+        {
+            visible.push(session_response(session));
+        }
+    }
+    Ok(Json(visible))
 }
 
 /// List only redaction-safe pending interactions for an authenticated
@@ -166,6 +214,22 @@ pub async fn list_session_interactions(
     user: AuthenticatedUser,
     Path(session_id): Path<String>,
 ) -> ApiResult<Json<Vec<ProtectedInteractionSummaryResponse>>> {
+    // A session the caller cannot reach has no pending interactions for
+    // them: the same empty list the broker's owner join returns.
+    if let Err(error) = crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Read,
+    )
+    .await
+    {
+        return if error.is_not_found() {
+            Ok(Json(Vec::new()))
+        } else {
+            Err(error)
+        };
+    }
     let summaries = state
         .embedded_agent_service
         .interaction_broker()
@@ -186,6 +250,16 @@ pub async fn answer_session_interaction(
     Path((session_id, interaction_id)): Path<(String, String)>,
     Json(request): Json<ProtectedInteractionAnswerRequest>,
 ) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(protected_interaction_error(AgentHostError::SessionNotFound))
+    })?;
     let answer = InteractionAnswer::new(
         interaction_id,
         request.expected_version,
@@ -210,6 +284,16 @@ pub async fn cancel_session_interaction(
     Path((session_id, interaction_id)): Path<(String, String)>,
     Json(request): Json<ProtectedInteractionCancelRequest>,
 ) -> ApiResult<Json<ProtectedInteractionSummaryResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await
+    .map_err(|error| {
+        error.mask_not_found(protected_interaction_error(AgentHostError::SessionNotFound))
+    })?;
     let summary = state
         .embedded_agent_service
         .interaction_broker()
@@ -230,6 +314,13 @@ pub async fn rotate_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     let session = state
         .embedded_agent_service
         .rotate_session(&user.user_id, &session_id, request.version)
@@ -243,6 +334,13 @@ pub async fn suspend_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     set_session_status(state, user, session_id, request.version, "suspended").await
 }
 
@@ -252,6 +350,13 @@ pub async fn resume_session(
     Path(session_id): Path<String>,
     Json(request): Json<SessionVersionRequest>,
 ) -> ApiResult<Json<AgentSessionResponse>> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     set_session_status(state, user, session_id, request.version, "ready").await
 }
 
@@ -260,6 +365,13 @@ pub async fn cancel_session_turn(
     user: AuthenticatedUser,
     Path(session_id): Path<String>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     state
         .embedded_agent_service
         .cancel_session_turn(&user.user_id, &session_id)
@@ -273,6 +385,13 @@ pub async fn steer_session_turn(
     Path(session_id): Path<String>,
     Json(request): Json<SteerAgentSessionRequest>,
 ) -> ApiResult<StatusCode> {
+    crate::routes::authorization::require_session_access(
+        &state,
+        &session_id,
+        &user.user_id,
+        crate::routes::authorization::ProjectAccess::Write,
+    )
+    .await?;
     state
         .embedded_agent_service
         .steer_session_turn(&user.user_id, &session_id, request.content)
@@ -311,25 +430,43 @@ async fn set_session_status(
     Ok(Json(session_response(session)))
 }
 
-async fn response_for_agent(state: &AppState, agent: Agent) -> ApiResult<api_types::AgentResponse> {
+async fn response_for_agent(
+    state: &AppState,
+    agent: Agent,
+    admin: bool,
+) -> ApiResult<api_types::AgentResponse> {
     let stats = ExecutionRepo::stats_by_agent(&*state.db, &agent.id).await?;
-    let usage = state.agent_usage_cache.get(&state.db, &agent.id).await?;
+    let usage = state.usage_ledger_index.agent(&agent.id).await?;
     let active_assigned_task_count =
         AgentRepo::count_active_assigned_tasks(&*state.db, &agent.id).await?;
     let running_execution_count =
         AgentRepo::count_running_executions(&*state.db, &agent.id).await?;
-    let effective_status = compute_effective_status(&state.db, &agent)
-        .await?
-        .as_str()
-        .to_owned();
-    Ok(agent_response(
+    let effective_status =
+        compute_effective_status(&state.db, &agent, Some(&state.daemon_connections))
+            .await?
+            .as_str()
+            .to_owned();
+    let runnable_on = services::environment_surfaces::runnable_on(
+        &state.db,
+        &agent,
+        &state.adapter_registry,
+        &state.daemon_connections,
+        admin,
+    )
+    .await?;
+    let mut response = agent_response(
         agent,
         Some(active_assigned_task_count),
         Some(running_execution_count),
         Some(effective_status),
         stats,
         usage,
-    ))
+    );
+    response.runnable_on = runnable_on;
+    if !admin {
+        response.daemon_id = None;
+    }
+    Ok(response)
 }
 
 async fn require_owned_identity(
@@ -433,6 +570,8 @@ fn protected_interaction_error(error: AgentHostError) -> ApiError {
             )
         }
         AgentHostError::CredentialNotFound
+        | AgentHostError::AgentPaused { .. }
+        | AgentHostError::ProjectPaused { .. }
         | AgentHostError::Runtime(_)
         | AgentHostError::RuntimeWithUsage { .. }
         | AgentHostError::TurnLimitReached { .. }

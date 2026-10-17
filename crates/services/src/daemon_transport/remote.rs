@@ -117,6 +117,9 @@ pub(crate) fn daemon_error_to_service_error(
     error: api_types::DaemonErrorPayload,
 ) -> ServiceError {
     match error.code.as_str() {
+        api_types::DAEMON_UPGRADE_REQUIRED => ServiceError::DaemonUpgradeRequired {
+            daemon_id: daemon_id.to_owned(),
+        },
         api_types::DAEMON_UNAVAILABLE => ServiceError::DaemonUnavailable {
             daemon_id: daemon_id.to_owned(),
         },

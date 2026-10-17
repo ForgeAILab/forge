@@ -1,6 +1,6 @@
 # Workflow Hook Actions
 
-This directory contains the flexible workflow engine and the curated library of Rust hook actions that workflow definitions reference by name. Workflow JSON never executes user code; `registry.rs::resolve_action` maps a string such as `"run_review"` to a compiled Rust type implementing `HookAction`.
+This directory contains the flexible workflow engine and the curated library of Rust hook actions that workflow definitions reference by name. Workflow JSON selects compiled actions; script-running actions execute configured commands through the workspace backend; `registry.rs::resolve_action` maps a string such as `"run_review"` to a compiled Rust type implementing `HookAction`.
 
 ## Action Contract
 
@@ -22,7 +22,7 @@ Return one of:
 - `HookResult::Ok`: action succeeded.
 - `HookResult::Skipped { reason }`: action does not apply to this transition/context.
 - `HookResult::Failed { reason }`: action tried to run and failed.
-- `HookResult::Cascade { to, reason }`: request an engine-managed follow-up transition.
+- `HookResult::Cascade { to, reason }`: request a durable queued follow-up transition; use `TaskService::drain(task_id)` in tests before asserting its settled state.
 
 Always check preconditions first. Return `Skipped` when required context is missing, such as no workspace, no executor/execution row, no role assignment, or no applicable state config. This keeps human-driven board flows working: a user can move cards without having an agent workspace, and hooks record that they did not apply instead of breaking the transition.
 
@@ -52,7 +52,7 @@ Workflow definitions attach actions through `HookSpec`:
 - `FailurePolicy::Log`: for effects. Failures are logged/emitted and the transition remains committed.
 - `FailurePolicy::Cascade(target)`: declared in the API type for auto-advance policy. In the current engine, auto-advance is implemented by an action returning `HookResult::Cascade` from `after_enter`; verify engine support before relying on policy-driven cascade from `on_exit` or `on_enter`.
 
-The engine writes a `transition_log` row after the status update, then backfills hook results after hooks complete.
+The status CAS writes the transition log and a durable `hooks` step. The leased step checkpoints each action, backfills hook results, and atomically settles with any cascade enqueue. Resumed CI and user before-work scripts may re-run; other effects use durable completion facts.
 
 ## Audience
 

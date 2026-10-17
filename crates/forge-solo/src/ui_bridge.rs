@@ -96,9 +96,6 @@ pub struct AppReducer {
     setup_candidates: Vec<AgentCandidate>,
 }
 
-/// Product-oriented alias for callers that prefer the Solo name.
-pub type SoloAppReducer = AppReducer;
-
 impl Default for AppReducer {
     fn default() -> Self {
         Self::new(AppState::new())
@@ -120,13 +117,6 @@ impl AppReducer {
         }
     }
 
-    /// Install the physical-key policy used when converting controller keys
-    /// to `AppInput`.  The policy remains independent of crossterm events.
-    pub fn with_keymap(mut self, keymap: Keymap) -> Self {
-        self.keymap = keymap;
-        self
-    }
-
     /// Seed or replace the structured setup candidates discovered by
     /// bootstrap.  The backend snapshot intentionally carries only the
     /// selected Agent, while discovery/authentication stays at bootstrap.
@@ -135,20 +125,12 @@ impl AppReducer {
         self
     }
 
-    pub fn set_setup_candidates(&mut self, candidates: Vec<AgentCandidate>) {
-        self.setup_candidates = candidates;
-    }
-
     pub fn state(&self) -> &AppState {
         &self.state
     }
 
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
-    }
-
-    pub fn into_state(self) -> AppState {
-        self.state
     }
 
     pub fn scope(&self) -> Option<&SoloScope> {
@@ -585,6 +567,7 @@ impl AppReducer {
             }
             CommandRequest::Review {
                 review_id: _,
+                guidance,
                 task_id,
                 action,
                 expected_version,
@@ -603,6 +586,7 @@ impl AppReducer {
                     // it at this boundary without changing AppState.
                     target_digest: String::new(),
                     decision,
+                    guidance,
                     idempotency_key: key.clone().into(),
                 });
                 self.pending_backend_commands.insert(key, command_id);
@@ -920,7 +904,7 @@ pub fn to_projection_snapshot(snapshot: &SoloSnapshot) -> ProjectionSnapshot {
         setup: to_setup_state(snapshot),
         timeline: snapshot.chat.messages.iter().map(to_chat_message).collect(),
         live_activity,
-        retryable_turn: latest_retryable_failed_turn(&snapshot.chat.active_turns)
+        retryable_turn: latest_retryable_terminal_turn(&snapshot.chat.active_turns)
             .map(to_turn_reference),
         tasks: snapshot.tasks.iter().map(to_task_summary).collect(),
         review_cards: snapshot
@@ -958,10 +942,13 @@ fn projected_activity_for_turn(
         .or_else(|| turn_is_activity_visible(turn.state).then(|| to_turn_activity(turn)))
 }
 
-fn latest_retryable_failed_turn(turns: &[TurnSnapshot]) -> Option<&TurnSnapshot> {
-    turns
-        .last()
-        .filter(|turn| turn.state == BackendTurnState::Failed && turn.retryable)
+fn latest_retryable_terminal_turn(turns: &[TurnSnapshot]) -> Option<&TurnSnapshot> {
+    turns.last().filter(|turn| {
+        matches!(
+            turn.state,
+            BackendTurnState::Failed | BackendTurnState::Cancelled
+        ) && turn.retryable
+    })
 }
 
 fn turn_is_activity_visible(state: BackendTurnState) -> bool {
@@ -1170,6 +1157,30 @@ pub fn to_task_summary(task: &TaskSnapshot) -> TaskSummary {
         to_app_task_state(task.state),
     );
     result.version = nonnegative_u64(task.version);
+    result.review_actions = task
+        .review_actions
+        .iter()
+        .filter_map(|offer| match offer.action {
+            api_types::TaskAction::Approve {
+                override_checks: Some(false),
+                ..
+            } => Some(AppApprovalAction::Accept),
+            api_types::TaskAction::SendBack { .. } => Some(AppApprovalAction::RequestChanges),
+            _ => None,
+        })
+        .collect();
+    result.review_reason_required = task.review_actions.iter().any(|offer| {
+        matches!(
+            offer.action,
+            api_types::TaskAction::Approve {
+                override_checks: Some(false),
+                ..
+            }
+        ) && offer
+            .parameters
+            .iter()
+            .any(|spec| spec.name == "reason" && spec.required)
+    });
     result.worker = task.worker.as_ref().map_or_else(String::new, agent_label);
     result.reviewer = task.reviewer.as_ref().map_or_else(String::new, agent_label);
     result.checks = task.checks.iter().map(to_check_summary).collect();
@@ -1249,7 +1260,10 @@ pub fn to_review_card(task: &TaskSnapshot) -> ReviewCard {
         worker: summary.worker,
         reviewer: summary.reviewer,
         expected_version: summary.version,
-        permitted_actions: vec![AppApprovalAction::Accept, AppApprovalAction::RequestChanges],
+        permitted_actions: summary.review_actions,
+        guidance: String::new(),
+        editing_guidance: false,
+        requires_reason: summary.review_reason_required,
         selected_action: 0,
         visibility: ContentVisibility::Public,
     }
@@ -1656,6 +1670,18 @@ mod tests {
                 cursor: ActivityCursor::beginning(&target),
             }],
             tasks: vec![TaskSnapshot {
+                review_actions: vec![api_types::Offer {
+                    action: api_types::TaskAction::Approve {
+                        override_checks: Some(false),
+                        reason: None,
+                    },
+                    parameters: Vec::new(),
+                    authority: vec![api_types::ActionAuthority::Owner],
+                    reason: "human_review".into(),
+                    label: "Accept".into(),
+                    target_execution_id: None,
+                    propagates: false,
+                }],
                 id: "task".into(),
                 title: "Review me".into(),
                 state: BackendTaskState::Review,
@@ -1861,6 +1887,36 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_snapshot_reaches_retry_command() {
+        let mut snapshot = snapshot();
+        snapshot.project.readiness = BackendProjectReadiness::Operational;
+        snapshot.chat.interactions.clear();
+        snapshot.chat.active_turns = vec![turn("cancelled", BackendTurnState::Cancelled, 9, true)];
+        snapshot.live_activity.clear();
+        let mut reducer = AppReducer::new(AppState::new());
+        reducer.reduce(ControllerEvent::SnapshotUpdated {
+            request: SnapshotRequest::default(),
+            result: Ok(snapshot),
+        });
+        assert_eq!(reducer.state().live_turn_id(), None);
+        assert_eq!(
+            reducer.state().retryable_turn.as_ref().unwrap().turn_id,
+            "cancelled"
+        );
+        reducer.reduce(ControllerEvent::Input(InputEvent::Key(
+            ControllerKeyEvent::new(ControllerKeyCode::Tab),
+        )));
+        let effects = reducer.reduce(ControllerEvent::Input(InputEvent::Key(
+            ControllerKeyEvent::new(ControllerKeyCode::Char('r')),
+        )));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            ControllerEffect::Command(BackendCommand::RetryTurn(request))
+                if request.turn_id == "cancelled" && request.expected_version == 9
+        )));
+    }
+
+    #[test]
     fn live_snapshot_refreshes_exact_version_for_cancel_command() {
         let mut snapshot = snapshot();
         snapshot.project.readiness = BackendProjectReadiness::Operational;
@@ -1967,10 +2023,9 @@ mod tests {
     }
 
     #[test]
-    fn charter_drafting_admits_chat_but_not_task_mutation() {
+    fn charter_drafting_admits_chat() {
         let readiness = to_app_readiness(BackendProjectReadiness::AwaitingCharter);
         assert!(readiness.allows_chat());
-        assert!(!readiness.allows_mutating_tasks());
     }
 
     #[test]
@@ -2166,5 +2221,61 @@ mod tests {
             ControllerEffect::ReadActivity(request)
                 if request.limit == DEFAULT_ACTIVITY_PAGE && request.cursor.next_sequence == 0
         )));
+    }
+    #[test]
+    fn review_card_uses_only_offered_decisions() {
+        let mut task = snapshot().tasks[0].clone();
+        task.review_actions.clear();
+        assert!(to_review_card(&task).permitted_actions.is_empty());
+        task.review_actions.push(api_types::Offer {
+            action: api_types::TaskAction::SendBack {
+                guidance: String::new(),
+            },
+            parameters: Vec::new(),
+            authority: vec![api_types::ActionAuthority::Owner],
+            reason: "review_failed".into(),
+            label: "Request changes".into(),
+            target_execution_id: None,
+            propagates: false,
+        });
+        assert_eq!(
+            to_review_card(&task).permitted_actions,
+            vec![AppApprovalAction::RequestChanges]
+        );
+    }
+    #[test]
+    fn physical_review_keys_collect_guidance_and_forward_it_to_backend() {
+        let mut snapshot = snapshot();
+        snapshot.project.readiness = BackendProjectReadiness::Operational;
+        snapshot.chat.interactions.clear();
+        snapshot.tasks[0].review_actions = vec![api_types::Offer {
+            action: api_types::TaskAction::SendBack {
+                guidance: String::new(),
+            },
+            parameters: Vec::new(),
+            authority: vec![api_types::ActionAuthority::Owner],
+            reason: "human_review".into(),
+            label: "Request changes".into(),
+            target_execution_id: None,
+            propagates: false,
+        }];
+        let mut reducer = AppReducer::new(AppState::new());
+        reducer.reduce(ControllerEvent::SnapshotUpdated {
+            request: SnapshotRequest::default(),
+            result: Ok(snapshot),
+        });
+        reducer.state_mut().focus = crate::app::FocusTarget::ProjectRail;
+        reducer.state_mut().rail.tab = crate::app::ProjectTab::Tasks;
+        let input = |code| ControllerEvent::Input(InputEvent::Key(ControllerKeyEvent::new(code)));
+        assert!(reducer.reduce(input(ControllerKeyCode::Enter)).is_empty());
+        assert!(reducer.reduce(input(ControllerKeyCode::Enter)).is_empty());
+        let guidance = "Add coverage for retry? yes.";
+        for character in guidance.chars() {
+            assert!(reducer
+                .reduce(input(ControllerKeyCode::Char(character)))
+                .is_empty());
+        }
+        let effects = reducer.reduce(input(ControllerKeyCode::Enter));
+        assert!(effects.iter().any(|effect| matches!(effect, ControllerEffect::Command(BackendCommand::DecideReview(request)) if request.guidance.as_deref() == Some(guidance) && request.expected_version == 4 && request.decision == crate::backend::ReviewDecision::Reject)));
     }
 }

@@ -32,8 +32,11 @@ make frontend
 cargo test
 
 # Specific crate
-cargo test -p db
-cargo test -p api --test happy_path
+cargo test -p api --test main happy_path::
+# db and services: without the feature, only the unit tests run and the
+# integration targets are skipped without a message (see docs/ci.md)
+cargo test -p db --features test-template
+cargo test -p services --features test-support
 
 # Frontend
 cd web
@@ -59,13 +62,13 @@ exports to `web/src/types/generated/bindings/` from any crate directory or
 worktree location; there is no separate Rust-side copy to synchronize.
 
 Do not edit or format these bindings by hand. ESLint and Prettier exclude them.
-The Rust CI job regenerates them and fails on changed or untracked output with
+The `Rust lint` CI job regenerates them and fails on changed or untracked output with
 a reminder to run `make types`.
 
 ## Code Standards
 
 - **No unsafe code** — `#![forbid(unsafe_code)]` is enforced workspace-wide
-- **Clippy clean** — `cargo clippy -- -D warnings` must pass
+- **Clippy clean** — `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings` must pass (`./scripts/ci-rust.sh lint` runs it)
 - **Formatted** — run `cargo fmt` before committing
 - **Frontend** — `pnpm lint` with zero warnings
 
@@ -73,7 +76,8 @@ a reminder to run `make types`.
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes with tests where appropriate
-3. Ensure CI passes: `./scripts/ci-rust.sh`
+3. Ensure CI passes: `./scripts/ci-rust.sh` (CI runs the same checks split
+   into parallel jobs; see [docs/ci.md](docs/ci.md#rust-jobs))
 4. For frontend changes: `./scripts/ci-web.sh` and the Playwright smoke test
 5. Open a PR with a clear description of what changed and why
 

@@ -12,23 +12,32 @@ pub async fn run(
     workspace_root: PathBuf,
     active_executions: ActiveExecutionTracker,
     shutdown: watch::Receiver<bool>,
+    run_policy: api_types::WorkspaceRunPolicy,
 ) -> Result<()> {
     let workspace_root = Arc::new(workspace_root);
+    let (initial_tx, _initial_rx) = mpsc::unbounded_channel();
+    let daemon_id = client
+        .daemon_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("daemon credentials are missing"))?;
+    let daemon_runtime = forge_client::daemon_runtime::DaemonRuntime::new_owned(
+        initial_tx,
+        workspace_root.as_ref().clone(),
+        active_executions,
+        daemon_id,
+        run_policy,
+    )?;
     run_with_reconnect(client, move |stream| {
         let workspace_root = Arc::clone(&workspace_root);
         let shutdown = shutdown.clone();
-        let active_executions = active_executions.clone();
+        let daemon_runtime = Arc::clone(&daemon_runtime);
         async move {
             let (responses_tx, responses_rx) = mpsc::unbounded_channel();
             let terminal = crate::terminal::TerminalRuntime::new(
                 responses_tx.clone(),
                 workspace_root.as_ref().clone(),
             );
-            let daemon_runtime = forge_client::daemon_runtime::DaemonRuntime::new_with_tracker(
-                responses_tx.clone(),
-                workspace_root.as_ref().clone(),
-                active_executions,
-            );
+            daemon_runtime.attach(responses_tx.clone());
             let handler = {
                 let workspace_root = Arc::clone(&workspace_root);
                 let terminal = Arc::clone(&terminal);

@@ -2,6 +2,7 @@ import { lazy, Suspense } from 'react'
 import { Kanban, Plus } from '@phosphor-icons/react'
 import { ErrorBanner } from '@/components/error-banner'
 import { Button } from '@/components/ui/button'
+import { ProjectFlowHeader } from '@/components/project-flow-status'
 import { BoardToolbar } from './BoardToolbar'
 import { BoardView } from './BoardView'
 import { useBoardPageController } from './useBoardPageController'
@@ -22,6 +23,7 @@ export function BoardPage({ projectId }: { projectId: string }) {
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-3" data-board-page>
+      <ProjectFlowHeader key={projectId} projectId={projectId} />
       <BoardToolbar
         agents={board.agentsQuery.data?.items ?? []}
         selectedAgentIds={board.filterAgentIds}

@@ -1227,7 +1227,7 @@ pub struct AdaptiveEnvelope {
 /// keeps the immutable copy in `project_task_governance`; the server derives
 /// `runnable` from Charter and repository readiness and never trusts a
 /// caller-provided flag.
-#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq, Eq, schemars::JsonSchema)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct TaskGovernanceRequest {
@@ -2653,10 +2653,11 @@ pub struct StartAgentChatTopicRequest {
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct StartAgentChatTopicResponse {
-    pub topic: AgentChatTopicResponse,
+    pub topic: Option<AgentChatTopicResponse>,
+    pub rotation_pending: bool,
     /// The visible divider message appended to the chat timeline at the
     /// start of this topic.
-    pub divider_message_id: String,
+    pub divider_message_id: Option<String>,
 }
 
 #[cfg(test)]

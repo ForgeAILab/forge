@@ -1,5 +1,4 @@
 use super::agent_chat::admit_agent_chat_turn_in_tx;
-use super::domain_event::map_domain_event;
 use super::*;
 
 #[async_trait]
@@ -87,6 +86,11 @@ impl AgentWakeDispositionRepo for SqliteDb {
              LEFT JOIN attention_projection AS attention
                ON attention.id = disposition.attention_id
              WHERE current.consumer_name = ?
+               AND NOT EXISTS (SELECT 1 FROM worker_dead_letter dead
+                   WHERE dead.worker_name = current.consumer_name AND dead.source_key = 'wake-retry:' || disposition.id)
+               AND NOT EXISTS (SELECT 1 FROM worker_item_failure failure
+                   WHERE failure.worker_name = current.consumer_name AND failure.source_key = 'wake-retry:' || disposition.id
+                     AND failure.retry_not_before > ?)
                AND disposition.attempt_number < disposition.max_attempts
                AND (
                    (disposition.disposition = 'deferred'
@@ -155,6 +159,7 @@ impl AgentWakeDispositionRepo for SqliteDb {
         )
         .bind(consumer_name)
         .bind(now)
+        .bind(now)
         .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await?
@@ -163,278 +168,15 @@ impl AgentWakeDispositionRepo for SqliteDb {
         .collect()
     }
 
-    async fn complete_claimed_agent_wake(
-        &self,
-        input: CompleteClaimedWake,
-    ) -> Result<AgentWakeDisposition> {
-        validate_disposition_input(&input.disposition)?;
-        if input.disposition.consumer_name != input.completion.consumer_name
-            || input.disposition.source_event_id != input.completion.event_id
-            || input.disposition.source_event_sequence != input.completion.event_sequence
-        {
-            return Err(DbError::Check(
-                "wake disposition and claimed event identity must match".to_owned(),
-            ));
-        }
-
-        let mut transaction = crate::begin_immediate(&self.pool).await?;
-        let event = load_claimed_event(&mut transaction, &input.completion).await?;
-        if event.sequence != input.disposition.source_event_sequence {
-            return Err(DbError::Check(
-                "wake disposition source sequence does not match event".to_owned(),
-            ));
-        }
-
-        if let Some(expected_attention) = input.expected_attention.as_ref() {
-            validate_expected_attention_in_tx(&mut transaction, expected_attention).await?;
-        }
-
-        let mut admitted_turn = false;
-        match input.disposition.disposition {
-            AgentWakeDispositionKind::TurnAdmitted => {
-                let admission = input.admission.clone().ok_or_else(|| {
-                    DbError::Check(
-                        "turn_admitted wake disposition requires an atomic turn admission"
-                            .to_owned(),
-                    )
-                })?;
-                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                    || admission.message.id != admission.turn.triggering_message_id
-                {
-                    return Err(DbError::Check(
-                        "wake disposition turn link does not match admission".to_owned(),
-                    ));
-                }
-                let admitted =
-                    admit_agent_chat_turn_in_tx(self, &mut transaction, admission).await?;
-                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                {
-                    return Err(DbError::IdempotencyConflict);
-                }
-                admitted_turn = true;
-            }
-            _ if input.admission.is_some() => {
-                return Err(DbError::Check(
-                    "only turn_admitted wake dispositions may carry admission".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-
-        let existing = sqlx::query(
-            "SELECT * FROM agent_wake_disposition
-             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
-        )
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(input.disposition.attempt_number)
-        .fetch_optional(&mut *transaction)
-        .await?;
-
-        let disposition = if let Some(row) = existing {
-            let existing = map_agent_wake_disposition(row)?;
-            if !wake_disposition_semantics_match(&input.disposition, &existing) {
-                return Err(DbError::IdempotencyConflict);
-            }
-            ensure_current_pointer(&mut transaction, &existing, &input.disposition.updated_at)
-                .await?;
-            existing
-        } else {
-            if input.disposition.attempt_number > 1 {
-                let current = current_disposition_in_tx(
-                    &mut transaction,
-                    &input.disposition.consumer_name,
-                    &input.disposition.source_event_id,
-                )
-                .await?
-                .ok_or(DbError::VersionConflict)?;
-                if input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
-                    || !matches!(
-                        current.disposition,
-                        AgentWakeDispositionKind::Deferred
-                            | AgentWakeDispositionKind::SetupRequired
-                    )
-                {
-                    return Err(DbError::VersionConflict);
-                }
-            } else if input.disposition.parent_disposition_id.is_some()
-                || current_disposition_in_tx(
-                    &mut transaction,
-                    &input.disposition.consumer_name,
-                    &input.disposition.source_event_id,
-                )
-                .await?
-                .is_some()
-            {
-                return Err(DbError::IdempotencyConflict);
-            }
-
-            if input.disposition.disposition == AgentWakeDispositionKind::TurnAdmitted
-                && !admitted_turn
-            {
-                return Err(DbError::Check(
-                    "turn admission must be committed with turn_admitted disposition".to_owned(),
-                ));
-            }
-
-            insert_disposition(&mut transaction, &input.disposition).await?;
-            ensure_current_pointer(
-                &mut transaction,
-                &input.disposition,
-                &input.disposition.updated_at,
-            )
-            .await?;
-            disposition_from_create(&input.disposition)
-        };
-
-        complete_event_in_tx(&mut transaction, &input.completion).await?;
-        transaction.commit().await?;
-        Ok(disposition)
-    }
-
     async fn retry_agent_wake(
         &self,
         input: RetryAgentWakeDisposition,
     ) -> Result<AgentWakeDisposition> {
-        validate_disposition_input(&input.disposition)?;
-        if input.disposition.consumer_name.trim().is_empty()
-            || input.disposition.source_event_id.trim().is_empty()
-        {
-            return Err(DbError::Check(
-                "wake retry source identity must be non-empty".to_owned(),
-            ));
-        }
-
         let mut transaction = crate::begin_immediate(&self.pool).await?;
-        if let Some(expected_attention) = input.expected_attention.as_ref() {
-            validate_expected_attention_in_tx(&mut transaction, expected_attention).await?;
-        }
-        match input.disposition.disposition {
-            AgentWakeDispositionKind::TurnAdmitted => {
-                let admission = input.admission.clone().ok_or_else(|| {
-                    DbError::Check(
-                        "turn_admitted wake retry requires an atomic turn admission".to_owned(),
-                    )
-                })?;
-                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                    || admission.message.id != admission.turn.triggering_message_id
-                {
-                    return Err(DbError::Check(
-                        "wake retry turn link does not match admission".to_owned(),
-                    ));
-                }
-                let admitted =
-                    admit_agent_chat_turn_in_tx(self, &mut transaction, admission).await?;
-                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
-                {
-                    return Err(DbError::IdempotencyConflict);
-                }
-            }
-            _ if input.admission.is_some() => {
-                return Err(DbError::Check(
-                    "only turn_admitted wake retries may carry admission".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-        let existing = sqlx::query(
-            "SELECT * FROM agent_wake_disposition
-             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
-        )
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(input.disposition.attempt_number)
-        .fetch_optional(&mut *transaction)
-        .await?;
-        if let Some(row) = existing {
-            let existing = map_agent_wake_disposition(row)?;
-            if !wake_disposition_semantics_match(&input.disposition, &existing) {
-                return Err(DbError::IdempotencyConflict);
-            }
-            transaction.commit().await?;
-            return Ok(existing);
-        }
-
-        let current = current_disposition_with_pointer_in_tx(
-            &mut transaction,
-            &input.disposition.consumer_name,
-            &input.disposition.source_event_id,
-        )
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if current.disposition.disposition != AgentWakeDispositionKind::Deferred
-            && current.disposition.disposition != AgentWakeDispositionKind::SetupRequired
-        {
-            return Err(DbError::InvalidTransition);
-        }
-        if current.id != input.expected_parent_id
-            || input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
-            || input.disposition.attempt_number != current.attempt_number + 1
-            || input.disposition.max_attempts != current.max_attempts
-        {
-            return Err(DbError::VersionConflict);
-        }
-        if current.disposition.disposition == AgentWakeDispositionKind::Deferred
-            && current
-                .retry_at
-                .as_deref()
-                .is_none_or(|retry_at| retry_at > input.now.as_str())
-        {
-            return Err(DbError::Check("deferred wake retry is not due".to_owned()));
-        }
-        if current.attempt_number >= current.max_attempts {
-            return Err(DbError::Check("wake retry budget is exhausted".to_owned()));
-        }
-
-        insert_disposition(&mut transaction, &input.disposition).await?;
-        let updated = sqlx::query(
-            "UPDATE agent_wake_disposition_current
-             SET disposition_id = ?, attempt_number = ?, version = version + 1,
-                 updated_at = ?
-             WHERE consumer_name = ? AND source_event_id = ?
-               AND disposition_id = ? AND version = ?",
-        )
-        .bind(&input.disposition.id)
-        .bind(input.disposition.attempt_number)
-        .bind(&input.disposition.updated_at)
-        .bind(&input.disposition.consumer_name)
-        .bind(&input.disposition.source_event_id)
-        .bind(&input.expected_parent_id)
-        .bind(current.version)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-
-        let disposition = disposition_from_create(&input.disposition);
+        let disposition = self.retry_agent_wake_in_tx(&mut transaction, input).await?;
         transaction.commit().await?;
         Ok(disposition)
     }
-}
-
-async fn load_claimed_event(
-    transaction: &mut Transaction<'_, Sqlite>,
-    input: &CompleteDomainEvent,
-) -> Result<DomainEvent> {
-    let event = sqlx::query("SELECT * FROM domain_event WHERE sequence = ?")
-        .bind(input.event_sequence)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(DbError::NotFound)
-        .and_then(|row| map_domain_event(row).map_err(DbError::from))?;
-    if event.id != input.event_id {
-        return Err(DbError::Check(
-            "event id does not match the claimed sequence".to_owned(),
-        ));
-    }
-    let expected_dedupe = event.dedupe_key.clone().unwrap_or_else(|| event.id.clone());
-    if expected_dedupe != input.dedupe_key {
-        return Err(DbError::Check(
-            "event dedupe key does not match the claimed event".to_owned(),
-        ));
-    }
-    Ok(event)
 }
 
 /// Re-read the Attention materialization inside the same write transaction as
@@ -527,98 +269,6 @@ fn canonical_attention_digest_from_row(row: &SqliteRow) -> Result<String> {
         source_sequence: row.try_get("source_sequence")?,
     };
     Ok(canonical_attention_incident_digest(&attention))
-}
-
-async fn complete_event_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
-    input: &CompleteDomainEvent,
-) -> Result<()> {
-    let cursor = sqlx::query_scalar::<_, i64>(
-        "SELECT last_sequence FROM event_consumer_cursor WHERE consumer_name = ?",
-    )
-    .bind(&input.consumer_name)
-    .fetch_optional(&mut **transaction)
-    .await?
-    .ok_or(DbError::NotFound)?;
-    if input.event_sequence
-        > super::domain_event::next_existing_sequence(transaction, cursor)
-            .await?
-            .unwrap_or(i64::MAX)
-    {
-        return Err(DbError::Check(
-            "domain events must be checkpointed in sequence order".to_owned(),
-        ));
-    }
-
-    let receipt = sqlx::query(
-        "SELECT dedupe_key FROM event_projection_receipt
-         WHERE consumer_name = ? AND event_id = ?",
-    )
-    .bind(&input.consumer_name)
-    .bind(&input.event_id)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    if let Some(row) = receipt {
-        let dedupe_key: String = row.try_get("dedupe_key")?;
-        if dedupe_key != input.dedupe_key {
-            return Err(DbError::IdempotencyConflict);
-        }
-    } else {
-        let lease_owner = sqlx::query_scalar::<_, String>(
-            "SELECT lease_owner FROM event_processing_lease
-             WHERE consumer_name = ? AND event_sequence = ?",
-        )
-        .bind(&input.consumer_name)
-        .bind(input.event_sequence)
-        .fetch_optional(&mut **transaction)
-        .await?
-        .ok_or(DbError::NotFound)?;
-        if lease_owner != input.lease_owner {
-            return Err(DbError::VersionConflict);
-        }
-        sqlx::query(
-            "INSERT INTO event_projection_receipt (
-                consumer_name, event_id, dedupe_key, processed_at
-             ) VALUES (?, ?, ?, ?)",
-        )
-        .bind(&input.consumer_name)
-        .bind(&input.event_id)
-        .bind(&input.dedupe_key)
-        .bind(&input.completed_at)
-        .execute(&mut **transaction)
-        .await
-        .map_err(map_wake_write_error)?;
-    }
-
-    if Some(input.event_sequence)
-        == super::domain_event::next_existing_sequence(transaction, cursor).await?
-    {
-        let updated = sqlx::query(
-            "UPDATE event_consumer_cursor
-             SET last_sequence = ?, version = version + 1, updated_at = ?
-             WHERE consumer_name = ? AND last_sequence = ?",
-        )
-        .bind(input.event_sequence)
-        .bind(&input.completed_at)
-        .bind(&input.consumer_name)
-        .bind(cursor)
-        .execute(&mut **transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            return Err(DbError::VersionConflict);
-        }
-    }
-
-    sqlx::query(
-        "DELETE FROM event_processing_lease
-         WHERE consumer_name = ? AND event_sequence = ? AND lease_owner = ?",
-    )
-    .bind(&input.consumer_name)
-    .bind(input.event_sequence)
-    .bind(&input.lease_owner)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
 }
 
 async fn insert_disposition(
@@ -945,5 +595,1045 @@ fn map_wake_write_error(error: sqlx::Error) -> DbError {
         DbError::Check("wake disposition constraint failed".to_owned())
     } else {
         error.into()
+    }
+}
+
+impl SqliteDb {
+    pub async fn get_agent_wake_disposition_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        consumer: &str,
+        event_id: &str,
+    ) -> Result<Option<AgentWakeDisposition>> {
+        current_disposition_in_tx(tx, consumer, event_id).await
+    }
+
+    pub async fn retry_agent_wake_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        input: RetryAgentWakeDisposition,
+    ) -> Result<AgentWakeDisposition> {
+        validate_disposition_input(&input.disposition)?;
+        if input.disposition.consumer_name.trim().is_empty()
+            || input.disposition.source_event_id.trim().is_empty()
+        {
+            return Err(DbError::Check(
+                "wake retry source identity must be non-empty".to_owned(),
+            ));
+        }
+
+        if let Some(expected_attention) = input.expected_attention.as_ref() {
+            validate_expected_attention_in_tx(transaction, expected_attention).await?;
+        }
+        match input.disposition.disposition {
+            AgentWakeDispositionKind::TurnAdmitted => {
+                let admission = input.admission.clone().ok_or_else(|| {
+                    DbError::Check(
+                        "turn_admitted wake retry requires an atomic turn admission".to_owned(),
+                    )
+                })?;
+                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                    || admission.message.id != admission.turn.triggering_message_id
+                {
+                    return Err(DbError::Check(
+                        "wake retry turn link does not match admission".to_owned(),
+                    ));
+                }
+                let admitted = admit_agent_chat_turn_in_tx(self, transaction, admission).await?;
+                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+            }
+            _ if input.admission.is_some() => {
+                return Err(DbError::Check(
+                    "only turn_admitted wake retries may carry admission".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let existing = sqlx::query(
+            "SELECT * FROM agent_wake_disposition
+             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
+        )
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(input.disposition.attempt_number)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(row) = existing {
+            let existing = map_agent_wake_disposition(row)?;
+            if !wake_disposition_semantics_match(&input.disposition, &existing) {
+                return Err(DbError::IdempotencyConflict);
+            }
+            return Ok(existing);
+        }
+
+        let current = current_disposition_with_pointer_in_tx(
+            transaction,
+            &input.disposition.consumer_name,
+            &input.disposition.source_event_id,
+        )
+        .await?
+        .ok_or(DbError::NotFound)?;
+        if current.disposition.disposition != AgentWakeDispositionKind::Deferred
+            && current.disposition.disposition != AgentWakeDispositionKind::SetupRequired
+        {
+            return Err(DbError::InvalidTransition);
+        }
+        if current.id != input.expected_parent_id
+            || input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
+            || input.disposition.attempt_number != current.attempt_number + 1
+            || input.disposition.max_attempts != current.max_attempts
+        {
+            return Err(DbError::VersionConflict);
+        }
+        if current.disposition.disposition == AgentWakeDispositionKind::Deferred
+            && current
+                .retry_at
+                .as_deref()
+                .is_none_or(|retry_at| retry_at > input.now.as_str())
+        {
+            return Err(DbError::Check("deferred wake retry is not due".to_owned()));
+        }
+        if current.attempt_number >= current.max_attempts {
+            return Err(DbError::Check("wake retry budget is exhausted".to_owned()));
+        }
+
+        insert_disposition(transaction, &input.disposition).await?;
+        let updated = sqlx::query(
+            "UPDATE agent_wake_disposition_current
+             SET disposition_id = ?, attempt_number = ?, version = version + 1,
+                 updated_at = ?
+             WHERE consumer_name = ? AND source_event_id = ?
+               AND disposition_id = ? AND version = ?",
+        )
+        .bind(&input.disposition.id)
+        .bind(input.disposition.attempt_number)
+        .bind(&input.disposition.updated_at)
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(&input.expected_parent_id)
+        .bind(current.version)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(DbError::VersionConflict);
+        }
+
+        self.settle_wake_decision_in_tx(
+            transaction,
+            &input.disposition,
+            input.expected_attention.as_ref(),
+        )
+        .await?;
+        let disposition = disposition_from_create(&input.disposition);
+        Ok(disposition)
+    }
+    async fn settle_wake_decision_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        disposition: &CreateAgentWakeDisposition,
+        expected: Option<&ExpectedAttentionSnapshot>,
+    ) -> Result<()> {
+        if disposition.disposition == AgentWakeDispositionKind::TurnAdmitted {
+            if let Some(expected) = expected.filter(|expected| {
+                expected
+                    .dedupe_key
+                    .starts_with("attention:decision_recorded:")
+            }) {
+                self.resolve_attention_by_dedupe_in_tx(
+                    tx,
+                    &expected.dedupe_key,
+                    &disposition.source_event_id,
+                    &disposition.updated_at,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+    pub async fn persist_agent_wake_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Sqlite>,
+        event: &DomainEvent,
+        input: PersistAgentWake,
+    ) -> Result<AgentWakeDisposition> {
+        validate_disposition_input(&input.disposition)?;
+        if event.id != input.disposition.source_event_id
+            || event.sequence != input.disposition.source_event_sequence
+        {
+            return Err(DbError::Check(
+                "wake disposition source does not match event".to_owned(),
+            ));
+        }
+        let source: Option<String> =
+            sqlx::query_scalar("SELECT id FROM domain_event WHERE sequence = ?")
+                .bind(event.sequence)
+                .fetch_optional(&mut **transaction)
+                .await?;
+        if source.as_deref() != Some(event.id.as_str()) {
+            return Err(DbError::NotFound);
+        }
+        if let Some(expected_attention) = input.expected_attention.as_ref() {
+            validate_expected_attention_in_tx(transaction, expected_attention).await?;
+        }
+
+        let mut admitted_turn = false;
+        match input.disposition.disposition {
+            AgentWakeDispositionKind::TurnAdmitted => {
+                let admission = input.admission.clone().ok_or_else(|| {
+                    DbError::Check(
+                        "turn_admitted wake disposition requires an atomic turn admission"
+                            .to_owned(),
+                    )
+                })?;
+                if admission.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                    || admission.message.id != admission.turn.triggering_message_id
+                {
+                    return Err(DbError::Check(
+                        "wake disposition turn link does not match admission".to_owned(),
+                    ));
+                }
+                let admitted = admit_agent_chat_turn_in_tx(self, transaction, admission).await?;
+                if admitted.turn.id != input.disposition.turn_job_id.as_deref().unwrap_or_default()
+                {
+                    return Err(DbError::IdempotencyConflict);
+                }
+                admitted_turn = true;
+            }
+            _ if input.admission.is_some() => {
+                return Err(DbError::Check(
+                    "only turn_admitted wake dispositions may carry admission".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        let existing = sqlx::query(
+            "SELECT * FROM agent_wake_disposition
+             WHERE consumer_name = ? AND source_event_id = ? AND attempt_number = ?",
+        )
+        .bind(&input.disposition.consumer_name)
+        .bind(&input.disposition.source_event_id)
+        .bind(input.disposition.attempt_number)
+        .fetch_optional(&mut **transaction)
+        .await?;
+
+        let disposition = if let Some(row) = existing {
+            let existing = map_agent_wake_disposition(row)?;
+            if !wake_disposition_semantics_match(&input.disposition, &existing) {
+                return Err(DbError::IdempotencyConflict);
+            }
+            ensure_current_pointer(transaction, &existing, &input.disposition.updated_at).await?;
+            existing
+        } else {
+            if input.disposition.attempt_number > 1 {
+                let current = current_disposition_in_tx(
+                    transaction,
+                    &input.disposition.consumer_name,
+                    &input.disposition.source_event_id,
+                )
+                .await?
+                .ok_or(DbError::VersionConflict)?;
+                if input.disposition.parent_disposition_id.as_deref() != Some(current.id.as_str())
+                    || !matches!(
+                        current.disposition,
+                        AgentWakeDispositionKind::Deferred
+                            | AgentWakeDispositionKind::SetupRequired
+                    )
+                {
+                    return Err(DbError::VersionConflict);
+                }
+            } else if input.disposition.parent_disposition_id.is_some()
+                || current_disposition_in_tx(
+                    transaction,
+                    &input.disposition.consumer_name,
+                    &input.disposition.source_event_id,
+                )
+                .await?
+                .is_some()
+            {
+                return Err(DbError::IdempotencyConflict);
+            }
+
+            if input.disposition.disposition == AgentWakeDispositionKind::TurnAdmitted
+                && !admitted_turn
+            {
+                return Err(DbError::Check(
+                    "turn admission must be committed with turn_admitted disposition".to_owned(),
+                ));
+            }
+
+            insert_disposition(transaction, &input.disposition).await?;
+            ensure_current_pointer(
+                transaction,
+                &input.disposition,
+                &input.disposition.updated_at,
+            )
+            .await?;
+            disposition_from_create(&input.disposition)
+        };
+
+        self.settle_wake_decision_in_tx(
+            transaction,
+            &input.disposition,
+            input.expected_attention.as_ref(),
+        )
+        .await?;
+        Ok(disposition)
+    }
+}
+
+impl SqliteDb {
+    pub async fn prior_blocker_turn_ids(&self, attention_id: &str) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT turn_job_id FROM agent_wake_blocker WHERE attention_id = ? ORDER BY turn_job_id")
+.bind(attention_id)
+.fetch_all(self.pool())
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn failed_wake_matches_current_profile_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        incident_key: &str,
+        incident_digest: Option<&str>,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_disposition d JOIN agent_chat_turn_job j ON j.id=d.turn_job_id JOIN agent_identity i ON i.id=j.responder_identity_id JOIN agent_profile p ON p.id=i.selected_profile_id WHERE d.disposition='turn_admitted' AND d.incident_key=? AND d.incident_digest=? AND j.status='failed' AND j.profile_id=p.id AND j.profile_version=p.version)")
+.bind(incident_key)
+.bind(incident_digest)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_project_batch_is_cooling_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        now: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_wake_batch WHERE project_id = ? AND cooldown_until > ?)")
+.bind(project_id)
+.bind(now)
+.fetch_one(connection)
+.await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct ActiveIncidentWakeLeaseInTxInput<'a> {
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub incident_key: &'a str,
+    pub leased_after: &'a str,
+    pub cooldown_after: &'a str,
+}
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct ActiveIncidentWakeLeaseRow {
+    pub leased_until: crate::Result<String>,
+    pub cooldown_until: crate::Result<Option<String>>,
+}
+
+impl SqliteDb {
+    pub async fn active_incident_wake_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: ActiveIncidentWakeLeaseInTxInput<'_>,
+    ) -> crate::Result<Option<ActiveIncidentWakeLeaseRow>> {
+        let rows = sqlx::query(
+            "SELECT identity_id, leased_until, cooldown_until
+             FROM agent_wake_lease
+             WHERE scope_type = ? AND scope_id = ? AND incident_key = ?
+               AND (leased_until > ? OR cooldown_until > ?)
+             ORDER BY leased_until DESC, identity_id ASC
+             LIMIT 1",
+        )
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.incident_key)
+        .bind(input.leased_after)
+        .bind(input.cooldown_after)
+        .fetch_optional(connection)
+        .await?;
+        rows.map(|row| {
+            Ok(ActiveIncidentWakeLeaseRow {
+                leased_until: row.try_get("leased_until").map_err(crate::DbError::from),
+                cooldown_until: row.try_get("cooldown_until").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+/// Typed fields retain decoding failures for the caller's original conditional/error handling.
+#[derive(Debug)]
+pub struct WakeBudgetWindowRow {
+    pub window_started_at: crate::Result<String>,
+    pub admitted_count: crate::Result<i64>,
+}
+
+impl SqliteDb {
+    pub async fn wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        scope_type: &str,
+        scope_id: &str,
+        category: &str,
+    ) -> crate::Result<Option<WakeBudgetWindowRow>> {
+        let rows = sqlx::query(
+            "SELECT window_started_at, admitted_count
+                 FROM agent_wake_budget_window
+                 WHERE scope_type = ? AND scope_id = ? AND category = ?",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(category)
+        .fetch_optional(connection)
+        .await?;
+        rows.map(|row| {
+            Ok(WakeBudgetWindowRow {
+                window_started_at: row
+                    .try_get("window_started_at")
+                    .map_err(crate::DbError::from),
+                admitted_count: row.try_get("admitted_count").map_err(crate::DbError::from),
+            })
+        })
+        .transpose()
+    }
+}
+
+impl SqliteDb {
+    pub async fn shared_wake_budget_used_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        scope_type: &str,
+        scope_id: &str,
+        window_started: &str,
+    ) -> crate::Result<i64> {
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(admitted_count), 0) FROM agent_wake_budget_window
+                     WHERE scope_type = ? AND scope_id = ? AND window_started_at > ?",
+        )
+        .bind(scope_type)
+        .bind(scope_id)
+        .bind(window_started)
+        .fetch_one(connection)
+        .await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct IncrementWakeBudgetWindowInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub updated_at: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub category: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn increment_wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: IncrementWakeBudgetWindowInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_wake_budget_window
+                     SET admitted_count = admitted_count + 1, identity_id = ?,
+                         version = version + 1, updated_at = ?
+                     WHERE scope_type = ? AND scope_id = ? AND category = ?",
+        )
+        .bind(input.identity_id)
+        .bind(input.updated_at)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.category)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct StartWakeBudgetWindowInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub category: &'a str,
+    pub window_started_at: &'a str,
+    pub updated_at: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn start_wake_budget_window_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: StartWakeBudgetWindowInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_wake_budget_window (
+                        identity_id, scope_type, scope_id, category, window_started_at,
+                        window_seconds, admitted_count, version, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, 3600, 1, 1, ?)
+                     ON CONFLICT(scope_type, scope_id, category) DO UPDATE SET
+                        window_started_at = excluded.window_started_at,
+                        identity_id = excluded.identity_id,
+                        admitted_count = 1,
+                        version = agent_wake_budget_window.version + 1,
+                        updated_at = excluded.updated_at",
+        )
+        .bind(input.identity_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.category)
+        .bind(input.window_started_at)
+        .bind(input.updated_at)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct AdmitIncidentWakeLeaseInTxInput<'a> {
+    pub identity_id: &'a str,
+    pub scope_type: &'a str,
+    pub scope_id: &'a str,
+    pub incident_key: &'a str,
+    pub lease_owner: &'a str,
+    pub leased_until: &'a str,
+    pub reaction_depth: i64,
+    pub updated_at: &'a str,
+    pub cooldown_until: &'a str,
+    pub last_admitted_at: &'a str,
+    pub correlation_id: &'a str,
+    pub causation_id: Option<&'a str>,
+}
+
+impl SqliteDb {
+    pub async fn admit_incident_wake_lease_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: AdmitIncidentWakeLeaseInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "INSERT INTO agent_wake_lease (
+                identity_id, scope_type, scope_id, incident_key, lease_owner,
+                leased_until, reaction_depth, updated_at, cooldown_until,
+                last_admitted_at, admission_count, correlation_id, causation_id
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(identity_id, scope_type, scope_id, incident_key) DO UPDATE SET
+                lease_owner = excluded.lease_owner,
+                leased_until = excluded.leased_until,
+                reaction_depth = excluded.reaction_depth,
+                updated_at = excluded.updated_at,
+                cooldown_until = excluded.cooldown_until,
+                last_admitted_at = excluded.last_admitted_at,
+                admission_count = agent_wake_lease.admission_count + 1,
+                correlation_id = excluded.correlation_id,
+                causation_id = excluded.causation_id
+             WHERE agent_wake_lease.leased_until <= excluded.updated_at
+               AND (agent_wake_lease.cooldown_until IS NULL
+                    OR agent_wake_lease.cooldown_until <= excluded.updated_at)",
+        )
+        .bind(input.identity_id)
+        .bind(input.scope_type)
+        .bind(input.scope_id)
+        .bind(input.incident_key)
+        .bind(input.lease_owner)
+        .bind(input.leased_until)
+        .bind(input.reaction_depth)
+        .bind(input.updated_at)
+        .bind(input.cooldown_until)
+        .bind(input.last_admitted_at)
+        .bind(input.correlation_id)
+        .bind(input.causation_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+#[derive(Debug)]
+pub struct RecordLatestAttentionWakeInTxInput<'a> {
+    pub attention_id: &'a str,
+    pub incident_digest: &'a str,
+    pub disposition: &'a str,
+    pub reason: &'a str,
+    pub identity_id: Option<&'a str>,
+    pub updated_at: &'a str,
+    pub existing_attention_id: &'a str,
+}
+
+impl SqliteDb {
+    pub async fn record_latest_attention_wake_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: RecordLatestAttentionWakeInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_attention_latest(attention_id,incident_digest,disposition,reason,identity_id,updated_at)
+                 SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM attention_projection WHERE id=?)
+                 ON CONFLICT(attention_id) DO UPDATE SET incident_digest=excluded.incident_digest,
+                    disposition=excluded.disposition, reason=excluded.reason,
+                    identity_id=excluded.identity_id, updated_at=excluded.updated_at
+                 WHERE agent_wake_attention_latest.incident_digest IS NOT excluded.incident_digest
+                    OR agent_wake_attention_latest.disposition IS NOT excluded.disposition
+                    OR agent_wake_attention_latest.reason IS NOT excluded.reason
+                    OR agent_wake_attention_latest.identity_id IS NOT excluded.identity_id")
+.bind(input.attention_id)
+.bind(input.incident_digest)
+.bind(input.disposition)
+.bind(input.reason)
+.bind(input.identity_id)
+.bind(input.updated_at)
+.bind(input.existing_attention_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_admitted_wake_blocker_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+        incident_digest: String,
+        turn_job_id: &str,
+        admitted_at: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_blocker(attention_id,incident_digest,turn_job_id,admitted_at) VALUES(?,?,?,?)
+                         ON CONFLICT(attention_id,incident_digest) DO UPDATE SET turn_job_id=excluded.turn_job_id,
+                            admitted_at=excluded.admitted_at, escalation_id=NULL, recorded_outcome=NULL,
+                            legacy_source_event_id=NULL")
+.bind(attention_id)
+.bind(incident_digest)
+.bind(turn_job_id)
+.bind(admitted_at)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_admitted_wake_batch_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        admitted_at: &str,
+        cooldown_until: Option<String>,
+        turn_job_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_batch(project_id,admitted_at,cooldown_until,turn_job_id) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET admitted_at=excluded.admitted_at,cooldown_until=excluded.cooldown_until,turn_job_id=excluded.turn_job_id")
+.bind(project_id)
+.bind(admitted_at)
+.bind(cooldown_until)
+.bind(turn_job_id)
+.execute(connection)
+.await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn rearm_answered_escalation_blockers_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_job_id: &str,
+        admitted_at: &str,
+        escalation_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query(
+            "UPDATE agent_wake_blocker SET turn_job_id = ?, escalation_id = NULL,
+                        recorded_outcome = NULL, admitted_at = ?
+                     WHERE escalation_id = ?",
+        )
+        .bind(turn_job_id)
+        .bind(admitted_at)
+        .bind(escalation_id)
+        .execute(connection)
+        .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct ProjectEscalationSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl ProjectEscalationSourceRow {
+    pub fn id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("id")?)
+    }
+    pub fn project_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("project_id")?)
+    }
+    pub fn need(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("need")?)
+    }
+    pub fn task_ids_json(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("task_ids_json")?)
+    }
+    pub fn attention_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("attention_id")?)
+    }
+    pub fn notification_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("notification_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn answer(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("answer")?)
+    }
+    pub fn version(&self) -> crate::Result<i64> {
+        Ok(self.row.try_get("version")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+}
+
+#[derive(Debug)]
+pub struct InsertProjectEscalationInTxInput<'a> {
+    pub id: &'a str,
+    pub project_id: &'a str,
+    pub identity_id: Option<&'a str>,
+    pub dedupe_key: &'a str,
+    pub need: &'a str,
+    pub task_ids_json: &'a str,
+    pub attention_id: &'a str,
+    pub notification_id: &'a str,
+    pub created_at: &'a str,
+}
+
+/// Query-specific typed accessors preserve the caller's conditional decoding order.
+pub struct EscalationBlockerTurnSourceRow {
+    row: sqlx::sqlite::SqliteRow,
+}
+
+impl EscalationBlockerTurnSourceRow {
+    pub fn turn_job_id(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("turn_job_id")?)
+    }
+    pub fn responder_identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("responder_identity_id")?)
+    }
+    pub fn created_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("created_at")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn reused_turn_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_id: &str,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT e.* FROM agent_wake_escalation e JOIN agent_wake_blocker b ON b.escalation_id=e.id WHERE b.turn_job_id=? AND e.dedupe_key<>? LIMIT 1")
+            .bind(turn_id)
+            .bind(dedupe_key)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_turn_blockers_to_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        escalation_id: &str,
+        turn_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND escalation_id IS NULL")
+            .bind(escalation_id)
+            .bind(turn_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn record_project_blocker_recovery_action(
+        &self,
+        project_id: &str,
+        task_id: &str,
+        identity_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET recorded_outcome='recovery_action' WHERE escalation_id IS NULL AND attention_id IN (SELECT id FROM attention_projection WHERE scope_type='project' AND scope_id=? AND json_extract(details_json,'$.entity_id')=?) AND turn_job_id IN (SELECT j.id FROM agent_chat_turn_job j JOIN agent_chat c ON c.id=j.chat_id WHERE c.project_id=? AND j.responder_identity_id=? AND j.status='leased')")
+            .bind(project_id)
+            .bind(task_id)
+            .bind(project_id)
+            .bind(identity_id)
+            .execute(self.pool())
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_project_escalation_sources_on_connection(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        project_id: &str,
+        status: Option<&str>,
+        after_created_at: Option<&str>,
+        after_id: Option<&str>,
+        limit: i64,
+    ) -> crate::Result<Vec<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT * FROM agent_wake_escalation
+             WHERE project_id = ? AND (? IS NULL OR status = ?)
+               AND (? IS NULL OR created_at > ? OR (created_at = ? AND id > ?))
+             ORDER BY created_at, id LIMIT ?",
+        )
+        .bind(project_id)
+        .bind(status)
+        .bind(status)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_created_at)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(connection)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProjectEscalationSourceRow { row })
+            .collect())
+    }
+}
+
+impl SqliteDb {
+    pub async fn owner_project_escalation_source_on_connection(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
+            .bind(id)
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn answer_project_escalation_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+        project_id: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=? AND project_id=?")
+            .bind(id)
+            .bind(project_id)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn answer_project_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        answer: &str,
+        answered_at: &str,
+        id: &str,
+        project_id: &str,
+        expected_version: i64,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_escalation SET status='answered',answer=?,answered_at=?,version=version+1 WHERE id=? AND project_id=? AND version=? AND status='open'")
+            .bind(answer)
+            .bind(answered_at)
+            .bind(id)
+            .bind(project_id)
+            .bind(expected_version)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn answered_project_escalation_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        id: &str,
+    ) -> crate::Result<ProjectEscalationSourceRow> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE id=?")
+            .bind(id)
+            .fetch_one(connection)
+            .await?;
+        Ok(ProjectEscalationSourceRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn project_escalation_by_dedupe_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        dedupe_key: &str,
+    ) -> crate::Result<Option<ProjectEscalationSourceRow>> {
+        let rows = sqlx::query("SELECT * FROM agent_wake_escalation WHERE dedupe_key=?")
+            .bind(dedupe_key)
+            .fetch_optional(connection)
+            .await?;
+        Ok(rows.map(|row| ProjectEscalationSourceRow { row }))
+    }
+}
+
+impl SqliteDb {
+    pub async fn insert_project_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        input: InsertProjectEscalationInTxInput<'_>,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("INSERT INTO agent_wake_escalation(id,project_id,identity_id,dedupe_key,need,task_ids_json,attention_id,notification_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
+            .bind(input.id)
+            .bind(input.project_id)
+            .bind(input.identity_id)
+            .bind(input.dedupe_key)
+            .bind(input.need)
+            .bind(input.task_ids_json)
+            .bind(input.attention_id)
+            .bind(input.notification_id)
+            .bind(input.created_at)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_blocker_turn_source_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+        incident_digest: &str,
+    ) -> crate::Result<EscalationBlockerTurnSourceRow> {
+        let rows = sqlx::query("SELECT b.turn_job_id,j.responder_identity_id,j.created_at,j.updated_at FROM agent_wake_blocker b JOIN agent_chat_turn_job j ON j.id=b.turn_job_id WHERE b.attention_id=? AND b.incident_digest=? AND b.legacy_source_event_id IS NULL")
+            .bind(attention_id)
+            .bind(incident_digest)
+            .fetch_one(connection)
+            .await?;
+        Ok(EscalationBlockerTurnSourceRow { row: rows })
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_unlinked_turn_blockers_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        turn_id: &str,
+    ) -> crate::Result<Vec<(String, String, Option<String>)>> {
+        Ok(sqlx::query_as::<_, (String, String, Option<String>)>("SELECT attention_id,incident_digest,recorded_outcome FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL AND legacy_source_event_id IS NULL")
+            .bind(turn_id)
+            .fetch_all(connection)
+            .await?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn link_attention_blocker_to_escalation_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        escalation_id: &str,
+        turn_id: &str,
+        attention_id: &str,
+    ) -> crate::Result<u64> {
+        let result = sqlx::query("UPDATE agent_wake_blocker SET escalation_id=? WHERE turn_job_id=? AND attention_id=? AND escalation_id IS NULL")
+            .bind(escalation_id)
+            .bind(turn_id)
+            .bind(attention_id)
+            .execute(connection)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+impl SqliteDb {
+    pub async fn escalation_unlinked_turn_attention_ids(
+        &self,
+        turn_id: &str,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT attention_id FROM agent_wake_blocker WHERE turn_job_id=? AND escalation_id IS NULL")
+            .bind(turn_id)
+            .fetch_all(self.pool())
+            .await?)
+    }
+}
+
+pub struct WakeBlockerTurnSourceRow {
+    row: SqliteRow,
+}
+impl WakeBlockerTurnSourceRow {
+    pub fn incident_digest(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("incident_digest")?)
+    }
+    pub fn legacy_source_event_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("legacy_source_event_id")?)
+    }
+    pub fn escalation_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("escalation_id")?)
+    }
+    pub fn status(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("status")?)
+    }
+    pub fn error_code(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("error_code")?)
+    }
+    pub fn failure_class_json(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("failure_class_json")?)
+    }
+    pub fn responder_identity_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("responder_identity_id")?)
+    }
+    pub fn profile_id(&self) -> crate::Result<Option<String>> {
+        Ok(self.row.try_get("profile_id")?)
+    }
+    pub fn profile_version(&self) -> crate::Result<Option<i64>> {
+        Ok(self.row.try_get("profile_version")?)
+    }
+    pub fn updated_at(&self) -> crate::Result<String> {
+        Ok(self.row.try_get("updated_at")?)
+    }
+}
+
+impl SqliteDb {
+    pub async fn wake_blocker_turn_sources(
+        connection: &mut sqlx::SqliteConnection,
+        attention_id: &str,
+    ) -> crate::Result<Vec<WakeBlockerTurnSourceRow>> {
+        let rows = sqlx::query(
+            "SELECT b.incident_digest, b.legacy_source_event_id, b.escalation_id,
+                j.status, j.error_code, j.failure_class_json, j.responder_identity_id,
+                j.profile_id, j.profile_version, j.updated_at
+         FROM agent_wake_blocker b JOIN agent_chat_turn_job j ON j.id = b.turn_job_id
+         WHERE b.attention_id = ?",
+        )
+        .bind(attention_id)
+        .fetch_all(connection)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| WakeBlockerTurnSourceRow { row })
+            .collect())
     }
 }

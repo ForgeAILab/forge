@@ -1,0 +1,598 @@
+#![allow(dead_code, clippy::assertions_on_constants)]
+use crate::common;
+
+use std::sync::Arc;
+
+use api::{build_router, AppState};
+use api_types::{ProjectResponse, RepoResponse, TaskResponse, TransitionTaskResponse};
+use axum::{
+    body::{to_bytes, Body},
+    http::{header, Method, Request, StatusCode},
+    Router,
+};
+use db::{CreateTransitionLog, TaskRepo, TransitionLogRepo};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+#[tokio::test]
+async fn owner_send_back_preserves_budget_without_blocking_gate_entry() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": review_budget_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let mut task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Retry budget" }),
+        StatusCode::OK,
+    )
+    .await;
+
+    task = transition(&harness.app, &task, "in_progress").await;
+    task = transition(&harness.app, &task, "review").await;
+    // No step worker runs here: settle review's entry hooks (the attached
+    // check_retry_budget) before acting on the gate, as production would.
+    task = common::drain(&harness._state, &harness.app, &task.id).await;
+    assert_eq!(task.status, "review");
+    task = gate_reject(&harness.app, &task).await;
+    assert_eq!(task.status, "in_progress");
+
+    task = transition(&harness.app, &task, "review").await;
+    task = common::drain(&harness._state, &harness.app, &task.id).await;
+    assert_eq!(
+        task.status, "review",
+        "the second review cycle should stay in review; review execution failure enforces the exhausted budget"
+    );
+    assert_eq!(task.remaining_retries.get("review"), Some(&1));
+    assert!(
+        task.condition.details().interruption.is_none(),
+        "entering review should not block before review execution fails"
+    );
+}
+
+#[tokio::test]
+async fn task_response_remaining_retries_resets_at_recovery_boundary() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": review_budget_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Retry boundary projection" }),
+        StatusCode::OK,
+    )
+    .await;
+    let task = TaskRepo::update_status(
+        &*harness._state.db,
+        db::UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: "review".to_owned(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: None,
+            failed_json: None,
+            updated_at: db::now_rfc3339(),
+        },
+    )
+    .await
+    .expect("task enters review");
+
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("reject".to_owned()),
+            triggered_by: "test".to_owned(),
+            bridge: Default::default(),
+            trigger_reason: "first rejection".to_owned(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("rejection log inserts");
+    let mut budget_tx = db::begin_immediate(harness._state.db.pool()).await.unwrap();
+    db::budget::charge(
+        &mut budget_tx,
+        &task.id,
+        db::budget::Kind::Review.key(),
+        1,
+        "fixture-verdict",
+    )
+    .await
+    .unwrap();
+    budget_tx.commit().await.unwrap();
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "in_progress".to_owned(),
+            trigger_name: Some("review_refresh".to_owned()),
+            triggered_by: "system:workflow".to_owned(),
+            bridge: api_types::TransitionBridge::new(
+                api_types::TransitionBridgeKind::ReviewRefresh,
+            ),
+            trigger_reason: "[review-refresh] target advanced".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("review-refresh bridge inserts");
+
+    let response: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        response.remaining_retries.get("review"),
+        Some(&0),
+        "a review-refresh bridge must not reset the runtime/API retry window"
+    );
+
+    TransitionLogRepo::insert(
+        &*harness._state.db,
+        CreateTransitionLog {
+            id: db::new_uuid_v4(),
+            task_id: task.id.clone(),
+            from_state: "review".to_owned(),
+            to_state: "review".to_owned(),
+            trigger_name: Some("reset_to_initial".to_owned()),
+            triggered_by: "test".to_owned(),
+            bridge: api_types::TransitionBridge::new(
+                api_types::TransitionBridgeKind::RetryWindowReset,
+            ),
+            trigger_reason: "reset retry window".to_owned(),
+            hook_results_json: None,
+            rejection: false,
+            // Keep the boundary at the same timestamp as the preceding rows;
+            // list ordering must still follow the database's row order.
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("recovery boundary inserts");
+
+    let response: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.remaining_retries.get("review"), Some(&1));
+}
+
+/// The web editor writes only top-level `retry_budgets` and keeps per-state
+/// keys; that save must take effect over a stored per-state value.
+#[tokio::test]
+async fn editor_task_wide_save_takes_effect_over_per_state_value() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let _: Value = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project_id}/workflow"),
+        json!({ "definition": review_budget_workflow() }),
+        StatusCode::OK,
+    )
+    .await;
+    let mut task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({ "title": "Editor save" }),
+        StatusCode::OK,
+    )
+    .await;
+    for review in [4, 1] {
+        let _: Value = json_request(
+            &harness.app,
+            Method::PATCH,
+            &format!("/api/v1/tasks/{}", task.id),
+            json!({
+                "version": task.version,
+                "task_state_config": {
+                    "retry_budgets": { "review": review },
+                    "review": { "retry_budgets": { "review": 5 } }
+                }
+            }),
+            StatusCode::OK,
+        )
+        .await;
+        task = json_request(
+            &harness.app,
+            Method::GET,
+            &format!("/api/v1/tasks/{}", task.id),
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(task.retry_limits.get("review"), Some(&review));
+        assert_eq!(task.remaining_retries.get("review"), Some(&review));
+    }
+}
+
+fn review_budget_workflow() -> Value {
+    json!({
+        "roles": [],
+        "states": [
+            state("todo", "initial", Value::Null, trigger("in_progress")),
+            state("in_progress", "active", Value::Null, trigger("review")),
+            state("review", "gate", json!({ "max_rejections": 1 }), json!({
+                "accept": { "to": "done", "dispatch": null },
+                "reject": { "to": "in_progress", "dispatch": null }
+            })),
+            state("done", "terminal", Value::Null, json!({}))
+        ],
+        "cancellation_state": null
+    })
+}
+
+async fn transition(app: &Router, task: &TaskResponse, status: &str) -> TaskResponse {
+    let response: TransitionTaskResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/transition", task.id),
+        json!({ "status": status, "version": task.version, "reason": format!("to {status}") }),
+        StatusCode::OK,
+    )
+    .await;
+    assert!(!response.task.status.is_empty());
+    response.task
+}
+
+async fn gate_reject(app: &Router, task: &TaskResponse) -> TaskResponse {
+    json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({ "action": {"verb":"send_back","guidance":"needs another pass"},  "version": task.version}),
+        StatusCode::OK,
+    )
+    .await
+}
+
+fn state(name: &str, kind: &str, gate_config: Value, triggers: Value) -> Value {
+    let canonical_phase = match kind {
+        "backlog" => "backlog",
+        "initial" => "ready",
+        "gate" => "review",
+        "terminal" => "done",
+        _ => "working",
+    };
+    json!({ "name": name, "kind": kind, "canonical_phase": canonical_phase, "column": name, "display_name": name, "role": null, "hooks": {}, "gate_config": gate_config, "triggers": triggers, "config": {} })
+}
+
+fn trigger(to: &str) -> Value {
+    json!({ "accept": { "to": to, "dispatch": null } })
+}
+
+struct Harness {
+    app: Router,
+    _state: Arc<AppState>,
+    _web_dist_dir: common::TestDir,
+}
+
+async fn test_app() -> Harness {
+    let pool = db::create_sqlite_pool("sqlite::memory:")
+        .await
+        .expect("pool creates");
+    db::run_migrations(&pool).await.expect("migrations run");
+    let db = Arc::new(db::SqliteDb::new(pool));
+    let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
+    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+        .await
+        .expect("default agents upsert");
+    let event_bus = Arc::new(events::EventBus::new(64));
+    let state = Arc::new(AppState::with_adapter_registry(
+        db,
+        event_bus,
+        true,
+        adapter_registry,
+    ));
+    let web_dist_dir = common::TestDir::new("forge-retry-budget-web");
+    std::fs::write(web_dist_dir.path().join("index.html"), "<html></html>").expect("write index");
+    let app = build_router((*state).clone(), web_dist_dir.path().to_path_buf());
+    Harness {
+        app,
+        _state: state,
+        _web_dist_dir: web_dist_dir,
+    }
+}
+
+async fn create_project_and_repo(app: &Router) -> (String, String) {
+    let project: ProjectResponse = json_request(
+        app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({ "name": "Retry Budget" }),
+        StatusCode::OK,
+    )
+    .await;
+    let repo: RepoResponse = json_request(
+        app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/repos", project.id),
+        json!({ "name": "repo", "remote_url": "https://example.com/repo.git", "default_branch": "main" }),
+        StatusCode::OK,
+    )
+    .await;
+    (project.id, repo.id)
+}
+
+async fn json_request<T>(
+    app: &Router,
+    method: Method,
+    uri: &str,
+    body: Value,
+    expected_status: StatusCode,
+) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::from(serde_json::to_string(&body).unwrap()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+    parse_response(response, expected_status).await
+}
+
+async fn empty_request<T>(app: &Router, method: Method, uri: &str, expected_status: StatusCode) -> T
+where
+    T: DeserializeOwned,
+{
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {}", test_jwt()))
+                .body(Body::empty())
+                .expect("build empty request"),
+        )
+        .await
+        .expect("router response");
+    parse_response(response, expected_status).await
+}
+
+fn test_jwt() -> String {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = serde_json::json!({
+        "sub": "test-user-id",
+        "email": "test@example.com",
+        "is_admin": true,
+        "iat": now,
+        "exp": now + 900,
+    });
+    jsonwebtoken::encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(b"test-jwt-secret-for-development"),
+    )
+    .expect("encode test jwt")
+}
+
+async fn parse_response<T>(response: axum::response::Response, expected_status: StatusCode) -> T
+where
+    T: DeserializeOwned,
+{
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(
+        status,
+        expected_status,
+        "body: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    serde_json::from_slice(&bytes).expect("parse JSON")
+}
+
+#[tokio::test]
+async fn api_remaining_matches_charge_enforcement_for_every_kind() {
+    let harness = test_app().await;
+    let (project_id, _) = create_project_and_repo(&harness.app).await;
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"All budget kinds"}),
+        StatusCode::OK,
+    )
+    .await;
+    sqlx::query("UPDATE project SET settings=json_set(settings,'$.automatic_recovery.enabled',json('true'),'$.automatic_recovery.max_attempts',1) WHERE id=?").bind(&project_id).execute(harness._state.db.pool()).await.unwrap();
+    let mut tx = db::begin_immediate(harness._state.db.pool()).await.unwrap();
+    for kind in db::budget::Kind::PERSISTED {
+        let limit = match kind {
+            db::budget::Kind::Review => 2,
+            _ => i64::from(kind.default_limit()),
+        };
+        for attempt in 0..limit {
+            assert!(
+                db::budget::charge(
+                    &mut tx,
+                    &task.id,
+                    kind.key(),
+                    limit,
+                    &format!("{}:{attempt}", kind.key())
+                )
+                .await
+                .unwrap()
+                .charged
+            );
+        }
+        assert!(
+            !db::budget::charge(&mut tx, &task.id, kind.key(), limit, "blocked")
+                .await
+                .unwrap()
+                .charged
+        );
+    }
+    for attempt in 0..2 {
+        db::budget::charge(
+            &mut tx,
+            &task.id,
+            "gate:planning",
+            2,
+            &format!("planning:{attempt}"),
+        )
+        .await
+        .unwrap();
+    }
+    db::budget::charge(&mut tx, &task.id, "gate:review", 1, "review-gate")
+        .await
+        .unwrap();
+    db::budget::charge(&mut tx, &task.id, "gate:merging", 1, "merging")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let response: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    for (key, value) in &response.remaining_retries {
+        if key == "report_correction" {
+            assert_eq!(*value, 2);
+        } else {
+            assert_eq!(*value, 0, "{key}");
+        }
+    }
+    assert_eq!(response.retry_limits.get("review"), Some(&2));
+    let mut tx = db::begin_immediate(harness._state.db.pool()).await.unwrap();
+    db::budget::reset_all(&mut tx, &task.id, "api-reset")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let reset: TaskResponse = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reset.remaining_retries, reset.retry_limits);
+}
+
+#[tokio::test]
+async fn review_progress_response_resolves_project_then_task_override_and_spending() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let project = db::ProjectRepo::get_by_id(&*harness._state.db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let _: Value = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        json!({"version":project.version,"settings":{"retry_budgets":{"review_progress":4}}}),
+        StatusCode::OK,
+    )
+    .await;
+    let mut task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Progress projection"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(task.retry_limits.get("review_progress"), Some(&4));
+    assert_eq!(task.remaining_retries.get("review_progress"), Some(&4));
+    let _: Value = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({"version":task.version,"task_state_config":{"retry_budgets":{"review_progress":2}}}),
+        StatusCode::OK,
+    )
+    .await;
+    let mut tx = db::begin_immediate(harness._state.db.pool()).await.unwrap();
+    db::budget::charge(
+        &mut tx,
+        &task.id,
+        "review_progress",
+        2,
+        "progress:projection",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    task = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(task.retry_limits.get("review_progress"), Some(&2));
+    assert_eq!(task.remaining_retries.get("review_progress"), Some(&1));
+    let list: Value = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let listed = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == task.id)
+        .unwrap();
+    assert_eq!(listed["remaining_retries"]["review_progress"], 1);
+}

@@ -1,4 +1,50 @@
+import type { IntegrationHeadCheckEvidence } from './bindings/IntegrationHeadCheckEvidence'
+export type { IntegrationHeadCheckEvidence } from './bindings/IntegrationHeadCheckEvidence'
+import type { TaskCondition } from './bindings/TaskCondition'
+import type { MachineDisk } from './bindings/MachineDisk'
+import type { DiskFloor } from './bindings/DiskFloor'
+export type { MachineDisk } from './bindings/MachineDisk'
+export type { MachineDiskFacts } from './bindings/MachineDiskFacts'
+export type { DiskFloor } from './bindings/DiskFloor'
+export type { DiskPressureKind } from './bindings/DiskPressureKind'
+export type { TaskCondition } from './bindings/TaskCondition'
+export type { IntegrationAttemptId } from './bindings/IntegrationAttemptId'
+export type { IntegrationReason } from './bindings/IntegrationReason'
+export type { IntegrationPaths } from './bindings/IntegrationPaths'
+export type { IntegrationPhase } from './bindings/IntegrationPhase'
+export type { IntegrationDeferralCause } from './bindings/IntegrationDeferralCause'
+import type { TaskIntegrationSummary } from './bindings/TaskIntegrationSummary'
+export type { IntegrationActionHint } from './bindings/IntegrationActionHint'
+export type { IntegrationBacklog } from './bindings/IntegrationBacklog'
+export type { IntegrationPercentiles } from './bindings/IntegrationPercentiles'
+export type { IntegrationTimingStatus } from './bindings/IntegrationTimingStatus'
+export type { IntegrationMemberState } from './bindings/IntegrationMemberState'
+export type { IntegrationQueueMemberResponse } from './bindings/IntegrationQueueMemberResponse'
+export type { IntegrationQueueResponse } from './bindings/IntegrationQueueResponse'
+export type { IntegrationQueueState } from './bindings/IntegrationQueueState'
+export type { IntegrationQueueStateReason } from './bindings/IntegrationQueueStateReason'
+export type { IntegrationQueuesResponse } from './bindings/IntegrationQueuesResponse'
+export type { IntegrationTimings } from './bindings/IntegrationTimings'
+export type { IntegrationWait } from './bindings/IntegrationWait'
+export type { IntegrationWaitCode } from './bindings/IntegrationWaitCode'
+export type { TaskIntegrationSummary } from './bindings/TaskIntegrationSummary'
+export type { CheckWait } from './bindings/CheckWait'
+export type { CheckWaitPhase } from './bindings/CheckWaitPhase'
+export type { ReviewFinding } from './bindings/ReviewFinding'
+export type { ReviewFindingKind } from './bindings/ReviewFindingKind'
+export type { ReviewFindingSeverity } from './bindings/ReviewFindingSeverity'
+export type { ReviewFindingSource } from './bindings/ReviewFindingSource'
+export type { ReviewFindingStatus } from './bindings/ReviewFindingStatus'
+export type { ReviewFindingEntry } from './bindings/ReviewFindingEntry'
+export type { TaskFindingsResponse } from './bindings/TaskFindingsResponse'
 import type { ReviewConformance } from './bindings/ReviewConformance'
+export type { RepoLocationOwnerKind } from './bindings/RepoLocationOwnerKind'
+export type { RepoLocationKind } from './bindings/RepoLocationKind'
+export type { RepoLocationStatus } from './bindings/RepoLocationStatus'
+export type { RepoLocationResponse } from './bindings/RepoLocationResponse'
+export type { CreateRepoLocationRequest } from './bindings/CreateRepoLocationRequest'
+export type { UpdateRepoLocationRequest } from './bindings/UpdateRepoLocationRequest'
+export type { VerifyRepoLocationRequest } from './bindings/VerifyRepoLocationRequest'
 // Types aligned with the backend api-types crate responses.
 // PaginatedResponse<T> = { data: T[], next_cursor?, has_more, total_count? }
 
@@ -13,6 +59,11 @@ import type { TokenCounters } from './bindings/TokenCounters'
 import type { UsageAggregate } from './bindings/UsageAggregate'
 import type { UsageBreakdown } from './bindings/UsageBreakdown'
 import type { WorkflowDefinition as GeneratedWorkflowDefinition } from './bindings/WorkflowDefinition'
+import type { EnvironmentPauseResponse } from './bindings/EnvironmentPauseResponse'
+import type { ProjectEnvironmentReadiness } from './bindings/ProjectEnvironmentReadiness'
+import type { AgentRunnableOn } from './bindings/AgentRunnableOn'
+import type { TaskPlacementDiagnostic } from './bindings/TaskPlacementDiagnostic'
+import type { ProjectSlots } from './bindings/ProjectSlots'
 
 export type TaskStatus = string
 
@@ -51,39 +102,11 @@ export type ExecutionBehavior = {
   cascade_state: string | null
   description: string
 }
-export type ExecutionActionKind =
-  | 'manual_launch'
-  | 'session_follow_up'
-  | 'workflow_resume'
-  | 're_execute'
-  | 'stop_execution'
-  | 'cancel_task'
-export type ExecutionAction = {
-  action: ExecutionActionKind
-  label: string
-  enabled: boolean
-  propagates: boolean
-  requires_session: boolean
-  disabled_reason: string | null
-  target_execution_id: string | null
-}
-export type RecoveryAction =
-  | 'resume_session'
-  | 'reexecute'
-  | 'reset_to_initial'
-  | 'cancel_task'
-  | 'mark_reviewed'
-  | 'retry_hook'
-  | 'resume_process'
-  | 'update_workspace_and_retry_hook'
-  | 'skip_hook_once'
-  | 'reset_retry_window'
-  | 'proceed_once'
-  | 'open_interactive'
+import type { Offer } from './bindings/Offer'
+export type { Offer } from './bindings/Offer'
 export type AgentStatus = 'idle' | 'busy' | 'error' | 'offline'
 export type ReviewStatus = 'running' | 'awaiting_human' | 'passed' | 'failed' | 'cancelled'
 export type DaemonStatus = 'online' | 'offline'
-export type WorkMode = 'direct_merge' | 'pull_request'
 export type TerminalSessionStatus =
   | 'starting'
   | 'running'
@@ -163,31 +186,7 @@ export interface BlockingArtifact {
   log_path: string | null
 }
 
-export type FailureKind =
-  | 'merge_conflict'
-  | 'target_repo_dirty'
-  | 'dirty_worktree'
-  | 'ci_failed'
-  | 'review_gate_failed'
-  | 'review_budget_exhausted'
-  | 'review_blocked'
-  | 'environment_not_ready'
-  | 'retry_exhausted'
-  | 'merge_fix_budget_exhausted'
-  | 'workflow_guard_rejected'
-  | 'internal_command_failed'
-  | 'pr_closed_without_merge'
-  | 'executor_failed'
-  | 'workspace_failed'
-  | 'workspace_reset_required'
-  | 'workspace_error'
-  | 'before_work_hook_timeout'
-  | 'before_work_hook_failed'
-  | 'max_turns_exceeded'
-  | 'manual_stop'
-  | 'recovery_required'
-  | 'executor_unavailable'
-  | 'unknown'
+export type FailureKind = import('./bindings/FailureKind').FailureKind
 
 export interface TaskBlockingAnnotation {
   type: FailureKind
@@ -198,12 +197,10 @@ export interface TaskBlockingAnnotation {
   artifact: BlockingArtifact | null
   message: string | null
   hook?: Record<string, unknown> | null
-  recovery_actions: RecoveryAction[]
 }
 
-export type TaskAnnotation = TaskBlockingAnnotation | Record<string, unknown>
-
 export interface ReviewConfig {
+  verify?: import('./bindings/ReviewVerifyConfig').ReviewVerifyConfig | null
   conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
   requirement_ids?: string[]
   requirement_allocations?: Record<string, string>
@@ -229,8 +226,17 @@ export interface TaskRoleAssignmentResponse {
   updated_at: string
 }
 
+export type EffectiveCoderSource = 'own' | 'inherited_from_root'
+
+export interface EffectiveLeadResponse {
+  assignment: TaskRoleAssignmentResponse
+  source: EffectiveCoderSource
+}
+
 export interface RetryBudgets {
   review?: number | null
+  review_progress?: number | null
+  review_verify_rerun?: number | null
   merge_fix?: number | null
   execution?: number | null
 }
@@ -272,6 +278,8 @@ export interface LifecycleHookTestResponse {
 }
 
 export interface ProjectSettings {
+  placement?: ProjectPlacementSettings
+  max_active_tasks: number
   retry_budgets: RetryBudgets
   default_role_assignments: DefaultRoleAssignment[]
   lifecycle_hooks: LifecycleHooks
@@ -280,6 +288,7 @@ export interface ProjectSettings {
 }
 
 export interface ProjectEnvironment {
+  recheck_interval_seconds: number
   env: Record<string, string>
   assets: EnvironmentAsset[]
   checks: EnvironmentCheck[]
@@ -290,7 +299,15 @@ export interface EnvironmentAsset {
   target: string
 }
 
+export type EnvironmentCheckScope = 'workspace' | 'machine'
+export type PlacementProvision = 'when_verified' | 'never'
+export interface ProjectPlacementSettings {
+  provision_timeout_seconds?: number
+  provision: PlacementProvision
+}
+
 export interface EnvironmentCheck {
+  scope?: EnvironmentCheckScope
   name: string
   command: string
   roles: string[]
@@ -354,19 +371,6 @@ export interface RelatedEvidence {
   message: string | null
 }
 
-export interface WorkflowExceptionAction {
-  kind: RecoveryAction
-  label: string
-  enabled: boolean
-  disabled_reason: string | null
-  requires_reason: boolean
-  requires_guidance: boolean
-  propagates: boolean
-  target_state: string | null
-  target_role: string | null
-  target_execution_id: string | null
-}
-
 export interface WorkflowExceptionSummary {
   type: string
   message: string
@@ -378,13 +382,7 @@ export interface WorkflowExceptionSummary {
   target_role: string | null
   failing_step: FailingStepSummary | null
   related_evidence: RelatedEvidence[]
-  actions: WorkflowExceptionAction[]
-}
-
-export interface PrProviderStatus {
-  provider_type: string
-  has_token: boolean
-  polling_interval_seconds: number
+  actions: Offer[]
 }
 
 export interface TaskExecutionObservability {
@@ -570,6 +568,7 @@ export interface PaginatedResponse<T> {
 // --- Task (matches api_types::TaskResponse) ---
 
 export interface Task {
+  placement_diagnostics?: TaskPlacementDiagnostic[]
   id: string
   project_id: string
   parent_task_id?: string | null
@@ -584,12 +583,16 @@ export interface Task {
   board_position: number
   subtask_order?: number | null
   role_assignments: TaskRoleAssignmentResponse[]
+  effective_coder: TaskRoleAssignmentResponse | null
+  effective_coder_source: EffectiveCoderSource | null
+  effective_lead?: EffectiveLeadResponse | null
   remaining_retries: Record<string, number>
-  execution_actions?: ExecutionAction[]
+  retry_limits?: Record<string, number>
+  available_actions?: Offer[]
   awaiting_human?: boolean
-  error_annotation?: TaskAnnotation | null
-  blocked?: InterruptionMetadata | null
-  failed?: InterruptionMetadata | null
+  condition: TaskCondition
+  /** The Task's place in the merge queue; null without an attempt in progress. */
+  integration?: TaskIntegrationSummary | null
   workflow_health?: WorkflowHealthSummary | null
   workflow_exception?: WorkflowExceptionSummary | null
   external_issue_number?: number | null
@@ -597,6 +600,7 @@ export interface Task {
   review_passed_at?: string | null
   archived_at?: string | null
   workspace?: Workspace | null
+  placement: WorkspacePlacementResponse | null
   execution_observability?: TaskExecutionObservability
   plan_progress?: PlanProgressSummary | null
   plan_artifact?: PlanArtifactDetail | null
@@ -634,9 +638,10 @@ export interface TaskListItem {
   subtask_order: number | null
   role_assignments: TaskRoleAssignmentResponse[]
   remaining_retries: Record<string, number>
-  error_annotation: TaskAnnotation | null
-  blocked: InterruptionMetadata | null
-  failed: InterruptionMetadata | null
+  retry_limits: Record<string, number>
+  condition: TaskCondition
+  /** The Task's place in the merge queue; null without an attempt in progress. */
+  integration: TaskIntegrationSummary | null
   workflow_health: WorkflowHealthSummary | null
   workflow_exception: WorkflowExceptionSummary | null
   review_passed_at: string | null
@@ -709,12 +714,6 @@ export interface ExecutionSummary {
   updated_at: string
 }
 
-export interface RecoverTaskRequest {
-  action: RecoveryAction
-  reason: string | null
-  context: string | null
-}
-
 export type ExecutionResponse = Execution
 
 /** The first execution page embedded in a Task detail bootstrap response. */
@@ -751,6 +750,7 @@ export interface TaskRelationsResponse {
 // --- Agent (matches api_types::AgentResponse) ---
 
 export interface Agent {
+  runnable_on?: AgentRunnableOn
   id: string
   name: string
   description: string | null
@@ -799,6 +799,9 @@ export interface Project {
   workflow_template_name?: string | null
   paused_at: string | null
   system_pause_reason?: string | null
+  environment_pause: EnvironmentPauseResponse | null
+  environment_readiness?: ProjectEnvironmentReadiness[]
+  slots: ProjectSlots
   paused: boolean
   charter_status: string
   charter_setup_required: boolean
@@ -821,9 +824,6 @@ export interface Repo {
   local_path: string | null
   remote_url: string | null
   default_branch: string
-  work_mode: WorkMode
-  pr_provider?: string | null
-  pr_provider_status?: PrProviderStatus | null
   created_at: string
   updated_at: string
 }
@@ -877,6 +877,8 @@ export interface AuditorVerdictEntry {
 }
 
 export interface ReviewDetails {
+  verify?: import('./bindings/ReviewVerifyDetails').ReviewVerifyDetails | null
+  execution?: { integration_checks: IntegrationHeadCheckEvidence[]; [key: string]: unknown } | null
   conformance: ReviewConformance
   ci_steps: StepResultEntry[]
   auditor?: AuditorVerdictEntry | null
@@ -896,10 +898,8 @@ export interface Review {
   updated_at: string
 }
 
-export interface TransitionTaskResponse {
-  task: Task
-  review: Review | null
-}
+export type TransitionTaskResponse =
+  import('./bindings/TransitionTaskResponse').TransitionTaskResponse
 
 export interface NotificationResponse {
   id: string
@@ -998,15 +998,6 @@ export interface UpdateTaskRequest {
   version: number
 }
 
-export interface RejectReviewRequest {
-  reason?: string | null
-}
-
-export interface ReviewDecisionResponse {
-  task: Task
-  review: Review
-}
-
 export type AssigneeKind = 'agent' | 'user'
 
 export type AuthorType = 'user' | 'agent' | 'system'
@@ -1018,6 +1009,8 @@ export interface Comment {
   author_id?: string | null
   author_name: string
   content: string
+  /** CommentResponse.kind in crates/api-types/src/repo_review.rs; absent on ordinary comments. */
+  kind?: string | null
   created_at: string
   updated_at: string
 }
@@ -1125,13 +1118,6 @@ export interface CreateRepoRequest {
   local_path?: string | null
   name?: string | null
   default_branch?: string | null
-  work_mode?: WorkMode
-  pr_provider?: string | null
-  pr_provider_config?: {
-    base_url?: string | null
-    polling_interval_seconds?: number | null
-    token?: string | null
-  } | null
 }
 
 export interface UpdateRepoRequest {
@@ -1139,13 +1125,6 @@ export interface UpdateRepoRequest {
   local_path?: string | null
   remote_url?: string | null
   default_branch?: string | null
-  work_mode?: WorkMode
-  pr_provider?: string | null
-  pr_provider_config?: {
-    base_url?: string | null
-    polling_interval_seconds?: number | null
-    token?: string | null
-  } | null
 }
 
 export interface CreateAgentRequest {
@@ -1201,11 +1180,36 @@ export interface AgentAvailability {
   reason?: string | null
 }
 
+export interface WorkspacePlacementResponse {
+  id: string
+  workspace_id: string
+  task_id: string
+  agent_id: string | null
+  owner_kind: string
+  daemon_id: string | null
+  runtime_id: string | null
+  repo_location_id: string
+  execution_daemon_id: string | null
+  workspace_handle: string | null
+  generation: number
+  state: string
+  selected_by: string
+  selection_reason: Record<string, unknown>
+  reserved_until: string | null
+  disconnected_at: string | null
+  failure_cause: string | null
+  version: number
+  created_at: string
+  updated_at: string
+}
+
 export interface Workspace {
+  pending_remote_cancel: import('./bindings/PendingRemoteCancel').PendingRemoteCancel[]
   id: string
   task_id: string
   repo_id: string
   worktree_path: string
+  placement: WorkspacePlacementResponse
   branch: string
   status: string
   before_sha?: string | null
@@ -1215,6 +1219,16 @@ export interface Workspace {
 }
 
 export interface Daemon {
+  owner_id: string | null
+  max_concurrent_runs: number | null
+  run_limit: number | null
+  effective_max_concurrent_runs: number | null
+  /** The machine's last disk reading with the free-space floor applied. */
+  disk?: MachineDisk | null
+  /** The free-space floor the server applies to this machine. */
+  workspace_floor?: DiskFloor | null
+  /** The server's check-run wall limit; a daemon's collector derives its check-checkout age from it. */
+  check_run_timeout_seconds?: number | null
   id: string
   machine_id: string
   hostname: string
@@ -1359,7 +1373,13 @@ export interface HookResultEntry {
   error: string | null
 }
 
+// The generated binding is the one definition (it carries `replan`).
+import type { TransitionBridgeKind } from './bindings/TransitionBridgeKind'
+export type { TransitionBridgeKind } from './bindings/TransitionBridgeKind'
+
 export interface TransitionLogEntry {
+  bridge_kind: TransitionBridgeKind | null
+  bridge_payload: unknown | null
   id: string
   task_id: string
   from_state: string
@@ -1385,6 +1405,7 @@ export interface ReorderSubtasksRequest {
 export type ExecutionsResponse = PaginatedResponse<ExecutionSummary>
 export type AgentsResponse = PaginatedResponse<Agent>
 export type ProjectsResponse = PaginatedResponse<Project>
+// GET task lists support ETag/If-None-Match with private, no-cache; 304 preserves the cached page.
 export type TasksResponse = PaginatedResponse<TaskListItem> & { board_revision: number }
 
 // --- Events (matches events::ForgeEvent/EventContext) ---
@@ -1562,7 +1583,70 @@ export interface McpConfigActionRequest {
 
 export type OperatorSeverity = 'healthy' | 'attention' | 'blocked' | 'error'
 
+export interface EventRelayStatus {
+  running: boolean
+  position: number | null
+  head: number | null
+  last_error: string | null
+  last_error_at: string | null
+}
+
+export interface WorkerDeadLetterSummary {
+  replayable: boolean
+  event_created_at: string | null
+  events_since: number
+  consumer_name: string
+  event_type: string
+  attempts: number
+  id: string
+  item_key: string
+  event_sequence: number | null
+  reason: string
+  occurred_at: string
+}
+
+export interface EventConsumerStatus {
+  consumer_name: string
+  last_sequence: number
+  lag: number
+  oldest_unprocessed_at: string | null
+  oldest_unprocessed_age_seconds: number | null
+  last_advanced_at: string | null
+  stalled: boolean
+  dead_letter_count: number
+  recent_dead_letters: WorkerDeadLetterSummary[]
+}
+
+export interface DatabaseStorageStatus {
+  incremental_vacuum: boolean
+  free_pages: number
+}
+
+export interface UsageIndexStatus {
+  current_size_bytes: number
+  budget_bytes: number
+  fallback: boolean
+}
+
+export interface PeriodicWorkerStatus {
+  worker_name: string
+  running: boolean
+  last_tick_at: string | null
+  last_error: string | null
+  last_error_at: string | null
+  restart_count: number
+}
+
 export interface OperatorStatusResponse {
+  integration_queues: import('./bindings/IntegrationQueueStatus').IntegrationQueueStatus
+  checks: import('./bindings/ChecksStatus').ChecksStatus
+  pending_remote_cancels: number
+  usage_index: UsageIndexStatus
+  event_relay: EventRelayStatus
+  event_consumers: EventConsumerStatus[]
+  periodic_workers: PeriodicWorkerStatus[]
+  task_steps: import('./bindings/TaskStepQueueStatus').TaskStepQueueStatus
+  database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]
   blocked_tasks: BlockedTaskSummary[]
@@ -1601,19 +1685,26 @@ export interface ActiveExecutionSummary {
 }
 
 export interface DaemonPressureSummary {
+  check_runs: number
+  borrowed_check_runs: number
+  logical_cores: number | null
+  build_jobs_per_run: number | null
+  run_nice: number | null
   daemon_id: string
   hostname: string | null
-  active_sessions: number
-  max_sessions: number | null
+  active_runs: number
+  max_concurrent_runs: number | null
   at_capacity: boolean
+  /** While `disk.pressure` is set the machine starts no new worktree or check. */
+  disk?: MachineDisk | null
 }
 
 export interface AgentPressureSummary {
   agent_id: string
   agent_name: string
   daemon_id: string | null
-  active_sessions: number
-  max_sessions: number
+  active_tasks: number
+  max_concurrent_tasks: number
   at_capacity: boolean
 }
 
@@ -1735,6 +1826,10 @@ export interface UpdateForgePathsRequest {
 }
 
 export interface UpdateServerSettingsRequest {
+  build_jobs_per_run?: number | null
+  run_nice?: number | null
+  usage_index_budget_mb?: number | null
+  max_concurrent_runs?: number | null
   bind?: string | null
   mcp_enabled?: boolean | null
 }
@@ -1833,3 +1928,9 @@ export interface ProviderUsageResponse {
   fetched_at: string
   detail: string | null
 }
+
+export type { ProjectEscalateRequest } from './bindings/ProjectEscalateRequest'
+export type { AnswerProjectEscalationRequest } from './bindings/AnswerProjectEscalationRequest'
+export type { ProjectEscalationResponse } from './bindings/ProjectEscalationResponse'
+export type { ProjectEscalationListResponse } from './bindings/ProjectEscalationListResponse'
+export type { ListProjectEscalationsQuery } from './bindings/ListProjectEscalationsQuery'

@@ -149,15 +149,12 @@ impl ProjectCharterCommandService {
         let account_id = if let Some(owner_id) = project.owner_id.clone() {
             owner_id
         } else if command.authorization.principal_type == "agent" {
-            sqlx::query_scalar::<_, String>(
-                "SELECT owner_id FROM agent_identity WHERE id = ? LIMIT 1",
-            )
-            .bind(&command.authorization.principal_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| ServiceError::AuthorizationDenied {
-                message: "agent principal has no canonical account owner".to_owned(),
-            })?
+            self.db
+                .charter_command_agent_account_owner(&command.authorization.principal_id)
+                .await?
+                .ok_or_else(|| ServiceError::AuthorizationDenied {
+                    message: "agent principal has no canonical account owner".to_owned(),
+                })?
         } else {
             command.authorization.principal_id.clone()
         };
@@ -471,11 +468,10 @@ impl ProjectCharterCommandService {
             )
             .await?
         };
-        let charter_version: i64 =
-            sqlx::query_scalar("SELECT version FROM project_charter WHERE id = ? LIMIT 1")
-                .bind(&revision.charter_id)
-                .fetch_one(self.db.pool())
-                .await?;
+        let charter_version: i64 = self
+            .db
+            .charter_command_revision_version(&revision.charter_id)
+            .await?;
         Ok(ProjectCharterRevisionCommandOutcome {
             revision,
             charter_version,
@@ -506,15 +502,12 @@ impl ProjectCharterCommandService {
         let account_id = if let Some(owner_id) = project.owner_id.clone() {
             owner_id
         } else if command.authorization.principal_type == "agent" {
-            sqlx::query_scalar::<_, String>(
-                "SELECT owner_id FROM agent_identity WHERE id = ? LIMIT 1",
-            )
-            .bind(&command.authorization.principal_id)
-            .fetch_optional(self.db.pool())
-            .await?
-            .ok_or_else(|| ServiceError::AuthorizationDenied {
-                message: "agent principal has no canonical account owner".to_owned(),
-            })?
+            self.db
+                .charter_command_agent_account_owner(&command.authorization.principal_id)
+                .await?
+                .ok_or_else(|| ServiceError::AuthorizationDenied {
+                    message: "agent principal has no canonical account owner".to_owned(),
+                })?
         } else {
             command.authorization.principal_id.clone()
         };
@@ -621,13 +614,11 @@ impl ProjectCharterCommandService {
             } else {
                 (None, None, None)
             };
-        let project_chat_id: String = sqlx::query_scalar(
-            "SELECT id FROM agent_chat WHERE kind = 'project' AND project_id = ? LIMIT 1",
-        )
-        .bind(&command.project_id)
-        .fetch_optional(self.db.pool())
-        .await?
-        .ok_or_else(|| ServiceError::not_found("agent_chat", command.project_id.clone()))?;
+        let project_chat_id: String = self
+            .db
+            .charter_command_project_chat_id(&command.project_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_chat", command.project_id.clone()))?;
         let bootstrap_content = bootstrap_message_id.as_ref().map(|_| {
             format!(
                 "Project Charter adoption approved for Project {}. Charter {} revision {} is now authoritative.",
@@ -902,24 +893,19 @@ impl ProjectCharterCommandService {
                 Ok(())
             }
             "agent" => {
-                let bound: Option<String> = sqlx::query_scalar(
-                    "SELECT identity_id FROM project_agent_binding WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-                )
-                .bind(project_id)
-                .bind(&authorization.principal_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+                let bound: Option<String> = self
+                    .db
+                    .charter_command_active_agent_binding(project_id, &authorization.principal_id)
+                    .await?;
                 if bound.is_none() {
                     return Err(ServiceError::AuthorizationDenied {
                         message: "agent principal is not actively bound to the Project".to_owned(),
                     });
                 }
-                let eligible: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM agent_identity WHERE id = ? AND paused = 0 AND archived_at IS NULL LIMIT 1",
-                )
-                .bind(&authorization.principal_id)
-                .fetch_optional(self.db.pool())
-                .await?;
+                let eligible: Option<i64> = self
+                    .db
+                    .charter_command_agent_eligible(&authorization.principal_id)
+                    .await?;
                 if eligible.is_none() {
                     return Err(ServiceError::AuthorizationDenied {
                         message: "agent principal is paused or archived".to_owned(),
@@ -1156,15 +1142,6 @@ fn validate_approval_target(
     Ok(())
 }
 
-type SelectedAgentEligibilityRow = (
-    String,
-    Option<String>,
-    Option<String>,
-    String,
-    String,
-    String,
-);
-
 async fn validate_selected_agent(
     db: &SqliteDb,
     account_id: &str,
@@ -1173,35 +1150,19 @@ async fn validate_selected_agent(
     skill_revision_id: &str,
     expected_policy_digest: &str,
 ) -> Result<()> {
-    let selected: Option<SelectedAgentEligibilityRow> = sqlx::query_as(
-        "SELECT p.tool_policy_json, i.owner_id, i.selected_profile_id,
-                sr.id, sr.skill_key, os.lifecycle
-         FROM agent_profile p
-         JOIN agent_identity i ON i.id = p.identity_id
-         JOIN operating_skill_revision sr ON sr.id = ?
-         JOIN operating_skill os ON os.id = sr.operating_skill_id
-         WHERE p.id = ? AND p.identity_id = ? AND i.owner_id = ?
-           AND i.paused = 0 AND i.archived_at IS NULL
-         LIMIT 1",
-    )
-    .bind(skill_revision_id)
-    .bind(profile_id)
-    .bind(identity_id)
-    .bind(account_id)
-    .fetch_optional(db.pool())
-    .await?;
-    let Some((policy_json, _owner, selected_profile, selected_skill, skill_key, lifecycle)) =
-        selected
-    else {
+    let selected = db
+        .charter_selected_agent_eligibility(skill_revision_id, profile_id, identity_id, account_id)
+        .await?;
+    let Some(selected) = selected else {
         return Err(ServiceError::conflict(
             "the selected Project Agent is no longer eligible",
         ));
     };
-    if selected_profile.as_deref() != Some(profile_id)
-        || selected_skill != skill_revision_id
-        || skill_key != PROJECT_OPERATING_SKILL_KEY
-        || lifecycle != "active"
-        || expected_policy_digest != project_agent_policy_digest(&policy_json)
+    if selected.selected_profile_id.as_deref() != Some(profile_id)
+        || selected.skill_revision_id != skill_revision_id
+        || selected.skill_key != PROJECT_OPERATING_SKILL_KEY
+        || selected.lifecycle != "active"
+        || expected_policy_digest != project_agent_policy_digest(&selected.tool_policy_json)
         || current_project_agent_operating_skill_revision(db).await? != skill_revision_id
     {
         return Err(ServiceError::conflict(

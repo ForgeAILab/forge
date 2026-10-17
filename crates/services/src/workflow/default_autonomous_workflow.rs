@@ -8,8 +8,6 @@ use serde_json::json;
 
 use crate::workflow::{default_roles, dispatch};
 
-pub const PRESET_NAME: &str = "autonomous_v1";
-
 pub const BACKLOG: &str = "backlog";
 pub const READY: &str = "ready";
 pub const WORKING: &str = "working";
@@ -136,7 +134,6 @@ pub fn default_autonomous_workflow() -> WorkflowDefinition {
             CanonicalPhase::Review,
             StateHooks {
                 on_enter: vec![hook("run_merge")],
-                after_enter: vec![hook("auto_cascade_on_merge_result")],
                 ..StateHooks::default()
             },
         ),

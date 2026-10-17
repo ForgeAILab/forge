@@ -8,12 +8,13 @@ pub mod agent_chat_service;
 pub mod agent_chat_turn_policy;
 pub mod agent_chat_turn_worker;
 pub mod agent_inquiry_runner;
-pub mod agent_inquiry_service;
 pub mod agent_service;
 pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
+pub mod chat_notices;
 pub(crate) mod chat_usage;
+pub mod check_runner;
 pub mod command_boundary;
 pub mod context_manifest;
 pub mod coordination_consumer;
@@ -21,6 +22,7 @@ pub mod coordination_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
 pub mod daemon_transport;
+pub mod dead_letter_service;
 pub mod default_agents;
 pub(crate) mod deferred_dispatch;
 pub mod demo;
@@ -29,18 +31,22 @@ pub mod domain_event_broadcast;
 pub mod domain_event_service;
 pub mod embedded_agent_service;
 pub mod embedded_daemon;
-pub mod embedded_task_executor;
+pub mod environment_surfaces;
 pub mod execution_setup;
 pub mod external_api;
 pub mod external_sync;
+pub mod integration_effects;
+pub mod integration_owner;
+pub mod integration_ports;
+pub mod integration_reads;
 pub mod integration_service;
+pub mod integration_steps;
+pub mod integration_worker;
 pub mod lifecycle;
-pub mod main_chat_topic;
 pub mod main_genesis_commands;
 pub mod main_orchestration_actions;
 pub mod main_orchestration_queries;
 pub mod memory;
-pub mod memory_source;
 pub mod merge_service;
 pub mod milestone_orchestration;
 pub mod milestone_runtime;
@@ -51,11 +57,8 @@ pub mod operating_skills;
 pub mod operator_status;
 pub mod operator_status_emitter;
 pub mod orchestration_authorization;
+pub mod placement;
 pub mod plan_artifact;
-pub mod pr_service;
-pub mod pricing;
-pub mod pricing_auto;
-pub mod pricing_db;
 pub mod product_genesis;
 pub mod project_agent_actions;
 pub mod project_agent_selection;
@@ -64,6 +67,7 @@ pub mod project_charter_commands;
 pub mod project_creation;
 pub mod project_decision_commands;
 pub mod project_documents;
+pub(crate) mod project_environment;
 pub mod project_execution_setup;
 pub mod project_execution_setup_projection;
 pub mod project_hooks;
@@ -74,27 +78,35 @@ pub mod project_provisioning;
 pub mod project_reconciliation;
 pub mod project_runtime;
 pub mod project_settings;
-pub mod prompt_preview;
-pub mod provider_authorization;
+pub mod provider_credentials;
 pub mod provider_health;
+pub mod queue_invalidation;
 pub mod recovery;
-pub mod runtime;
+pub mod repo_location;
 pub mod shared_media_cleanup;
 pub mod shutdown;
-pub mod solo_bootstrap;
-pub mod solo_session;
+pub mod task_actions;
 pub mod task_diagnostics;
+pub use task_actions::{available_actions, ActionCaller, TaskSnapshot};
 pub mod task_dispatcher;
 pub mod task_hierarchy;
 pub mod task_service;
+#[cfg(any(test, feature = "test-support"))]
+pub mod task_usage_fixture;
 pub mod terminal_service;
 pub mod turn_log_sink;
 pub mod types;
 pub mod usage_projection;
+pub(crate) mod wake_blocker;
 pub mod wake_turn_consumer;
+pub mod wake_turns;
+pub mod worker_runtime;
 pub mod workflow;
+pub mod workspace_backend;
 pub mod workspace_cleanup;
 pub mod workspace_execution_lock;
+pub mod workspace_manager;
+pub mod workspace_root;
 
 // Test-only failpoints used by the Gate A characterization suite.  These are
 // compiled out of normal library builds; they let the suite model a process
@@ -110,25 +122,22 @@ pub use adaptive_task_operations::{
     adaptive_task_operation_supported_values, parse_persisted_adaptive_envelope,
     validate_adaptive_task_operations, ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
 };
-pub use agent_chat_memory_consumer::{
-    memory_consumer_lease_owner, memory_consumer_name, AgentChatMemoryConsumer,
-};
+pub use agent_chat_memory_consumer::{memory_consumer_name, AgentChatMemoryConsumer};
 pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
 pub use agent_chat_service::{
-    append_system_chat_message, AdmittedAgentChatMessage, AgentChatHandoffOutcome,
-    AgentChatService, CancelAgentChatTurnInput, CommittedAgentChatResponse,
-    CreateAgentHandoffInput, RetryAgentChatTurnInput, SendAgentChatMessageInput,
-    SetMainAgentBindingInput, SetProjectAgentBindingInput,
+    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
+    CommittedAgentChatResponse, CreateAgentHandoffInput, RetryAgentChatTurnInput,
+    SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
 };
 pub use agent_chat_turn_policy::{
     bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
-    failure as fail_agent_chat_turn, failure_after_claim as fail_agent_chat_turn_after_claim,
+    failure_after_claim as fail_agent_chat_turn_after_claim,
     recover_expired as recover_expired_agent_chat_turn,
     FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
 };
 pub use agent_chat_turn_worker::{
-    AgentChatTurnLogRoot, AgentChatTurnRunner, AgentChatTurnWorker, CliAgentChatSessionBackend,
-    CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
+    AgentChatTurnLogRoot, AgentChatTurnRunOutcome, AgentChatTurnRunner, AgentChatTurnWorker,
+    CliAgentChatSessionBackend, CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
 };
 pub use agent_inquiry_runner::{
     EmbeddedInquiryRunner, InquiryOutcome, InquiryRequest, InquiryRunner,
@@ -150,8 +159,7 @@ pub use context_manifest::{
     fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
 };
 pub use coordination_consumer::{
-    coordination_consumer_lease_owner, coordination_consumer_name, CoordinationOutcomeConsumer,
-    CoordinationOutcomeRun,
+    coordination_consumer_name, CoordinationOutcomeConsumer, CoordinationOutcomeRun,
 };
 pub use coordination_service::{
     AgentActionService, AgentInboxService, ApproveActionInput, AskQuestionInput,
@@ -172,14 +180,10 @@ pub use default_agents::ensure_default_agents;
 pub use deferred_dispatch::wake_task_dispatch;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
-pub use domain_event_broadcast::{
-    domain_event_broadcast_consumer_name, domain_event_broadcast_lease_owner,
-    DomainEventBroadcastConsumer,
-};
+pub use domain_event_broadcast::DomainEventBroadcastConsumer;
 pub use domain_event_service::DomainEventService;
 pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
-pub use embedded_task_executor::{EmbeddedTaskExecutor, TaskExecutorRouter};
 pub use execution_setup::{
     canonical_task_capability, classify_task_execution, eligible_project_execution_agents,
     ensure_execution_role_principal, is_eligible_execution_identity, is_read_only_capability,
@@ -190,7 +194,6 @@ pub use execution_setup::{
 };
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
-pub use main_chat_topic::{MainChatTopicRotation, MainChatTopicService, StartMainChatTopicInput};
 pub use main_genesis_commands::{
     MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
     MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
@@ -206,10 +209,6 @@ pub use memory::{
     BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
     MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
     MemoryService,
-};
-pub use memory_source::{
-    ForgeMemoryQuery, ForgeMemoryRecord, ForgeMemorySearch, ForgeMemorySource,
-    MemorySourceBindingInput,
 };
 pub use merge_service::{MergeOutcome, MergeService, ReviewCarryFacts};
 pub use milestone_orchestration::{
@@ -241,6 +240,7 @@ pub use operating_skills::{
     PROJECT_OPERATING_SKILL_SCHEMA_VERSION, PROJECT_OPERATING_SKILL_VERSION,
 };
 pub use operator_status::OperatorStatusService;
+pub(crate) mod remote_cancel;
 pub use operator_status_emitter::OperatorStatusEmitter;
 pub use orchestration_authorization::OrchestrationAuthorizationService;
 pub use product_genesis::{
@@ -314,19 +314,13 @@ pub use project_runtime::{
     ProjectCommitmentProjection, ProjectCurrentStateResponse, ProjectEffectiveStateProjection,
     ProjectInboxProjection,
 };
-pub use prompt_preview::preview_effective_prompt;
-pub use provider_authorization::ProviderAuthorizationService;
 pub use recovery::{CrashRecovery, HeartbeatMonitor};
-pub use runtime::{
-    ForgeRuntime, ForgeRuntimeBuilder, RuntimeAssemblyMode, RuntimeMode, RuntimeSupervisor,
-    RuntimeTaskHandle, RuntimeWorker, ShutdownSignal,
-};
 pub use shared_media_cleanup::SharedMediaCleanupScheduler;
 pub use shutdown::GracefulShutdown;
 pub use task_dispatcher::TaskDispatcher;
 pub use task_service::{
-    AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, NewSubtaskInput,
-    TaskDependencyAction, TaskProposalCommandResult, TaskService,
+    AdaptiveTaskCommand, AdaptiveTaskCommandResult, DirectTaskProposalInput, LeadRun,
+    NewSubtaskInput, TaskDependencyAction, TaskProposalCommandResult, TaskService,
 };
 pub use terminal_service::{TerminalActivityTracker, TerminalService};
 pub use types::Assignee;
@@ -335,17 +329,69 @@ pub use usage_projection::{
     usage_aggregate_for_source, usage_aggregate_for_source_state, usage_aggregate_for_task,
     usage_breakdowns_for_invocation, usage_breakdowns_for_source, UsageDomainRun,
 };
-pub use wake_turn_consumer::{
-    wake_turn_consumer_lease_owner, wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun,
-};
+pub use wake_turn_consumer::{wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun};
+pub use worker_runtime::assembly::{RuntimeWorker, ShutdownSignal};
 pub use workflow::template_service::WorkflowTemplateService;
-pub use workspace_cleanup::WorkspaceCleanupScheduler;
+pub use workspace_cleanup::{GcSettings, WorkspaceCleanupScheduler};
 pub use workspace_execution_lock::WorkspaceExecutionLockManager;
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
-#[derive(Debug, thiserror::Error)]
+/// Why a lead operation was refused. The value is the public reason code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LeadRefusal {
+    /// The target is not this root or one of its subtasks.
+    OutsideSubtree,
+    /// The caller's run does not lead this root (any more).
+    NotLeading,
+    /// The operation is for a subtask, or for the planning run on the root.
+    WrongTarget,
+    /// The subtask already had an implementation run.
+    SubtaskStarted,
+    /// A machine bound on what a lead may repeat is spent.
+    LimitReached,
+    /// The action is not offered to the lead on this subtask now.
+    ActionNotOffered,
+    /// The root already waits for an answer to an earlier question.
+    InputPending,
+    /// The lead named itself as a worker.
+    SelfAssignment,
+}
+impl LeadRefusal {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::OutsideSubtree => "outside_lead_subtree",
+            Self::NotLeading => "not_leading",
+            Self::WrongTarget => "wrong_target",
+            Self::SubtaskStarted => "subtask_started",
+            Self::LimitReached => "lead_limit_reached",
+            Self::ActionNotOffered => "action_not_offered",
+            Self::InputPending => "lead_input_pending",
+            Self::SelfAssignment => "lead_self_assignment",
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, serde::Serialize)]
 pub enum ServiceError {
+    #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
+    TaskBusy {
+        pending_steps: i64,
+        retry_after_ms: u64,
+    },
+    /// The Task's stored condition is a newer build's encoding. The command
+    /// wrote nothing.
+    #[error("Task {task_id} has a condition written by a newer Forge build; it is quarantined until a build that understands it runs")]
+    TaskConditionQuarantined { task_id: String },
+    #[error(transparent)]
+    PlacementUnavailable(#[from] placement::PlacementUnavailable),
+
+    #[error("workspace preparation failed for placement {placement_id}: {message}")]
+    PrepareFailed {
+        placement_id: String,
+        message: String,
+    },
+
     #[error("dependency gate")]
     DependencyGate,
 
@@ -356,16 +402,24 @@ pub enum ServiceError {
     },
 
     #[error(transparent)]
-    Db(db::DbError),
+    Db(#[serde(with = "worker_runtime::queue::command_reply::database")] db::DbError),
 
     #[error(transparent)]
-    Git(git::GitError),
+    Git(#[serde(with = "worker_runtime::queue::command_reply::git_error")] git::GitError),
 
     #[error(transparent)]
-    Review(review::ReviewError),
+    Review(
+        #[serde(with = "worker_runtime::queue::command_reply::review_error")] review::ReviewError,
+    ),
 
     #[error("{entity} not found: {id}")]
     NotFound { entity: &'static str, id: String },
+
+    #[error("{error}")]
+    TurnFailure {
+        failure: api_types::TurnFailure,
+        error: Box<ServiceError>,
+    },
 
     #[error("invalid operation: {message}")]
     InvalidOperation { message: String },
@@ -387,8 +441,9 @@ pub enum ServiceError {
 
     #[error("task action unavailable: {reason}")]
     TaskActionUnavailable {
-        available_actions: Vec<api_types::TaskAction>,
+        available_actions: Vec<api_types::Offer>,
         reason: String,
+        wait_cause: Option<api_types::DeniedBy>,
     },
 
     #[error("conflict: {0}")]
@@ -399,6 +454,15 @@ pub enum ServiceError {
 
     #[error("daemon unavailable: {daemon_id}")]
     DaemonUnavailable { daemon_id: String },
+
+    #[error("daemon_not_ready: daemon {daemon_id} has not sent its command handshake")]
+    DaemonNotReady { daemon_id: String },
+
+    #[error(
+        "daemon_upgrade_required: daemon {daemon_id}: {}",
+        api_types::DAEMON_UPGRADE_REQUIRED_MESSAGE
+    )]
+    DaemonUpgradeRequired { daemon_id: String },
 
     #[error("daemon command timed out for daemon {daemon_id}: {method}")]
     DaemonTimeout { daemon_id: String, method: String },
@@ -415,15 +479,6 @@ pub enum ServiceError {
     #[error("repo does not match primary repo for project {project_id}")]
     RepoMismatch { project_id: String },
 
-    #[error("PR provider missing for repo {repo_id}")]
-    PrProviderMissing { repo_id: String },
-
-    #[error("PR provider token missing for repo {repo_id}")]
-    PrProviderTokenMissing { repo_id: String },
-
-    #[error("PR sync failure for task {task_id}: {details}")]
-    PrSyncFailure { task_id: String, details: String },
-
     #[error("agent {agent_id} is paused and cannot accept new work")]
     AgentPaused { agent_id: String },
 
@@ -438,6 +493,41 @@ pub enum ServiceError {
 
     #[error("parent workspace required for task {parent_task_id}")]
     ParentWorkspaceRequired { parent_task_id: String },
+
+    /// The parent is terminal or in a review-phase gate (review, merging):
+    /// that state never schedules a subtask.
+    #[error("task {parent_task_id} is in `{state}` and no longer accepts subtasks; add subtasks before the parent enters review, or create a new root Task")]
+    SubtaskParentClosed {
+        parent_task_id: String,
+        state: String,
+    },
+
+    /// The planning role on a coordination root is its lead, and a lead is
+    /// a native Agent: its Task tools exist only in native sessions.
+    #[error("the lead of coordination root {task_id} must be a native Agent; assign a native Agent to its `{role}` role")]
+    LeadRequiresNativeProfile { task_id: String, role: String },
+
+    /// The native host runs Task roles by name; a planning gate whose role
+    /// is not the built-in planner cannot run as a lead yet.
+    #[error("the planning role `{role}` of this workflow cannot lead coordination root {task_id}; only the built-in `planner` role is supported")]
+    LeadRoleNotSupported { task_id: String, role: String },
+
+    /// The step-check role of a subtask is held by its root's lead; a row
+    /// on the subtask would hold nothing.
+    #[error("the `{role}` role of subtask {task_id} is held by the lead of its root {root_task_id}; assign `{role}` on the root")]
+    StepCheckRoleHeldByRoot {
+        task_id: String,
+        root_task_id: String,
+        role: String,
+    },
+
+    /// A lead operation the server refuses: the typed reason is `refusal`,
+    /// the sentence says what the lead may do instead.
+    #[error("{message}")]
+    LeadOperationRefused {
+        refusal: LeadRefusal,
+        message: String,
+    },
 
     #[error("workspace reset required for task {task_id}: {reason}")]
     WorkspaceResetRequired { task_id: String, reason: String },
@@ -473,6 +563,16 @@ pub enum ServiceError {
 impl From<db::DbError> for ServiceError {
     fn from(error: db::DbError) -> Self {
         match error {
+            db::DbError::TaskBusy {
+                pending_steps,
+                retry_after_ms,
+            } => Self::TaskBusy {
+                pending_steps,
+                retry_after_ms,
+            },
+            db::DbError::TaskConditionQuarantined { task_id } => {
+                Self::TaskConditionQuarantined { task_id }
+            }
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             db::DbError::ProjectPaused { project_id } => Self::ProjectPaused { project_id },
@@ -481,6 +581,17 @@ impl From<db::DbError> for ServiceError {
                 execution_id,
             } => Self::execution_already_running(scope, execution_id),
             error => Self::Db(error),
+        }
+    }
+}
+
+impl From<pricing::PricingError> for ServiceError {
+    fn from(error: pricing::PricingError) -> Self {
+        match error {
+            pricing::PricingError::Db(error) => error.into(),
+            pricing::PricingError::InvalidOperation { message } => {
+                Self::InvalidOperation { message }
+            }
         }
     }
 }
@@ -500,6 +611,15 @@ impl From<git::GitError> for ServiceError {
 impl From<review::ReviewError> for ServiceError {
     fn from(error: review::ReviewError) -> Self {
         match error {
+            review::ReviewError::OwnerUnavailable { daemon_id } => {
+                Self::DaemonUnavailable { daemon_id }
+            }
+            review::ReviewError::WorkspaceInfrastructure(message) => {
+                Self::invalid_operation(message)
+            }
+            review::ReviewError::Db(db::DbError::VersionConflict) => {
+                Self::Db(db::DbError::VersionConflict)
+            }
             review::ReviewError::Db(db::DbError::ProjectPaused { project_id }) => {
                 Self::ProjectPaused { project_id }
             }
@@ -524,14 +644,23 @@ impl From<executors::ExecutorError> for ServiceError {
 }
 
 impl ServiceError {
-    pub(crate) fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
+    /// Boundary projection of the typed owner-input failure. Transports do
+    /// not need a dependency on the lower-level Review error type.
+    pub fn is_check_environment_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Review(review::ReviewError::CheckEnvironmentUnavailable)
+        )
+    }
+
+    pub fn not_found(entity: &'static str, id: impl Into<String>) -> Self {
         Self::NotFound {
             entity,
             id: id.into(),
         }
     }
 
-    pub(crate) fn invalid_operation(message: impl Into<String>) -> Self {
+    pub fn invalid_operation(message: impl Into<String>) -> Self {
         Self::InvalidOperation {
             message: message.into(),
         }
@@ -563,7 +692,7 @@ impl ServiceError {
         }
     }
 
-    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+    pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
     }
 
@@ -613,6 +742,9 @@ mod execution_admission_error_tests {
     }
 }
 
-#[cfg(test)]
-#[path = "pricing_auto_tests.rs"]
-mod pricing_auto_tests;
+pub mod project_escalation;
+
+mod topic_rotation;
+pub use topic_rotation::{TopicRotationCoordinator, TopicRotator};
+
+pub mod check_owner;

@@ -77,7 +77,10 @@ async function setupReviewGateTask(
   const toInProgress = await request.post(`/api/v1/tasks/${taskJson.id}/transition`, {
     data: { status: 'in_progress', version: taskJson.version },
   })
-  expect(toInProgress.ok(), `todo->in_progress should succeed: ${toInProgress.status()}`).toBeTruthy()
+  expect(
+    toInProgress.ok(),
+    `todo->in_progress should succeed: ${toInProgress.status()}`,
+  ).toBeTruthy()
   taskJson = (await toInProgress.json()).task as TaskResponse
 
   const toReview = await request.post(`/api/v1/tasks/${taskJson.id}/transition`, {
@@ -111,6 +114,7 @@ test('approve gate from UI advances task to accept target and updates the board'
     timeout: 15000,
   })
   await page.getByRole('button', { name: 'Approve review' }).click()
+  await page.getByRole('button', { name: 'Apply', exact: true }).click()
 
   await expect
     .poll(
@@ -122,9 +126,9 @@ test('approve gate from UI advances task to accept target and updates the board'
     )
     .toBe('merging')
 
-  await expect(
-    page.getByRole('region', { name: 'Review column' }).getByText(title),
-  ).toBeVisible({ timeout: 15000 })
+  await expect(page.getByRole('region', { name: 'Review column' }).getByText(title)).toBeVisible({
+    timeout: 15000,
+  })
 })
 
 test('reject gate from UI with reason records rejection in history', async ({
@@ -142,9 +146,9 @@ test('reject gate from UI with reason records rejection in history', async ({
   await openBoardTask(page, projectId, taskId, title)
 
   await page.getByRole('button', { name: 'Request changes' }).click()
-  await expect(page.getByRole('heading', { name: 'Reject Gate' })).toBeVisible()
-  await page.getByPlaceholder('Describe what needs to change').fill(rejectReason)
-  await page.getByRole('button', { name: 'Reject', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Request changes' })).toBeVisible()
+  await page.getByLabel('guidance (required)', { exact: true }).fill(rejectReason)
+  await page.getByRole('button', { name: 'Apply', exact: true }).click()
 
   await expect
     .poll(
@@ -157,6 +161,6 @@ test('reject gate from UI with reason records rejection in history', async ({
     .toBe('in_progress')
 
   await page.getByRole('button', { name: 'History' }).click()
-  await expect(page.getByText(`gate rejected: ${rejectReason}`)).toBeVisible({ timeout: 15000 })
+  await expect(page.getByText(rejectReason)).toBeVisible({ timeout: 15000 })
   await expect(page.getByText('rejection')).toBeVisible()
 })

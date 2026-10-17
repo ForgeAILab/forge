@@ -8,22 +8,28 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+tokio-util = { version = "0.7", features = ["rt"] }
+check-executor = { path = "../check-executor" }
+process-supervisor = { path = "../process-supervisor" }
+async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 db = { path = "../db" }
-events = { path = "../events" }
 executors = { path = "../executors" }
 git = { path = "../git" }
 serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
-tracing = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
+events = { path = "../events" }
+uuid = { version = "1", features = ["v4"] }
+db = { path = "../db", features = ["test-template"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
-async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -143,6 +143,14 @@ impl TaskService {
             if parent.parent_task_id.is_some() {
                 return Err(ServiceError::nested_subtask_unsupported());
             }
+            crate::task_hierarchy::ensure_parent_accepts_subtasks(
+                &parent,
+                &WorkflowEngine::resolve_workflow_for_task(
+                    &parent,
+                    &project.workflow_definition,
+                    &Actor::system(api_types::SystemComponent::Workflow),
+                ),
+            )?;
             Some(TaskRepo::next_subtask_order(&*self.db, parent_id).await?)
         } else {
             None
@@ -182,6 +190,7 @@ impl TaskService {
                 "task_type must be task, planning_task, sub_task, or discovery",
             ));
         }
+        super::update::reject_retired_auditor_config(task_state_config.as_deref())?;
         let review_requirement_ids =
             super::update::review_requirement_ids_from_config(task_state_config.as_deref())?
                 .unwrap_or_default();
@@ -255,7 +264,24 @@ impl TaskService {
             created_at: now.clone(),
             updated_at: now.clone(),
         };
+        let initial_defaults = if is_root {
+            let covered = validated_assignments
+                .as_ref()
+                .map(|rows| rows.iter().map(|(role, _, _)| role.clone()).collect())
+                .unwrap_or_default();
+            self.project_default_role_assignments_for_ids(&create_task.id, &project_id, covered)
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut transaction = db::begin_immediate(self.db.pool()).await?;
+        let project_version: i64 = self
+            .db
+            .task_creation_project_version_in_tx(&mut transaction, &project_id)
+            .await?;
+        if project_version != project.version {
+            return Err(db::DbError::VersionConflict.into());
+        }
         for dependency_id in &dependency_ids {
             let dependency =
                 TaskRepo::get_by_id_in_tx(&*self.db, &mut transaction, dependency_id, false)
@@ -281,29 +307,51 @@ impl TaskService {
                 ));
             }
         }
-        let task = TaskRepo::create_in_tx(&*self.db, &mut transaction, create_task).await?;
+        let task = self
+            .insert_created_task_in_tx(&mut transaction, create_task, prepared_governance)
+            .await?;
         if let Some(parent_task_id) = task.parent_task_id.as_deref() {
             // Creating the first child atomically converts its parent into a
-            // coordination container. Preserve only aggregate-review roles;
-            // implementation/planning assignments belong on child Tasks.
+            // coordination container. Preserve the coder as its default
+            // worker plus aggregate-review roles; other implementation and
+            // planning assignments belong on child Tasks.
             let root_role_policy =
                 crate::task_hierarchy::RootRolePolicy::for_workflow(&project_workflow);
-            let parent_roles = sqlx::query_scalar::<_, String>(
-                "SELECT role_name FROM task_role_assignment WHERE task_id = ?",
-            )
-            .bind(parent_task_id)
-            .fetch_all(&mut *transaction)
-            .await?;
+            // The planning role stays only with an assignee that may lead
+            // the root (a native Agent); any other planner is stripped.
+            let parent_roles = self
+                .db
+                .task_creation_parent_roles_in_tx(&mut transaction, parent_task_id)
+                .await?;
             let mut removed_parent_role = false;
-            for role_name in parent_roles {
-                if !root_role_policy.allows_assignment(&role_name) {
-                    sqlx::query(
-                        "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-                    )
-                    .bind(parent_task_id)
-                    .bind(role_name)
-                    .execute(&mut *transaction)
-                    .await?;
+            for row in parent_roles {
+                let (role_name, assignee_type, assignee_id, backend_kind) = (
+                    row.role_name,
+                    row.assignee_type,
+                    row.assignee_id,
+                    row.backend_kind,
+                );
+                let assignee_type = assignee_id
+                    .as_ref()
+                    .and(assignee_type.as_deref())
+                    .and_then(|kind| kind.parse::<db::AssigneeKind>().ok());
+                if !crate::task_hierarchy::root_keeps_assignment(
+                    &root_role_policy,
+                    parent_task_id,
+                    &role_name,
+                    assignee_type.as_ref(),
+                    backend_kind.as_deref(),
+                ) {
+                    // Effects on an existing parent are its own queued
+                    // steps, identity-fenced so they are never dropped.
+                    let _queued_or_applied = self
+                        .db
+                        .prune_coordination_root_role_in_tx(
+                            &mut transaction,
+                            parent_task_id,
+                            role_name,
+                        )
+                        .await?;
                     removed_parent_role = true;
                 }
             }
@@ -311,51 +359,15 @@ impl TaskService {
                 // Converting a Task into a coordination root changes its
                 // authority surface. Invalidate review authority and wake
                 // parked dispatch in the same transaction as role pruning.
-                sqlx::query(
-                    "UPDATE task
-                     SET review_passed_at = NULL,
-                         version = version + CASE WHEN review_passed_at IS NOT NULL THEN 1 ELSE 0 END,
-                         metadata_json = CASE
-                             WHEN json_valid(COALESCE(metadata_json, '{}'))
-                             THEN NULLIF(json_remove(COALESCE(metadata_json, '{}'), '$.dispatch_disposition', '$.deferred_dispatch'), '{}')
-                             ELSE metadata_json
-                         END,
-                         updated_at = CASE
-                             WHEN review_passed_at IS NOT NULL
-                                  OR (json_valid(COALESCE(metadata_json, '{}'))
-                                      AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                           OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL))
-                             THEN ? ELSE updated_at END
-                     WHERE id = ? AND deleted_at IS NULL
-                       AND (review_passed_at IS NOT NULL
-                            OR (json_valid(COALESCE(metadata_json, '{}'))
-                                AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))",
-                )
-                .bind(&now)
-                .bind(parent_task_id)
-                .execute(&mut *transaction)
-                .await?;
+                let _queued_or_applied = self
+                    .db
+                    .clear_coordination_root_review_dispatch_in_tx(
+                        &mut transaction,
+                        &now,
+                        parent_task_id,
+                    )
+                    .await?;
             }
-        }
-        if !task.is_automation {
-            ProjectRepo::increment_project_work_epoch(
-                &*self.db,
-                &mut transaction,
-                &task.project_id,
-                1,
-            )
-            .await?;
-        }
-        if let Some(governance) = prepared_governance {
-            self.insert_task_governance(
-                &mut transaction,
-                &task.id,
-                &task.project_id,
-                governance,
-                &now,
-            )
-            .await?;
         }
         for dependency_id in &dependency_ids {
             TaskDependencyRepo::add_dependency_in_tx(
@@ -367,32 +379,32 @@ impl TaskService {
             )
             .await?;
         }
-        transaction.commit().await?;
-
         if let Some(assignments) = validated_assignments {
             for (role_name, assignee_type, assignee_id) in assignments {
-                TaskRoleAssignmentRepo::assign_if_unchanged(
-                    &*self.db,
-                    CreateTaskRoleAssignment {
-                        id: new_uuid_v4(),
-                        task_id: task.id.clone(),
-                        role_name,
-                        assignee_type: Some(assignee_type),
-                        assignee_id: Some(assignee_id),
-                        created_at: now.clone(),
-                        updated_at: now.clone(),
-                    },
-                    None,
-                )
-                .await?;
+                // Initial assignment is part of the unpublished Task's
+                // birth transaction, before another writer can see it.
+                self.db
+                    .insert_initial_explicit_task_role_in_tx(
+                        &mut transaction,
+                        db::InsertInitialExplicitTaskRoleInTxInput {
+                            id: new_uuid_v4(),
+                            task_id: &task.id,
+                            role_name,
+                            assignee_type: assignee_type.to_string(),
+                            assignee_id,
+                            created_at: &now,
+                            updated_at: &now,
+                        },
+                    )
+                    .await?;
             }
         }
-
-        let task = if is_root {
-            self.assign_project_default_roles(&task).await?
-        } else {
-            task
-        };
+        for assignment in initial_defaults {
+            self.db
+                .insert_initial_default_task_role_in_tx(&mut transaction, &task.id, assignment)
+                .await?;
+        }
+        transaction.commit().await?;
 
         self.publish(ForgeEvent {
             event_type: "task.created".to_owned(),
@@ -404,6 +416,27 @@ impl TaskService {
             },
         });
 
+        Ok(task)
+    }
+
+    /// Normal Task insertion shared with atomic recovery-created follow-ups.
+    /// Governance and the Project work epoch commit with the Task row.
+    pub(super) async fn insert_created_task_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: CreateTask,
+        prepared_governance: Option<super::governance::PreparedTaskGovernance>,
+    ) -> Result<Task> {
+        let now = input.created_at.clone();
+        let task = TaskRepo::create_in_tx(&*self.db, transaction, input).await?;
+        if !task.is_automation {
+            ProjectRepo::increment_project_work_epoch(&*self.db, transaction, &task.project_id, 1)
+                .await?;
+        }
+        if let Some(governance) = prepared_governance {
+            self.insert_task_governance(transaction, &task.id, &task.project_id, governance, &now)
+                .await?;
+        }
         Ok(task)
     }
 
@@ -550,11 +583,33 @@ impl TaskService {
     pub(super) async fn project_default_role_assignments(
         &self,
         task: &Task,
+        covered_roles: HashSet<String>,
+    ) -> Result<Vec<CreateTaskRoleAssignment>> {
+        let mut assignments = self
+            .project_default_role_assignments_for_ids(&task.id, &task.project_id, covered_roles)
+            .await?;
+        // A role the Task's root holds for it (a subtask's step check) is
+        // never a row of the Task: no default is copied onto it.
+        assignments.retain(|assignment| {
+            db::inherited_subtask::step_check_holder(
+                task.parent_task_id.as_deref(),
+                &task.status,
+                &assignment.role_name,
+            )
+            .is_none()
+        });
+        Ok(assignments)
+    }
+
+    async fn project_default_role_assignments_for_ids(
+        &self,
+        task_id: &str,
+        project_id: &str,
         mut covered_roles: HashSet<String>,
     ) -> Result<Vec<CreateTaskRoleAssignment>> {
-        let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+        let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?
-            .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
+            .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))?;
         let settings =
             serde_json::from_str::<ProjectSettings>(&project.settings).map_err(|error| {
                 ServiceError::invalid_operation(format!("invalid project settings: {error}"))
@@ -613,7 +668,7 @@ impl TaskService {
             let now = now_rfc3339();
             assignments.push(CreateTaskRoleAssignment {
                 id: new_uuid_v4(),
-                task_id: task.id.clone(),
+                task_id: task_id.to_owned(),
                 role_name: role_name.clone(),
                 assignee_type: Some(assignee_type),
                 assignee_id: Some(assignee_id),
@@ -669,5 +724,110 @@ impl TaskService {
                 .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         }
         Ok(current)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedProjectHookTask {
+    input: CreateTask,
+    governance: Option<super::governance::PreparedTaskGovernance>,
+    assignments: Vec<CreateTaskRoleAssignment>,
+}
+
+impl TaskService {
+    pub(crate) async fn prepare_project_hook_task(
+        &self,
+        project: &db::Project,
+        title: String,
+        description: String,
+        task_type: String,
+        priority: i64,
+        is_automation: bool,
+    ) -> Result<PreparedProjectHookTask> {
+        validate_required("title", &title)?;
+        if !is_automation {
+            self.validate_task_review_requirement_ids(project, &[])
+                .await?;
+        }
+        let governance = self
+            .prepare_task_governance(project, &task_type, None)
+            .await?;
+        let workflow = WorkflowEngine::resolve_workflow(&project.workflow_definition);
+        let status = workflow
+            .states
+            .iter()
+            .find(|state| state.kind == api_types::StateKind::Initial)
+            .ok_or_else(|| ServiceError::invalid_operation("workflow has no initial state"))?
+            .name
+            .clone();
+        let now = now_rfc3339();
+        let input = CreateTask {
+            id: new_uuid_v4(),
+            project_id: project.id.clone(),
+            parent_task_id: None,
+            subtask_order: None,
+            assignee_type: None,
+            assignee_id: None,
+            title,
+            description: Some(description),
+            task_type,
+            status,
+            is_automation,
+            priority,
+            task_state_config: None,
+            merge_config: None,
+            plan: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let assignments = if is_automation {
+            Vec::new()
+        } else {
+            self.project_default_role_assignments_for_ids(
+                &input.id,
+                &input.project_id,
+                HashSet::new(),
+            )
+            .await?
+        };
+        Ok(PreparedProjectHookTask {
+            input,
+            governance,
+            assignments,
+        })
+    }
+
+    pub(crate) async fn commit_project_hook_task(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        prepared: &PreparedProjectHookTask,
+    ) -> Result<Task> {
+        let task = self
+            .insert_created_task_in_tx(
+                transaction,
+                prepared.input.clone(),
+                prepared.governance.clone(),
+            )
+            .await?;
+        for (expected_version, assignment) in (task.version..).zip(&prepared.assignments) {
+            self.db
+                .insert_project_hook_task_role_in_tx(transaction, &task.id, assignment)
+                .await?;
+            let updated = self
+                .db
+                .advance_project_hook_task_role_version_in_tx(
+                    transaction,
+                    now_rfc3339(),
+                    &task.id,
+                    expected_version,
+                )
+                .await?;
+            if updated.rows_affected() != 1 {
+                return Err(DbError::VersionConflict.into());
+            }
+        }
+        TaskRepo::get_by_id_in_tx(&*self.db, transaction, &task.id, false)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("task", task.id))
     }
 }

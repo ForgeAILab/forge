@@ -28,7 +28,6 @@ use forge_agent_host::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
-use sqlx::Row;
 
 use crate::{
     AgentActionProvenance, AuthorizationProvenance, CommandContext, CommandPrincipal, CommandScope,
@@ -881,15 +880,13 @@ impl ProjectMilestoneCommandService {
             return Ok(None);
         };
         let snapshot_id = outcome_string(&receipt, "readiness_snapshot_id")?;
-        let row =
-            sqlx::query("SELECT * FROM project_readiness_snapshot WHERE id = ? AND project_id = ?")
-                .bind(&snapshot_id)
-                .bind(context.canonical_scope().scope_id())
-                .fetch_optional(self.db.pool())
-                .await?
-                .ok_or_else(|| {
-                    ServiceError::Conflict("readiness replay snapshot is missing".to_owned())
-                })?;
+        let row = self
+            .db
+            .milestone_replay_readiness_source(&snapshot_id, context.canonical_scope().scope_id())
+            .await?
+            .ok_or_else(|| {
+                ServiceError::Conflict("readiness replay snapshot is missing".to_owned())
+            })?;
         Ok(Some(map_readiness(row)?))
     }
 
@@ -1224,34 +1221,27 @@ async fn validate_release_readiness_candidate(
     db: &SqliteDb,
     command: &ProjectReleaseRequestCommand,
 ) -> Result<()> {
-    let row = sqlx::query(
-        "SELECT project_id, milestone_id, readiness_digest, outcome,
-                blocking_reasons_json
-         FROM project_readiness_snapshot WHERE id = ?",
-    )
-    .bind(&command.readiness_snapshot_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| {
-        ServiceError::not_found("readiness_snapshot", command.readiness_snapshot_id.clone())
-    })?;
-    let project_id: String = row.try_get("project_id")?;
-    let milestone_id: String = row.try_get("milestone_id")?;
-    let readiness_digest: String = row.try_get("readiness_digest")?;
+    let row = db
+        .milestone_release_readiness_candidate(&command.readiness_snapshot_id)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::not_found("readiness_snapshot", command.readiness_snapshot_id.clone())
+        })?;
+    let project_id: String = row.project_id()?;
+    let milestone_id: String = row.milestone_id()?;
+    let readiness_digest: String = row.readiness_digest()?;
     if project_id != command.project_id
         || milestone_id != command.milestone_id
         || readiness_digest != command.readiness_digest
     {
         return Err(ServiceError::Db(db::DbError::VersionConflict));
     }
-    let outcome: String = row.try_get("outcome")?;
+    let outcome: String = row.outcome()?;
     if outcome == "ready" {
         return Ok(());
     }
-    let reasons = serde_json::from_str::<Vec<ReadinessReason>>(
-        &row.try_get::<String, _>("blocking_reasons_json")?,
-    )
-    .unwrap_or_default();
+    let reasons = serde_json::from_str::<Vec<ReadinessReason>>(&row.blocking_reasons_json()?)
+        .unwrap_or_default();
     let details = reasons
         .iter()
         .filter(|reason| reason.blocking)
@@ -1618,17 +1608,14 @@ async fn replay_receipt(db: &SqliteDb, context: &CommandContext) -> Result<Optio
     if exact.is_some() {
         return Ok(exact);
     }
-    let existing_digest: Option<String> = sqlx::query_scalar(
-        "SELECT input_digest FROM command_receipt
-         WHERE scope_type = ? AND scope_id = ? AND operation = ?
-           AND idempotency_key = ? LIMIT 1",
-    )
-    .bind(context.canonical_scope().scope_type().as_str())
-    .bind(context.canonical_scope().scope_id())
-    .bind(context.operation())
-    .bind(context.idempotency_key())
-    .fetch_optional(db.pool())
-    .await?;
+    let existing_digest: Option<String> = db
+        .milestone_replay_input_digest(
+            context.canonical_scope().scope_type().as_str(),
+            context.canonical_scope().scope_id(),
+            context.operation(),
+            context.idempotency_key(),
+        )
+        .await?;
     if existing_digest.is_some_and(|digest| digest != context.input_digest()) {
         return Err(ServiceError::Db(db::DbError::IdempotencyConflict));
     }
@@ -1658,14 +1645,9 @@ async fn authorize_project_principal(
             }
         }
         "agent" => {
-            let bound: Option<String> = sqlx::query_scalar(
-                "SELECT identity_id FROM project_agent_binding
-                 WHERE project_id = ? AND identity_id = ? AND state = 'active' LIMIT 1",
-            )
-            .bind(project_id)
-            .bind(&authorization.principal_id)
-            .fetch_optional(db.pool())
-            .await?;
+            let bound: Option<String> = db
+                .milestone_authorized_project_identity(project_id, &authorization.principal_id)
+                .await?;
             if bound.is_some() {
                 Ok(())
             } else {
@@ -1689,35 +1671,18 @@ async fn inherited_charter_reference(
     project_id: &str,
     milestone_id: &str,
 ) -> Result<Option<api_types::ArtifactRef>> {
-    let row = sqlx::query(
-        "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
-                r.render_version, r.rendered_digest
-         FROM project_milestone m
-         JOIN project_milestone_revision d
-           ON d.id = COALESCE(
-                m.current_definition_revision_id,
-                (SELECT id FROM project_milestone_revision
-                 WHERE milestone_id = m.id ORDER BY revision DESC LIMIT 1)
-              )
-          AND d.milestone_id = m.id
-         JOIN project_charter_revision r ON r.id = d.charter_revision_id
-         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = m.project_id
-         WHERE m.id = ? AND m.project_id = ?
-         LIMIT 1",
-    )
-    .bind(milestone_id)
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db
+        .milestone_inherited_charter_reference(milestone_id, project_id)
+        .await?;
     let Some(row) = row else {
         return Ok(None);
     };
     Ok(Some(api_types::ArtifactRef {
-        artifact_id: row.try_get("artifact_id")?,
-        revision_id: row.try_get("revision_id")?,
-        content_digest: row.try_get("content_digest")?,
-        render_version: row.try_get("render_version")?,
-        render_digest: row.try_get("rendered_digest")?,
+        artifact_id: row.artifact_id()?,
+        revision_id: row.revision_id()?,
+        content_digest: row.content_digest()?,
+        render_version: row.render_version_optional()?,
+        render_digest: row.rendered_digest_optional()?,
     }))
 }
 
@@ -1726,26 +1691,16 @@ async fn current_charter_reference(
     db: &SqliteDb,
     project_id: &str,
 ) -> Result<Option<api_types::ArtifactRef>> {
-    let row = sqlx::query(
-        "SELECT c.id AS artifact_id, r.id AS revision_id, r.content_digest,
-                r.render_version, r.rendered_digest
-         FROM project p
-         JOIN project_charter_revision r ON r.id = p.current_charter_revision_id
-         JOIN project_charter c ON c.id = r.charter_id AND c.project_id = p.id
-         WHERE p.id = ?",
-    )
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?;
+    let row = db.milestone_current_charter_reference(project_id).await?;
     let Some(row) = row else {
         return Ok(None);
     };
     Ok(Some(api_types::ArtifactRef {
-        artifact_id: row.try_get("artifact_id")?,
-        revision_id: row.try_get("revision_id")?,
-        content_digest: row.try_get("content_digest")?,
-        render_version: row.try_get("render_version")?,
-        render_digest: row.try_get("rendered_digest")?,
+        artifact_id: row.artifact_id()?,
+        revision_id: row.revision_id()?,
+        content_digest: row.content_digest()?,
+        render_version: row.render_version_optional()?,
+        render_digest: row.rendered_digest_optional()?,
     }))
 }
 
@@ -1766,12 +1721,9 @@ async fn validate_definition_references(
                 "milestone Task references must be non-empty",
             ));
         }
-        let owned: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM task WHERE id = ? AND project_id = ? LIMIT 1")
-                .bind(task_id)
-                .bind(project_id)
-                .fetch_optional(db.pool())
-                .await?;
+        let owned: Option<i64> = db
+            .milestone_definition_task_reference(task_id, project_id)
+            .await?;
         if owned.is_none() {
             return Err(ServiceError::invalid_operation(
                 "milestone Task reference is missing or belongs to another Project",
@@ -1787,28 +1739,20 @@ async fn validate_charter_reference(
     reference: &api_types::ArtifactRef,
 ) -> Result<()> {
     validate_artifact_ref_shape(reference, "milestone Charter reference")?;
-    let row = sqlx::query(
-        "SELECT c.id AS artifact_id, c.current_approved_revision_id,
-                r.id AS revision_id, r.lifecycle, r.content_digest,
-                r.render_version, r.rendered_digest
-         FROM project_charter_revision r
-         JOIN project_charter c ON c.id = r.charter_id
-         WHERE r.id = ? AND r.charter_id = ? AND c.project_id = ?
-         LIMIT 1",
-    )
-    .bind(&reference.revision_id)
-    .bind(&reference.artifact_id)
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| {
-        ServiceError::invalid_operation(
-            "milestone Charter revision is missing or belongs to another Project",
+    let row = db
+        .milestone_charter_reference_source(
+            &reference.revision_id,
+            &reference.artifact_id,
+            project_id,
         )
-    })?;
-    let current_approved_revision_id: Option<String> =
-        row.try_get("current_approved_revision_id")?;
-    let lifecycle: String = row.try_get("lifecycle")?;
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "milestone Charter revision is missing or belongs to another Project",
+            )
+        })?;
+    let current_approved_revision_id: Option<String> = row.current_approved_revision_id()?;
+    let lifecycle: String = row.lifecycle()?;
     if lifecycle != "approved"
         || current_approved_revision_id.as_deref() != Some(reference.revision_id.as_str())
     {
@@ -1823,24 +1767,18 @@ async fn validate_document_reference(
     reference: &api_types::ArtifactRef,
 ) -> Result<()> {
     validate_artifact_ref_shape(reference, "milestone Document reference")?;
-    let row = sqlx::query(
-        "SELECT d.id AS artifact_id, r.id AS revision_id, r.content_digest,
-                r.render_version, r.rendered_digest
-         FROM project_document_revision r
-         JOIN project_document d ON d.id = r.document_id
-         WHERE r.id = ? AND r.document_id = ? AND d.project_id = ?
-         LIMIT 1",
-    )
-    .bind(&reference.revision_id)
-    .bind(&reference.artifact_id)
-    .bind(project_id)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| {
-        ServiceError::invalid_operation(
-            "milestone Document revision is missing or belongs to another Project",
+    let row = db
+        .milestone_document_reference_source(
+            &reference.revision_id,
+            &reference.artifact_id,
+            project_id,
         )
-    })?;
+        .await?
+        .ok_or_else(|| {
+            ServiceError::invalid_operation(
+                "milestone Document revision is missing or belongs to another Project",
+            )
+        })?;
     validate_artifact_ref_digests(reference, &row, "milestone Document reference")
 }
 
@@ -1866,12 +1804,12 @@ fn validate_artifact_ref_shape(reference: &api_types::ArtifactRef, label: &str) 
 
 fn validate_artifact_ref_digests(
     reference: &api_types::ArtifactRef,
-    row: &sqlx::sqlite::SqliteRow,
+    row: &db::MilestoneArtifactReferenceSourceRow,
     label: &str,
 ) -> Result<()> {
-    let content_digest: String = row.try_get("content_digest")?;
-    let render_version: String = row.try_get("render_version")?;
-    let rendered_digest: String = row.try_get("rendered_digest")?;
+    let content_digest: String = row.content_digest()?;
+    let render_version: String = row.render_version_required()?;
+    let rendered_digest: String = row.rendered_digest_required()?;
     if reference.content_digest != content_digest
         || reference
             .render_version
@@ -1885,11 +1823,11 @@ fn validate_artifact_ref_digests(
         return Err(ServiceError::Db(db::DbError::VersionConflict));
     }
     if row
-        .try_get::<String, _>("revision_id")
+        .revision_id()
         .ok()
         .is_some_and(|revision_id| revision_id != reference.revision_id)
         || row
-            .try_get::<String, _>("artifact_id")
+            .artifact_id()
             .ok()
             .is_some_and(|artifact_id| artifact_id != reference.artifact_id)
     {
@@ -1901,9 +1839,7 @@ fn validate_artifact_ref_digests(
 }
 
 async fn current_project_version(db: &SqliteDb, project_id: &str) -> Result<i64> {
-    sqlx::query_scalar("SELECT version FROM project WHERE id = ?")
-        .bind(project_id)
-        .fetch_optional(db.pool())
+    db.milestone_command_project_version(project_id)
         .await?
         .ok_or_else(|| ServiceError::not_found("project", project_id.to_owned()))
 }
@@ -1922,6 +1858,7 @@ fn frozen_project_value(
         "workflow_template_name": project.workflow_template_name,
         "primary_repo_id": project.primary_repo_id,
         "paused_at": project.paused_at,
+        "environment_pause_json": project.environment_pause_json,
         "owner_id": project.owner_id,
         "project_hooks_json": project.project_hooks_json,
         "project_work_epoch": project.project_work_epoch,
@@ -1947,6 +1884,7 @@ fn project_from_value(value: &Value) -> Result<Project> {
         primary_repo_id: optional_value_string(value, "primary_repo_id")?,
         paused_at: optional_value_string(value, "paused_at")?,
         system_pause_reason: optional_value_string(value, "system_pause_reason")?,
+        environment_pause_json: optional_value_string(value, "environment_pause_json")?,
         owner_id: optional_value_string(value, "owner_id")?,
         project_hooks_json: required_value(value, "project_hooks_json")?,
         project_work_epoch: required_value_i64(value, "project_work_epoch")?,
@@ -2032,21 +1970,6 @@ fn native_authorization(
             "occurred_at": action.created_at,
         })
         .to_string(),
-    }
-}
-
-fn build_revision_provenance() -> RevisionProvenance {
-    RevisionProvenance {
-        author: api_types::PrincipalRef {
-            kind: api_types::PrincipalKind::Agent,
-            id: String::new(),
-            display_name: None,
-        },
-        source_refs: Vec::new(),
-        change_summary: "Project Agent authored a typed milestone definition".to_owned(),
-        profile_revision: None,
-        operating_skill_revision: None,
-        material_diff: None,
     }
 }
 
@@ -2144,37 +2067,32 @@ fn required_value(value: &Value, field: &str) -> Result<String> {
         .ok_or_else(|| ServiceError::Conflict(format!("command outcome has no {field}")))
 }
 
-fn map_readiness(row: sqlx::sqlite::SqliteRow) -> Result<ProjectReadinessSnapshotRecord> {
+fn map_readiness(
+    row: db::MilestoneReplayReadinessSourceRow,
+) -> Result<ProjectReadinessSnapshotRecord> {
     Ok(ProjectReadinessSnapshotRecord {
-        id: row.try_get("id")?,
-        project_id: row.try_get("project_id")?,
-        milestone_id: row.try_get("milestone_id")?,
-        definition_revision_id: row.try_get("definition_revision_id")?,
-        input_manifest_json: row.try_get("input_manifest_json")?,
-        event_watermark: row.try_get("event_watermark")?,
-        outcome: row.try_get("outcome")?,
-        blocking_reasons_json: row.try_get("blocking_reasons_json")?,
-        check_results_json: row.try_get("check_results_json")?,
-        waiver_manifest_json: row.try_get("waiver_manifest_json")?,
-        evidence_manifest_json: row.try_get("evidence_manifest_json")?,
-        commit_context_json: row.try_get("commit_context_json")?,
-        computing_policy_revision: row.try_get("computing_policy_revision")?,
-        readiness_digest: row.try_get("readiness_digest")?,
-        principal_type: row.try_get("principal_type")?,
-        principal_id: row.try_get("principal_id")?,
-        authorization_basis: row.try_get("authorization_basis")?,
-        authorization_action: row.try_get("authorization_action")?,
-        authorization_occurred_at: row.try_get("authorization_occurred_at")?,
-        expected_milestone_version: row.try_get("expected_milestone_version")?,
-        explicit_event: row.try_get("explicit_event")?,
-        idempotency_key: row.try_get("idempotency_key")?,
-        created_at: row.try_get("created_at")?,
+        id: row.id()?,
+        project_id: row.project_id()?,
+        milestone_id: row.milestone_id()?,
+        definition_revision_id: row.definition_revision_id()?,
+        input_manifest_json: row.input_manifest_json()?,
+        event_watermark: row.event_watermark()?,
+        outcome: row.outcome()?,
+        blocking_reasons_json: row.blocking_reasons_json()?,
+        check_results_json: row.check_results_json()?,
+        waiver_manifest_json: row.waiver_manifest_json()?,
+        evidence_manifest_json: row.evidence_manifest_json()?,
+        commit_context_json: row.commit_context_json()?,
+        computing_policy_revision: row.computing_policy_revision()?,
+        readiness_digest: row.readiness_digest()?,
+        principal_type: row.principal_type()?,
+        principal_id: row.principal_id()?,
+        authorization_basis: row.authorization_basis()?,
+        authorization_action: row.authorization_action()?,
+        authorization_occurred_at: row.authorization_occurred_at()?,
+        expected_milestone_version: row.expected_milestone_version()?,
+        explicit_event: row.explicit_event()?,
+        idempotency_key: row.idempotency_key()?,
+        created_at: row.created_at()?,
     })
-}
-
-impl ProjectMilestoneDefinitionCommand {
-    #[must_use]
-    pub fn native_provenance() -> RevisionProvenance {
-        build_revision_provenance()
-    }
 }

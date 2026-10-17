@@ -1,6 +1,6 @@
 ---
 created_at: 2026-09-30T21:00:00Z
-updated_at: 2026-09-30T21:00:00Z
+updated_at: 2026-10-04T23:59:28Z
 completed_at:
 ---
 
@@ -22,11 +22,13 @@ completed_at:
 
 ## 3. Project Agent unblocking
 - [ ] 3.1 `task.recover` refused with `environment_paused` while the Project is env-paused; one project-level wake per pause
-- [ ] 3.2 `project.escalate` tool → Notification + Attention; automatic escalation when a blocker turn ends with no recorded outcome
-- [ ] 3.3 Wakes on pause cleared, config provided, and escalation answered
-- [ ] 3.4 Reserved budget share for blocker wakes; `repeated_failure` suppression for delivery follow-ups
-- [ ] 3.5 Doctrine: verify recovery took effect, never retry an unchanged blocker, escalate the exact need
-- [ ] 3.6 Focused tests for each of the above
+- [x] 3.2 `project.escalate` tool → Notification + Attention; automatic escalation when a blocker turn ends with no recorded outcome
+- [x] 3.3 Wake when the owner answers an escalation (folded into Refactor 3.5)
+- [ ] 3.3a Wake on environment pause cleared: follow-up; next has only the in-process `project.resumed` event, no durable event to consume
+- [ ] 3.3b Wake on config provided: follow-up to sections 1–2, which are not built
+- [x] 3.4 Reserved budget share for blocker wakes; `repeated_failure` suppression for delivery follow-ups
+- [x] 3.5 Doctrine: verify recovery took effect, never retry an unchanged blocker, escalate the exact need
+- [x] 3.6 Focused tests for the folded 3.2–3.5 scope (3.1, 3.3a and 3.3b remain follow-ups)
 
 ## 4. UI and release
 - [ ] 4.1 Configuration page (list, paste, mask), header badge, Attention card, `needs_config` task card text
