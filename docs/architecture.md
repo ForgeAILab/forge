@@ -10445,8 +10445,7 @@ another settlement command for its completed reviewer. An entry can commit and
 still not open its replacement (its `dispatch_role_agent` hook only logs a
 failure). The completed reviewer is then bound to the cancelled newest Review,
 which has nothing left to settle: the dispatcher does not settle it again, and
-its role dispatch opens the next attempt and starts a reviewer (a gate with
-review checks parks on them instead).
+its role dispatch opens the next attempt and starts a reviewer.
 
 A Task whose `task_state_config` still names an auditor
 (`review.auditor_agent_id`, read only by the retired pipeline) and has no
