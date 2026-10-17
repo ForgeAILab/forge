@@ -371,7 +371,7 @@ function ReviewOwnerAttentionCard(props: AttentionCardProps) {
   const project = useProjectQuery(props.item.scope_id)
   const members = useMembersQuery(props.item.scope_id)
   const member = members.data?.find((entry) => entry.user_id === user?.id)
-  const ownerId = project.data && 'owner_id' in project.data ? project.data.owner_id : undefined
+  const ownerId = project.data?.owner_id
   // Match ProjectAccess::Owner: an explicit membership takes precedence over
   // owner_id, and instance administration alone does not grant owner rights.
   const canAct = Boolean(
