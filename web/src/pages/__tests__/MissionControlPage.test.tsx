@@ -8,15 +8,23 @@ const retryTurn = vi.hoisted(() => vi.fn())
 const resolveAttention = vi.hoisted(() => vi.fn())
 const answerEscalation = vi.hoisted(() => vi.fn())
 const turnState = vi.hoisted(() => ({ live: false }))
+const taskAction = vi.hoisted(() => vi.fn())
 vi.mock('@/api/hooks', () => ({
+  useTaskAction: () => ({ mutate: taskAction, isPending: false }),
   useAgentQuery: (id?: string) => ({
     data: id === 'lead-agent' ? { name: 'Ada Lead' } : undefined,
   }),
 }))
 
 vi.mock('@tanstack/react-router', () => ({
-  Link: ({ children, ...props }: { children: React.ReactNode } & Record<string, unknown>) => (
-    <a {...props}>{children}</a>
+  Link: ({
+    children,
+    params,
+    ...props
+  }: { children: React.ReactNode } & Record<string, unknown>) => (
+    <a href="#" {...props} data-params={JSON.stringify(params)}>
+      {children}
+    </a>
   ),
 }))
 vi.mock('@/features/federation/hooks', () => ({
@@ -413,6 +421,81 @@ describe('MissionControlPage', () => {
       data.review_ready = previous.review_ready
       data.active_work = previous.active_work
       data.agent_health = previous.agent_health
+    }
+  })
+
+  it.each([
+    'repeated finding F1',
+    'only non-blocking findings remain',
+    'no change after repair round',
+  ])('shows review parks with their reason and owner offers: %s', (reason) => {
+    const previous = data.needs_attention
+    data.needs_attention = [
+      {
+        ...previous[0],
+        category: 'review_needs_owner',
+        scope_type: 'project',
+        scope_id: 'project-1',
+        summary: `Review needs the owner: ${reason}`,
+        recommended_action: 'inspect_review',
+        details: {
+          entity_type: 'task',
+          entity_id: 'task-1',
+          task: { task_version: 12 },
+          interruption: { kind: 'review_needs_owner', reason },
+          recovery: {
+            actions: [
+              {
+                action: { verb: 'approve', override: false },
+                label: 'Defer Finding to Follow-up',
+                reason: 'review_needs_owner',
+                authority: ['owner'],
+                parameters: [{ name: 'reason', required: true, boolean_values: null }],
+                target_execution_id: null,
+                propagates: false,
+              },
+              {
+                action: { verb: 'retry' },
+                label: 'Retry With Guidance',
+                reason: 'review_owner_retry',
+                authority: ['owner'],
+                parameters: [{ name: 'guidance', required: false, boolean_values: null }],
+                target_execution_id: null,
+                propagates: false,
+              },
+            ],
+          },
+        },
+      },
+    ]
+    try {
+      render(<MissionControlPage />)
+      const card = screen
+        .getByRole('heading', { name: `Review needs the owner: ${reason}` })
+        .closest('article')
+      expect(card?.className).toContain('bg-warning/5')
+      expect(card?.textContent).not.toContain('Task needs recovery')
+      expect(
+        screen.getByRole('link', { name: 'Open review' }).getAttribute('data-params'),
+      ).toContain('review')
+      expect(screen.getByRole('button', { name: 'Retry With Guidance' })).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'Defer Finding to Follow-up' }))
+      expect(screen.getByRole('button', { name: 'Apply' }).hasAttribute('disabled')).toBe(true)
+      fireEvent.change(screen.getByLabelText('reason (required)'), {
+        target: { value: 'Track in follow-up' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+      expect(taskAction).toHaveBeenCalledWith(
+        {
+          taskId: 'task-1',
+          version: 12,
+          action: { verb: 'approve', override: false, reason: 'Track in follow-up' },
+        },
+        expect.anything(),
+      )
+    } finally {
+      data.needs_attention = previous
+      taskAction.mockClear()
     }
   })
 

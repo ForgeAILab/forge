@@ -87,6 +87,93 @@ async fn non_member_cannot_read_agent_detail() {
 }
 
 #[tokio::test]
+async fn attention_review_owner_category_survives_list_and_home() {
+    let workspace = common::TestDir::new("review-owner-attention-ws");
+    let harness = common::test_app(workspace.path(), "review-owner-attention").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Review owner Attention"}),
+        StatusCode::OK,
+    )
+    .await;
+    for (category, summary) in [
+        (
+            "review_needs_owner",
+            "Review needs the owner: repeated finding F1",
+        ),
+        ("execution_failed", "Task needs recovery"),
+    ] {
+        let id = new_uuid_v4();
+        let event = DomainEventRepo::append_event(
+            &*harness.state.db,
+            CreateDomainEvent {
+                id: new_uuid_v4(),
+                event_type: "test.attention".into(),
+                entity_type: "task".into(),
+                entity_id: id.clone(),
+                actor_type: "system".into(),
+                actor_id: None,
+                scope_type: "project".into(),
+                scope_id: project.id.clone(),
+                correlation_id: new_uuid_v4(),
+                causation_id: None,
+                causation_depth: 0,
+                dedupe_key: None,
+                payload_json: "{}".into(),
+                created_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        let now = now_rfc3339();
+        AttentionRepo::insert_attention(&*harness.state.db, CreateAttentionProjection {
+            id: id.clone(), attention_type: category.into(), scope_type: "project".into(),
+            scope_id: project.id.clone(), identity_id: None, source_event_id: event.id,
+            priority: 85, status: "open".into(), summary: summary.into(),
+            details_json: json!({"entity_type":"task","entity_id":id,"interruption":{"kind":category,"reason":"repeated finding F1"},"recovery":{"actions":[]}}).to_string(),
+            dedupe_key: format!("attention:test:{id}"), occurred_at: now.clone(), updated_at: now,
+            acknowledged_at: None, snoozed_until: None, resolved_at: None, updated_by_user_id: None,
+            recommended_action: if category == "review_needs_owner" { "inspect_review" } else { "inspect_task" }.into(),
+            source_sequence: Some(event.sequence),
+        }).await.unwrap();
+    }
+    let list: api_types::AttentionListResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!(
+            "/api/v1/mission-control/attention?project_id={}",
+            project.id
+        ),
+        StatusCode::OK,
+    )
+    .await;
+    let home: MissionControlHomeResponse = common::empty_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/mission-control?project_id={}", project.id),
+        StatusCode::OK,
+    )
+    .await;
+    for items in [&list.items, &home.needs_attention] {
+        assert_eq!(items.len(), 2);
+        let park = items
+            .iter()
+            .find(|i| i.category == api_types::AttentionCategory::ReviewNeedsOwner)
+            .unwrap();
+        assert_eq!(park.summary, "Review needs the owner: repeated finding F1");
+        assert_eq!(park.recommended_action, "inspect_review");
+        let failure = items
+            .iter()
+            .find(|i| i.category == api_types::AttentionCategory::ExecutionFailed)
+            .unwrap();
+        assert_eq!(failure.summary, "Task needs recovery");
+        assert_eq!(failure.recommended_action, "inspect_task");
+    }
+}
+
+#[tokio::test]
 async fn mission_control_reports_visible_attention_count_and_stale_health() {
     let workspace = common::TestDir::new("mission-control-health-ws");
     let harness = common::test_app(workspace.path(), "mission-control-health").await;

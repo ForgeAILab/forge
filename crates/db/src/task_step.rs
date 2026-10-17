@@ -71,6 +71,31 @@ pub struct EnqueueTaskStep {
     pub available_at: String,
 }
 
+/// Workflow authority carried by a hooks or cascade payload. A definition is
+/// preparation-only: enqueue freezes it to a snapshot in the step transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum WorkflowReference {
+    Project,
+    Snapshot(String),
+    Definition(String),
+}
+
+async fn store_step_workflow_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    definition: &str,
+) -> Result<String> {
+    sqlx::query("INSERT INTO task_step_workflow(id,definition_json,last_used_at) VALUES (?,?,?) ON CONFLICT(definition_json) DO UPDATE SET last_used_at=excluded.last_used_at")
+        .bind(crate::new_uuid_v4()).bind(definition).bind(now_rfc3339())
+        .execute(&mut **tx).await?;
+    Ok(
+        sqlx::query_scalar("SELECT id FROM task_step_workflow WHERE definition_json=?")
+            .bind(definition)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
 #[async_trait]
 pub trait TaskStepRepo: Send + Sync {
     async fn enqueue_step_in_tx(
@@ -158,9 +183,41 @@ impl TaskStepRepo for SqliteDb {
         tx: &mut Transaction<'_, Sqlite>,
         i: &EnqueueTaskStep,
     ) -> Result<String> {
+        let mut payload_json = i.payload_json.clone();
+        let definition_payload = serde_json::from_str::<serde_json::Value>(&payload_json)
+            .ok()
+            .filter(|payload| {
+                payload
+                    .pointer("/workflow_ref/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("definition")
+            });
+        if let Some(mut payload) = definition_payload {
+            // A replay must not freeze a payload the existing step will
+            // never consume. Other step kinds keep their replay handling.
+            if let Some(id) = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM task_step WHERE task_id=? AND causation_key=?",
+            )
+            .bind(&i.task_id)
+            .bind(&i.causation_key)
+            .fetch_optional(&mut **tx)
+            .await?
+            {
+                return Ok(id);
+            }
+            let definition = payload
+                .pointer("/workflow_ref/id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    DbError::Check("step workflow definition must be a string".into())
+                })?;
+            let id = store_step_workflow_in_tx(tx, definition).await?;
+            payload["workflow_ref"] = serde_json::json!({"kind":"snapshot","id":id});
+            payload_json = payload.to_string();
+        }
         let now = now_rfc3339();
         sqlx::query("INSERT INTO task_step (id,task_id,seq,kind,payload_json,causation_step_id,causation_key,chain_id,chain_position,expected_status,expected_version,expected_epoch,lane,status,available_at,created_at,updated_at) SELECT ?,?,COALESCE(MAX(seq),0)+1,?,?,?,?,?,?,?,?,COALESCE(?,(SELECT status_epoch FROM task WHERE id=?),0),?,'pending',?,?,? FROM task_step WHERE task_id = ? ON CONFLICT(task_id,causation_key) DO NOTHING")
-            .bind(&i.id).bind(&i.task_id).bind(&i.kind).bind(&i.payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
+            .bind(&i.id).bind(&i.task_id).bind(&i.kind).bind(&payload_json).bind(&i.causation_step_id).bind(&i.causation_key)
             .bind(&i.chain_id).bind(i.chain_position).bind(&i.expected_status).bind(i.expected_version)
             .bind(i.expected_epoch).bind(&i.task_id).bind(&i.lane).bind(&i.available_at).bind(&now).bind(&now).bind(&i.task_id).execute(&mut **tx).await?;
         let mut superseded = 0;
@@ -218,13 +275,10 @@ impl TaskStepRepo for SqliteDb {
         )
     }
     async fn store_step_workflow(&self, definition: &str) -> Result<String> {
-        sqlx::query("INSERT INTO task_step_workflow(id,definition_json,last_used_at) VALUES (?,?,?) ON CONFLICT(definition_json) DO UPDATE SET last_used_at=excluded.last_used_at").bind(crate::new_uuid_v4()).bind(definition).bind(now_rfc3339()).execute(self.pool()).await?;
-        Ok(
-            sqlx::query_scalar("SELECT id FROM task_step_workflow WHERE definition_json=?")
-                .bind(definition)
-                .fetch_one(self.pool())
-                .await?,
-        )
+        let mut tx = begin_immediate(self.pool()).await?;
+        let id = store_step_workflow_in_tx(&mut tx, definition).await?;
+        tx.commit().await?;
+        Ok(id)
     }
     async fn step_workflow(&self, id: &str) -> Result<String> {
         Ok(
@@ -1349,6 +1403,64 @@ mod tests {
     }
     fn later() -> String {
         (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+    }
+    #[tokio::test]
+    async fn workflow_snapshot_rolls_back_with_its_step_and_replays_without_orphans() {
+        let db = fixture().await;
+        let mut step = input("a", "frozen-workflow");
+        step.payload_json = serde_json::json!({
+            "workflow_ref": WorkflowReference::Definition("{\"states\":[]}".into())
+        })
+        .to_string();
+        let mut tx = begin_immediate(db.pool()).await.unwrap();
+        db.enqueue_step_in_tx(&mut tx, &step).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap(),
+            1
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.task_steps("a").await.unwrap().is_empty());
+
+        let id = db.enqueue_step(&step).await.unwrap();
+        let stored = db.task_steps("a").await.unwrap().remove(0);
+        let payload: serde_json::Value = serde_json::from_str(&stored.payload_json).unwrap();
+        assert_eq!(payload["workflow_ref"]["kind"], "snapshot");
+        assert_eq!(
+            db.step_workflow(payload["workflow_ref"]["id"].as_str().unwrap())
+                .await
+                .unwrap(),
+            "{\"states\":[]}"
+        );
+        step.payload_json = serde_json::json!({"workflow_ref": WorkflowReference::Definition("different workflow".into())}).to_string();
+        assert_eq!(db.enqueue_step(&step).await.unwrap(), id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        step.id = crate::new_uuid_v4();
+        step.causation_key = "same-definition".into();
+        step.payload_json = serde_json::json!({"workflow_ref": WorkflowReference::Definition("{\"states\":[]}".into())}).to_string();
+        db.enqueue_step(&step).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
     }
     #[tokio::test]
     async fn fast_commands_do_not_hide_owner_actions_but_long_commands_do() {

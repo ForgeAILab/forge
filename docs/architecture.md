@@ -7082,6 +7082,15 @@ Historical events without a snapshot remain unchanged and have unknown
 workflow semantics. Live authorization and recovery checks still use current
 state.
 
+Queued hooks and cascades prepare their workflow definition without a database
+write. `TaskStepRepo::enqueue_step_in_tx` freezes it to the deduplicated
+`task_step_workflow` snapshot and stores its reference in the same transaction
+as the step and producing transition (including board moves). Rollback leaves
+no snapshot behind; a transition with no hooks creates none, and an idempotent
+enqueue never freezes a replacement payload. Persisted step references remain
+`project` or `snapshot`; the preparation-only `definition` reference never
+reaches a worker. Existing snapshot retention and garbage collection apply.
+
 `StateKind` classifies states:
 
 - **`backlog`** — parking lot; agent claims rejected. Reserved for a

@@ -50,6 +50,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Review parks with a `review_needs_owner` condition now use Attention category
+  `review_needs_owner` instead of `execution_failed`. Clients matching category
+  values must handle this owner-decision category.
 - Provider and fetch now reject bare `internal`, `home.arpa` and `local`, plus
   `localhost.localdomain` and its subdomains. Public search now also rejects
   bare `local` and subdomains of `localhost.localdomain`. Case and trailing-dot
@@ -1854,6 +1857,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Review parks name the owner decision and park reason in Attention and show
+  the owner's finding deferral and guided retry offers when eligible.
+- Workflow snapshots now commit with their queued step and transition,
+  including board moves; failed entries and unused payloads leave no orphan.
 - Review rounds now derive repeat parks from open blocking reviewer findings.
   A carried finding gets another round while the open blocking count shrinks;
   after ordinary Review retries are spent, `review_progress` grants up to two

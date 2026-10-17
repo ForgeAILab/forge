@@ -920,8 +920,21 @@ direct stream so one approved execution cannot appear twice.
 
 `AttentionCategory` includes `human_input_required`, `validation_failed`,
 `run_stalled`, `progress_warning`, `retry_exhausted`, `review_ready`, `review_risk`,
-`execution_failed`, `delivery_followup`, `decision_recorded`, `runtime_offline`,
+`review_needs_owner`, `execution_failed`, `delivery_followup`, `decision_recorded`, `runtime_offline`,
 `budget_threshold`, `commitment_overdue`, and `conflict_hotspot`.
+
+Tasks parked with the typed `review_needs_owner` condition project as
+`review_needs_owner`, priority 85, recommended action `inspect_review`. Their
+summary is `Review needs the owner: <park reason>`; `details.interruption`
+retains that reason (for example a repeated finding, only non-blocking findings
+remaining, or no change after repair). `details.recovery.actions` contains the
+owner's standard Task offers, including finding deferral and guided retry when
+eligible. These are versioned context snapshots: commands still use the Task
+action API and its current authorization. Mission Control renders the shared
+Task action forms and a link to Review. Other interruption causes retain
+`execution_failed`. Clearing the condition, replacing its cause, or reaching a
+terminal state resolves the old park incident; owner parks use the existing
+blocker wake budget and intervention checks.
 
 `project.conflict_hotspot.detected` is a durable Project-scoped event with
 `project_id`, `path`, `task_ids` (distinct, most recent first, at most 10),

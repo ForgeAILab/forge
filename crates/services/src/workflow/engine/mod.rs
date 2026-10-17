@@ -1460,7 +1460,7 @@ impl WorkflowExecution<'_> {
             producing.status = target_state.clone();
             producing.version = version + 1;
             let input = self.cascade_step_input(&producing, workflow, target_state.clone(), reason.clone(), bridge.clone(), false, false, authority.clone(), step.as_ref(), transition_log_id.clone(), None).await?;
-            let frozen = self.db.store_step_workflow(&serde_json::to_string(&durable::HookDefinition { workflow: workflow.clone(), project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()) }).map_err(|e| ServiceError::invalid_operation(e.to_string()))?).await?;
+            let frozen = serde_json::to_string(&durable::HookDefinition { workflow: workflow.clone(), project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()) }).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
             let cascade_payload: crate::worker_runtime::queue::CascadePayload = serde_json::from_str(&input.payload_json).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
             let mut dispatch_index = to_state.hooks.on_enter.iter().position(|h| registry::is_dispatch_action(&h.action) && hook_audience_matches(h.applies_to, &actor))
                 .map(|i| (from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len() + i) as i64);
@@ -1513,7 +1513,7 @@ impl WorkflowExecution<'_> {
             let hook_payload = durable::HookPayload {
                 entry_origin,
                 from: current_status.clone(), to: target_state.clone(), actor: actor.clone(), reason: reason.clone(), bridge: bridge.clone(), transition_log_id: transition_log_id.clone(),
-                workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen), authority: authority.as_ref().map(|a| a.project_version),
+                workflow_ref: db::WorkflowReference::Definition(frozen), authority: authority.as_ref().map(|a| a.project_version),
                 from_config: exit_ctx.state_config.clone(), to_config: enter_ctx.state_config.clone(), workspace_id: enter_ctx.workspace_id.clone(), execution_id: enter_ctx.execution_id.clone(), agent_id: enter_ctx.agent_id.clone(),
                 skip_before_enter: review_refresh_bridge, skip_on_exit: entry_retry, defer_dispatch_until: defer_dispatch_until.clone(), action_dispatch, pre_results: hook_results.clone(), dispatch_index, admission_agent_id, evidence: cascade_payload.evidence,
             };
@@ -1855,15 +1855,11 @@ impl WorkflowExecution<'_> {
             .await?;
         let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
         let workflow_ref = if authority.is_some() {
-            crate::worker_runtime::queue::WorkflowReference::Project
+            db::WorkflowReference::Project
         } else {
-            crate::worker_runtime::queue::WorkflowReference::Snapshot(
-                self.db
-                    .store_step_workflow(
-                        &serde_json::to_string(workflow)
-                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
-                    )
-                    .await?,
+            db::WorkflowReference::Definition(
+                serde_json::to_string(workflow)
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
             )
         };
         let continuing = parent.filter(|p| {

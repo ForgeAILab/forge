@@ -47,6 +47,8 @@ pub async fn home(
     ))
 }
 
+/// Review parks are returned as `review_needs_owner`, with their park reason
+/// in the summary and owner Task offers in `details.recovery.actions`.
 pub async fn list_attention(
     State(state): State<AppState>,
     user: AuthenticatedUser,

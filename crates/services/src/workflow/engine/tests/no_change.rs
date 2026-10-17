@@ -112,6 +112,105 @@ async fn no_change_twice_parks_without_another_review_or_check() {
     assert_eq!(blocked["reason"], "no change after repair round");
 }
 
+#[tokio::test]
+async fn review_park_attention_names_the_reason_and_offers_owner_actions() {
+    let f = red_fixture().await;
+    let attention = crate::AttentionService::new(
+        f.db.clone(),
+        Arc::new(crate::WakeTurnConsumer::new(f.db.clone())),
+    );
+    attention.project_once(100).await.unwrap();
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    repair(&f).await;
+    let parked = enter(&f, workflow_actor()).await;
+    attention.project_once(100).await.unwrap();
+    let raw: String = sqlx::query_scalar("SELECT id FROM attention_projection WHERE attention_type='review_needs_owner' AND status='open'")
+        .fetch_one(f.db.pool()).await.unwrap();
+    let row = db::AttentionRepo::get_attention(&*f.db, &raw)
+        .await
+        .unwrap()
+        .unwrap();
+    let item = crate::attention_service::attention_item(row.clone()).unwrap();
+    assert_eq!(
+        item.category,
+        api_types::AttentionCategory::ReviewNeedsOwner
+    );
+    assert_eq!(
+        item.summary,
+        "Review needs the owner: no change after repair round"
+    );
+    assert_eq!(item.recommended_action, "inspect_review");
+    assert_eq!(
+        item.details["interruption"]["reason"],
+        "no change after repair round"
+    );
+    assert_eq!(item.details["recovery"]["automatic_retry"], false);
+    assert_eq!(item.details["task"]["task_version"], parked.version);
+    let snapshot = f
+        .engine
+        .task_action_snapshot(
+            &parked.id,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+        )
+        .await
+        .unwrap();
+    let offers = crate::available_actions(&snapshot);
+    assert!(offers
+        .iter()
+        .any(|offer| offer.reason == "review_needs_owner"));
+    assert_eq!(
+        item.details["recovery"]["actions"],
+        serde_json::to_value(offers).unwrap()
+    );
+    assert!(crate::attention_service::blocker_category(
+        "review_needs_owner"
+    ));
+    assert_eq!(
+        crate::attention_service::wake_budget_category(&row),
+        "blocker"
+    );
+    TaskRepo::update_status(
+        &*f.db,
+        db::UpdateTaskStatus {
+            id: parked.id.clone(),
+            expected_version: parked.version,
+            status: "in_progress".into(),
+            assignee_id: None,
+            error_annotation: Some(None),
+            blocked_json: Some(None),
+            failed_json: Some(None),
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !crate::project_escalation::ProjectEscalationService::new(f.db.clone())
+            .escalate_blocker(&row)
+            .await
+            .unwrap(),
+        "a cleared review park cannot escalate while projection is behind"
+    );
+    assert_eq!(
+        db::AttentionRepo::get_attention(&*f.db, &raw)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "resolved"
+    );
+    attention.project_once(100).await.unwrap();
+    assert_eq!(
+        db::AttentionRepo::get_attention(&*f.db, &raw)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "resolved"
+    );
+}
+
 async fn forge_comments(f: &FailedCiFixture) -> Vec<db::TaskComment> {
     db::TaskCommentRepo::list_comments(
         &*f.db,

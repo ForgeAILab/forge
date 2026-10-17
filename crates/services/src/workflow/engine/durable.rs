@@ -25,7 +25,7 @@ pub(crate) struct HookPayload {
     pub actor: Actor,
     pub reason: String,
     pub transition_log_id: String,
-    pub workflow_ref: crate::worker_runtime::queue::WorkflowReference,
+    pub workflow_ref: db::WorkflowReference,
     pub authority: Option<i64>,
     pub from_config: serde_json::Value,
     pub to_config: serde_json::Value,
@@ -323,8 +323,7 @@ impl WorkflowExecution<'_> {
         step: &db::TaskStep,
         payload: &HookPayload,
     ) -> crate::Result<HookPhaseResult> {
-        let crate::worker_runtime::queue::WorkflowReference::Snapshot(id) = &payload.workflow_ref
-        else {
+        let db::WorkflowReference::Snapshot(id) = &payload.workflow_ref else {
             return Err(ServiceError::invalid_operation(
                 "hook phase requires its committed workflow",
             ));

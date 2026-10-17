@@ -581,13 +581,16 @@ impl AttentionService {
         let recommended_action: String = row.recommended_action?;
         let version: i64 = row.version?;
         let details = serde_json::from_str::<Value>(&details_json).unwrap_or(Value::Null);
-        let requires_current_task_intervention = attention_type == "execution_failed"
-            && details.get("source_event_type").and_then(Value::as_str)
+        let requires_current_task_intervention =
+            matches!(
+                attention_type.as_str(),
+                "execution_failed" | "review_needs_owner"
+            ) && details.get("source_event_type").and_then(Value::as_str)
                 == Some("task.interruption_changed")
-            && details
-                .pointer("/recovery/requires_intervention")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+                && details
+                    .pointer("/recovery/requires_intervention")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
         let task_id = requires_current_task_intervention
             .then(|| {
                 details
@@ -2429,7 +2432,16 @@ impl AttentionService {
             let cause = failed_turn
                 .as_ref()
                 .and_then(|turn| turn.failure_class.as_ref());
-            let summary = if category == "conflict_hotspot" {
+            let summary = if category == "review_needs_owner" {
+                let reason = event
+                    .task_material_blocker()
+                    .and_then(|m| m.interruption)
+                    .and_then(|i| i.get("reason").and_then(Value::as_str).map(str::to_owned));
+                match reason.filter(|reason| !reason.trim().is_empty()) {
+                    Some(reason) => format!("Review needs the owner: {reason}"),
+                    None => summary.to_owned(),
+                }
+            } else if category == "conflict_hotspot" {
                 let payload =
                     serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
                 format!(
@@ -2504,16 +2516,22 @@ impl AttentionService {
                     if let Some(project) =
                         db::ProjectRepo::get_by_id(&*self.db, &task.project_id).await?
                     {
-                        let actor = match db::ProjectAgentBindingRepo::get_active_project_binding(
-                            &*self.db,
-                            &task.project_id,
-                        )
-                        .await?
-                        .filter(|binding| binding.state == "active")
-                        .and_then(|binding| binding.identity_id)
-                        {
-                            Some(agent_id) => api_types::Actor::agent(agent_id),
-                            None => api_types::Actor::system(api_types::SystemComponent::Workflow),
+                        let actor = if category == "review_needs_owner" {
+                            api_types::Actor::user(api_types::UserActionSource::Api)
+                        } else {
+                            match db::ProjectAgentBindingRepo::get_active_project_binding(
+                                &*self.db,
+                                &task.project_id,
+                            )
+                            .await?
+                            .filter(|binding| binding.state == "active")
+                            .and_then(|binding| binding.identity_id)
+                            {
+                                Some(agent_id) => api_types::Actor::agent(agent_id),
+                                None => {
+                                    api_types::Actor::system(api_types::SystemComponent::Workflow)
+                                }
+                            }
                         };
                         let workflow =
                             crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
@@ -2698,6 +2716,7 @@ impl AttentionService {
                 "retry_exhausted",
                 "review_ready",
                 "review_risk",
+                "review_needs_owner",
                 "execution_failed",
             ]);
         }
@@ -3737,10 +3756,26 @@ fn classify_event(event: &DomainEvent) -> Option<&'static str> {
         return Some("delivery_followup");
     }
     if event_type == "task.interruption_changed" {
-        return event
-            .task_material_blocker()
-            .is_some_and(|m| m.requires_intervention)
-            .then_some("execution_failed");
+        let material = event.task_material_blocker()?;
+        return material.requires_intervention.then(|| {
+            if material
+                .interruption
+                .as_ref()
+                .and_then(|i| i.get("kind"))
+                .and_then(Value::as_str)
+                == Some("review_needs_owner")
+                && material
+                    .interruption
+                    .as_ref()
+                    .and_then(|i| i.get("source"))
+                    .and_then(Value::as_str)
+                    != Some("integration")
+            {
+                "review_needs_owner"
+            } else {
+                "execution_failed"
+            }
+        });
     }
     None
 }
@@ -3776,12 +3811,16 @@ fn resolution_categories(event: &DomainEvent) -> Vec<&'static str> {
     if event_type == "execution.completed" {
         categories.push("execution_failed");
     }
-    if event_type == "task.interruption_changed"
-        && !event
-            .task_material_blocker()
-            .is_some_and(|m| m.requires_intervention)
-    {
-        categories.push("execution_failed");
+    if event_type == "task.interruption_changed" {
+        // A changed cause replaces the previous kind of Task incident. A
+        // cleared condition closes either kind; neither park can linger.
+        let current = classify_event(event);
+        if current != Some("execution_failed") {
+            categories.push("execution_failed");
+        }
+        if current != Some("review_needs_owner") {
+            categories.push("review_needs_owner");
+        }
     }
     if event_type.contains("review")
         && (event_type.contains("passed") || event_type.contains("approved"))
@@ -3819,6 +3858,7 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "retry_exhausted" => (90, "Retry budget exhausted", "review_retry"),
         "review_ready" => (55, "Work is ready for review", "review"),
         "review_risk" => (85, "Review reported a risk", "inspect_review"),
+        "review_needs_owner" => (85, "Review needs the owner", "inspect_review"),
         "execution_failed" => (85, "Task needs recovery", "inspect_task"),
         "delivery_followup" => (
             70,
@@ -3849,6 +3889,7 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "retry_exhausted" => AttentionCategory::RetryExhausted,
         "review_ready" => AttentionCategory::ReviewReady,
         "review_risk" => AttentionCategory::ReviewRisk,
+        "review_needs_owner" => AttentionCategory::ReviewNeedsOwner,
         "execution_failed" => AttentionCategory::ExecutionFailed,
         "delivery_followup" => AttentionCategory::DeliveryFollowup,
         "decision_recorded" => AttentionCategory::DecisionRecorded,
@@ -4198,7 +4239,11 @@ pub(crate) async fn resolve_turn_incident<D: db::AttentionRepo>(
 pub(crate) fn blocker_category(category: &str) -> bool {
     matches!(
         category,
-        "execution_failed" | "environment_not_ready" | "review_risk" | "human_input_required"
+        "execution_failed"
+            | "review_needs_owner"
+            | "environment_not_ready"
+            | "review_risk"
+            | "human_input_required"
     )
 }
 pub(crate) fn wake_budget_category(attention: &AttentionProjection) -> &'static str {
@@ -5047,6 +5092,41 @@ mod tests {
     }
 
     #[test]
+    fn review_park_attention_uses_the_typed_cause_and_replaces_other_blockers() {
+        for reason in [
+            "repeated finding F1",
+            "only non-blocking findings remain",
+            "no change after repair round",
+        ] {
+            let payload = json!({"requires_intervention":true,"interruption":{"kind":"review_needs_owner","reason":reason}}).to_string();
+            let park = event("task.interruption_changed", &payload);
+            assert_eq!(classify_event(&park), Some("review_needs_owner"));
+            assert_eq!(resolution_categories(&park), vec!["execution_failed"]);
+        }
+        let failure = event(
+            "task.interruption_changed",
+            r#"{"requires_intervention":true,"interruption":{"kind":"executor_failed","reason":"no change after repair round"}}"#,
+        );
+        assert_eq!(classify_event(&failure), Some("execution_failed"));
+        assert_eq!(resolution_categories(&failure), vec!["review_needs_owner"]);
+        // Integration deferrals reuse the diagnostic failure kind but retain
+        // their existing recovery category, rather than becoming review parks.
+        let integration = event(
+            "task.interruption_changed",
+            r#"{"requires_intervention":true,"interruption":{"source":"integration","kind":"review_needs_owner","reason":"integration requires the owner"}}"#,
+        );
+        assert_eq!(classify_event(&integration), Some("execution_failed"));
+        let clear = event(
+            "task.interruption_changed",
+            r#"{"requires_intervention":false}"#,
+        );
+        assert_eq!(
+            resolution_categories(&clear),
+            vec!["execution_failed", "review_needs_owner"]
+        );
+    }
+
+    #[test]
     fn task_transition_rules_are_deterministic() {
         assert_eq!(
             classify_event(&event("task.transitioned", r#"{"to_state":"blocked"}"#)),
@@ -5097,7 +5177,7 @@ mod tests {
                 "task.interruption_changed",
                 r#"{"requires_intervention":false}"#
             )),
-            vec!["execution_failed"]
+            vec!["execution_failed", "review_needs_owner"]
         );
         assert_eq!(
             classify_event(&event(

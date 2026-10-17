@@ -610,6 +610,8 @@ fn wake_content(
     let decision_requirement = decision_directive(attention);
     let final_instruction = if attention.attention_type == "execution_failed" {
         execution_failed_directive(attention)
+    } else if attention.attention_type == "review_needs_owner" {
+        "Review is parked for the owner. Refresh the Task and inspect the park reason and finding ledger. The owner offers in this snapshot are context only: use only actions the current Task advertises for your own authority. Ask the owner for any owner-only decision; this wake grants no approval or deferral authority.".to_owned()
     } else if attention.attention_type == "conflict_hotspot" {
         conflict_hotspot_directive().to_owned()
     } else {
@@ -690,6 +692,21 @@ mod tests {
             recommended_action: "continue_from_decision".to_owned(),
             source_sequence: Some(1),
         }
+    }
+
+    #[test]
+    fn review_park_attention_wake_preserves_owner_authority() {
+        let content = wake_content(
+            &attention(
+                "review_needs_owner",
+                r#"{"interruption":{"reason":"repeated finding F1"}}"#,
+            ),
+            None,
+        );
+        assert!(content.contains("repeated finding F1"));
+        assert!(content.contains("owner-only decision"));
+        assert!(content.contains("this wake grants no approval or deferral authority"));
+        assert!(!content.contains("EXECUTION FAILURE RECOVERY"));
     }
 
     #[test]

@@ -322,6 +322,11 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 ### Mission Control and Agent detail
 
+- Review parks use the existing warning card treatment and name the owner's
+  decision and park reason. Render the server's owner offers with the shared
+  Task action buttons and parameter dialogs; link to the Task's Review tab.
+  Resolved cards retain their reason and link without active Task controls.
+  Long reasons wrap and actions use the existing responsive button layout.
 - **Hierarchy:** primary views lead with the singular Main binding, one Project binding per authorized Project, relevant Task Worker/reviewer activity, Attention, and outcomes. Connected profiles without a binding or active Task scope stay in secondary configuration inventory.
 - **Coordination activity:** render one titled, durable activity section with two explicit groups: `Durable direct-command receipts` for commands committed through the shared command boundary, and `Pending and approved approval actions` for frozen approval-required records. The groups remain visually and semantically distinct even when one group is empty; never imply that an approval action has applied its domain effect until a committed command receipt exists.
 - **Activity provenance:** each row exposes the operation, status, policy result, actor type/ID, scope type/ID, input digest, correlation ID, and occurred-at time in a wrapped metadata grid. Render IDs and digests as inspectable metadata with `break-all`/`title` support; never render raw input or outcome JSON. A recorded outcome may be acknowledged as metadata only (for example, `Outcome recorded`).

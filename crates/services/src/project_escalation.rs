@@ -439,7 +439,10 @@ impl ProjectEscalationService {
         // intervention state under the escalation transaction's writer lock.
         if details.get("source_event_type").and_then(Value::as_str)
             == Some("task.interruption_changed")
-            && current.attention_type == "execution_failed"
+            && matches!(
+                current.attention_type.as_str(),
+                "execution_failed" | "review_needs_owner"
+            )
         {
             let task_id = details
                 .get("entity_id")
