@@ -1675,9 +1675,7 @@ fn public_https_origin(origin: &str) -> bool {
         return false;
     }
     match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            !crate::network_policy::restricted_provider_hostname(domain)
-        }
+        Some(url::Host::Domain(domain)) => !config::is_restricted_public_hostname(domain),
         Some(url::Host::Ipv4(address)) => !config::is_restricted_public_address(address.into()),
         Some(url::Host::Ipv6(address)) => !config::is_restricted_public_address(address.into()),
         None => false,
@@ -4319,6 +4317,44 @@ mod tests {
                 !public_https_origin(refused),
                 "{refused} must not be an authorizable fetch origin"
             );
+        }
+    }
+
+    #[test]
+    fn hostname_refusal_fetch_authorization() {
+        for reserved in [
+            "localhost",
+            "localhost.localdomain",
+            "internal",
+            "home.arpa",
+            "local",
+        ] {
+            for host in [
+                reserved.to_owned(),
+                format!("search.{reserved}"),
+                format!("nested.search.{reserved}"),
+            ] {
+                for host in [
+                    host.clone(),
+                    host.to_ascii_uppercase(),
+                    format!("{host}."),
+                    format!("{}.", host.to_ascii_uppercase()),
+                ] {
+                    assert!(!public_https_origin(&format!("https://{host}")), "{host}");
+                }
+            }
+        }
+        for host in [
+            "example.internal.com",
+            "internal.example.com",
+            "home.arpa.example.com",
+            "local.example.com",
+            "localhost.example.com",
+            "localhost.localdomain.example.com",
+            "notinternal",
+            "notlocal",
+        ] {
+            assert!(public_https_origin(&format!("https://{host}")), "{host}");
         }
     }
 

@@ -125,9 +125,14 @@ provider/fetch refusing the six IPv6 special-use ranges above, both policies
 refusing IPv4-translated addresses carrying restricted IPv4, and public
 search admitting well-known NAT64 addresses whose embedded IPv4 is public.
 
-Public-search endpoint validation and result URLs also refuse `internal`,
-`home.arpa` and names under them alongside the existing local suffixes,
-including mixed case and trailing dots. At request time, search rejects the entire
+`config::is_restricted_public_hostname` owns the common hostname policy for
+provider-entry validation and probes, native provider requests, fetch
+authorization and transport, and public-search endpoint validation, request
+resolution and result URLs. All refuse `localhost`, `localhost.localdomain`,
+`internal`, `home.arpa`, `local` (mDNS), and subdomains of each, ignoring ASCII
+case and trailing dots. Matching uses whole DNS labels: `example.internal.com`,
+`internal.example.com`, `home.arpa.example.com` and `local.example.com` remain
+allowed. At request time, search rejects the entire
 hostname if resolution is empty or any answer is blocked, matching providers
 and fetch; it never filters a mixed answer down to its public members.
 The request client receives only an all-public answer set. Deterministic
@@ -272,7 +277,7 @@ database. Shared shutdown and worker identity contracts live in core
 `config::is_restricted_public_address` owns the shared IP policy used by
 provider-entry validation, service probes, native provider transport, the web
 fetch tool's authorization gate and transport, and public search.
-`forge-agent-host::network_policy` owns provider/fetch hostname checks. Public
+`config::is_restricted_public_hostname` owns the shared hostname checks. Public
 search (`services::native_tools` request resolver and result filter, and
 `config` endpoint validation) adds the deliberate IPv6 exclusions listed
 above. Provider connection tests and health probes share a client builder that

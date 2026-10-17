@@ -37,7 +37,7 @@ use api_types::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use config::{is_blocked_public_search_address, PublicSearchConfig};
+use config::{is_blocked_public_search_address, is_restricted_public_hostname, PublicSearchConfig};
 use db::{
     AgentAction, AgentActionListQuery, AgentActionPolicyResult, AgentActionRepo,
     AgentCommitmentListQuery, AgentCommitmentRepo, AgentInboxListQuery, AgentInboxRepo,
@@ -4035,14 +4035,7 @@ fn is_private_or_local_search_host(host: &str) -> bool {
     if normalized.contains('%') {
         return true;
     }
-    if matches!(
-        normalized.as_str(),
-        "localhost" | "localhost.localdomain" | "internal" | "home.arpa"
-    ) || normalized.ends_with(".localhost")
-        || normalized.ends_with(".local")
-        || normalized.ends_with(".internal")
-        || normalized.ends_with(".home.arpa")
-    {
+    if is_restricted_public_hostname(&normalized) {
         return true;
     }
     let Ok(address) = normalized.parse::<IpAddr>() else {
@@ -6999,6 +6992,52 @@ mod tests {
                 normalize_public_result_url(&format!("https://{host}/result")).is_ok(),
                 "{host}"
             );
+        }
+    }
+
+    #[test]
+    fn hostname_refusal_public_search_results() {
+        for reserved in [
+            "localhost",
+            "localhost.localdomain",
+            "internal",
+            "home.arpa",
+            "local",
+        ] {
+            for host in [
+                reserved.to_owned(),
+                format!("search.{reserved}"),
+                format!("nested.search.{reserved}"),
+            ] {
+                for host in [
+                    host.clone(),
+                    host.to_ascii_uppercase(),
+                    format!("{host}."),
+                    format!("{}.", host.to_ascii_uppercase()),
+                ] {
+                    assert!(
+                        normalize_public_result_url(&format!("https://{host}/result")).is_err(),
+                        "{host}"
+                    );
+                    assert!(is_private_or_local_search_host(&host), "resolver: {host}");
+                }
+            }
+        }
+        for host in [
+            "example.internal.com",
+            "internal.example.com",
+            "home.arpa.example.com",
+            "local.example.com",
+            "localhost.example.com",
+            "localhost.localdomain.example.com",
+            "notinternal",
+            "notlocal",
+        ] {
+            assert!(
+                normalize_public_result_url(&format!("https://{host}/result")).is_ok(),
+                "{host}"
+            );
+            assert!(!is_private_or_local_search_host(host), "resolver: {host}");
         }
     }
 

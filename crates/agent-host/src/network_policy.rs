@@ -1,14 +1,4 @@
-//! Hostname policy for provider probes, native requests and web tools.
-
-/// Hostnames that cannot name a public outbound endpoint.
-pub fn restricted_provider_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
-}
+//! Regression coverage for the shared destination policy.
 
 #[cfg(test)]
 mod tests {

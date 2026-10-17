@@ -36,8 +36,7 @@ use agent_runtime::core::error::RuntimeError;
 use agent_runtime::harness::{FetchRequest, FetchResponse, FetchTransport};
 use async_trait::async_trait;
 
-use crate::network_policy::restricted_provider_hostname;
-use config::is_restricted_public_address;
+use config::{is_restricted_public_address, is_restricted_public_hostname};
 
 /// Redirect hops followed inside one authorized origin.
 const MAX_REDIRECTS: u8 = 3;
@@ -238,7 +237,7 @@ async fn pinned_client(url: &url::Url, timeout: Duration) -> Result<reqwest::Cli
         .ok_or_else(|| RuntimeError::tool("fetch URL has no port"))?;
     let addresses = match url.host() {
         Some(url::Host::Domain(domain)) => {
-            if restricted_provider_hostname(domain) {
+            if is_restricted_public_hostname(domain) {
                 return Err(RuntimeError::tool(
                     "fetch refuses hostnames that name this host's own network",
                 ));

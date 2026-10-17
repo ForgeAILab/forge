@@ -1,10 +1,11 @@
 use crate::{
     default_data_dir, default_workspace_root, error::ConfigError, is_blocked_public_search_address,
-    DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
-    DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
-    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT,
-    DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    is_restricted_public_hostname, DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_AGENT_MAX_CONCURRENT_TASKS, DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST,
+    DEFAULT_CORS_ORIGIN, DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS,
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT,
+    DEFAULT_MIN_FREE_PERCENT, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
@@ -595,14 +596,7 @@ fn is_private_or_local_host(host: &str) -> bool {
     if normalized.contains('%') {
         return true;
     }
-    if matches!(
-        normalized.as_str(),
-        "localhost" | "localhost.localdomain" | "internal" | "home.arpa"
-    ) || normalized.ends_with(".localhost")
-        || normalized.ends_with(".local")
-        || normalized.ends_with(".internal")
-        || normalized.ends_with(".home.arpa")
-    {
+    if is_restricted_public_hostname(&normalized) {
         return true;
     }
     let Ok(address) = normalized.parse::<IpAddr>() else {

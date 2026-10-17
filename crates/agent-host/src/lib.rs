@@ -8,7 +8,8 @@ mod interaction;
 mod lcm;
 mod manifest;
 mod native;
-pub mod network_policy;
+#[cfg(test)]
+mod network_policy;
 pub mod operation_catalog;
 pub(crate) mod operation_contract;
 mod protected_store;

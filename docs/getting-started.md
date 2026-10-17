@@ -844,6 +844,12 @@ authorized origin, a 2 MiB body cap, and the turn's own deadline. A Task worker
 needs its Task read permission; a chat needs the same permission that gates the
 search tool below.
 
+Providers, fetch and public search share a hostname policy: `localhost`,
+`localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS), and subdomains
+of each are refused, ignoring ASCII case and trailing dots. Public names such
+as `example.internal.com` and `local.example.com` remain allowed. This also
+applies when reading stored provider endpoints and filtering search result URLs.
+
 Forge also owns the request headers, because ordinary sites answer a bare
 client badly. It identifies itself as
 `Mozilla/5.0 (compatible; ForgeAgent/<version>; +https://github.com/ForgeAILab/forge)`,

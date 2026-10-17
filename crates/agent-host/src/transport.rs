@@ -1,5 +1,4 @@
-use crate::network_policy::restricted_provider_hostname;
-use config::is_restricted_public_address;
+use config::{is_restricted_public_address, is_restricted_public_hostname};
 
 use std::{
     fmt,
@@ -187,7 +186,7 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
         .ok_or_else(|| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
     let addresses = match parsed.host() {
         Some(url::Host::Domain(domain)) => {
-            if restricted_provider_hostname(domain) {
+            if is_restricted_public_hostname(domain) {
                 return Err(ProviderError::new(
                     ProviderErrorKind::Network,
                     "provider URL rejected",

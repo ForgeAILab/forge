@@ -28,7 +28,9 @@ pub use defaults::{
     DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 pub use error::ConfigError;
-pub use network_policy::{is_blocked_public_search_address, is_restricted_public_address};
+pub use network_policy::{
+    is_blocked_public_search_address, is_restricted_public_address, is_restricted_public_hostname,
+};
 pub use path::{data_dir_from_env, default_config_path, default_data_dir, default_workspace_root};
 pub use runtime::{
     read_server_state, server_state_path, write_server_state, ServerState, SERVER_STATE_FILE,

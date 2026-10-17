@@ -8,6 +8,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
+- Provider, fetch and public search now share one hostname policy, refusing
+  `localhost`, `localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS)
+  and all subdomains of those names, ignoring ASCII case and trailing dots.
+  Checks match complete DNS labels, so public names such as
+  `example.internal.com` and `local.example.com` remain allowed.
 - Provider and fetch now also refuse IPv6 documentation `2001:db8::/32` and
   `3fff::/20`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2
   `2001:20::/28`, and discard-only `100::/64`. Both policies judge
@@ -45,6 +50,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Provider and fetch now reject bare `internal`, `home.arpa` and `local`, plus
+  `localhost.localdomain` and its subdomains. Public search now also rejects
+  bare `local` and subdomains of `localhost.localdomain`. Case and trailing-dot
+  variants are refused too; stored provider endpoints using these names must
+  be changed to public destinations.
 - Provider/fetch destinations in the IPv6 documentation, benchmarking, ORCHID
   and discard-only ranges listed above are newly refused. Providers, fetch and
   public search also refuse IPv4-translated destinations carrying restricted

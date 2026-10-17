@@ -1,9 +1,8 @@
 //! Provider-entry endpoints and their shared URL-shape validation.
 
 use crate::{Result, ServiceError};
-use config::is_restricted_public_address;
+use config::{is_restricted_public_address, is_restricted_public_hostname};
 use db::CredentialHandle;
-use forge_agent_host::network_policy::restricted_provider_hostname;
 use serde_json::Value;
 use std::net::IpAddr;
 
@@ -91,7 +90,7 @@ pub(crate) fn validate_provider_url_shape(
         url::Host::Ipv6(address) if is_restricted_public_address(IpAddr::V6(address)) => {
             return Err("base_url must not target a private or local address");
         }
-        url::Host::Domain(domain) if restricted_provider_hostname(domain) => {
+        url::Host::Domain(domain) if is_restricted_public_hostname(domain) => {
             return Err("base_url must not target a local or private hostname");
         }
         _ => {}

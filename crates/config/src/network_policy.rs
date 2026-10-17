@@ -1,6 +1,26 @@
-//! Destination address policy shared by providers, fetch and public search.
+//! Destination hostname and address policy shared by providers, fetch and public search.
 
 use std::net::{IpAddr, Ipv4Addr};
+
+/// Reject local hostnames and their subdomains before DNS resolution.
+/// Matching uses complete DNS labels, ignoring ASCII case and trailing dots.
+pub fn is_restricted_public_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    [
+        "localhost",
+        "localhost.localdomain",
+        "internal",
+        "home.arpa",
+        "local",
+    ]
+    .into_iter()
+    .any(|reserved| {
+        host == reserved
+            || host
+                .strip_suffix(reserved)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
 
 /// Reject local, private, special-use and restricted transition destinations.
 /// IPv4-carrying IPv6 forms are judged by their embedded IPv4 destination.
@@ -105,6 +125,44 @@ mod tests {
 
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn hostname_refusal_shared_policy() {
+        for reserved in [
+            "localhost",
+            "localhost.localdomain",
+            "internal",
+            "home.arpa",
+            "local",
+        ] {
+            for host in [
+                reserved.to_owned(),
+                format!("service.{reserved}"),
+                format!("nested.service.{reserved}"),
+            ] {
+                for host in [
+                    host.clone(),
+                    host.to_ascii_uppercase(),
+                    format!("{host}."),
+                    format!("{}.", host.to_ascii_uppercase()),
+                ] {
+                    assert!(is_restricted_public_hostname(&host), "{host}");
+                }
+            }
+        }
+        for host in [
+            "example.internal.com",
+            "internal.example.com",
+            "home.arpa.example.com",
+            "local.example.com",
+            "localhost.example.com",
+            "localhost.localdomain.example.com",
+            "notinternal",
+            "notlocal",
+        ] {
+            assert!(!is_restricted_public_hostname(host), "{host}");
+        }
+    }
 
     #[test]
     fn address_tightening_refuses_special_ipv6_ranges_with_exact_boundaries() {

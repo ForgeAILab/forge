@@ -194,3 +194,43 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
         );
     }
 }
+
+#[test]
+fn hostname_refusal_provider_endpoints() {
+    for reserved in [
+        "localhost",
+        "localhost.localdomain",
+        "internal",
+        "home.arpa",
+        "local",
+    ] {
+        for host in [
+            reserved.to_owned(),
+            format!("search.{reserved}"),
+            format!("nested.search.{reserved}"),
+        ] {
+            for host in [
+                host.clone(),
+                host.to_ascii_uppercase(),
+                format!("{host}."),
+                format!("{}.", host.to_ascii_uppercase()),
+            ] {
+                let endpoint = format!("https://{host}/v1");
+                assert!(validate_provider_url_shape(&endpoint).is_err(), "{host}");
+            }
+        }
+    }
+    for host in [
+        "example.internal.com",
+        "internal.example.com",
+        "home.arpa.example.com",
+        "local.example.com",
+        "localhost.example.com",
+        "localhost.localdomain.example.com",
+        "notinternal",
+        "notlocal",
+    ] {
+        let endpoint = format!("https://{host}/v1");
+        assert!(validate_provider_url_shape(&endpoint).is_ok(), "{host}");
+    }
+}

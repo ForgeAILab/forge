@@ -4763,8 +4763,11 @@ resolves the configured host at connect time, and rejects the entire hostname
 if any resolved address is private or otherwise blocked (including mixed
 public/private IPv4/IPv6 answers). Empty resolution is also refused; accepted
 answers are passed directly to the connection. Endpoint and result URL checks
-reject `internal`, `home.arpa` and names under them alongside existing local
-suffixes, ignoring case and trailing dots. IPv4-translated addresses apply the embedded
+share the provider/fetch hostname policy: reject `localhost`,
+`localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS), and subdomains
+of each, ignoring ASCII case and trailing dots. Names such as
+`example.internal.com`, `internal.example.com`, `home.arpa.example.com` and
+`local.example.com` remain allowed. IPv4-translated addresses apply the embedded
 IPv4 policy; IPv4-mapped/compatible and 6to4 addresses remain refused outright.
 An unset endpoint omits the tool; invalid configuration is rejected before a
 runtime can expose it.

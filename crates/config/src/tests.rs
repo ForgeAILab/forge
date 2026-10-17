@@ -312,6 +312,52 @@ fn address_tightening_public_search_refuses_local_dns_suffixes() {
 }
 
 #[test]
+fn hostname_refusal_public_search_config() {
+    for reserved in [
+        "localhost",
+        "localhost.localdomain",
+        "internal",
+        "home.arpa",
+        "local",
+    ] {
+        for host in [
+            reserved.to_owned(),
+            format!("search.{reserved}"),
+            format!("nested.search.{reserved}"),
+        ] {
+            for host in [
+                host.clone(),
+                host.to_ascii_uppercase(),
+                format!("{host}."),
+                format!("{}.", host.to_ascii_uppercase()),
+            ] {
+                let config = PublicSearchConfig {
+                    endpoint: Some(format!("https://{host}/search")),
+                    ..Default::default()
+                };
+                assert!(config.validate().is_err(), "{host}");
+            }
+        }
+    }
+    for host in [
+        "example.internal.com",
+        "internal.example.com",
+        "home.arpa.example.com",
+        "local.example.com",
+        "localhost.example.com",
+        "localhost.localdomain.example.com",
+        "notinternal",
+        "notlocal",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{host}");
+    }
+}
+
+#[test]
 fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
     for endpoint in [
         "http://search.example.test",
