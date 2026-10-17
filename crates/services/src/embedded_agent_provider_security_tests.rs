@@ -120,7 +120,8 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
         "0.0.0.1",
         "0.255.255.255",
         "64:ff9b::7f00:1",
-        "64:ff9b::808:808",
+        "64:ff9b::a00:1",
+        "64:ff9b::a9fe:a9fe",
         "64:ff9b::ffff:ffff",
         "64:ff9b:1::",
         "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
@@ -160,6 +161,8 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
     for ip in [
         "1.0.0.1",
         "8.8.8.8",
+        // Well-known NAT64 is judged by its embedded IPv4 destination.
+        "64:ff9b::808:808",
         "64:ff9b:0:1::",
         "64:ff9b:2::",
         "2001:1::",
