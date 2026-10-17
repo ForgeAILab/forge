@@ -58,10 +58,12 @@ Consistent signatures:
 
 A failing step without signatures SHALL be `introduced` and blocking when the
 valid red base has test signatures. Its reason SHALL state that the candidate
-failed without signatures while the base failed with signatures. Candidate
-failures with no signatures in common with a signature-bearing base SHALL
-also be introduced. `pre_existing_unverified` SHALL be reserved for a red base
-without comparable signatures; it keeps blocking and the brief names the base failure.
+failed without signatures while the base failed with signatures. When the
+rerun reports no signatures, a candidate signature the red base does not fail
+SHALL make the step `introduced`, and the reason SHALL name it.
+`pre_existing_unverified` SHALL be reserved for a red base without comparable
+signatures, and for candidate signatures that all fail on the red base while
+the rerun reports none; it keeps blocking and the brief names the base failure.
 
 #### Scenario: Candidate breaks the build on a red base
 - **WHEN** the candidate and rerun fail to compile with no test signatures, while the valid base fails `TestSumCSVLegacy` and `TestClockSkew`
@@ -70,6 +72,10 @@ without comparable signatures; it keeps blocking and the brief names the base fa
 #### Scenario: Neither side reports test signatures
 - **WHEN** the candidate, rerun and valid base fail without test signatures
 - **THEN** the candidate failure remains `pre_existing_unverified` and blocking
+
+#### Scenario: The rerun loses the signatures
+- **WHEN** the candidate fails `TestSumCSVLegacy`, the rerun fails without test signatures, and the valid base fails `TestSumCSVLegacy` and `TestClockSkew`
+- **THEN** the candidate failure is `pre_existing_unverified` and blocking; had the candidate also failed `TestNew`, it would be `introduced` with a reason naming `TestNew`
 
 #### Scenario: Red base
 - **WHEN** 26 tests fail consistently on the candidate and 26 of the same signatures fail on the base

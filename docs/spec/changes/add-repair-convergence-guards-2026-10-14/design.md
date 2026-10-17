@@ -135,11 +135,12 @@ Non-Goals:
    - a step that passes on the re-run is flaky;
    - a signatureless candidate failure against a red base with signatures is
      `introduced` and blocking, with a reason distinguishing the two failures;
-   - failures with no signatures in common with a signature-bearing base are
-     also `introduced`;
-   - a step that fails on both the candidate and a signatureless base is
-     `pre_existing_unverified`. It still blocks, because new failures may hide
-     inside it, but the brief and attention say the base fails too.
+   - when the re-run reports no signatures, a candidate signature the red
+     base does not fail makes the step `introduced`, naming that signature;
+   - a step that fails on both the candidate and a signatureless base, or
+     whose candidate signatures all fail on the base while the re-run reports
+     none, is `pre_existing_unverified`. It still blocks, because new failures
+     may hide inside it, but the brief and attention say the base fails too.
 8. **At the merge-queue head**, the same triage runs against the target tip,
    on that check's owner.
 

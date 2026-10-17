@@ -344,27 +344,38 @@ pub(crate) fn classify(
                 None => unclassified = true,
             }
         }
-    } else if let (Some(again), Some(base)) = (again, base) {
-        triage.class = Some(if base.exit_code != 0 && base.failures.is_empty() {
-            triage.reason = Some("The base also fails this step without comparable test signatures; new failures may be hidden, so it still blocks".to_owned());
-            CiFailureClass::PreExistingUnverified
+    } else if let (Some(_), Some(base)) = (again, base) {
+        // Here the candidate or its rerun reported no signatures. Only the
+        // candidate's own signatures can be compared with a red base's.
+        let absent: Vec<_> = entry
+            .failures
+            .iter()
+            .filter(|signature| !base.failures.contains(signature))
+            .map(String::as_str)
+            .collect();
+        let (class, reason) = if base.exit_code == 0 {
+            (CiFailureClass::Introduced, None)
+        } else if base.failures.is_empty() {
+            (CiFailureClass::PreExistingUnverified, Some("The base also fails this step without comparable test signatures; new failures may be hidden, so it still blocks".to_owned()))
+        } else if entry.failures.is_empty() {
+            (CiFailureClass::Introduced, Some("The candidate failed without test signatures, while the base failed with test signatures; this candidate failure is introduced and still blocks".to_owned()))
+        } else if absent.is_empty() {
+            (CiFailureClass::PreExistingUnverified, Some("Every candidate test signature also fails on the base, but the rerun failed without test signatures, so it cannot be confirmed as pre-existing; it still blocks".to_owned()))
+        } else if absent.len() == entry.failures.len() {
+            (CiFailureClass::Introduced, Some("The candidate and base have no shared test signatures; this candidate failure is introduced and still blocks".to_owned()))
         } else {
-            if base.exit_code != 0 {
-                triage.reason = Some(if entry.failures.is_empty() {
-                    "The candidate failed without test signatures, while the base failed with test signatures; this candidate failure is introduced and still blocks".to_owned()
-                } else if entry
-                    .failures
-                    .iter()
-                    .chain(&again.failures)
-                    .all(|signature| !base.failures.contains(signature))
-                {
-                    "The candidate and base have no shared test signatures; this candidate failure is introduced and still blocks".to_owned()
-                } else {
-                    "The candidate rerun failed without test signatures, so matching base test failures cannot verify it is pre-existing; it is treated as introduced and still blocks".to_owned()
-                });
-            }
-            CiFailureClass::Introduced
-        });
+            (
+                CiFailureClass::Introduced,
+                Some(format!(
+                "The base does not fail {}; this candidate failure is introduced and still blocks",
+                absent.iter().take(20).copied().collect::<Vec<_>>().join(", ")
+            )),
+            )
+        };
+        triage.class = Some(class);
+        if reason.is_some() {
+            triage.reason = reason;
+        }
     } else {
         unclassified = true;
     }
@@ -683,6 +694,34 @@ mod tests {
                 assert_eq!(result.failures[0].class, CiFailureClass::Introduced);
             }
         }
+    }
+    #[test]
+    fn ci_triage_base_signatures_with_signatureless_rerun_are_labelled_by_overlap() {
+        // Every candidate signature also fails on the base, but the rerun
+        // reported none: the failure looks pre-existing yet is unconfirmed.
+        let result = classify(
+            &step(&["TestSumCSVLegacy"]),
+            Some(&command(&[], 1)),
+            Some(&command(&["TestSumCSVLegacy", "TestClockSkew"], 1)),
+            facts(),
+        );
+        assert!(result.blocking);
+        assert_eq!(result.class, Some(CiFailureClass::PreExistingUnverified));
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("also fails on the base"), "{reason}");
+        assert!(reason.contains("rerun failed without"), "{reason}");
+        // One candidate signature the base does not fail is introduced.
+        let result = classify(
+            &step(&["TestSumCSVLegacy", "TestNew"]),
+            Some(&command(&[], 1)),
+            Some(&command(&["TestSumCSVLegacy"], 1)),
+            facts(),
+        );
+        assert!(result.blocking);
+        assert_eq!(result.class, Some(CiFailureClass::Introduced));
+        let reason = result.reason.unwrap();
+        assert!(reason.contains("TestNew"), "{reason}");
+        assert!(reason.contains("does not fail"), "{reason}");
     }
     #[test]
     fn ci_triage_signatureless_red_base_stays_pre_existing_unverified() {

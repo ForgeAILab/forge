@@ -80,8 +80,9 @@ or a merge-queue head check fails:
   `flaky_check` and `base_check_failing`. They do not block the Task when the
   Project's `review_ci_triage` is `full` (the default).
 - A signatureless candidate failure is introduced when the red base has test
-  signatures; only a red base without comparable signatures can support
-  `pre_existing_unverified`. Both classes still block.
+  signatures. `pre_existing_unverified` is kept for a red base without
+  comparable signatures, and for candidate signatures that all fail on the
+  base when the rerun reports none. Both classes still block.
 
 **3. No-change gate.**
 - A Task that comes back to review with a clean tree and the exact commit its

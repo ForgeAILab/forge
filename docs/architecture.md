@@ -10242,9 +10242,10 @@ failures remain unclassified and still block. A base step passing
 makes consistent candidate signatures `introduced`; matching red-base signatures
 are `pre_existing`. A signatureless candidate failure against a red base with
 test signatures is `introduced` and blocks: the base reached test failures
-while the candidate failed without comparable signatures. Candidate failures
-with no signatures in common with a signature-bearing base are also introduced.
-Only a red base without comparable signatures supports
+while the candidate failed without comparable signatures. When the rerun
+reports no signatures, a candidate signature the red base does not fail makes
+the step `introduced` (the reason names it); candidate signatures that all fail
+on the base, and a red base without comparable signatures, give
 `pre_existing_unverified`, which still blocks.
 
 Review details keep `ci_steps[].triage`, original nonzero exits and rerun/base run
