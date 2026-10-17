@@ -1360,7 +1360,7 @@ async fn a_rerun_is_refused_while_the_entry_step_is_claimed_or_woken() {
     }
 }
 
-async fn seed_reviewer_agent(fixture: &FailedCiFixture) -> String {
+pub(super) async fn seed_reviewer_agent(fixture: &FailedCiFixture) -> String {
     let db = &*fixture.db;
     let now = now_rfc3339();
     let daemon_id = new_uuid_v4();

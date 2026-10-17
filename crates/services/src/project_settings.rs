@@ -59,6 +59,10 @@ pub async fn validate_project_settings(
             }
         }
     }
+    if let Some(review) = settings.get("default_review_config") {
+        api_types::validate_review_verify_config(review)
+            .map_err(ServiceError::invalid_operation)?;
+    }
     let settings: ProjectSettings = serde_json::from_value(settings.clone())
         .map_err(|error| ServiceError::invalid_operation(format!("invalid settings: {error}")))?;
     if !(1..=86400).contains(&settings.placement.provision_timeout_seconds) {
@@ -138,6 +142,11 @@ pub async fn validate_project_settings(
 
     for (name, value) in [
         ("review", settings.retry_budgets.review),
+        ("review_progress", settings.retry_budgets.review_progress),
+        (
+            "review_verify_rerun",
+            settings.retry_budgets.review_verify_rerun,
+        ),
         ("merge_fix", settings.retry_budgets.merge_fix),
     ] {
         if value.is_some_and(|value| value < 0) {
@@ -191,6 +200,42 @@ pub async fn validate_project_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn review_ci_triage_defaults_full_and_validates_values() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        let db = SqliteDb::new(pool);
+        let workflow = crate::workflow::default_workflow::default_workflow();
+        assert_eq!(
+            ProjectSettings::default().review_ci_triage,
+            api_types::ReviewCiTriage::Full
+        );
+        for value in ["full", "report", "off"] {
+            validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        for value in [
+            serde_json::json!("unknown"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ] {
+            assert!(validate_project_settings(
+                &db,
+                &serde_json::json!({"review_ci_triage":value}),
+                &workflow,
+                None,
+                None
+            )
+            .await
+            .is_err());
+        }
+    }
     #[tokio::test]
     async fn provision_timeout_defaults_to_thirty_minutes_and_is_bounded() {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();

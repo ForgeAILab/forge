@@ -135,8 +135,14 @@ impl SoloStartup {
         // resolution cannot leave a marker or data directory behind.
         let launch_path = cli.resolve_path()?;
         let git = resolve_git_repository(&launch_path)?;
-        let config_path = config::default_config_path();
-        let base_config = ForgeConfig::load(Some(&config_path), ConfigOverrides::default())?;
+        let config_path = config::default_config_path(cli.data_dir.as_deref());
+        let base_config = ForgeConfig::load(
+            Some(&config_path),
+            ConfigOverrides {
+                data_dir: cli.data_dir.clone(),
+                ..Default::default()
+            },
+        )?;
 
         // This is the first mutating repository operation, now that TTY
         // preflight and read-only Git/config validation have succeeded.

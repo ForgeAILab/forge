@@ -77,7 +77,12 @@ pub struct CheckRetryBudget;
 #[async_trait]
 impl HookAction for CheckRetryBudget {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        let (max_rejections, count) = if ctx.to_state == default_states::REVIEW {
+        let is_review = ctx
+            .workflow
+            .states
+            .iter()
+            .any(|state| state.name == ctx.to_state && db::budget::is_review_state(state));
+        let (max_rejections, count) = if is_review {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },
@@ -151,7 +156,7 @@ impl HookAction for CheckRetryBudget {
             (max_rejections, count)
         };
 
-        if db::budget::gate_entry_exhausted(&ctx.to_state, i64::from(max_rejections), count) {
+        if db::budget::gate_entry_exhausted(is_review, i64::from(max_rejections), count) {
             let task = match task(ctx).await {
                 Ok(task) => task,
                 Err(reason) => return HookResult::Failed { reason },

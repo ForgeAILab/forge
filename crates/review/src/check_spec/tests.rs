@@ -367,7 +367,14 @@ fn worktree_families_carry_the_workspace_identity_and_commit_families_never_do()
         (CheckPurpose::ReadinessProbe, &with_setup, None, Probe),
         (CheckPurpose::EnvironmentHelper, &with_setup, None, Probe),
     ];
-    for purpose in CheckPurpose::ALL {
+    assert_eq!(
+        check_family_scope(CheckPurpose::ReviewVerify, None, false),
+        Worktree
+    );
+    for purpose in CheckPurpose::ALL
+        .iter()
+        .filter(|purpose| **purpose != CheckPurpose::ReviewVerify)
+    {
         assert!(families.iter().any(|(family, ..)| family == purpose));
     }
     for (purpose, source, bundle, expected) in families {
@@ -456,7 +463,11 @@ fn purpose_selects_the_bundle_and_is_not_in_the_spec_or_its_digest() {
     assert_eq!(digest(&entry), digest(&queue_head));
     assert!(!serde_json::to_string(&entry).unwrap().contains("purpose"));
     // No family configured today declares a cleanup step.
-    for purpose in CheckPurpose::ALL {
+    // Verify uses its own runtime bundle builder, covered in verify::tests.
+    for purpose in CheckPurpose::ALL
+        .iter()
+        .filter(|purpose| **purpose != CheckPurpose::ReviewVerify)
+    {
         assert!(!build_check_spec(*purpose, &cfg).unwrap().declares_cleanup);
     }
 }

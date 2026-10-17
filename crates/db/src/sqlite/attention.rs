@@ -1011,3 +1011,94 @@ impl SqliteDb {
         .await?)
     }
 }
+
+impl SqliteDb {
+    /// Merge occurrence/task sets transactionally; hook redelivery counts once.
+    pub async fn record_ci_triage_attention(
+        &self,
+        mut input: CreateAttentionProjection,
+        occurrence: &str,
+        task: &str,
+    ) -> Result<()> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let mut details: serde_json::Value =
+            serde_json::from_str(&input.details_json).map_err(|e| DbError::Check(e.to_string()))?;
+        // Reuse the command incident even if an earlier build keyed it by
+        // base commit. Existing rows are retained as resolved history.
+        let old = if input.attention_type == "base_check_failing" {
+            sqlx::query("SELECT * FROM attention_projection WHERE scope_type='project' AND scope_id=? AND attention_type='base_check_failing' AND json_extract(details_json,'$.command')=? ORDER BY julianday(occurred_at) DESC,id LIMIT 1")
+                .bind(&input.scope_id).bind(details["command"].as_str()).fetch_optional(&mut *tx).await?
+        } else {
+            sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key=?")
+                .bind(&input.dedupe_key).fetch_optional(&mut *tx).await?
+        }.map(map_attention_projection).transpose()?;
+        if let Some(old) = old
+            .as_ref()
+            .filter(|_| input.attention_type == "base_check_failing")
+        {
+            input.dedupe_key = old.dedupe_key.clone();
+            sqlx::query("UPDATE attention_projection SET status='resolved',resolved_at=?,updated_at=?,source_event_id=?,version=version+1 WHERE scope_type='project' AND scope_id=? AND attention_type='base_check_failing' AND json_extract(details_json,'$.command')=? AND id<>? AND status<>'resolved'")
+                .bind(&input.updated_at).bind(&input.updated_at).bind(&input.source_event_id).bind(&input.scope_id).bind(details["command"].as_str()).bind(&old.id).execute(&mut *tx).await?;
+        }
+        if input.attention_type == "base_check_failing" {
+            if let Some(observed) = details["base_observed_at"].as_str() {
+                input.occurred_at = observed.to_owned();
+            }
+            // Cached old red evidence must neither replace a newer base nor
+            // reopen an incident settled by a newer passing base.
+            let observed = chrono::DateTime::parse_from_rfc3339(&input.occurred_at)
+                .map_err(|error| DbError::Check(error.to_string()))?;
+            if old.as_ref().is_some_and(|old| {
+                chrono::DateTime::parse_from_rfc3339(&old.occurred_at).is_ok_and(|at| observed < at)
+                    || old.resolved_at.as_ref().is_some_and(|at| {
+                        chrono::DateTime::parse_from_rfc3339(at).is_ok_and(|at| observed <= at)
+                    })
+            }) {
+                tx.commit().await?;
+                return Ok(());
+            }
+        }
+        let old: serde_json::Value = old
+            .and_then(|row| serde_json::from_str(&row.details_json).ok())
+            .unwrap_or_default();
+        // A flaky test can recur for months and its item never resolves: the
+        // count is a counter, and only the latest occurrences and Tasks are
+        // kept (a redelivery arrives right after its first delivery).
+        const RECENT: usize = 64;
+        let mut occurrences: Vec<String> =
+            serde_json::from_value(old["occurrences"].clone()).unwrap_or_default();
+        if occurrences.iter().any(|seen| seen == occurrence) {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let count = old["count"]
+            .as_u64()
+            .unwrap_or(occurrences.len() as u64)
+            .saturating_add(1);
+        occurrences.push(occurrence.to_owned());
+        occurrences.drain(..occurrences.len().saturating_sub(RECENT));
+        let mut tasks: Vec<String> =
+            serde_json::from_value(old["task_ids"].clone()).unwrap_or_default();
+        tasks.retain(|seen| seen != task);
+        tasks.push(task.to_owned());
+        tasks.drain(..tasks.len().saturating_sub(RECENT));
+        details["count"] = serde_json::json!(count);
+        details["occurrences"] = serde_json::json!(occurrences);
+        details["task_ids"] = serde_json::json!(tasks);
+        input.details_json = details.to_string();
+        self.insert_attention_in_tx(&mut tx, input).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    pub async fn resolve_passing_base_attention(
+        &self,
+        project: &str,
+        command: &str,
+        observed_at: &str,
+        event: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE attention_projection SET status='resolved',resolved_at=?,updated_at=?,source_event_id=?,version=version+1 WHERE scope_type='project' AND scope_id=? AND attention_type='base_check_failing' AND status<>'resolved' AND json_extract(details_json,'$.command')=? AND julianday(occurred_at)<julianday(?)")
+            .bind(observed_at).bind(observed_at).bind(event).bind(project).bind(command).bind(observed_at).execute(self.pool()).await?;
+        Ok(())
+    }
+}

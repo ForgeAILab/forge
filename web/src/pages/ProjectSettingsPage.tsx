@@ -72,6 +72,7 @@ import { productTerm } from '@/lib/i18n'
 import { useAuthStore } from '@/stores/auth'
 import { clearDeletedProjectScope, resolveNextProjectId } from '@/stores/project-scope'
 import type { DefaultRoleAssignment, LifecycleHooks } from '@/types/generated'
+import type { ReviewVerifyConfig } from '@/types/generated/bindings/ReviewVerifyConfig'
 
 const SETTINGS_TABS: Array<{
   id: ProjectSettingsTab
@@ -90,8 +91,13 @@ const SETTINGS_TABS: Array<{
   { id: 'danger', label: 'Danger zone', icon: WarningOctagon, danger: true },
 ]
 
+
 interface ProjectFormState {
+  verify: ReviewVerifyConfig | null
   name: string
+  reviewCiTriage: 'full' | 'report' | 'off'
+  repairSwitchModelWhenStuck: boolean
+  reviewProgress: string
   ciSteps: string[]
   lifecycleHooks: LifecycleHooks
   defaultRoleSelections: Record<string, string>
@@ -103,7 +109,11 @@ interface ProjectFormState {
 
 const EMPTY_PROJECT_FORM: ProjectFormState = {
   name: '',
+  verify: null,
   ciSteps: [],
+  reviewCiTriage: 'full',
+  reviewProgress: '',
+  repairSwitchModelWhenStuck: false,
   lifecycleHooks: {},
   defaultRoleSelections: {},
   automaticRecoveryEnabled: false,
@@ -143,7 +153,11 @@ export function ProjectSettingsPage({
   const [form, updateForm] = useReducer(mergeProjectForm, EMPTY_PROJECT_FORM)
   const {
     name,
+    verify,
     ciSteps,
+    reviewCiTriage,
+    reviewProgress,
+    repairSwitchModelWhenStuck,
     lifecycleHooks,
     defaultRoleSelections,
     automaticRecoveryEnabled,
@@ -198,9 +212,22 @@ export function ProjectSettingsPage({
       const rawEnvironment = isRecord(project.settings?.environment)
         ? project.settings.environment
         : {}
+      const rawRetryBudgets = isRecord(project.settings?.retry_budgets)
+        ? project.settings.retry_budgets
+        : {}
       updateForm({
         name: project.name,
+        verify: project.default_review_config?.verify ?? null,
+        reviewProgress:
+          rawRetryBudgets.review_progress == null ? '' : String(rawRetryBudgets.review_progress),
+        repairSwitchModelWhenStuck: project.settings?.repair_switch_model_when_stuck === true,
         ciSteps: ciStepsFromReviewConfig(project.default_review_config),
+        reviewCiTriage:
+          project.settings?.review_ci_triage === 'off'
+            ? 'off'
+            : project.settings?.review_ci_triage === 'report'
+              ? 'report'
+              : 'full',
         lifecycleHooks: lifecycleHooksFromSettings(project.settings),
         defaultRoleSelections: selections,
         automaticRecoveryEnabled: rawRecovery.enabled === true,
@@ -222,6 +249,14 @@ export function ProjectSettingsPage({
     const nextName = name.trim()
     if (!nextName) {
       toast.error('Project name is required')
+      return
+    }
+    const progressLimit = Number(reviewProgress)
+    if (
+      reviewProgress.trim() &&
+      (!Number.isInteger(progressLimit) || progressLimit < 0 || progressLimit > 2147483647)
+    ) {
+      toast.error('Review progress rounds must be a whole number 0 or greater')
       return
     }
     for (const hooks of Object.values(lifecycleHooks)) {
@@ -268,9 +303,17 @@ export function ProjectSettingsPage({
         ]
       },
     )
+    const retryBudgets: Record<string, unknown> = isRecord(project.settings?.retry_budgets)
+      ? { ...project.settings.retry_budgets }
+      : {}
+    if (reviewProgress.trim()) retryBudgets.review_progress = progressLimit
+    else delete retryBudgets.review_progress
     const nextSettings: Record<string, unknown> = {
       ...settingsWithoutRolePrompts,
       max_active_tasks: activeLimit,
+      review_ci_triage: reviewCiTriage,
+      retry_budgets: retryBudgets,
+      repair_switch_model_when_stuck: repairSwitchModelWhenStuck,
       default_role_assignments: defaultRoleAssignmentsList,
       lifecycle_hooks: lifecycleHooks,
       automatic_recovery: {
@@ -287,7 +330,9 @@ export function ProjectSettingsPage({
           name: nextName,
           settings: nextSettings,
           default_review_config: {
+            ...(isRecord(project.default_review_config) ? project.default_review_config : {}),
             ci_steps: normalizeCiSteps(ciSteps),
+            verify,
             review_prompt: null,
           },
         },
@@ -319,7 +364,10 @@ export function ProjectSettingsPage({
           version: project.version,
           settings: {
             ...(isRecord(project.settings) ? project.settings : {}),
-            placement: { ...(isRecord(project.settings?.placement) ? project.settings.placement : {}), provision },
+            placement: {
+              ...(isRecord(project.settings?.placement) ? project.settings.placement : {}),
+              provision,
+            },
             environment: {
               ...(environment.value ?? { env: {}, assets: [], checks: [] }),
               recheck_interval_seconds: Math.round(recheckMinutes * 60),
@@ -418,6 +466,16 @@ export function ProjectSettingsPage({
               pausePending={pauseProject.isPending || resumeProject.isPending}
               name={name}
               ciSteps={ciSteps}
+              verify={verify}
+              onVerifyChange={(verify) => updateForm({ verify })}
+              reviewCiTriage={reviewCiTriage}
+              reviewProgress={reviewProgress}
+              repairSwitchModelWhenStuck={repairSwitchModelWhenStuck}
+              onRepairSwitchModelWhenStuckChange={(repairSwitchModelWhenStuck) =>
+                updateForm({ repairSwitchModelWhenStuck })
+              }
+              onReviewProgressChange={(reviewProgress) => updateForm({ reviewProgress })}
+              onReviewCiTriageChange={(reviewCiTriage) => updateForm({ reviewCiTriage })}
               defaultRoleSelections={defaultRoleSelections}
               roles={roles}
               workflowIsLoading={workflowQuery.isLoading}

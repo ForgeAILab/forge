@@ -7,10 +7,7 @@ import { ErrorBanner } from '@/components/error-banner'
 import { isTransientApiError } from '@/lib/api-error'
 import { budgetLabel, visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
-import {
-  type AssigneeSelection,
-  TaskStatusDropdown,
-} from '@/components/task-controls'
+import { type AssigneeSelection, TaskStatusDropdown } from '@/components/task-controls'
 import { TaskExecutionObservabilityPanel } from '@/components/task-execution-observability'
 import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banner'
@@ -27,13 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { productTerm } from '@/lib/i18n'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { cn } from '@/lib/cn'
-import type {
-  Agent,
-  
-  RoleDefinition,
-  Task,
-  WorkflowDefinition,
-} from '@/types/generated'
+import type { Agent, RoleDefinition, Task, WorkflowDefinition } from '@/types/generated'
 import {
   budgetValue,
   formatDate,
@@ -81,6 +72,7 @@ interface TaskOverviewPanelProps {
     review: number | undefined,
     mergeFix: number | undefined,
     execution: number | undefined,
+    reviewProgress: number | undefined,
   ) => void
 }
 
@@ -122,6 +114,7 @@ export function TaskOverviewPanel({
   const [descriptionDraft, setDescriptionDraft] = useState('')
   const [priorityDraft, setPriorityDraft] = useState('')
   const [reviewRetryOverride, setReviewRetryOverride] = useState('')
+  const [reviewProgressOverride, setReviewProgressOverride] = useState('')
   const [mergeFixRetryOverride, setMergeFixRetryOverride] = useState('')
   const [executionRetryOverride, setExecutionRetryOverride] = useState('')
 
@@ -136,6 +129,7 @@ export function TaskOverviewPanel({
       setPriorityDraft(String(task.priority))
       const taskStateConfig = readTaskStateConfig(task)
       setReviewRetryOverride(retryBudgetFromConfig(taskStateConfig, 'review'))
+      setReviewProgressOverride(retryBudgetFromConfig(taskStateConfig, 'review_progress'))
       setMergeFixRetryOverride(retryBudgetFromConfig(taskStateConfig, 'merge_fix'))
       setExecutionRetryOverride(retryBudgetFromConfig(taskStateConfig, 'execution'))
     }, 0)
@@ -146,7 +140,7 @@ export function TaskOverviewPanel({
     ? visibleRemainingBudgets(task.remaining_retries, task.retry_limits)
     : []
   const effectiveRetryBudget = (
-    key: 'review' | 'merge_fix' | 'execution',
+    key: 'review' | 'review_progress' | 'merge_fix' | 'execution',
     draft: string,
   ) => {
     const taskOverride = budgetValue(Number(draft.trim()))
@@ -154,7 +148,8 @@ export function TaskOverviewPanel({
       return `(effective: ${taskOverride} — task override)`
     }
     const workflowDefault = budgetValue(workflowRetryBudgets?.[key])
-    if (workflowDefault !== undefined) return `(effective: ${workflowDefault} — current server limit)`
+    if (workflowDefault !== undefined)
+      return `(effective: ${workflowDefault} — current server limit)`
     return '(server limit unavailable)'
   }
 
@@ -216,12 +211,13 @@ export function TaskOverviewPanel({
       return value
     }
     const review = parseDraft('Review retries', reviewRetryOverride)
+    const reviewProgress = parseDraft('Review progress rounds', reviewProgressOverride)
     const mergeFix = parseDraft('Merge-fix retries', mergeFixRetryOverride)
     const execution = parseDraft(`${productTerm('run')} retries`, executionRetryOverride)
-    if (review === null || mergeFix === null || execution === null) {
+    if (review === null || mergeFix === null || execution === null || reviewProgress === null) {
       return
     }
-    onSaveRetryBudgets(review, mergeFix, execution)
+    onSaveRetryBudgets(review, mergeFix, execution, reviewProgress)
   }
 
   const onTitleKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -336,7 +332,13 @@ export function TaskOverviewPanel({
             ) : null}
 
             <WorkflowExceptionPanel task={task} />
-            {onOpenLaunchDialog ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" onClick={onOpenLaunchDialog}>Launch run</Button></div> : null}
+            {onOpenLaunchDialog ? (
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={onOpenLaunchDialog}>
+                  Launch run
+                </Button>
+              </div>
+            ) : null}
             {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
             {task.plan_progress || task.plan_artifact ? (
@@ -391,7 +393,13 @@ export function TaskOverviewPanel({
               )}
             </div>
 
-            {!task.workflow_exception ? <TaskActionButtons taskId={task.id} version={task.version} offers={task.available_actions ?? []} /> : null}
+            {!task.workflow_exception ? (
+              <TaskActionButtons
+                taskId={task.id}
+                version={task.version}
+                offers={task.available_actions ?? []}
+              />
+            ) : null}
 
             <div>
               <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
@@ -412,17 +420,12 @@ export function TaskOverviewPanel({
                 <span title={managedStatusDisabledReason}>
                   <TaskStatusDropdown
                     availableStatuses={availableTransitions}
-                    disabled={
-                      transitionPending ||
-                      
-                      Boolean(managedStatusDisabledReason)
-                    }
+                    disabled={transitionPending || Boolean(managedStatusDisabledReason)}
                     disabledStatusReasons={{ review: reviewDisabledReason }}
                     status={task.status}
                     onChange={(status) => onStatusChange(status)}
                   />
                 </span>
-
               </div>
               {managedStatusDisabledReason ? (
                 <p className="mt-1 text-xs text-muted-foreground">{managedStatusDisabledReason}</p>
@@ -499,8 +502,7 @@ export function TaskOverviewPanel({
                 <span className="font-medium uppercase tracking-wide">Remaining budget</span>
                 {remainingBudgets.map(([key, value]) => (
                   <span key={key}>
-                    {budgetLabel(key)}:{' '}
-                    <span className="font-mono text-foreground">{value}</span>
+                    {budgetLabel(key)}: <span className="font-mono text-foreground">{value}</span>
                   </span>
                 ))}
               </div>
@@ -530,6 +532,20 @@ export function TaskOverviewPanel({
                   />
                   <p className="text-xs text-muted-foreground">
                     {effectiveRetryBudget('review', reviewRetryOverride)}
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="task-review-progress-budget">Review progress rounds</Label>
+                  <Input
+                    id="task-review-progress-budget"
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={reviewProgressOverride}
+                    onChange={(e) => setReviewProgressOverride(e.target.value)}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    {effectiveRetryBudget('review_progress', reviewProgressOverride)}
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -587,7 +603,8 @@ export function TaskOverviewPanel({
                   <p className="break-all font-mono">{task.workspace.worktree_path}</p>
                 </div>
               ) : null}
-              {task.status === 'done' && (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
+              {task.status === 'done' &&
+              (task.placement ?? task.workspace?.placement)?.state === 'cleaned' ? (
                 <p>Workspace cleaned after merge.</p>
               ) : null}
             </div>
@@ -598,8 +615,6 @@ export function TaskOverviewPanel({
           </div>
         )}
       </div>
-
     </div>
   )
 }
-

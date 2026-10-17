@@ -245,6 +245,8 @@ async fn managed_checkout_is_exact_root_scoped_and_removed_without_touching_sour
         operation_id: "managed",
         spec: &bundle,
         target: CheckoutTarget::ExactCommit {
+            environment_workspace: None,
+            assets: &[],
             repository: &source,
             build_area: &build,
             commit: &commit,
@@ -295,11 +297,25 @@ fn alive(pid: &str) -> bool {
         .status()
         .unwrap()
         .success();
-    let zombie = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|s| {
-        s.rsplit_once(") ")
-            .is_some_and(|(_, tail)| tail.starts_with('Z'))
-    });
-    exists && !zombie
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, tail)| tail.starts_with("Z "))
+    }) {
+        return false;
+    }
+    exists
+}
+#[cfg(unix)]
+async fn wait_until_dead(pid: &str) {
+    // SIGKILL and reaping need not finish before the stop call returns.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while alive(pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process {} is still running after stop", pid.trim()));
 }
 #[cfg(unix)]
 #[tokio::test]
@@ -340,13 +356,7 @@ async fn grandchild_ignoring_term_is_gone_after_timeout_and_cancel() {
             "{receipt:?}"
         );
         let pid = std::fs::read_to_string(temp.path().join("grandchild.pid")).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while alive(&pid) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        wait_until_dead(&pid).await;
         assert!(receipt.commands[0].process_tree_stopped);
     }
 }
@@ -426,13 +436,7 @@ async fn descendants_are_stopped_even_when_the_leader_exits_successfully() {
     .await;
     assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
     let pid = std::fs::read_to_string(temp.path().join("child.pid")).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while alive(&pid) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_until_dead(&pid).await;
 }
 
 #[tokio::test]
@@ -826,7 +830,7 @@ async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end
     assert_eq!(receipt.commands.len(), 2);
     assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
     let service = std::fs::read_to_string(&pid).unwrap();
-    assert!(!alive(service.trim()), "the run ended: its tree is stopped");
+    wait_until_dead(&service).await;
     assert_eq!(receipt.tracked_changes, Some(false));
 
     // The same at a failed and at a timed-out end.
@@ -845,7 +849,7 @@ async fn a_canonical_service_survives_to_the_next_step_and_is_stopped_at_run_end
         assert_eq!(receipt.outcome, outcome);
         assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
         let service = std::fs::read_to_string(&pid).unwrap();
-        assert!(!alive(service.trim()));
+        wait_until_dead(&service).await;
     }
 }
 #[tokio::test]
@@ -1146,4 +1150,169 @@ async fn next_check_removes_abandoned_forge_reports_without_following_symlinks()
         "owner data"
     );
     assert!(receipt.commands[0].failures.is_empty());
+}
+
+#[tokio::test]
+async fn canonical_base_assets_are_materialized_without_invalidating_sharing_witness() {
+    let (temp, head) = candidate().await;
+    let asset = tempfile::tempdir().unwrap();
+    std::fs::write(asset.path().join("input"), "project-asset").unwrap();
+    let assets = [EnvironmentAsset {
+        source: asset.path().to_str().unwrap().into(),
+        target: "./assets with spaces".into(),
+    }];
+    let build = temp.path().join("build");
+    let inputs = ServerCheckExecutionInputs {
+        toolchain_revision: "t".into(),
+        environment_revision: "e".into(),
+        asset_revisions: BTreeMap::from([("assets".into(), "revision".into())]),
+        secret_revisions: BTreeMap::new(),
+        shell_revision: "s".into(),
+        runner_revision: "r".into(),
+    };
+    for (command, outcome, changed) in [
+        ("test \"$(cat 'assets with spaces/input')\" = project-asset", CheckExecutionOutcome::Passed, false),
+        ("test \"$(cat 'assets with spaces/input')\" = project-asset; printf 'test base ... FAILED\\n'; exit 1", CheckExecutionOutcome::Failed, false),
+        ("echo changed >> tracked", CheckExecutionOutcome::Failed, true),
+    ] {
+        let mut spec = canonical_spec(&[command]);
+        spec.scope = CheckScope::Commit;
+        let receipt = execute(CheckExecution {
+            operation_id: "base-assets", spec: &spec,
+            target: CheckoutTarget::ExactCommit { repository: temp.path(), build_area: &build, commit: &head, environment_workspace: None, assets: &assets },
+            owner: owner(), input_revisions: Some(&inputs), environment: &BTreeMap::new(),
+            deadline: Some(Instant::now() + Duration::from_secs(30)), cancel: &CancellationToken::new(),
+            permit: &CheckPermit::already_admitted(), cleanup: CleanupPlan { commands: &[], timeout: CLEANUP_TIMEOUT }, output_limit: 4096,
+        }).await;
+        assert_eq!(receipt.outcome, outcome, "{receipt:?}");
+        assert_eq!(receipt.tracked_changes, Some(changed), "{receipt:?}");
+        assert_eq!(receipt.execution_inputs, inputs.identity().unwrap());
+        assert!(receipt.cleanup.checkout_removed);
+    }
+    assert!(!temp.path().join("assets with spaces").exists());
+}
+
+#[tokio::test]
+async fn review_verify_background_tree_is_stopped_on_cancellation_and_dropped_run() {
+    let (temp, _) = candidate().await;
+    let scratch = tempfile::tempdir().unwrap();
+    let pid = scratch.path().join("server.pid");
+    let start = format!("sleep 300 >/dev/null 2>&1 & echo $! > '{}'", pid.display());
+    let spec = canonical_spec(&[&start, "sleep 300"]);
+    let environment = BTreeMap::new();
+    let cancel = CancellationToken::new();
+    let permit = CheckPermit::already_admitted();
+    let input = || CheckExecution {
+        operation_id: "verify-cancel",
+        spec: &spec,
+        target: CheckoutTarget::Workspace(temp.path()),
+        owner: owner(),
+        input_revisions: None,
+        environment: &environment,
+        deadline: Some(Instant::now() + Duration::from_secs(10)),
+        cancel: &cancel,
+        permit: &permit,
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: CLEANUP_TIMEOUT,
+        },
+        output_limit: 512,
+    };
+    let mut run = Box::pin(execute(input()));
+    let ready = async {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pid.is_file() {
+            assert!(Instant::now() < until, "background start did not run");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tokio::select! { result=&mut run=>panic!("run ended before cancel: {result:?}"),_=ready=>{} }
+    cancel.cancel();
+    let receipt = run.await;
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Cancelled);
+    assert!(receipt.commands.iter().all(|c| c.process_tree_stopped));
+    wait_until_dead(&std::fs::read_to_string(&pid).unwrap()).await;
+    std::fs::remove_file(&pid).unwrap();
+    let cancel = CancellationToken::new();
+    let mut run = Box::pin(execute(CheckExecution {
+        operation_id: "verify-drop",
+        spec: &spec,
+        target: CheckoutTarget::Workspace(temp.path()),
+        owner: owner(),
+        input_revisions: None,
+        environment: &environment,
+        deadline: Some(Instant::now() + Duration::from_secs(10)),
+        cancel: &cancel,
+        permit: &permit,
+        cleanup: CleanupPlan {
+            commands: &[],
+            timeout: CLEANUP_TIMEOUT,
+        },
+        output_limit: 512,
+    }));
+    let ready = async {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !pid.is_file() {
+            assert!(Instant::now() < until);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    tokio::select! {result=&mut run=>panic!("run ended before drop: {result:?}"),_=ready=>{} }
+    drop(run);
+    let service = std::fs::read_to_string(&pid).unwrap();
+    wait_until_dead(&service).await;
+}
+
+#[tokio::test]
+async fn review_verify_runtime_values_are_public_but_project_values_are_redacted() {
+    let temp = tempfile::tempdir().unwrap();
+    let env = BTreeMap::from([
+        ("FORGE_VERIFY_PORT".into(), "54321".into()),
+        ("FORGE_VERIFY_URL".into(), "http://127.0.0.1:54321".into()),
+        ("FORGE_VERIFY_DIR".into(), "/tmp/verify-review".into()),
+        (
+            "FORGE_VERIFY_REQUEST".into(),
+            "/tmp/verify-review/request.json".into(),
+        ),
+        (
+            "FORGE_VERIFY_REPORT".into(),
+            "/tmp/verify-review/smoke.report.json".into(),
+        ),
+        ("PROJECT_TOKEN".into(), "real-project-secret".into()),
+    ]);
+    let mut command = step(
+        r#"printf '%s\n' "$FORGE_VERIFY_PORT" "$FORGE_VERIFY_URL" "$FORGE_VERIFY_DIR" "$FORGE_VERIFY_REQUEST" "$FORGE_VERIFY_REPORT" "1543219" "$PROJECT_TOKEN""#,
+    );
+    command.environment_keys = env.keys().cloned().collect();
+    let receipt = run_command(
+        temp.path(),
+        &command,
+        &env,
+        CANONICAL_CI_POLICY,
+        Some(Instant::now() + Duration::from_secs(10)),
+        &CancellationToken::new(),
+        4096,
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.outcome, CheckExecutionOutcome::Passed);
+    for (key, value) in &env {
+        if key.starts_with("FORGE_VERIFY_") {
+            assert!(receipt.stdout_tail.contains(value), "{receipt:?}");
+        }
+    }
+    assert!(receipt.stdout_tail.contains("1543219"));
+    assert!(receipt.stdout_tail.contains("[REDACTED]"));
+    assert!(!receipt.stdout_tail.contains("real-project-secret"));
+    // Partial-tail masking must obey the same distinction.
+    assert_eq!(
+        redacted_tail(b"review/smoke.report.json 54321", true, true, &env, 4096),
+        "review/smoke.report.json 54321"
+    );
+    assert_eq!(
+        redacted_tail(b"project-secret", true, true, &env, 4096),
+        "[REDACTED]"
+    );
 }

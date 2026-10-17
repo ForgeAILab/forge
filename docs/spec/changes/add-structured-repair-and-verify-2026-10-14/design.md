@@ -94,7 +94,7 @@ derived.**
   every existing row re-serializes byte-for-byte.
 - Forge-computed state (ids for new findings, open/resolved status, age)
   never goes into the frozen row.
-- A pure function, `finding_ledger(reviews_in_window)`, computes it from the
+- A pure function, `db::review_findings::finding_ledger(reviews_in_window)`, computes it from the
   Task's ordered Reviews in the current review-budget window. The same window
   resets the review budget at a recovery boundary.
 - Routing, the repair brief, comments and `GET /tasks/{id}/findings` all call
@@ -112,7 +112,9 @@ derived.**
 - Unknown ids, and ids reused for a finding Forge does not know, are treated
   as new findings.
 - Forge-owned findings get stable ids from their source:
-  - `CI-<step index>` for review CI steps;
+  - `CI-<step index>#<first 8 hex of sha256(normalised signature)>` for each
+    failing review CI test, or `CI-<step index>` when signatures are absent
+    (the signature refinement from `add-repair-convergence-guards` D1);
   - `CHK-<check id>` for required conformance checks;
   - `V-<check name>` for verify checks, plus `V-start` and `V-ready`.
 
@@ -232,8 +234,14 @@ Today the same Task parks at review 2 with `review_budget_exhausted`.
   3. check tails, each down to 1 KiB;
   4. resolved and unconfirmed list, ids only.
 
-  Task and open findings are never cut. If they alone exceed 24 KiB, each
-  finding's `expected` and `observed` are cut to 300 characters.
+  Task and open findings are never dropped. The cap is hard (owner decision,
+  2026-10-16): if the brief is still over, check tails share 4 KiB and verify
+  keeps 2 KiB; then each finding's summary is cut to 200 characters, `where`
+  to 120, `expected` and `observed` to 300, and past a line budget the
+  remaining open findings are listed by id. Description and plan each keep
+  4 KiB including a truncation note; compacted updates share 1 KiB across
+  steps. The final 24 KiB cap includes its notice even for an exceptional
+  window whose ids alone exceed the message capacity.
 
 **D8 — Verify runs as its own check request after review CI.**
 - New `CheckPurpose::ReviewVerify`, origin `entry`.
@@ -271,7 +279,7 @@ judgement.**
   |---|---|
   | `FORGE_VERIFY_PORT` | a free loopback port picked when the run starts |
   | `FORGE_VERIFY_URL` | `http://127.0.0.1:$FORGE_VERIFY_PORT` |
-  | `FORGE_VERIFY_DIR` | `<task root>/.forge-task/verify/<review attempt>/` |
+  | `FORGE_VERIFY_DIR` | `<task root>/.forge-task/verify/<review id>/` |
   | `FORGE_VERIFY_REQUEST` | `$FORGE_VERIFY_DIR/request.json` |
   | `FORGE_VERIFY_REPORT` | `$FORGE_VERIFY_DIR/<check name>.report.json` |
 
@@ -292,8 +300,9 @@ Start and readiness failures are fails with `V-start` / `V-ready`. Their
 `observed` is the tail of `app.log`. The app built from this candidate did not
 come up, and the coder owns that.
 
-An inconclusive result re-runs verify once automatically. The new volatile
-budget `ReviewVerifyRerun` has limit 1. A second inconclusive parks the Task
+An inconclusive result re-runs verify while the ledger-backed `ReviewVerifyRerun`
+budget admits it (default 1, 0 disables), honoring Task/Project overrides in a
+Review-id window. An exhausted inconclusive result parks the Task
 with `review_blocked` (source `verify`). The offered actions are `retry`
 (re-run verify), `mark_reviewed` (reason required) and `cancel_task`. The
 review budget is not charged.
@@ -331,6 +340,9 @@ An infrastructure failure of the runner keeps the existing
   a review CI failure posts no comment.
 - Forge adds a system comment when it dispatches a repair round, and one when
   it parks over findings (rules D5.1 and D5.2).
+- The no-change send-back and park also get Forge comments tied to the failed
+  Review, idempotent per review entry: the reminder names the unchanged HEAD and
+  `repair_no_change` budget; the park names open findings and owner actions.
 - Example:
 
   ```md
@@ -413,3 +425,58 @@ jq '{app_id:"web", change_summary:.title, changed_files:.changed_files,
 munk verify change --request-file "$FORGE_VERIFY_DIR/munk-request.json" --config munk.yaml
 # convert .munk/runs/<latest>/report.json → $FORGE_VERIFY_REPORT (verdict + screenshots)
 ```
+
+## Phase 4 implementation decisions (2026-10-16)
+
+- The pure ledger lives in `db::review_findings`, below both transactional
+  budget charging and reviewer/services callers, avoiding a dependency cycle.
+- `failures_truncated=false` describes extraction completeness, not command
+  coverage. Existing failure outcomes cannot prove all test binaries ran, so
+  only a passing CI step resolves omitted signatures. A failed step leaves
+  omitted findings and their streaks unchanged. Replaced step-level findings
+  become `superseded`, never progress credit.
+- Task description and plan each keep 4 KiB, including a truncation note.
+  Compacted updates share 1 KiB across steps; the 24 KiB cap is unconditional.
+  Exceptionally large id-only windows can exceed a message's capacity; the
+  final note directs the reader to the complete ledger.
+- Merge-CI messages retain 20 signatures (`+N more`) and a 2 KiB output end.
+- Review-entry merge-base observations can open/update base Attention, but
+  only newer queue-head target-tip passing observations can resolve it.
+- Project `retry_budgets.review_progress` supplies the Review state default;
+  explicit state values and Task-wide overrides win. Anchoring, reopened
+  findings, Attempts/Pattern memory, and fresh carried-finding executions are
+  implemented by phases 4–5 of `add-repair-convergence-guards-2026-10-14`;
+  that follow-up amends D5 and D7 above.
+
+- The hook's merged configuration is an optional trailing field on the typed
+  review-routing command. Three-field queued requests decode with no supplied
+  configuration; new requests carry the hook configuration when present.
+
+## Phase 5 implementation decisions (2026-10-16)
+
+- The server owner prepares runtime inputs under its existing admitted checkout
+  lock. Generated start/readiness/check commands use the unchanged durable
+  check runner and canonical process-tree settlement; no daemon or queue-head
+  verify execution is introduced.
+- The constrained check-consumer purpose column needs a forward, data-preserving
+  rebuild, retaining all checkpoints, indexes and both scheduler triggers.
+- Inconclusive evaluations checkpoint their invocation counter across hook
+  suspension, never in Task budget spending. Their final park uses the existing
+  reason-required manual approval action for Mark Reviewed.
+- The decided follow-ups bound requirement status to 40 lines with open ones
+  first and make it yield before open finding text; avoid attempt diffs outside
+  coder/worker repair dispatches; prioritize verify/open blockers at the findings
+  read cap; and preserve infrastructure classification during progress rounds.
+
+## Release verify follow-ups (2026-10-16)
+
+The approved release follow-ups key runtime directories and command identities
+by Review id; remove `start.pgid` on confirmed group settlement; exclude public
+`FORGE_VERIFY_*` values from redaction; and charge inconclusive reruns through
+the budget ledger per Review invocation, honoring Task/Project overrides.
+Evidence shares 64 MiB per evaluation. The app still appends to `app.log`
+directly (no buffering sink); the server owner that runs the bundle keeps the
+first 16 MiB by cutting the file back every 200 ms and once after settlement,
+so the slack during a run is what the app writes in one interval. App exit during readiness creates only `V-ready`.
+A post-run occupied-port warning appears in verify notes and reviewer prompts;
+processes escaping owned groups are outside containment and are not killed by port.

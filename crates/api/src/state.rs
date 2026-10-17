@@ -77,6 +77,10 @@ pub struct AppState {
     pub provider_authorization_service: Arc<ProviderAuthorizationService>,
     pub mcp_enabled: bool,
     pub config_path: Arc<PathBuf>,
+    /// The data directory this start was launched with (`--data-dir`), if
+    /// any. It outranks the file's `forge.data_dir`, so a settings read
+    /// resolves pending values the way the next start of this launch would.
+    pub launch_data_dir: Option<Arc<PathBuf>>,
     pub effective_config: Arc<ForgeConfig>,
     pub run_process_policy: Arc<executors::run_process::MachineRunPolicy>,
     /// Keeps compatibility notification startup abortable when no runtime
@@ -237,6 +241,7 @@ impl AppState {
             provider_authorization_service: Arc::clone(&runtime.provider_authorization_service),
             mcp_enabled,
             config_path: Arc::clone(&runtime.config_path),
+            launch_data_dir: None,
             effective_config: Arc::clone(&runtime.effective_config),
             run_process_policy: Arc::clone(&runtime.run_process_policy),
             _notification_worker: runtime.notification_worker_handle(),
@@ -246,6 +251,12 @@ impl AppState {
 
     pub fn with_config_path(mut self, config_path: PathBuf) -> Self {
         self.config_path = Arc::new(config_path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_launch_data_dir(mut self, data_dir: Option<PathBuf>) -> Self {
+        self.launch_data_dir = data_dir.map(Arc::new);
         self
     }
 

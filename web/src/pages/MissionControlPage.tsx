@@ -76,6 +76,7 @@ function attentionTaskId(item: AttentionItem): string | null {
 function attentionActionLabel(value: string | null | undefined): string {
   const normalized = value?.trim().toLowerCase().replaceAll(' ', '_')
   if (normalized === 'inspect_run') return 'Inspect run'
+  if (normalized === 'inspect_ci') return 'Inspect CI'
   return humanize(value)
 }
 
@@ -132,11 +133,76 @@ function attentionTone(item: AttentionItem): string {
       'commitment_overdue',
       'conflict_hotspot',
       'progress_warning',
+      'flaky_check',
+      'base_check_failing',
     ].includes(item.category)
   ) {
     return 'border-warning/30 bg-warning/5'
   }
   return 'border-border-subtle bg-card'
+}
+
+function CiIncidentDetails({ item }: { item: AttentionItem }) {
+  if (!['flaky_check', 'base_check_failing'].includes(item.category)) return null
+  const details = item.details
+  const tasks = Array.isArray(details.task_ids)
+    ? details.task_ids.filter((id): id is string => typeof id === 'string')
+    : []
+  const triage =
+    details.triage && typeof details.triage === 'object'
+      ? (details.triage as Record<string, unknown>)
+      : null
+  const failures = Array.isArray(details.base_failures)
+    ? details.base_failures.filter((s): s is string => typeof s === 'string')
+    : []
+  const signature = typeof details.signature === 'string' ? details.signature : ''
+  const reason = typeof triage?.reason === 'string' ? triage.reason : ''
+  return (
+    <div className="mt-3 space-y-2 text-xs">
+      {typeof details.command === 'string' ? (
+        <code className="block whitespace-pre-wrap break-words">{details.command}</code>
+      ) : null}
+      {typeof details.count === 'number' ? (
+        <p className="text-muted-foreground">
+          {details.count} occurrences · {tasks.length} tasks
+        </p>
+      ) : null}
+      {typeof details.base_commit === 'string' ? (
+        <p className="break-words text-muted-foreground">
+          Base: <code>{details.base_commit}</code>
+        </p>
+      ) : null}
+      {reason ? <p className="break-words text-muted-foreground">{reason}</p> : null}
+      {signature ? <p className="break-words font-mono">{signature}</p> : null}
+      {failures.length ? (
+        <details>
+          <summary className="cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            {failures.length} base failures
+          </summary>
+          <ul className="mt-2 space-y-1">
+            {failures.map((failure) => (
+              <li className="break-words font-mono" key={failure}>
+                {failure}
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+      <div className="flex flex-wrap gap-2">
+        {tasks.map((taskId) => (
+          <Link
+            key={taskId}
+            to="/tasks/$taskId/$tab"
+            params={{ taskId, tab: 'executions' }}
+            className="rounded-sm underline underline-offset-2 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`Inspect CI for task ${taskId}`}
+          >
+            Task {taskId.slice(0, 8)}
+          </Link>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function escalationOf(item: AttentionItem): { id: string; need: string } | null {
@@ -306,6 +372,7 @@ function AttentionCard({
               humanize(item.category)
             )}
           </p>
+          <CiIncidentDetails item={item} />
           <p className="mt-3 font-mono text-micro text-muted-foreground">
             {humanize(item.scope_type)} · {item.scope_id.slice(0, 8)} · priority {item.priority} ·
             event {item.source_event_id.slice(0, 8)}

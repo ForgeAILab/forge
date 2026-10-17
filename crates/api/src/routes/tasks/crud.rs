@@ -203,10 +203,13 @@ pub async fn list_tasks(
             let workflow = if task.parent_task_id.is_none() {
                 project_workflow.clone()
             } else {
-                std::sync::Arc::new(WorkflowEngine::resolve_workflow_for_task(
-                    &task,
-                    &project_workflow_definition,
-                    &Actor::system(SystemComponent::General),
+                std::sync::Arc::new(db::budget::with_project_defaults(
+                    &WorkflowEngine::resolve_workflow_for_task(
+                        &task,
+                        &project_workflow_definition,
+                        &Actor::system(SystemComponent::General),
+                    ),
+                    &snapshot.project_settings,
                 ))
             };
             (task, workflow)

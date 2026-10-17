@@ -1,5 +1,9 @@
 //! Bounded, streaming test identities. Unknown formats remain step failures.
-use std::{collections::BTreeSet, path::Path, sync::LazyLock};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::LazyLock,
+};
 
 use regex::Regex;
 
@@ -29,12 +33,51 @@ static JS_SOURCE_FILE: LazyLock<Regex> =
 static VITEST_HEADER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^(?:RUN|DEV)\s+v\d+\.").unwrap());
 
+/// Package decorators from pnpm recursive test scripts and turbo test tasks.
+/// Strip only their test-task grammar; e.g. Go's `--- FAIL: Test` is evidence,
+/// not a package decorator. Nested wrappers may contribute both prefixes.
+/// Also returns the packages: test paths are often package-relative, so two
+/// packages can report the same test, and only the package tells them apart.
+fn strip_runner_prefix(mut line: &str) -> (Option<String>, Vec<&str>, &str) {
+    let mut producer = None::<String>;
+    let mut packages = Vec::new();
+    while let Some((prefix, rest)) = line.split_once(": ") {
+        let Some((package, task)) = prefix.rsplit_once(' ').or_else(|| prefix.split_once(':'))
+        else {
+            break;
+        };
+        let package_token = !package.is_empty()
+            && package
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"@/._-".contains(&byte));
+        let test_task = (task == "test" || task.starts_with("test:"))
+            && task
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte));
+        if !package_token || !test_task {
+            break;
+        }
+        let key = producer.get_or_insert_with(String::new);
+        key.push_str(prefix);
+        key.push('|');
+        packages.push(package);
+        line = rest.trim_start();
+    }
+    (producer, packages, line)
+}
+
 #[derive(Default, PartialEq, Eq)]
 enum Runner {
     #[default]
     Unknown,
     JavaScript,
     Nextest,
+}
+
+#[derive(Default)]
+struct RunnerContext {
+    file: Option<String>,
+    runner: Runner,
 }
 
 /// ANSI parser state survives pipe chunk boundaries, including OSC hyperlinks.
@@ -155,8 +198,8 @@ pub(crate) struct Stream<'a> {
     ansi: Ansi,
     tail: Vec<u8>,
     line: Vec<u8>,
-    file: Option<String>,
-    runner: Runner,
+    context: RunnerContext,
+    producers: BTreeMap<String, RunnerContext>,
     limit: usize,
     roots: &'a [&'a Path],
     env: &'a std::collections::BTreeMap<String, String>,
@@ -173,8 +216,8 @@ impl<'a> Stream<'a> {
             ansi: Ansi::default(),
             tail: vec![],
             line: vec![],
-            file: None,
-            runner: Runner::Unknown,
+            context: RunnerContext::default(),
+            producers: BTreeMap::new(),
             limit,
             roots,
             env,
@@ -198,7 +241,20 @@ impl<'a> Stream<'a> {
     }
     fn end_line(&mut self) {
         let line = String::from_utf8_lossy(&self.line);
-        let line = line.trim();
+        let (producer, packages, line) = strip_runner_prefix(line.trim());
+        let mut overflow = RunnerContext::default();
+        let context = if let Some(producer) = producer {
+            // Parallel packages must not lend one another their file or runner
+            // block. Bound this state just like the signature collection.
+            if self.producers.len() == MAX_FAILURES && !self.producers.contains_key(&producer) {
+                self.failures.truncated = true;
+                &mut overflow
+            } else {
+                self.producers.entry(producer).or_default()
+            }
+        } else {
+            &mut self.context
+        };
         // A runner block ends at its summary. A later linter or progress
         // renderer may print the same glyphs, without reporting any tests.
         if line.starts_with("Test Suites:")
@@ -206,25 +262,25 @@ impl<'a> Stream<'a> {
             || line.starts_with("Summary [")
             || line.starts_with("SUMMARY [")
         {
-            self.runner = Runner::Unknown;
-            self.file = None;
+            context.runner = Runner::Unknown;
+            context.file = None;
         } else if VITEST_HEADER.is_match(line) {
-            self.runner = Runner::JavaScript;
-            self.file = None;
+            context.runner = Runner::JavaScript;
+            context.file = None;
         } else if line.starts_with("Nextest run ID ") {
-            self.runner = Runner::Nextest;
-            self.file = None;
+            context.runner = Runner::Nextest;
+            context.file = None;
         }
         let identity = if let Some(failure) = NEXTEST_FAILURE.captures(line) {
-            self.runner = Runner::Nextest;
-            self.file = None;
+            context.runner = Runner::Nextest;
+            context.file = None;
             Some(format!("{} > {}", &failure[1], &failure[2]))
-        } else if self.runner == Runner::Nextest {
+        } else if context.runner == Runner::Nextest {
             // Both nextest's --- STDOUT:/STDERR: blocks and newer indented
             // stdout/stderr sections can repeat libtest failures. The binary
             // plus test on nextest's own FAIL line is the identity, once.
             if line == "error: test run failed" {
-                self.runner = Runner::Unknown;
+                context.runner = Runner::Unknown;
             }
             None
         } else if let Some(test) = line
@@ -249,8 +305,8 @@ impl<'a> Stream<'a> {
                 // must not reach the identity, which keeps only a trailing one.
                 let file = DURATION.replace(test, "");
                 if JS_SOURCE_FILE.is_match(&file) {
-                    self.runner = Runner::JavaScript;
-                    self.file = Some(file.into_owned());
+                    context.runner = Runner::JavaScript;
+                    context.file = Some(file.into_owned());
                 }
                 None
             }
@@ -258,14 +314,15 @@ impl<'a> Stream<'a> {
             .strip_prefix('×')
             .or_else(|| line.strip_prefix('✗'))
             .or_else(|| line.strip_prefix('●'))
-            .filter(|_| self.runner == Runner::JavaScript)
+            .filter(|_| context.runner == Runner::JavaScript)
         {
             let test = test.trim().replace(" › ", " > ");
-            if test.contains(" > ") && self.file.is_none() {
+            if test.contains(" > ") && context.file.is_none() {
                 Some(test)
             } else {
                 Some(
-                    self.file
+                    context
+                        .file
                         .as_ref()
                         .map_or(test.clone(), |file| format!("{file} > {test}")),
                 )
@@ -276,12 +333,17 @@ impl<'a> Stream<'a> {
                 .and_then(|s| s.trim().split_once(" ("))
                 .filter(|(file, summary)| JS_SOURCE_FILE.is_match(file) && summary.contains("test"))
             {
-                self.runner = Runner::JavaScript;
-                self.file = Some(file.0.to_owned());
+                context.runner = Runner::JavaScript;
+                context.file = Some(file.0.to_owned());
             }
             None
         };
         if let Some(identity) = identity {
+            let identity = if packages.is_empty() {
+                identity
+            } else {
+                format!("{} > {identity}", packages.join(" > "))
+            };
             self.failures.add(&identity, self.roots, self.env);
         }
         self.line.clear();
@@ -485,6 +547,70 @@ mod tests {
             extract(include_str!("fixtures/go-test.txt")),
             ["TestParser", "TestParser/Empty", "TestParser/Unicode"]
         );
+    }
+    #[test]
+    fn monorepo_prefixes_from_captured_pnpm_and_turbo_output() {
+        assert_eq!(
+            extract(include_str!("fixtures/pnpm-monorepo.txt")),
+            [
+                "packages/beta > packages/beta/beta.test.js > monorepo suite > rejects invalid input",
+                "packages/alpha > packages/alpha/alpha.test.js > monorepo suite > rejects invalid input",
+            ]
+        );
+        assert_eq!(
+            extract(include_str!("fixtures/turbo-monorepo.txt")),
+            [
+                "beta > packages/beta/beta.test.js > monorepo suite > rejects invalid input",
+                "alpha > packages/alpha/alpha.test.js > monorepo suite > rejects invalid input",
+            ]
+        );
+    }
+    #[test]
+    fn monorepo_packages_with_the_same_relative_test_stay_distinct() {
+        // Each package's runner reports paths relative to that package.
+        assert_eq!(
+            extract("a:test: FAIL src/index.test.ts\nb:test: FAIL src/index.test.ts\na:test: ● parse › rejects\nb:test: ● parse › rejects\na test: test parser::empty ... FAILED\nb test: test parser::empty ... FAILED\n"),
+            [
+                "a > src/index.test.ts > parse > rejects",
+                "b > src/index.test.ts > parse > rejects",
+                "a > parser::empty",
+                "b > parser::empty",
+            ]
+        );
+    }
+    #[test]
+    fn monorepo_prefixes_preserve_glyph_scope_and_other_runner_syntax() {
+        assert!(extract("pkg test: × lint starting\npkg:test: RUN v4.1.11 /task\npkg:test: Test Files 1 passed (1)\npkg:test: ● bundling\n").is_empty());
+        assert_eq!(extract("pkg test: inner:test: test parser::empty ... FAILED\n--- FAIL: TestParser (0.01s)\n"),["pkg > inner > parser::empty","TestParser"]);
+    }
+    #[test]
+    fn monorepo_packages_keep_independent_runner_blocks() {
+        assert_eq!(extract("a:test: FAIL src/a.test.ts\nb test: FAIL src/b.test.ts\na:test: ● suite-a › broken\na:test: Test Suites: 1 failed\na:test: × linter\nb test: ● suite-b › broken\nb test: Test Suites: 1 failed\n"),[
+            "a > src/a.test.ts > suite-a > broken", "b > src/b.test.ts > suite-b > broken",
+        ]);
+    }
+    #[test]
+    fn monorepo_runner_context_overflow_is_incomplete_evidence() {
+        let env = BTreeMap::new();
+        let roots = [Path::new("/task")];
+        let mut stream = Stream::new(64, &roots, &env);
+        for index in 0..=MAX_FAILURES {
+            stream.push(format!("pkg{index}:test: RUN v4.1.11 /task\n").as_bytes());
+        }
+        stream.push("pkg0:test: × suite > failure\n".as_bytes());
+        let (_, _, failures) = stream.finish();
+        assert!(failures.truncated);
+        assert_eq!(failures.signatures, ["pkg0 > suite > failure"]);
+    }
+    #[test]
+    fn monorepo_prefixes_remain_in_the_stored_tail() {
+        let env = BTreeMap::new();
+        let roots = [Path::new("/task")];
+        let mut stream = Stream::new(4096, &roots, &env);
+        stream.push(b"pkg:test: test parser::empty ... FAILED\n");
+        let (tail, _, failures) = stream.finish();
+        assert_eq!(failures.signatures, ["pkg > parser::empty"]);
+        assert!(String::from_utf8(tail).unwrap().starts_with("pkg:test: "));
     }
     #[test]
     fn signature_normalisation_deduplicates_caps_and_redacts() {

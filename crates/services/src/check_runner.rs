@@ -1,4 +1,6 @@
 //! Durable mechanical-evidence requests. This port has no Task/Review writers.
+pub(crate) mod ci_triage;
+mod ci_triage_attention;
 pub mod consumer;
 pub mod owners;
 pub mod policy;

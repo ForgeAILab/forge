@@ -817,6 +817,35 @@ impl CoordinationToolProvider {
 
     /// Store one captured artifact as Task media with the checksum milestone
     /// evidence attachment compares against.
+    /// The admitted server verify hook uses the same idempotent Task evidence
+    /// store as task.evidence and CLI outboxes, without inventing an Agent run.
+    pub(crate) async fn capture_verify_evidence(
+        &self,
+        task_id: &str,
+        media_id: &str,
+        filename: &str,
+        kind: &str,
+        _caption: &str,
+        bytes: &[u8],
+    ) -> Result<String, AgentHostError> {
+        if bytes.is_empty() || bytes.len() as i64 > MAX_CAPTURED_EVIDENCE_BYTES {
+            return Err(invalid_arguments(
+                "verify evidence must be 1 byte to 25 MiB".into(),
+            ));
+        }
+        let stored = self
+            .store_task_evidence_with_id(
+                EvidenceAuthor::Verify,
+                task_id,
+                filename,
+                content_type_for(filename, kind),
+                bytes,
+                media_id.to_owned(),
+            )
+            .await?;
+        Ok(stored.media_id)
+    }
+
     async fn store_task_evidence(
         &self,
         actor_identity_id: &str,
@@ -826,7 +855,7 @@ impl CoordinationToolProvider {
         bytes: &[u8],
     ) -> Result<StoredEvidence, AgentHostError> {
         self.store_task_evidence_with_id(
-            actor_identity_id,
+            EvidenceAuthor::Agent(actor_identity_id),
             task_id,
             filename,
             content_type,
@@ -844,7 +873,7 @@ impl CoordinationToolProvider {
     /// creating another asset.
     async fn store_task_evidence_with_id(
         &self,
-        actor_identity_id: &str,
+        author: EvidenceAuthor<'_>,
         task_id: &str,
         filename: &str,
         content_type: String,
@@ -865,7 +894,7 @@ impl CoordinationToolProvider {
             return self
                 .resolve_task_evidence_receipt(
                     existing,
-                    actor_identity_id,
+                    author,
                     task_id,
                     filename,
                     &content_type,
@@ -895,9 +924,9 @@ impl CoordinationToolProvider {
                 content_type: content_type.clone(),
                 byte_size,
                 storage_key: storage_key.clone(),
-                author_type: db::CommentAuthorType::Agent,
-                author_id: Some(actor_identity_id.to_owned()),
-                author_name: "Agent".to_owned(),
+                author_type: author.kind(),
+                author_id: author.id().map(str::to_owned),
+                author_name: author.name().to_owned(),
                 created_at: db::now_rfc3339(),
             },
         )
@@ -925,7 +954,7 @@ impl CoordinationToolProvider {
 
         self.resolve_task_evidence_receipt(
             created,
-            actor_identity_id,
+            author,
             task_id,
             filename,
             &content_type,
@@ -940,7 +969,7 @@ impl CoordinationToolProvider {
     async fn resolve_task_evidence_receipt(
         &self,
         media: db::TaskMedia,
-        actor_identity_id: &str,
+        author: EvidenceAuthor<'_>,
         task_id: &str,
         filename: &str,
         content_type: &str,
@@ -953,8 +982,8 @@ impl CoordinationToolProvider {
             || media.content_type != content_type
             || media.byte_size != byte_size
             || media.storage_key != storage_key
-            || media.author_type != db::CommentAuthorType::Agent
-            || media.author_id.as_deref() != Some(actor_identity_id)
+            || media.author_type != author.kind()
+            || media.author_id.as_deref() != author.id()
             || media.deleted_at.is_some()
         {
             return Err(AgentHostError::Runtime(
@@ -1186,7 +1215,7 @@ impl CoordinationToolProvider {
             ));
         }
         self.store_task_evidence_with_id(
-            input.agent_id,
+            EvidenceAuthor::Agent(input.agent_id),
             input.task_id,
             &filename,
             content_type,
@@ -1391,7 +1420,7 @@ impl CoordinationToolProvider {
             return Ok(());
         }
         self.store_task_evidence_with_id(
-            input.agent_id,
+            EvidenceAuthor::Agent(input.agent_id),
             input.task_id,
             &filename,
             content_type,
@@ -4627,6 +4656,32 @@ fn truncate(value: &str, limit: usize) -> String {
 
 /// A captured artifact is evidence, not a transfer channel: keep it small
 /// enough that a runaway capture cannot fill the media store.
+#[derive(Clone, Copy)]
+enum EvidenceAuthor<'a> {
+    Agent(&'a str),
+    Verify,
+}
+impl<'a> EvidenceAuthor<'a> {
+    fn kind(self) -> db::CommentAuthorType {
+        match self {
+            Self::Agent(_) => db::CommentAuthorType::Agent,
+            Self::Verify => db::CommentAuthorType::System,
+        }
+    }
+    fn id(self) -> Option<&'a str> {
+        match self {
+            Self::Agent(id) => Some(id),
+            Self::Verify => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Agent(_) => "Agent",
+            Self::Verify => "Forge Verify",
+        }
+    }
+}
+
 struct StoredEvidence {
     media_id: String,
     asset_id: String,
@@ -4782,7 +4837,7 @@ fn resolve_outbox_artifact(
 /// replacement between validation and open from being accepted, and outbox
 /// callers also require a single link so a hard link cannot turn the outbox
 /// into a read channel for another file.
-fn read_bounded_regular_file(
+pub(crate) fn read_bounded_regular_file(
     path: &Path,
     allowed_root: &Path,
     max_bytes: u64,
@@ -5619,7 +5674,7 @@ mod tests {
         fixture
             .provider
             .store_task_evidence_with_id(
-                &fixture.agent_id,
+                EvidenceAuthor::Agent(&fixture.agent_id),
                 &fixture.task_id,
                 "log.txt",
                 "text/plain".to_owned(),

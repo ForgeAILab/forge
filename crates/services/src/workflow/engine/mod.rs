@@ -561,12 +561,12 @@ impl WorkflowExecution<'_> {
     async fn settle_failed_ci_entry(
         &self,
         task: &db::Task,
+        ctx: &HookContext,
         action: &str,
-        actor: &Actor,
         entry_started_at: &str,
         authority: Option<&WorkflowAuthority>,
     ) -> crate::Result<Option<ReviewEntryFailure>> {
-        if action != "run_ci_steps" || actor.is_user() {
+        if ctx.triggered_by.is_user() {
             return Ok(None);
         }
         // A typed owner/preflight refusal was settled atomically by the hook.
@@ -591,6 +591,12 @@ impl WorkflowExecution<'_> {
         let Some(review) = latest_review(&self.db, &task.id).await? else {
             return Ok(None);
         };
+        // Infrastructure interruptions were classified and settled by the
+        // hook above. A progress receipt does not turn configuration or other
+        // deterministic failures into infrastructure retries.
+        if action != "run_ci_steps" {
+            return Ok(None);
+        }
         // Authority-loss cancellations retain the base routing.
         if review.status != db::ReviewStatus::Failed
             || review.started_at.as_str() < entry_started_at
@@ -1489,6 +1495,13 @@ impl WorkflowExecution<'_> {
                     .map(|previous| previous.entry_origin.unwrap_or(durable::EntryOrigin {
                         from: previous.from, actor: previous.actor,
                     }))
+                    .map(|mut origin| {
+                        // The owner taking over a blocked entry also owns its
+                        // later automatic reconnect retries. Keep the source
+                        // state, while retaining that explicit owner intent.
+                        if actor.is_owner() { origin.actor = actor.clone(); }
+                        origin
+                    })
             } else {
                 None
             };

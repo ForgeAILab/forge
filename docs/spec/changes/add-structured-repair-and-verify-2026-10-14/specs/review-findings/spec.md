@@ -57,11 +57,12 @@ continues that finding. An unknown id is treated as a new finding.
 
 Forge-owned failures recorded on a Review SHALL be findings with ids taken
 from their source:
-- `CI-<step index>` for a failed review CI step;
+- `CI-<step index>#<first 8 hex of sha256(normalised signature)>` per failing
+  review CI test, or `CI-<step index>` for a failed step without signatures;
 - `CHK-<check id>` for a failed required conformance check;
 - `V-<check name>`, `V-start` and `V-ready` for verify.
 
-Their `observed` text is the bounded output tail. The same source failing
+Their `observed` text is the normalised test signature or bounded output tail. The same source failing
 again carries the same id. Merge-queue failures create no Review and are not
 part of the ledger; the repair brief covers them.
 
@@ -70,7 +71,7 @@ part of the ledger; the repair brief covers them.
 - **THEN** after review 2, F1 is open, F2 is resolved, and the new finding is F3
 
 #### Scenario: CI failure is a finding
-- **WHEN** review CI step 2 (`cargo test`) exits 101
+- **WHEN** review CI step 2 (`cargo test`) exits 101 without failure signatures
 - **THEN** the ledger has an open finding `CI-2` whose `where` is `cargo test` and whose `observed` is the step's output tail
 
 ### Requirement: The finding ledger is derived from the window's Reviews
@@ -82,7 +83,7 @@ Each entry has:
 - `id`, `source` (`reviewer | ci | check | verify | merge`), `severity`;
 - `summary`, `where`, `expected`, `observed`;
 - `first_attempt`, `last_checked_attempt`;
-- `status`: `open | resolved | unconfirmed`;
+- `status`: `open | resolved | unconfirmed | flaky | pre_existing | superseded`;
 - `streak`.
 
 The rules:
@@ -108,8 +109,10 @@ one function.
 
 ### Requirement: Findings are readable through the API and CLI
 `GET /api/v1/tasks/{id}/findings` SHALL return the current window's ledger as
-`{ items, window_started_at, review_attempts }`. `items` is ordered by id and
-has at most 200 entries. The route needs the same Task read authority as
+`{ items, window_started_at, review_attempts }`. `items` has at most 200 entries
+after complete derivation. It prioritizes open blocking verify findings, then
+other open blocking findings, then other statuses/severities, with natural id
+ordering within each group. The route needs the same Task read authority as
 `GET /api/v1/tasks/{id}/reviews`.
 
 `forge-ctl task findings <task>` SHALL print the same ledger.
@@ -124,3 +127,19 @@ The types SHALL be exported to the generated TypeScript and documented in
 #### Scenario: No access
 - **WHEN** a user who cannot read the Task calls the route
 - **THEN** the response is the same refusal `GET /api/v1/tasks/{id}/reviews` returns for that user
+
+#### Scenario: A fail-fast CI round omits a previous failing binary
+- **WHEN** a CI step fails again with an untruncated list that omits a prior test
+- **THEN** that test retains its previous status, streak and last checked attempt; it contributes no false progress
+
+#### Scenario: A passing triage re-run resolves omitted tests
+- **WHEN** a CI step fails on its first run but its CI-triage re-run of the whole step passes (step class `flaky`)
+- **THEN** prior per-test findings of that step absent from the first run's list are resolved, as after a first-run pass
+
+#### Scenario: Per-test CI findings replace a step finding
+- **WHEN** a failed step formerly represented by CI-0 now reports signatures
+- **THEN** CI-0 is superseded, not resolved, and GET findings reports that additive status
+
+#### Scenario: Verify findings survive a large history
+- **WHEN** more than 200 resolved or minor findings precede an open blocking `V-smoke`
+- **THEN** the capped response includes `V-smoke` before that history

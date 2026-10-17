@@ -96,8 +96,11 @@ Non-Goals:
 1. When review CI fails, Forge re-runs the failing steps once on the
    candidate, in the same workspace (earlier steps' effects are still on
    disk).
-2. A signature that does not fail in both runs is `flaky`. A step that passes
-   on the re-run is wholly flaky.
+2. A signature that does not fail in both runs is `flaky`, when the re-run
+   fails again with at least one of the same signatures. A step that passes
+   on the re-run is wholly flaky. A re-run failing with only other signatures
+   (a fail-fast runner stopping at another test) shows no flake: the step is
+   consistent and all its signatures go to the base.
 3. For the remaining consistent failures, Forge runs a base check on the base
    commit. The base is the merge base with the target branch. The run must be
    comparable to the candidate run:
@@ -116,7 +119,8 @@ Non-Goals:
      re-run step only, and the base comparison is `base_unavailable` in
      version 1.
 4. That base run has its own identity. It is reused by every Task and attempt
-   on the same base commit, setup steps and CI steps.
+   on the same base commit, setup steps and CI steps. Completed red evidence is
+   shared only for base comparison, never as a certified candidate/head pass.
 5. **An invalid base run classifies nothing.** The base run is
    `base_run_invalid` when either of these holds:
    - its setup steps fail;
@@ -129,9 +133,14 @@ Non-Goals:
    `pre_existing`. The rest are `introduced`.
 7. **Without signatures:**
    - a step that passes on the re-run is flaky;
-   - a step that fails on both the candidate and the base is
-     `pre_existing_unverified`. It still blocks, because new failures may hide
-     inside it, but the brief and attention say the base fails too.
+   - a signatureless candidate failure against a red base with signatures is
+     `introduced` and blocking, with a reason distinguishing the two failures;
+   - when the re-run reports no signatures, a candidate signature the red
+     base does not fail makes the step `introduced`, naming that signature;
+   - a step that fails on both the candidate and a signatureless base, or
+     whose candidate signatures all fail on the base while the re-run reports
+     none, is `pre_existing_unverified`. It still blocks, because new failures
+     may hide inside it, but the brief and attention say the base fails too.
 8. **At the merge-queue head**, the same triage runs against the target tip,
    on that check's owner.
 
@@ -144,6 +153,8 @@ Non-Goals:
 | `report` | yes | everything, as today; the triage is still recorded and reported |
 | `off` | no | everything, as today |
 
+- Under `full`, candidate CI collects all configured steps so waiving an early
+  failure cannot omit later validation. `report` and `off` retain stop-at-first-failure.
 - **Under `full`, with no blocking failures left**, the step counts as passed
   for this review. The Review details keep the triage, and review continues
   to verify and the reviewer. At the queue head, the head is not sent back.
@@ -152,17 +163,17 @@ Non-Goals:
   settle, treats the step as non-blocking. A triaged step therefore never
   becomes a reusable certified pass. The unchanged-commit reuse path cannot
   skip head CI because of it.
-- **Budget:** triage uses the volatile `ReviewCiTriage` budget, limit 1 per
-  review attempt or queue-head check.
+- **Replay bound:** durable consumer request keys admit at most one rerun bundle
+  and base comparison per review attempt or queue-head check; no volatile budget.
 - **Attention.** Flaky and pre-existing failures raise Project attention, deduped:
   - `flaky_check` is keyed by the step command and signature, with a count
     and the Tasks that hit it;
-  - `base_check_failing` is keyed by step and base commit, and resolves when a
-    later base run of that step passes.
+  - `base_check_failing` is keyed by Project and step command. A newer red base
+    updates it. Only a newer passing queue-head target-tip base run of that command resolves it; review-entry merge-base runs never resolve it.
 
 **D4 — No-change gate.**
 - When a coder repair round ends and the commit about to enter review equals
-  the commit judged by the latest Review in the window, and that Review failed
+  the commit judged by the latest settled Review in the window, and that Review failed
   (with a clean worktree), Forge starts no CI, verify or reviewer, and creates
   no Review row.
 - **First time:** it sends the Task back to the coder with a brief headed
@@ -170,15 +181,22 @@ Non-Goals:
   `RepairNoChange` budget (Review window, limit 1).
 - **Second time:** it parks with `review_needs_owner` and the message
   `no change after repair round`.
+- Each outcome posts a Forge comment, idempotent per review entry: a replay
+  posts nothing new, and a later park of the same failed Review (after an owner
+  send-back) posts its own.
+  The send-back states the unchanged HEAD and `repair_no_change` budget spent
+  and remaining; the park lists open findings and owner actions, using the
+  repeated-finding park comment.
 - A later passing Review of the same commit means no reminder is due.
-- Owner-initiated re-reviews are exempt.
+- Owner-initiated re-reviews and explicit owner Retry of a blocked entry are exempt. Only passed/failed Reviews participate in the latest settled Review comparison.
 - Entries already past the guard when it ships continue: entry checkpoints
   without a guard decision record `Continue`. A recorded `awaited_consumer_id`
   is no proof (an exit hook's wait keeps it too); a suspended entry hook has
   its own open checkpoint.
-- Same-state retries after an offline entry carry the original source state and
+- Automatic same-state retries after an offline entry carry the original source state and
   actor in the hooks payload, so reconnect still evaluates a repair entry as a
-  repair and retains owner exemptions. A reminder clears the resolved entry's
+  repair and retains owner exemptions. An explicit owner Retry is exempt even
+  when that original actor was the coder. A reminder clears the resolved entry's
   infrastructure blocker before returning to the coder. No schema migration is
   needed.
 
@@ -188,8 +206,9 @@ Non-Goals:
 - `kind`: `regression`, `missed` or `out_of_scope`. Absent is allowed.
 - `same_cause_as`: an earlier finding id.
 
-From the second review in a window, Forge applies these rules in the ledger,
-never in the frozen assessment:
+After the reviewer's first assessment in a window (a Review that stopped before
+a reviewer ran does not count), Forge applies these rules in the ledger, never
+in the frozen assessment:
 - A new (not continued) blocking finding stays blocking only if one of these
   holds:
   - its kind is `regression`;
@@ -199,7 +218,9 @@ never in the frozen assessment:
     `where` has no path, this clause is not met.
 
   Otherwise it is shown as `minor` with the note "outside requirements and
-  Task files".
+  Task files". A continued finding that was downgraded stays `minor` until it
+  meets one of these clauses: the re-review prompt asks the reviewer to copy
+  every open id, which must not turn a nit into a blocker.
 - `out_of_scope` findings never block. Their status is `out_of_scope`, and
   they are listed as follow-up candidates.
 
@@ -243,7 +264,10 @@ owner pass it in one step.
   changed."
 
 The drop order adds Attempts after the reviewer report, keeping the latest
-round longest. Requirement status and Pattern are never dropped.
+round longest. Requirement status and Pattern are never dropped. Pattern has
+display limits instead (open members first, 20 sites per family and 30 in all,
+locations clipped, then "+N more"), so a large family cannot crowd the open
+findings out of the 24 KiB brief.
 
 **D8 — Change strategy when a finding is carried.** A repair round that
 contains a carried reviewer finding (streak 2, the round D5 of the first
@@ -287,7 +311,7 @@ a coder repeat. Per-test findings make the count fine-grained.
 
 - New optional fields only. There are no schema migrations, unless
   `task_budget.kind` is constrained, in which case it is widened for
-  `review_ci_triage` and `repair_no_change`.
+  `repair_no_change`.
 - Existing Projects get `review_ci_triage: full`. This is the visible behaviour
   change, listed under CHANGELOG `### Changed` with the `off` opt-out.
 - Older daemons keep working without signatures.
@@ -304,3 +328,22 @@ All resolved. The owner accepted the recommendations on 2026-10-14.
   for the owner. Forge does not pass it automatically.
 - **Q3.** `repair_switch_model_when_stuck` is opt-in (default `false`).
 - **Q4.** Triage also runs at the merge-queue head.
+
+
+## Phases 4–5 implementation decisions (2026-10-16)
+
+- Anchoring and reopened state are projections in `db::review_findings`.
+  Unknown requirement IDs are also removed before an assessment is frozen;
+  empty optional fields preserve older assessment serialization.
+- `resolved_attempt` records the last actual resolution, including across a
+  later reopened status. Minor appearances count zero in a blocking streak.
+- Attempts keep the last three settled, non-manual Reviews and use owner-backed
+  diffs between reviewed commits. The oldest attempt is cut first after the
+  reviewer report; Requirement status and Pattern are protected with findings.
+- Model switching promotes the first fallback in a fresh execution snapshot
+  only. The next ordinary round starts on the primary, fresh when the previous
+  snapshot switched models, so same-agent continuation cannot make it sticky.
+- `WorkflowDefinition` owns the shared planning-state/coordination-role resolver;
+  budget charging and services use it. Review-window reads share one SQL owner.
+- Project settings stay optional JSON; no migration is required. Detailed
+  choices and verification are recorded under `/Volumes/Data/tmp/refactor/guards-45/`.

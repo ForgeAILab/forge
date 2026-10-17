@@ -364,13 +364,22 @@ fn remove_staging_path(path: &Path) {
 /// `echo "$TOKEN"` from copying a configured value into durable logs and
 /// blocking annotations.
 #[must_use]
-pub fn redact_environment_values(text: &str, environment: &BTreeMap<String, String>) -> String {
+pub fn redaction_values(environment: &BTreeMap<String, String>) -> Vec<&String> {
+    // These reserved runtime inputs are public addresses and paths, not
+    // Project secrets. In particular a port must not redact matching digits.
     let mut values = environment
-        .values()
-        .filter(|value| !value.is_empty())
+        .iter()
+        .filter(|(key, value)| !key.starts_with("FORGE_VERIFY_") && !value.is_empty())
+        .map(|(_, value)| value)
         .collect::<Vec<_>>();
     values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
     values.dedup();
+    values
+}
+
+#[must_use]
+pub fn redact_environment_values(text: &str, environment: &BTreeMap<String, String>) -> String {
+    let values = redaction_values(environment);
     values.into_iter().fold(text.to_owned(), |redacted, value| {
         redacted.replace(value, "[REDACTED]")
     })

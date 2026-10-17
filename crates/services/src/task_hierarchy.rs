@@ -14,43 +14,6 @@ use crate::{
     Result, ServiceError,
 };
 
-/// The workflow's planning state: the first gate with a role, outside the
-/// review phase, on the path a Task takes from an initial state to the first
-/// implementation (`Active`) state. A coordination root runs its lead there.
-pub(crate) fn planning_state(workflow: &WorkflowDefinition) -> Option<&StateDefinition> {
-    for initial in workflow
-        .states
-        .iter()
-        .filter(|state| state.kind == StateKind::Initial)
-    {
-        let mut cursor = initial.name.as_str();
-        for _ in 0..workflow.states.len() {
-            let Some(next) = workflow
-                .outgoing_trigger_targets(cursor)
-                .filter(|(trigger, _)| !trigger.system_only())
-                .find_map(|(_, target)| {
-                    workflow.states.iter().find(|state| {
-                        state.name == target
-                            && matches!(state.kind, StateKind::Active | StateKind::Gate)
-                    })
-                })
-            else {
-                break;
-            };
-            if next.kind == StateKind::Active {
-                break;
-            }
-            if next.canonical_phase != Some(CanonicalPhase::Review)
-                && effective_role(next).is_some()
-            {
-                return Some(next);
-            }
-            cursor = next.name.as_str();
-        }
-    }
-    None
-}
-
 /// Whether the native host can run `role` as a root's lead. It maps Task
 /// roles by literal name, so v1 supports only the built-in planner.
 pub(crate) fn lead_role_supported(role: &str) -> bool {
@@ -82,11 +45,7 @@ impl<'a> RootRolePolicy<'a> {
             });
         // The implementation role is never executed on a root, so a planning
         // gate that names it has no lead.
-        let planning = planning_state(workflow).filter(|state| {
-            effective_role(state).is_some_and(|role| {
-                role != crate::workflow::default_roles::CODER && implementation_role != Some(role)
-            })
-        });
+        let planning = workflow.coordination_planning_state();
         Self {
             workflow,
             implementation_role,
@@ -1801,10 +1760,37 @@ mod tests {
     /// The planning state is found by position, not by name, and a planning
     /// gate that names the implementation role has no lead.
     #[test]
+    fn task_hierarchy_budget_workflow_fallback_matches_service_resolution() {
+        for raw in ["", "{}", "not-json"] {
+            let workflow = WorkflowEngine::resolve_workflow(raw);
+            assert_eq!(
+                WorkflowDefinition::coordination_planning_role_from_json(raw),
+                RootRolePolicy::for_workflow(&workflow)
+                    .planning_role()
+                    .map(str::to_owned)
+            );
+        }
+        let mut workflow = crate::workflow::default_workflow::default_workflow();
+        workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == default_states::PLANNING)
+            .unwrap()
+            .role = Some("architect".into());
+        let raw = serde_json::to_string(&workflow).unwrap();
+        assert_eq!(
+            WorkflowDefinition::coordination_planning_role_from_json(&raw),
+            RootRolePolicy::for_workflow(&workflow)
+                .planning_role()
+                .map(str::to_owned)
+        );
+    }
+
+    #[test]
     fn task_hierarchy_planning_state_is_the_first_role_gate_before_implementation() {
         let mut workflow = crate::workflow::default_workflow::default_workflow();
         assert_eq!(
-            planning_state(&workflow).map(|state| state.name.as_str()),
+            workflow.planning_state().map(|state| state.name.as_str()),
             Some(default_states::PLANNING)
         );
         for state in &mut workflow.states {

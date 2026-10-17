@@ -1181,7 +1181,9 @@ impl HeadDriver {
         // Retry admitted: a successor of that attempt has no more proof of
         // its candidate than it had.
         let retried_incomplete_import = self.w.db.retried_quarantined_import(&a.task_ref).await?;
+        let triaged_review = self.w.db.review_ci_passed_by_triage(&a.task_ref).await?;
         let skip_check = facts.target_in_candidate
+            && (!triaged_review || checked)
             && (!rebased_by_queue || checked)
             && (!retried_incomplete_import || checked);
         let lost = !facts.target_in_candidate;
@@ -1566,6 +1568,24 @@ impl HeadDriver {
             return Ok(Pass::Progress);
         }
         let Some(ack) = IntegrationStepAck::current(&a, IntegrationStepAction::Settle) else {
+            if let Some(authority) = crate::integration_steps::check_authority(&a) {
+                if self
+                    .w
+                    .db
+                    .integration_head_triage_pending(
+                        &a.task_ref,
+                        a.expected_epoch,
+                        &authority,
+                        &stamp(self.w.clock.now()),
+                    )
+                    .await?
+                {
+                    // Each triage stage has its own check deadline. Give its
+                    // delivery a fresh head wait instead of timing out on the
+                    // original candidate check's 35-minute allowance.
+                    self.since = Some((a.state, self.w.clock.now()));
+                }
+            }
             if self.timed_out(HeadTimeout::Check) {
                 return self
                     .park(&a, ParkReason::Timeout, "no check verdict arrived")
@@ -1643,7 +1663,9 @@ impl HeadDriver {
         let message = ack.message.clone();
         self.send_back(a, S::Ejected, |a| {
             a.failure_kind = Some(IntegrationFailureKind::CandidateCheckFailed);
-            a.failure_message = message.as_deref().map(bounded);
+            a.failure_message = message
+                .as_deref()
+                .map(crate::integration_steps::bounded_ci_failure);
         })
         .await
     }

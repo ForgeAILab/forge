@@ -6,6 +6,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- `forge --demo` no longer executes configured server commands or starts the
+  embedded daemon, refuses provider credentials and Chat/agent turns, and
+  accepts only public `https://` repositories (no server paths, environment
+  assets, integrations or MCP config file writes). Git operations performed by
+  Forge remain available.
+- Session cookie names are now `__Host-forge_session` and
+  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
+  unprefixed cookies are no longer read. Registration, login and refresh no
+  longer set cookies on plain HTTP; localStorage token authentication remains
+  available.
+
+### Added
+
+- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
+  registration, login and refresh, with matching logout cleanup.
+  REST, web startup and SSE support cookie-only sessions while password-login
+  JSON tokens and existing localStorage behavior remain available. TestSprite
+  can capture a session credential after username/password sign-in.
+- Web startup revives a cookie-only session after an expired access cookie:
+  one empty-body refresh request, then one `/auth/me` retry. Failed revival
+  returns to `/login` without a loop or storing the returned tokens.
+
 ### Fixed
 
 - Clearing a Task description now persists an empty value from both the board
@@ -13,6 +37,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Non-default Task types are visible on Kanban cards and Task detail headers.
 - The header brand is a consistently labelled Forge home link to `/`, using the
   existing home routing for accounts with and without Projects.
+
+## [0.14.0] - 2026-10-16
 
 ### Security
 
@@ -69,16 +95,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- `forge --demo` no longer executes configured server commands or starts the
-  embedded daemon, refuses provider credentials and Chat/agent turns, and
-  accepts only public `https://` repositories (no server paths, environment
-  assets, integrations or MCP config file writes). Git operations performed by
-  Forge remain available.
-- Session cookie names are now `__Host-forge_session` and
-  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
-  unprefixed cookies are no longer read. Registration, login and refresh no
-  longer set cookies on plain HTTP; localStorage token authentication remains
-  available.
+- `forge --data-dir X` and `forge-solo --data-dir X` now read configuration
+  from `X/forge.yaml`, without falling back to `~/.forge/forge.yaml`.
+  `FORGE_DATA_DIR` likewise selects the config directory when no flag is set.
+  Users who kept their configuration in `~/.forge/forge.yaml` while running
+  with `--data-dir X` must move it to `X/forge.yaml`.
+- Later reviews anchor new blocking findings to frozen requirements, regressions,
+  or candidate-diff files. Other new findings become minor; out-of-scope findings
+  never block. Structured failed reviews with no blocking findings park for the
+  owner with `only non-blocking findings remain`. The findings API adds
+  `reopened` and `out_of_scope` statuses; clients matching statuses exhaustively
+  must handle them.
+
 - **Project access and mutation roles are now enforced across REST, MCP and
   SSE.** Non-members receive scoped `404` responses on `/projects/{id}` and its
   subroutes, `/tasks/{id}` and its subroutes, `/repos/{id}`, `/executions/{id}`,
@@ -1786,13 +1814,44 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Review rounds now derive repeat parks from open blocking reviewer findings.
+  A carried finding gets another round while the open blocking count shrinks;
+  after ordinary Review retries are spent, `review_progress` grants up to two
+  extra repair rounds (0 disables). A third appearance parks for the owner. Findings-less windows retain legacy
+  repeat handling, and coordination leads retain replan routing.
+- Failed CI rounds no longer resolve tests absent from a fail-fast run's
+  signature list. Only passing steps (or a passing CI-triage re-run of the step)
+  prove those tests fixed. Base-CI Attention
+  resolves only from a newer queue-head target-tip pass.
+- Pre-existing and flaky check failures no longer block review or merge under the default `review_ci_triage: full`; set `review_ci_triage: off` to retain the previous gate.
+- Under `review_ci_triage: full`, entry CI now runs every configured step instead
+  of stopping at the first failure. This changes the check identity, so existing
+  cached CI passes are missed once after upgrade.
+- Coder and autonomous-worker repair prompts now use a structured brief with
+  Task description and plan, finding history, all failing check output,
+  recorded verify evidence, the reviewer report and prior completion summary.
+  Automatic review recovery uses the same brief; no-change reminders still lead.
+  The brief body is capped at 24 KiB even with long Task text and many waived
+  failures: after the report, older attempts and check tails are cut, finding
+  text is clipped and remaining open findings are listed by id.
+- Merge-time check failures give the coder the target branch, failing command
+  and the end of its combined output (where the failure is printed, not the
+  oldest lines of the stderr tail), plus up to 20 failing signatures and a
+  2 KiB output tail, in a `MERGE-CI` finding. Committed conflict handoffs use
+  `MERGE-CONFLICT`; both stay out of the review ledger.
+- Review CI findings use stable per-test signature ids (`CI-<step>#<hash>`),
+  with step-level ids when signatures are unavailable. Review checklists show
+  checked findings only when resolved by that review, omitting older resolutions.
+
+
 - Review comments show the finding checklist and drop the full report. Read the
   full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
   findings retain a 2 KiB excerpt. The checklist lists open findings first and
   stops at 8 KiB; later findings are named by id only. CI-only failures now get review comments, and
   repair/park system comments name findings once per Review. The Review tab
   displays the current ledger and per-attempt findings. Finding IDs now sort
-  naturally before the API's 200-entry cap (`F2` before `F10`).
+  naturally within priority groups (`F2` before `F10`); the API’s 200-entry cap
+  prioritizes open verify blockers, then other blockers, then other findings.
 - Check failure signatures recognise cargo-nextest binary/test identities,
   omitting durations, progress counters and repeated stdout or summary output,
   including timed-out, signalled and retried tests (final attempt only). A jest
@@ -3114,14 +3173,43 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
-- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
-  registration, login and refresh, with matching logout cleanup.
-  REST, web startup and SSE support cookie-only sessions while password-login
-  JSON tokens and existing localStorage behavior remain available. TestSprite
-  can capture a session credential after username/password sign-in.
-- Web startup revives a cookie-only session after an expired access cookie:
-  one empty-body refresh request, then one `/auth/me` retry. Failed revival
-  returns to `/login` without a loop or storing the returned tokens.
+- Optional `ReviewConfig.verify` starts the candidate app, waits for readiness,
+  and runs behavioural checks after review CI and before reviewer dispatch.
+  Verify uses the durable check runner with `canonical-ci/1` process-tree
+  settlement and its own wall limit; results are never reused. Its files live
+  in `<task root>/.forge-task/verify/<review id>/`, so coordination children
+  sharing a Task root stay isolated and never stop each other's running app.
+  Failed checks become `V-*` findings (an app exit during readiness creates only
+  `V-ready`), reports can attach Task evidence (64 MiB per evaluation across all
+  checks), and `app.log` keeps its first 16 MiB on disk. Reviewers see the
+  recorded results, notes and evidence paths. Inconclusive reruns use the
+  ledger-backed `retry_budgets.review_verify_rerun` allowance (default 1, 0
+  disables; Task and Project overrides apply), then park without charging
+  Review. Public `FORGE_VERIFY_*` ports, URLs and paths stay readable while
+  Project secrets remain redacted. A port still in use after group cleanup adds
+  a non-blocking warning to Review details and the reviewer prompt (a process
+  that escapes its group via `setsid` stays outside containment). Daemon
+  placements record `not_run` with `placement_unsupported`. Project review
+  settings expose the configuration.
+
+- Reviewer findings accept optional `requirement_ids`, `kind`, and `same_cause_as`.
+  Repair briefs carry the last three attempts, frozen requirement status and
+  shared-cause families within the 24 KiB cap. Re-broken findings name their
+  resolution round. Carried findings start fresh repair sessions with a root-cause
+  instruction; opt-in Project setting `repair_switch_model_when_stuck` prefers the
+  next fallback for that round only, then returns to the primary.
+
+- `retry_budgets.review_progress` (default 2, 0 disables), Task/Project editors,
+  and Task remaining/limit projections for extra repair rounds on progress.
+- Additive `superseded` finding status for step-level CI findings replaced by
+  per-test findings, exposed in the findings API and web ledger.
+
+- Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
+
+
+- Project `review_ci_triage` (`full`, `report`, `off`), a durable rerun and exact-commit base comparison, queue-head CI triage, and Project Attention categories `flaky_check` and `base_check_failing` with Mission Control warnings.
+
+
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with
   bounded signature lists and explicit truncation in receipts and Review details.
@@ -3479,6 +3567,35 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a command are stored as written.
 
 ### Fixed
+
+- A custom workflow's renamed review gate (a gate with the `reviewer` role in
+  the `review` phase) is budgeted like `review`: verification reruns run and
+  charge their invocation budget, Project default review configuration
+  applies, gate rejections spend the Task's `review` and `gate:review`
+  budgets instead of `gate:<state>`, and, as for `review`, its entry is not
+  parked by the gate cap. Spending already
+  recorded under `gate:<state>` for such a gate is not carried over. A
+  reviewer-role gate in another phase keeps its own gate budget.
+
+- The Docker image runs Forge under Tini so orphaned verification and CI
+  descendants are reaped and process groups can finish stopping.
+
+- `GET /api/v1/settings` on a server started with `--data-dir X` reports
+  `forge.data_dir` as `X` instead of a pending `~/.forge` that claimed a
+  restart was required. A refused start prints a `--migrate-workspace-root`
+  command that reads the same `forge.yaml` as that start, also when
+  `~/.forge/forge.yaml` sets `forge.data_dir`.
+- CI triage classifies a candidate build failure without test signatures as
+  introduced when the red base has test signatures, with a reason distinguishing
+  the failures. No-change repair send-backs and parks now post idempotent Forge
+  comments explaining the budget or open findings and owner actions.
+- Review streaks count only blocking appearances. Progress-round entry failures
+  use infrastructure retries, and custom workflow planning roles agree between
+  review routing and charging. A passing conformance CI rerun resolves prior test
+  findings just like entry CI. Project settings preserve an unset progress-round
+  allowance on unrelated saves and allow clearing an override back to default.
+  Stranded lead-root Reviews honor the same owner/non-blocking parks as initial
+  completion.
 
 - Repair convergence compares against the latest Review, so a later pass of the
   same commit does not resurrect an old failure. Suspended review entries from

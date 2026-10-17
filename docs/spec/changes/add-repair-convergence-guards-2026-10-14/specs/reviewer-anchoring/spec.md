@@ -19,7 +19,7 @@ Parsing SHALL stay lenient, as for the rest of the block. The fields SHALL be op
 - **THEN** `R99` is dropped, and the finding is treated as citing no requirement
 
 ### Requirement: Later reviews cannot move the goalposts
-From the second review in a window, Forge SHALL treat a new (not continued) blocking finding as `minor` unless one of these holds:
+After the reviewer's first assessment in a window, Forge SHALL treat a new (not continued) blocking finding as `minor` unless one of these holds. A Review that stopped before a reviewer ran (CI failed first, or it was cancelled) does not count as that first assessment. A continued finding that was downgraded stays `minor` until it meets one of these:
 - its `kind` is `regression`;
 - it cites a requirement id;
 - its `where` names a file in the Task's candidate diff. The path is the first repository-relative path in `where`, with any `:line` suffix removed. A `where` without a path does not meet this clause.
@@ -27,6 +27,14 @@ From the second review in a window, Forge SHALL treat a new (not continued) bloc
 An `out_of_scope` finding SHALL never block. It is listed as a follow-up candidate, with ledger status `out_of_scope`.
 
 These rules apply in the derived ledger only. The frozen assessment is never changed.
+
+#### Scenario: CI failed before the first reviewer ran
+- **WHEN** review 1 fails CI before any reviewer runs, and review 2 is the reviewer's first assessment with a finding in an untouched file
+- **THEN** the finding stays blocking
+
+#### Scenario: Reviewer copies a downgraded id
+- **WHEN** review 2's naming nit was downgraded and review 3 copies its id without a citation, regression kind or candidate-diff path
+- **THEN** it stays `minor` and does not start a blocking streak
 
 When a reviewer `fail` has no blocking finding left after these rules, the Task SHALL park with `review_needs_owner` and the message `only non-blocking findings remain`. The coder is not dispatched and no review budget is spent.
 

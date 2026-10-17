@@ -72,12 +72,13 @@ pub async fn load_agent_dispatch_context(
     } else {
         None
     };
-    let continuation_of_execution_id = continuation_execution
+    let mut continuation_of_execution_id = continuation_execution
         .as_ref()
         .map(|execution| execution.id.clone());
     let continuation_logs_path = continuation_execution
         .as_ref()
         .and_then(|execution| execution.logs_path.clone());
+    let review_window = db.review_window(task_id).await?.reviews;
     let latest_review_context = latest_failed_review_context(db.as_ref(), &prior_reviews).await?;
     let plan = if matches!(
         role,
@@ -132,6 +133,85 @@ pub async fn load_agent_dispatch_context(
         _ => None,
     };
 
+    let previous_coder = match review_window
+        .iter()
+        .max_by_key(|review| review.attempt_number)
+    {
+        Some(review) => ExecutionRepo::get_by_id(&*db, &review.execution_id)
+            .await?
+            .filter(|execution| {
+                execution.task_id == task.id
+                    && matches!(execution.role.as_str(), "coder" | "worker" | "executor")
+            }),
+        None => None,
+    };
+    let previous_coder = match previous_coder {
+        Some(execution) => Some(execution),
+        None => latest_terminal_execution_for_role(&db, task_id, role).await?,
+    };
+    let previous_coder_summary = previous_coder.and_then(|execution| execution.summary);
+    let (mut budget_kind, gate_state) = repair_budget_source(workflow, state_name, &transition_log);
+    if budget_kind == db::budget::Kind::Review {
+        if let Some(review) = review_window.last() {
+            if db::budget::receipt_recorded(
+                db.pool(),
+                task_id,
+                db::budget::Kind::ReviewProgress.key(),
+                &format!("progress:{}", review.id),
+            )
+            .await?
+            {
+                budget_kind = db::budget::Kind::ReviewProgress;
+            }
+        }
+    }
+    let budget_config = gate_state.map(|state| {
+        crate::workflow::engine::effective_state_config(
+            state,
+            project.as_ref(),
+            task.task_state_config.as_deref(),
+        )
+    });
+    let repair_budget = Some(super::repair_brief::RepairBudget {
+        name: budget_kind.key().to_owned(),
+        spent: db::budget::spent(db.pool(), task_id, budget_kind.key()).await?,
+        limit: i64::from(db::budget::limit(
+            &task,
+            budget_kind,
+            budget_config.as_ref(),
+            gate_state.and_then(|state| state.gate_config.as_ref()),
+        )?),
+    });
+
+    let carried_repair = matches!(
+        budget_kind,
+        db::budget::Kind::Review | db::budget::Kind::ReviewProgress
+    ) && workflow
+        .states
+        .iter()
+        .any(|state| state.name == state_name && state.kind == StateKind::Active)
+        && (task.parent_task_id.is_some() || sub_tasks.is_empty())
+        && db::review_findings::has_carried_finding(&review_window);
+    let reset_model_after_repair = continuation_execution
+        .as_ref()
+        .and_then(|execution| execution.executor_config_snapshot_json.as_deref())
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .is_some_and(|snapshot| snapshot["repair_model_switched"] == true);
+    if carried_repair || reset_model_after_repair {
+        continuation_of_execution_id = None;
+    }
+    let repair_attempts = if matches!(role, "coder" | "worker")
+        && workflow
+            .states
+            .iter()
+            .any(|state| state.name == state_name && state.kind == StateKind::Active)
+        && !super::repair_brief::repair_rounds(&review_window).is_empty()
+    {
+        load_repair_attempts(&db, router, &task, &review_window).await?
+    } else {
+        Vec::new()
+    };
+
     Ok(AgentDispatchContext {
         task,
         role: role.to_string(),
@@ -141,6 +221,12 @@ pub async fn load_agent_dispatch_context(
         comments,
         plan,
         prior_reviews,
+        review_window: Some(review_window),
+        previous_coder_summary,
+        repair_attempts,
+        carried_repair,
+        reset_model_after_repair,
+        repair_budget,
         parent_task,
         sub_tasks,
         last_manual_bounce_reason,
@@ -154,6 +240,172 @@ pub async fn load_agent_dispatch_context(
         review_ci_steps,
         step_diff,
     })
+}
+
+/// Evidence is read through the placement owner, including daemon workspaces.
+/// A missing historical Git object leaves the memory useful, with an explicit
+/// unavailable marker rather than invented file names.
+async fn load_repair_attempts(
+    db: &db::SqliteDb,
+    router: &crate::workspace_backend::WorkspaceBackendRouter,
+    task: &db::Task,
+    reviews: &[db::Review],
+) -> Result<Vec<super::repair_brief::RepairAttempt>> {
+    let settled = super::repair_brief::repair_rounds(reviews);
+    let workspace =
+        WorkspaceRepo::get_by_task_id(db, task.parent_task_id.as_deref().unwrap_or(&task.id))
+            .await?;
+    let owner = match workspace.as_ref() {
+        Some(workspace) => router.resolve(db, workspace).await.ok(),
+        None => None,
+    };
+    let mut memories = Vec::new();
+    for (index, review) in settled
+        .iter()
+        .enumerate()
+        .skip(settled.len().saturating_sub(3))
+    {
+        let execution = ExecutionRepo::get_by_id(db, &review.execution_id)
+            .await?
+            .filter(|execution| execution.task_id == task.id);
+        let commit = |review: &db::Review| {
+            serde_json::from_str::<Value>(&review.step_results_json)
+                .ok()
+                .and_then(|details| {
+                    details["conformance"]["contract"]["commit_sha"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+        };
+        let mut previous_commit = index
+            .checked_sub(1)
+            .and_then(|prior| commit(settled[prior]));
+        if previous_commit.is_none() {
+            if let Some(prior) = index.checked_sub(1) {
+                previous_commit = ExecutionRepo::get_by_id(db, &settled[prior].execution_id)
+                    .await?
+                    .filter(|execution| execution.task_id == task.id)
+                    .and_then(|execution| execution.after_sha);
+            }
+        }
+        let from_sha = previous_commit.or_else(|| {
+            execution
+                .as_ref()
+                .and_then(|execution| execution.before_sha.clone())
+        });
+        let to_sha = commit(review).or_else(|| {
+            execution
+                .as_ref()
+                .and_then(|execution| execution.after_sha.clone())
+        });
+        let mut files = Vec::new();
+        let mut files_unavailable = true;
+        if let (Some(owner), Some(from), Some(to)) = (&owner, &from_sha, &to_sha) {
+            match owner
+                .backend
+                .diff(
+                    &owner.placement,
+                    &crate::workspace_backend::DiffSpec {
+                        base_ref: from.clone(),
+                        head_ref: Some(to.clone()),
+                        max_bytes: 1024,
+                    },
+                )
+                .await
+            {
+                Ok(diff) => {
+                    files = diff
+                        .response
+                        .files
+                        .iter()
+                        .take(20)
+                        .map(|file| {
+                            format!("{} (+{}, -{})", file.path, file.additions, file.deletions)
+                        })
+                        .collect();
+                    if diff.response.files.len() > 20 {
+                        files.push(format!("+{} more files", diff.response.files.len() - 20));
+                    }
+                    files_unavailable = false;
+                }
+                Err(error) => {
+                    tracing::warn!(task_id = %task.id, %error, "repair attempt file history unavailable")
+                }
+            }
+        }
+        memories.push(super::repair_brief::RepairAttempt {
+            attempt: review.attempt_number,
+            from_sha,
+            to_sha,
+            files,
+            files_unavailable,
+            summary: execution.and_then(|execution| execution.summary),
+        });
+    }
+    Ok(memories)
+}
+
+/// Follow the gate that actually sent this role back, including workflows
+/// that renamed their review, integration and repair states.
+fn repair_budget_source<'a>(
+    workflow: &'a WorkflowDefinition,
+    state_name: &str,
+    transition_log: &[db::TransitionLog],
+) -> (db::budget::Kind, Option<&'a api_types::StateDefinition>) {
+    let entry = transition_log
+        .iter()
+        .rev()
+        .find(|entry| entry.to_state == state_name);
+    let source = entry.and_then(|entry| {
+        workflow
+            .states
+            .iter()
+            .find(|state| state.name == entry.from_state && state.kind == StateKind::Gate)
+    });
+    let current = workflow
+        .states
+        .iter()
+        .find(|state| state.name == state_name);
+    let is_merge = |state: &api_types::StateDefinition| {
+        state
+            .hooks
+            .on_enter
+            .iter()
+            .any(|hook| hook.action == "run_merge")
+    };
+    let merge_repair = source.is_some_and(is_merge)
+        || current.is_some_and(|state| {
+            state.name == crate::workflow::default_states::MERGE_FAILED
+                || state
+                    .hooks
+                    .before_exit
+                    .iter()
+                    .any(|hook| hook.action == "require_conflict_markers_resolved")
+        });
+    let kind = if entry.is_some_and(|entry| entry.bridge.is_repair_no_change()) {
+        db::budget::Kind::RepairNoChange
+    } else if entry.is_some_and(|entry| {
+        entry.bridge.bridge_kind == Some(api_types::TransitionBridgeKind::ConflictHandoff)
+    }) {
+        db::budget::Kind::ConflictHandoff
+    } else if merge_repair {
+        db::budget::Kind::MergeFix
+    } else {
+        db::budget::Kind::Review
+    };
+    let gate = source
+        .or_else(|| current.filter(|state| state.kind == StateKind::Gate))
+        .or_else(|| {
+            workflow.states.iter().find(|state| {
+                if merge_repair {
+                    is_merge(state)
+                } else {
+                    state.name == crate::workflow::default_states::REVIEW
+                        || state.role.as_deref() == Some(crate::workflow::default_roles::REVIEWER)
+                }
+            })
+        });
+    (kind, gate)
 }
 
 /// The diff of a finished step for its step check: the shared root workspace
@@ -759,5 +1011,52 @@ mod tests {
             loaded[0].parent_task_id.as_deref(),
             Some(parent.id.as_str())
         );
+    }
+    #[test]
+    fn repair_budget_follows_renamed_source_gates_and_reminders() {
+        let mut workflow = crate::workflow::default_workflow::default_workflow();
+        for state in &mut workflow.states {
+            state.name = match state.name.as_str() {
+                "review" => "audit",
+                "merging" => "integrate",
+                "merge_failed" => "repair",
+                name => name,
+            }
+            .to_owned();
+        }
+        let mut entry = db::TransitionLog {
+            id: "entry".into(),
+            task_id: "task".into(),
+            from_state: "integrate".into(),
+            to_state: "repair".into(),
+            trigger_name: None,
+            triggered_by: "system:workflow".into(),
+            bridge: Default::default(),
+            trigger_reason: "checks failed".into(),
+            hook_results_json: None,
+            rejection: true,
+            created_at: "now".into(),
+        };
+        let entries = [entry.clone()];
+        let (kind, gate) = repair_budget_source(&workflow, "repair", &entries);
+        assert!(matches!(kind, db::budget::Kind::MergeFix));
+        assert_eq!(gate.unwrap().name, "integrate");
+        entry.from_state = "audit".into();
+        entry.to_state = "in_progress".into();
+        let entries = [entry.clone()];
+        let (kind, gate) = repair_budget_source(&workflow, "in_progress", &entries);
+        assert!(matches!(kind, db::budget::Kind::Review));
+        assert_eq!(gate.unwrap().name, "audit");
+        entry.bridge = api_types::TransitionBridge::recovery("repair_no_change", false);
+        assert!(matches!(
+            repair_budget_source(&workflow, "in_progress", &[entry.clone()]).0,
+            db::budget::Kind::RepairNoChange
+        ));
+        entry.bridge =
+            api_types::TransitionBridge::new(api_types::TransitionBridgeKind::ConflictHandoff);
+        assert!(matches!(
+            repair_budget_source(&workflow, "in_progress", &[entry]).0,
+            db::budget::Kind::ConflictHandoff
+        ));
     }
 }

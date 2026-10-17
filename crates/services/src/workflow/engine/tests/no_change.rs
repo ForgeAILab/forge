@@ -112,6 +112,168 @@ async fn no_change_twice_parks_without_another_review_or_check() {
     assert_eq!(blocked["reason"], "no change after repair round");
 }
 
+async fn forge_comments(f: &FailedCiFixture) -> Vec<db::TaskComment> {
+    db::TaskCommentRepo::list_comments(
+        &*f.db,
+        &f.task.id,
+        db::PageRequest {
+            cursor: None,
+            limit: 100,
+            sort_by: db::SortBy::CreatedAt,
+            sort_order: db::SortOrder::Asc,
+            include_total: false,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+    .into_iter()
+    .filter(|comment| comment.author_name == "Forge")
+    .collect()
+}
+
+#[tokio::test]
+async fn no_change_send_back_posts_forge_comment_with_head_and_budget() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "in_progress");
+    let comments = forge_comments(&f).await;
+    let reminders: Vec<_> = comments
+        .iter()
+        .filter(|comment| comment.content.starts_with("No change since review 1"))
+        .collect();
+    assert_eq!(reminders.len(), 1, "{comments:?}");
+    let reminder = reminders[0];
+    assert_eq!(reminder.author_type, db::CommentAuthorType::System);
+    assert!(reminder
+        .content
+        .contains("HEAD still matches the failed candidate"));
+    assert!(reminder
+        .content
+        .contains("repair_no_change budget 1 of 1 spent; 0 remaining"));
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+    let review = reviews(&f).await.remove(0);
+    // A replay of the same review entry posts nothing new.
+    let entry_step = reminder
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix(&format!("review:{}:repair_no_change:", review.id)))
+        .unwrap()
+        .to_owned();
+    for _ in 0..2 {
+        f.engine
+            .publish_review_no_change_comment(&review, &entry_step)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        forge_comments(&f)
+            .await
+            .iter()
+            .filter(|comment| comment.content.starts_with("No change since review 1"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn no_change_park_posts_forge_comment_with_findings_and_owner_actions() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "review");
+    let comments = forge_comments(&f).await;
+    let parks: Vec<_> = comments
+        .iter()
+        .filter(|comment| {
+            comment
+                .content
+                .starts_with("Task parked after review attempt 1")
+        })
+        .collect();
+    assert_eq!(parks.len(), 1, "{comments:?}");
+    let park = parks[0];
+    assert_eq!(park.author_type, db::CommentAuthorType::System);
+    assert!(park.content.contains("no change after repair round"));
+    assert!(park.content.contains("Open findings: CI-0"));
+    assert!(park
+        .content
+        .contains("Owner actions: re-run review, mark reviewed with a reason, or cancel the Task"));
+    assert_eq!(reviews(&f).await.len(), 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+    let review = reviews(&f).await.remove(0);
+    // A replay of the same review entry posts nothing new.
+    let kind = park
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix(&format!("review:{}:", review.id)))
+        .unwrap()
+        .to_owned();
+    assert!(kind.starts_with("park:"), "{kind}");
+    for _ in 0..2 {
+        f.engine
+            .publish_review_park_comment_as(&review, "no change after repair round", &kind)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        forge_comments(&f)
+            .await
+            .iter()
+            .filter(|comment| comment
+                .content
+                .starts_with("Task parked after review attempt 1"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn no_change_park_after_owner_send_back_posts_its_own_comment() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "review");
+    // The owner sends the parked Task back, and the coder again changes
+    // nothing: the same failed Review parks a second time.
+    let owner = api_types::Actor::user(api_types::UserActionSource::Api);
+    let snapshot = f
+        .engine
+        .task_action_snapshot(&f.task.id, &owner)
+        .await
+        .unwrap();
+    f.engine
+        .perform_task_action(
+            f.task.id.clone(),
+            api_types::TaskAction::SendBack {
+                guidance: "change the code this time".to_owned(),
+            },
+            snapshot.task.version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        drain(f.engine.clone(), &f.task.id).await.status,
+        "in_progress"
+    );
+    repair(&f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "review");
+    let blocked: serde_json::Value =
+        serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
+    assert_eq!(blocked["reason"], "no change after repair round");
+    assert_eq!(reviews(&f).await.len(), 1);
+    let comments = forge_comments(&f).await;
+    let parks = comments
+        .iter()
+        .filter(|comment| comment.content.contains("no change after repair round"))
+        .count();
+    assert_eq!(parks, 2, "{comments:?}");
+}
+
 #[tokio::test]
 async fn no_change_owner_rereview_of_same_commit_runs() {
     let f = red_fixture().await;
@@ -156,6 +318,14 @@ async fn no_change_changed_commit_reviews_normally() {
     assert_eq!(reviews(&f).await.len(), 2);
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await, (2, 2, 0));
+    let comments = forge_comments(&f).await;
+    assert!(
+        !comments.iter().any(
+            |comment| comment.content.starts_with("No change since review")
+                || comment.content.contains("no change after repair round")
+        ),
+        "{comments:?}"
+    );
 }
 
 #[tokio::test]
@@ -168,6 +338,14 @@ async fn no_change_dirty_worktree_is_not_rejected_by_guard() {
     assert_eq!(reviews(&f).await.len(), 2);
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await, (2, 2, 0));
+    let comments = forge_comments(&f).await;
+    assert!(
+        !comments.iter().any(
+            |comment| comment.content.starts_with("No change since review")
+                || comment.content.contains("no change after repair round")
+        ),
+        "{comments:?}"
+    );
 }
 
 #[tokio::test]
@@ -711,6 +889,145 @@ async fn no_change_offline_owner_entry_retry_retains_the_owner_exemption() {
     enter(&f, api_types::Actor::user(api_types::UserActionSource::Api)).await;
     away.store(false, std::sync::atomic::Ordering::SeqCst);
     retry_offline_entry(&f).await;
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await.2, 0);
+}
+
+#[tokio::test]
+async fn no_change_cancelled_review_does_not_hide_latest_settled_failure() {
+    let f = red_fixture().await;
+    let failed = reviews(&f).await.remove(0);
+    let now = now_rfc3339();
+    db::ReviewRepo::create(
+        &*f.db,
+        db::CreateReview {
+            id: new_uuid_v4(),
+            task_id: f.task.id.clone(),
+            execution_id: failed.execution_id,
+            attempt_number: 2,
+            status: db::ReviewStatus::Cancelled,
+            step_results_json: failed.step_results_json,
+            started_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    repair(&f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "in_progress");
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 1);
+    assert_eq!(spending(&f).await, (1, 1, 1));
+}
+
+#[tokio::test]
+async fn no_change_owner_retry_of_offline_coder_entry_is_exempt() {
+    let mut f = red_fixture().await;
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert!(task.entry_barrier_json.is_some());
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    // A successful check proves that the normal entry completes and clears
+    // the infrastructure annotation and barrier, without a no-change park.
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(json!({"retry_budgets":{"review":3},"review":{"ci_steps":["true"]}}).to_string())
+        .bind(&f.task.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    let task = TaskRepo::get_by_id(&*f.db, &f.task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let result = f
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &task.id,
+            task.version,
+            &f.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            "owner presses Retry",
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let task = drain_result(f.engine.clone(), result).await.task;
+    assert!(
+        task.entry_barrier_json.is_none(),
+        "{:?}",
+        task.entry_barrier_json
+    );
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none(), "{:?}", task.blocked_json);
+    assert_eq!(reviews(&f).await.len(), 2);
+    assert_eq!(check_runs(&f).await, 2);
+    assert_eq!(spending(&f).await, (1, 1, 0));
+}
+
+#[tokio::test]
+async fn no_change_owner_retry_exemption_survives_another_offline_retry() {
+    let mut f = red_fixture().await;
+    let gate = f
+        .workflow
+        .states
+        .iter_mut()
+        .find(|state| state.name == "review")
+        .unwrap()
+        .gate_config
+        .as_mut()
+        .unwrap();
+    gate.reject_target = None;
+    gate.requires_user_approval = Some(true);
+    sqlx::query("UPDATE project SET workflow_definition=? WHERE id=?")
+        .bind(serde_json::to_string(&f.workflow).unwrap())
+        .bind(&f.task.project_id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    repair(&f).await;
+    let away = make_owner_away(&mut f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert!(task.entry_barrier_json.is_some());
+    let result = f
+        .engine
+        .workflow_execution()
+        .retry_entry_barrier_with_authority(
+            &task.id,
+            task.version,
+            &f.workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            "owner retries while still offline",
+            f.workflow_authority().await,
+        )
+        .await
+        .unwrap();
+    let waiting = drain_result(f.engine.clone(), result).await.task;
+    assert!(waiting.entry_barrier_json.is_some());
+    assert_eq!(spending(&f).await.2, 0);
+    sqlx::query("UPDATE task SET task_state_config=? WHERE id=?")
+        .bind(json!({"retry_budgets":{"review":3},"review":{"ci_steps":["true"]}}).to_string())
+        .bind(&f.task.id)
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    away.store(false, std::sync::atomic::Ordering::SeqCst);
+    let task = retry_offline_entry(&f).await;
+    assert!(task.entry_barrier_json.is_none());
+    assert!(
+        task.error_annotation.is_none(),
+        "{:?}",
+        task.error_annotation
+    );
+    assert!(task.blocked_json.is_none());
     assert_eq!(reviews(&f).await.len(), 2);
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await.2, 0);

@@ -85,7 +85,9 @@ export function ReviewFindingsLedger({ taskId }: { taskId: string }) {
                   <td className="p-2 align-top">{entry.source}</td>
                   <td className="p-2 align-top">{entry.severity}</td>
                   <td className="p-2 align-top">
-                    <Badge variant="outline">{entry.status}</Badge>
+                    <Badge variant="outline">
+                      {entry.status === 'superseded' ? 'superseded by test findings' : entry.status}
+                    </Badge>
                   </td>
                   <td className="p-2 align-top">{entry.streak}</td>
                   <td className="min-w-48 p-2 align-top">
@@ -94,6 +96,22 @@ export function ReviewFindingsLedger({ taskId }: { taskId: string }) {
                       First seen: attempt {entry.first_attempt} · Last checked: attempt{' '}
                       {entry.last_checked_attempt}
                     </p>
+                    {entry.status === 'reopened' && (
+                      <p className="mt-1 text-muted-foreground">
+                        Re-broken: resolved in round {entry.resolved_attempt}
+                      </p>
+                    )}
+                    {entry.status === 'out_of_scope' && (
+                      <p className="mt-1 text-muted-foreground">Follow-up candidate</p>
+                    )}
+                    {entry.anchoring_note && (
+                      <p className="mt-1 text-muted-foreground">{entry.anchoring_note}</p>
+                    )}
+                    {entry.requirement_ids?.length ? (
+                      <p className="mt-1 text-muted-foreground">
+                        Requirements: {entry.requirement_ids.join(', ')}
+                      </p>
+                    ) : null}
                     <FindingDetails finding={entry} />
                   </td>
                 </tr>

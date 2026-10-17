@@ -9,6 +9,10 @@ The check executor SHALL extract failure signatures from each step's full output
 - go test (`--- FAIL: <Test>`);
 - failed and errored cases in JUnit XML files a step writes under `FORGE_CI_REPORT_DIR`.
 
+Recursive pnpm (`pkg test: `) and turbo (`pkg:test: `) test-task prefixes are
+removed before extraction. Parallel package/task runner blocks remain independent;
+unknown glyphs outside those blocks still produce no signature.
+
 Signatures are normalised as follows:
 - durations, absolute Task-root prefixes and ANSI codes are removed;
 - each is cut to 300 characters;
@@ -49,6 +53,10 @@ Forge SHALL strip ANSI escape sequences from every `output_tail` and `stderr_tai
 
 ### Requirement: Each failing test is its own finding
 In the finding ledger, a failed review CI step with signatures SHALL produce one finding per signature, with id `CI-<step>#<first 8 hex of sha256(signature)>`. The same test failing again carries the same id. A failed step without signatures SHALL stay one finding, `CI-<step>`.
+
+A complete signature list resolves earlier signatures that no longer fail. A
+passing step resolves every finding for that step. A missing or truncated
+signature list SHALL NOT be treated as evidence that an omitted test passed.
 
 The repair brief and Task comments SHALL list at most 20 test findings per step, followed by "+N more". The ledger keeps all of them.
 

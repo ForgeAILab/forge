@@ -82,6 +82,11 @@ docker compose up -d
 Data persists in the `forge-data` Docker volume. Set `RUST_LOG=debug` in
 `docker-compose.yml` for verbose output.
 
+The Forge image runs under Tini to reap orphaned verification, CI, and shell
+processes. Custom images or entrypoint overrides must also use an init process
+(for example, `docker run --init` or Compose `init: true`); Forge must not run
+directly as PID 1. The public demo Compose file already sets `init: true`.
+
 ## First boot
 
 By default the server:
@@ -137,7 +142,8 @@ CLI's own login flow and then retry Solo.
 ### Config-declared model providers
 
 Solo also accepts direct Agents backed by providers declared in the user-owned
-Forge config file (`~/.forge/forge.yaml` by default). This is the onboarding
+Forge config file (`<data dir>/forge.yaml`, `~/.forge/forge.yaml` by default;
+`--data-dir` or `FORGE_DATA_DIR` selects another directory). This is the onboarding
 path when you do not want to depend on a local CLI harness login — for example
 a z.ai GLM endpoint or a Google Gemini key:
 
@@ -204,6 +210,8 @@ repository binding is validated; it does not silently fall back to another
 Project. The default root is `<Forge data root>/solo/<repository-id>/`, where
 the Forge data root follows the normal config/env settings (`FORGE_DATA_DIR`
 or the configured data directory).
+Before its first launch, an unbound Solo root may contain only a regular
+`forge.yaml`. Existing runtime state still requires a matching repository binding.
 
 ### First run and Project adoption
 
@@ -328,6 +336,15 @@ unless a backup exists. Removing neither is required for ordinary upgrades.
 ## Configuration
 
 Precedence: **CLI flags > env vars > config file > defaults**.
+
+Config lookup happens first: `--data-dir` > `FORGE_DATA_DIR` > `~/.forge`
+selects the directory containing `forge.yaml`. For example,
+`forge --data-dir ./test` reads only `./test/forge.yaml`; a missing file uses defaults and never
+falls back to `~/.forge/forge.yaml`. An explicit config path supplied by an
+embedding caller takes precedence over this lookup. The file's `forge.data_dir`
+may set the runtime data directory when no flag or environment override exists,
+but does not relocate or trigger another config lookup. Existing users running
+with `--data-dir X` must move their config to `X/forge.yaml`.
 
 ```bash
 cargo run -p forge-cli                          # plain start
@@ -695,8 +712,10 @@ work was lost. What the first start after the upgrade does:
 
 A start is refused only in the last three cases and when a configured root
 differs from a recorded one that still holds live data; every refusal prints
-the command to run, with `--data-dir` when your data directory is not the
-default one. To leave the temp directory:
+the command to run, with `--data-dir` when the server was started with
+`--data-dir` or `FORGE_DATA_DIR` (a `forge.data_dir` set in
+`~/.forge/forge.yaml` is reached by the plain command, which reads that file).
+To leave the temp directory:
 
 ```bash
 # Stop Forge first.
@@ -771,7 +790,7 @@ command of its own: when its start is refused (its data root was moved, or
 copied from another machine), the message prints the command to run, with
 both paths: `forge --data-dir <Solo data root> --migrate-workspace-root
 <Solo data root>/worktrees`. Type the target as printed: without it `forge`
-would use the root of the server's own configuration, if one is set. A Solo data root
+would use `workspace.root` from `<Solo data root>/forge.yaml`, if set. A Solo data root
 *copied* beside an original that still exists is not supported: both
 databases name the original's worktrees, so remove the copy or the original.
 
@@ -895,8 +914,8 @@ and tells workers to report required edits outside their Task scope.
 
 ### Local development data dir
 
-`make dev` and friends point data at `./test/` (gitignored) so dev state never
-pollutes `~/.forge`. See the project [Makefile](../Makefile).
+`make dev` and friends use `./test/` (gitignored) for data and read only
+`./test/forge.yaml` for configuration. See the project [Makefile](../Makefile).
 
 ## Configuring agents
 

@@ -43,6 +43,8 @@ pub enum AttentionCategory {
     CommitmentOverdue,
     /// Repeated conflict handoffs indicate a shared file needs clearer module ownership.
     ConflictHotspot,
+    FlakyCheck,
+    BaseCheckFailing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS, PartialEq)]

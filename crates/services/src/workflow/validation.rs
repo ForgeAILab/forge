@@ -71,6 +71,8 @@ pub fn validate_workflow(def: &WorkflowDefinition) -> Result<(), ServiceError> {
                 ),
             });
         }
+        api_types::validate_review_verify_config(&state.config)
+            .map_err(ServiceError::invalid_operation)?;
         validate_hooks(&state.name, &state.hooks)?;
         // "assignee" is reserved as the implicit role for active states; no role-declaration check is enforced (engine is role-name-agnostic by design).
         if state.role.as_deref() == Some(default_roles::ASSIGNEE) && state.kind != StateKind::Active

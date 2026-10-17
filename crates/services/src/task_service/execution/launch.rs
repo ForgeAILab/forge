@@ -281,10 +281,24 @@ impl TaskService {
             .await?;
         let workspace_admission = self.prepare_claim_workspace(workspace_admission).await?;
         let workspace = workspace_admission.workspace.clone();
-        let executor_config_snapshot_json = with_dispatch_metadata(
-            build_executor_config_snapshot(&self.db, &task, &agent, None).await?,
-            dispatch_metadata,
-        )?;
+        let mut snapshot = build_executor_config_snapshot(&self.db, &task, &agent, None).await?;
+        if dispatch_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata["carried_finding"] == true)
+        {
+            let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                .await?
+                .ok_or(DbError::NotFound)?;
+            let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
+                .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+            if settings.repair_switch_model_when_stuck {
+                snapshot = snapshot
+                    .as_deref()
+                    .map(executor_snapshot_with_next_fallback)
+                    .transpose()?;
+            }
+        }
+        let executor_config_snapshot_json = with_dispatch_metadata(snapshot, dispatch_metadata)?;
         let now = now_rfc3339();
         let create_input = CreateExecution {
             id: new_uuid_v4(),

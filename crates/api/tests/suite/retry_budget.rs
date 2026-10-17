@@ -524,3 +524,75 @@ async fn api_remaining_matches_charge_enforcement_for_every_kind() {
     .await;
     assert_eq!(reset.remaining_retries, reset.retry_limits);
 }
+
+#[tokio::test]
+async fn review_progress_response_resolves_project_then_task_override_and_spending() {
+    let harness = test_app().await;
+    let (project_id, _repo_id) = create_project_and_repo(&harness.app).await;
+    let project = db::ProjectRepo::get_by_id(&*harness._state.db, &project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let _: Value = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project_id}"),
+        json!({"version":project.version,"settings":{"retry_budgets":{"review_progress":4}}}),
+        StatusCode::OK,
+    )
+    .await;
+    let mut task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({"title":"Progress projection"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(task.retry_limits.get("review_progress"), Some(&4));
+    assert_eq!(task.remaining_retries.get("review_progress"), Some(&4));
+    let _: Value = json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({"version":task.version,"task_state_config":{"retry_budgets":{"review_progress":2}}}),
+        StatusCode::OK,
+    )
+    .await;
+    let mut tx = db::begin_immediate(harness._state.db.pool()).await.unwrap();
+    db::budget::charge(
+        &mut tx,
+        &task.id,
+        "review_progress",
+        2,
+        "progress:projection",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    task = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/tasks/{}", task.id),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(task.retry_limits.get("review_progress"), Some(&2));
+    assert_eq!(task.remaining_retries.get("review_progress"), Some(&1));
+    let list: Value = json_request(
+        &harness.app,
+        Method::GET,
+        &format!("/api/v1/projects/{project_id}/tasks"),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let listed = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == task.id)
+        .unwrap();
+    assert_eq!(listed["remaining_retries"]["review_progress"], 1);
+}

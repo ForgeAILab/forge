@@ -9,7 +9,10 @@ impl ForgeConfig {
         config_path: Option<&Path>,
         overrides: ConfigOverrides,
     ) -> Result<Self, ConfigError> {
-        let path = config_path.map_or_else(default_config_path, Path::to_path_buf);
+        let path = config_path.map_or_else(
+            || default_config_path(overrides.data_dir.as_deref()),
+            Path::to_path_buf,
+        );
 
         let file_config = if path.exists() {
             let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {

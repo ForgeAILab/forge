@@ -384,3 +384,9 @@ export type { DeadLetterActionResponse } from './bindings/DeadLetterActionRespon
 export type { DismissDeadLetterRequest } from './bindings/DismissDeadLetterRequest'
 
 export type { DeadLetterOutcome } from './bindings/DeadLetterOutcome'
+
+export type { ReviewVerifyConfig } from './bindings/ReviewVerifyConfig'
+export type { ReviewVerifyCheck } from './bindings/ReviewVerifyCheck'
+export type { ReviewVerifyDetails } from './bindings/ReviewVerifyDetails'
+export type { ReviewVerifyCheckResult } from './bindings/ReviewVerifyCheckResult'
+export type { ReviewVerifyStatus } from './bindings/ReviewVerifyStatus'

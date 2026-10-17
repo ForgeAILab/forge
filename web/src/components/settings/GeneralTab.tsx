@@ -15,7 +15,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import type { Agent, RoleDefinition } from '@/types/generated'
 
+import { ReviewVerifyEditor } from '@/components/settings/ReviewVerifyEditor'
+import type { ReviewVerifyConfig } from '@/types/generated/bindings/ReviewVerifyConfig'
+
 interface GeneralTabProps {
+  verify: ReviewVerifyConfig | null
+  onVerifyChange: (value: ReviewVerifyConfig | null) => void
   projectIsLoading: boolean
   canSave: boolean
   isSaving: boolean
@@ -24,6 +29,12 @@ interface GeneralTabProps {
   systemPauseReason?: string | null
   pausePending: boolean
   name: string
+  reviewCiTriage: 'full' | 'report' | 'off'
+  repairSwitchModelWhenStuck: boolean
+  onRepairSwitchModelWhenStuckChange: (value: boolean) => void
+  reviewProgress: string
+  onReviewProgressChange: (value: string) => void
+  onReviewCiTriageChange: (value: 'full' | 'report' | 'off') => void
   ciSteps: string[]
   defaultRoleSelections: Record<string, string>
   roles: RoleDefinition[]
@@ -56,6 +67,14 @@ export function GeneralTab({
   pausePending,
   name,
   ciSteps,
+  verify,
+  onVerifyChange,
+  reviewCiTriage,
+  reviewProgress,
+  repairSwitchModelWhenStuck,
+  onRepairSwitchModelWhenStuckChange,
+  onReviewProgressChange,
+  onReviewCiTriageChange,
   defaultRoleSelections,
   roles,
   workflowIsLoading,
@@ -154,6 +173,43 @@ export function GeneralTab({
             <CiStepsEditor steps={ciSteps} onChange={onCiStepsChange} />
           </SettingsSection>
           <SettingsSection
+            title="Verify"
+            description="Exercise the candidate before a reviewer is dispatched."
+          >
+            <ReviewVerifyEditor
+              value={verify}
+              onChange={onVerifyChange}
+              disabled={!canSave || isSaving}
+            />
+          </SettingsSection>
+          <SettingsSection
+            title="CI failure triage"
+            description="Recheck failures and compare with the base before sending work back."
+          >
+            <div className="space-y-2">
+              <Label htmlFor="review-ci-triage">Triage policy</Label>
+              <Select
+                id="review-ci-triage"
+                value={reviewCiTriage}
+                disabled={!canSave || isSaving}
+                aria-describedby="review-ci-triage-help"
+                options={[
+                  { value: 'full', label: 'Full — block introduced failures (default)' },
+                  { value: 'report', label: 'Report — classify and block all failures' },
+                  { value: 'off', label: 'Off — block all failures without triage' },
+                ]}
+                onChange={(value) => {
+                  if (value === 'full' || value === 'report' || value === 'off')
+                    onReviewCiTriageChange(value)
+                }}
+              />
+              <p id="review-ci-triage-help" className="text-xs text-muted-foreground">
+                Full lets flaky and confirmed pre-existing failures continue. Base comparison
+                requires review setup steps and a server workspace.
+              </p>
+            </div>
+          </SettingsSection>
+          <SettingsSection
             title="Active task limit"
             description="Cap new task admission for this project."
           >
@@ -233,6 +289,38 @@ export function GeneralTab({
               )}
             </SettingsSection>
           )}
+          <SettingsSection
+            title="Review progress rounds"
+            description="Extra repair rounds after the review allowance is spent, while open blocking findings decrease. Leave blank for the default (2); 0 disables them."
+          >
+            <Label htmlFor="project-review-progress-budget">Progress round allowance</Label>
+            <Input
+              id="project-review-progress-budget"
+              type="number"
+              min={0}
+              step={1}
+              placeholder="Default (2)"
+              value={reviewProgress}
+              onChange={(e) => onReviewProgressChange(e.target.value)}
+            />
+          </SettingsSection>
+          <SettingsSection
+            title="Change model for stuck findings"
+            description="When a finding survives a repair, start a fresh session on the agent’s next fallback candidate for that round. Later rounds use the primary candidate."
+          >
+            <div className="flex items-center gap-3">
+              <Switch
+                id="repair-switch-model"
+                checked={repairSwitchModelWhenStuck}
+                onChange={(event) =>
+                  onRepairSwitchModelWhenStuckChange((event.target as HTMLInputElement).checked)
+                }
+              />
+              <Label htmlFor="repair-switch-model" className="cursor-pointer text-sm">
+                Switch model when stuck
+              </Label>
+            </div>
+          </SettingsSection>
           <SettingsSection
             title="Automatic recovery agent"
             description="Before an exhausted review retry window blocks a task, dispatch one configured agent as a final recovery attempt."

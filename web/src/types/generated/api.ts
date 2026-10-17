@@ -31,6 +31,7 @@ export type { TaskIntegrationSummary } from './bindings/TaskIntegrationSummary'
 export type { CheckWait } from './bindings/CheckWait'
 export type { CheckWaitPhase } from './bindings/CheckWaitPhase'
 export type { ReviewFinding } from './bindings/ReviewFinding'
+export type { ReviewFindingKind } from './bindings/ReviewFindingKind'
 export type { ReviewFindingSeverity } from './bindings/ReviewFindingSeverity'
 export type { ReviewFindingSource } from './bindings/ReviewFindingSource'
 export type { ReviewFindingStatus } from './bindings/ReviewFindingStatus'
@@ -199,6 +200,7 @@ export interface TaskBlockingAnnotation {
 }
 
 export interface ReviewConfig {
+  verify?: import('./bindings/ReviewVerifyConfig').ReviewVerifyConfig | null
   conformance_checks?: import('./bindings/ConformanceCheck').ConformanceCheck[]
   requirement_ids?: string[]
   requirement_allocations?: Record<string, string>
@@ -233,6 +235,8 @@ export interface EffectiveLeadResponse {
 
 export interface RetryBudgets {
   review?: number | null
+  review_progress?: number | null
+  review_verify_rerun?: number | null
   merge_fix?: number | null
   execution?: number | null
 }
@@ -873,6 +877,7 @@ export interface AuditorVerdictEntry {
 }
 
 export interface ReviewDetails {
+  verify?: import('./bindings/ReviewVerifyDetails').ReviewVerifyDetails | null
   execution?: { integration_checks: IntegrationHeadCheckEvidence[]; [key: string]: unknown } | null
   conformance: ReviewConformance
   ci_steps: StepResultEntry[]
@@ -1199,7 +1204,7 @@ export interface WorkspacePlacementResponse {
 }
 
 export interface Workspace {
-  pending_remote_cancel: import("./bindings/PendingRemoteCancel").PendingRemoteCancel[]
+  pending_remote_cancel: import('./bindings/PendingRemoteCancel').PendingRemoteCancel[]
   id: string
   task_id: string
   repo_id: string
@@ -1640,7 +1645,7 @@ export interface OperatorStatusResponse {
   event_relay: EventRelayStatus
   event_consumers: EventConsumerStatus[]
   periodic_workers: PeriodicWorkerStatus[]
-  task_steps: import("./bindings/TaskStepQueueStatus").TaskStepQueueStatus
+  task_steps: import('./bindings/TaskStepQueueStatus').TaskStepQueueStatus
   database: DatabaseStorageStatus
   overall_severity: OperatorSeverity
   active_executions: ActiveExecutionSummary[]

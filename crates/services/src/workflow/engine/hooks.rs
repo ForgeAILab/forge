@@ -10,11 +10,8 @@ pub(crate) fn merged_state_config(
     project: Option<&db::Project>,
     task_state_config_json: Option<&str>,
 ) -> Value {
-    let mut merged = db::budget::state_config(
-        &state.config,
-        &state.name,
-        project.map(|p| p.settings.as_str()).unwrap_or("{}"),
-    );
+    let mut merged =
+        db::budget::state_config(state, project.map(|p| p.settings.as_str()).unwrap_or("{}"));
 
     let Some(task_state_config_json) = task_state_config_json else {
         return merged;

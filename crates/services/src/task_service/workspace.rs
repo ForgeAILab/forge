@@ -3114,6 +3114,7 @@ pub(crate) mod tests {
                         | 202610101906
                         | 202610110650
                         | 202610111217
+                        | 202610161644
                 ))
                 .then_some((version, path))
             })
@@ -3160,6 +3161,14 @@ pub(crate) mod tests {
         // order.
         sqlx::raw_sql(include_str!(
             "../../../db/migrations/V202610111217__integration_cutover.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The verify purpose rebuild re-creates the slot-wait age trigger on
+        // `check_run`, so it follows that migration, in version order.
+        sqlx::raw_sql(include_str!(
+            "../../../db/migrations/V202610161644__review_verify_purpose.sql"
         ))
         .execute(&pool)
         .await

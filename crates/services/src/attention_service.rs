@@ -3810,6 +3810,8 @@ fn category_metadata(category: &str) -> (i64, &'static str, &'static str) {
         "budget_threshold" => (60, "Agent budget threshold reached", "review_budget"),
         "commitment_overdue" => (75, "Commitment is overdue", "review_commitment"),
         "conflict_hotspot" => (60, "Shared file repeatedly conflicted", "split_hotspot"),
+        "flaky_check" => (60, "CI check is flaky", "inspect_ci"),
+        "base_check_failing" => (60, "Base CI needs attention", "inspect_ci"),
         _ => (50, "Attention required", "inspect"),
     }
 }
@@ -3830,6 +3832,8 @@ pub fn attention_item(item: AttentionProjection) -> Result<AttentionItem> {
         "budget_threshold" => AttentionCategory::BudgetThreshold,
         "commitment_overdue" => AttentionCategory::CommitmentOverdue,
         "conflict_hotspot" => AttentionCategory::ConflictHotspot,
+        "flaky_check" => AttentionCategory::FlakyCheck,
+        "base_check_failing" => AttentionCategory::BaseCheckFailing,
         other => {
             return Err(ServiceError::Domain(format!(
                 "unknown attention category: {other}"

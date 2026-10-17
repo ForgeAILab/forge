@@ -164,7 +164,7 @@ pub struct ReviewContract {
     pub context: ReviewGoverningContext,
     /// Results Forge recorded before dispatching the reviewer. These are
     /// immutable reviewer inputs; conformance admission reruns required checks
-    /// before accepting the assessment.
+    /// except exact CI results already classified non-blocking by entry triage.
     #[serde(default)]
     pub check_results: Vec<ConformanceCheckResult>,
     pub digest: String,
@@ -205,6 +205,15 @@ impl FixableBy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ReviewFinding {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kind: Option<ReviewFindingKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub same_cause_as: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub id: Option<String>,
@@ -220,6 +229,15 @@ pub struct ReviewFinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub observed: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewFindingKind {
+    Regression,
+    Missed,
+    OutOfScope,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
@@ -249,14 +267,46 @@ pub enum ReviewFindingSource {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewFindingStatus {
     Open,
+    Reopened,
+    OutOfScope,
     Resolved,
     Unconfirmed,
+    /// A step-level CI finding replaced by per-test findings.
+    Superseded,
+    Flaky,
+    PreExisting,
+}
+
+impl ReviewFindingStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Open | Self::Reopened)
+    }
 }
 
 /// Derived state of one finding in the current review-budget window.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ReviewFindingEntry {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[ts(as = "Option<Vec<String>>", optional)]
+    pub requirement_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kind: Option<ReviewFindingKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub same_cause_as: Option<String>,
+    /// Why a new finding was downgraded by later-review anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub anchoring_note: Option<String>,
+    /// Most recent actual resolution, retained when a finding is re-broken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number", optional)]
+    pub resolved_attempt: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ci_triage: Option<crate::CiFailureClass>,
     pub id: String,
     pub source: ReviewFindingSource,
     pub severity: ReviewFindingSeverity,
@@ -332,10 +382,20 @@ pub enum ConformanceStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct ConformanceCheckResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub triage: Option<crate::StepCiTriage>,
     pub check_id: String,
     pub command: String,
     pub exit_code: i32,
     pub output: String,
+}
+
+impl ConformanceCheckResult {
+    /// Triage changes review routing, never the recorded process exit code.
+    pub fn is_blocking(&self) -> bool {
+        self.exit_code != 0 && self.triage.as_ref().is_none_or(|triage| triage.blocking)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, TS)]

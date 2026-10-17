@@ -6,7 +6,8 @@ in order:
 1. The current headline, for example `Review failed (attempt N): <reason>`.
 2. A GitHub-flavoured task list of the ledger after this review. Each finding
    that is new or still open is unchecked and says since which attempt it has
-   been open. Each finding resolved in this review is checked. Each
+   been open. Each finding resolved in this review is checked; earlier-resolved findings are
+   not repeated. Each
    unconfirmed finding is shown without a box, as "not re-checked".
 3. When verify ran, one line with its result, the failing check names and the
    evidence count. When it was skipped, the reason.
@@ -23,6 +24,10 @@ failure posts no comment.
 #### Scenario: Failed review with findings
 - **WHEN** review 2 leaves F1 open since attempt 1, adds F4, resolves F2 and CI-1, and leaves F3 unconfirmed
 - **THEN** the comment shows `- [ ] F1 … open since attempt 1`, `- [ ] F4 New: …`, `- [x] F2 … resolved`, `- [x] CI-1 … passing now`, `F3 … not re-checked`, and the pointer to attempt 2 in the Review tab, without the report body
+
+#### Scenario: Earlier resolution is not repeated
+- **WHEN** F2 was resolved in review 2 and stays resolved in review 3
+- **THEN** review 3's comment omits F2, including when its source ran and passed again
 
 #### Scenario: CI failure gets a comment
 - **WHEN** review CI step 2 (`cargo test`) fails and no reviewer runs
@@ -46,6 +51,13 @@ parked it.
 
 Both comments SHALL be idempotent per Review, so a replayed step does not
 post them twice.
+
+The no-change gate SHALL also post these Forge comments without creating a new
+Review: a send-back comment states that HEAD still matches the failed candidate
+and names the `repair_no_change` budget spent and remaining; a park comment
+names the open findings, the no-change rule, and owner actions. These are
+idempotent per review entry: a replayed entry posts nothing new, and a later
+park of the same failed Review after an owner send-back posts its own comment.
 
 #### Scenario: Progress round comment
 - **WHEN** Forge grants a progress round after review 2

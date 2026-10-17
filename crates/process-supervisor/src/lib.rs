@@ -144,7 +144,10 @@ pub fn stop_group(id: u32) -> bool {
         std::thread::sleep(Duration::from_millis(5));
     }
     signal("KILL", id);
-    // A killed member is gone once its parent (or init) has reaped it.
+    // Group existence is deliberately stricter than process death. On Linux
+    // kill -0 also sees zombies: their parent (or init) must reap them before
+    // this can certify that no member remains. A zombie can cause a bounded
+    // false result, never a false proof that a running member is gone.
     let until = Instant::now() + Duration::from_secs(2);
     loop {
         match group_alive(id) {
@@ -157,6 +160,36 @@ pub fn stop_group(id: u32) -> bool {
 }
 #[cfg(not(unix))]
 pub fn stop_group(_id: u32) -> bool {
+    false
+}
+/// Stop what is left of a recorded process group whose owner died without
+/// stopping it (a server crash or restart mid-run), and say whether nothing
+/// of it is left. Its leader is long gone; its members keep the group id
+/// reserved, so a group without a live leader is still the recorded one.
+/// A live process with that id means the recorded group is gone and the id
+/// now names somebody else: nothing is signalled then (`true`). Blocking,
+/// like [`stop_group`].
+#[cfg(unix)]
+pub fn stop_orphaned_group(id: u32) -> bool {
+    if id <= 1 {
+        return false;
+    }
+    let leader = std::process::Command::new("kill")
+        .args(["-0", "--", &id.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|status| status.success());
+    match leader {
+        None => false,
+        Some(true) => true,
+        Some(false) => stop_group(id),
+    }
+}
+#[cfg(not(unix))]
+pub fn stop_orphaned_group(_id: u32) -> bool {
     false
 }
 /// A synchronous, bounded observer of each drained output chunk.

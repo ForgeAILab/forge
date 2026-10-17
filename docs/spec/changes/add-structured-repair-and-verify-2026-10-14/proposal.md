@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-15T01:40:00Z
-updated_at: 2026-10-15T02:22:50Z
+updated_at: 2026-10-17T00:42:17Z
 ---
 
 ## Why
@@ -102,6 +102,8 @@ reviewer is paid to read it. Munk calls this Deploy → Verify.
   Review tab.
 - Forge posts a short comment when it starts a repair round and when it parks
   a Task over findings. Both name the finding ids.
+- No-change send-backs state the unchanged HEAD and `repair_no_change` budget;
+  no-change parks name the open findings and owner actions.
 
 **Public surfaces** (each change touches the route, `api-types`, generated TS
 and `docs/api.md`):

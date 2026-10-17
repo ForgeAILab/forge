@@ -80,8 +80,8 @@ impl SoloDataPaths {
     }
 
     /// Check an existing root before acquiring the runtime lock or publishing
-    /// the repository binding. Missing roots and existing empty private
-    /// directories are safe first-run targets; an existing root is otherwise
+    /// the repository binding. Missing roots and private directories containing
+    /// only forge.yaml (or nothing) are safe first-run targets; an existing root is otherwise
     /// accepted only when its binding already names `repository_id`.
     pub fn preflight_existing_root(&self, repository_id: Uuid) -> Result<DataRootPreflight> {
         preflight_data_root(&self.root, repository_id)
@@ -221,7 +221,7 @@ pub enum DataDirError {
     DataRootPermissions { path: PathBuf },
 
     #[error(
-        "Solo data root {path} is non-empty but has no repository binding; choose an empty directory or an existing bound Solo data root"
+        "Solo data root {path} is non-empty but has no repository binding; choose an empty directory, one containing only forge.yaml, or an existing bound Solo data root"
     )]
     UnboundNonEmptyDataRoot { path: PathBuf },
 
@@ -267,6 +267,8 @@ pub enum DataRootPreflight {
     Absent,
     /// The root exists, is private, and contains no entries.
     Empty,
+    /// The private root contains only a regular forge.yaml and no runtime state.
+    Configured,
     /// The root is already bound to the requested repository identifier.
     Bound,
 }
@@ -376,8 +378,24 @@ pub fn preflight_data_root(data_root: &Path, repository_id: Uuid) -> Result<Data
         path: data_root.clone(),
         source,
     })?;
-    if entries.next().is_none() {
+    let first = entries
+        .next()
+        .transpose()
+        .map_err(|source| DataDirError::Io {
+            path: data_root.clone(),
+            source,
+        })?;
+    let Some(first) = first else {
         return Ok(DataRootPreflight::Empty);
+    };
+    if first.file_name() == "forge.yaml" && entries.next().is_none() {
+        let kind = first.file_type().map_err(|source| DataDirError::Io {
+            path: first.path(),
+            source,
+        })?;
+        if kind.is_file() {
+            return Ok(DataRootPreflight::Configured);
+        }
     }
 
     let paths = SoloDataPaths::new(data_root.clone());
@@ -831,6 +849,30 @@ mod tests {
             preflight_data_root(&root, id()).unwrap(),
             DataRootPreflight::Empty
         );
+    }
+
+    #[test]
+    fn preflight_accepts_only_config_before_first_launch_but_rejects_foreign_state() {
+        let outer = TempDir::new().unwrap();
+        let root = outer.path().join("configured-state");
+        fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let config_path = root.join("forge.yaml");
+        let config = "server:\n  bind: 127.0.0.1:9104\n";
+        fs::write(&config_path, config).unwrap();
+        assert!(preflight_data_root(&root, id()).is_ok());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        fs::write(root.join(DATABASE_FILE), "foreign state").unwrap();
+        assert!(matches!(
+            preflight_data_root(&root, id()),
+            Err(DataDirError::UnboundNonEmptyDataRoot { .. })
+        ));
     }
 
     #[test]

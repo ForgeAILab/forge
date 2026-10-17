@@ -107,7 +107,7 @@ pub async fn abandon_superseded_waits(
                 .request_key
                 .rsplit('|')
                 .next()
-                .map(str::to_owned)
+                .map(|authority| super::consumer::ci_parent_authority(authority).to_owned())
         });
         let review = match review_id {
             Some(id) => ReviewRepo::get_by_id(&**db, &id).await?,
@@ -152,9 +152,13 @@ pub(crate) async fn withdraw_consumer(
     let Some(state) = CheckDeliveryRepo::check_consumer_delivery(&**db, consumer_id).await? else {
         return Ok(());
     };
-    db.cancel_abandoned_check_consumer(consumer_id).await?;
-    if let Some(step_id) = step_id {
-        fence_remote_run(db, daemons, step_id, &state.consumer).await?;
+    let mut withdrawn = db.ci_triage_child_consumers(&state.consumer).await?;
+    withdrawn.push(state.consumer);
+    for consumer in withdrawn {
+        db.cancel_abandoned_check_consumer(&consumer.id).await?;
+        if let Some(step_id) = step_id {
+            fence_remote_run(db, daemons.clone(), step_id, &consumer).await?;
+        }
     }
     Ok(())
 }
@@ -256,7 +260,7 @@ pub(crate) async fn review_ci_identity(
         "task_id": input.task.id, "project_id": input.task.project_id,
         "repo_id": input.workspace.repo_id, "target_branch": target,
     });
-    let spec = review::check_spec::build_check_spec(
+    let mut spec = review::check_spec::build_check_spec(
         api_types::CheckPurpose::EntryCi,
         &review::check_spec::CheckSpecConfiguration {
             source: &source,
@@ -278,6 +282,19 @@ pub(crate) async fn review_ci_identity(
         },
     )
     .map_err(ServiceError::invalid_operation)?;
+    // A non-blocking failed step must not hide later configured checks.
+    // Full triage collects the whole candidate observation once, then reruns
+    // only failures. Report/off retain stop-at-first-failure routing.
+    let project = db::ProjectRepo::get_by_id(db, &input.task.project_id)
+        .await?
+        .ok_or(db::DbError::NotFound)?;
+    let settings: api_types::ProjectSettings = serde_json::from_str(&project.settings)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
+    if settings.review_ci_triage == api_types::ReviewCiTriage::Full {
+        for command in &mut spec.commands {
+            command.failure_policy = api_types::CheckFailurePolicy::Continue;
+        }
+    }
     if spec.commands.is_empty() {
         return Ok(None);
     }

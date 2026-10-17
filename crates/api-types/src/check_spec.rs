@@ -23,6 +23,7 @@ pub const CANONICAL_CI_POLICY: &str = "canonical-ci/1";
 pub enum CheckPurpose {
     EntryCi,
     ReviewCi,
+    ReviewVerify,
     Conformance,
     BeforeWork,
     Lifecycle,
@@ -36,6 +37,7 @@ impl CheckPurpose {
     pub const ALL: &'static [Self] = &[
         Self::EntryCi,
         Self::ReviewCi,
+        Self::ReviewVerify,
         Self::Conformance,
         Self::BeforeWork,
         Self::Lifecycle,
@@ -49,6 +51,7 @@ impl CheckPurpose {
         match self {
             Self::EntryCi => "entry_ci",
             Self::ReviewCi => "review_ci",
+            Self::ReviewVerify => "review_verify",
             Self::Conformance => "conformance",
             Self::BeforeWork => "before_work",
             Self::Lifecycle => "lifecycle",
@@ -338,3 +341,14 @@ pub struct CheckCommandOutcome {
 
 #[cfg(test)]
 mod tests;
+
+/// Internal base-comparison bundle, deliberately distinct from candidate CI.
+/// Only this commit-scoped canonical bundle may share red comparison evidence.
+pub fn is_ci_triage_base(spec: &CheckSpec) -> bool {
+    spec.execution_policy == CANONICAL_CI_POLICY
+        && spec.scope == CheckScope::Commit
+        && spec
+            .commands
+            .first()
+            .is_some_and(|command| command.id == "triage-base:setup:0")
+}

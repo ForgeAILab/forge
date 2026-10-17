@@ -246,6 +246,9 @@ pub enum CheckoutTarget<'a> {
         repository: &'a Path,
         build_area: &'a Path,
         commit: &'a str,
+        /// The candidate workspace supplies per-run build/temp policy.
+        environment_workspace: Option<&'a Path>,
+        assets: &'a [api_types::EnvironmentAsset],
     },
 }
 /// Declared cleanup is owner policy, pinned by the spec's execution_policy.
@@ -293,13 +296,7 @@ fn redacted(
     // A retained tail may begin halfway through a secret. Mask that fragment
     // too; otherwise truncation could disclose a secret suffix. Similarly the
     // final bytes of an interrupted command may be only a secret prefix.
-    let mut values = env
-        .values()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
-    values.dedup();
-    for value in values {
+    for value in executors::environment::redaction_values(env) {
         if truncated {
             for (offset, _) in value.char_indices() {
                 if value.len() - offset < SECRET_FRAGMENT_BYTES {
@@ -331,6 +328,20 @@ fn redacted(
     let text = executors::environment::redact_environment_values(&text, env);
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
+}
+/// The bounded, ANSI-free, redacted tail of output that did not come through
+/// a command pipe (a verify app's own log file), masked exactly like command
+/// output tails. `truncated`: the bytes are the end of a longer stream, so
+/// they may begin inside a value; `interrupted`: the writer may have been
+/// stopped mid-write, so they may end inside one.
+pub fn redacted_tail(
+    bytes: &[u8],
+    truncated: bool,
+    interrupted: bool,
+    env: &BTreeMap<String, String>,
+    limit: usize,
+) -> String {
+    redacted(bytes, truncated, interrupted, env, limit).0
 }
 /// Build a command. The two frozen legacy policies and the canonical CI
 /// policy inherit the owner's environment through a login shell, with the
@@ -427,9 +438,18 @@ pub async fn run_command(
     cancel: &CancellationToken,
     limit: usize,
 ) -> Result<CheckCommandReceipt, String> {
-    run_command_group(path, spec, environment, policy, deadline, cancel, limit)
-        .await
-        .map(|(receipt, _)| receipt)
+    run_command_group(
+        path,
+        path,
+        spec,
+        environment,
+        policy,
+        deadline,
+        cancel,
+        limit,
+    )
+    .await
+    .map(|(receipt, _)| receipt)
 }
 
 /// Only Forge's tempfile names inside its reserved Task directory are eligible.
@@ -460,8 +480,10 @@ fn remove_abandoned_reports(root: &executors::sandbox::TaskRoot) {
 }
 
 /// Also returns the command's process group, when one was started.
+#[allow(clippy::too_many_arguments)]
 async fn run_command_group(
     path: &Path,
+    environment_workspace: &Path,
     spec: &CheckCommandSpec,
     environment: &BTreeMap<String, String>,
     policy: &str,
@@ -471,10 +493,12 @@ async fn run_command_group(
 ) -> Result<(CheckCommandReceipt, Option<u32>), String> {
     let started_at = now();
     let start = Instant::now();
-    executors::sandbox::start_compiler_cache(path).await;
+    executors::sandbox::start_compiler_cache(environment_workspace).await;
     // Removed when this command returns: pass, fail, timeout or cancel.
-    let run_scope =
-        executors::sandbox::SandboxEnv::for_command(path, executors::sandbox::RunPurpose::Check);
+    let run_scope = executors::sandbox::SandboxEnv::for_command(
+        environment_workspace,
+        executors::sandbox::RunPurpose::Check,
+    );
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
     // An isolated directory prevents one step from inheriting another's reports.
     // Reports are optional evidence: a directory that cannot be made leaves the
@@ -631,6 +655,45 @@ pub fn unstarted_receipt(
     }
 }
 
+async fn clean_checkout(path: &Path, target: &CheckoutTarget<'_>) -> Result<bool, String> {
+    let output = git::command_output(
+        path,
+        &["status", "--porcelain", "-z", "--untracked-files=all"],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err("checkout cleanliness witness failed".into());
+    }
+    let assets = match target {
+        CheckoutTarget::ExactCommit { assets, .. } => *assets,
+        CheckoutTarget::Workspace(_) => &[],
+    };
+    // Only Forge-materialized untracked assets in the disposable checkout
+    // are inputs rather than dirt. Tracked edits and other untracked files
+    // still invalidate the witness. NUL paths avoid Git quoting ambiguities.
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .all(|entry| {
+            entry.strip_prefix(b"?? ").is_some_and(|name| {
+                assets.iter().any(|asset| {
+                    let target = Path::new(&asset.target)
+                        .components()
+                        .filter(|part| *part != std::path::Component::CurDir)
+                        .map(|part| part.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    name == target.as_bytes()
+                        || name
+                            .strip_prefix(target.as_bytes())
+                            .is_some_and(|rest| rest.starts_with(b"/"))
+                })
+            })
+        }))
+}
+
 pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
     if let Err(error) = executors::server_commands::ensure_allowed() {
         return unstarted_receipt(
@@ -679,6 +742,8 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                 repository,
                 build_area,
                 commit,
+                assets,
+                ..
             } => {
                 if !matches!(input.spec.scope, CheckScope::Commit) {
                     return Err("exact checkout requires commit scope".into());
@@ -733,6 +798,7 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
                 {
                     return Err("managed checkout witness mismatch".into());
                 }
+                executors::environment::materialize_assets(&checkout, assets).await?;
                 checkout
             }
         };
@@ -772,18 +838,23 @@ pub async fn execute(input: CheckExecution<'_>) -> CheckReceipt {
             if canonical(&input.spec.execution_policy) {
                 clean_before = tokio::time::timeout(
                     CLEAN_WITNESS_TIMEOUT,
-                    git::command_output(path, &["status", "--porcelain"]),
+                    clean_checkout(path, &input.target),
                 )
                 .await
                 .ok()
-                .and_then(Result::ok)
-                .filter(|output| output.status.success())
-                .map(|output| output.stdout.is_empty());
+                .and_then(Result::ok);
             }
             let mut sequence = CheckSequence::new(input.spec.clone());
             while let Some((_, spec)) = sequence.next_command() {
                 match run_command_group(
                     path,
+                    match &input.target {
+                        CheckoutTarget::ExactCommit {
+                            environment_workspace: Some(workspace),
+                            ..
+                        } => workspace,
+                        _ => path,
+                    },
                     spec,
                     input.environment,
                     &input.spec.execution_policy,

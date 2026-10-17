@@ -310,8 +310,58 @@ pub struct BranchListResponse {
     pub origin_url: Option<String>,
 }
 
+/// Classification of one failing test (or a whole step without signatures).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CiFailureClass {
+    Flaky,
+    PreExisting,
+    Introduced,
+    PreExistingUnverified,
+}
+impl CiFailureClass {
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Introduced | Self::PreExistingUnverified)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct CiFailureTriage {
+    pub signature: String,
+    pub class: CiFailureClass,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum CiBaseStatus {
+    NotNeeded,
+    Available,
+    BaseUnavailable,
+    BaseRunInvalid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export)]
+pub struct StepCiTriage {
+    pub mode: crate::ReviewCiTriage,
+    pub base_status: CiBaseStatus,
+    pub base_commit: Option<String>,
+    pub rerun_run_id: Option<String>,
+    pub base_run_id: Option<String>,
+    pub reason: Option<String>,
+    /// Whole-step classification when no signatures exist, or the rerun passed.
+    pub class: Option<CiFailureClass>,
+    pub failures: Vec<CiFailureTriage>,
+    pub blocking: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResultResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<StepCiTriage>,
     pub index: usize,
     pub command: String,
     pub exit_code: i32,
@@ -331,6 +381,9 @@ pub struct StepResultResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export)]
 pub struct StepResultEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub triage: Option<StepCiTriage>,
     pub index: usize,
     pub command: String,
     pub exit_code: i32,
@@ -382,6 +435,8 @@ pub struct ReviewExecutionEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct ReviewDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::ReviewVerifyDetails>,
     #[serde(default)]
     pub execution: Option<ReviewExecutionEvidence>,
     #[serde(default)]

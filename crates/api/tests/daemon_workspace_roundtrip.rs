@@ -1762,7 +1762,13 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
             "fail" => {
                 assert!(matches!(result, HookResult::Failed { .. }));
                 assert_eq!(reviews[0].status, ReviewStatus::Failed);
-                assert_eq!(details["ci_steps"].as_array().unwrap().len(), 1);
+                // Default full triage collects every step and reruns the red
+                // one; a daemon placement has no base comparison.
+                assert_eq!(details["ci_steps"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    details["ci_steps"][0]["triage"]["base_status"],
+                    "base_unavailable"
+                );
                 assert_eq!(details["ci_steps"][0]["exit_code"], 7);
                 assert_eq!(details["ci_steps"][0]["output_tail"], "failure\ndiagnostic");
                 assert!(task.review_passed_at.is_none());
@@ -1774,7 +1780,11 @@ async fn remote_ci_pass_and_failure_record_reviews_and_events() {
         // absolute deadline; no command travels as `workspace.run` any more.
         let link = fixture.link.as_ref().unwrap();
         let runs = link.requests(api_types::METHOD_CHECK_RUN);
-        assert_eq!(runs.len(), 1, "{case}: one check.run per entry");
+        assert_eq!(
+            runs.len(),
+            if case == "fail" { 2 } else { 1 },
+            "{case}: one check.run per entry, plus the red step's triage rerun"
+        );
         assert_eq!(
             runs[0]["purpose"],
             serde_json::to_value(api_types::WorkspaceRunPurpose::CiStep).unwrap()
@@ -5184,9 +5194,13 @@ async fn queue_worker_ejects_a_red_check_on_a_daemon_owned_target() {
     .fetch_all(state.db.pool())
     .await
     .unwrap();
+    // The red head's check and its default-full triage rerun.
     assert_eq!(
         checks,
-        vec![(attempt.candidate_sha.clone().unwrap(), "fail".to_owned())]
+        vec![
+            (attempt.candidate_sha.clone().unwrap(), "fail".to_owned()),
+            (attempt.candidate_sha.clone().unwrap(), "fail".to_owned())
+        ]
     );
     {
         use db::IntegrationQueueRepo;
@@ -7334,7 +7348,8 @@ async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_
     assert_eq!(succeeded(&merged, Kind::FastForward).len(), 1);
     assert_eq!(succeeded(&ejected, Kind::Rebase).len(), 1);
     assert!(receipt_owners(&ejected, Kind::FastForward).is_empty());
-    // Green first, red second, each on its own rebased commit.
+    // Green first, red second, each on its own rebased commit; the red one
+    // also ran its default-full triage rerun.
     let checks: Vec<(String, String)> = sqlx::query_as(
         "SELECT r.commit_sha, s.outcome FROM check_run r JOIN check_result s ON s.run_id=r.id ORDER BY r.created_at, r.id",
     )
@@ -7345,6 +7360,7 @@ async fn two_tasks_in_one_queue_on_a_daemon_owned_target_merge_green_then_eject_
         checks,
         vec![
             (tip, "pass".to_owned()),
+            (ejected.candidate_sha.clone().unwrap(), "fail".to_owned()),
             (ejected.candidate_sha.clone().unwrap(), "fail".to_owned())
         ]
     );

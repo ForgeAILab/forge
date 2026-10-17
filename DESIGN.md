@@ -143,6 +143,14 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 - Cancel restores focus; pending disables both actions; a racing conflict stays visible in the dialog and refreshes machine status.
 - The registration owner and administrators see the action.
 
+### CI triage settings and incidents
+
+Project General settings use the existing SettingsSection, Label and native Select
+for Full, Report and Off, with a short explanation of which failures block and
+why setup steps are needed. Mission Control uses its existing warning tokens for
+flaky/base CI incidents, preserving summary, command, count, Task links and
+inspect controls. No new colors, fonts, motion or layout primitives are needed.
+
 ### Form controls
 
 - **Structure:** label plus input/select/textarea/checkbox/switch, supporting help and error text.
@@ -709,3 +717,13 @@ Show “Remote cleanup pending” with a plain explanation that the owner must c
 remote work stopped before workspace reuse. The existing status region announces
 the state; no extra control is added. Operations reuses StatCard for the pending
 remote cleanup count. Existing wrapping, loading, error and responsive rules apply.
+
+### Project review verify settings
+
+Reuse SettingsSection, Switch, Input, Label, Button and the existing bordered
+command editor pattern. An optional Verify section follows CI steps. Enabling
+it exposes a start command, one readiness method, readiness and run limits,
+and 1–16 named checks with command and timeout. Fields have visible labels;
+errors remain inline with role alert, and disabled saving/permission states
+apply to every control. Check rows stack on compact screens and wrap names.
+No new tokens, motion or browser permissions are introduced.

@@ -1,0 +1,57 @@
+Scope: 2 of 3 workspace projects
+packages/alpha test$ /forge/web/node_modules/.bin/vitest run --globals --root /task packages/alpha/alpha.test.js --reporter=verbose
+packages/beta test$ /forge/web/node_modules/.bin/vitest run --globals --root /task packages/beta/beta.test.js --reporter=verbose
+packages/alpha test:  RUN  v4.1.11 /task
+packages/beta test:  RUN  v4.1.11 /task
+packages/beta test:  × packages/beta/beta.test.js > monorepo suite > rejects invalid input 3ms
+packages/beta test:    → expected 1 to be 2 // Object.is equality
+packages/alpha test:  × packages/alpha/alpha.test.js > monorepo suite > rejects invalid input 3ms
+packages/alpha test:    → expected 1 to be 2 // Object.is equality
+packages/alpha test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+packages/alpha test:  FAIL  packages/alpha/alpha.test.js > monorepo suite > rejects invalid input
+packages/beta test: ⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+packages/beta test:  FAIL  packages/beta/beta.test.js > monorepo suite > rejects invalid input
+packages/alpha test: AssertionError: expected 1 to be 2 // Object.is equality
+packages/alpha test: - Expected
+packages/alpha test: + Received
+packages/alpha test: - 2
+packages/alpha test: + 1
+packages/alpha test:  ❯ packages/alpha/alpha.test.js:1:82
+packages/beta test: AssertionError: expected 1 to be 2 // Object.is equality
+packages/beta test: - Expected
+packages/beta test: + Received
+packages/beta test: - 2
+packages/beta test: + 1
+packages/beta test:  ❯ packages/beta/beta.test.js:1:82
+packages/beta test:       1| describe('monorepo suite', () => { it('rejects invalid input', () => {…
+packages/beta test:        |                                                                                  ^
+packages/beta test:       2|
+packages/beta test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+packages/alpha test:       1| describe('monorepo suite', () => { it('rejects invalid input', () => {…
+packages/alpha test:        |                                                                                  ^
+packages/alpha test:       2|
+packages/alpha test: ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+packages/beta test:  Test Files  1 failed (1)
+packages/beta test:       Tests  1 failed (1)
+packages/beta test:    Start at  21:06:15
+packages/alpha test:  Test Files  1 failed (1)
+packages/alpha test:       Tests  1 failed (1)
+packages/alpha test:    Start at  21:06:15
+packages/alpha test:    Duration  262ms (transform 28ms, setup 0ms, import 140ms, tests 4ms, environment 0ms)
+packages/beta test:    Duration  262ms (transform 28ms, setup 0ms, import 140ms, tests 3ms, environment 0ms)
+packages/alpha test: Failed
+packages/beta test: Failed
+[ERR_PNPM_RECURSIVE_FAIL] 
+
+
+Summary: 2 fails, 0 passes
+
+/task/packages/alpha:
+[ERROR] alpha@1.0.0 test: `/forge/web/node_modules/.bin/vitest run --globals --root /task packages/alpha/alpha.test.js --reporter=verbose`
+Exit status 1
+
+/task/packages/beta:
+[ERROR] beta@1.0.0 test: `/forge/web/node_modules/.bin/vitest run --globals --root /task packages/beta/beta.test.js --reporter=verbose`
+Exit status 1
+[WARN]  Local package.json exists, but node_modules missing, did you mean to install?
+[WARN]  Local package.json exists, but node_modules missing, did you mean to install?

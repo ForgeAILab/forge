@@ -246,3 +246,33 @@ describe('Review tab finding ledger', () => {
     expect(apiFetch).toHaveBeenCalledTimes(2)
   })
 })
+
+it('labels a step finding superseded by test findings without claiming resolution', async () => {
+  vi.mocked(apiFetch).mockResolvedValue({
+    items: [{ ...entry('CI-0', 'superseded'), source: 'ci' }],
+    window_started_at: review.created_at,
+    review_attempts: 3,
+  })
+  show()
+  const table = await screen.findByRole('table')
+  expect(within(table).getByText('superseded by test findings')).toBeTruthy()
+  expect(within(table).queryByText('resolved')).toBeNull()
+})
+
+it('shows reopened rounds, anchoring notes, citations, and follow-up candidates', async () => {
+  vi.mocked(apiFetch).mockResolvedValue({
+    items: [
+      { ...entry('F1', 'reopened'), resolved_attempt: 2, requirement_ids: ['R2'] },
+      { ...entry('F2'), severity: 'minor', anchoring_note: 'outside requirements and Task files' },
+      { ...entry('F3', 'out_of_scope'), severity: 'minor' },
+    ],
+    window_started_at: review.created_at,
+    review_attempts: 3,
+  })
+  show()
+  const ledger = await screen.findByRole('table')
+  expect(within(ledger).getByText('Re-broken: resolved in round 2')).toBeTruthy()
+  expect(within(ledger).getByText('Requirements: R2')).toBeTruthy()
+  expect(within(ledger).getByText('outside requirements and Task files')).toBeTruthy()
+  expect(within(ledger).getByText('Follow-up candidate')).toBeTruthy()
+})

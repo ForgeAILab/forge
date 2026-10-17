@@ -79,6 +79,33 @@ beforeEach(() => {
 })
 
 describe('Project flow control settings', () => {
+  it('defaults CI triage to full and saves off while preserving setup steps', async () => {
+    query.data = {
+      ...project,
+      default_review_config: { ci_steps: ['cargo test'], setup_steps: ['cargo fetch'] },
+    }
+    renderSettings('general')
+    await waitFor(() =>
+      expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+    )
+    expect(screen.getByLabelText('Triage policy').textContent).toContain('Full')
+    expect(screen.getByLabelText('Triage policy').getAttribute('aria-describedby')).toBe(
+      'review-ci-triage-help',
+    )
+    fireEvent.click(screen.getByLabelText('Triage policy'))
+    fireEvent.click(screen.getByRole('option', { name: 'Off — block all failures without triage' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          settings: expect.objectContaining({ review_ci_triage: 'off' }),
+          default_review_config: expect.objectContaining({ setup_steps: ['cargo fetch'] }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+
   it('preserves the provision timeout when saving environment controls', async () => {
     query.data = {
       ...project,
@@ -137,7 +164,7 @@ describe('Project flow control settings', () => {
             version: 7,
             settings: expect.objectContaining({
               max_active_tasks: Number(value),
-              retry_budgets: project.settings.retry_budgets,
+              retry_budgets: { review: 3 },
               environment: project.settings.environment,
               command_allowlist: project.settings.command_allowlist,
             }),
@@ -255,5 +282,129 @@ describe('Project flow control settings', () => {
       ),
     )
     expect(screen.getByRole('alert').textContent).toContain('Project settings were changed')
+  })
+})
+
+it.each(['0', '4'])('saves the Project progress round allowance %s', async (value) => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+  )
+  fireEvent.change(screen.getByLabelText('Progress round allowance'), { target: { value } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate).toHaveBeenCalledWith(
+    expect.objectContaining({
+      body: expect.objectContaining({
+        settings: expect.objectContaining({
+          retry_budgets: { review: 3, review_progress: Number(value) },
+        }),
+      }),
+    }),
+    expect.any(Object),
+  )
+})
+
+it('leaves an unset progress allowance unset when saving unrelated settings', async () => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+  )
+  const allowance = screen.getByLabelText('Progress round allowance') as HTMLInputElement
+  expect(allowance.value).toBe('')
+  expect(allowance.placeholder).toBe('Default (2)')
+  fireEvent.change(screen.getByLabelText('Active task limit'), { target: { value: '7' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.retry_budgets).toEqual({ review: 3 })
+})
+
+it('can clear a stored progress allowance back to the default', async () => {
+  query.data = {
+    ...project,
+    settings: { ...project.settings, retry_budgets: { review: 3, review_progress: 4 } },
+  }
+  renderSettings('general')
+  await waitFor(() =>
+    expect((screen.getByLabelText('Progress round allowance') as HTMLInputElement).value).toBe('4'),
+  )
+  fireEvent.change(screen.getByLabelText('Progress round allowance'), { target: { value: '' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.retry_budgets).toEqual({ review: 3 })
+})
+
+it('keeps model switching opt-in and saves the explicit choice', async () => {
+  renderSettings('general')
+  await waitFor(() =>
+    expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+  )
+  const toggle = screen.getByRole('checkbox', {
+    name: 'Switch model when stuck',
+  }) as HTMLInputElement
+  expect(toggle.checked).toBe(false)
+  fireEvent.click(toggle)
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  expect(mutate.mock.calls[0][0].body.settings.repair_switch_model_when_stuck).toBe(true)
+})
+
+describe('Project verify settings', () => {
+  it('edits and saves verify commands and limits while preserving CI', async () => {
+    renderSettings('general')
+    await waitFor(() =>
+      expect((document.getElementById('project-name') as HTMLInputElement).value).toBe('NovelKit'),
+    )
+    expect(
+      (screen.getByLabelText('Verify the running app before review') as HTMLInputElement).checked,
+    ).toBe(false)
+    fireEvent.click(screen.getByLabelText('Verify the running app before review'))
+    fireEvent.change(screen.getByLabelText('Start command (optional)'), {
+      target: { value: 'pnpm dev --port "$FORGE_VERIFY_PORT"' },
+    })
+    fireEvent.change(screen.getByLabelText('Readiness URL path (optional)'), {
+      target: { value: '/health' },
+    })
+    fireEvent.change(screen.getByLabelText('Check 1 command'), {
+      target: { value: './scripts/verify.sh' },
+    })
+    fireEvent.change(screen.getByLabelText('Verify run timeout (seconds)'), {
+      target: { value: '42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          default_review_config: expect.objectContaining({
+            ci_steps: ['cargo test -p db one_case'],
+            verify: expect.objectContaining({
+              ready_path: '/health',
+              timeout_seconds: 42,
+              checks: [{ name: 'smoke', command: './scripts/verify.sh' }],
+            }),
+          }),
+        }),
+      }),
+      expect.any(Object),
+    )
+  })
+  it('loads verify and clears it when disabled', async () => {
+    query.data = {
+      ...project,
+      default_review_config: {
+        ci_steps: ['true'],
+        verify: { ready_path: '/', checks: [{ name: 'smoke', command: 'verify' }] },
+      },
+    }
+    renderSettings('general')
+    await waitFor(() =>
+      expect((screen.getByLabelText('Check 1 command') as HTMLInputElement).value).toBe('verify'),
+    )
+    fireEvent.click(screen.getByLabelText('Verify the running app before review'))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(mutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          default_review_config: expect.objectContaining({ verify: null }),
+        }),
+      }),
+      expect.any(Object),
+    )
   })
 })

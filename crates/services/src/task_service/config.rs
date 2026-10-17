@@ -132,6 +132,26 @@ pub(super) fn executor_snapshot_with_sticky_resume(
     }
 }
 
+/// Promote one fallback in this transient snapshot. The Agent's authored route
+/// is untouched, so a later non-carried round returns to its primary candidate.
+pub(super) fn executor_snapshot_with_next_fallback(snapshot_json: &str) -> Result<String> {
+    let mut snapshot = parse_json_value("executor config snapshot", snapshot_json)?;
+    let Some(candidate) = snapshot
+        .get(executors::ROUTING_SNAPSHOT_KEY)
+        .and_then(|routing| routing["candidates"].as_array())
+        .and_then(|candidates| candidates.get(1))
+        .cloned()
+    else {
+        return Ok(snapshot_json.to_owned());
+    };
+    snapshot["repair_model_switched"] = Value::Bool(true);
+    snapshot["executor_type"] = candidate["executor_type"].clone();
+    snapshot["config"] = candidate["config"].clone();
+    snapshot["model"] = candidate["config"]["model"].clone();
+    serde_json::to_string(&snapshot)
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))
+}
+
 pub(super) fn truncate_utf8_bytes(bytes: &[u8], max_bytes: usize) -> String {
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= max_bytes {
@@ -883,6 +903,24 @@ mod tests {
         assert_eq!(
             snapshot["dispatch_metadata"]["execution_policy"],
             "resume_latest_target_role_thread"
+        );
+    }
+    #[test]
+    fn carried_repair_model_switch_changes_only_the_transient_round_snapshot() {
+        let primary = smith_snapshot("acct-1", true);
+        let switched = executor_snapshot_with_next_fallback(&primary).unwrap();
+        let switched: Value = serde_json::from_str(&switched).unwrap();
+        assert_eq!(switched["config"]["profile"], "acct-2");
+        assert_eq!(
+            switched["routing"]["candidates"][0]["config"]["profile"],
+            "acct-1"
+        );
+        let later: Value = serde_json::from_str(&primary).unwrap();
+        assert_eq!(later["config"]["profile"], "acct-1");
+        let no_fallback = smith_snapshot("acct-1", false);
+        assert_eq!(
+            executor_snapshot_with_next_fallback(&no_fallback).unwrap(),
+            no_fallback
         );
     }
 }

@@ -6,7 +6,7 @@
 //! - the `settle` step, when the target did not move (no check is asked);
 //! - the check's delivery (`apply_check_result`, through
 //!   [`IntegrationCheckFamily`]), after a `request_check` for a rebased head.
-use super::{ack_value, bounded, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
+use super::{ack_value, IntegrationSteps, StepOutcome, TaskStepIntegrationPort};
 use crate::{
     check_runner::consumer::{
         CheckApplication, CheckConsumerFamily, CheckVerdict, TaskCheckRequest,
@@ -208,28 +208,122 @@ pub(super) fn check_input(application: &CheckApplication) -> CheckInput {
                     CheckInput::NoVerdict(format!("the check ended {}", result.outcome))
                 }
                 CheckResultOutcome::Fail | CheckResultOutcome::TimedOut => {
-                    let failed = result
-                        .commands
-                        .iter()
-                        .find(|command| command.exit_code != 0)
-                        .map(|command| {
-                            format!(
-                                "`{}` exited {}: {}",
-                                command.command,
-                                command.exit_code,
-                                if command.stderr_tail.trim().is_empty() {
-                                    command.output_tail.trim()
-                                } else {
-                                    command.stderr_tail.trim()
-                                }
-                            )
-                        })
+                    let failed = failed_command_message(&result.commands)
                         .unwrap_or_else(|| format!("the check ended {}", result.outcome));
-                    CheckInput::Failed(timing, bounded(&failed))
+                    CheckInput::Failed(timing, super::bounded_ci_failure(&failed))
                 }
             }
         }
     }
+}
+
+/// The first failing command and the end of its combined output. The cause
+/// of a red check is where its output ends; the bounded message keeps that
+/// end rather than the oldest lines of the tail.
+fn failed_command_message(commands: &[api_types::CheckCommandOutcome]) -> Option<String> {
+    let command = commands.iter().find(|command| command.exit_code != 0)?;
+    let head = format!(
+        "`{}` exited {}: ",
+        message_prefix(&command.command, 1024),
+        command.exit_code
+    );
+    let failures = failure_signatures(&command.failures, command.failures_truncated);
+    let output = output_end(&command.output_tail, &command.stderr_tail, 2 * 1024);
+    Some(format!("{head}{failures}\n{output}"))
+}
+
+fn failure_signatures(failures: &[String], truncated: bool) -> String {
+    let mut out = failures
+        .iter()
+        .take(20)
+        .map(|signature| format!("\n- {}", message_prefix(signature, 300)))
+        .collect::<String>();
+    if failures.len() > 20 {
+        out.push_str(&format!("\n+{} more", failures.len() - 20));
+    }
+    if truncated {
+        out.push_str("\nAdditional failure signatures were truncated.");
+    }
+    out
+}
+
+/// Keep the failing test names and a separate 2 KiB output end. The triage
+/// summary may contain many steps; it must not consume the output allowance.
+fn triaged_failure_message(entries: &[api_types::StepResultEntry], summary: &str) -> String {
+    let Some(step) = entries
+        .iter()
+        .find(|entry| crate::check_runner::ci_triage::blocks(entry))
+    else {
+        return super::bounded_ci_failure(summary);
+    };
+    let mut failures = Vec::new();
+    let mut headers = Vec::new();
+    let mut truncated = false;
+    for entry in entries
+        .iter()
+        .filter(|entry| crate::check_runner::ci_triage::blocks(entry))
+    {
+        let mut signatures = entry.failures.clone();
+        if let Some(triage) = &entry.triage {
+            let classified: Vec<_> = triage
+                .failures
+                .iter()
+                .filter(|failure| {
+                    triage.mode != api_types::ReviewCiTriage::Full || failure.class.blocks()
+                })
+                .map(|failure| failure.signature.clone())
+                .collect();
+            if !triage.failures.is_empty() {
+                signatures = classified;
+            }
+        }
+        failures.extend(
+            signatures
+                .into_iter()
+                .map(|signature| format!("CI-{} {signature}", entry.index)),
+        );
+        truncated |= entry.failures_truncated;
+        let reason = entry
+            .triage
+            .as_ref()
+            .and_then(|triage| triage.reason.as_deref())
+            .unwrap_or_default();
+        headers.push(format!(
+            "`{}` exited {}{}{}",
+            entry.command,
+            entry.exit_code,
+            if reason.is_empty() { "" } else { "; " },
+            reason
+        ));
+    }
+    format!(
+        "{}{}\n{}",
+        message_prefix(&headers.join("\n"), 2048),
+        failure_signatures(&failures, truncated),
+        output_end(&step.output_tail, &step.stderr_tail, 2 * 1024)
+    )
+}
+
+fn message_prefix(text: &str, bytes: usize) -> &str {
+    let mut end = bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// The end of a step's combined output (stderr only when it is empty).
+fn output_end<'a>(output_tail: &'a str, stderr_tail: &'a str, bytes: usize) -> &'a str {
+    let output = if output_tail.trim().is_empty() {
+        stderr_tail.trim()
+    } else {
+        output_tail.trim()
+    };
+    let mut start = output.len().saturating_sub(bytes);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    &output[start..]
 }
 
 /// What `settle` decided before its transaction.
@@ -353,7 +447,9 @@ impl IntegrationSteps {
                     let application = CheckApplication {
                         task_id: task.id.clone(),
                         status_epoch: attempt.expected_epoch,
-                        authority: String::new(),
+                        authority: check_authority(&attempt).ok_or_else(|| {
+                            ServiceError::invalid_operation("the head has no candidate commit")
+                        })?,
                         consumer_id: delivery.consumer.id.clone(),
                         run,
                         verdict: if result.outcome == CheckResultOutcome::InfrastructureFailed {
@@ -594,6 +690,94 @@ impl IntegrationSteps {
             return self.answer_task_left(step, request, states).await;
         };
 
+        // Every candidate failure is triaged before an ejection/send-back can
+        // be authorised. Subcheck deliveries retain the head's authority.
+        let mut triaged_steps = None;
+        let check = if matches!(check, CheckInput::Failed(..)) {
+            if let Some(application) = evidence {
+                let project = db::ProjectRepo::get_by_id(&*self.db, &task.project_id)
+                    .await?
+                    .ok_or(db::DbError::NotFound)?;
+                let workflow = WorkflowEngine::resolve_workflow_for_task(
+                    &task,
+                    &project.workflow_definition,
+                    &crate::worker_runtime::queue::cascade_actor(),
+                );
+                let config = workflow
+                    .states
+                    .iter()
+                    .find(|state| state.name == default_states::REVIEW)
+                    .map(|state| {
+                        crate::workflow::engine::effective_state_config(
+                            state,
+                            Some(&project),
+                            task.task_state_config.as_deref(),
+                        )
+                    })
+                    .unwrap_or_default();
+                let consumers = self.task_service.check_consumers().ok_or_else(|| {
+                    ServiceError::invalid_operation("check consumers are not composed")
+                })?;
+                match crate::check_runner::ci_triage::triage(
+                    &self.db,
+                    &consumers,
+                    &task,
+                    application,
+                    &config,
+                    attempt.target_tip_sha.as_deref(),
+                )
+                .await?
+                {
+                    crate::check_runner::ci_triage::Progress::Pending(_) => {
+                        if let Some(step) = step {
+                            let mut tx = db::begin_immediate(self.db.pool()).await?;
+                            self.db
+                                .finish_step_in_tx(&mut tx, step, "done", None)
+                                .await?;
+                            tx.commit().await?;
+                        }
+                        return Ok(StepOutcome::Settled);
+                    }
+                    crate::check_runner::ci_triage::Progress::Infrastructure(consumer) => {
+                        CheckInput::NoVerdict(format!(
+                            "CI triage check {consumer} produced no verdict after its infrastructure retries"
+                        ))
+                    }
+                    crate::check_runner::ci_triage::Progress::Complete(entries) => {
+                        let blocking = entries.iter().any(crate::check_runner::ci_triage::blocks);
+                        let triaged = entries.iter().any(|entry| entry.triage.is_some());
+                        let summary = triaged
+                            .then(|| crate::check_runner::ci_triage::failure_summary(&entries));
+                        triaged_steps = Some(entries);
+                        match check {
+                            // Only failures triage classified may pass. A red
+                            // result it never looked at (timed out, `off`, or
+                            // no failing step recorded) stays red.
+                            CheckInput::Failed(timing, _) if triaged && !blocking => {
+                                CheckInput::Passed(timing)
+                            }
+                            CheckInput::Failed(timing, _)
+                                if summary.as_ref().is_some_and(|summary| !summary.is_empty()) =>
+                            {
+                                CheckInput::Failed(
+                                    timing,
+                                    triaged_failure_message(
+                                        triaged_steps.as_deref().unwrap_or_default(),
+                                        summary.as_deref().unwrap_or_default(),
+                                    ),
+                                )
+                            }
+                            other => other,
+                        }
+                    }
+                }
+            } else {
+                check
+            }
+        } else {
+            check
+        };
+
         // Everything that reads Git or the workflow is decided before the
         // write transaction; the transaction re-reads what it depends on.
         let authority = {
@@ -754,7 +938,7 @@ impl IntegrationSteps {
             }
         };
         if let Some(application) = evidence {
-            self.record_head_review_in_tx(&mut tx, &attempt, application)
+            self.record_head_review_in_tx(&mut tx, &attempt, application, triaged_steps.as_deref())
                 .await?;
         }
         let written = db::acknowledge_integration_step_in_tx(
@@ -833,6 +1017,34 @@ impl CheckConsumerFamily for IntegrationCheckFamily {
         else {
             return Ok(());
         };
+        let subcheck = application
+            .run
+            .identity
+            .inputs
+            .spec
+            .commands
+            .first()
+            .is_some_and(|command| {
+                command.id.starts_with("triage-rerun:") || command.id.starts_with("triage-base:")
+            });
+        let original = if subcheck {
+            let task = TaskRepo::get_by_id(&*self.steps.db, &application.task_id, false)
+                .await?
+                .ok_or(db::DbError::NotFound)?;
+            Some(
+                crate::check_runner::ci_triage::original_application(
+                    &self.steps.db,
+                    &task,
+                    application.status_epoch,
+                    CheckConsumerOrigin::Integration,
+                    &application.authority,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let application = original.as_ref().unwrap_or(application);
         // The answer is for the worker that waits now: its `effect_seq` and
         // generation, whichever step first asked for this commit.
         let request = crate::integration_worker::IntegrationQueueWorker::step_request(
@@ -1039,6 +1251,7 @@ impl IntegrationSteps {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         attempt: &IntegrationAttempt,
         application: &CheckApplication,
+        triaged_steps: Option<&[api_types::StepResultEntry]>,
     ) -> Result<()> {
         let CheckVerdict::Result(result) = &application.verdict else {
             return Ok(());
@@ -1114,8 +1327,10 @@ impl IntegrationSteps {
         } else {
             "cache_hit"
         };
-        let ci_steps: Vec<serde_json::Value> = result
-            .commands
+        let steps = triaged_steps
+            .map(<[_]>::to_vec)
+            .unwrap_or_else(|| crate::check_runner::ci_triage::steps(result));
+        let ci_steps: Vec<serde_json::Value> = steps
             .iter()
             .map(|command| {
                 let mut value = serde_json::to_value(command).expect("command facts serialize");
@@ -1144,5 +1359,81 @@ impl IntegrationSteps {
             .produce_condition_in_tx(tx, &attempt.task_ref, db::ConditionChange::Human)
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod failed_message_tests {
+    use super::*;
+
+    #[test]
+    fn a_red_check_message_keeps_the_end_of_the_combined_output() {
+        let command = api_types::CheckCommandOutcome {
+            index: 0,
+            command: "cargo test".into(),
+            exit_code: 101,
+            stderr_tail: format!(
+                "{}error: test failed, to rerun pass `--lib`",
+                "   Compiling dep v0.1.0\n".repeat(100)
+            ),
+            failures: vec!["parser::empty".into()],
+            failures_truncated: false,
+            output_tail: format!(
+                "{}test parser::empty ... FAILED\ntest result: FAILED. 1 passed; 1 failed",
+                "   Compiling dep v0.1.0\n".repeat(100)
+            ),
+            started_at: "now".into(),
+            finished_at: "now".into(),
+        };
+        let message = failed_command_message(&[command]).unwrap();
+        assert!(
+            message.starts_with("`cargo test` exited 101: "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("test result: FAILED. 1 passed; 1 failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("test parser::empty ... FAILED"),
+            "{message}"
+        );
+        assert!(message.len() <= super::super::CI_MESSAGE_LIMIT);
+    }
+    #[test]
+    fn merge_ci_failure_names_twenty_tests_and_keeps_two_kib_output_end() {
+        let command = api_types::CheckCommandOutcome {
+            index: 0,
+            command: "cargo test".into(),
+            exit_code: 101,
+            stderr_tail: String::new(),
+            failures: (0..25).map(|i| format!("binary::case_{i}")).collect(),
+            failures_truncated: false,
+            output_tail: format!("{}END", "x".repeat(4096)),
+            started_at: "now".into(),
+            finished_at: "now".into(),
+        };
+        let message = failed_command_message(std::slice::from_ref(&command)).unwrap();
+        for i in 0..20 {
+            assert!(
+                message.contains(&format!("- binary::case_{i}\n")),
+                "{message}"
+            );
+        }
+        assert!(message.contains("+5 more"));
+        assert!(message.ends_with(&format!("{}END", "x".repeat(2045))));
+        let entry: api_types::StepResultEntry =
+            serde_json::from_value(serde_json::to_value(command).unwrap()).unwrap();
+        let message =
+            triaged_failure_message(std::slice::from_ref(&entry), "base comparison unavailable");
+        assert!(message.contains("binary::case_19") && message.contains("+5 more"));
+        assert!(message.ends_with(&format!("{}END", "x".repeat(2045))));
+        let mut second = entry.clone();
+        second.index = 1;
+        second.command = "pytest".into();
+        second.failures = vec!["other-test".into()];
+        let message = triaged_failure_message(&[entry, second], "unused");
+        assert!(message.contains("+6 more"));
+        assert_eq!(message.matches("\n- CI-").count(), 20);
     }
 }

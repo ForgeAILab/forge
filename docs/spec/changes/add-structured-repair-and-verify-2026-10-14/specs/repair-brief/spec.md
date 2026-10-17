@@ -20,6 +20,9 @@ The brief SHALL contain these sections, in this order:
 9. **Logs:** reviewer and coder log paths.
 
 The prompt builder IDs and the session-resume policy SHALL stay as they are.
+CI classifications SHALL follow the recorded triage mode: under `full`, flaky
+and pre-existing findings are labelled non-blocking; under `report`, those same
+classifications remain blocking open findings in the brief.
 
 #### Scenario: Review fix after two rounds
 - **WHEN** review 2 fails with F1 open (streak 2), F2 resolved and F4 new
@@ -37,13 +40,28 @@ sections in this order until it fits:
 3. each check tail, down to 1 KiB;
 4. the resolved and unconfirmed list, down to ids only.
 
-The Task section and the open findings are never dropped. When they alone are
-over 24 KiB, each finding's `expected` and `observed` are cut to 300
-characters.
+The Task section and the open findings are never dropped. When the brief is
+still over 24 KiB, Forge SHALL next share 4 KiB among the check tails and keep
+2 KiB of the verify section. If it is still over, each finding's summary is cut
+to 200 characters, `where` to 120, and `expected` and `observed` to 300; past a
+line budget the remaining open findings are listed by id only. Task description
+and plan SHALL each keep at most 4 KiB including a UTF-8-safe truncation note.
+Compacted update lines SHALL share 1 KiB across all steps, including waived
+findings. Check output SHALL share 8 KiB and logs 1 KiB. If even an id-only
+window exceeds the body capacity, the final truncation notice SHALL point to
+the complete finding ledger; the byte cap is unconditional.
+
+#### Scenario: Fifty long findings
+- **WHEN** a review fails with 50 findings whose texts are 1,000 characters each
+- **THEN** the brief is at most 24 KiB and names every open finding, in full-clipped form or by id
 
 #### Scenario: Large report is trimmed first
 - **WHEN** the reviewer report is 40 KiB and the rest of the brief is 6 KiB
 - **THEN** the brief is at most 24 KiB, contains every open finding in full, and contains at most 2 KiB of the report
+
+#### Scenario: Large Task text and many waived failures
+- **WHEN** the description and plan are each 30 KiB and 40 steps report waived failures
+- **THEN** the brief is at most 24 KiB, clips each Task text to 4 KiB with a truncation note, and limits compacted updates to a shared 1 KiB line allowance
 
 ### Requirement: Merge-time check failures reach the coder with detail
 The merge-fix request SHALL use the repair brief with a `MERGE-CI` entry in
@@ -53,13 +71,18 @@ send-back metadata, not from the review ledger. A conflict handoff appears
 the same way as `MERGE-CONFLICT`. The `MERGE-CI` entry carries:
 - the target branch;
 - the failing command;
-- its output tail.
+- up to 20 failing test signatures, followed by `+N more`;
+- its UTF-8-safe 2 KiB output end.
 
 The request SHALL NOT tell the coder that manual worktree repair is required.
 
 #### Scenario: Tests fail after rebase
 - **WHEN** a Task's merge attempt rebases onto `main` and `cargo test` fails
 - **THEN** the coder's merge-fix request contains the `MERGE-CI` finding with `cargo test` and its output tail, and no "manual task-worktree repair" text
+
+#### Scenario: Merge-time failures name the tests
+- **WHEN** a merge-time CI step reports more than 20 failing signatures
+- **THEN** the send-back and MERGE-CI brief name 20 signatures, show +N more, and retain a 2 KiB output end
 
 ### Requirement: Progress rounds after the review budget is spent
 A new retry budget kind `review_progress` SHALL exist:
@@ -81,7 +104,9 @@ off for a window once any reviewer `fail` in it had no blocking finding. In
 that case today's exhaustion behaviour applies.
 
 Coordination roots with a lead SHALL keep `charge_replan` and get no progress
-rounds.
+rounds. During a progress round, only review-entry failures classified as
+infrastructure SHALL use the infrastructure retry path; configuration and
+other deterministic errors retain ordinary parking.
 
 #### Scenario: Progress earns a round
 - **WHEN** under the default gate, review 1 opens F1, F2 and F3, and review 2 leaves only F1 open
@@ -90,6 +115,10 @@ rounds.
 #### Scenario: No progress parks as before
 - **WHEN** the review budget is spent and review 2 leaves the same number of findings open as review 1
 - **THEN** the Task parks with `review_budget_exhausted` as today
+
+#### Scenario: Configuration error during a progress round
+- **WHEN** a progress repair returns to review with invalid entry configuration
+- **THEN** it parks as before and spends no infrastructure retry allowance
 
 #### Scenario: Disabled
 - **WHEN** a Task's `retry_budgets.review_progress` is 0

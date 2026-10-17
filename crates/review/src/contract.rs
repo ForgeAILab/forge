@@ -43,6 +43,8 @@ repeat defaults to false; set it true only when the previous review attempt rais
 Owner example: {"result":"fail","reason":"Forge linked_documents is empty","fixable_by":"owner","repeat":false}.
 Repeat example: {"result":"fail","reason":"The null-input crash from the previous review is still reproducible","fixable_by":"coder","repeat":true}.
 findings is an optional list of problems. Each item needs a one-sentence summary; severity is "blocking" (default) or "minor". Include where (file and line, command, or screen), expected, and observed when available. Keep at most 50 items and each text field at most 1,000 characters. A pass may include minor findings; a fail remains a fail even without blocking findings.
+Each finding may cite requirement_ids from the frozen requirement ids listed below. kind is "regression" (re-broken behavior), "missed" (unmet requirement), or "out_of_scope" (follow-up candidate; never blocking); unknown kinds are ignored. Use same_cause_as with an earlier finding id when they share a root cause.
+After the first review in a window, raise a new blocking finding only for a regression, an unmet requirement (cite its id), or a file in candidate_changed_paths. Other new findings become minor with an anchoring note. Preserve prior ids and address the shared cause at every call site.
 Forge assigns new finding ids. For a prior finding still open, copy its id into the item; list prior ids that are fixed in the optional resolved list. Do not invent ids for new findings. An omitted prior finding is unconfirmed, not resolved.
 Findings example: {"result":"fail","reason":"Empty input still crashes","findings":[{"id":"F1","summary":"Empty input crashes parse()","severity":"blocking","where":"src/parse.rs:42","expected":"error message","observed":"panic"},{"summary":"Help text has a typo","severity":"minor"}],"resolved":["F2"]}.
 Do not pass work you could not check."#;
@@ -559,7 +561,7 @@ async fn try_git_read(
 ///    the fix report for what that would take.)
 /// 3. The previous behavior: the named branch's current tip, or `HEAD` when
 ///    no branch is known.
-async fn review_base(
+pub async fn review_base(
     path: &(impl ReviewWorkspace + ?Sized),
     context: &ReviewGoverningContext,
 ) -> Result<String, String> {
@@ -700,6 +702,7 @@ async fn completed_ci_check_results(
         .map_err(|error| format!("invalid stored review check results: {error}"))?;
     let stored = parse_stored_ci_steps(details)?;
     let mut results = Vec::with_capacity(stored.len());
+    let mut triage_signature_budget = 20;
     let mut seen_indices = BTreeSet::new();
     for result in stored {
         let index = result.index;
@@ -729,6 +732,7 @@ async fn completed_ci_check_results(
             result.output_tail.clone()
         };
         results.push(ConformanceCheckResult {
+            triage: compact_ci_triage(result.triage, &mut triage_signature_budget),
             check_id,
             command: result.command,
             exit_code: result.exit_code,
@@ -749,6 +753,28 @@ async fn completed_ci_check_results(
         ));
     }
     Ok(results)
+}
+
+/// Frozen reviewer input is a bounded view. Full classifications remain on
+/// the Review/ledger; settlement only needs each exact check's blocking flag.
+fn compact_ci_triage(
+    mut triage: Option<StepCiTriage>,
+    remaining: &mut usize,
+) -> Option<StepCiTriage> {
+    if let Some(triage) = &mut triage {
+        let total = triage.failures.len();
+        let keep = total.min(*remaining);
+        *remaining -= keep;
+        if keep < total {
+            let reason = triage.reason.get_or_insert_with(String::new);
+            if !reason.is_empty() {
+                reason.push_str("; ");
+            }
+            reason.push_str(&format!("Showing {keep} of {total} classified signatures; full evidence remains on the Review"));
+            triage.failures.truncate(keep);
+        }
+    }
+    triage
 }
 
 /// Resolve the Review attempt that supplied pre-review checks for this
@@ -820,6 +846,7 @@ fn parse_stored_ci_steps(details: Value) -> Result<Vec<StepResultEntry>, String>
 
 const PERSISTED_REVIEW_DETAIL_KEYS: &[&str] = &[
     "ci_steps",
+    "verify",
     "conformance",
     "auditor",
     "user_approval",
@@ -840,7 +867,7 @@ fn validate_persisted_review_detail_keys(
             return Err("persisted review ci_steps must be an array".into());
         }
     }
-    for key in ["user_approval", "execution", "execution_retry"] {
+    for key in ["user_approval", "execution", "execution_retry", "verify"] {
         if let Some(value) = details.get(key) {
             if !value.is_object() {
                 return Err(format!("persisted review {key} must be an object"));
@@ -852,7 +879,14 @@ fn validate_persisted_review_detail_keys(
 
 pub fn contract_prompt(contract: &ReviewContract) -> String {
     format!(
-        "\n\n{RESPONSE_INSTRUCTION}\n\nFrozen review contract:\n{}",
+        "\n\n{RESPONSE_INSTRUCTION}\n\nFrozen requirement ids: {}\n\nFrozen review contract:\n{}",
+        contract
+            .context
+            .requirements
+            .iter()
+            .map(|requirement| requirement.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
         serde_json::to_string(contract).expect("contract serializes")
     )
 }
@@ -876,8 +910,18 @@ pub async fn prepare_prompt(
     if !shell {
         if let Some(contract) = contract.as_ref() {
             let budget = MAX_PREPARED_PROMPT_BYTES.saturating_sub(prompt.len() + 1024);
+            let include_verify = !prompt.contains("\nVerify results:\n");
             prompt.push_str(
-                &reviewer_context_prompt(db, task_id, execution_id, path, contract, budget).await,
+                &reviewer_context_prompt(
+                    db,
+                    task_id,
+                    execution_id,
+                    path,
+                    contract,
+                    budget,
+                    include_verify,
+                )
+                .await,
             );
         }
     }
@@ -944,8 +988,26 @@ async fn reviewer_context_prompt(
     path: &(impl ReviewWorkspace + ?Sized),
     contract: &ReviewContract,
     budget: usize,
+    include_verify: bool,
 ) -> String {
     let mut out = String::new();
+    if include_verify {
+        if let Ok(reviews) = db::ReviewRepo::list_by_task(db, task_id).await {
+            if let Some(review) = reviews
+                .iter()
+                .filter(|r| r.status == db::ReviewStatus::Running)
+                .max_by_key(|r| r.attempt_number)
+            {
+                if let Ok(details) = serde_json::from_str::<Value>(&review.step_results_json) {
+                    if let Ok(verify) = serde_json::from_value::<api_types::ReviewVerifyDetails>(
+                        details["verify"].clone(),
+                    ) {
+                        out.push_str(&crate::verify::prompt(&verify));
+                    }
+                }
+            }
+        }
+    }
     if contract.base_sha != contract.commit_sha {
         let range = format!("{}..{}", contract.base_sha, contract.commit_sha);
         let diff_budget = MAX_INLINE_DIFF_BYTES.min(budget / 2);
@@ -1035,7 +1097,7 @@ async fn prior_review_section(
         .map(|window| window.reviews)
         .unwrap_or_default();
     window.retain(earlier);
-    let ledger = crate::finding_ledger(&window).unwrap_or_default();
+    let ledger = db::review_findings::finding_ledger(&window).unwrap_or_default();
     let mut section = String::new();
     let mut prior_commit = None;
     for review in reviews.iter().rev() {
@@ -1086,7 +1148,7 @@ async fn prior_review_section(
     }
     let open: Vec<_> = ledger
         .iter()
-        .filter(|entry| entry.status == ReviewFindingStatus::Open)
+        .filter(|entry| entry.status.is_open())
         .collect();
     if !open.is_empty() {
         section.push_str("Open findings in the prior review ledger:\n");
@@ -1121,6 +1183,8 @@ async fn prior_review_section(
         }
         section.push_str("For each reviewer finding still open, copy its id into findings. Put fixed reviewer ids in resolved; omission means unconfirmed. Forge re-checks its own CI, check and verify ids.\n");
     }
+    section.push_str(&format!("Frozen requirement ids: {}. After the first review in this window, a new blocking finding must be a regression, cite an unmet requirement, or name a file in candidate_changed_paths. Mark shared causes with same_cause_as.\n",
+        contract.context.requirements.iter().map(|requirement| requirement.id.as_str()).collect::<Vec<_>>().join(", ")));
     section.push_str("Confirm each problem it raised is resolved, and review what changed since. Do not reopen parts it accepted unless the new changes touch them.\n");
     if let Some(prior_commit) = prior_commit.filter(|sha| *sha != contract.commit_sha) {
         let is_ancestor = try_git_read(
@@ -1257,6 +1321,16 @@ fn parse_findings(value: Option<&Value>) -> Vec<ReviewFinding> {
         .flatten()
         .filter_map(|item| {
             Some(ReviewFinding {
+                requirement_ids: parse_resolved(item.get("requirement_ids")),
+                kind: item.get("kind").and_then(Value::as_str).and_then(|kind| {
+                    match kind.trim().to_ascii_lowercase().as_str() {
+                        "regression" => Some(api_types::ReviewFindingKind::Regression),
+                        "missed" => Some(api_types::ReviewFindingKind::Missed),
+                        "out_of_scope" => Some(api_types::ReviewFindingKind::OutOfScope),
+                        _ => None,
+                    }
+                }),
+                same_cause_as: finding_text(item.get("same_cause_as")),
                 summary: finding_text(item.get("summary"))?,
                 id: finding_text(item.get("id")),
                 severity: match item.get("severity").and_then(Value::as_str) {
@@ -1414,6 +1488,20 @@ async fn verify_contract_context(db: &SqliteDb, contract: &ReviewContract) -> Re
     Ok(())
 }
 
+fn retain_contract_requirement_ids(report: &mut ReviewAssessment, contract: &ReviewContract) {
+    for finding in &mut report.findings {
+        finding.requirement_ids.retain(|id| {
+            contract
+                .context
+                .requirements
+                .iter()
+                .any(|requirement| requirement.id == *id)
+        });
+        finding.requirement_ids.sort();
+        finding.requirement_ids.dedup();
+    }
+}
+
 async fn evaluate_inner(
     db: &SqliteDb,
     path: &(impl ReviewWorkspace + ?Sized),
@@ -1421,7 +1509,8 @@ async fn evaluate_inner(
     contract: &ReviewContract,
     result: &mut ReviewConformance,
 ) -> Result<(), String> {
-    let report = parse_assessment(message)?;
+    let mut report = parse_assessment(message)?;
+    retain_contract_requirement_ids(&mut report, contract);
     // Keep the review even when the checks below fail: its Markdown is what
     // the coder or the owner reads next.
     result.assessment = Some(report.clone());
@@ -1460,6 +1549,7 @@ async fn evaluate_inner(
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         let exit_code = output.exit_code.unwrap_or(-1);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: format!("setup:{index}"),
             command: setup.clone(),
             exit_code,
@@ -1476,12 +1566,27 @@ async fn evaluate_inner(
         .iter()
         .take_while(|_| !setup_failed)
     {
+        // Entry triage already established that these exact CI failures are
+        // non-blocking. Keep their real verdict and frozen classification;
+        // do not turn conformance into another untriaged run of that command.
+        if let Some(previous) = contract.check_results.iter().find(|previous| {
+            previous.check_id == check.id
+                && previous.command == check.command
+                && previous
+                    .triage
+                    .as_ref()
+                    .is_some_and(|triage| !triage.blocking)
+        }) {
+            result.checks.push(previous.clone());
+            continue;
+        }
         let output =
             check_workspace_output(checkout, &check.command, &environment.env, timeout).await?;
         let mut text = output.stdout;
         text.push_str(&output.stderr);
         let text = executors::environment::redact_environment_values(&text, &environment.env);
         result.checks.push(ConformanceCheckResult {
+            triage: None,
             check_id: check.id.clone(),
             command: check.command.clone(),
             exit_code: output.exit_code.unwrap_or(-1),
@@ -1528,7 +1633,10 @@ async fn evaluate_inner(
         result.reason = Some(reason);
         return Ok(());
     }
-    let failed_check = result.checks.iter().any(|check| check.exit_code != 0);
+    let failed_check = result
+        .checks
+        .iter()
+        .any(ConformanceCheckResult::is_blocking);
     // A failing required check is a defect in the candidate whatever the
     // reviewer concluded. Otherwise the reviewer's result stands: a pass is
     // only as strong as the checks Forge ran, which is why projects should
@@ -1565,6 +1673,38 @@ mod tests {
             "documents":[], "workflow":{}, "project_settings":{}})
     }
 
+    #[test]
+    fn ci_triage_reviewer_input_bounds_signature_lists_without_changing_routing() {
+        let triage = StepCiTriage {
+            mode: ReviewCiTriage::Full,
+            base_status: CiBaseStatus::Available,
+            base_commit: None,
+            rerun_run_id: None,
+            base_run_id: None,
+            reason: None,
+            class: None,
+            blocking: false,
+            failures: (0..200)
+                .map(|index| CiFailureTriage {
+                    signature: format!("test-{index}"),
+                    class: CiFailureClass::PreExisting,
+                })
+                .collect(),
+        };
+        let mut budget = 20;
+        let first = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        let second = compact_ci_triage(Some(triage.clone()), &mut budget).unwrap();
+        assert_eq!(first.failures.len(), 20);
+        assert!(second.failures.is_empty());
+        assert!(!first.blocking && !second.blocking);
+        assert_eq!(
+            triage.failures.len(),
+            200,
+            "source evidence remains complete"
+        );
+        assert!(first.reason.unwrap().contains("20 of 200"));
+        assert!(second.reason.unwrap().contains("0 of 200"));
+    }
     #[tokio::test]
     async fn project_environment_fails_closed_without_task_authority() {
         let pool = db::create_sqlite_pool("sqlite::memory:")
@@ -1823,9 +1963,16 @@ mod tests {
             "CI-2: cargo test failed",
             "copy its id into findings",
             "in resolved",
+            "Frozen requirement ids:",
+            "After the first review in this window",
+            "candidate_changed_paths",
+            "same_cause_as",
             "[report truncated]",
         ] {
             assert!(section.contains(expected), "missing {expected}");
+        }
+        for requirement in &contract.context.requirements {
+            assert!(section.contains(&requirement.id));
         }
         assert!(section.contains(&"R".repeat(8192)));
         assert!(!section.contains(&"R".repeat(8193)));
@@ -1872,6 +2019,66 @@ mod tests {
         assert!(section.contains(&"R".repeat(8192)));
         assert!(!section.contains("Open findings"));
         assert!(!section.contains("F1: one"));
+    }
+
+    #[test]
+    fn findings_unknown_requirement_ids_are_dropped_before_freezing() {
+        let context = context_from_source(&source()).unwrap();
+        let known = context.requirements[0].id.clone();
+        let contract = ReviewContract {
+            execution_id: "e".into(),
+            policy: REVIEW_CONFORMANCE_POLICY.into(),
+            commit_sha: "c".into(),
+            base_sha: "b".into(),
+            candidate_changed_paths: vec![],
+            context,
+            check_results: vec![],
+            digest: "d".into(),
+        };
+        let mut report = parse_assessment(&json!({"result":"fail","findings":[{"summary":"missed", "requirement_ids":[known, "R99", known]}]}).to_string()).unwrap();
+        retain_contract_requirement_ids(&mut report, &contract);
+        assert_eq!(report.findings[0].requirement_ids, [known]);
+        assert!(!serde_json::to_string(&report).unwrap().contains("R99"));
+        let prompt = contract_prompt(&contract);
+        assert!(prompt.contains(&format!(
+            "Frozen requirement ids: {}",
+            contract
+                .context
+                .requirements
+                .iter()
+                .map(|requirement| requirement.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+        assert!(prompt.contains("After the first review in a window"));
+    }
+
+    #[test]
+    fn findings_parser_anchoring_fields_are_lenient_and_omit_empty_values() {
+        let parsed = parse_assessment(&json!({"result":"fail","findings":[
+            {"summary":"valid", "requirement_ids":[" R2 ",4,null,""], "kind":" MISSED ", "same_cause_as":" F1 "},
+            {"summary":"malformed", "requirement_ids":{}, "kind":"new_kind", "same_cause_as":4},
+            {"summary":"regressed", "kind":"regression"},
+            {"summary":"later work", "kind":"out_of_scope"}
+        ]}).to_string()).unwrap();
+        assert_eq!(parsed.findings[0].requirement_ids, ["R2"]);
+        assert_eq!(
+            parsed.findings[0].kind,
+            Some(api_types::ReviewFindingKind::Missed)
+        );
+        assert_eq!(parsed.findings[0].same_cause_as.as_deref(), Some("F1"));
+        let malformed = serde_json::to_value(&parsed.findings[1]).unwrap();
+        for field in ["requirement_ids", "kind", "same_cause_as"] {
+            assert!(malformed.get(field).is_none(), "{malformed}");
+        }
+        assert_eq!(
+            parsed.findings[2].kind,
+            Some(api_types::ReviewFindingKind::Regression)
+        );
+        assert_eq!(
+            parsed.findings[3].kind,
+            Some(api_types::ReviewFindingKind::OutOfScope)
+        );
     }
 
     #[test]
@@ -2392,7 +2599,16 @@ mod tests {
         assert!(prompt.contains("fixable_by is \"coder\" (default) or \"owner\""));
         assert!(prompt.contains("repeat defaults to false"));
         assert!(prompt.contains("Owner example:") && prompt.contains("Repeat example:"));
-        assert!(prompt.len() <= serialized.len() + RESPONSE_INSTRUCTION.len() + 64);
+        let requirement_ids_bytes: usize = c
+            .context
+            .requirements
+            .iter()
+            .map(|requirement| requirement.id.len() + 2)
+            .sum();
+        assert!(
+            prompt.len()
+                <= serialized.len() + RESPONSE_INSTRUCTION.len() + requirement_ids_bytes + 96
+        );
         assert!(prompt.len() <= MAX_PREPARED_PROMPT_BYTES);
     }
 

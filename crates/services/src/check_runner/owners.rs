@@ -174,8 +174,8 @@ impl WorkspaceCheckOwners {
             let placement=WorkspacePlacementRepo::get_by_workspace_id(&*self.db,workspace_id).await?.ok_or(db::DbError::NotFound)?;
             if placement.id!=*placement_id || placement.generation!=*generation || placement.owner_kind!=PlacementOwnerKind::Server || placement.workspace_handle.as_deref()!=Some(path) || placement.state!=PlacementState::Ready { return Err(ServiceError::invalid_operation("check placement changed")); }
             let actual=tokio::time::timeout(Duration::from_secs(2),git::get_current_sha(Path::new(path))).await.map_err(|_| ServiceError::invalid_operation("check candidate witness timed out"))??;
-            if actual!=record.run.identity.commit_sha { return Err(ServiceError::invalid_operation("check candidate changed")); }
-            let environment=self.environment(record).await?;
+            if !is_ci_triage_base(&record.run.identity.inputs.spec) && actual!=record.run.identity.commit_sha { return Err(ServiceError::invalid_operation("check candidate changed")); }
+            let mut environment=self.environment(record).await?;
             // Reuse the durable inherited answer for this owner generation;
             // only Project values are recombined now. A changed Project
             // environment executes as a verdict without reusable attestation.
@@ -184,9 +184,32 @@ impl WorkspaceCheckOwners {
                 let stated=&record.run.identity.inputs.environment_identity;
                 Some(super::policy::attest(&self.db,&environment).await?).filter(|inputs| matches!(stated,CheckEnvironmentIdentity::Attested { .. }) && inputs.identity().as_ref()==Ok(stated))
             } else { None };
-            crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
-                operation_id:&id,spec:&record.run.identity.inputs.spec,target:check_executor::CheckoutTarget::Workspace(Path::new(path)),owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
-            }).await
+            let project_environment = review::contract::project_environment(&self.db, &intent.environment_task_id)
+                .await.map_err(ServiceError::invalid_operation)?;
+            let build_area = executors::sandbox::TaskRoot::of_worktree(Path::new(path))
+                .map(|root| root.path().join(".forge-task/base-checks"))
+                .unwrap_or_else(|| Path::new(path).parent().unwrap_or(Path::new(path)).join(".forge-base-checks"));
+            let target = if is_ci_triage_base(&record.run.identity.inputs.spec) {
+                check_executor::CheckoutTarget::ExactCommit {
+                    repository: Path::new(path), build_area: &build_area,
+                    commit: &record.run.identity.commit_sha,
+                    environment_workspace: Some(Path::new(path)), assets: &project_environment.assets,
+                }
+            } else { check_executor::CheckoutTarget::Workspace(Path::new(path)) };
+            // Off the runtime: preparing may first stop an app that a crashed
+            // owner left running, which blocks for up to a few seconds.
+            let verify_environment = {
+                let spec = record.run.identity.inputs.spec.clone();
+                let worktree = Path::new(path).to_owned();
+                tokio::task::spawn_blocking(move || review::verify::prepare_environment(&spec, &worktree))
+                    .await
+                    .map_err(|error| ServiceError::invalid_operation(error.to_string()))?
+                    .map_err(ServiceError::invalid_operation)?
+            };
+            environment.extend(verify_environment);
+            review::verify::run_admitted(&record.run.identity.inputs.spec, Path::new(path), crate::check_owner::ServerCheckOwner::run(check_executor::CheckExecution {
+                operation_id:&id,spec:&record.run.identity.inputs.spec,target,owner:intent.owner.clone(),input_revisions:inputs.as_ref(),environment:&environment,deadline:Some(deadline),cancel:&token,permit:&check_executor::CheckPermit::already_admitted(),cleanup:check_executor::CleanupPlan { commands:&[],timeout:check_executor::CLEANUP_TIMEOUT },output_limit:check_executor::OUTPUT_TAIL_BYTES,
+            })).await
         }.await.unwrap_or_else(|_| check_executor::unstarted_receipt(&id,intent.owner.clone(),CheckExecutionOutcome::Infrastructure,Some("check checkout or execution inputs unavailable".into())));
         let result = DaemonCheckResult::Completed {
             receipt: Box::new(receipt.clone()),

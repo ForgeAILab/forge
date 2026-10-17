@@ -62,7 +62,8 @@ pub(super) async fn prepare_review_entry(
     // candidate: its skipped checks are not a missing validation. Nor are
     // those of a Task with no Workspace: the owner moves such a Task across
     // the board by hand and its checks have nowhere to run, as before.
-    let checks = !review_ci_steps(&ctx.state_config)?.is_empty()
+    let checks = (!review_ci_steps(&ctx.state_config)?.is_empty()
+        || review::verify::config(&ctx.state_config)?.is_some())
         && (workspace_id(ctx).await.is_some()
             || match task.parent_task_id.as_deref() {
                 Some(parent) => db::WorkspaceRepo::get_by_task_id(&*ctx.db, parent)
@@ -144,7 +145,11 @@ impl HookAction for RunCiSteps {
             Ok(ci_steps) => ci_steps,
             Err(reason) => return HookResult::Failed { reason },
         };
-        if ci_steps.is_empty() {
+        let verify = match review::verify::config(&ctx.state_config) {
+            Ok(verify) => verify,
+            Err(reason) => return HookResult::Failed { reason },
+        };
+        if ci_steps.is_empty() && verify.is_none() {
             if let Err(error) =
                 crate::placement::admission::resolve_review_ci_attention(&ctx.db, &ctx.task_id)
                     .await
@@ -430,7 +435,7 @@ impl HookAction for RunCiSteps {
                 }
             }
         };
-        let (ci_results, failed_step_index) = match result {
+        let (ci_results, mut failed_step_index) = match result {
             None => (Vec::new(), None),
             Some(result) => {
                 let failed = result
@@ -467,13 +472,74 @@ impl HookAction for RunCiSteps {
                         reason: reason.to_owned(),
                     };
                 }
+                let entries = if result.outcome == db::CheckResultOutcome::Fail {
+                    let triaged = async {
+                        let state =
+                            db::CheckDeliveryRepo::check_consumer_delivery(&*ctx.db, &consumer_id)
+                                .await?
+                                .ok_or(db::DbError::NotFound)?;
+                        let run = db::CheckRunRepo::check_run(&*ctx.db, &result.run_id)
+                            .await?
+                            .ok_or(db::DbError::NotFound)?;
+                        let application = crate::check_runner::consumer::CheckApplication {
+                            task_id: task.id.clone(),
+                            status_epoch: state.consumer.status_epoch,
+                            authority: review.id.clone(),
+                            consumer_id: consumer_id.clone(),
+                            run,
+                            verdict: crate::check_runner::consumer::CheckVerdict::Result(
+                                result.clone(),
+                            ),
+                        };
+                        crate::check_runner::ci_triage::triage(
+                            &ctx.db,
+                            &consumers,
+                            &task,
+                            &application,
+                            &ctx.state_config,
+                            None,
+                        )
+                        .await
+                    }
+                    .await;
+                    match triaged {
+                        Ok(crate::check_runner::ci_triage::Progress::Complete(entries)) => entries,
+                        Ok(
+                            crate::check_runner::ci_triage::Progress::Pending(consumer)
+                            | crate::check_runner::ci_triage::Progress::Infrastructure(consumer),
+                        ) => {
+                            let until = (chrono::Utc::now()
+                                + chrono::Duration::seconds(entry_check_wake_seconds(
+                                    &ctx.task_id,
+                                )))
+                            .to_rfc3339();
+                            if !crate::workflow::engine::durable::suspend_hook(
+                                &ctx.task_id,
+                                &consumer,
+                                until,
+                            ) {
+                                return HookResult::Failed {
+                                    reason: "CI triage requires the Task hooks step".into(),
+                                };
+                            }
+                            return HookResult::Ok;
+                        }
+                        Err(error) => {
+                            return HookResult::Failed {
+                                reason: error.to_string(),
+                            }
+                        }
+                    }
+                } else {
+                    crate::check_runner::ci_triage::steps(&result)
+                };
+                let failed = entries
+                    .iter()
+                    .position(crate::check_runner::ci_triage::blocks);
                 (
-                    result
-                        .commands
+                    entries
                         .into_iter()
-                        .map(|command| {
-                            serde_json::to_value(command).expect("CI command facts serialize")
-                        })
+                        .map(|entry| serde_json::to_value(entry).expect("CI step serializes"))
                         .collect::<Vec<_>>(),
                     failed,
                 )
@@ -493,6 +559,30 @@ impl HookAction for RunCiSteps {
                 .expect("CI results array")
             {
                 entry["step_id"] = json!(attempt.step.id);
+            }
+        }
+        if failed_step_index.is_none() && verify.is_some() {
+            match super::verify::run(ctx, &task, &review, &consumers).await {
+                Ok(super::verify::Progress::Waiting) => return HookResult::Ok,
+                Ok(super::verify::Progress::Complete(verify)) => {
+                    if matches!(
+                        verify.status,
+                        api_types::ReviewVerifyStatus::Fail
+                            | api_types::ReviewVerifyStatus::Inconclusive
+                    ) {
+                        failed_step_index = Some(0);
+                    }
+                    review_details["verify"] =
+                        serde_json::to_value(verify).expect("verify details serialize");
+                }
+                Err(super::verify::Error::Infrastructure(reason)) => {
+                    cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                    return interrupt_ci(ctx, &task, &reason, true, false).await;
+                }
+                Err(super::verify::Error::Refused(reason)) => {
+                    cancel_review_after_authority_loss(ctx, &review, &reason).await;
+                    return HookResult::Failed { reason };
+                }
             }
         }
         let now = now_rfc3339();
@@ -558,6 +648,45 @@ impl HookAction for RunCiSteps {
                     reason: error.to_string(),
                 };
             }
+            if review_details["verify"]["status"] == "inconclusive" {
+                let reason = "verify remained inconclusive after its automatic re-run";
+                let annotation = json!({"type":api_types::FailureKind::ReviewBlocked,"blocking_reason":"review_verify_inconclusive","message":reason,"blocked_at":now});
+                if let Err(error) = super::common::block_task_with_annotation(
+                    ctx,
+                    &settled_task,
+                    reason,
+                    api_types::FailureKind::ReviewBlocked,
+                    Some("verify"),
+                    Some(annotation.to_string()),
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                let parked = match super::common::task(ctx).await {
+                    Ok(task) => task,
+                    Err(reason) => return HookResult::Failed { reason },
+                };
+                let barrier = json!({"state":ctx.to_state,"status":"blocked","interrupted_at":now,"started_at":now,"blocking_reason":reason});
+                if let Err(error) = TaskRepo::set_entry_barrier(
+                    &*ctx.db,
+                    &parked.id,
+                    parked.version,
+                    Some(barrier.to_string()),
+                    &now,
+                )
+                .await
+                {
+                    return HookResult::Failed {
+                        reason: error.to_string(),
+                    };
+                }
+                return HookResult::Failed {
+                    reason: reason.into(),
+                };
+            }
             if had_review_passed && ctx.triggered_by.is_user() {
                 let reason = "merge-fix follow-up failed: ci";
                 if let Err(error) = block_task(
@@ -578,7 +707,9 @@ impl HookAction for RunCiSteps {
                 };
             }
             return HookResult::Failed {
-                reason: ci_failure_summary(&review_details["ci_steps"], failed_step_index),
+                reason: verify_failure_summary(&review_details).unwrap_or_else(|| {
+                    ci_failure_summary(&review_details["ci_steps"], failed_step_index)
+                }),
             };
         } else if had_review_passed && !reviewer_assigned && !user_approval_required {
             review_details["auditor"] = json!({
@@ -822,6 +953,25 @@ async fn drop_entry_check(
             return Ok(false);
         }
     }
+    if let Some(raw) = crate::workflow::engine::durable::hook_effect(&ctx.task_id, "review_verify")
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if let Ok(saved) = serde_json::from_str::<Value>(&raw) {
+            if saved["review_id"] == review.id {
+                if let Some(verify_consumer) = saved["consumer_id"].as_str() {
+                    crate::check_runner::review_entry::withdraw_consumer(
+                        &ctx.db,
+                        ctx.daemon_connections.clone(),
+                        None,
+                        verify_consumer,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
     if !consumer_id.is_empty() {
         let step_id = crate::workflow::engine::durable::current_hook(&ctx.task_id)
             .map(|attempt| attempt.step.id.clone());
@@ -939,7 +1089,8 @@ fn settled_ci_result(review: &db::Review) -> Option<HookResult> {
                 .and_then(|steps| steps.iter().position(|step| step["exit_code"] != json!(0)))
                 .unwrap_or(0);
             Some(HookResult::Failed {
-                reason: ci_failure_summary(steps.unwrap_or(&Value::Null), failed),
+                reason: verify_failure_summary(&details)
+                    .unwrap_or_else(|| ci_failure_summary(steps.unwrap_or(&Value::Null), failed)),
             })
         }
         ReviewStatus::Cancelled => Some(HookResult::Failed {
@@ -950,7 +1101,8 @@ fn settled_ci_result(review: &db::Review) -> Option<HookResult> {
         ReviewStatus::Running
             if steps
                 .and_then(Value::as_array)
-                .is_none_or(|steps| steps.is_empty()) =>
+                .is_none_or(|steps| steps.is_empty())
+                && details.get("verify").is_none() =>
         {
             None
         }
@@ -968,6 +1120,16 @@ async fn request_entry_check(
     consumers: &crate::check_runner::consumer::TaskCheckConsumers,
 ) -> Result<EntryCheck, HookResult> {
     let failed = |reason: String| HookResult::Failed { reason };
+    if review::verify::config(&ctx.state_config)
+        .map_err(failed)?
+        .is_some()
+        && review_ci_steps(&ctx.state_config)
+            .map_err(failed)?
+            .iter()
+            .all(|command| command.trim().is_empty())
+    {
+        return Ok(EntryCheck::NothingToRun);
+    }
     let workspace = match crate::task_service::workspace::prepare_workspace_for(
         &ctx.db,
         &ctx.workspace_root,
@@ -1371,74 +1533,26 @@ impl HookAction for AutoCascadeOnReviewPass {
                     }
                     return HookResult::Ok;
                 }
-                let budget = match db::budget::limit(
-                    &task,
-                    db::budget::Kind::Review,
-                    Some(&ctx.state_config),
-                    ctx.gate_config.as_ref(),
-                ) {
-                    Ok(budget) => budget,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                };
-                let existing_count = match db::budget::spent(
-                    ctx.db.pool(),
-                    &ctx.task_id,
-                    db::budget::Kind::Review.key(),
-                )
-                .await
-                {
-                    Ok(n) => n,
-                    Err(error) => {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        }
-                    }
-                };
-                if !db::budget::allows_retry(i64::from(budget), existing_count) {
-                    let reason = "review retry budget exhausted";
-                    if let Err(error) = block_task(
-                        ctx,
+                // One disposition path, with the hook's merged configuration:
+                // D5, progress receipts and lead-root replans cannot drift.
+                match ctx
+                    .task_service
+                    .review_failure_target_with_config(
                         &task,
-                        reason,
-                        api_types::FailureKind::ReviewGateFailed,
-                        None,
+                        ctx.execution_id.as_deref(),
+                        Some(&ctx.state_config),
                     )
                     .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    if let Err(error) = ctx
-                        .task_service
-                        .publish_review_park_comment(&review, reason)
-                        .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    HookResult::Ok
-                } else {
-                    if let Err(error) = ctx
-                        .task_service
-                        .publish_review_repair_comment(&review, existing_count, budget)
-                        .await
-                    {
-                        return HookResult::Failed {
-                            reason: error.to_string(),
-                        };
-                    }
-                    HookResult::Cascade {
-                        to: default_states::IN_PROGRESS.to_string(),
-                        reason: "review failed".to_string(),
-
+                {
+                    Ok((_, Some(to), reason)) => HookResult::Cascade {
+                        to,
+                        reason,
                         bridge: Default::default(),
-                    }
+                    },
+                    Ok((_, None, _)) => HookResult::Ok,
+                    Err(error) => HookResult::Failed {
+                        reason: error.to_string(),
+                    },
                 }
             }
             Some(_) | None => HookResult::Ok,
@@ -1491,7 +1605,15 @@ impl HookAction for AutoCascadeOnUnconfiguredReview {
             },
             Err(reason) => return HookResult::Failed { reason },
         };
-        if !ci_steps.is_empty() {
+        if !ci_steps.is_empty()
+            || (!super::common::task_is_read_only(&ctx.db, &task)
+                .await
+                .unwrap_or(false)
+                && review::verify::config(&ctx.state_config)
+                    .ok()
+                    .flatten()
+                    .is_some())
+        {
             return HookResult::Skipped {
                 reason: "review checks configured".to_string(),
             };
@@ -1649,6 +1771,30 @@ async fn interrupt_ci(
     HookResult::Failed {
         reason: reason.to_owned(),
     }
+}
+
+fn verify_failure_summary(details: &Value) -> Option<String> {
+    if !matches!(
+        details["verify"]["status"].as_str(),
+        Some("fail" | "inconclusive")
+    ) {
+        return None;
+    }
+    Some(format!(
+        "verify failed: {}",
+        details["verify"]["checks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["result"] != "pass")
+            .map(|c| format!(
+                "V-{} {}",
+                c["name"].as_str().unwrap_or("unknown"),
+                c["summary"].as_str().unwrap_or("failed")
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    ))
 }
 
 #[cfg(test)]

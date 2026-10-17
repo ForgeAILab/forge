@@ -623,6 +623,13 @@ impl WorkflowExecution<'_> {
                         .and_then(|gate| gate.reject_target.clone())
                         .unwrap_or_else(|| crate::workflow::default_states::IN_PROGRESS.to_owned());
                     if WorkflowEngine::find_state(workflow, &target).is_some() {
+                        let (review, _) =
+                            db::budget::failed_review_for_no_change(&self.db, &task.id)
+                                .await?
+                                .ok_or(db::DbError::NotFound)?;
+                        self.task_service
+                            .publish_review_no_change_comment(&review, &step.id)
+                            .await?;
                         let reason = format!("No change since review {attempt}\nHEAD still matches the failed candidate and the worktree is clean. Address the review feedback, run the required checks, and commit the repair before resubmitting.");
                         cascade = Some((
                             target,
@@ -633,13 +640,16 @@ impl WorkflowExecution<'_> {
                         // Bypass an owner-approval wait without charging a rejection.
                         before_enter_rejection_cascade = true;
                     } else {
-                        crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task)
-                            .await?;
+                        crate::workflow::actions::no_change::park_no_change(
+                            &enter_ctx, &task, step,
+                        )
+                        .await?;
                     }
                     skip_target_enter_hooks = true;
                 }
                 db::budget::RepairNoChangeDecision::Park => {
-                    crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task).await?;
+                    crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task, step)
+                        .await?;
                     skip_target_enter_hooks = true;
                 }
             }
@@ -739,8 +749,8 @@ impl WorkflowExecution<'_> {
                         if let Some(settled) = self
                             .settle_failed_ci_entry(
                                 &task,
+                                &enter_ctx,
                                 &hook.action,
-                                &actor,
                                 &entry_barrier_started_at,
                                 authority.as_ref(),
                             )

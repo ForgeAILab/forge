@@ -2305,6 +2305,12 @@ retrospective mutation tool in this change.
 `GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
 The response lists `value`, `effective_value` and `restart_required` per key.
 Other keys retain their startup value until restart.
+Both read and write `config_path`, the `forge.yaml` this start loaded
+(`<data dir>/forge.yaml`, see
+[getting-started.md](getting-started.md#configuration)). `value` is what the
+next start of the same launch would use: on a server started with
+`--data-dir X`, `forge.data_dir` is `X`, because the flag outranks the file's
+`forge.data_dir`.
 
 | Key | Configured value | Application |
 | --- | --- | --- |
@@ -2556,6 +2562,68 @@ optional `project_hooks` array. When provided, the server validates and stores
 the rules in `project.project_hooks_json`; saving rules does not run hook
 actions. Omitting `project_hooks` leaves existing rules unchanged; sending an
 empty array clears all rules.
+
+### Project CI triage
+
+`settings.repair_switch_model_when_stuck` is an optional boolean, default `false`.
+When a reviewer finding remains blocking in two consecutive source checks, the
+repair starts a fresh execution and asks for a root-cause decision worklog entry.
+With this setting enabled and a CLI fallback chain available, that execution
+prefers the next candidate after the primary. The Agent's configuration does not
+change. The next ordinary round returns to the primary, using a fresh session
+when needed to avoid resuming the switched candidate. Without a fallback the
+fresh execution keeps the configured model. Native Agents have no CLI fallback
+chain. REST Project create/PATCH and MCP Project settings use the same boolean
+validation. The web switch is off by default.
+
+The web Project progress allowance stays blank when unset, showing the default
+of 2. Unrelated saves preserve the absent `retry_budgets.review_progress` key;
+clearing a stored allowance removes that override. Explicit `0` disables it.
+`retry_budgets.review_verify_rerun` (inconclusive verify reruns, default 1)
+takes the same nonnegative integer through REST/MCP; it has no web editor, and
+web saves keep a stored value.
+
+`settings.review_ci_triage` accepts `full` (default when omitted), `report`, or
+`off` through Project create/update (REST and MCP) and the Project settings form.
+Other values are rejected. `full` reruns failed review/queue-head CI commands once
+and compares consistent failures with an exact base checkout. Flaky and confirmed
+pre-existing failures do not block; `introduced` and `pre_existing_unverified`
+failures do. `report` records classification but blocks all original failures;
+`off` does no rerun or base comparison and preserves the previous gate.
+Base comparison requires effective review `setup_steps` and a server placement.
+
+`StepResultEntry.triage` (also on Review step responses and integration-head
+`ci_steps`) is optional. It contains:
+
+- `mode`: `full | report`;
+- `base_status`: `not_needed | available | base_unavailable | base_run_invalid`;
+- nullable `base_commit`, `rerun_run_id`, `base_run_id`, and explanatory `reason`;
+- nullable whole-step `class`: `flaky | pre_existing | introduced | pre_existing_unverified`;
+- `failures`: classified `{ signature, class }[]`, with the same class values;
+  unclassified failures remain in the step's original `failures` and still block;
+- `blocking`: whether this step still blocks under the selected mode.
+
+The real `exit_code` and immutable `check_result.outcome` remain failed. Triage
+cannot certify a pass or satisfy queue-head pass reuse. The frozen conformance
+check carries optional `triage` for the exact CI command; its frozen display view
+shares a 20-signature budget and explains any omitted signatures in `reason`.
+The original Review `ci_steps[].triage` retains the full classifications. Derived CI ledger
+entries carry optional `ci_triage`; `flaky` and `pre_existing` ledger statuses
+are minor and do not count as open blocking findings under `full`. Under `report`,
+classified flaky and pre-existing findings remain open and blocking in the ledger
+and repair brief.
+
+`AttentionCategory` also includes `flaky_check` and `base_check_failing`.
+Both use Project scope and `recommended_action: inspect_ci`. Flaky items are
+deduplicated by command/signature; base items by Project and command. A newer red
+base updates the existing item with its base commit and run. Details
+include `command`, `count` (every distinct occurrence), `task_ids` (the latest 64,
+most recent last), run references and triage facts (including
+why the base is unavailable or invalid). A later passing base observation resolves
+older base incidents for its command. These items remain visible in Mission Control
+without blocking the Task. The durable `check.ci_triaged` source event carries
+Task/run references and bounded per-step routing and base/rerun references; full
+signatures and tails stay in Review/check evidence.
 
 ### Project environment
 
@@ -6208,6 +6276,12 @@ replays preserve the stored bytes; changed assessment content is refused.
 The optional `findings` list accepts `summary` (required and nonblank),
 `severity` (`blocking` by default, or `minor`), `where`, `expected`, `observed`,
 and `id` only when continuing an earlier finding. New findings receive Forge ids.
+Optional `requirement_ids` cites frozen contract requirements, `kind` is
+`regression | missed | out_of_scope`, and `same_cause_as` names an earlier finding
+in the window. Unknown kinds read as absent, malformed optional values are
+ignored, and unknown requirement IDs are dropped before the assessment is frozen.
+Empty optional fields are omitted. The reviewer prompt and re-review section
+list the frozen requirement IDs and the later-review rule.
 `resolved` lists fixed reviewer ids. Malformed lists are ignored; invalid items
 are dropped. At most 50 valid items per list are retained, with each text field
 limited to 1,000 Unicode characters. These fields default to empty and are
@@ -6219,10 +6293,10 @@ frozen assessments.
 window. Before a reset the window starts at Task creation; after a recovery
 reset it starts at that reset's transition timestamp. Review attempts created
 at or after that timestamp belong to the window. `review_attempts` counts all
-attempts in it, including running and cancelled attempts. `items` is ordered
-naturally by id (`F2` before `F10`, and `CI-2` before `CI-10`) and capped
-at 200 entries after the full ledger is derived and naturally sorted. The cap
-therefore retains the earliest numeric ids within each source prefix.
+attempts in it, including running and cancelled attempts. `items` is capped at 200 after complete derivation. Open blocking verify
+findings come first, then other open blocking findings, then other statuses
+and severities. Each group uses natural id order (`F2` before `F10`, and
+`CI-2` before `CI-10`), so resolved/minor history cannot evict a verify blocker.
 Project members with Task read access may use the route; hidden and unknown
 Tasks get the same refusal as `/tasks/{id}/reviews`.
 
@@ -6234,23 +6308,61 @@ detail keys or malformed metadata still produce a server corruption error.
 
 Each item has `id`, `source` (`reviewer`, `ci`, `check`, `verify`), `severity`,
 `summary`, `where`, `expected`, `observed`, `first_attempt`,
-`last_checked_attempt`, `status` (`open`, `resolved`, `unconfirmed`), and
-`streak`. Nullable text fields are `null` when unavailable. Reviewer ids are
+`last_checked_attempt`, `status` (`open`, `reopened`, `resolved`, `unconfirmed`, `flaky`,
+`pre_existing`, `superseded`, `out_of_scope`), `streak`, and optional `ci_triage` (the CI failure class of a
+triaged CI finding). Items also carry optional `requirement_ids`, `kind`,
+`same_cause_as`, `anchoring_note`, and numeric `resolved_attempt`. `reopened`
+means a resolved finding failed again; `resolved_attempt` retains the last actual
+resolution and comments/briefs say “re-broken: resolved in round N”. It counts
+as open with a fresh streak. Only blocking appearances advance a streak: minor
+appearances count zero, and raising a minor to blocking starts at one.
+
+After the reviewer's first assessment in the window (Reviews that stopped
+before a reviewer ran do not count), a new blocking reviewer finding becomes minor unless
+it is a regression, cites a known requirement, or its first repository-relative
+`where` path (without `:line`) is in the candidate diff. Such a downgrade carries
+`anchoring_note: "outside requirements and Task files"`. Continued IDs keep their
+identity; copying a downgraded finding's id keeps it minor until it qualifies. `out_of_scope` never blocks, even in review 1, and is shown as a follow-up
+candidate. These rules change the projection, never the frozen assessment. A
+structured reviewer fail with no blocking findings left parks `review_needs_owner`
+with `only non-blocking findings remain`, spending no Review budget. A legacy
+findings-less fail retains its fallback routing.
+
+`flaky` and `pre_existing` are CI findings that
+`review_ci_triage: full` waived: minor, with zero streak. Under `report` the same
+classes stay `open` and blocking, with `ci_triage` set. Nullable text fields are
+`null` when unavailable. Reviewer ids are
 `F1`, `F2`, ... in first-seen list order within the window. Known ids continue
 findings; unknown ids become new findings. A known id repeated within one
 review is one finding: its first occurrence continues it and later duplicates
 are dropped. Forge sources use the stored,
-zero-based `CI-<step index>`, `CHK-<check id>` and `V-<check name>` ids.
+zero-based `CI-<step index>#<first 8 hex of sha256(normalised failure signature)>`
+for steps with test signatures, `CI-<step index>` for failed steps without
+signatures, and `CHK-<check id>` / `V-<check name>` for the other sources. The
+same test keeps its id across review rounds and server/daemon owners. A
+passing step resolves its per-test findings; so does a step whose CI-triage
+re-run passed (step class `flaky`), including the final `ci:N` conformance
+observation of that passing rerun. An untruncated failure list
+only proves that every observed signature fit in the extraction cap; it cannot
+prove that a fail-fast command executed later binaries. Therefore a failed step
+never resolves an omitted test or advances that test's streak. A step-level
+`CI-<n>` replaced by per-test findings is `superseded`; it does not count as a
+resolution, remains superseded on later passes, and is labelled accordingly in
+the web ledger. The ledger retains all signatures; briefs and comments display at
+most 20 test findings per step followed by `+N more`.
 `source: merge` is reserved in the wire type and is not emitted in the ledger.
 Merge failures do not enter this ledger. A source that did not run leaves its
 findings unchanged. An omitted open reviewer finding becomes `unconfirmed`;
 an explicit resolution or passing Forge check resolves it. Reopening a resolved
-or unconfirmed finding starts its streak at one. A reset empties the ledger
-and restarts reviewer numbering. Findings are informational in this phase;
-existing verdict routing and retry budgets remain authoritative.
+finding has status `reopened`; continuing an unconfirmed finding has status `open`.
+Both start a new blocking streak at one. A reset empties the ledger
+and restarts reviewer numbering. Open blocking findings drive the repeat and
+progress policy below; the frozen verdict is unchanged.
 
 Finished review comments show the headline, the ledger as a Markdown checklist
-(open unchecked, resolved checked, unconfirmed labelled "not re-checked"), and
+(open unchecked, resolved in this review checked, unconfirmed labelled
+"not re-checked", waived CI findings labelled "flaky (non-blocking)" or
+"pre-existing (non-blocking)"), omitting earlier-resolved findings, and
 `Full review: Review tab, attempt N`. The full report stays in the Review API and
 Review tab. Reviews without findings retain at most the first 2 KiB of their
 report, truncated on a UTF-8 boundary. CI-only failures get the same checklist.
@@ -6259,7 +6371,7 @@ parking rule. Result, repair and park comments each use a per-Review idempotency
 key, so replay does not append duplicates. The Review tab reads `/findings`,
 shows source, severity, status and streak with expandable finding details, and
 retains each attempt's input findings and full report. Verify presentation is
-conditional on recorded results; this phase adds no verify execution or config.
+conditional on recorded results; configured verify runs through the durable review entry below.
 
 Conformance `status` follows from the result and Forge's own checks. A failing
 setup step or required check makes the review `failed` whatever the reviewer
@@ -6367,6 +6479,115 @@ sends the Task back with "No change since review N" and spends the persistent
 `review_needs_owner` with `no change after repair round`. Review and gate-rejection budgets are unchanged.
 Owner-started re-reviews are exempt. A changed commit or dirty worktree takes
 the normal review path; an explicit retry-window reset restores the allowance.
+
+#### Behavioural verify before reviewer dispatch
+
+`ReviewConfig.verify` is optional in the workflow state config, Project
+`default_review_config`, and Task `task_state_config`; it follows the same merge
+order as `ci_steps`. Project and Task writes validate field paths such as
+`verify.ready_command` and `verify.checks.0.name`.
+
+| Field | Default | Constraint |
+|---|---|---|
+| `start` | omitted | Optional non-empty app start command |
+| `ready_path` | omitted | Local URL path starting with `/` |
+| `ready_command` | omitted | Non-empty command; mutually exclusive with `ready_path` |
+| `ready_timeout_seconds` | 120 | Integer 1–900 |
+| `timeout_seconds` | 1200 | Whole verify run, integer 1–3600 |
+| `checks` | required | 1–16 ordered `{name, command, timeout_seconds?}` items |
+
+A check's name is unique and matches `[a-z0-9-]{1,32}`; its command is non-empty.
+Its timeout defaults to 600 seconds and accepts 1–3600. For example:
+
+```json
+{"verify":{"start":"pnpm dev --port \"$FORGE_VERIFY_PORT\"","ready_path":"/","checks":[{"name":"smoke","command":"./scripts/verify.sh"}]}}
+```
+
+After review CI passes (including an empty CI bundle), the same durable hooks
+step requests a separate `review_verify` check, origin `entry`, then suspends
+and resumes on its result. All commands are `uncacheable`, under unchanged
+`canonical-ci/1`, with verify's own wall limit. This does not change CI reuse.
+No verify runs at the integration queue head. Daemon placements record
+`details.verify = {"status":"not_run","reason":"placement_unsupported",...}`
+and continue to their reviewer.
+
+At execution start Forge picks a free loopback port (never one another
+verify of this server holds, nor one already served on `::1`) and supplies every step
+with `FORGE_VERIFY_PORT`, `FORGE_VERIFY_URL` (`http://127.0.0.1:<port>`),
+`FORGE_VERIFY_DIR` (`<task root>/.forge-task/verify/<review id>/`),
+`FORGE_VERIFY_REQUEST` (`<dir>/request.json`), and `FORGE_VERIFY_REPORT`
+(`<dir>/<check name>.report.json`, set per check). `request.json` contains
+`task_id`, `title`, `description`, requirement texts, `base_sha`, `commit_sha`,
+`changed_files`, and the ledger's open `findings`. The optional start command
+runs in the background with output appended to `app.log` as it is written.
+The file keeps the first 16 MiB of output: while the run lasts Forge cuts it
+back to 16 MiB every 200 ms (so it exceeds the cap by at most what the app
+writes in that interval), and once more after the run, so the recorded file
+is never above 16 MiB. Later output is discarded, the stored tail is the end
+of what was kept, and `details.verify.notes` says the cap was reached.
+Directories are keyed by Review id even when coordination children share a Task
+root. Forge polls the readiness
+path until an HTTP status below 500, or repeats the readiness command until
+exit 0. Then checks run in order. Every process group started by the run is
+stopped and verified stopped on every outcome, using the same check executor
+and supervisor as CI. The start step records its process group in
+`start.pgid`; before a verify starts anything, Forge stops a recorded group
+that a crashed or restarted server left running in any verify directory of
+the Task root. A verify this server is still running (for example a sibling
+coordination child's) is never treated as such a group. When this Review's own
+record cannot be confirmed stopped, the record is kept and the run ends as an
+infrastructure outcome instead of starting beside it. A stopped run’s receipt causes `start.pgid` to be deleted, so
+later recovery cannot signal an unrelated reused group id. A process that leaves
+its group (`setsid`, a daemonizing start) is outside that stop. After the run,
+Forge checks whether the port is free on both loopbacks. A port still in use
+adds a non-blocking warning to `details.verify.notes` and the reviewer prompt;
+it does not fail verify or kill an unowned process. Warnings survive an
+inconclusive rerun even when the later evaluation's port is free. This detects escaped
+listeners only, not every process outside the owned groups.
+
+A check fails on non-zero exit, timeout, or an optional JSON report's
+`verdict: "fail"`/`"failed"`; it is inconclusive on exit 0 with
+`verdict: "inconclusive"`, an unrecognized `verdict`, or a report that is
+present but unusable (invalid JSON, not an object, over 256 KiB, not a regular
+file); otherwise it passes. Verdict words are matched case-insensitively and a
+report without `verdict` leaves the exit code to decide. Reports may contain
+`summary`, `findings: [{summary, where, expected, observed}]`, and
+`evidence: [{path, kind, caption}]`. A failed check creates `V-<name>` before
+any reviewer execution. A start-step exit creates `V-start`; a readiness
+timeout or app exit during readiness creates only `V-ready`, carrying the
+`app.log` tail. A verify fail after an earlier
+review pass keeps the existing `merge-fix follow-up failed: ci` block.
+
+An inconclusive result reruns verify using the ledger-backed
+`retry_budgets.review_verify_rerun` allowance (default 1, 0 disables), with a
+window keyed by Review id, initialized at the first request, and an idempotent
+receipt per evaluation. Replaying initialization never refunds a debit. Task-wide
+overrides take precedence over Review state config and Project defaults. Once
+that allowance is spent, an inconclusive result parks `review_blocked`, source
+`verify`, without charging the Review failure budget. Offers are Retry Verify (`retry`), Mark
+Reviewed (`approve`, reason required), and Cancel (`cancel`). Retry re-enters
+the ordinary review entry. Runner infrastructure retains the existing review
+CI infrastructure handling.
+
+Evidence paths are relative to `FORGE_VERIFY_DIR` and confined to that directory;
+absolute/traversing/symlink escapes, hard links, non-regular files, empty files,
+unsupported kinds, files above 25 MiB, and files exceeding the shared 64 MiB
+evidence byte allowance per verify evaluation are skipped with a note. The
+allowance covers every check, including raw bytes and redaction expansion. Supported
+kinds are `screenshot`, `walkthrough_video`, `log`, `report`, and `other`.
+Evidence uses the existing Task evidence store. The allowed Review detail key
+`verify` exposes overall `status`, optional `reason`, per-check
+`{name,result,summary,evidence,evidence_paths,observed?}`, `app_log_tail`, and
+`notes`. `evidence` contains Task media ids; `evidence_paths` contains paths
+inside the Task root for the reviewer's **Verify results** prompt section.
+Reports are bounded to 256 KiB, findings to 50 per check with bounded text,
+and evidence lists to 50 entries per check. Malformed optional reports are
+noted; they cannot turn a non-zero command into a pass. The `app.log` tail,
+report summaries/findings/captions and UTF-8 evidence files are stored with
+ANSI sequences stripped (text fields) and Project environment values
+replaced by `[REDACTED]`, as command output tails are. Public `FORGE_VERIFY_*`
+port/URL/directory values are excluded from redaction, including matching digits;
+Project secrets remain redacted.
 
 Project-level `setup_steps` and `ci_steps` are inherited by Tasks that do not
 override them. Forge re-runs them in the Task's worktree at the reviewed commit
@@ -6688,13 +6909,16 @@ JSON output passes these through. The web displays remaining budgets and uses
 server-resolved limits in its editor, rather than reconstructing defaults.
 
 Gate state names remain keys (`planning`, `review`, `merging`, custom gate names).
-The cancelled-review entry cap is exposed as `review_gate`. The web's
+The cancelled-review entry cap is exposed as `review_gate`. A renamed review
+gate (a gate with the `reviewer` role in the `review` phase) is projected like
+`review`: its key carries the review allowance and `review_gate` is present. The web's
 "Remaining budget" panel shows only kinds with an active limit for the Task: it
 omits `report_correction`, `review_gate`, and `automatic_review_recovery` while
 recovery is disabled.
 Additional kind keys are `merge_fix`, `execution`, `workflow_guard`,
 `target_moved_rebase`, `conflict_handoff`, `review_carry`,
-`automatic_review_recovery`, `review_ci_infrastructure`, and `report_correction`.
+`automatic_review_recovery`, `review_ci_infrastructure`, `review_progress`,
+`review_verify_rerun`, and `report_correction`.
 A coordination root that has re-planned also reports `replan` (limit 5 per
 budget window: one per rejected aggregate review and one per parked subtask);
 no other Task has the key. The limit is fixed: `retry_budgets.replan` is not
@@ -6716,6 +6940,43 @@ values. Execution failure retries survive status
 changes until an explicit budget reset. Other kinds retain their natural
 contract/completion/interruption/exhaustion windows; reset additionally restores
 all persisted kinds. There is no lifetime execution maximum.
+
+`retry_budgets.review_progress` is an optional nonnegative integer on Task
+state config and Project settings (default 2, `0` disables). Task-wide values
+win, then the supplied Review state config; Project settings supply its default.
+It never inherits gate `max_rejections`. `remaining_retries.review_progress`
+and `retry_limits.review_progress` appear on Task detail/list responses and use
+the Review window and state even while the Task is in a repair state.
+A progress round uses an idempotent `progress:<review id>` receipt. Only entry
+failures classified as infrastructure use the infrastructure retry/park episode;
+configuration and other deterministic errors retain ordinary entry parking.
+A progress receipt never reclassifies an error. Owner actions
+never spend it; an owner's review re-run still gets a progress round only while
+the limit has one left. `review_verify_rerun` is ledger-backed per Review invocation
+(default 1, configurable), with its own remaining/limit projections and replay-safe
+receipts across suspension. It does not consume the Review failure allowance.
+
+After a coder-fixable failed Review, a reviewer finding open on its third
+blocking source check parks with `review_needs_owner`, message
+`repeated finding: <id> <summary>`. A second appearance parks only when the
+number of open blocking findings did not decrease. These parks apply even when
+a required conformance check also failed in that Review. Forge-owned findings count
+for progress but never cause repeat parks. Normal Review allowance is used
+first; when it has no retry left, a smaller open blocking count can spend one
+`review_progress` round. Otherwise normal exhaustion/recovery applies. Triage
+waivers never count. A raw reviewer fail with no blocking input finding disables
+these derived rules for the rest of the window. Structured non-blocking-only
+failures still park for the owner; findings-less failures retain legacy
+self-reported repeat behavior. With derived rules on, `repeat` is ignored. Owner-fixable and
+blocked results still park first; coordination roots with a lead keep replan
+routing. Repair targets come from the workflow (`working` for autonomous).
+
+Repair briefs have a hard 24 KiB byte cap, including truncation notes. Task
+description and plan each keep at most 4 KiB; compacted finding updates share
+1 KiB across all steps. Merge-CI send-backs include up to 20 failing test
+signatures, `+N more`, and a UTF-8-safe 2 KiB output end. Review-entry base
+observations may open/update `base_check_failing`; only newer queue-head
+target-tip passes resolve it.
 
 
 #### Owner check protocol (revision 5)
