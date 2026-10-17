@@ -2494,13 +2494,20 @@ impl TaskService {
             .await
     }
 
-    pub(crate) async fn publish_review_no_change_comment(&self, review: &Review) -> Result<()> {
+    /// `entry_step` is the review entry that sent the Task back: a replay of
+    /// that entry posts nothing new, a later entry judged against the same
+    /// failed Review posts its own comment.
+    pub(crate) async fn publish_review_no_change_comment(
+        &self,
+        review: &Review,
+        entry_step: &str,
+    ) -> Result<()> {
         let kind = db::budget::Kind::RepairNoChange;
         let spent = db::budget::spent(self.db.pool(), &review.task_id, kind.key()).await?;
         let limit = i64::from(kind.default_limit());
         self.create_review_comment(
             review,
-            kind.key(),
+            &format!("{}:{entry_step}", kind.key()),
             None,
             format!(
                 "No change since review {}: HEAD still matches the failed candidate and the worktree is clean. Sent back to the coder (repair_no_change budget {spent} of {limit} spent; {} remaining). See the Review tab.",
@@ -2537,9 +2544,22 @@ impl TaskService {
         review: &Review,
         rule: &str,
     ) -> Result<()> {
+        self.publish_review_park_comment_as(review, rule, "park")
+            .await
+    }
+
+    /// A park comment under its own idempotency `kind`. The no-change park
+    /// keys it by the review entry that parked, so parking the same failed
+    /// Review again (after an owner send-back) is reported once more.
+    pub(crate) async fn publish_review_park_comment_as(
+        &self,
+        review: &Review,
+        rule: &str,
+        kind: &str,
+    ) -> Result<()> {
         let ledger = self.review_comment_ledger(review).await?;
         let ids = finding_ids(&ledger, |entry| entry.status.is_open());
-        self.create_review_comment(review, "park", None, format!(
+        self.create_review_comment(review, kind, None, format!(
             "Task parked after review attempt {}: {rule}. Open findings: {ids}. Owner actions: re-run review, mark reviewed with a reason, or cancel the Task. See the Review tab.", review.attempt_number
         )).await
     }

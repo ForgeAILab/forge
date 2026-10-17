@@ -154,9 +154,16 @@ async fn no_change_send_back_posts_forge_comment_with_head_and_budget() {
     assert_eq!(reviews(&f).await.len(), 1);
     assert_eq!(spending(&f).await, (1, 1, 1));
     let review = reviews(&f).await.remove(0);
+    // A replay of the same review entry posts nothing new.
+    let entry_step = reminder
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix(&format!("review:{}:repair_no_change:", review.id)))
+        .unwrap()
+        .to_owned();
     for _ in 0..2 {
         f.engine
-            .publish_review_no_change_comment(&review)
+            .publish_review_no_change_comment(&review, &entry_step)
             .await
             .unwrap();
     }
@@ -197,9 +204,17 @@ async fn no_change_park_posts_forge_comment_with_findings_and_owner_actions() {
     assert_eq!(reviews(&f).await.len(), 1);
     assert_eq!(spending(&f).await, (1, 1, 1));
     let review = reviews(&f).await.remove(0);
+    // A replay of the same review entry posts nothing new.
+    let kind = park
+        .idempotency_key
+        .as_deref()
+        .and_then(|key| key.strip_prefix(&format!("review:{}:", review.id)))
+        .unwrap()
+        .to_owned();
+    assert!(kind.starts_with("park:"), "{kind}");
     for _ in 0..2 {
         f.engine
-            .publish_review_park_comment(&review, "no change after repair round")
+            .publish_review_park_comment_as(&review, "no change after repair round", &kind)
             .await
             .unwrap();
     }
@@ -213,6 +228,50 @@ async fn no_change_park_posts_forge_comment_with_findings_and_owner_actions() {
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn no_change_park_after_owner_send_back_posts_its_own_comment() {
+    let f = red_fixture().await;
+    repair(&f).await;
+    enter(&f, workflow_actor()).await;
+    repair(&f).await;
+    assert_eq!(enter(&f, workflow_actor()).await.status, "review");
+    // The owner sends the parked Task back, and the coder again changes
+    // nothing: the same failed Review parks a second time.
+    let owner = api_types::Actor::user(api_types::UserActionSource::Api);
+    let snapshot = f
+        .engine
+        .task_action_snapshot(&f.task.id, &owner)
+        .await
+        .unwrap();
+    f.engine
+        .perform_task_action(
+            f.task.id.clone(),
+            api_types::TaskAction::SendBack {
+                guidance: "change the code this time".to_owned(),
+            },
+            snapshot.task.version,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        drain(f.engine.clone(), &f.task.id).await.status,
+        "in_progress"
+    );
+    repair(&f).await;
+    let task = enter(&f, workflow_actor()).await;
+    assert_eq!(task.status, "review");
+    let blocked: serde_json::Value =
+        serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
+    assert_eq!(blocked["reason"], "no change after repair round");
+    assert_eq!(reviews(&f).await.len(), 1);
+    let comments = forge_comments(&f).await;
+    let parks = comments
+        .iter()
+        .filter(|comment| comment.content.contains("no change after repair round"))
+        .count();
+    assert_eq!(parks, 2, "{comments:?}");
 }
 
 #[tokio::test]
@@ -259,6 +318,14 @@ async fn no_change_changed_commit_reviews_normally() {
     assert_eq!(reviews(&f).await.len(), 2);
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await, (2, 2, 0));
+    let comments = forge_comments(&f).await;
+    assert!(
+        !comments.iter().any(
+            |comment| comment.content.starts_with("No change since review")
+                || comment.content.contains("no change after repair round")
+        ),
+        "{comments:?}"
+    );
 }
 
 #[tokio::test]
@@ -271,6 +338,14 @@ async fn no_change_dirty_worktree_is_not_rejected_by_guard() {
     assert_eq!(reviews(&f).await.len(), 2);
     assert_eq!(check_runs(&f).await, 2);
     assert_eq!(spending(&f).await, (2, 2, 0));
+    let comments = forge_comments(&f).await;
+    assert!(
+        !comments.iter().any(
+            |comment| comment.content.starts_with("No change since review")
+                || comment.content.contains("no change after repair round")
+        ),
+        "{comments:?}"
+    );
 }
 
 #[tokio::test]

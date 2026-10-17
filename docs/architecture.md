@@ -9946,7 +9946,9 @@ unchanged repair spends `RepairNoChange` (fixed limit 1) and returns to the gate
 reject target with a brief headed "No change since review N". A second parks
 `review_needs_owner` with `no change after repair round`. Neither creates a
 Review, starts checks or a reviewer, nor charges Review or gate-rejection
-budgets. Both post idempotent Forge comments tied to the failed Review: the
+budgets. Both post a Forge comment tied to the failed Review and keyed by the
+review entry that decided it: a replayed entry posts nothing new, and a later
+park of the same Review (after an owner send-back) posts its own. The
 send-back states that HEAD still matches the failed candidate and names the
 `repair_no_change` budget spent and remaining; the park names the open findings
 and the owner's re-run review, mark reviewed with a reason, and cancel actions.

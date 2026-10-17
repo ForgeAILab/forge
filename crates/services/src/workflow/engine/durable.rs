@@ -628,7 +628,7 @@ impl WorkflowExecution<'_> {
                                 .await?
                                 .ok_or(db::DbError::NotFound)?;
                         self.task_service
-                            .publish_review_no_change_comment(&review)
+                            .publish_review_no_change_comment(&review, &step.id)
                             .await?;
                         let reason = format!("No change since review {attempt}\nHEAD still matches the failed candidate and the worktree is clean. Address the review feedback, run the required checks, and commit the repair before resubmitting.");
                         cascade = Some((
@@ -640,13 +640,16 @@ impl WorkflowExecution<'_> {
                         // Bypass an owner-approval wait without charging a rejection.
                         before_enter_rejection_cascade = true;
                     } else {
-                        crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task)
-                            .await?;
+                        crate::workflow::actions::no_change::park_no_change(
+                            &enter_ctx, &task, step,
+                        )
+                        .await?;
                     }
                     skip_target_enter_hooks = true;
                 }
                 db::budget::RepairNoChangeDecision::Park => {
-                    crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task).await?;
+                    crate::workflow::actions::no_change::park_no_change(&enter_ctx, &task, step)
+                        .await?;
                     skip_target_enter_hooks = true;
                 }
             }

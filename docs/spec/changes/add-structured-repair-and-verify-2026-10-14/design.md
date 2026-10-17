@@ -341,7 +341,7 @@ An infrastructure failure of the runner keeps the existing
 - Forge adds a system comment when it dispatches a repair round, and one when
   it parks over findings (rules D5.1 and D5.2).
 - The no-change send-back and park also get Forge comments tied to the failed
-  Review, idempotent per kind: the reminder names the unchanged HEAD and
+  Review, idempotent per review entry: the reminder names the unchanged HEAD and
   `repair_no_change` budget; the park names open findings and owner actions.
 - Example:
 

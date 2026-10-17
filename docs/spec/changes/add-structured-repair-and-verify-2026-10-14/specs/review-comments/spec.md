@@ -56,7 +56,8 @@ The no-change gate SHALL also post these Forge comments without creating a new
 Review: a send-back comment states that HEAD still matches the failed candidate
 and names the `repair_no_change` budget spent and remaining; a park comment
 names the open findings, the no-change rule, and owner actions. These are
-idempotent per failed Review and comment kind.
+idempotent per review entry: a replayed entry posts nothing new, and a later
+park of the same failed Review after an owner send-back posts its own comment.
 
 #### Scenario: Progress round comment
 - **WHEN** Forge grants a progress round after review 2

@@ -181,7 +181,9 @@ Non-Goals:
   `RepairNoChange` budget (Review window, limit 1).
 - **Second time:** it parks with `review_needs_owner` and the message
   `no change after repair round`.
-- Each outcome posts a Forge comment, idempotent per failed Review and kind.
+- Each outcome posts a Forge comment, idempotent per review entry: a replay
+  posts nothing new, and a later park of the same failed Review (after an owner
+  send-back) posts its own.
   The send-back states the unchanged HEAD and `repair_no_change` budget spent
   and remaining; the park lists open findings and owner actions, using the
   repeated-finding park comment.

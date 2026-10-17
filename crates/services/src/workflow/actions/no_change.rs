@@ -96,7 +96,11 @@ async fn unchanged_attempt(
     )
 }
 
-pub(crate) async fn park_no_change(ctx: &HookContext, task: &db::Task) -> crate::Result<()> {
+pub(crate) async fn park_no_change(
+    ctx: &HookContext,
+    task: &db::Task,
+    step: &db::TaskStep,
+) -> crate::Result<()> {
     let message = "no change after repair round";
     let (review, _) = db::budget::failed_review_for_no_change(&ctx.db, &task.id)
         .await?
@@ -109,6 +113,6 @@ pub(crate) async fn park_no_change(ctx: &HookContext, task: &db::Task) -> crate:
     block_task_with_annotation(ctx, task, message, kind, None, Some(annotation.to_string()))
         .await?;
     ctx.task_service
-        .publish_review_park_comment(&review, message)
+        .publish_review_park_comment_as(&review, message, &format!("park:{}", step.id))
         .await
 }

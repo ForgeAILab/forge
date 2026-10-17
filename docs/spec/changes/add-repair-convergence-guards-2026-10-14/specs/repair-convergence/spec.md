@@ -6,7 +6,7 @@ Forge SHALL NOT start review CI, verify or a reviewer when a coder repair round 
 - **First time:** Forge sends the Task back to the coder with a brief headed "No change since review N". This is charged to the persistent `repair_no_change` budget (Review window, limit 1). A Forge comment SHALL state that HEAD still matches the failed candidate and name the budget spent and remaining.
 - **Second time:** the Task parks with `review_needs_owner` and the message `no change after repair round`. A Forge comment SHALL name the open findings and owner actions: re-run review, mark reviewed with a reason, or cancel the Task.
 
-Both comments SHALL be idempotent per failed Review and comment kind.
+Both comments SHALL be idempotent per review entry: a replayed entry SHALL NOT post again, and a later park of the same failed Review after an owner send-back SHALL post its own comment.
 
 Neither case charges the review budget. A re-review the owner starts, and an explicit owner Retry of a blocked review entry, are exempt. Cancelled, running and awaiting-human Reviews do not replace the latest settled (passed/failed) Review.
 
