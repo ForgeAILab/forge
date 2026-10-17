@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = "2"
-which = "7"
+which = "8"
 
 [dev-dependencies]
 tempfile = "3"
