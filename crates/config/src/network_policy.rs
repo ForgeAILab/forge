@@ -97,6 +97,11 @@ mod tests {
     //! refusing `192.88.99.0/24` (also in IPv6 carriers) and six IPv6 special-use
     //! ranges, both policies refusing restricted IPv4-translated destinations,
     //! and public search judging well-known NAT64 by its embedded IPv4.
+    //! Public search's other two changes in the same release are not address
+    //! verdicts and are proven elsewhere: refusing `internal`/`home.arpa`
+    //! names (`address_tightening_public_search_refuses_local_dns_suffixes`)
+    //! and refusing a hostname with any blocked DNS answer
+    //! (`address_tightening_public_search_refuses_any_blocked_dns_answer`).
 
     use super::*;
     use std::net::Ipv6Addr;
