@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-16
+
 ### Security
 
 - Scope Project and Task REST reads and mutations, including indirect comments,
