@@ -249,6 +249,15 @@ mod tests {
     async fn native_provider_rejects_transition_and_zero_network_urls_before_io() {
         for url in [
             "https://0.1.2.3/v1",
+            "https://[2001:db8::1]/v1",
+            "https://[2001:2::1]/v1",
+            "https://[2001:10::1]/v1",
+            "https://[2001:20::1]/v1",
+            "https://[100::1]/v1",
+            "https://[3fff::1]/v1",
+            "https://[::ffff:0:10.0.0.1]/v1",
+            "https://[::ffff:0:127.0.0.1]/v1",
+            "https://[::ffff:0:169.254.169.254]/v1",
             "https://192.88.99.1/v1",
             "https://[64:ff9b::192.88.99.1]/v1",
             "https://[2002:c058:6301::]/v1",

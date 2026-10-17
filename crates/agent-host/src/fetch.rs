@@ -327,6 +327,15 @@ mod tests {
     async fn fetch_rejects_transition_and_zero_network_urls_before_io() {
         for endpoint in [
             "https://0.1.2.3/",
+            "https://[2001:db8::1]/",
+            "https://[2001:2::1]/",
+            "https://[2001:10::1]/",
+            "https://[2001:20::1]/",
+            "https://[100::1]/",
+            "https://[3fff::1]/",
+            "https://[::ffff:0:10.0.0.1]/",
+            "https://[::ffff:0:127.0.0.1]/",
+            "https://[::ffff:0:169.254.169.254]/",
             "https://192.88.99.1/",
             "https://[64:ff9b::192.88.99.1]/",
             "https://[2002:c058:6301::]/",

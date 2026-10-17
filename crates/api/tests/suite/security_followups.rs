@@ -283,6 +283,15 @@ async fn providers_reject_legacy_transition_endpoints_before_sending_test_reques
     let now = db::now_rfc3339();
     for (index, endpoint) in [
         "https://0.1.2.3",
+        "https://[2001:db8::1]",
+        "https://[2001:2::1]",
+        "https://[2001:10::1]",
+        "https://[2001:20::1]",
+        "https://[100::1]",
+        "https://[3fff::1]",
+        "https://[::ffff:0:10.0.0.1]",
+        "https://[::ffff:0:127.0.0.1]",
+        "https://[::ffff:0:169.254.169.254]",
         "https://[64:ff9b::7f00:1]",
         "https://[64:ff9b:1::1]",
         "https://[2002:7f00:1::]",

@@ -4038,6 +4038,8 @@ fn is_private_or_local_search_host(host: &str) -> bool {
     if matches!(normalized.as_str(), "localhost" | "localhost.localdomain")
         || normalized.ends_with(".localhost")
         || normalized.ends_with(".local")
+        || normalized.ends_with(".internal")
+        || normalized.ends_with(".home.arpa")
     {
         return true;
     }
@@ -4066,6 +4068,7 @@ impl reqwest::dns::Resolve for PublicSearchResolver {
             let normalized_allowed_host = allowed_host.trim_end_matches('.');
             if normalized_host.is_empty()
                 || !normalized_host.eq_ignore_ascii_case(normalized_allowed_host)
+                || is_private_or_local_search_host(normalized_host)
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -4073,21 +4076,29 @@ impl reqwest::dns::Resolve for PublicSearchResolver {
                 )
                 .into());
             }
-            let addresses = tokio::net::lookup_host((normalized_host, 0))
-                .await?
-                .filter(|address| !is_blocked_public_search_address(address.ip()))
-                .collect::<Vec<_>>();
-            if addresses.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "public search endpoint resolved only to blocked addresses",
-                )
-                .into());
-            }
-            let addresses: reqwest::dns::Addrs = Box::new(addresses.into_iter());
-            Ok(addresses)
+            let addresses = tokio::net::lookup_host((normalized_host, 0)).await?;
+            validated_public_search_addresses(addresses).map_err(Into::into)
         })
     }
+}
+
+fn validated_public_search_addresses(
+    addresses: impl Iterator<Item = std::net::SocketAddr>,
+) -> std::io::Result<reqwest::dns::Addrs> {
+    let addresses = addresses.collect::<Vec<_>>();
+    // Refuse the whole hostname on any blocked answer, matching provider/fetch.
+    // Never turn a mixed DNS response into an apparently safe public subset.
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| is_blocked_public_search_address(address.ip()))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "public search endpoint did not resolve exclusively to public addresses",
+        ));
+    }
+    Ok(Box::new(addresses.into_iter()))
 }
 
 fn bounded_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -6955,6 +6966,68 @@ mod tests {
     }
 
     #[test]
+    fn address_tightening_public_search_result_urls_refuse_local_dns_suffixes() {
+        for host in [
+            "search.internal",
+            "nested.search.internal",
+            "SEARCH.INTERNAL.",
+            "search.home.arpa",
+            "nested.search.home.arpa",
+            "SEARCH.HOME.ARPA.",
+        ] {
+            assert!(
+                normalize_public_result_url(&format!("https://{host}/result")).is_err(),
+                "{host}"
+            );
+        }
+        for host in [
+            "search.internal.example",
+            "search.home.arpa.example",
+            "searchinternal",
+        ] {
+            assert!(
+                normalize_public_result_url(&format!("https://{host}/result")).is_ok(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn address_tightening_public_search_refuses_any_blocked_dns_answer() {
+        let public_v4 = "8.8.8.8:443".parse().unwrap();
+        let public_v6 = "[2001:4860:4860::8888]:443".parse().unwrap();
+        for host in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "192.88.99.1",
+            "::1",
+            "2001:db8::1",
+            "64:ff9b::10.0.0.1",
+            "::ffff:0:10.0.0.1",
+        ] {
+            let blocked = std::net::SocketAddr::new(host.parse().unwrap(), 443);
+            for addresses in [
+                vec![blocked],
+                vec![public_v4, blocked, public_v6],
+                vec![blocked, public_v4],
+                vec![public_v6, blocked],
+            ] {
+                let error = validated_public_search_addresses(addresses.into_iter())
+                    .err()
+                    .expect("one blocked answer must refuse the entire hostname");
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+        }
+        assert!(validated_public_search_addresses(std::iter::empty()).is_err());
+        let public = vec![public_v4, public_v6];
+        let approved = validated_public_search_addresses(public.clone().into_iter())
+            .expect("all-public DNS answers")
+            .collect::<Vec<_>>();
+        assert_eq!(approved, public);
+    }
+
+    #[test]
     fn public_search_result_urls_reject_private_and_special_use_hosts() {
         for url in [
             "https://localhost/result",
@@ -6962,6 +7035,9 @@ mod tests {
             "https://10.0.0.1/result",
             "https://169.254.169.254/result",
             "https://[::1]/result",
+            "https://[::ffff:0:10.0.0.1]/result",
+            "https://[::ffff:0:127.0.0.1]/result",
+            "https://[::ffff:0:169.254.169.254]/result",
             "https://[::ffff:127.0.0.1]/result",
             "https://[::ffff:8.8.8.8]/result",
             "https://[::8.8.8.8]/result",
@@ -7072,6 +7148,11 @@ mod tests {
             ("::ffff:10.0.0.1", true),
             ("::ffff:192.88.99.1", true),
             ("::192.88.99.1", true),
+            ("::ffff:0:8.8.8.8", false),
+            ("::ffff:0:10.0.0.1", true),
+            ("::ffff:0:127.0.0.1", true),
+            ("::ffff:0:169.254.169.254", true),
+            ("::ffff:0:192.88.99.1", true),
             ("64:ff9b::8.8.8.8", false),
             ("64:ff9b::1.1.1.1", false),
             ("64:ff9b::10.0.0.1", true),
@@ -7083,13 +7164,23 @@ mod tests {
             ("64:ff9b:1:ffff:ffff:ffff:ffff:ffff", true),
             ("64:ff9b:2::", false),
             ("100:0:0:1::", false),
+            ("100::", true),
+            ("100::ffff:ffff:ffff:ffff", true),
             ("2001::1", true),
+            ("2001:2::1", true),
+            ("2001:db8::1", true),
+            ("2001:10::1", true),
+            ("2001:1f:ffff:ffff:ffff:ffff:ffff:ffff", true),
+            ("2001:20::1", true),
+            ("2001:2f:ffff:ffff:ffff:ffff:ffff:ffff", true),
             ("2001:6::1", false),
             ("2001:30::1", false),
             ("2001:4860:4860::8888", false),
             ("2002:7f00:1::", true),
             ("2002:c058:6301::", true),
             ("3fef::1", false),
+            ("3fff::1", true),
+            ("3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff", true),
             ("4000::1", false),
             ("fc00::1", true),
             ("fdff::1", true),
@@ -7117,19 +7208,13 @@ mod tests {
             "::ffff:8.8.8.8",
             "::8.8.8.8",
             "2002:808:808::",
-            "100::",
-            "100::ffff:ffff:ffff:ffff",
             "2001:1::1",
-            "2001:2::1",
+            "2001:2:1::1",
             "2001:3::1",
             "2001:4::1",
             "2001:5:ffff:ffff:ffff:ffff:ffff:ffff",
-            "2001:db8::1",
-            "2001:10::1",
-            "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
-            "2001:20::1",
-            "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
             "3ff0::1",
+            "3fff:1000::1",
             "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
             "64:ff9b:0:1::",
             "64:ff9b::1:0:0",
@@ -7433,18 +7518,17 @@ mod tests {
         .await;
         assert!(unexpected.is_err());
 
-        let localhost_resolver = PublicSearchResolver {
-            allowed_host: "localhost".to_owned(),
-        };
-        let local = <PublicSearchResolver as reqwest::dns::Resolve>::resolve(
-            &localhost_resolver,
-            reqwest::dns::Name::from_str("localhost").expect("DNS name"),
-        )
-        .await;
-        assert!(
-            local.is_err(),
-            "localhost must not resolve for public search"
-        );
+        for host in ["localhost", "SEARCH.INTERNAL.", "SEARCH.HOME.ARPA."] {
+            let resolver = PublicSearchResolver {
+                allowed_host: host.to_owned(),
+            };
+            let local = <PublicSearchResolver as reqwest::dns::Resolve>::resolve(
+                &resolver,
+                reqwest::dns::Name::from_str(host).expect("DNS name"),
+            )
+            .await;
+            assert!(local.is_err(), "{host} must not resolve for public search");
+        }
     }
     #[tokio::test]
     async fn setup_completed_denial_names_adoption_not_applicable() {

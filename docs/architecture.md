@@ -90,33 +90,49 @@ opencode/Gemini/Smith launches use these bounded retries.
 Provider probes, native requests, web fetch and public search share
 `config::is_restricted_public_address`. `config` has no internal crate
 dependencies, so `agent-host` can use this implementation without a cycle.
-Well-known NAT64 `64:ff9b::/96` addresses apply the IPv4 policy to the final
-32 bits in every consumer, as provider/fetch 6to4 and mapped/compatible
-addresses do to their embedded IPv4 destination. Local-use NAT64
+Well-known NAT64 `64:ff9b::/96` and IPv4-translated `::ffff:0:0:0/96`
+(RFC 2765) addresses apply the IPv4 policy to the final 32 bits in every
+consumer, as provider/fetch 6to4 and mapped/compatible addresses do to their
+embedded IPv4 destination. Local-use NAT64
 `64:ff9b:1::/48` and Teredo remain refused. Every consumer rejects IPv4 IETF
 protocol assignments at `192.0.0.0/24`, TEST-NET-1 at `192.0.2.0/24`, and
 former 6to4 relay anycast at `192.88.99.0/24`, including IPv6 forms embedding
-those destinations.
+those destinations. All consumers also refuse IPv6 documentation
+`2001:db8::/32` and `3fff::/20`, benchmarking `2001:2::/48`,
+ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`, and discard-only `100::/64`.
 
 `config::is_blocked_public_search_address` adds public search's existing
 conservative IPv6 exclusions to that common policy for endpoint validation,
 the request resolver and result URLs. These are deliberate differences:
 public search refuses all IPv4-mapped/compatible and 6to4 addresses even when
-their embedded IPv4 is public; discard-only `100::/64`; `2001:1::/32` through
-`2001:5::/32` (including benchmarking and special-use assignments);
-documentation `2001:db8::/32`; ORCHID `2001:10::/28` and ORCHIDv2
-`2001:20::/28`; the rest of `64:ff9b::/48` outside the well-known `/96`
-(unassigned); and the existing conservative documentation guard
-`3ff0::/12`. Provider/fetch continues to admit these when the common policy
-does not reject them. The shared address table in
+their embedded IPv4 is public, while explicitly configured providers and
+fetch can reach public IPv4 destinations through these transition forms.
+Search also retains its broader guards over `2001:1::/32` through
+`2001:5::/32`, `3ff0::/12`, and the rest of `64:ff9b::/48` outside the
+well-known `/96` (unassigned). These conservative search-only guards cover
+more than the precise benchmarking/documentation prefixes: search accepts
+an endpoint and untrusted result metadata, while provider/fetch deliberately
+admits otherwise public destinations outside the shared special-use ranges.
+Keeping these broader guards search-only preserves that provider/fetch
+boundary without relaxing search's existing restrictions. The shared address table in
 `services::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
 checks agreement and each documented exclusion.
-`config::network_policy::tests::shared_policy_changes_only_the_two_intended_verdicts`
+`config::network_policy::tests::shared_policy_changes_only_intended_address_verdicts`
 compares both predicates with verbatim copies of their pre-sharing versions
 over a generated address set: the only verdict changes allowed are
-provider/fetch refusing `192.88.99.0/24` (and IPv6 forms carrying it) and
-public search admitting well-known NAT64 addresses whose embedded IPv4 is
-public.
+provider/fetch refusing `192.88.99.0/24` (and IPv6 forms carrying it),
+provider/fetch refusing the six IPv6 special-use ranges above, both policies
+refusing IPv4-translated addresses carrying restricted IPv4, and public
+search admitting well-known NAT64 addresses whose embedded IPv4 is public.
+
+Public-search endpoint validation and result URLs also refuse `.internal`
+and `.home.arpa` hostnames alongside the existing local suffixes, including
+mixed case and trailing dots. At request time, search rejects the entire
+hostname if resolution is empty or any answer is blocked, matching providers
+and fetch; it never filters a mixed answer down to its public members.
+The request client receives only an all-public answer set. Deterministic
+regressions cover hostname suffixes and mixed IPv4/IPv6 DNS answers without
+contacting DNS or an external endpoint.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and
 the admission-time price resolution (`pricing::auto`). It sits below `services`

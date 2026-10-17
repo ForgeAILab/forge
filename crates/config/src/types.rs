@@ -598,6 +598,8 @@ fn is_private_or_local_host(host: &str) -> bool {
     if matches!(normalized.as_str(), "localhost" | "localhost.localdomain")
         || normalized.ends_with(".localhost")
         || normalized.ends_with(".local")
+        || normalized.ends_with(".internal")
+        || normalized.ends_with(".home.arpa")
     {
         return true;
     }

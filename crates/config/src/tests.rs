@@ -275,6 +275,35 @@ fn public_search_ietf_protocol_assignments_are_only_a_slash24() {
 }
 
 #[test]
+fn address_tightening_public_search_refuses_local_dns_suffixes() {
+    for host in [
+        "search.internal",
+        "nested.search.internal",
+        "SEARCH.INTERNAL.",
+        "search.home.arpa",
+        "nested.search.home.arpa",
+        "SEARCH.HOME.ARPA.",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err(), "{host}");
+    }
+    for host in [
+        "search.internal.example",
+        "search.home.arpa.example",
+        "searchinternal",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{host}");
+    }
+}
+
+#[test]
 fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
     for endpoint in [
         "http://search.example.test",
@@ -283,6 +312,9 @@ fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
         "https://[::ffff:127.0.0.1]/search",
         "https://[::ffff:8.8.8.8]/search",
         "https://[::8.8.8.8]/search",
+        "https://[::ffff:0:10.0.0.1]/search",
+        "https://[::ffff:0:127.0.0.1]/search",
+        "https://[::ffff:0:169.254.169.254]/search",
         "https://[64:ff9b::192.0.2.1]/search",
         "https://[fe80::1%25en0]/search",
         "https://[2001:2::1]/search",

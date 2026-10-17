@@ -118,6 +118,15 @@ async fn provider_client_does_not_follow_redirects_to_internal_hosts() {
 async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
     for ip in [
         "0.0.0.1",
+        "2001:db8::1",
+        "2001:2::1",
+        "2001:10::1",
+        "2001:20::1",
+        "100::1",
+        "3fff::1",
+        "::ffff:0:10.0.0.1",
+        "::ffff:0:127.0.0.1",
+        "::ffff:0:169.254.169.254",
         "0.255.255.255",
         "192.88.99.0",
         "192.88.99.1",
@@ -168,6 +177,7 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
     for ip in [
         "1.0.0.1",
         "8.8.8.8",
+        "::ffff:0:8.8.8.8",
         // Well-known NAT64 is judged by its embedded IPv4 destination.
         "64:ff9b::808:808",
         "64:ff9b:0:1::",

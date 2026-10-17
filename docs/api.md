@@ -325,14 +325,17 @@ reject any restricted address in the result, and connect only to those pinned
 addresses. They do not follow redirects or use proxies. Endpoint checks also
 apply when loading stored metadata. Restricted destinations include `0.0.0.0/8`,
 former 6to4 relay anycast `192.88.99.0/24`, local-use NAT64 `64:ff9b:1::/48`,
-Teredo `2001::/32`, and well-known NAT64 (`64:ff9b::/96`), 6to4
-(`2002::/16`), IPv4-mapped and IPv4-compatible IPv6 addresses whose embedded
-IPv4 address is restricted. Native provider transport, the web fetch tool
+Teredo `2001::/32`, IPv6 documentation `2001:db8::/32` and `3fff::/20`,
+benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`,
+discard-only `100::/64`, and well-known NAT64 (`64:ff9b::/96`),
+IPv4-translated (`::ffff:0:0:0/96`), 6to4 (`2002::/16`), IPv4-mapped and
+IPv4-compatible IPv6 addresses whose embedded IPv4 address is restricted.
+Native provider transport, the web fetch tool
 (authorization gate and transport) and public search use the same address
 predicate. Public search adds stricter IPv6 exclusions for its endpoint,
 resolver and result URLs: it refuses every IPv4-mapped/compatible and 6to4
 address outright, the rest of `64:ff9b::/48` outside the well-known `/96`,
-and the special-use ranges listed in [architecture](architecture.md).
+and broader conservative guards listed in [architecture](architecture.md).
 
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`
@@ -4756,9 +4759,15 @@ The endpoint contract is `{"results":[{"url","title","snippet"}]}`. Forge
 adds its retrieval timestamp, validates public HTTP(S) source URLs, caps the
 query at 512 characters and results at 10, and labels all returned text as
 untrusted data. Forge disables redirects and ambient proxy/cookie/auth state,
-resolves the configured host at connect time, and rejects private, special-use,
-and IPv4-mapped IPv6 addresses. An unset endpoint omits the tool; invalid
-configuration is rejected before a runtime can expose it.
+resolves the configured host at connect time, and rejects the entire hostname
+if any resolved address is private or otherwise blocked (including mixed
+public/private IPv4/IPv6 answers). Empty resolution is also refused; accepted
+answers are passed directly to the connection. Endpoint and result URL checks
+reject `.internal` and `.home.arpa` names alongside existing local suffixes,
+ignoring case and trailing dots. IPv4-translated addresses apply the embedded
+IPv4 policy; IPv4-mapped/compatible and 6to4 addresses remain refused outright.
+An unset endpoint omits the tool; invalid configuration is rejected before a
+runtime can expose it.
 
 ### Access model
 

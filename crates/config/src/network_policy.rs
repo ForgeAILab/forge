@@ -31,9 +31,16 @@ pub fn is_restricted_public_address(ip: IpAddr) -> bool {
                 || (segments[0] & 0xffc0) == 0xfec0
                 || (segments[0] & 0xfe00) == 0xfc00
                 || segments[0] >= 0xff00
-                // The well-known NAT64 /96 carries its IPv4 destination in
-                // the last 32 bits. Apply the same policy to that destination.
-                || (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                // Documentation, benchmarking, ORCHID and discard-only ranges.
+                || segments[..2] == [0x2001, 0x0db8]
+                || segments[..3] == [0x2001, 2, 0]
+                || (segments[0] == 0x2001 && (0x0010..=0x002f).contains(&segments[1]))
+                || segments[..4] == [0x0100, 0, 0, 0]
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
+                // Well-known NAT64 and RFC 2765 IPv4-translated /96 forms
+                // carry their IPv4 destination in the last 32 bits.
+                || ((segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                    || segments[..6] == [0, 0, 0, 0, 0xffff, 0])
                     && is_restricted_public_address(IpAddr::V4(Ipv4Addr::new(
                         (segments[6] >> 8) as u8,
                         segments[6] as u8,
@@ -76,27 +83,72 @@ pub fn is_blocked_public_search_address(address: IpAddr) -> bool {
         || first == 0x2002
         // The rest of 64:ff9b::/48 outside the well-known /96 is unassigned.
         || (segments[..3] == [0x64, 0xff9b, 0] && segments[3..6] != [0, 0, 0])
-        || (first == 0x2001 && segments[1] == 0x0db8)
+        // Keep search's broader protocol-assignment guard beyond the shared
+        // benchmarking /48, and its broader documentation guard beyond /20.
         || (first == 0x2001 && (1..=5).contains(&segments[1]))
-        || (first == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
-        || (first == 0x2001 && (0x0020..=0x002f).contains(&segments[1]))
-        // Preserve search's conservative documentation-range guard.
         || (0x3ff0..=0x3fff).contains(&first)
-        // Discard-only 100::/64.
-        || segments[..4] == [0x0100, 0, 0, 0]
 }
 
 #[cfg(test)]
 mod tests {
     //! Old-vs-new verdicts. The two predicates as they stood at `fb957882` are
     //! copied verbatim below and compared with the shared policy over a broad,
-    //! reproducible address set. The only permitted differences are the two
-    //! intended changes: provider/fetch now refuses `192.88.99.0/24` (also
-    //! when carried by an IPv6 form), and public search judges the well-known
-    //! NAT64 `64:ff9b::/96` by its embedded IPv4 destination.
+    //! reproducible address set. Permitted differences are provider/fetch
+    //! refusing `192.88.99.0/24` (also in IPv6 carriers) and six IPv6 special-use
+    //! ranges, both policies refusing restricted IPv4-translated destinations,
+    //! and public search judging well-known NAT64 by its embedded IPv4.
 
     use super::*;
     use std::net::Ipv6Addr;
+
+    #[test]
+    fn address_tightening_refuses_special_ipv6_ranges_with_exact_boundaries() {
+        for (base, prefix, before_blocked, after_blocked) in [
+            ("2001:db8::", 32, false, false),
+            ("2001:2::", 48, false, false),
+            ("2001:10::", 28, false, true),
+            ("2001:20::", 28, true, false),
+            ("100::", 64, false, false),
+            ("3fff::", 20, false, false),
+        ] {
+            let start = u128::from(base.parse::<Ipv6Addr>().unwrap());
+            let end = start | (u128::MAX >> prefix);
+            for value in [start, start + 1, end - 1, end] {
+                let address = IpAddr::V6(Ipv6Addr::from(value));
+                assert!(is_restricted_public_address(address), "{address}");
+                assert!(is_blocked_public_search_address(address), "{address}");
+            }
+            for (value, blocked) in [(start - 1, before_blocked), (end + 1, after_blocked)] {
+                let address = IpAddr::V6(Ipv6Addr::from(value));
+                assert_eq!(is_restricted_public_address(address), blocked, "{address}");
+            }
+        }
+    }
+
+    #[test]
+    fn address_tightening_translated_ipv4_applies_embedded_policy() {
+        let prefix = u128::from("::ffff:0:0:0".parse::<Ipv6Addr>().unwrap());
+        let mut rng = SplitMix(0x2765);
+        for ipv4 in ipv4_set(&mut rng) {
+            let translated = IpAddr::V6(Ipv6Addr::from(prefix | u128::from(u32::from(ipv4))));
+            assert_eq!(
+                is_restricted_public_address(translated),
+                is_restricted_public_address(IpAddr::V4(ipv4)),
+                "provider/fetch: {translated}"
+            );
+            assert_eq!(
+                is_blocked_public_search_address(translated),
+                is_blocked_public_search_address(IpAddr::V4(ipv4)),
+                "public search: {translated}"
+            );
+        }
+        // Adjacent /96 prefixes must not be mistaken for IPv4-translated.
+        for host in ["::fffe:0:7f00:1", "::ffff:1:7f00:1", "::ffff:0:0:7f00:1"] {
+            let address = host.parse().unwrap();
+            assert!(!is_restricted_public_address(address), "{host}");
+            assert!(!is_blocked_public_search_address(address), "{host}");
+        }
+    }
 
     /// `forge_agent_host::network_policy::restricted_provider_ip` at `fb957882`.
     fn old_restricted_provider_ip(ip: IpAddr) -> bool {
@@ -374,52 +426,95 @@ mod tests {
         address.octets()[..3] == [192, 88, 99]
     }
 
+    fn translated_ipv4(address: IpAddr) -> Option<Ipv4Addr> {
+        let IpAddr::V6(address) = address else {
+            return None;
+        };
+        let value = u128::from(address);
+        let prefix = u128::from("::ffff:0:0:0".parse::<Ipv6Addr>().unwrap());
+        (value >> 32 == prefix >> 32).then(|| Ipv4Addr::from(value as u32))
+    }
+
+    fn newly_shared_ipv6_range(address: IpAddr) -> bool {
+        let IpAddr::V6(address) = address else {
+            return false;
+        };
+        let value = u128::from(address);
+        [
+            ("2001:db8::", 32),
+            ("2001:2::", 48),
+            ("2001:10::", 28),
+            ("2001:20::", 28),
+            ("100::", 64),
+            ("3fff::", 20),
+        ]
+        .into_iter()
+        .any(|(base, prefix)| {
+            let start = u128::from(base.parse::<Ipv6Addr>().unwrap());
+            (start..=start | (u128::MAX >> prefix)).contains(&value)
+        })
+    }
+
     #[test]
-    fn shared_policy_changes_only_the_two_intended_verdicts() {
+    fn shared_policy_changes_only_intended_address_verdicts() {
         let addresses = address_set();
         assert!(addresses.len() > 40_000, "{}", addresses.len());
         let mut violations = Vec::new();
         let mut provider_relay_refusals = 0usize;
+        let mut provider_special_ipv6_refusals = 0usize;
+        let mut provider_translated_refusals = 0usize;
         let mut search_nat64_admissions = 0usize;
+        let mut search_translated_refusals = 0usize;
         for address in addresses {
             let (old, new) = (
                 old_restricted_provider_ip(address),
                 is_restricted_public_address(address),
             );
-            if old != new {
-                let carries_relay = match address {
-                    IpAddr::V4(address) => is_former_6to4_relay(address),
-                    IpAddr::V6(address) => {
-                        embedded_ipv4(address).into_iter().any(is_former_6to4_relay)
-                    }
-                };
-                if !old && carries_relay {
-                    provider_relay_refusals += 1;
-                } else {
-                    violations.push(format!("provider/fetch {address}: old {old}, new {new}"));
-                }
+            let carries_relay = match address {
+                IpAddr::V4(address) => is_former_6to4_relay(address),
+                IpAddr::V6(address) => embedded_ipv4(address).into_iter().any(is_former_6to4_relay),
+            };
+            let special_ipv6 = newly_shared_ipv6_range(address);
+            let restricted_translated = translated_ipv4(address).is_some_and(|ipv4| {
+                old_restricted_provider_ip(IpAddr::V4(ipv4)) || is_former_6to4_relay(ipv4)
+            });
+            let expected = old || carries_relay || special_ipv6 || restricted_translated;
+            if new != expected {
+                violations.push(format!(
+                    "provider/fetch {address}: old {old}, expected {expected}, new {new}"
+                ));
+            }
+            if !old && new {
+                provider_relay_refusals += usize::from(carries_relay);
+                provider_special_ipv6_refusals += usize::from(special_ipv6);
+                provider_translated_refusals += usize::from(restricted_translated);
             }
 
             let (old, new) = (
                 old_is_blocked_public_search_address(address),
                 is_blocked_public_search_address(address),
             );
-            if old != new {
-                let public_nat64 = match address {
-                    IpAddr::V6(address) => {
-                        let segments = address.segments();
-                        segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
-                            && !old_is_blocked_public_search_address(IpAddr::V4(Ipv4Addr::from(
-                                (u32::from(segments[6]) << 16) | u32::from(segments[7]),
-                            )))
-                    }
-                    IpAddr::V4(_) => false,
-                };
-                if old && public_nat64 {
-                    search_nat64_admissions += 1;
-                } else {
-                    violations.push(format!("public search {address}: old {old}, new {new}"));
+            let public_nat64 = match address {
+                IpAddr::V6(address) => {
+                    let segments = address.segments();
+                    segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                        && !old_is_blocked_public_search_address(IpAddr::V4(Ipv4Addr::from(
+                            (u32::from(segments[6]) << 16) | u32::from(segments[7]),
+                        )))
                 }
+                IpAddr::V4(_) => false,
+            };
+            let expected = (old && !public_nat64) || restricted_translated;
+            if new != expected {
+                violations.push(format!(
+                    "public search {address}: old {old}, expected {expected}, new {new}"
+                ));
+            }
+            if old && !new && public_nat64 {
+                search_nat64_admissions += 1;
+            }
+            if !old && new && restricted_translated {
+                search_translated_refusals += 1;
             }
         }
         assert!(
@@ -428,12 +523,17 @@ mod tests {
             violations.len(),
             &violations[..violations.len().min(20)]
         );
-        // Both intended changes are exercised, so the comparison is not vacuous.
+        // Every intended address change is exercised; missing changes also fail.
         assert!(provider_relay_refusals > 0);
+        assert!(provider_special_ipv6_refusals > 0);
+        assert!(provider_translated_refusals > 0);
         assert!(search_nat64_admissions > 0);
+        assert!(search_translated_refusals > 0);
         eprintln!(
-            "provider/fetch newly refuses {provider_relay_refusals}; \
-             public search newly admits {search_nat64_admissions}"
+            "provider/fetch newly refuses: relay {provider_relay_refusals}, \
+             special IPv6 {provider_special_ipv6_refusals}, translated {provider_translated_refusals}; \
+             public search newly admits NAT64 {search_nat64_admissions}, \
+             newly refuses translated {search_translated_refusals}"
         );
     }
 }
