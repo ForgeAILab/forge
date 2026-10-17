@@ -5169,15 +5169,20 @@ In demo mode (`forge --demo`), command-bearing Project settings, Task state
 configuration, workflow/template definitions and scaffold configuration are
 refused with HTTP **422**, code `server_commands_disabled`, and message
 `This demo does not run commands`. This includes Script lifecycle hooks,
-review `ci_steps`/`setup_steps`, environment check commands and Project command
-allowlists. Empty CI/setup/environment-check lists can be saved to remove
-configuration. REST and
+review `ci_steps`/`setup_steps`, non-null `ReviewConfig.verify` (app start,
+readiness commands and scripted checks), environment check commands and Project
+command allowlists. Empty CI/setup/environment-check lists and `verify: null`
+can be saved to remove configuration. REST and
 MCP use the shared domain validation; MCP reports `-32602` with
 `data.code: "server_commands_disabled"`. Native orchestration outcomes use the
 same code with status `failed`. Stored commands are also refused at execution:
-hook/check results retain the reason and review entry requiring CI parks the
-Task. Native Chat command tools also refuse execution, including when a visitor
-connects their own provider credential; other native tools keep their permissions.
+hook/check results retain the reason and review entry requiring CI or verify
+parks the Task in `review` with `server_commands_disabled`, before creating a
+Review attempt or check consumer. No review, infrastructure or verify retry
+budget is spent, and no hooks step stays suspended. Remove the configuration
+and retry the entry, or cancel the Task. Native Chat command tools also refuse
+execution, including when a visitor connects their own provider credential;
+other native tools keep their permissions.
 Forge's built-in Git operations remain available. Normal mode is unchanged.
 
 The same demo switch refuses two more things, also with HTTP **422**:
@@ -6486,6 +6491,13 @@ the normal review path; an explicit retry-window reset restores the allowance.
 `default_review_config`, and Task `task_state_config`; it follows the same merge
 order as `ci_steps`. Project and Task writes validate field paths such as
 `verify.ready_command` and `verify.checks.0.name`.
+
+Demo mode refuses any non-null `verify` at the shared Project, Task and
+workflow/settings write boundary with the command refusal described in
+[Errors](#errors), including through MCP. Stored verify configuration and Project
+defaults are refused before a Review attempt or durable check is created; the
+Task parks in `review` with `server_commands_disabled` and no retry budget is
+spent. Its start, readiness and check commands never run.
 
 | Field | Default | Constraint |
 |---|---|---|

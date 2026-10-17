@@ -9,6 +9,255 @@ fn demo() {
     executors::server_commands::disable();
 }
 
+fn assert_command_refusal(error: &Value) {
+    assert_eq!(error["code"], "server_commands_disabled", "{error}");
+    assert_eq!(error["message"], "This demo does not run commands");
+    assert!(error["details"].is_null());
+    assert!(error["request_id"].is_string());
+}
+
+#[tokio::test]
+async fn demo_verify_configuration_writes_are_422() {
+    demo();
+    let (_root, harness, project, _, task) = support::fixture("demo-verify-writes").await;
+    let verify = json!({"start":"touch start-marker", "ready_command":"touch ready-marker",
+        "checks":[{"name":"smoke","command":"touch check-marker"}]});
+    let row = db::ProjectRepo::get_by_id(&*harness.state.db, &project)
+        .await
+        .unwrap()
+        .unwrap();
+    for body in [
+        json!({"version":row.version,"default_review_config":{"verify":verify}}),
+        json!({"version":row.version,"settings":{"default_review_config":{"verify":verify}}}),
+        // Any non-null verify is refused, even before its field validation.
+        json!({"version":row.version,"settings":{"default_review_config":{"verify":{}}}}),
+        json!({"version":row.version,"settings":{"review":{"verify":{"start":"true"}}}}),
+    ] {
+        let error: Value = common::json_request(
+            &harness.app,
+            Method::PATCH,
+            &format!("/api/v1/projects/{project}"),
+            body,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert_command_refusal(&error);
+    }
+    let error: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"verify-project","default_review_config":{"verify":verify}}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_command_refusal(&error);
+    let error: Value = common::json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{project}/tasks"),
+        json!({"title":"verify-task","review_config":{"verify":verify}}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_command_refusal(&error);
+    for review in [json!({"verify":verify}), json!({"verify":{}})] {
+        let error: Value = common::json_request(
+            &harness.app,
+            Method::PATCH,
+            &format!("/api/v1/tasks/{}", task["id"].as_str().unwrap()),
+            json!({"version":task["version"],"task_state_config":{"review":review}}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+        assert_command_refusal(&error);
+    }
+    let mut definition: Value = serde_json::from_str(&row.workflow_definition).unwrap();
+    definition["states"][0]["config"] = json!({"review":{"verify":{}}});
+    let error: Value = common::json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{project}/workflow"),
+        json!({"definition":definition}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    assert_command_refusal(&error);
+    // Null removes verify and must remain usable in demo mode.
+    let _: Value = common::json_request(
+        &harness.app,
+        Method::PATCH,
+        &format!("/api/v1/projects/{project}"),
+        json!({"version":row.version,"default_review_config":{"verify":null}}),
+        StatusCode::OK,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn demo_verify_mcp_settings_write_has_command_refusal_shape() {
+    demo();
+    let (_root, harness, project, _, _) = support::fixture("demo-verify-mcp").await;
+    let pat: api_types::TokenResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/auth/tokens",
+        json!({"name":"demo-verify"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let row = db::ProjectRepo::get_by_id(&*harness.state.db, &project)
+        .await
+        .unwrap()
+        .unwrap();
+    for verify in [
+        json!({"checks":[{"name":"smoke","command":"true"}]}),
+        json!({}),
+    ] {
+        let (status, response) = support::send_with_bearer(
+            &harness.app,
+            Method::POST,
+            &format!("/mcp?project_id={project}"),
+            pat.token.as_deref().unwrap(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"forge_update_project","arguments":{"project_id":project,
+                    "version":row.version,"settings":{"default_review_config":{"verify":verify}}}
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        let outcome = &response["result"]["structuredContent"];
+        assert_eq!(outcome["code"], "server_commands_disabled", "{response}");
+        assert_eq!(outcome["status"], "failed");
+        assert_eq!(outcome["safe_message"], "This demo does not run commands");
+    }
+}
+
+#[tokio::test]
+async fn demo_verify_stored_task_and_project_default_park_without_spawn() {
+    demo();
+    for project_default in [false, true] {
+        let (root, harness, project, repo, task) = support::fixture("demo-stored-verify").await;
+        let task_id = task["id"].as_str().unwrap();
+        support::seed_candidate(&harness, task_id, &repo, root.path()).await;
+        let marker = root.path().join("verify-marker");
+        let verify = json!({"start":format!("touch '{}'; sleep 1",marker.display()),
+            "ready_command":format!("touch '{}'",marker.display()),
+            "checks":[{"name":"smoke","command":format!("touch '{}'",marker.display())}]});
+        if project_default {
+            support::store_settings(
+                &harness,
+                &project,
+                json!({"default_review_config":{"verify":verify}}),
+            )
+            .await;
+        } else {
+            sqlx::query("UPDATE task SET task_state_config = ? WHERE id = ?")
+                .bind(json!({"review":{"verify":verify}}).to_string())
+                .bind(task_id)
+                .execute(harness.state.db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE task SET status = 'in_progress' WHERE id = ?")
+            .bind(task_id)
+            .execute(harness.state.db.pool())
+            .await
+            .unwrap();
+        let before = db::TaskRepo::get_by_id(&*harness.state.db, task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        harness
+            .state
+            .task_service
+            .transition(task_id, "review".to_owned(), before.version)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                harness.state.task_service.drain(task_id).await.unwrap();
+                let task = db::TaskRepo::get_by_id(&*harness.state.db, task_id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let annotation: Value =
+                    serde_json::from_str(task.error_annotation.as_deref().unwrap_or("{}")).unwrap();
+                if annotation["blocking_reason"] == "server_commands_disabled" {
+                    assert_eq!(task.status, "review");
+                    assert!(task
+                        .blocked_json
+                        .as_deref()
+                        .unwrap()
+                        .contains("server_commands_disabled"));
+                    assert!(task.review_passed_at.is_none());
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("verify refusal must settle as a visible, non-retrying park");
+        assert!(
+            !marker.exists(),
+            "no start, readiness or check command may run"
+        );
+        assert!(
+            db::ReviewRepo::list_by_task(&*harness.state.db, task_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "demo refusal precedes opening a Review attempt"
+        );
+        for table in ["check_run", "check_consumer"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(harness.state.db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "refusal must precede {table} admission");
+        }
+        let suspended: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_step WHERE task_id = ? AND status = 'suspended'",
+        )
+        .bind(task_id)
+        .fetch_one(harness.state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(suspended, 0, "no hooks step may remain suspended");
+        for budget in ["review", "review_ci_infrastructure", "review_verify_rerun"] {
+            assert_eq!(
+                db::budget::spent(harness.state.db.pool(), task_id, budget)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        let uri = format!("/api/v1/tasks/{task_id}/actions");
+        let offers: api_types::TaskActionsResponse =
+            common::empty_request(&harness.app, Method::GET, &uri, StatusCode::OK).await;
+        for verb in ["retry", "cancel"] {
+            assert!(
+                offers
+                    .available_actions
+                    .iter()
+                    .any(|offer| offer.action.verb() == verb),
+                "the parked entry must offer {verb}"
+            );
+        }
+        let cancelled: Value = common::json_request(
+            &harness.app,
+            Method::POST,
+            &uri,
+            json!({"version":offers.version,"action":{"verb":"cancel"}}),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(!marker.exists());
+    }
+}
+
 #[tokio::test]
 async fn demo_registered_non_admin_cannot_save_script_hook() {
     demo();

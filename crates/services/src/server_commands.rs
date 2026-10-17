@@ -20,7 +20,7 @@ pub fn validate_configuration(value: &Value) -> Result<()> {
                             && !value.is_null())
                             || (key == "command"
                                 && value.as_str().is_some_and(|s| !s.trim().is_empty()))
-                            || (key == "scaffold" && !value.is_null())
+                            || (matches!(key.as_str(), "scaffold" | "verify") && !value.is_null())
                             || commands(value)
                     })
             }

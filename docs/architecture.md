@@ -1018,9 +1018,11 @@ Execution sources independently consult the same decision before shell probes,
 hook/check/environment commands, scaffold processes, CLI/shell executors,
 native Chat command tools, compiler-cache helpers or embedded terminals can start. Stored asynchronous
 hooks also leave the ordinary hook-not-run comment on the Task. Review entry
-with configured CI records the refusal through the existing interruption park,
-without spending retries or leaving a suspended check consumer. Stored durable
-checks return unstarted infrastructure receipts carrying the refusal. Forge's
+with configured CI or non-null `ReviewConfig.verify` (app start, readiness and
+scripted checks) records the refusal through the existing interruption park in
+`review`, before creating a Review attempt or check consumer. It spends no
+review, infrastructure or verify retries and leaves no suspended hooks step.
+Stored durable checks return unstarted infrastructure receipts carrying the refusal. Forge's
 own Git operations remain outside this policy.
 
 The same switch also makes the demo server a manager only for agents and

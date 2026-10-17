@@ -118,15 +118,18 @@ that Project settings cannot turn off. It refuses three things, each with HTTP
 **422** and a code of its own:
 
 - **Commands** (`server_commands_disabled`, "This demo does not run
-  commands"): Script lifecycle hooks, review CI and setup steps, environment
+  commands"): Script lifecycle hooks, review CI and setup steps, review
+  `verify` (app start, readiness commands and scripted checks), environment
   checks and setup, scaffolding, server CLI/shell Agent executors, native
   command tools, interactive terminals and compiler-cache helpers. Project
   settings, Task overrides and workflow/template writes that contain them are
   refused. Commands that are already stored (seeded, template-derived) are
   refused before spawning: Script hooks record failed results (asynchronous
-  ones also as a Task comment), a review entry that requires CI parks the Task
-  with the reason instead of approving it, and environment checks return failed
-  results.
+  ones also as a Task comment), a review entry that requires CI or verify parks
+  the Task in `review` with `server_commands_disabled` before opening a Review
+  attempt or queuing a check. It spends no review, infrastructure or verify
+  retries and leaves no suspended check consumer. Remove the configuration and
+  retry the entry, or cancel the Task. Environment checks return failed results.
 - **Agents** (`server_agents_disabled`, "This demo does not run agents or
   connect model providers"): adding a provider credential (`POST
   /api/v1/providers`) or starting a provider authorization, and admitting a

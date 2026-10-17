@@ -50,3 +50,42 @@ pub fn ensure_agents_allowed() -> Result<(), ServerAgentsDisabled> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_commands_policy_is_monotonic_and_shared_with_agents() {
+        const CHILD: &str = "FORGE_SERVER_COMMANDS_POLICY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Disabling is irreversible: keep other executor tests in normal mode.
+            assert!(!manager_only());
+            assert!(ensure_allowed().is_ok());
+            assert!(ensure_agents_allowed().is_ok());
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server_commands::tests::server_commands_policy_is_monotonic_and_shared_with_agents",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(!manager_only());
+            return;
+        }
+        for _ in 0..2 {
+            disable();
+            assert!(manager_only());
+            assert_eq!(
+                ensure_allowed().unwrap_err().to_string(),
+                format!("{CODE}: {MESSAGE}")
+            );
+            assert_eq!(
+                ensure_agents_allowed().unwrap_err().to_string(),
+                format!("{AGENTS_CODE}: {AGENTS_MESSAGE}")
+            );
+        }
+    }
+}

@@ -8,8 +8,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- `forge --demo` no longer executes configured server commands or starts the
-  embedded daemon, refuses provider credentials and Chat/agent turns, and
+- `forge --demo` no longer executes configured server commands, including review
+  `verify` (app start, readiness and scripted checks), or starts the embedded
+  daemon. It refuses provider credentials and Chat/agent turns, and
   accepts only public `https://` repositories (no server paths, environment
   assets, integrations or MCP config file writes). Git operations performed by
   Forge remain available.
@@ -38,14 +39,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - The header brand is a consistently labelled Forge home link to `/`, using the
   existing home routing for accounts with and without Projects.
 
-## [0.14.0] - 2026-10-16
-
 ### Security
 
 - Demo mode refuses every command the server would run from user configuration.
   Command-bearing Project, Task and workflow writes return `422 server_commands_disabled`;
   stored hooks, checks, environment setup, scaffolds, executors, native Chat
-  command tools and terminals refuse before spawn. Review entries requiring CI park with the reason.
+  command tools and terminals refuse before spawn. Review entries requiring CI
+  or verify park with the reason before creating a Review attempt or check.
 - Demo mode runs no agent in the server process and reads nothing from the
   server through configuration. Adding provider credentials or authorizations
   and admitting native Chat turns return `422 server_agents_disabled`; any
@@ -72,6 +72,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   An explicit credential (any `Authorization` header, or `?token=`) always
   decides the request: the session cookie never overrides it or stands in for
   an invalid one.
+
+## [0.14.0] - 2026-10-16
+
+### Security
+
 - Scope Project and Task REST reads and mutations, including indirect comments,
   media, executions, reviews, repositories, diffs, terminals, chats, sessions,
   memory and coordination records, to the authenticated caller. Any signed-in
