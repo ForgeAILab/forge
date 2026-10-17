@@ -3516,6 +3516,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - The Docker image runs Forge under Tini so orphaned verification and CI
   descendants are reaped and process groups can finish stopping.
 
+- `GET /api/v1/settings` on a server started with `--data-dir X` reports
+  `forge.data_dir` as `X` instead of a pending `~/.forge` that claimed a
+  restart was required. A refused start prints a `--migrate-workspace-root`
+  command that reads the same `forge.yaml` as that start, also when
+  `~/.forge/forge.yaml` sets `forge.data_dir`.
 - CI triage classifies a candidate build failure without test signatures as
   introduced when the red base has test signatures, with a reason distinguishing
   the failures. No-change repair send-backs and parks now post idempotent Forge

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use api_types::{
     ForgeSettingResponse, SettingsResponse, UpdateAgentSettingsRequest, UpdateForgePathsRequest,
@@ -71,7 +71,7 @@ pub async fn update_settings(
 
 async fn settings_response(state: &AppState) -> ApiResult<SettingsResponse> {
     let path = state.config_path.as_path();
-    let pending_config = load_pending_config(path)?;
+    let pending_config = load_pending_config(path, state.launch_data_dir.as_deref())?;
     let effective_config = state.effective_config.as_ref();
 
     let mut transaction = state
@@ -413,9 +413,17 @@ async fn write_yaml_config(path: &Path, config: &Value) -> ApiResult<()> {
     })
 }
 
-fn load_pending_config(path: &Path) -> ApiResult<ForgeConfig> {
-    ForgeConfig::load(Some(path), ConfigOverrides::default())
-        .map_err(|error| ApiError::bad_request(error.to_string()))
+/// What the next start of this launch would load: the same forge.yaml and
+/// the same `--data-dir`, which outranks the file's `forge.data_dir`.
+fn load_pending_config(path: &Path, launch_data_dir: Option<&PathBuf>) -> ApiResult<ForgeConfig> {
+    ForgeConfig::load(
+        Some(path),
+        ConfigOverrides {
+            data_dir: launch_data_dir.cloned(),
+            ..ConfigOverrides::default()
+        },
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
 fn set_path(config: &mut Value, path: &[&str], value: Value) -> ApiResult<()> {

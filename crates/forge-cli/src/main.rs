@@ -96,6 +96,7 @@ fn main() {
 async fn run() {
     let cli = Cli::parse();
     let config_path = config::default_config_path(cli.data_dir.as_deref());
+    let launch_data_dir = cli.data_dir.clone();
     let config = ForgeConfig::load(
         Some(&config_path),
         ConfigOverrides {
@@ -355,7 +356,8 @@ async fn run() {
     ));
     let _daemon_monitor_handle = Arc::clone(&daemon_monitor).start(&periodic_workers);
     let state =
-        api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled);
+        api::AppState::from_runtime_arc(Arc::clone(&runtime), effective_config.server.mcp_enabled)
+            .with_launch_data_dir(launch_data_dir);
     executors::run_process::install_machine_policy(Arc::clone(&state.run_process_policy));
     let shared_media_cleanup_handle = Arc::clone(&shared_media_cleanup_scheduler)
         .spawn(&periodic_workers, state.shutdown_signal.subscribe());

@@ -2236,6 +2236,12 @@ retrospective mutation tool in this change.
 `GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
 The response lists `value`, `effective_value` and `restart_required` per key.
 Other keys retain their startup value until restart.
+Both read and write `config_path`, the `forge.yaml` this start loaded
+(`<data dir>/forge.yaml`, see
+[getting-started.md](getting-started.md#configuration)). `value` is what the
+next start of the same launch would use: on a server started with
+`--data-dir X`, `forge.data_dir` is `X`, because the flag outranks the file's
+`forge.data_dir`.
 
 | Key | Configured value | Application |
 | --- | --- | --- |
