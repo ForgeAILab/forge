@@ -134,7 +134,7 @@ async fn run() {
     }
 
     if let Some(target) = cli.migrate_workspace_root {
-        std::process::exit(migrate_workspace_root(&config, target).await);
+        std::process::exit(migrate_workspace_root(&config, &config_path, target).await);
     }
 
     init_tracing(&config.forge.data_dir.join("logs"));
@@ -161,7 +161,7 @@ async fn run() {
         .await
         .expect("Failed to run migrations");
     let db = Arc::new(db::SqliteDb::new(pool));
-    let workspace_root = settle_workspace_root(&db, &config).await;
+    let workspace_root = settle_workspace_root(&db, &config, &config_path).await;
 
     let configured_addr: SocketAddr = config
         .server
@@ -495,14 +495,18 @@ fn init_tracing(log_dir: &std::path::Path) {
 /// or on a first start the configured one (see `services::workspace_root`).
 /// A configured root that would leave recorded workspaces behind, and a move
 /// that did not finish, stop the start here.
-async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathBuf {
+async fn settle_workspace_root(
+    db: &db::SqliteDb,
+    config: &ForgeConfig,
+    config_path: &Path,
+) -> PathBuf {
     let choice = services::workspace_root::RootChoice {
         configured: absolute_path(config.workspace.root.clone())
             .expect("Failed to resolve workspace root path"),
         explicit: config.workspace.root_explicit,
         data_dir: config.forge.data_dir.clone(),
         system_temp: std::env::temp_dir(),
-        migrate_command: migrate_command(config),
+        migrate_command: migrate_command(config_path),
     };
     match services::workspace_root::settle(db, &choice).await {
         Ok(settled) => {
@@ -529,16 +533,28 @@ async fn settle_workspace_root(db: &db::SqliteDb, config: &ForgeConfig) -> PathB
 }
 
 /// The move command as this server's operator types it.
-fn migrate_command(config: &ForgeConfig) -> String {
+fn migrate_command(config_path: &Path) -> String {
+    launch_migrate_command(config_path, &config::default_data_dir())
+}
+
+/// The command must read the forge.yaml this start read. That file lives in
+/// the launch data directory (`--data-dir`, `FORGE_DATA_DIR`, `~/.forge`),
+/// which is the data directory unless the default file set `forge.data_dir`:
+/// naming that one with `--data-dir` would read another forge.yaml.
+fn launch_migrate_command(config_path: &Path, default_data_dir: &Path) -> String {
     services::workspace_root::RootChoice::migrate_command_for(
-        &config.forge.data_dir,
-        &config::default_data_dir(),
+        config_path.parent().unwrap_or_else(|| Path::new(".")),
+        default_data_dir,
     )
 }
 
 /// `forge --migrate-workspace-root [NEW_ROOT]`: the process exit code. The
 /// caller holds the data directory's runtime lock, so no server is running.
-async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -> i32 {
+async fn migrate_workspace_root(
+    config: &ForgeConfig,
+    config_path: &Path,
+    target: Option<PathBuf>,
+) -> i32 {
     let opened = async {
         let data_dir = absolute_path(config.forge.data_dir.clone()).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
@@ -572,7 +588,7 @@ async fn migrate_workspace_root(config: &ForgeConfig, target: Option<PathBuf>) -
         config.workspace.min_free_bytes,
     )
     .with_default_target(configured)
-    .with_command(migrate_command(config));
+    .with_command(migrate_command(config_path));
     match services::workspace_root::migrate::migrate(&db, &request).await {
         Ok(report) => {
             print!("{report}");
@@ -819,6 +835,22 @@ mod tests {
 #[cfg(test)]
 mod migrate_workspace_root_tests {
     use super::*;
+
+    #[test]
+    fn printed_command_reads_the_same_config_as_this_start() {
+        let home = PathBuf::from("/home/forge/.forge");
+        // Started with no flag or environment, whatever `forge.data_dir` the
+        // default file set: `--data-dir <that dir>` would read another file.
+        assert_eq!(
+            launch_migrate_command(&home.join("forge.yaml"), &home),
+            services::workspace_root::MIGRATE_COMMAND
+        );
+        // Started with --data-dir (or FORGE_DATA_DIR): the config lives there.
+        assert_eq!(
+            launch_migrate_command(Path::new("./test/forge.yaml"), &home),
+            "forge --data-dir ./test --migrate-workspace-root"
+        );
+    }
 
     #[test]
     fn flag_takes_an_optional_target_and_excludes_a_server_start() {

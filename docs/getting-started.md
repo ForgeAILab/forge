@@ -712,8 +712,10 @@ work was lost. What the first start after the upgrade does:
 
 A start is refused only in the last three cases and when a configured root
 differs from a recorded one that still holds live data; every refusal prints
-the command to run, with `--data-dir` when your data directory is not the
-default one. To leave the temp directory:
+the command to run, with `--data-dir` when the server was started with
+`--data-dir` or `FORGE_DATA_DIR` (a `forge.data_dir` set in
+`~/.forge/forge.yaml` is reached by the plain command, which reads that file).
+To leave the temp directory:
 
 ```bash
 # Stop Forge first.

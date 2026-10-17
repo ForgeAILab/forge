@@ -46,14 +46,15 @@ pub struct RootChoice {
     pub system_temp: PathBuf,
     /// The exact command that moves this install's root, as its operator
     /// types it (`forge --data-dir <dir> --migrate-workspace-root` when the
-    /// data directory is not the default one). Every refusal and warning
-    /// names it.
+    /// start located forge.yaml outside the default directory). Every refusal
+    /// and warning names it.
     pub migrate_command: String,
 }
 
 impl RootChoice {
-    /// The move command for a data directory: [`MIGRATE_COMMAND`] alone for
-    /// the default one, with `--data-dir` for any other.
+    /// The move command for the directory config lookup used:
+    /// [`MIGRATE_COMMAND`] alone for the default one, with `--data-dir` for
+    /// any other.
     #[must_use]
     pub fn migrate_command_for(data_dir: &Path, default_data_dir: &Path) -> String {
         if same_path(data_dir, default_data_dir) {
