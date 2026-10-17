@@ -79,8 +79,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   lifecycle as the default gate when they have the `reviewer` role and
   `canonical_phase: review`. Agent verdicts advance Tasks through integration;
   cancelled and failed entries retain the normal retry/park behavior. Human
-  review actions, recovery, review carry, checks, and review-ready projections
-  also resolve the gate from its workflow definition.
+  review actions, recovery, review carry, checks, review-ready projections and
+  the Task's `awaiting_human` flag also resolve the gate from its workflow
+  definition.
 - Well-known NAT64 (`64:ff9b::/96`) provider and fetch destinations now apply
   the IPv4 policy to the embedded address, allowing public IPv4 services on
   DNS64 networks while refusing private, loopback and metadata targets.
