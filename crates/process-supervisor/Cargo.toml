@@ -9,5 +9,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "process", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

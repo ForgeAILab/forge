@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 
 # Same program as `WRITER` in crates/process-supervisor/src/executable.rs.
-WRITER = 'umask 077\nexec /bin/cat > "$1"\n'
+WRITER = 'umask 077\nset -C\nexec /bin/cat > "$1"\n'
 
 
 def write_executable(path: Path, contents: str) -> None:

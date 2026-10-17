@@ -71,7 +71,12 @@ Script publication stages in a private sibling directory, writes from a separate
 Unix process, waits for that writer to exit, fsyncs through a read-only descriptor,
 and renames into place. The multithreaded parent never opens the executable inode
 for writing, so another fork cannot inherit a writable descriptor and make even
-an indirectly invoked Git hook fail with Linux `ETXTBSY`. All fake executable
+an indirectly invoked Git hook fail with Linux `ETXTBSY`. The staging directory
+can sit in a run-writable compiler-cache store, so the writer creates the file
+exclusively (`set -C`), the parent opens it with `O_NOFOLLOW | O_NONBLOCK` and
+requires a regular file with one link, and a writer still running after 10 s is
+stopped: an entry a run plants there fails the publication instead of being
+written through or chmodded. All fake executable
 fixtures and the generated compiler-cache launcher use this publisher.
 The writer program lives in the crate, since release images build from
 `crates/` alone (`scripts/test_crate_includes.py` keeps non-test includes

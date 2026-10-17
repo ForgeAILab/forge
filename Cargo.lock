@@ -2753,6 +2753,7 @@ dependencies = [
 name = "process-supervisor"
 version = "0.14.0"
 dependencies = [
+ "libc",
  "tempfile",
  "tokio",
  "tokio-util",
