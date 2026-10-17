@@ -1,18 +1,42 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MissionControlPage } from '@/pages/MissionControlPage'
 import type { AgentChatEntry } from '@/features/agent-chat/types'
 import type { MissionControlResponse } from '@/features/federation/types'
+import { useAuthStore } from '@/stores/auth'
+import type { Offer } from '@/types/generated'
 
 const retryTurn = vi.hoisted(() => vi.fn())
 const resolveAttention = vi.hoisted(() => vi.fn())
 const answerEscalation = vi.hoisted(() => vi.fn())
 const turnState = vi.hoisted(() => ({ live: false }))
 const taskAction = vi.hoisted(() => vi.fn())
+const permissions = vi.hoisted(() => ({
+  ownerId: 'user-1' as string | null,
+  role: 'owner' as string | null,
+  projectLoading: false,
+  projectError: false,
+  membersLoading: false,
+  membersError: false,
+}))
 vi.mock('@/api/hooks', () => ({
   useTaskAction: () => ({ mutate: taskAction, isPending: false }),
   useAgentQuery: (id?: string) => ({
     data: id === 'lead-agent' ? { name: 'Ada Lead' } : undefined,
+  }),
+  useProjectQuery: (id: string) => ({
+    data: permissions.projectLoading ? undefined : { id, owner_id: permissions.ownerId },
+    isLoading: permissions.projectLoading,
+    isError: permissions.projectError,
+  }),
+  useMembersQuery: () => ({
+    data: permissions.membersLoading
+      ? undefined
+      : permissions.role === null
+        ? []
+        : [{ user_id: 'user-1', role: permissions.role }],
+    isLoading: permissions.membersLoading,
+    isError: permissions.membersError,
   }),
 }))
 
@@ -199,7 +223,175 @@ const data: MissionControlResponse = {
   computed_at: '2026-08-12T12:00:00Z',
 }
 
+function reviewOwnerAttention(): MissionControlResponse['needs_attention'][number] {
+  return {
+    ...data.needs_attention[0],
+    category: 'review_needs_owner',
+    scope_type: 'project',
+    scope_id: 'project-1',
+    summary: 'Review needs the owner: repeated finding F1',
+    recommended_action: 'inspect_review',
+    details: {
+      entity_type: 'task',
+      entity_id: 'task-1',
+      task: { task_version: 12 },
+      interruption: { kind: 'review_needs_owner', reason: 'repeated finding F1' },
+      recovery: {
+        actions: [
+          {
+            action: { verb: 'retry' },
+            label: 'Retry With Guidance',
+            reason: 'review_owner_retry',
+            authority: ['owner'],
+            parameters: [],
+            target_execution_id: null,
+            propagates: false,
+          },
+        ],
+      },
+    },
+  }
+}
+
 describe('MissionControlPage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    Object.assign(permissions, {
+      ownerId: 'user-1',
+      role: 'owner',
+      projectLoading: false,
+      projectError: false,
+      membersLoading: false,
+      membersError: false,
+    })
+    useAuthStore.setState({
+      user: {
+        id: 'user-1',
+        email: 'owner@example.test',
+        display_name: 'Owner',
+        is_admin: false,
+        created_at: '2026-08-12T12:00:00Z',
+      },
+    })
+  })
+  afterEach(() => useAuthStore.getState().clearAuth())
+
+  it.each([
+    'member',
+    'viewer',
+    'admin',
+    'instance administrator',
+    'loading project',
+    'failed project',
+    'loading memberships',
+    'failed memberships',
+    'signed out',
+    'owner id with member role',
+  ])('keeps review parks visible without owner controls for %s', (viewer) => {
+    const previous = data.needs_attention
+    permissions.ownerId = 'another-owner'
+    permissions.role = viewer
+    if (viewer === 'instance administrator') {
+      useAuthStore.setState({ user: { ...useAuthStore.getState().user!, is_admin: true } })
+    }
+    if (viewer === 'signed out') useAuthStore.getState().clearAuth()
+    if (viewer === 'loading project') {
+      permissions.role = 'owner'
+      permissions.projectLoading = true
+    }
+    if (viewer === 'failed project') {
+      permissions.role = 'owner'
+      permissions.projectError = true
+    }
+    if (viewer === 'loading memberships') {
+      permissions.role = 'owner'
+      permissions.membersLoading = true
+    }
+    if (viewer === 'failed memberships') {
+      permissions.role = 'owner'
+      permissions.membersError = true
+    }
+    if (viewer === 'owner id with member role') {
+      permissions.ownerId = 'user-1'
+      permissions.role = 'member'
+    }
+    data.needs_attention = [reviewOwnerAttention()]
+    try {
+      render(<MissionControlPage />)
+      const card = screen
+        .getByRole('heading', {
+          name: 'Review needs the owner: repeated finding F1',
+        })
+        .closest('article')!
+      expect(within(card).getByText('Owner action needed')).toBeTruthy()
+      expect(within(card).getByRole('link', { name: 'Open review' })).toBeTruthy()
+      expect(within(card).queryAllByRole('button')).toHaveLength(0)
+      expect(taskAction).not.toHaveBeenCalled()
+      expect(resolveAttention).not.toHaveBeenCalled()
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
+  it.each([
+    { viewer: 'membership owner', ownerId: 'another-owner', role: 'owner' },
+    { viewer: 'owner id without membership', ownerId: 'user-1', role: null },
+    { viewer: 'legacy ownerless Project viewer', ownerId: null, role: 'viewer' },
+  ])('shows review owner controls to $viewer', ({ ownerId, role }) => {
+    const previous = data.needs_attention
+    Object.assign(permissions, { ownerId, role })
+    data.needs_attention = [reviewOwnerAttention()]
+    try {
+      render(<MissionControlPage />)
+      expect(screen.queryByText('Owner action needed')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Resolve' })).toBeTruthy()
+      fireEvent.click(screen.getByRole('button', { name: 'Retry With Guidance' }))
+      expect(taskAction).toHaveBeenCalledWith(
+        { taskId: 'task-1', version: 12, action: { verb: 'retry' } },
+        expect.anything(),
+      )
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
+  it('filters review offers by owner authority after an action refreshes them', () => {
+    const previous = data.needs_attention
+    const item = reviewOwnerAttention()
+    const recovery = item.details.recovery as { actions: Offer[] }
+    const ownerOffer = recovery.actions[0]
+    const agentOffer: Offer = {
+      ...ownerOffer,
+      label: 'Project Agent retry',
+      reason: 'agent_retry',
+      authority: ['project_agent'],
+    }
+    recovery.actions.push(agentOffer)
+    data.needs_attention = [item]
+    taskAction.mockImplementationOnce((_input, callbacks) =>
+      callbacks.onSuccess({
+        version: 13,
+        available_actions: [
+          { ...agentOffer, label: 'Refreshed Project Agent retry' },
+          { ...ownerOffer, label: 'Refreshed owner retry' },
+        ],
+      }),
+    )
+    try {
+      render(<MissionControlPage />)
+      expect(screen.queryByRole('button', { name: 'Project Agent retry' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Retry With Guidance' }))
+      expect(screen.queryByRole('button', { name: 'Refreshed Project Agent retry' })).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: 'Refreshed owner retry' }))
+      expect(taskAction).toHaveBeenLastCalledWith(
+        { taskId: 'task-1', version: 13, action: { verb: 'retry' } },
+        expect.anything(),
+      )
+    } finally {
+      data.needs_attention = previous
+    }
+  })
+
   it('keeps a withdrawn lead draft at its card position until dismissed, and can copy it', async () => {
     const previous = data.needs_attention
     const writeText = vi.fn().mockResolvedValue(undefined)

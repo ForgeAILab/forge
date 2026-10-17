@@ -498,7 +498,12 @@ impl ProjectEscalationService {
             let Some(a) = self.db.get_attention_in_tx(&mut tx, &id).await? else {
                 continue;
             };
-            if a.status != "open" || wake_attention_incident_digest(&a) != admitted_digest {
+            // Review parks already carry the owner's decision request. Old
+            // admitted turns may still link them alongside ordinary blockers.
+            if a.attention_type == "review_needs_owner"
+                || a.status != "open"
+                || wake_attention_incident_digest(&a) != admitted_digest
+            {
                 continue;
             }
             let recovered = outcome.is_some()

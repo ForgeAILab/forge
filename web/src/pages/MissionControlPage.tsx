@@ -19,7 +19,8 @@ import { Textarea } from '@/components/ui/textarea'
 import { LeadInputAnswer, isLeadInput } from '@/components/lead-input-answer'
 import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
 import type { Offer } from '@/types/generated'
-import { useAgentQuery } from '@/api/hooks'
+import { useAgentQuery, useMembersQuery, useProjectQuery } from '@/api/hooks'
+import { useAuthStore } from '@/stores/auth'
 import {
   useAgentChatsQuery,
   useAgentChatTurnsQuery,
@@ -145,7 +146,11 @@ function attentionTone(item: AttentionItem): string {
   return 'border-border-subtle bg-card'
 }
 
-function ReviewOwnerActions({ item }: { item: AttentionItem }) {
+function ownerOffers(offers: Offer[]): Offer[] {
+  return offers.filter((offer) => offer.authority.includes('owner'))
+}
+
+function ReviewOwnerActions({ item, canAct }: { item: AttentionItem; canAct: boolean }) {
   const taskId = attentionTaskId(item)
   const task = item.details.task as { task_version?: number } | null | undefined
   const recovery = item.details.recovery as { actions?: Offer[] } | null | undefined
@@ -160,10 +165,19 @@ function ReviewOwnerActions({ item }: { item: AttentionItem }) {
         Open review
         <ArrowUpRight size={14} aria-hidden />
       </Link>
-      {item.lifecycle !== 'resolved' &&
+      {!canAct && item.lifecycle !== 'resolved' ? (
+        <p className="text-xs text-muted-foreground">Owner action needed</p>
+      ) : null}
+      {canAct &&
+      item.lifecycle !== 'resolved' &&
       typeof task?.task_version === 'number' &&
       Array.isArray(recovery?.actions) ? (
-        <TaskActionButtons taskId={taskId} version={task.task_version} offers={recovery.actions} />
+        <TaskActionButtons
+          taskId={taskId}
+          version={task.task_version}
+          offers={recovery.actions}
+          transformOffers={ownerOffers}
+        />
       ) : null}
     </div>
   )
@@ -337,17 +351,47 @@ function WithdrawnLeadDraft({
   )
 }
 
-function AttentionCard({
-  item,
-  answer,
-  onAnswerChange,
-  onAnswered,
-}: {
+type AttentionCardProps = {
   item: AttentionItem
   answer: string
   onAnswerChange: (answer: string) => void
   onAnswered: () => void
-}) {
+}
+
+function AttentionCard(props: AttentionCardProps) {
+  return props.item.category === 'review_needs_owner' ? (
+    <ReviewOwnerAttentionCard {...props} />
+  ) : (
+    <AttentionCardContent {...props} />
+  )
+}
+
+function ReviewOwnerAttentionCard(props: AttentionCardProps) {
+  const user = useAuthStore((state) => state.user)
+  const project = useProjectQuery(props.item.scope_id)
+  const members = useMembersQuery(props.item.scope_id)
+  const member = members.data?.find((entry) => entry.user_id === user?.id)
+  const ownerId = project.data && 'owner_id' in project.data ? project.data.owner_id : undefined
+  // Match ProjectAccess::Owner: an explicit membership takes precedence over
+  // owner_id, and instance administration alone does not grant owner rights.
+  const canAct = Boolean(
+    user &&
+    project.data &&
+    !project.isError &&
+    members.data &&
+    !members.isError &&
+    (ownerId === null || (member ? member.role === 'owner' : ownerId === user.id)),
+  )
+  return <AttentionCardContent {...props} canAct={canAct} />
+}
+
+function AttentionCardContent({
+  item,
+  answer,
+  onAnswerChange,
+  onAnswered,
+  canAct = true,
+}: AttentionCardProps & { canAct?: boolean }) {
   const isProgressWarning = item.category === 'progress_warning'
   const taskId = isProgressWarning ? attentionTaskId(item) : null
   const retryAction = attentionRetryAction(item)
@@ -378,7 +422,7 @@ function AttentionCard({
               {isProgressWarning ? 'Waiting for semantic progress' : item.summary}
             </h3>
             <StateBadge status={item.lifecycle} />
-            {item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
+            {canAct && item.lifecycle !== 'resolved' && !isLeadInput(item) ? (
               <Button
                 variant="ghost"
                 size="sm"
@@ -400,7 +444,9 @@ function AttentionCard({
             )}
           </p>
           <CiIncidentDetails item={item} />
-          {item.category === 'review_needs_owner' ? <ReviewOwnerActions item={item} /> : null}
+          {item.category === 'review_needs_owner' ? (
+            <ReviewOwnerActions item={item} canAct={canAct} />
+          ) : null}
           <p className="mt-3 font-mono text-micro text-muted-foreground">
             {humanize(item.scope_type)} · {item.scope_id.slice(0, 8)} · priority {item.priority} ·
             event {item.source_event_id.slice(0, 8)}

@@ -3293,6 +3293,15 @@ commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
 
+`review_needs_owner` is an owner-only incident: projection retains its reason
+and owner Task offers without preparing a wake or an Agent setup decision.
+The blocker sweep skips it, consuming no wake budget, and completion of a
+previously admitted turn excludes it from owner escalation. Other Attention
+categories keep their wake behavior. Mission Control checks the signed-in
+user's Project and membership data before rendering owner offers or Resolve;
+other viewers retain the reason and Review link with `Owner action needed`
+and no buttons. Pending or failed permission reads withhold those controls.
+
 Attention consumer health uses live subscribed backlog and checkpoint progress.
 A caught-up or newly initialized consumer is not stale; both the oldest pending
 event and the progress/initialization baseline must exceed 90 seconds to be stale.
@@ -6561,7 +6570,8 @@ Resolving the item without an answer is refused; an answer on any other item
 is refused.
 
 Project Agent wakes. Project-scope blocker wakes are admitted in one place,
-the blocker sweep (the event path defers them to it), and the sweep has one
+the blocker sweep (the event path defers them to it). Owner-only
+`review_needs_owner` incidents are excluded. For other blockers, the sweep has one
 rule (`task_hierarchy::subtask_park_is_the_leads`): an open blocker of a subtask
 wakes nobody while its root's lead handles it, that is while the root is about
 to re-plan for that park or its lead is planning. It is level state, not a
@@ -6570,7 +6580,7 @@ parked (its `replan` budget included) or lost its lead, the next sweep admits
 the wake. The rule never guesses: a subtask whose root is gone is the
 Project Agent's, and a read that fails for any other reason holds the wake
 for that sweep instead of waking the Project Agent beside a lead that may be
-handling the park. Blockers of the root itself always wake the Project Agent.
+handling the park. Eligible blockers of the root itself wake the Project Agent.
 The Attention item of the subtask is raised either way; only the wake is
 filtered.
 

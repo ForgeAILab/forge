@@ -1715,6 +1715,177 @@ async fn undisposed_manual_execution_failure_becomes_actionable_after_grace() {
 }
 
 #[tokio::test]
+async fn review_owner_parks_stay_visible_without_wakes_or_escalations() {
+    for initially_paused in [false, true] {
+        let db = database().await;
+        let identity_id = new_uuid_v4();
+        identity(&db, &identity_id).await;
+        let project_id = configured_project(&db, &identity_id, "owner-only-review").await;
+        sqlx::query("UPDATE agent_identity SET paused=? WHERE id=?")
+            .bind(initially_paused)
+            .bind(&identity_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let task = project_task(&db, &project_id, "Owner must decide").await;
+        let now = now_rfc3339();
+        let annotation = serde_json::json!({
+            "type": "review_needs_owner", "message": "repeated finding F1"
+        });
+        let condition = serde_json::json!({
+            "kind": "review_needs_owner", "reason": "repeated finding F1", "created_at": now
+        });
+        TaskRepo::update_status(
+            &*db,
+            db::UpdateTaskStatus {
+                id: task.id.clone(),
+                expected_version: task.version,
+                status: "review".into(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation.to_string())),
+                blocked_json: Some(Some(condition.to_string())),
+                failed_json: Some(None),
+                updated_at: now.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let service = || {
+            AttentionService::new(
+                Arc::clone(&db),
+                Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+            )
+        };
+        service().project_once(100).await.unwrap();
+        let attention_id: String = sqlx::query_scalar(
+            "SELECT id FROM attention_projection
+         WHERE attention_type='review_needs_owner' AND scope_id=? AND status='open'",
+        )
+        .bind(&project_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let owner_park = db.get_attention(&attention_id).await.unwrap().unwrap();
+        assert_eq!(
+            owner_park.summary,
+            "Review needs the owner: repeated finding F1"
+        );
+        // Fresh service instances exercise startup sweeps as well as event projection.
+        for _ in 0..2 {
+            assert_eq!(service().sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
+            service().project_once(100).await.unwrap();
+        }
+        for table in [
+            "agent_chat_turn_job",
+            "agent_wake_budget_window",
+            "agent_wake_lease",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "owner review parks must not create {table}");
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM domain_event WHERE event_type LIKE 'agent.wake.%'"
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0,
+            "owner-only work needs neither an Agent wake nor a setup decision"
+        );
+
+        // An ordinary blocker beside the owner park still wakes and escalates normally.
+        sqlx::query("UPDATE agent_identity SET paused=0 WHERE id=?")
+            .bind(&identity_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let failure = project_task(&db, &project_id, "Recover executor failure").await;
+        let annotation = serde_json::json!({"type": "executor_failed"});
+        let condition = serde_json::json!({
+            "kind": "executor_failed", "reason": "executor failed", "created_at": now
+        });
+        TaskRepo::update_status(
+            &*db,
+            db::UpdateTaskStatus {
+                id: failure.id.clone(),
+                expected_version: failure.version,
+                status: "in_progress".into(),
+                assignee_id: None,
+                error_annotation: Some(Some(annotation.to_string())),
+                blocked_json: Some(Some(condition.to_string())),
+                failed_json: Some(None),
+                updated_at: now_rfc3339(),
+            },
+        )
+        .await
+        .unwrap();
+        service().project_once(100).await.unwrap();
+        let linked: Vec<String> = sqlx::query_scalar(
+            "SELECT a.attention_type FROM agent_wake_blocker b
+         JOIN attention_projection a ON a.id=b.attention_id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(linked, vec!["execution_failed"]);
+        let turn_id: String = sqlx::query_scalar("SELECT id FROM agent_chat_turn_job")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        // A turn admitted before this policy changed can still finish after an
+        // upgrade. Its old owner-park link must not duplicate the owner request.
+        sqlx::query(
+            "INSERT INTO agent_wake_blocker
+                    (attention_id,incident_digest,turn_job_id,admitted_at) VALUES (?,?,?,?)",
+        )
+        .bind(&attention_id)
+        .bind(services::wake_attention_incident_digest(&owner_park))
+        .bind(&turn_id)
+        .bind(&now)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agent_chat_turn_job SET status='succeeded',version=version+1 WHERE id=?",
+        )
+        .bind(&turn_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        services::project_escalation::ProjectEscalationService::new(Arc::clone(&db))
+            .after_wake_turn(&turn_id)
+            .await
+            .unwrap();
+        service().project_once(100).await.unwrap();
+        let needs: Vec<String> = sqlx::query_scalar(
+            "SELECT details_json FROM attention_projection
+         WHERE attention_type='human_input_required' AND status='open'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(needs.len(), 1, "the ordinary blocker still escalates");
+        assert!(needs[0].contains(&failure.id));
+        assert!(
+            !needs[0].contains(&task.id),
+            "the owner park must not be escalated again"
+        );
+        assert_eq!(
+            db.get_attention(&attention_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open"
+        );
+    }
+}
+
+#[tokio::test]
 async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention() {
     let db = database().await;
     let identity_id = new_uuid_v4();

@@ -325,6 +325,11 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 - Review parks use the existing warning card treatment and name the owner's
   decision and park reason. Render the server's owner offers with the shared
   Task action buttons and parameter dialogs; link to the Task's Review tab.
+  Show owner offers and Resolve only after the signed-in user's Project owner
+  permission is confirmed from Project and membership data. Other viewers,
+  including while permission data loads or fails, retain the reason and Review
+  link with muted `Owner action needed` text and no buttons. Filter refreshed
+  Task offers by owner authority too. Preserve legacy ownerless Project rights.
   Resolved cards retain their reason and link without active Task controls.
   Long reasons wrap and actions use the existing responsive button layout.
 - **Hierarchy:** primary views lead with the singular Main binding, one Project binding per authorized Project, relevant Task Worker/reviewer activity, Attention, and outcomes. Connected profiles without a binding or active Task scope stay in secondary configuration inventory.

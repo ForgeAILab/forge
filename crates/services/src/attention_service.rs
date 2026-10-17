@@ -353,6 +353,11 @@ impl AttentionService {
             let Some(attention) = self.db.get_attention(&candidate.id).await? else {
                 continue;
             };
+            // This incident already asks the owner. An Agent cannot resolve
+            // it, so neither a blocker turn nor its later escalation helps.
+            if attention.attention_type == "review_needs_owner" {
+                continue;
+            }
             if attention.scope_type == "project" && blocker_category(&attention.attention_type) {
                 // The one lead filter: a subtask's blocker that the lead of
                 // its coordination root handles (the root is about to
@@ -2638,7 +2643,9 @@ impl AttentionService {
             // as recursive suppression even when its binding has already
             // disappeared; setup-required would otherwise hide a recursion
             // decision behind a missing responder.
-            let decision = if let Some(reason) = wake_policy_suppression_reason(&request) {
+            let decision = if category == "review_needs_owner" {
+                PreparedWakeDecision::OwnerOnly
+            } else if let Some(reason) = wake_policy_suppression_reason(&request) {
                 PreparedWakeDecision::Suppressed(reason)
             } else {
                 let configured = self
@@ -2804,6 +2811,7 @@ impl AttentionService {
                 batch: vec![attention.clone()],
             };
             match &p.decision {
+                PreparedWakeDecision::OwnerOnly => {}
                 PreparedWakeDecision::Admit
                     if attention.scope_type == "project"
                         && blocker_category(&attention.attention_type) =>
@@ -4017,6 +4025,7 @@ struct PreparedAttentionIncident {
     orphan_execution_id: Option<String>,
 }
 enum PreparedWakeDecision {
+    OwnerOnly,
     Admit,
     Suppressed(WakeSuppressionReason),
     SetupRequired,
