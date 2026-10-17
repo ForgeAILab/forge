@@ -2254,7 +2254,7 @@ fn classify_status(status: &str, workflow: &api_types::WorkflowDefinition) -> Ta
         TaskBucket::Terminal
     } else if status == "blocked" || status.contains("blocked") {
         TaskBucket::Blocked
-    } else if status.contains("merge") {
+    } else if status.contains("review") || status.contains("merge") {
         TaskBucket::Review
     } else if matches!(
         status.as_str(),
@@ -2441,6 +2441,33 @@ fn sql_error(error: sqlx::Error) -> ApiError {
 /// this task it named no handler anywhere. `resolve_project_reconciliation`
 /// is referenced by path below so renaming or deleting that handler fails
 /// this module to compile rather than silently reintroducing a dead action.
+#[cfg(test)]
+mod classify_status_tests {
+    use super::*;
+
+    /// A renamed review gate counts as review whatever its name, and a state
+    /// whose name says review or merge stays in the review bucket, as before.
+    #[test]
+    fn review_bucket_adds_renamed_review_gates_and_keeps_review_names() {
+        let mut workflow = services::workflow::default_workflow::default_workflow();
+        for state in &mut workflow.states {
+            if state.name == "review" {
+                state.name = "signoff".into();
+            }
+        }
+        for status in ["signoff", "security_review", "review", "merge_failed"] {
+            assert!(
+                matches!(classify_status(status, &workflow), TaskBucket::Review),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            classify_status("in_progress", &workflow),
+            TaskBucket::Active
+        ));
+    }
+}
+
 #[cfg(test)]
 mod next_action_parity_tests {
     use super::*;
