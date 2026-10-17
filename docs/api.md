@@ -2247,23 +2247,6 @@ retrospective mutation tool in this change.
 ## Forge Settings
 
 `GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
-
-`GET /api/v1/config/mcp` and `POST /api/v1/config/mcp` use that same instance
-administrator requirement. A signed-in non-administrator receives HTTP 403
-`admin_required` before any server configuration file is accessed or its path
-is returned. These routes inspect or modify the server's filesystem: `scope=user`
-uses the server's HOME, and `scope=project` (the default) or `scope=local`
-without a Project id uses the server's current directory.
-
-With a non-empty `project_id` in Project/local scope, reads also require Project
-visibility and writes require its owner/admin role. Instance administrator status
-does not bypass Project visibility: an inaccessible Project has the same HTTP
-404 `not_found` response as an unknown Project, before repository/path lookup;
-an insufficient Project write role returns HTTP 403 `insufficient_role`.
-Authorized responses retain `config_path`, `url`, `expected_url`, `installed`
-and `agents`. Requests accept `agent` (`claude`, `cursor`, `codex`), `scope`
-(`project`, `local`, `user`), optional `project_id` and `public_base_url`;
-POST additionally accepts `action` (`install`, `uninstall`).
 The response lists `value`, `effective_value` and `restart_required` per key.
 Other keys retain their startup value until restart.
 Both read and write `config_path`, the `forge.yaml` this start loaded
@@ -2333,6 +2316,28 @@ Operations `daemon_pressure` machine entries add nullable `logical_cores`,
 external daemons leave them null because build/priority policy stays local and
 is not sent over the protocol. `build_jobs_per_run: 0` denotes a disabled budget,
 while `run_nice` reports the configured increment, including on Windows.
+
+
+### MCP client configuration
+
+`GET /api/v1/config/mcp` and `POST /api/v1/config/mcp` use the same instance
+administrator requirement as Settings. A signed-in non-administrator receives HTTP 403
+`admin_required` before any server configuration file is accessed or its path
+is returned. These routes inspect or modify the server's filesystem: `scope=user`
+uses the server's HOME, and `scope=project` (the default) or `scope=local`
+without a Project id uses the server's current directory.
+
+With a non-empty `project_id` in Project/local scope, reads also require Project
+visibility and writes require its owner/admin role. Instance administrator status
+does not bypass Project visibility: an inaccessible Project has the same HTTP
+404 `not_found` response as an unknown Project, before repository/path lookup;
+an insufficient Project write role returns HTTP 403 `insufficient_role`.
+Authorized responses retain `config_path`, `url`, `expected_url`, `installed`
+and `agents`. Requests accept `agent` (`claude`, `cursor`, `codex`), `scope`
+(`project`, `local`, `user`), optional `project_id` and `public_base_url`;
+POST additionally accepts `action` (`install`, `uninstall`). The web MCP controls
+call these routes only for administrators; other users see the browser-origin
+MCP URL (`/mcp`, with `?project_id=` in Project scope) for their own client.
 
 
 ### Daemon run limits
