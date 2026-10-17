@@ -77,7 +77,7 @@ pub(crate) fn review_ci_steps_for_task(
     workflow
         .states
         .iter()
-        .find(|state| state.name == crate::workflow::default_states::REVIEW)
+        .find(|state| db::budget::is_review_state(state))
         .map(|state| hooks::merged_state_config(state, project, task_state_config_json))
         .and_then(|config| crate::workflow::actions::review_ci_steps(&config).ok())
         .unwrap_or_default()

@@ -600,10 +600,7 @@ impl WorkflowExecution<'_> {
         // This guard precedes every review-entry check and every path that
         // creates a Review (including a gate without configured CI).
         let mut no_change_send_back = false;
-        if cascade.is_none()
-            && to_state.kind == StateKind::Gate
-            && to_state.canonical_phase == Some(api_types::CanonicalPhase::Review)
-        {
+        if cascade.is_none() && db::budget::is_review_state(to_state) {
             match crate::workflow::actions::no_change::repair_no_change_gate(
                 &enter_ctx,
                 &task,
@@ -767,7 +764,7 @@ impl WorkflowExecution<'_> {
                         }
 
                         if matches!(hook.on_failure, FailurePolicy::Block) {
-                            if target_state == crate::workflow::default_states::REVIEW {
+                            if db::budget::is_review_state(to_state) {
                                 if let Some(reject_target) = to_state
                                     .gate_config
                                     .as_ref()

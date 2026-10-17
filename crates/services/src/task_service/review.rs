@@ -49,7 +49,7 @@ impl TaskService {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? else {
             return Ok(());
         };
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Ok(());
         }
         if ExecutionRepo::list_running_by_task(&*self.db, &task.id)
@@ -276,7 +276,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
@@ -430,7 +430,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
@@ -518,7 +518,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status

@@ -273,7 +273,15 @@ impl ProjectArtifactCommandService {
                     "observed_task_id must name a Task in this Project that produced the observation",
                 )
             })?;
-            if !matches!(observed_task_status.as_str(), "done" | "review" | "merging") {
+            let project = ProjectRepo::get_by_id(&*self.db, &command.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", command.project_id.clone()))?;
+            let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow(
+                &project.workflow_definition,
+            );
+            if !matches!(observed_task_status.as_str(), "done" | "merging")
+                && !crate::workflow::is_review_state(&workflow, &observed_task_status)
+            {
                 return Err(ServiceError::invalid_operation(
                     "the observed Task has not produced a delivered result to validate against",
                 ));

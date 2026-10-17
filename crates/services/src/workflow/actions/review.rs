@@ -40,9 +40,7 @@ pub(super) async fn prepare_review_entry(
     else {
         return Ok(None);
     };
-    if state.kind != api_types::StateKind::Gate
-        || state.canonical_phase != Some(api_types::CanonicalPhase::Review)
-    {
+    if !db::budget::is_review_state(state) {
         return Ok(None);
     }
     // An Agent reviewer is refused dispatch for want of a candidate and
@@ -1705,7 +1703,9 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 }
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
-    ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
+    ctx.triggered_by.is_user()
+        && crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state)
+        && !reviewer_assigned
 }
 
 /// One line naming what failed, for the transition log and Task history. The

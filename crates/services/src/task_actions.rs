@@ -168,6 +168,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     else {
         return Vec::new();
     };
+    let in_review = db::budget::is_review_state(state);
     let mut offers = Vec::new();
     let running = snapshot.executions.iter().any(|execution| {
         execution.status == ExecutionStatus::Running && execution.role != "interactive"
@@ -270,8 +271,8 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             .as_ref()
             .is_some_and(|review| review.status == ReviewStatus::AwaitingHuman)
             || (condition_read.explicit_human_wait
-                && (task.status != "review" || snapshot.latest_review.is_none()))
-            || (task.status == "review"
+                && (!in_review || snapshot.latest_review.is_none()))
+            || (in_review
                 && snapshot.latest_review.is_none()
                 && !running
                 && state.gate_config.as_ref().is_some_and(|gate| {
@@ -382,7 +383,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                         | "execution_retry_exhausted"
                         | "check_infrastructure_exhausted"
                 ))
-            && (task.status != "review"
+            && (!in_review
                 || action.verb() != "retry"
                 || implementation_candidate
                 || matches!(
@@ -503,7 +504,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         && target(WorkflowTrigger::Reject)
             .or_else(|| workflow.gate_reject_target(&task.status).map(str::to_owned))
             .is_some_and(|target| workflow.state_kind(&target) == Some(StateKind::Active))
-        && !(exhausted && task.status == "review")
+        && !(exhausted && in_review)
         && matches!(
             task.condition.integration_wait(),
             Some(api_types::IntegrationReason::Repair { .. })
@@ -621,7 +622,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
     // candidate and a reviewer retry would park again. The decision is the
     // owner's, exactly as before the park existed: approve the gate, send
     // the Task back to add work, or cancel it (offered above).
-    if task.status == "review"
+    if in_review
         && condition == Some(FailureKind::ReviewBlocked)
         && snapshot.annotation().is_some_and(|annotation| {
             annotation.blocking_reason == crate::task_service::MISSING_REVIEW_CANDIDATE
@@ -661,7 +662,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         append_owner_advance(snapshot, &mut offers);
         return offers;
     }
-    if task.status == "review"
+    if in_review
         && condition == Some(FailureKind::ReviewBlocked)
         && task
             .blocked_json
@@ -737,7 +738,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         && (awaiting_human
             || (state.kind == StateKind::Active
                 && latest.is_some_and(|execution| execution.status == ExecutionStatus::Completed))
-            || (task.status == "review"
+            || (in_review
                 && (manual_review_candidate || target(WorkflowTrigger::Accept).is_some()))
             || (task.status == "planning" && snapshot.planning_approval_ready));
     let placement_wait = snapshot.wait_cause.is_some() && !decision_ready
@@ -967,7 +968,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Restart Task",
             );
         }
-        if task.status == "review" && failed_review && manual_review_candidate {
+        if in_review && failed_review && manual_review_candidate {
             offer(
                 TaskAction::Approve {
                     reason: None,
@@ -983,10 +984,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         // work, and a parent in review accepts no new subtask. Sending it
         // back reopens it, held, so a corrective subtask can be added; its
         // release runs that subtask and the aggregate review after it.
-        if task.status == "review"
-            && snapshot.coordination_root
-            && target(WorkflowTrigger::Reject).is_some()
-        {
+        if in_review && snapshot.coordination_root && target(WorkflowTrigger::Reject).is_some() {
             offer(
                 TaskAction::SendBack {
                     guidance: String::new(),
@@ -997,7 +995,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Reopen for a Corrective Subtask",
             );
         }
-        if !(task.status == "review"
+        if !(in_review
             && state
                 .gate_config
                 .as_ref()
@@ -1028,7 +1026,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         .gate_config
         .as_ref()
         .is_some_and(|gate| gate.requires_user_approval());
-    if task.status == "review"
+    if in_review
         && matches!(
             condition,
             Some(FailureKind::ReviewNeedsOwner | FailureKind::ReviewBlocked)
@@ -1078,10 +1076,9 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry With Guidance",
             );
         }
-    } else if (task.status != "review" || (awaiting_human && condition.is_none()))
+    } else if (!in_review || (awaiting_human && condition.is_none()))
         && (review_wait
-            || ((task.status == "review"
-                || (task.status == "planning" && snapshot.planning_approval_ready))
+            || ((in_review || (task.status == "planning" && snapshot.planning_approval_ready))
                 && !failed_review
                 && target(WorkflowTrigger::Accept).is_some())
             || (state.kind == StateKind::Gate
@@ -1089,7 +1086,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 && (task.status != "planning" || snapshot.planning_approval_ready)
                 && target(WorkflowTrigger::Accept).is_some()))
     {
-        let authorities = if task.status == "review" && owner_gate {
+        let authorities = if in_review && owner_gate {
             vec![Owner, ProjectAgent]
         } else {
             vec![Owner]
@@ -1101,7 +1098,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             },
             &[],
             &authorities,
-            if task.status == "review"
+            if in_review
                 && snapshot
                     .latest_review
                     .as_ref()
@@ -1127,7 +1124,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Reset Budget and Retry",
             );
         }
-        if task.status == "review"
+        if in_review
             && !exhausted
             && !one_shot_allowed
             && implementation_candidate
@@ -1144,7 +1141,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Recheck Review",
             );
         }
-    } else if task.status == "review"
+    } else if in_review
         && state.kind == StateKind::Gate
         && failed_review
         && implementation_candidate
@@ -1171,7 +1168,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
                 "Retry Review",
             );
         }
-        if task.status == "review" && manual_review_candidate {
+        if in_review && manual_review_candidate {
             offer(
                 TaskAction::Approve {
                     reason: None,
@@ -1372,7 +1369,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             propagates: false,
         });
     }
-    if task.status == "review"
+    if in_review
         && implementation_candidate
         && condition.is_none()
         && !offers.iter().any(|offer| offer.action.verb() == "retry")
@@ -1427,7 +1424,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
         }
     };
     if target(WorkflowTrigger::Reject).is_some() && state.kind == StateKind::Gate {
-        let authorities = if owner_gate && task.status == "review" {
+        let authorities = if owner_gate && in_review {
             vec![Owner, ProjectAgent]
         } else {
             vec![Owner]
@@ -1438,7 +1435,7 @@ fn derive_offers(snapshot: &TaskSnapshot) -> Vec<Offer> {
             },
             &["guidance"],
             &authorities,
-            if task.status == "review"
+            if in_review
                 && snapshot
                     .latest_review
                     .as_ref()
@@ -1689,7 +1686,7 @@ pub async fn load_snapshot(
             }
         }
     }
-    if task.status == "review" {
+    if crate::workflow::is_review_state(&workflow, &task.status) {
         if let Some(candidate) =
             crate::task_service::latest_executor_execution_for_task(db, &task).await?
         {
@@ -2177,6 +2174,50 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub(crate) use super::test_support::snapshot;
+
+    #[test]
+    fn renamed_review_gate_keeps_default_review_action_offers() {
+        for condition in [
+            None,
+            Some(FailureKind::ReviewNeedsOwner),
+            Some(FailureKind::ReviewBudgetExhausted),
+        ] {
+            for status in [
+                ReviewStatus::Running,
+                ReviewStatus::AwaitingHuman,
+                ReviewStatus::Failed,
+                ReviewStatus::Passed,
+                ReviewStatus::Cancelled,
+            ] {
+                let mut original = snapshot("review", condition);
+                original.latest_review = Some(super::condition_matrix::review(status.clone()));
+                original.executions = vec![super::condition_matrix::exec(
+                    "candidate",
+                    "coder",
+                    ExecutionStatus::Completed,
+                    false,
+                )];
+                let expected = projected_actions(&original);
+                let mut renamed = original.clone();
+                renamed.task.status = "qa_review".into();
+                for state in &mut renamed.workflow.states {
+                    if state.name == "review" {
+                        state.name = "qa_review".into();
+                    }
+                    for trigger in state.triggers.values_mut() {
+                        if trigger.to == "review" {
+                            trigger.to = "qa_review".into();
+                        }
+                    }
+                }
+                assert_eq!(
+                    projected_actions(&renamed),
+                    expected,
+                    "condition={condition:?}, review={status:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn open_item_5_failure_without_a_coder_does_not_offer_an_inapplicable_repair_retry() {

@@ -388,7 +388,7 @@ pub(super) fn merged_state_config(
     task_state_config_json: Option<&str>,
 ) -> Value {
     let mut merged = state.config.clone();
-    if state.name == crate::workflow::default_states::REVIEW {
+    if db::budget::is_review_state(state) {
         merge_project_review_config(&mut merged, project);
     }
 

@@ -3704,7 +3704,12 @@ Agent is at its run limit, for example a Task sent back by review while the
 coder runs other Tasks. It is the same kind of wait and clears when one of the
 Agent's runs ends; a Task still waiting for its first run shows no reason.
 
-A parent Task (one with subtasks) parked in `review` on an exhausted review
+Review actions, re-runs, and review-ready projections resolve review states from
+the workflow: the state named `review`, or a gate with role `reviewer` and
+`canonical_phase: review`. A custom name such as `qa_review` has the same review
+behavior and appears under its actual state name in responses and events.
+
+A parent Task (one with subtasks) parked in a review state on an exhausted review
 budget offers three exits besides `cancel`: `retry` (reset the budget and
 re-run the aggregate review in place), `approve` with `override_checks: true`
 (the owner passes the failed review; see below) and `send_back` (offer reason

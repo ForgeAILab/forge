@@ -18,7 +18,6 @@ use crate::{
             carry_budget_refusal, carry_path_refusal, gate_refuses_carry, task_carry_checks,
             CarryError,
         },
-        default_states,
         engine::WorkflowEngine,
     },
     Result, ServiceError,
@@ -103,7 +102,7 @@ impl HeadCheckSource for ReviewCiHeadCheck {
         let review_config = workflow
             .states
             .iter()
-            .find(|state| state.name == default_states::REVIEW)
+            .find(|state| db::budget::is_review_state(state))
             .map(|state| {
                 crate::workflow::engine::effective_state_config(
                     state,
@@ -572,7 +571,7 @@ impl IntegrationSteps {
         let review = workflow
             .states
             .iter()
-            .find(|state| state.name == default_states::REVIEW);
+            .find(|state| db::budget::is_review_state(state));
         if let Some(reason) =
             gate_refuses_carry(review.and_then(|state| state.gate_config.as_ref()))
         {
@@ -706,7 +705,7 @@ impl IntegrationSteps {
                 let config = workflow
                     .states
                     .iter()
-                    .find(|state| state.name == default_states::REVIEW)
+                    .find(|state| db::budget::is_review_state(state))
                     .map(|state| {
                         crate::workflow::engine::effective_state_config(
                             state,

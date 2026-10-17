@@ -5438,3 +5438,97 @@ async fn review_progress_configuration_entry_failure_parks_without_infrastructur
         1
     );
 }
+
+/// Entry failures and cancelled attempts share the built-in gate's bounded
+/// bounce/park behavior, including the final retry barrier.
+#[tokio::test]
+async fn renamed_review_gate_failed_and_cancelled_entries_match_default() {
+    for cancelled in [false, true] {
+        for gate_name in ["review", "qa_review"] {
+            let db = Arc::new(sqlite_db().await);
+            let event_bus = Arc::new(EventBus::new(64));
+            let task_id = new_uuid_v4();
+            let mut workflow = user_approval_review_workflow(
+                hook("run_ci_steps", FailurePolicy::Block),
+                Vec::new(),
+            );
+            for state in &mut workflow.states {
+                for trigger in state.triggers.values_mut() {
+                    if trigger.to == "review" {
+                        trigger.to = gate_name.into();
+                    }
+                }
+                if state.name == "review" {
+                    state.name = gate_name.into();
+                    state.role = Some("reviewer".into());
+                    state.canonical_phase = Some(api_types::CanonicalPhase::Review);
+                    state.config = json!({"ci_steps":"not-an-array"});
+                }
+            }
+            seed_custom_workflow_task(&db, &task_id, "working", &workflow).await;
+            if cancelled {
+                let now = now_rfc3339();
+                sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES('cancelled-coder',?,'coder','completed',?,?)")
+                    .bind(&task_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+                sqlx::query("INSERT INTO review(id,task_id,execution_id,attempt_number,status,step_results_json,started_at,created_at,updated_at) VALUES('cancelled-review',?,'cancelled-coder',1,'cancelled','{}',?,?,?)")
+                    .bind(&task_id).bind(&now).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+            }
+            let service = engine(Arc::clone(&db), Arc::clone(&event_bus));
+            for attempt in 1..=3 {
+                let task = TaskRepo::get_by_id(&*db, &task_id, false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(task.status, "working");
+                let result = service
+                    .workflow_execution()
+                    .transition(
+                        &task_id,
+                        gate_name,
+                        task.version,
+                        &workflow,
+                        &api_types::Actor::system(api_types::SystemComponent::Workflow),
+                        "submit",
+                        false,
+                        Default::default(),
+                    )
+                    .await
+                    .unwrap();
+                let result = drain_result(service.clone(), result).await;
+                assert_eq!(
+                    result.task.status,
+                    if attempt < 3 { "working" } else { gate_name },
+                    "cancelled={cancelled}, gate={gate_name}"
+                );
+                if attempt == 3 {
+                    let barrier: serde_json::Value = serde_json::from_str(
+                        result
+                            .task
+                            .entry_barrier_json
+                            .as_deref()
+                            .expect("exhausted gate parks"),
+                    )
+                    .unwrap();
+                    assert_eq!(barrier["state"], gate_name);
+                    assert_eq!(barrier["status"], "blocked");
+                    assert!(barrier["blocking_reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("review retry budget exhausted"));
+                }
+            }
+            assert_eq!(
+                db::budget::spent(db.pool(), &task_id, "review")
+                    .await
+                    .unwrap(),
+                if cancelled { 2 } else { 3 }
+            );
+            if cancelled {
+                assert_eq!(
+                    db::ReviewRepo::list_by_task(&*db, &task_id).await.unwrap()[0].status,
+                    db::ReviewStatus::Cancelled
+                );
+            }
+        }
+    }
+}

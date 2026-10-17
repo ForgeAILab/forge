@@ -1995,10 +1995,16 @@ impl AttentionService {
             .coordination_activity(user_id, project_id, limit)
             .await?;
         let review_ready = self
-            .work_items(user_id, project_id, &["review"], limit)
+            .work_items(user_id, project_id, &[], true, limit)
             .await?;
         let active_work = self
-            .work_items(user_id, project_id, &["in_progress", "merging"], limit)
+            .work_items(
+                user_id,
+                project_id,
+                &["in_progress", "merging"],
+                false,
+                limit,
+            )
             .await?;
         let agent_health = self.agent_health(user_id, project_id, limit).await?;
         let recent_outcomes = self.recent_outcomes(user_id, project_id, limit).await?;
@@ -3259,11 +3265,29 @@ impl AttentionService {
         user_id: &str,
         project_id: Option<&str>,
         statuses: &[&str],
+        review: bool,
         limit: i64,
     ) -> Result<Vec<MissionControlWorkItem>> {
+        let mut review_states = Vec::new();
+        if review {
+            for (project, raw) in self
+                .db
+                .attention_visible_project_workflows(user_id, project_id)
+                .await?
+            {
+                let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow(&raw);
+                review_states.extend(
+                    workflow
+                        .states
+                        .iter()
+                        .filter(|state| db::budget::is_review_state(state))
+                        .map(|state| (project.clone(), state.name.clone())),
+                );
+            }
+        }
         let rows = self
             .db
-            .attention_visible_work_items(user_id, project_id, statuses, limit)
+            .attention_visible_work_items(user_id, project_id, statuses, &review_states, limit)
             .await?;
         rows.into_iter()
             .map(|row| {
@@ -3274,7 +3298,7 @@ impl AttentionService {
                     status: row.status?,
                     priority: row.priority?,
                     updated_at: row.updated_at?,
-                    primary_action: if statuses.contains(&"review") {
+                    primary_action: if review {
                         "review".to_owned()
                     } else {
                         "inspect".to_owned()

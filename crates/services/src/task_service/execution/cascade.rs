@@ -1723,7 +1723,7 @@ impl TaskService {
             Some(task) => task,
             None => return Ok(()),
         };
-        if task.status != crate::workflow::default_states::REVIEW {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Ok(());
         }
 
@@ -2002,7 +2002,7 @@ impl TaskService {
                         task_id: task.id.clone(),
                         role: crate::workflow::default_roles::REVIEWER.to_owned(),
                         assignee_id: "human".to_owned(),
-                        state: crate::workflow::default_states::REVIEW.to_owned(),
+                        state: task.status.clone(),
                     },
                 });
             }

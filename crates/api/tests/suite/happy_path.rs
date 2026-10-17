@@ -1761,6 +1761,100 @@ async fn repair_release_project(
 }
 
 #[tokio::test]
+async fn renamed_review_gate_runs_agent_review_and_merges() {
+    let repo_dir = common::TestDir::new("renamed-review-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces = common::TestDir::new("renamed-review-workspaces");
+    let harness = test_app(workspaces.path()).await;
+    let (project, agent) = repair_release_project(&harness, &repo_path, workspaces.path()).await;
+    let mut workflow = services::workflow::default_workflow::default_workflow();
+    workflow.configuration.clear();
+    for state in &mut workflow.states {
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "review" {
+                trigger.to = "qa_review".into();
+            }
+        }
+        if state.name == "review" {
+            state.name = "qa_review".into();
+            state.config = json!({"ci_steps":["test -f greeting.txt"]});
+        }
+    }
+    let _: api_types::WorkflowDefinition = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{}/workflow", project.id),
+        json!({"definition":workflow}),
+        StatusCode::OK,
+    )
+    .await;
+    let review_prompt = r#"test -f greeting.txt && printf '%s\n' 'Checked greeting.txt and its required CI check.' '{"result":"pass","reason":"The greeting file satisfies the deliverable"}'"#;
+    let task: TaskResponse = json_request(
+        &harness.app, Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Deliver through a renamed review gate",
+            "description":"printf 'hello\\n' > greeting.txt && git add greeting.txt && git commit -m greeting",
+            "review_config":{"review_prompt":review_prompt}}),
+        StatusCode::OK,
+    ).await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".into()).await;
+    assert_eq!(completed.status, "done");
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
+    let reviewer = db::ExecutionRepo::get_by_id(
+        &*harness.state.db,
+        reviews[0]
+            .reviewer_execution_id
+            .as_deref()
+            .expect("agent reviewer ran"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reviewer.status, db::ExecutionStatus::Completed);
+    assert_eq!(reviewer.role, "reviewer");
+    let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0, "{details}");
+    let entries = db::TransitionLogRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    for (from, to) in [
+        ("in_progress", "qa_review"),
+        ("qa_review", "merging"),
+        ("merging", "done"),
+    ] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.from_state == from && entry.to_state == to),
+            "{entries:?}"
+        );
+    }
+    assert_eq!(run_git(&repo_path, &["show", "HEAD:greeting.txt"]), "hello");
+    let merged: String = sqlx::query_scalar(
+        "SELECT integrated_sha FROM integration_attempt WHERE task_ref=? AND state='completed'",
+    )
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(merged, run_git(&repo_path, &["rev-parse", "HEAD"]));
+    assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
+}
+
+#[tokio::test]
 async fn structured_review_findings_are_repaired_resolved_and_merged() {
     let repo_dir = common::TestDir::new("findings-release-repo");
     let repo_path = setup_git_repo(repo_dir.path()).await;

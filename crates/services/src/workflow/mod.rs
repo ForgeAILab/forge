@@ -109,6 +109,14 @@ pub mod template_service;
 pub mod transition_event;
 pub mod validation;
 
+/// Whether a named state has the same review semantics as the retry ledger.
+pub fn is_review_state(workflow: &WorkflowDefinition, name: &str) -> bool {
+    workflow
+        .states
+        .iter()
+        .any(|state| state.name == name && db::budget::is_review_state(state))
+}
+
 /// Paths recorded in typed conflict handoffs in the current retry window.
 pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<String> {
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
@@ -142,13 +150,14 @@ pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<St
 /// or a ConflictHandoff.
 pub(crate) fn review_carry_entry_kind(
     entries: &[db::TransitionLog],
+    workflow: &WorkflowDefinition,
 ) -> Option<db::ReviewCarryKind> {
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();
     let [.., bridge, current] = entries else {
         return None;
     };
     if current.from_state != default_states::MERGE_FAILED
-        || current.to_state != default_states::REVIEW
+        || !is_review_state(workflow, &current.to_state)
         || current.rejection
         || bridge.from_state != default_states::MERGING
         || bridge.to_state != default_states::MERGE_FAILED
@@ -390,6 +399,40 @@ mod tests {
     }
 
     #[test]
+    fn renamed_review_gate_carries_only_in_the_review_phase() {
+        let mut workflow = super::default_workflow::default_workflow();
+        let gate = workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == "review")
+            .unwrap();
+        gate.name = "qa_review".into();
+        let entries = [
+            bridge_log(
+                "merging",
+                "merge_failed",
+                api_types::TransitionBridge::conflict_handoff(&[]),
+            ),
+            bridge_log(
+                "merge_failed",
+                "qa_review",
+                api_types::TransitionBridge::default(),
+            ),
+        ];
+        assert_eq!(
+            review_carry_entry_kind(&entries, &workflow),
+            Some(db::ReviewCarryKind::ConflictRepair)
+        );
+        workflow
+            .states
+            .iter_mut()
+            .find(|state| state.name == "qa_review")
+            .unwrap()
+            .canonical_phase = Some(CanonicalPhase::Working);
+        assert_eq!(review_carry_entry_kind(&entries, &workflow), None);
+    }
+
+    #[test]
     fn bridge_readers_ignore_prose_and_use_only_typed_history() {
         use api_types::{TransitionBridge as Bridge, TransitionBridgeKind as Kind};
         let paths = vec!["src/a,b.rs".into(), "日本語.rs".into()];
@@ -400,7 +443,10 @@ mod tests {
         );
         let current = bridge_log("merge_failed", "review", Bridge::new(Kind::ReviewRefresh));
         assert_eq!(
-            review_carry_entry_kind(&[handoff.clone(), current.clone()]),
+            review_carry_entry_kind(
+                &[handoff.clone(), current.clone()],
+                &super::default_workflow::default_workflow()
+            ),
             Some(db::ReviewCarryKind::ConflictRepair)
         );
         let rebase = bridge_log(
@@ -409,7 +455,10 @@ mod tests {
             Bridge::new(Kind::TargetMovedRebase),
         );
         assert_eq!(
-            review_carry_entry_kind(&[rebase.clone(), current.clone()]),
+            review_carry_entry_kind(
+                &[rebase.clone(), current.clone()],
+                &super::default_workflow::default_workflow()
+            ),
             Some(db::ReviewCarryKind::CleanRebase)
         );
         let mut ordinary = handoff;
@@ -418,7 +467,13 @@ mod tests {
             "[conflict-handoff] [review-refresh] [target-moved-rebase]; paths_json=[\"fake.rs\"]"
                 .into();
         assert!(handed_off_conflict_paths(&[ordinary.clone()]).is_empty());
-        assert_eq!(review_carry_entry_kind(&[ordinary, current]), None);
+        assert_eq!(
+            review_carry_entry_kind(
+                &[ordinary, current],
+                &super::default_workflow::default_workflow()
+            ),
+            None
+        );
         let mut rejected = rebase;
         rejected.rejection = true;
         assert_eq!(

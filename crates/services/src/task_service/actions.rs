@@ -269,7 +269,7 @@ impl TaskService {
         } else if let Some(reason) = reason {
             validate_required("reason", reason)?;
         }
-        if snapshot.task.status == "review"
+        if crate::workflow::is_review_state(&snapshot.workflow, &snapshot.task.status)
             && matches!(
                 action,
                 TaskAction::Approve { .. } | TaskAction::SendBack { .. }
@@ -304,7 +304,7 @@ impl TaskService {
         // finished. Its release runs the entry again instead of putting a
         // role back: there is no check result yet for a reviewer to review.
         let review_entry_preempted = matches!(&action, TaskAction::Release { .. })
-            && task.status == crate::workflow::default_states::REVIEW
+            && crate::workflow::is_review_state(&snapshot.workflow, &task.status)
             && self.db.entry_hooks_preempted(&task.id).await?;
         let updated = TASK_ACTION_ACTOR
             .scope(
@@ -667,7 +667,10 @@ impl TaskService {
                                     .await?
                             };
                             if reset_budget
-                                && snapshot.task.status == "review"
+                                && crate::workflow::is_review_state(
+                                    &snapshot.workflow,
+                                    &snapshot.task.status,
+                                )
                                 && snapshot.latest_review.as_ref().is_some_and(|review| {
                                     review.status == ReviewStatus::AwaitingHuman
                                 })
@@ -934,7 +937,10 @@ impl TaskService {
     /// The entry is the automatic one (it spends as one). When it cannot run
     /// the Task stays released and its owner is offered the retry.
     async fn resume_review_entry_after_release(&self, released: Task) -> Result<Task> {
-        if released.status != crate::workflow::default_states::REVIEW {
+        if !crate::workflow::is_review_state(
+            &self.workflow_for_task(&released).await?,
+            &released.status,
+        ) {
             return Ok(released);
         }
         let deferred: Vec<String> = self

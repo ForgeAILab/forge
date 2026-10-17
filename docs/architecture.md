@@ -7683,9 +7683,12 @@ including when that Review passes without a rerun. Replaying initialization
 never refunds an existing charge. Task-wide overrides win
 over supplied Review state config, which includes Project defaults for both
 `review_progress` and `review_verify_rerun`.
-Review budgets resolve the Task's current review gate by its workflow definition:
-the state named `review`, or a gate with the `reviewer` role whose
-`canonical_phase` is `review` (a renamed review gate). Such a gate shares the
+Review lifecycle and budgets share `db::budget::is_review_state`: the state named
+`review`, or a gate with the `reviewer` role whose `canonical_phase` is `review`
+(a renamed review gate). Reviewer completion, failed/cancelled entry handling,
+human decisions and re-runs, recovery, review carry, integration checks, and
+review-ready projections all resolve that meaning from the workflow rather than
+requiring the built-in state name. Such a gate shares the
 Task's `review` and `gate:review` budgets with every other review gate. A
 reviewer-role gate in another phase runs no Review and keeps its own
 `gate:<state>` budget and entry cap. Verification
@@ -10382,7 +10385,8 @@ There is one review path. The owner's review `retry` (offer reason
 internal `rerun_review` command call `TaskService::rerun_review`, which does
 not run anything itself:
 
-1. It refuses unless the Task is in `review` and has a completed
+1. It refuses unless the Task is in a review state (resolved with
+   `db::budget::is_review_state`, including renamed review gates) and has a completed
    implementation candidate. It refuses `task_busy` when a review entry of the
    Task is still running (a hooks step is pending, claimed or suspended on its
    check) or a `reviewer`/`auditor` execution is running. The action system
@@ -10392,7 +10396,7 @@ not run anything itself:
    or `awaiting_human`, is cancelled with
    `execution_retry.status = "superseded_by_rerun"`, so a human gate or a late
    reviewer cannot settle an attempt the owner asked to run again.
-3. It re-enters `review` with a same-state transition
+3. It re-enters that same review state with a same-state transition
    (`review_rerun_entry_with_authority`, exit hooks skipped) under
    `Actor::system(Workflow)` and the current Project workflow snapshot. This is
    a new status entry: a new hooks step, so a new review attempt and a new

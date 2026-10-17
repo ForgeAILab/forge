@@ -9722,7 +9722,10 @@ async fn pre_upgrade_hooks_step_replays(checkpoint: Option<&str>) -> db::Transit
         Some(api_types::TransitionBridgeKind::ReviewRefresh)
     );
     assert_eq!(
-        crate::workflow::review_carry_entry_kind(&entries),
+        crate::workflow::review_carry_entry_kind(
+            &entries,
+            &crate::workflow::default_workflow::default_workflow()
+        ),
         Some(db::ReviewCarryKind::CleanRebase)
     );
     refresh.clone()

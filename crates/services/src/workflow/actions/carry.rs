@@ -119,7 +119,7 @@ fn failed(error: impl ToString) -> CarryError {
 }
 
 async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
-    if ctx.to_state != default_states::REVIEW {
+    if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state) {
         return Err(ineligible("only entry into review can carry"));
     }
     if ctx.triggered_by.is_user() {
@@ -150,7 +150,7 @@ async fn carry(ctx: &HookContext) -> Result<HookResult, CarryError> {
     let entries = TransitionLogRepo::list_by_task(&*ctx.db, &ctx.task_id)
         .await
         .map_err(failed)?;
-    let Some(kind) = review_carry_entry_kind(&entries) else {
+    let Some(kind) = review_carry_entry_kind(&entries, &ctx.workflow) else {
         return Err(ineligible("not a mechanical merge-contention entry"));
     };
 

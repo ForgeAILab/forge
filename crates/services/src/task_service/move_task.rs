@@ -246,7 +246,9 @@ impl TaskService {
             )
             .await?;
         }
-        if previous_status == default_states::REVIEW && task.status != default_states::REVIEW {
+        if crate::workflow::is_review_state(&workflow, &previous_status)
+            && !crate::workflow::is_review_state(&workflow, &task.status)
+        {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
         if previous_status != task.status {
