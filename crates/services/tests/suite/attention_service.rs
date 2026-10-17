@@ -1886,6 +1886,77 @@ async fn review_owner_parks_stay_visible_without_wakes_or_escalations() {
 }
 
 #[tokio::test]
+async fn a_task_leaving_its_owner_park_for_an_agent_cause_wakes_the_project_agent() {
+    let db = database().await;
+    let identity_id = new_uuid_v4();
+    identity(&db, &identity_id).await;
+    let project_id = configured_project(&db, &identity_id, "owner-park-exit").await;
+    let task = project_task(&db, &project_id, "Leaves the owner park").await;
+    let now = now_rfc3339();
+    let park = |kind: &str, status: &str, version: i64| db::UpdateTaskStatus {
+        id: task.id.clone(),
+        expected_version: version,
+        status: status.into(),
+        assignee_id: None,
+        error_annotation: Some(Some(serde_json::json!({"type": kind}).to_string())),
+        blocked_json: Some(Some(
+            serde_json::json!({"kind": kind, "reason": kind, "created_at": now}).to_string(),
+        )),
+        failed_json: Some(None),
+        updated_at: now_rfc3339(),
+    };
+    let service = AttentionService::new(
+        Arc::clone(&db),
+        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
+    );
+    TaskRepo::update_status(&*db, park("review_needs_owner", "review", task.version))
+        .await
+        .unwrap();
+    service.project_once(100).await.unwrap();
+    assert_eq!(service.sweep_once_at(&now_rfc3339()).await.unwrap(), 0);
+    let current = TaskRepo::get_by_id(&*db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    TaskRepo::update_status(
+        &*db,
+        park("executor_failed", "in_progress", current.version),
+    )
+    .await
+    .unwrap();
+    service.project_once(100).await.unwrap();
+    service.sweep_once_at(&now_rfc3339()).await.unwrap();
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attention_type, status FROM attention_projection
+         WHERE attention_type IN ('review_needs_owner', 'execution_failed')
+         ORDER BY attention_type",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("execution_failed".to_owned(), "open".to_owned()),
+            ("review_needs_owner".to_owned(), "resolved".to_owned()),
+        ]
+    );
+    let linked: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attention_type FROM agent_wake_blocker b
+         JOIN attention_projection a ON a.id=b.attention_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        linked,
+        vec!["execution_failed"],
+        "the Agent-handled cause that replaced the owner park must wake the Project Agent"
+    );
+}
+
+#[tokio::test]
 async fn actionable_task_interruption_wakes_once_and_resolution_closes_attention() {
     let db = database().await;
     let identity_id = new_uuid_v4();
