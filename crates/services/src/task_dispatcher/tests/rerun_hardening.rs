@@ -154,6 +154,47 @@ async fn reviews_by_attempt(f: &ReviewFixture) -> Vec<db::Review> {
     reviews
 }
 
+#[tokio::test]
+async fn awaiting_human_rerun_dispatches_exactly_one_replacement_reviewer() {
+    let mut f = fixture(ReviewStatus::AwaitingHuman).await;
+    f.dispatcher
+        .task_service
+        .rerun_review(
+            task_uuid(&f),
+            Actor::user(api_types::UserActionSource::Test),
+        )
+        .await
+        .unwrap();
+    // A sweep that runs while the entry's hooks step may still be queued
+    // must not start a second reviewer beside the entry's own dispatch.
+    f.dispatcher.reconcile_all().await.unwrap();
+    f.dispatcher.task_service.drain(&f.task.id).await.unwrap();
+    for _ in 0..20 {
+        f.dispatcher.reconcile_all().await.unwrap();
+        f.dispatcher.task_service.drain(&f.task.id).await.unwrap();
+    }
+    let launched = dispatched(&mut f);
+    assert_eq!(launched.len(), 1, "one replacement reviewer: {launched:?}");
+    assert_ne!(launched[0], f.reviewer.id);
+    assert_eq!(
+        ExecutionRepo::count_by_task_and_role(&*f.db, &f.task.id, "reviewer")
+            .await
+            .unwrap(),
+        2
+    );
+    let reviews = reviews_by_attempt(&f).await;
+    assert_eq!(reviews.len(), 2, "{reviews:?}");
+    assert_eq!(reviews[0].id, f.review.id);
+    assert_eq!(reviews[0].status, ReviewStatus::Cancelled);
+    let details: serde_json::Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_eq!(details["execution_retry"]["status"], "superseded_by_rerun");
+    assert_eq!(reviews[1].status, ReviewStatus::Running);
+    assert_eq!(
+        reviews[1].reviewer_execution_id.as_deref(),
+        Some(launched[0].as_str())
+    );
+}
+
 /// A re-run whose entry committed but whose reviewer dispatch failed (the
 /// dispatch hook only logs a failure) leaves the completed reviewer bound to
 /// the cancelled newest Review. That attempt has nothing left to settle: the
