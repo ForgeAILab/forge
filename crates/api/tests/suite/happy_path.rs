@@ -1777,7 +1777,6 @@ async fn renamed_review_gate_runs_agent_review_and_merges() {
         }
         if state.name == "review" {
             state.name = "qa_review".into();
-            state.config = json!({"ci_steps":["test -f greeting.txt"]});
         }
     }
     let _: api_types::WorkflowDefinition = json_request(
@@ -1794,7 +1793,7 @@ async fn renamed_review_gate_runs_agent_review_and_merges() {
         &format!("/api/v1/projects/{}/tasks", project.id),
         json!({"title":"Deliver through a renamed review gate",
             "description":"printf 'hello\\n' > greeting.txt && git add greeting.txt && git commit -m greeting",
-            "review_config":{"review_prompt":review_prompt}}),
+            "review_config":{"review_prompt":review_prompt,"ci_steps":["test -f greeting.txt"]}}),
         StatusCode::OK,
     ).await;
     let _: TaskResponse = json_request(

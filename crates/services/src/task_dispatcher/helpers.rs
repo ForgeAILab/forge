@@ -399,7 +399,7 @@ pub(super) fn merged_state_config(
     else {
         return merged;
     };
-    let Some(Value::Object(overrides)) = task_config.get(&state.name) else {
+    let Some(overrides) = crate::workflow::task_state_overrides(&task_config, state) else {
         return merged;
     };
 

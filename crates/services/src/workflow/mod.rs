@@ -117,6 +117,23 @@ pub fn is_review_state(workflow: &WorkflowDefinition, name: &str) -> bool {
         .any(|state| state.name == name && db::budget::is_review_state(state))
 }
 
+/// A Task's own overrides for `state` from its `task_state_config` object.
+/// The Task's `review_config` is stored under `review`; a renamed review gate
+/// reads it there unless the Task names the gate itself.
+pub(crate) fn task_state_overrides<'a>(
+    task_config: &'a serde_json::Map<String, serde_json::Value>,
+    state: &StateDefinition,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    task_config
+        .get(&state.name)
+        .or_else(|| {
+            db::budget::is_review_state(state)
+                .then(|| task_config.get(default_states::REVIEW))
+                .flatten()
+        })
+        .and_then(serde_json::Value::as_object)
+}
+
 /// Paths recorded in typed conflict handoffs in the current retry window.
 pub(crate) fn handed_off_conflict_paths(entries: &[db::TransitionLog]) -> Vec<String> {
     let workflow_actor = api_types::Actor::system(api_types::SystemComponent::Workflow).display();

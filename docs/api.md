@@ -3707,7 +3707,10 @@ Agent's runs ends; a Task still waiting for its first run shows no reason.
 Review actions, re-runs, and review-ready projections resolve review states from
 the workflow: the state named `review`, or a gate with role `reviewer` and
 `canonical_phase: review`. A custom name such as `qa_review` has the same review
-behavior and appears under its actual state name in responses and events.
+behavior and appears under its actual state name in responses and events. A
+Task's `review_config` is stored under `review` in its `task_state_config` and
+configures whichever review gate the workflow has: a renamed gate reads it there
+unless the Task configures that gate by its own name.
 
 A parent Task (one with subtasks) parked in a review state on an exhausted review
 budget offers three exits besides `cancel`: `retry` (reset the budget and

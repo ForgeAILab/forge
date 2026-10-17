@@ -450,7 +450,12 @@ pub fn effective_review_config(source: &Value) -> Result<Value, String> {
             let task_config = task_config
                 .as_object()
                 .ok_or("Task review config must be an object")?;
-            if let Some(overrides) = task_config.get(state_name) {
+            // A Task's `review_config` is stored under `review`; a renamed
+            // review gate reads it there unless the Task names the gate.
+            if let Some(overrides) = task_config
+                .get(state_name)
+                .or_else(|| task_config.get("review"))
+            {
                 if !overrides.is_null() {
                     let overrides = overrides
                         .as_object()
@@ -499,6 +504,28 @@ mod tests {
         for field in ["first_attempt: number", "last_checked_attempt: number"] {
             assert!(declaration.contains(field), "{declaration}");
         }
+    }
+
+    #[test]
+    fn renamed_review_gate_reads_the_task_review_config() {
+        let source = |task: Value| {
+            serde_json::json!({
+                "workflow": {"states": [
+                    {"name": "qa_review", "role": "reviewer", "config": {"ci_steps": ["state"]}}
+                ]},
+                "task_scope": {"config": task}
+            })
+        };
+        let config = |task| effective_review_config(&source(task)).unwrap()["ci_steps"].clone();
+        let task = serde_json::json!({"review": {"ci_steps": ["task"]}});
+        assert_eq!(config(task), serde_json::json!(["task"]));
+        let named = serde_json::json!({
+            "review": {"ci_steps": ["task"]},
+            "qa_review": {"ci_steps": ["named"]}
+        });
+        assert_eq!(config(named), serde_json::json!(["named"]));
+        let cleared = serde_json::json!({"qa_review": null, "review": {"ci_steps": ["task"]}});
+        assert_eq!(config(cleared), serde_json::json!(["state"]));
     }
 
     #[test]
