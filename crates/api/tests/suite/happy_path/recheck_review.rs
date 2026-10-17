@@ -147,12 +147,11 @@ async fn recheck_review(gate: &str, checks: bool, agent_requested: bool) {
         )
         .await;
     }
-    let second = wait_for_review(&harness, &task.id, 2).await;
-    dispatcher.stop();
-    dispatch_loop.await.unwrap();
-    assert_eq!(second.status, gate);
-    assert!(
-        second.available_actions.iter().any(|offer| {
+    let mut second = wait_for_review(&harness, &task.id, 2).await;
+    // Offers can trail the settled Review while its last step is still
+    // queued; keep the dispatcher running until the approve offer appears.
+    let ordinary_approve = |task: &TaskResponse| {
+        task.available_actions.iter().any(|offer| {
             matches!(
                 offer.action,
                 api_types::TaskAction::Approve {
@@ -160,7 +159,18 @@ async fn recheck_review(gate: &str, checks: bool, agent_requested: bool) {
                     ..
                 }
             )
-        }),
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !ordinary_approve(&second) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        second = common::drain(&harness.state, &harness.app, &task.id).await;
+    }
+    dispatcher.stop();
+    dispatch_loop.await.unwrap();
+    assert_eq!(second.status, gate);
+    assert!(
+        ordinary_approve(&second),
         "the new review offers ordinary approval: {:?}",
         second.available_actions
     );
@@ -378,9 +388,22 @@ async fn retry_verify(gate: &str) {
                     .iter()
                     .any(|review| review.status == db::ReviewStatus::AwaitingHuman)
             {
-                // `current` was read before the Review settled; read it again
-                // so its offers reflect the settled Review.
-                return common::drain(&harness.state, &harness.app, &task.id).await;
+                // `current` was read before the Review settled, and offers can
+                // trail it while its last step is queued: wait for the approve
+                // offer (a stale verify block never offers it).
+                let settled = common::drain(&harness.state, &harness.app, &task.id).await;
+                if settled.available_actions.iter().any(|offer| {
+                    matches!(
+                        offer.action,
+                        api_types::TaskAction::Approve {
+                            override_checks: Some(false),
+                            ..
+                        }
+                    )
+                }) {
+                    return settled;
+                }
+                last = format!("{last}; offers={:?}", settled.available_actions);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
