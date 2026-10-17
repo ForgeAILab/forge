@@ -276,7 +276,9 @@ pub fn gate_budget_key(state: &StateDefinition) -> String {
 }
 
 fn review_state_from_json(raw: &str, status: &str) -> bool {
-    review_states_from_json(raw).iter().any(|name| name == status)
+    review_states_from_json(raw)
+        .iter()
+        .any(|name| name == status)
 }
 
 /// The review states of a Project `workflow_definition` text. An empty or
