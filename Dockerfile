@@ -10,7 +10,7 @@ RUN pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm build
 
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 WORKDIR /app
 
