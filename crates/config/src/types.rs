@@ -608,6 +608,13 @@ fn is_private_or_local_host(host: &str) -> bool {
     let Ok(address) = normalized.parse::<IpAddr>() else {
         return false;
     };
+    is_blocked_public_search_address(address)
+}
+
+/// Addresses public search must not reach: private, local, special-use, and
+/// IPv6 forms that can encode an IPv4 destination. Shared by the configured
+/// endpoint check and the request-time resolver and result filter.
+pub fn is_blocked_public_search_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let octets = address.octets();
@@ -630,6 +637,10 @@ fn is_private_or_local_host(host: &str) -> bool {
     }
 }
 
+/// Reject IPv6 address classes that are private, local, special-use, or can
+/// encode another address family.  In particular, all IPv4-compatible and
+/// IPv4-mapped forms are denied (including mapped public IPv4 values), rather
+/// than only checking the embedded address for private ranges.
 fn is_blocked_public_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
     let first = segments[0];
@@ -637,20 +648,27 @@ fn is_blocked_public_ipv6(address: Ipv6Addr) -> bool {
         || address.is_unspecified()
         || address.is_unique_local()
         || address.is_unicast_link_local()
-        // Reject every IPv4-compatible/mapped representation, including a
-        // mapped public address.  Allowing one would make endpoint policy
-        // differ depending on the resolver's address-family choice.
         || address.to_ipv4().is_some()
+        // Deprecated site-local space (fec0::/10).
         || (first & 0xffc0 == 0xfec0)
+        // IPv6 multicast (ff00::/8).
         || (first & 0xff00 == 0xff00)
+        // Documentation and benchmark prefixes.
         || (first == 0x2001 && segments[1] == 0x0db8)
         || (first == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+        // IANA-reserved 2001:0::/29 special-use blocks (Teredo, AMT,
+        // AS112-v6, and related transition/documentation ranges).
         || (first == 0x2001 && (0..=5).contains(&segments[1]))
+        // RFC 9637 documentation prefix 3fff::/20.
         || (0x3ff0..=0x3fff).contains(&first)
+        // Teredo, ORCHID/ORCHIDv2, and 6to4 transition prefixes.
         || (first == 0x2001 && segments[1] == 0)
         || (first == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
         || (first == 0x2001 && (0x0020..=0x002f).contains(&segments[1]))
         || first == 0x2002
+        // Discard-only and NAT64 well-known/local-use prefixes.  These can
+        // otherwise hide a private IPv4 target behind a globally-looking v6
+        // literal.
         || (first == 0x0100
             && segments[1] == 0
             && segments[2] == 0

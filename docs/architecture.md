@@ -91,7 +91,9 @@ Provider probes, native requests and web fetch share the destination policy in
 `agent-host::network_policy`. Well-known NAT64 `64:ff9b::/96` addresses apply
 the IPv4 policy to the final 32 bits, as 6to4 does to its embedded IPv4 address.
 Local-use NAT64 `64:ff9b:1::/48` and Teredo remain refused. Public search retains
-its separate, stricter transition-address policy and blocks IPv4 IETF protocol
+its separate, stricter transition-address policy, defined once in
+`config::is_blocked_public_search_address` for the endpoint check, the resolver
+and result URLs, and blocks IPv4 IETF protocol
 assignments at `192.0.0.0/24` and TEST-NET-1 at `192.0.2.0/24`.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and

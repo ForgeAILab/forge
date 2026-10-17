@@ -22,7 +22,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::Read,
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -37,7 +37,7 @@ use api_types::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
-use config::PublicSearchConfig;
+use config::{is_blocked_public_search_address, PublicSearchConfig};
 use db::{
     AgentAction, AgentActionListQuery, AgentActionPolicyResult, AgentActionRepo,
     AgentCommitmentListQuery, AgentCommitmentRepo, AgentInboxListQuery, AgentInboxRepo,
@@ -4046,7 +4046,7 @@ fn is_private_or_local_search_host(host: &str) -> bool {
         // URLs are metadata only, so reject known local names immediately.
         return false;
     };
-    is_blocked_public_address(address)
+    is_blocked_public_search_address(address)
 }
 
 /// Resolve the configured endpoint ourselves and pass only validated socket
@@ -4075,7 +4075,7 @@ impl reqwest::dns::Resolve for PublicSearchResolver {
             }
             let addresses = tokio::net::lookup_host((normalized_host, 0))
                 .await?
-                .filter(|address| !is_blocked_public_address(address.ip()))
+                .filter(|address| !is_blocked_public_search_address(address.ip()))
                 .collect::<Vec<_>>();
             if addresses.is_empty() {
                 return Err(std::io::Error::new(
@@ -4088,69 +4088,6 @@ impl reqwest::dns::Resolve for PublicSearchResolver {
             Ok(addresses)
         })
     }
-}
-
-fn is_blocked_public_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || (octets[0] == 0)
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
-        }
-        IpAddr::V6(address) => is_blocked_public_ipv6(address),
-    }
-}
-
-/// Reject IPv6 address classes that are private, local, special-use, or can
-/// encode another address family.  In particular, all IPv4-compatible and
-/// IPv4-mapped forms are denied (including mapped public IPv4 values), rather
-/// than only checking the embedded address for private ranges.
-fn is_blocked_public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    let first = segments[0];
-    address.is_loopback()
-        || address.is_unspecified()
-        || address.is_unique_local()
-        || address.is_unicast_link_local()
-        || address.to_ipv4().is_some()
-        // Deprecated site-local space (fec0::/10).
-        || (first & 0xffc0 == 0xfec0)
-        // IPv6 multicast (ff00::/8).
-        || (first & 0xff00 == 0xff00)
-        // Documentation and benchmark prefixes.
-        || (first == 0x2001 && segments[1] == 0x0db8)
-        || (first == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
-        // IANA-reserved 2001:0::/29 special-use blocks (Teredo, AMT,
-        // AS112-v6, and related transition/documentation ranges).
-        || (first == 0x2001 && (0..=5).contains(&segments[1]))
-        // RFC 9637 documentation prefix 3fff::/20.
-        || (0x3ff0..=0x3fff).contains(&first)
-        // Teredo, ORCHID/ORCHIDv2, and 6to4 transition prefixes.
-        || (first == 0x2001 && segments[1] == 0)
-        || (first == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
-        || (first == 0x2001 && (0x0020..=0x002f).contains(&segments[1]))
-        || first == 0x2002
-        // Discard-only and NAT64 well-known/local-use prefixes.  These can
-        // otherwise hide a private IPv4 target behind a globally-looking v6
-        // literal.
-        || (first == 0x0100
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0)
-        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 0)
-        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 1)
 }
 
 fn bounded_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -7065,7 +7002,7 @@ mod tests {
             ("203.0.113.1", false),
         ] {
             assert_eq!(
-                is_blocked_public_address(host.parse().unwrap()),
+                is_blocked_public_search_address(host.parse().unwrap()),
                 !allowed,
                 "{host}"
             );
@@ -7105,14 +7042,14 @@ mod tests {
         ] {
             let address = address.parse().expect("valid test address");
             assert!(
-                is_blocked_public_address(address),
+                is_blocked_public_search_address(address),
                 "address must be blocked: {address}"
             );
         }
-        assert!(!is_blocked_public_address(
+        assert!(!is_blocked_public_search_address(
             "8.8.8.8".parse().expect("public IPv4")
         ));
-        assert!(!is_blocked_public_address(
+        assert!(!is_blocked_public_search_address(
             "2001:4860:4860::8888".parse().expect("public IPv6")
         ));
     }

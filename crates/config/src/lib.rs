@@ -31,6 +31,7 @@ pub use path::{data_dir_from_env, default_config_path, default_data_dir, default
 pub use runtime::{
     read_server_state, server_state_path, write_server_state, ServerState, SERVER_STATE_FILE,
 };
+pub use types::is_blocked_public_search_address;
 pub use types::{
     AgentDefaults, CommandPolicyConfig, ConfigOverrides, ForgeConfig, ForgePaths, ProjectSettings,
     ProviderDeclaration, ProviderDeclarations, ProviderModelDeclaration, PublicSearchConfig,
