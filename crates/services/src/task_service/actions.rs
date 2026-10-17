@@ -333,13 +333,7 @@ impl TaskService {
                                 .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?
                         }
                         TaskAction::Retry { .. } if offer.reason == "review_verify_retry" => {
-                            self.apply_review_check_retry(
-                                &task,
-                                offer.clone(),
-                                action.clone(),
-                                actor.clone(),
-                            )
-                            .await?
+                            self.apply_review_check_retry(&task, actor.clone()).await?
                         }
                         TaskAction::Retry { .. } if offer.reason == "owner_reconcile" => {
                             self.reconcile_task_action_owner(task, action.clone())
@@ -1189,20 +1183,18 @@ impl TaskService {
         Ok(moved)
     }
 
-    pub(crate) async fn apply_review_check_retry(
-        &self,
-        task: &Task,
-        offer: Offer,
-        action: TaskAction,
-        actor: Actor,
-    ) -> Result<Task> {
+    /// Recheck Review and Retry Verify. The re-run dispatches its reviewer
+    /// in its own entry, so no role is queued behind it: the condition the
+    /// retry was offered on (a verify that stayed inconclusive) belongs to
+    /// the replaced entry and is retired here. A new entry that parks again
+    /// writes its own annotation, which is left alone.
+    pub(crate) async fn apply_review_check_retry(&self, task: &Task, actor: Actor) -> Result<Task> {
         let id = Uuid::parse_str(&task.id)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
         let updated = TASK_ACTION_COMMAND
-            .scope((), Box::pin(self.rerun_review(id, actor.clone())))
+            .scope((), Box::pin(self.rerun_review(id, actor)))
             .await?;
-        self.queue_deferred_action_role(updated, offer, action, actor)
-            .await
+        super::transition::clear_manual_advance_error_annotation(&self.db, task, updated).await
     }
 
     pub(crate) async fn queue_deferred_action_role(

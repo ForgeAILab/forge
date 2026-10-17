@@ -1226,13 +1226,8 @@ impl TaskService {
                     }
                 }
                 "review_checks_retry" => {
-                    self.apply_review_check_retry(
-                        &task,
-                        request.offer.clone(),
-                        request.action.clone(),
-                        request.actor.clone(),
-                    )
-                    .await
+                    self.apply_review_check_retry(&task, request.actor.clone())
+                        .await
                 }
                 "review_failed" => self.retry_review_entry(task, guidance).await,
                 "review_owner_retry" => self.retry_review_entry(task, guidance).await,

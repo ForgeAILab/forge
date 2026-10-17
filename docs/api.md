@@ -6528,7 +6528,9 @@ overrides take precedence over Review state config and Project defaults. Once
 that allowance is spent, an inconclusive result parks `review_blocked`, source
 `verify`, without charging the Review failure budget. Offers are Retry Verify (`retry`), Mark
 Reviewed (`approve`, reason required), and Cancel (`cancel`). Retry re-enters
-the ordinary review entry. Runner infrastructure retains the existing review
+the ordinary review entry and retires the inconclusive block, so the new
+attempt offers the ordinary review decisions; an inconclusive result in the
+new entry parks again. Runner infrastructure retains the existing review
 CI infrastructure handling.
 
 Evidence paths are relative to `FORGE_VERIFY_DIR` and confined to that directory;

@@ -239,3 +239,178 @@ async fn agent_recheck_with_checks_builtin_review() {
 async fn agent_recheck_with_checks_renamed_review() {
     recheck_review("qa_review", true, true).await;
 }
+
+async fn retry_verify(gate: &str) {
+    let repo_dir = common::TestDir::new("verify-retry-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces = common::TestDir::new("verify-retry-workspaces");
+    let flags = common::TestDir::new("verify-retry-flag");
+    let flag = flags.path().join("pass");
+    let harness = test_app(workspaces.path()).await;
+    let (project, agent) = repair_release_project(&harness, &repo_path, workspaces.path()).await;
+    let mut workflow = services::workflow::default_workflow::default_workflow();
+    workflow.configuration.clear();
+    let verdict = format!(
+        r#"if test -f '{}'; then printf '%s' '{{"verdict":"pass"}}' > "$FORGE_VERIFY_REPORT"; else printf '%s' '{{"verdict":"inconclusive"}}' > "$FORGE_VERIFY_REPORT"; fi"#,
+        flag.display()
+    );
+    for state in &mut workflow.states {
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "review" {
+                trigger.to = gate.into();
+            }
+        }
+        if state.name == "review" {
+            state.name = gate.into();
+            state.config = json!({"verify": {"checks": [{"name": "smoke", "command": verdict}]}});
+            state.gate_config.as_mut().unwrap().requires_user_approval = Some(true);
+        }
+    }
+    let _: api_types::WorkflowDefinition = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{}/workflow", project.id),
+        json!({"definition": workflow}),
+        StatusCode::OK,
+    )
+    .await;
+    let review_prompt =
+        "test -f greeting.txt && printf '%s\\n' '{\"result\":\"pass\",\"reason\":\"reviewed\"}'";
+    let task: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({
+            "title": "Retry verify reviewer dispatch",
+            "description": "printf 'hello\\n' > greeting.txt && git add greeting.txt && git commit -m greeting",
+            "review_config": {"review_prompt": review_prompt}
+        }),
+        StatusCode::OK,
+    )
+    .await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id": agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let dispatcher = Arc::new(services::TaskDispatcher::with_check_interval(
+        harness.state.db.clone(),
+        harness.event_bus.clone(),
+        harness.state.task_service.clone(),
+        Duration::from_millis(25),
+    ));
+    let dispatch_loop = dispatcher.clone().start();
+    let state = |task: &TaskResponse, reviews: &[db::Review], reviewers: usize| {
+        format!(
+            "status={} offers={:?} reviews={:?} reviewers={reviewers} condition={:?}",
+            task.status,
+            task.available_actions
+                .iter()
+                .map(|offer| format!("{}:{}", offer.action.verb(), offer.reason))
+                .collect::<Vec<_>>(),
+            reviews
+                .iter()
+                .map(|review| (review.attempt_number, &review.status))
+                .collect::<Vec<_>>(),
+            task.condition
+        )
+    };
+    let reviewer_count = |harness: &TestHarness, id: String| {
+        let db = harness.state.db.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM execution WHERE task_id = ? AND role = 'reviewer'",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap() as usize
+        }
+    };
+    let mut last = String::new();
+    let blocked = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let current = common::drain(&harness.state, &harness.app, &task.id).await;
+            let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+                .await
+                .unwrap();
+            last = state(
+                &current,
+                &reviews,
+                reviewer_count(&harness, task.id.clone()).await,
+            );
+            if current
+                .available_actions
+                .iter()
+                .any(|offer| offer.reason == "review_verify_retry")
+            {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("verify must park inconclusive: {last}"));
+    std::fs::write(&flag, "").unwrap();
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/actions", task.id),
+        json!({"version": blocked.version, "action": {"verb": "retry"}}),
+        StatusCode::OK,
+    )
+    .await;
+    let reviewed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let current = common::drain(&harness.state, &harness.app, &task.id).await;
+            let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+                .await
+                .unwrap();
+            let reviewers = reviewer_count(&harness, task.id.clone()).await;
+            last = state(&current, &reviews, reviewers);
+            if reviewers == 1
+                && reviews
+                    .iter()
+                    .any(|review| review.status == db::ReviewStatus::AwaitingHuman)
+            {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("retry verify must dispatch the reviewer: {last}"));
+    dispatcher.stop();
+    dispatch_loop.await.unwrap();
+    // The inconclusive verify belonged to the replaced entry: the new review
+    // is decided like any other, not through an override.
+    assert!(
+        reviewed.condition.details().diagnostic.is_none(),
+        "the replaced entry's verify block is retired: {last}"
+    );
+    assert!(
+        reviewed.available_actions.iter().any(|offer| {
+            matches!(
+                offer.action,
+                api_types::TaskAction::Approve {
+                    override_checks: Some(false),
+                    ..
+                }
+            )
+        }),
+        "the new review offers ordinary approval: {last}"
+    );
+}
+
+#[tokio::test]
+async fn owner_retry_verify_builtin_review_dispatches_the_reviewer() {
+    retry_verify("review").await;
+}
+
+#[tokio::test]
+async fn owner_retry_verify_renamed_review_dispatches_the_reviewer() {
+    retry_verify("qa_review").await;
+}

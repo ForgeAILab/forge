@@ -8960,6 +8960,9 @@ gets a ledger-charged rerun (default one, configurable with
 `retry_budgets.review_verify_rerun`), then a `review_blocked` park with source
 `verify` without charging the Review failure budget; owner offers
 are Retry Verify, Mark Reviewed (manual approval with reason), and Cancel.
+Retry Verify is a review re-run: its entry dispatches the reviewer itself, so
+the action retires the inconclusive annotation it was offered on (compared,
+not version-fenced; a new park writes its own).
 Infrastructure failures retain review-CI interruption handling. A daemon
 placement records `not_run` / `placement_unsupported` without launching
 verify. The integration queue head never requests verify.
