@@ -298,6 +298,10 @@ mod tests {
         assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
         assert!(!temp.path().join("absent").exists());
         assert_eq!(fs::read_to_string(&existing).unwrap(), "kept");
+        // The refusals above come from the planted entries, not a broken writer.
+        let fresh = temp.path().join("fresh");
+        write_staged(&fresh, b"#!/bin/sh\n", WRITER_TIMEOUT).unwrap();
+        assert_eq!(fs::read_to_string(&fresh).unwrap(), "#!/bin/sh\n");
     }
 
     #[cfg(unix)]
