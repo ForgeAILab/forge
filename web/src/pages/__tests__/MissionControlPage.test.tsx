@@ -355,6 +355,26 @@ describe('MissionControlPage', () => {
     }
   })
 
+  it.each(['member', 'viewer', 'failed memberships', 'signed out'])(
+    'keeps Resolve on other Attention categories for %s',
+    (viewer) => {
+      permissions.ownerId = 'another-owner'
+      permissions.role = viewer
+      if (viewer === 'failed memberships') {
+        permissions.role = 'member'
+        permissions.membersError = true
+      }
+      if (viewer === 'signed out') useAuthStore.getState().clearAuth()
+      render(<MissionControlPage />)
+      const card = screen
+        .getByRole('heading', { name: 'A human decision is required.' })
+        .closest('article')!
+      expect(within(card).queryByText('Owner action needed')).toBeNull()
+      fireEvent.click(within(card).getByRole('button', { name: 'Resolve' }))
+      expect(resolveAttention).toHaveBeenCalled()
+    },
+  )
+
   it('filters review offers by owner authority after an action refreshes them', () => {
     const previous = data.needs_attention
     const item = reviewOwnerAttention()
