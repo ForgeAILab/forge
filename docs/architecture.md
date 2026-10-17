@@ -73,8 +73,10 @@ and renames into place. The multithreaded parent never opens the executable inod
 for writing, so another fork cannot inherit a writable descriptor and make even
 an indirectly invoked Git hook fail with Linux `ETXTBSY`. All fake executable
 fixtures and the generated compiler-cache launcher use this publisher.
-`scripts/write-executable.sh` is embedded in Rust; Python CI fixtures use the
-same writer through `scripts/executable_fixture.py`. The shared
+The writer program lives in the crate, since release images build from
+`crates/` alone (`scripts/test_crate_includes.py` keeps non-test includes
+inside it); Python CI fixtures run the same program through
+`scripts/executable_fixture.py`. The shared
 sync/async spawn helpers retry only `ExecutableFileBusy`, five retries with
 10/20/40/80/160 ms delays; other spawn errors and process exit failures retain
 their original behavior. Compiler-cache probes, supervised processes, and direct

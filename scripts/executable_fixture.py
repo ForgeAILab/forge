@@ -1,8 +1,11 @@
-"""Python binding to the same child writer used by process-supervisor."""
+"""The same child writer process-supervisor uses, for Python fixtures."""
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+
+# Same program as `WRITER` in crates/process-supervisor/src/executable.rs.
+WRITER = 'umask 077\nexec /bin/cat > "$1"\n'
 
 
 def write_executable(path: Path, contents: str) -> None:
@@ -11,7 +14,7 @@ def write_executable(path: Path, contents: str) -> None:
     with tempfile.TemporaryDirectory(prefix=".forge-executable-", dir=path.parent) as scratch:
         staged = Path(scratch) / "script"
         subprocess.run(
-            ["/bin/sh", str(Path(__file__).with_name("write-executable.sh")), str(staged)],
+            ["/bin/sh", "-c", WRITER, "forge-write-executable", str(staged)],
             input=contents.encode(), check=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
         )

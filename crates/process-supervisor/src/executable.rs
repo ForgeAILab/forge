@@ -3,6 +3,11 @@ use std::{fs, io, path::Path, time::Duration};
 #[cfg(unix)]
 use std::{io::Write, process::Stdio};
 
+/// The Unix writer process (`scripts/executable_fixture.py` runs the same
+/// program). Kept in the crate: release images build from `crates/` alone.
+#[cfg(unix)]
+const WRITER: &str = "umask 077\nexec /bin/cat > \"$1\"\n";
+
 /// Atomically publish an executable, without following an existing symlink.
 ///
 /// On Unix the writer is a separate process: the multithreaded parent never
@@ -23,11 +28,7 @@ pub fn write_executable(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<(
     #[cfg(unix)]
     {
         let mut writer = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                include_str!("../../../scripts/write-executable.sh"),
-                "forge-write-executable",
-            ])
+            .args(["-c", WRITER, "forge-write-executable"])
             .arg(&staged)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
