@@ -8,7 +8,8 @@ use serde_json::{json, Value};
 async fn both_agent_lists_hide_daemon_pins_from_non_admins() {
     let workspace = common::TestDir::new("agent-list-pins");
     let harness = common::test_app(workspace.path(), "agent-list-pins").await;
-    let (agent, _) = common::create_shell_agents(&harness.app, workspace.path(), "pins").await;
+    let (agent, _) =
+        common::create_shell_agents(&harness.app, &harness.state, workspace.path(), "pins").await;
     let project: ProjectResponse = common::json_request(
         &harness.app,
         Method::POST,

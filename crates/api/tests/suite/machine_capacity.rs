@@ -29,7 +29,8 @@ async fn machine_capacity_settings_live_update_controls_next_admission() {
     let repo_root = TestDir::new("machine-live-repo");
     let repo = common::setup_git_repo(repo_root.path());
     let (project, repo_id) = common::create_project_and_repo(&app, "Capacity", &repo).await;
-    let (worker, reviewer) = common::create_shell_agents(&app, root.path(), "capacity").await;
+    let (worker, reviewer) =
+        common::create_shell_agents(&app, &state, root.path(), "capacity").await;
     common::configure_execution_test_setup(&state.db, &project, &repo_id, &worker, &reviewer).await;
     sqlx::query("UPDATE agent_identity SET max_concurrent_tasks = 10 WHERE id = ?")
         .bind(&worker)

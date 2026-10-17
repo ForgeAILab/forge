@@ -291,6 +291,7 @@ async fn unavailable_actions_include_capabilities_for_both_workflows() {
 
     common::create_shell_agents(
         &harness.app,
+        &harness.state,
         workspace_root.path(),
         "available-action-agents",
     )
@@ -340,8 +341,13 @@ async fn task_actions_exposes_and_enforces_the_typed_recovery_contract() {
     let (project_id, _) =
         common::create_project_and_repo(&harness.app, "Recovery Actions", &repo_path).await;
     let task = create_task(&harness.app, &project_id, "closed recovery contract").await;
-    let (agent, _) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "recovery-contract").await;
+    let (agent, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "recovery-contract",
+    )
+    .await;
     db::TaskRoleAssignmentRepo::assign(
         &*harness.state.db,
         db::CreateTaskRoleAssignment {
@@ -438,8 +444,13 @@ async fn task_response_action_projection_paginates_execution_history() {
     let harness = common::test_app(workspace_root.path(), "facade-execution-history").await;
     let (project_id, _) =
         common::create_project_and_repo(&harness.app, "Execution history", &repo_path).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "history-authority").await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "history-authority",
+    )
+    .await;
     let task = create_task(&harness.app, &project_id, "history action authority").await;
     sqlx::query("UPDATE task SET assignee_type = 'agent', assignee_id = ? WHERE id = ?")
         .bind(&agent_id)
@@ -596,8 +607,13 @@ async fn recover_full_agent_returns_queued_task_and_preserves_other_errors() {
     let harness = common::test_app(workspace_root.path(), "facade-recovery-capacity").await;
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Recovery capacity", &repo_path).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "recovery-capacity").await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "recovery-capacity",
+    )
+    .await;
     common::configure_execution_test_setup(
         &harness.state.db,
         &project_id,
@@ -889,8 +905,13 @@ async fn execution_facade_actions_work_for_both_workflows() {
         .initialize()
         .await
         .expect("workflow templates initialize");
-    let (worker_id, reviewer_id) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "facade-execution").await;
+    let (worker_id, reviewer_id) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "facade-execution",
+    )
+    .await;
 
     let (autonomous_project, autonomous_repo) =
         common::create_project_and_repo(&harness.app, "Autonomous", &repo_path).await;
@@ -1107,8 +1128,13 @@ async fn task_actions_rest_diagnostics_and_execution_controls_share_one_offer_se
     let harness = common::test_app(workspace_root.path(), "action-surface-parity").await;
     let repo = common::setup_git_repo(workspace_root.path());
     let (project, _) = common::create_project_and_repo(&harness.app, "Action parity", &repo).await;
-    let _agents =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "action-parity").await;
+    let _agents = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "action-parity",
+    )
+    .await;
     for scenario in ["failed_review", "stored_annotation", "blocked_budget"] {
         let task = create_task(&harness.app, &project, scenario).await;
         let state = if scenario == "failed_review" {
@@ -1219,8 +1245,13 @@ async fn paused_task_action_refusals_keep_wait_cause_without_erasing_the_conditi
     let harness = common::test_app(workspace.path(), "action-pause-causes").await;
     let (project, _) = common::create_project_and_repo(&harness.app, "Pause causes", &path).await;
     let task = create_task(&harness.app, &project, "Wait for dispatch").await;
-    let (agent, _) =
-        common::create_shell_agents(&harness.app, workspace.path(), "pause-causes").await;
+    let (agent, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace.path(),
+        "pause-causes",
+    )
+    .await;
     db::TaskRoleAssignmentRepo::assign(
         &*harness.state.db,
         db::CreateTaskRoleAssignment {

@@ -5,10 +5,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
-    ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
-    TerminalSessionResponse, TerminalSessionStatus,
+    AgentResponse, CreateTerminalSessionResponse, ExecutionStatus, ExecutionSummaryResponse,
+    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse, TaskStatus,
+    TerminalAttachTokenResponse, TerminalServerFrame, TerminalSessionResponse,
+    TerminalSessionStatus,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -163,7 +163,7 @@ async fn forge_happy_path_end_to_end() {
         Some(repo_path.to_string_lossy().as_ref())
     );
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -473,7 +473,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -913,46 +913,10 @@ async fn setup_git_repo(path: &Path) -> std::path::PathBuf {
     repo_path
 }
 
-async fn register_daemon_and_report_shell(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "happy-path-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "happy-path-test",
-            "labels": { "suite": "happy_path" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_shell(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "happy-path-host", "shell")
+        .await
+        .daemon_id
 }
 
 async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &str) {
@@ -1296,8 +1260,13 @@ async fn single_machine_environment_recheck_resumes_task_dispatch() {
     let harness = test_app(root.path()).await;
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Environment smoke", &repo).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, root.path(), "environment-smoke").await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        root.path(),
+        "environment-smoke",
+    )
+    .await;
     let agent: AgentResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -1563,7 +1532,7 @@ async fn root_lead_kickoff_returned_step_and_aggregate_review_finish() {
         StatusCode::OK,
     )
     .await;
-    let daemon = register_daemon_and_report_shell(&harness.app, workspaces.path()).await;
+    let daemon = register_daemon_and_report_shell(&harness.state, workspaces.path()).await;
     let worker: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -1771,7 +1740,7 @@ async fn repair_release_project(
     )
     .await;
     let repo: RepoResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/repos", project.id), json!({"name":"repo","local_path":repo_path.to_string_lossy(),"remote_url":repo_path.to_string_lossy(),"default_branch":"main"}), StatusCode::OK).await;
-    let daemon = register_daemon_and_report_shell(&harness.app, workspaces).await;
+    let daemon = register_daemon_and_report_shell(&harness.state, workspaces).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,

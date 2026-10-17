@@ -54,7 +54,7 @@ use std::{
 };
 
 use api::{build_router, AppState};
-use api_types::{AgentResponse, DaemonRegisterResponse, DaemonResponse};
+use api_types::AgentResponse;
 use axum::{
     body::{to_bytes, Body},
     http::{header, Method, Request, StatusCode},
@@ -1697,7 +1697,7 @@ impl World {
         let (project_id, repo_id) =
             common::create_project_and_repo(&live.app, "Model", &repo).await;
         let (coder_id, reviewer_id) =
-            register_agents(&live.app, &dir.path().join("workspaces")).await;
+            register_agents(&live.app, &live.state, &dir.path().join("workspaces")).await;
         common::configure_execution_test_setup(
             &live.state.db,
             &project_id,
@@ -3370,33 +3370,9 @@ impl World {
     }
 }
 
-async fn register_agents(app: &Router, workspaces: &Path) -> (String, String) {
-    let registration: DaemonRegisterResponse = common::json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "model-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "model"
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let _: DaemonResponse = common::json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{}/report", registration.daemon_id),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{ "kind": "codex", "availability": "authenticated", "path": "/bin/codex" }],
-            "runtimes": [{ "kind": "local", "workspace_root": workspaces.to_string_lossy(), "status": "ready" }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
+async fn register_agents(app: &Router, state: &AppState, workspaces: &Path) -> (String, String) {
+    let registration =
+        common::register_embedded_daemon(state, workspaces, "model-host", "codex").await;
     let mut ids = Vec::new();
     for name in ["model-coder", "model-reviewer"] {
         let agent: AgentResponse = common::json_request_with_bearer(

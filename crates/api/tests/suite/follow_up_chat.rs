@@ -10,8 +10,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ErrorResponse, LaunchExecutionResponse,
-    ProjectResponse, RepoResponse,
+    AgentResponse, ErrorResponse, LaunchExecutionResponse, ProjectResponse, RepoResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -61,7 +60,7 @@ async fn follow_up_execution_happy_path_returns_task_execution_and_workspace() {
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent = create_agent(&harness.app, "shell-agent", &daemon_id).await;
     common::configure_execution_test_setup(
         &harness.state.db,
@@ -146,7 +145,7 @@ async fn follow_up_execution_rejects_running_parent_with_conflict_code() {
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent = create_agent(&harness.app, "shell-agent", &daemon_id).await;
 
     let seeded = seed_parent_execution(
@@ -206,7 +205,7 @@ async fn follow_up_execution_rejects_missing_session_with_conflict_code() {
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent = create_agent(&harness.app, "shell-agent", &daemon_id).await;
 
     let seeded = seed_parent_execution(
@@ -266,7 +265,7 @@ async fn follow_up_execution_rejects_terminal_task_with_invalid_operation_code()
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent = create_agent(&harness.app, "shell-agent", &daemon_id).await;
 
     let seeded = seed_parent_execution(
@@ -519,46 +518,10 @@ async fn seed_parent_execution(
     }
 }
 
-async fn register_daemon_and_report_shell(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "follow-up-chat-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "follow-up-chat-test",
-            "labels": { "suite": "follow_up_chat" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_shell(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "follow-up-chat-host", "shell")
+        .await
+        .daemon_id
 }
 
 async fn create_agent(app: &Router, name: &str, daemon_id: &str) -> AgentResponse {

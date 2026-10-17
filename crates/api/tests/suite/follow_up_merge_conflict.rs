@@ -11,8 +11,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionSummaryResponse,
-    PaginatedResponse, ProjectResponse, RepoResponse,
+    AgentResponse, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -66,7 +65,7 @@ async fn merge_conflict_is_handed_back_to_the_coder() {
     .await;
     assert!(repo.local_path.is_some());
 
-    let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_codex(&harness.state, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     common::configure_execution_test_setup(
         &harness.state.db,
@@ -417,46 +416,10 @@ fn prepare_conflicting_worktree(repo_path: &Path, worktree_path: &Path, task_id:
     run_git(repo_path, &["commit", "-m", "main change"]);
 }
 
-async fn register_daemon_and_report_codex(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "merge-conflict-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "merge-conflict-test",
-            "labels": { "suite": "follow_up_merge_conflict" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "codex",
-                "availability": "authenticated",
-                "path": "/bin/codex"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_codex(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "merge-conflict-host", "codex")
+        .await
+        .daemon_id
 }
 
 async fn create_agent(app: &Router, name: &str, daemon_id: &str) -> AgentResponse {

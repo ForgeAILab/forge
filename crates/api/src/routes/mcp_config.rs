@@ -16,7 +16,10 @@ use tokio::fs;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{
+        auth::{AuthenticatedUser, RequireAdmin},
+        authorization::{require_project_access, ProjectAccess},
+    },
     state::AppState,
 };
 use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
@@ -24,10 +27,18 @@ use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,
     State(state): State<AppState>,
-    user: AuthenticatedUser,
+    RequireAdmin(user): RequireAdmin,
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&params.agent)?;
     let scope = parse_scope(params.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        params.project_id.as_deref(),
+        ProjectAccess::Read,
+    )
+    .await?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
     let expected_url = mcp_url_for_scope_from_request(
@@ -55,11 +66,19 @@ pub async fn get_mcp_config(
 
 pub async fn update_mcp_config(
     State(state): State<AppState>,
-    user: AuthenticatedUser,
+    RequireAdmin(user): RequireAdmin,
     Json(body): Json<McpConfigActionRequest>,
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        body.project_id.as_deref(),
+        ProjectAccess::Admin,
+    )
+    .await?;
     let action = parse_action(&body.action)?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, body.project_id.as_deref()).await?;
@@ -114,6 +133,21 @@ pub async fn update_mcp_config(
         config_path: config_path.to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
+}
+
+async fn authorize_config_project(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    scope: &McpScope,
+    project_id: Option<&str>,
+    access: ProjectAccess,
+) -> ApiResult<()> {
+    if matches!(scope, McpScope::Project | McpScope::Local) {
+        if let Some(project_id) = project_id.map(str::trim).filter(|id| !id.is_empty()) {
+            require_project_access(state, project_id, &user.user_id, access).await?;
+        }
+    }
+    Ok(())
 }
 
 fn mcp_url_for_scope_from_request(
@@ -984,7 +1018,7 @@ command = "other"
     ) -> McpConfigResponse {
         update_mcp_config(
             State(state.clone()),
-            test_authenticated_user(),
+            RequireAdmin(test_authenticated_user()),
             Json(McpConfigActionRequest {
                 agent: agent.to_owned(),
                 scope: scope.map(str::to_owned),
@@ -1012,7 +1046,7 @@ command = "other"
                 public_base_url: None,
             }),
             State(state.clone()),
-            test_authenticated_user(),
+            RequireAdmin(test_authenticated_user()),
         )
         .await
         .expect("get config succeeds")
@@ -1082,7 +1116,7 @@ command = "other"
         AuthenticatedUser {
             user_id: "test-user-id".to_owned(),
             email: "test@example.com".to_owned(),
-            is_admin: false,
+            is_admin: true,
         }
     }
 

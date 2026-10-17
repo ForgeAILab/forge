@@ -644,6 +644,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_daemon_registers_and_reports_through_internal_path() {
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        let daemon = test_daemon(tempdir.path()).await;
+        daemon
+            .scan_and_report()
+            .await
+            .expect("internal report succeeds");
+        let credentials = daemon.read_credentials().unwrap().unwrap();
+        let registered = daemon
+            .service
+            .authenticate(&credentials.daemon_id, &credentials.token)
+            .await
+            .unwrap();
+        assert_eq!(registered.machine_id, embedded_machine_id());
+        assert_eq!(registered.owner_id, None);
+        assert_eq!(registered.visibility, "global");
+        assert!(registered.last_report_at.is_some());
+    }
+
+    #[tokio::test]
     async fn test_second_run_loads() {
         let tempdir = tempfile::tempdir().expect("tempdir creates");
         let daemon = test_daemon(tempdir.path()).await;

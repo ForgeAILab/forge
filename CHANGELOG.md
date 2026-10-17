@@ -6,6 +6,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Security
+
+- Provider connection tests and health probes share one HTTP client policy:
+  resolve and validate the endpoint once, pin the approved addresses, and
+  disable redirects and proxies so requests cannot reach an unchecked host.
+- Provider endpoint checks now reject `0.0.0.0/8`, NAT64 and Teredo prefixes,
+  and 6to4, IPv4-mapped and IPv4-compatible addresses carrying restricted IPv4
+  destinations, including when reading stored provider metadata. The same
+  predicate protects native provider requests, web fetch and public search.
+- Remote daemon registration, reports and WebSocket connections reject every
+  reserved `embedded:` identity, including this server's own identity. Internal
+  embedded daemon registration and reporting continue through their service path.
+- MCP configuration reads and writes require an instance administrator before
+  accessing server files or returning their paths. Project/local scope with a
+  Project id also enforces Project visibility and owner/admin roles for writes.
+
+### Breaking
+
+- Remote daemon clients using any `embedded:` machine id now receive HTTP 409
+  `machine_id_reserved`, including re-registration and authenticated report or
+  reconnect attempts. These ids are reserved for the in-process server daemon.
+- `GET` and `POST /api/v1/config/mcp` now reject non-administrators with HTTP
+  403 `admin_required`. For Project/local scope with a Project id, inaccessible
+  Projects return scoped HTTP 404; writes by an administrator who is only a
+  Project viewer/member return HTTP 403 `insufficient_role`.
+
 ## [0.14.0] - 2026-10-16
 
 ### Security

@@ -36,7 +36,7 @@ use agent_runtime::core::error::RuntimeError;
 use agent_runtime::harness::{FetchRequest, FetchResponse, FetchTransport};
 use async_trait::async_trait;
 
-use crate::transport::{restricted_provider_hostname, restricted_provider_ip};
+use crate::network_policy::{restricted_provider_hostname, restricted_provider_ip};
 
 /// Redirect hops followed inside one authorized origin.
 const MAX_REDIRECTS: u8 = 3;
@@ -318,6 +318,25 @@ mod tests {
             assert!(
                 pinned_client(&url, DEFAULT_FETCH_TIMEOUT).await.is_err(),
                 "{rejected} must not be reachable through the fetch transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_transition_and_zero_network_urls_before_io() {
+        for endpoint in [
+            "https://0.1.2.3/",
+            "https://[64:ff9b::7f00:1]/",
+            "https://[64:ff9b:1::1]/",
+            "https://[2002:7f00:1::]/",
+            "https://[2001::1]/",
+            "https://[::ffff:0.1.2.3]/",
+            "https://[::0.1.2.3]/",
+        ] {
+            let url = url::Url::parse(endpoint).unwrap();
+            assert!(
+                pinned_client(&url, DEFAULT_FETCH_TIMEOUT).await.is_err(),
+                "{endpoint}"
             );
         }
     }

@@ -34,16 +34,7 @@ pub async fn register_daemon(
 ) -> ApiResult<Json<DaemonRegisterResponse>> {
     // `embedded:` names a server's own in-process daemon and `removed:` a
     // tombstone; neither is an identity an external daemon may claim.
-    let machine_id = request.machine_id.trim();
-    if machine_id.starts_with("removed:")
-        || (machine_id.starts_with("embedded:")
-            && !services::embedded_daemon::is_embedded_daemon_machine(machine_id))
-    {
-        return Err(ApiError::conflict_with_code(
-            "machine_id_reserved",
-            "This machine_id is reserved for the Forge server",
-        ));
-    }
+    require_external_machine_id(&request.machine_id)?;
     let owner_id = registration_owner_id(&state, &headers).await?;
     let visibility = owner_id.as_ref().map(|_| "account".to_owned());
 
@@ -81,11 +72,12 @@ pub async fn report_daemon(
     Json(request): Json<DaemonReportRequest>,
 ) -> ApiResult<Json<DaemonResponse>> {
     let token = bearer_token(&headers)?;
-    state
+    let daemon = state
         .daemon_service
         .authenticate(&id, token)
         .await
         .map_err(|_| ApiError::unauthorized("invalid daemon bearer token"))?;
+    require_external_machine_id(&daemon.machine_id)?;
 
     // Kept before the report is ingested, so the reply already shows it.
     if let Some(disk) = request.disk.as_ref() {
@@ -140,13 +132,25 @@ pub async fn connect_daemon(
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
     let token = connect_token(&headers, query.token)?;
-    state
+    let daemon = state
         .daemon_service
         .authenticate(&id, &token)
         .await
         .map_err(|_| ApiError::unauthorized("invalid daemon bearer token"))?;
+    require_external_machine_id(&daemon.machine_id)?;
 
     Ok(ws.on_upgrade(move |socket| run_command_socket(state, id, socket)))
+}
+
+fn require_external_machine_id(machine_id: &str) -> ApiResult<()> {
+    let machine_id = machine_id.trim();
+    if machine_id.starts_with("removed:") || machine_id.starts_with("embedded:") {
+        return Err(ApiError::conflict_with_code(
+            "machine_id_reserved",
+            "This machine_id is reserved for the Forge server",
+        ));
+    }
+    Ok(())
 }
 
 async fn run_command_socket(state: AppState, daemon_id: String, socket: WebSocket) {

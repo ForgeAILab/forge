@@ -5,8 +5,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse, RepoResponse,
-    TaskResponse, TransitionTaskResponse,
+    AgentResponse, ProjectResponse, RepoResponse, TaskResponse, TransitionTaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -44,7 +43,8 @@ async fn entering_planning_dispatches_assigned_planner_role() {
     )
     .await;
     let workspace_root = common::TestDir::new("forge-planning-workspaces");
-    let planner_agent_id = create_shell_agent(&harness.app, workspace_root.path()).await;
+    let planner_agent_id =
+        create_shell_agent(&harness.app, &harness._state, workspace_root.path()).await;
     let _: Value = json_request_with_bearer(
         &harness.app,
         Method::PUT,
@@ -272,34 +272,11 @@ async fn create_project_and_repo(app: &Router) -> (String, String) {
     (project.id, repo.id)
 }
 
-async fn create_shell_agent(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "planning-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "test"
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{ "kind": "shell", "availability": "authenticated", "path": "/bin/sh" }],
-            "runtimes": [{ "kind": "local", "workspace_root": workspace_root.to_string_lossy(), "status": "ready" }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
+async fn create_shell_agent(app: &Router, state: &AppState, workspace_root: &Path) -> String {
+    let daemon_id =
+        common::register_embedded_daemon(state, workspace_root, "planning-host", "shell")
+            .await
+            .daemon_id;
     let agent: AgentResponse = json_request_with_bearer(
         app,
         Method::POST,

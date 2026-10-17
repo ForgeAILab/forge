@@ -1,3 +1,5 @@
+use crate::network_policy::{restricted_provider_hostname, restricted_provider_ip};
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
@@ -219,52 +221,6 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
     Ok((client, url.to_owned()))
 }
 
-/// Hostnames that never belong to a public endpoint. Shared with the web
-/// fetch transport so both outbound paths refuse the same names.
-pub(crate) fn restricted_provider_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
-}
-
-/// Addresses that never belong to a public endpoint: RFC 1918, loopback,
-/// link-local, CGNAT, documentation ranges, and multicast. Shared with the
-/// web fetch transport.
-pub(crate) fn restricted_provider_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] & 0xfe00) == 0xfc00
-                || segments[0] >= 0xff00
-                || address
-                    .to_ipv4()
-                    .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
-        }
-    }
-}
-
 impl fmt::Debug for ReqwestTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -287,6 +243,21 @@ impl HttpTransport for ReqwestTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn native_provider_rejects_transition_and_zero_network_urls_before_io() {
+        for url in [
+            "https://0.1.2.3/v1",
+            "https://[64:ff9b::7f00:1]/v1",
+            "https://[64:ff9b:1::1]/v1",
+            "https://[2002:7f00:1::]/v1",
+            "https://[2001::1]/v1",
+            "https://[::ffff:0.1.2.3]/v1",
+            "https://[::0.1.2.3]/v1",
+        ] {
+            assert!(provider_client_for_url(url).await.is_err(), "{url}");
+        }
+    }
 
     #[tokio::test]
     async fn provider_transport_rejects_private_urls_before_network_io() {

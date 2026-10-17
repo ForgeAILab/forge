@@ -291,6 +291,7 @@ credential health), so it may be `active` below the concurrency cap while
 capacity is a placement wait, independent of Agent availability.
 
 | GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
+| GET / POST | `/api/v1/config/mcp` | Administrator-only read/install/uninstall of MCP configuration on the server; Project/local scope with a Project id also requires Project visibility (read) or owner/admin role (write) |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner or an administrator |
 | GET    | `/api/v1/daemons/{id}/removal` | Preview a removal for its owner or an administrator: Tasks to re-place and Agents to retire |
@@ -317,6 +318,15 @@ capacity is a placement wait, independent of Agent availability.
 | POST   | `/api/v1/provider-authorizations` | Start a finite browser/device provider authorization operation. Browser flows require `redirect_origin` to be a trusted origin: a configured `cors_origins` / `public_base_url` entry, the server's own serving origin, or the origin the request itself arrived from (`Origin` header, else dialed `Host`) |
 | GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |
 | POST   | `/api/v1/provider-authorizations/{id}/cancel` | Cancel a non-terminal provider authorization using `expected_version` |
+
+Provider connection tests and health probes resolve each HTTPS endpoint once,
+reject any restricted address in the result, and connect only to those pinned
+addresses. They do not follow redirects or use proxies. Endpoint checks also
+apply when loading stored metadata. Restricted destinations include `0.0.0.0/8`,
+the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, Teredo `2001::/32`,
+and 6to4 (`2002::/16`), IPv4-mapped and IPv4-compatible IPv6 addresses whose
+embedded IPv4 address is restricted. Native provider transport, web fetch and
+public-search endpoint admission use the same address predicate.
 
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`
@@ -2234,6 +2244,23 @@ retrospective mutation tool in this change.
 ## Forge Settings
 
 `GET /api/v1/settings` and `PUT /api/v1/settings` are administrator-only.
+
+`GET /api/v1/config/mcp` and `POST /api/v1/config/mcp` use that same instance
+administrator requirement. A signed-in non-administrator receives HTTP 403
+`admin_required` before any server configuration file is accessed or its path
+is returned. These routes inspect or modify the server's filesystem: `scope=user`
+uses the server's HOME, and `scope=project` (the default) or `scope=local`
+without a Project id uses the server's current directory.
+
+With a non-empty `project_id` in Project/local scope, reads also require Project
+visibility and writes require its owner/admin role. Instance administrator status
+does not bypass Project visibility: an inaccessible Project has the same HTTP
+404 `not_found` response as an unknown Project, before repository/path lookup;
+an insufficient Project write role returns HTTP 403 `insufficient_role`.
+Authorized responses retain `config_path`, `url`, `expected_url`, `installed`
+and `agents`. Requests accept `agent` (`claude`, `cursor`, `codex`), `scope`
+(`project`, `local`, `user`), optional `project_id` and `public_base_url`;
+POST additionally accepts `action` (`install`, `uninstall`).
 The response lists `value`, `effective_value` and `restart_required` per key.
 Other keys retain their startup value until restart.
 Both read and write `config_path`, the `forge.yaml` this start loaded
@@ -6789,8 +6816,15 @@ without authentication when it has an owner, returns HTTP 409 with
 `code: machine_owned` and leaves the owner, credential and hostname untouched.
 The same owner re-registering rotates the credential as before, and an unclaimed
 registration can still be claimed by the first authenticated user. A
-`machine_id` starting with `removed:`, or starting with `embedded:` and not this
-server's own embedded identity, returns HTTP 409 with `code: machine_id_reserved`.
+`machine_id` starting with `removed:` or `embedded:` (after trimming whitespace)
+returns HTTP 409 with `code: machine_id_reserved` and message
+`This machine_id is reserved for the Forge server`. This includes this server's
+own embedded identity, for both fresh registration and re-registration, with or
+without user authentication. Authenticated remote reports and WebSocket reconnects
+for reserved identities return the same error and do not modify daemon state.
+Errors use the standard `{code, message, details, request_id}` response shape.
+The server's embedded daemon registers and reports directly through its internal
+service path; it does not use these HTTP routes.
 
 ### Task budget projections
 

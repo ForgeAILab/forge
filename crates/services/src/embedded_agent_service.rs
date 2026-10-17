@@ -1,5 +1,5 @@
 use crate::provider_credentials::{
-    default_api_key_base_url, entry_base_url, restricted_provider_ip, validate_provider_url_shape,
+    default_api_key_base_url, entry_base_url, validate_provider_url_shape,
 };
 use operation_registry::authority::permission_set;
 use std::{
@@ -24,6 +24,7 @@ use db::{
 };
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
+use forge_agent_host::network_policy::restricted_provider_ip;
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
     CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
@@ -714,7 +715,7 @@ impl EmbeddedAgentService {
             .require_owned_entry(owner_user_id, credential_id)
             .await?;
         let base_url = entry_base_url(&entry)?;
-        provider_url_addresses(&base_url)
+        let client = provider_http_client(&base_url, Duration::from_secs(10))
             .await
             .map_err(ServiceError::invalid_operation)?;
         let secret = self
@@ -733,10 +734,6 @@ impl EmbeddedAgentService {
             "openai" if openai_oauth => base.to_owned(),
             _ => format!("{base}/models"),
         };
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|_| ServiceError::invalid_operation("provider test client unavailable"))?;
         let mut request = client.get(&probe_url);
         request = if entry.provider == "gemini" && !is_oauth {
             request.header("x-goog-api-key", secret.expose())
@@ -2245,19 +2242,10 @@ impl EmbeddedAgentService {
             .get("base_url")
             .and_then(Value::as_str)
             .ok_or_else(|| "base_url_missing".to_owned())?;
-        let (parsed, addresses) = provider_url_addresses(base_url)
+        let client = provider_http_client(base_url, Duration::from_secs(8))
             .await
             .map_err(|_| "provider_endpoint_invalid".to_owned())?;
         let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| "provider_endpoint_invalid".to_owned())?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|_| "provider_endpoint_invalid".to_owned())?;
         // Gemini's AI Studio API rejects API keys sent as Bearer tokens; it
         // authenticates via the `x-goog-api-key` header. Every other backend
         // Forge probes takes standard Bearer auth.
@@ -2483,6 +2471,31 @@ async fn provider_url_addresses(
         return Err("base_url must not target a private or local address");
     }
     Ok((parsed, addresses))
+}
+
+/// Resolve and validate once, then use exactly those addresses for the request.
+/// Redirects and proxies must not introduce an unvalidated destination.
+async fn provider_http_client(
+    base_url: &str,
+    timeout: Duration,
+) -> std::result::Result<reqwest::Client, &'static str> {
+    let (parsed, addresses) = provider_url_addresses(base_url).await?;
+    pinned_provider_http_client_builder(&parsed, &addresses, timeout)?
+        .build()
+        .map_err(|_| "provider client unavailable")
+}
+
+fn pinned_provider_http_client_builder(
+    parsed: &url::Url,
+    addresses: &[SocketAddr],
+    timeout: Duration,
+) -> std::result::Result<reqwest::ClientBuilder, &'static str> {
+    let host = parsed.host_str().ok_or("base_url must include a host")?;
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addresses))
 }
 
 fn validate_public_runtime_text(value: Option<&str>) -> Result<Option<String>> {
@@ -4079,3 +4092,7 @@ mod tests {
 #[cfg(test)]
 #[path = "embedded_agent_service_scoped_cli_chat_tests.rs"]
 mod scoped_cli_chat_tests;
+
+#[cfg(test)]
+#[path = "embedded_agent_provider_security_tests.rs"]
+mod provider_security_tests;

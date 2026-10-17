@@ -201,6 +201,12 @@ database. Shared shutdown and worker identity contracts live in core
 `worker_runtime::assembly`; graph-dependent dead-letter registration lives in
 `ForgeRuntime::dead_letter_service` in `services-agents`.
 
+`forge-agent-host::network_policy` owns the shared restricted-IP and hostname
+predicates used by provider-entry validation, service probes, native provider
+transport, web fetch and public-search endpoint admission. Provider connection
+tests and health probes share a client builder that resolves and validates once,
+pins those addresses and disables redirects and proxies.
+
 The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
 `prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with
 their tests. The remaining chat/admission/native-tool modules still live in

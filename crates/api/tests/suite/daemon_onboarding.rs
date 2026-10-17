@@ -10,9 +10,9 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonRegisterResponse,
-    DaemonResponse, ExecutionResponse, ExecutionStatus, ExecutionSummaryResponse,
-    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
+    AgentResponse, CliProjectionItem, CliProjectionResponse, DaemonResponse, ExecutionResponse,
+    ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse,
+    TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -27,42 +27,21 @@ use tower::ServiceExt;
 async fn daemon_onboarding_shell_task_flow_end_to_end() {
     let (app, state) = test_app_with_state().await;
 
-    let registration: DaemonRegisterResponse = json_request(
-        &app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "e2e-test-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "e2e-test",
-            "labels": { "suite": "daemon_onboarding" }
-        }),
-        StatusCode::OK,
+    let registration = common::register_embedded_daemon(
+        &state,
+        &std::env::temp_dir().join("forge-e2e"),
+        "e2e-test-host",
+        "shell",
     )
     .await;
     assert!(!registration.daemon_id.is_empty());
     assert!(!registration.registration_token.is_empty());
     let daemon_id = registration.daemon_id;
-
-    let report: DaemonResponse = json_request_with_bearer(
+    let report: DaemonResponse = common::empty_request_with_bearer(
         &app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": "/tmp/forge-e2e",
-                "status": "ready"
-            }]
-        }),
+        Method::GET,
+        &format!("/api/v1/daemons/{daemon_id}"),
+        &common::admin_jwt(),
         StatusCode::OK,
     )
     .await;

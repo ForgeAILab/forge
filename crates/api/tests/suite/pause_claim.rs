@@ -13,8 +13,13 @@ async fn claim_rejects_paused_agent() {
     let harness = common::test_app(workspace_root.path(), "pause-claim-agent").await;
     let (project_id, _repo_id) =
         common::create_project_and_repo(&harness.app, "Pause Claim Agent", &repo_path).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "pause-claim-agent").await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "pause-claim-agent",
+    )
+    .await;
 
     let _: Value = common::empty_request(
         &harness.app,
@@ -47,9 +52,13 @@ async fn claim_rejects_agent_on_paused_project() {
     let harness = common::test_app(workspace_root.path(), "pause-claim-project").await;
     let (project_id, _repo_id) =
         common::create_project_and_repo(&harness.app, "Pause Claim Project", &repo_path).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "pause-claim-project")
-            .await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "pause-claim-project",
+    )
+    .await;
 
     let _: Value = common::empty_request(
         &harness.app,
@@ -112,9 +121,13 @@ async fn running_task_continues_after_pause() {
     let harness = common::test_app(workspace_root.path(), "pause-claim-running").await;
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Pause Claim Running", &repo_path).await;
-    let (agent_id, reviewer_id) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "pause-claim-running")
-            .await;
+    let (agent_id, reviewer_id) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "pause-claim-running",
+    )
+    .await;
     common::configure_execution_test_setup(
         &harness.state.db,
         &project_id,

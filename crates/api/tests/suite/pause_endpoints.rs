@@ -12,7 +12,7 @@ async fn agent_pause_resume_idempotent() {
     let harness = test_app(workspace_dir.path(), "pause-test").await;
     let app = &harness.app;
     let (agent_id, _agent_b_id) =
-        create_shell_agents(app, workspace_dir.path(), "pause-test").await;
+        create_shell_agents(app, &harness.state, workspace_dir.path(), "pause-test").await;
 
     let agent: AgentResponse = empty_request(
         app,

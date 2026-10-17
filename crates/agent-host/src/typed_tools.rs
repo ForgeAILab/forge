@@ -1675,9 +1675,15 @@ fn public_https_origin(origin: &str) -> bool {
         return false;
     }
     match parsed.host() {
-        Some(url::Host::Domain(domain)) => !crate::transport::restricted_provider_hostname(domain),
-        Some(url::Host::Ipv4(address)) => !crate::transport::restricted_provider_ip(address.into()),
-        Some(url::Host::Ipv6(address)) => !crate::transport::restricted_provider_ip(address.into()),
+        Some(url::Host::Domain(domain)) => {
+            !crate::network_policy::restricted_provider_hostname(domain)
+        }
+        Some(url::Host::Ipv4(address)) => {
+            !crate::network_policy::restricted_provider_ip(address.into())
+        }
+        Some(url::Host::Ipv6(address)) => {
+            !crate::network_policy::restricted_provider_ip(address.into())
+        }
         None => false,
     }
 }
@@ -6125,3 +6131,22 @@ mod lead_tests;
 
 #[cfg(test)]
 mod proposal_registry_tests;
+
+#[cfg(test)]
+mod public_origin_security_tests {
+    #[test]
+    fn public_search_rejects_transition_and_zero_network_origins() {
+        for origin in [
+            "https://0.1.2.3",
+            "https://[64:ff9b::7f00:1]",
+            "https://[64:ff9b:1::1]",
+            "https://[2002:7f00:1::]",
+            "https://[2001::1]",
+            "https://[::ffff:0.1.2.3]",
+            "https://[::0.1.2.3]",
+        ] {
+            assert!(!super::public_https_origin(origin), "{origin}");
+        }
+        assert!(super::public_https_origin("https://8.8.8.8"));
+    }
+}
