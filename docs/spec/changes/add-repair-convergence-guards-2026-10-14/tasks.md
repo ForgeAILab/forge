@@ -133,3 +133,4 @@ completed_at: 2026-10-16T23:31:14Z
 - [x] 11.1 Isolate config lookup by CLI/environment data directory, including a fresh Solo root containing only `forge.yaml`, with regression coverage and a breaking-change note.
 - [x] 11.2 Classify a signatureless candidate failure against a signature-bearing red base as introduced and blocking; retain unverified classification only for a signatureless red base.
 - [x] 11.3 Post idempotent Forge comments for no-change send-back and park, naming the budget or open findings and owner actions.
+- [x] 11.4 Review follow-ups: keep `pre_existing_unverified` when every candidate signature fails on the red base and the rerun reports none (a partial overlap names the signatures the base does not fail); key both no-change comments by the review entry so a second park of the same Review is reported; print a migrate command and resolve pending settings with the same config lookup as the start.
