@@ -47,7 +47,9 @@ async fn wait_for_review(harness: &TestHarness, task_id: &str, attempt: usize) -
                     .iter()
                     .all(|execution| execution.status == db::ExecutionStatus::Completed)
             {
-                return task;
+                // `task` was read before the Review settled; read it again so
+                // its offers reflect the settled Review.
+                return common::drain(&harness.state, &harness.app, task_id).await;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
