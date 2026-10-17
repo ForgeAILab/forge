@@ -76,6 +76,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   controls show other users only the MCP URL for their own client, with no
   install buttons and no server config reads.
 
+### Changed
+
+- Review parks name the owner decision and park reason in Attention and show
+  the owner's finding deferral and guided retry offers when eligible.
+- Workflow snapshots now commit with their queued step and transition,
+  including board moves; failed entries and unused payloads leave no orphan.
+
 ### Fixed
 
 - Re-running Review now cancels its previous attempt and records the new entry
@@ -1857,10 +1864,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Review parks name the owner decision and park reason in Attention and show
-  the owner's finding deferral and guided retry offers when eligible.
-- Workflow snapshots now commit with their queued step and transition,
-  including board moves; failed entries and unused payloads leave no orphan.
 - Review rounds now derive repeat parks from open blocking reviewer findings.
   A carried finding gets another round while the open blocking count shrinks;
   after ordinary Review retries are spent, `review_progress` grants up to two
