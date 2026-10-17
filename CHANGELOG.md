@@ -30,7 +30,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - `GET` and `POST /api/v1/config/mcp` now reject non-administrators with HTTP
   403 `admin_required`. For Project/local scope with a Project id, inaccessible
   Projects return scoped HTTP 404; writes by an administrator who is only a
-  Project viewer/member return HTTP 403 `insufficient_role`.
+  Project viewer/member return HTTP 403 `insufficient_role`. The web MCP
+  controls show other users only the MCP URL for their own client, with no
+  install buttons and no server config reads.
 
 ## [0.14.0] - 2026-10-16
 

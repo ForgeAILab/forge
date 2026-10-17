@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/cn'
 import { getApiErrorMessage } from '@/lib/api-error'
+import { useAuthStore } from '@/stores/auth'
 import type { McpConfigActionRequest } from '@/types/generated'
 
 type McpInstallScope = 'project' | 'local' | 'user'
@@ -55,6 +56,15 @@ function getCliCommand(agent: McpInstallAgent, mcpUrl: string): string {
     case 'cursor':
       return JSON.stringify({ mcpServers: { forge: { type: 'http', url: mcpUrl } } }, null, 2)
   }
+}
+
+// The address this browser reaches Forge on; the server derives the same URL
+// when no public base URL is configured.
+function browserMcpUrl(scope: McpInstallScope, projectId?: string): string {
+  const base = `${window.location.origin}/mcp`
+  return scope === 'project' && projectId
+    ? `${base}?project_id=${encodeURIComponent(projectId)}`
+    : base
 }
 
 function getCommandLabel(agent: McpInstallAgent): string {
@@ -108,12 +118,38 @@ export function McpInstallControls({
       .map((item) => item.kind),
   )
   const supportedAgents = availableMcpClients(cliKinds)
+  // Server-side MCP configuration is administrator-only: other users get the
+  // URL to configure their own client, without reading the server's files.
+  const isAdmin = useAuthStore((state) => state.user?.is_admin === true)
 
-  const claudeQuery = useMcpConfigQuery('claude', scope, projectId)
-  const cursorQuery = useMcpConfigQuery('cursor', scope, projectId)
-  const codexQuery = useMcpConfigQuery('codex', scope, projectId)
+  const claudeQuery = useMcpConfigQuery('claude', scope, projectId, isAdmin)
+  const cursorQuery = useMcpConfigQuery('cursor', scope, projectId, isAdmin)
+  const codexQuery = useMcpConfigQuery('codex', scope, projectId, isAdmin)
   const mutation = useUpdateMcpConfig()
   const [pendingAgent, setPendingAgent] = useState<McpInstallAgent | 'all' | null>(null)
+
+  if (!isAdmin) {
+    const manualUrl = browserMcpUrl(scope, projectId)
+    return (
+      <div className={cn('space-y-3', compact && 'mt-3')}>
+        <div>
+          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            MCP Server URL
+          </p>
+          <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
+            <code className="min-w-0 flex-1 truncate font-mono text-sm text-foreground">
+              {manualUrl}
+            </code>
+            <CopyButton text={manualUrl} />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          Use this URL to configure your MCP client. Installing MCP configuration on the Forge
+          server requires a Forge administrator.
+        </p>
+      </div>
+    )
+  }
 
   const queries = { claude: claudeQuery, cursor: cursorQuery, codex: codexQuery } as const
 
