@@ -327,7 +327,7 @@ export function TaskOverviewPanel({
               </div>
             ) : null}
 
-            <WorkflowExceptionPanel task={task} />
+            <WorkflowExceptionPanel task={task} workflow={workflow} />
             {onOpenLaunchDialog ? (
               <div className="flex flex-wrap gap-2">
                 <Button size="sm" variant="outline" onClick={onOpenLaunchDialog}>

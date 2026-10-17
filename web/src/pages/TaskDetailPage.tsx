@@ -23,7 +23,7 @@ import { useRolePicker } from '@/components/task-detail/use-role-picker'
 import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
 import { roleAssignmentErrorMessage, rootHoldsRuns } from '@/lib/root-lead'
 import { productTerm } from '@/lib/i18n'
-import { workflowTriggerTargets } from '@/lib/workflow-utils'
+import { isReviewState, workflowTriggerTargets } from '@/lib/workflow-utils'
 import { saveRecentExecutionSelection } from '@/lib/execution-config-storage'
 import { TaskExecutionsTab } from '@/pages/task-detail/TaskExecutionsTab'
 import { TaskReviewTab } from '@/pages/task-detail/TaskReviewTab'
@@ -145,9 +145,12 @@ export function TaskDetailPage({
   ])
   // A root that coordinates subtasks takes no run launched by hand.
   const runsHeldForSubtasks = Boolean(
-    task && rootHoldsRuns(task, (rootRelationsQuery.data?.subtasks.length ?? 0) > 0),
+    task && rootHoldsRuns(task, (rootRelationsQuery.data?.subtasks.length ?? 0) > 0, workflow),
   )
-  const canLaunch = Boolean(task && launchableStatuses.has(task.status)) && !runsHeldForSubtasks
+  const canLaunch =
+    Boolean(
+      task && (launchableStatuses.has(task.status) || isReviewState(task.status, workflow)),
+    ) && !runsHeldForSubtasks
   const hasAgents = (agentsQuery.data?.items ?? []).length > 0
 
   const hiddenTransitions = ['merging', effectiveWorkflow?.cancellation_state ?? 'cancelled']
@@ -448,6 +451,7 @@ export function TaskDetailPage({
             <div className="p-6">
               <TaskReviewTab
                 task={task}
+                workflow={workflow}
                 reviews={reviews}
                 latestReview={latestReview}
                 reviewsLoading={reviewsQuery.isLoading}

@@ -201,7 +201,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/findings` | Current review-window findings (same Project read authority as Task reviews) |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update task |
-| DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
+| DELETE | `/api/v1/tasks/{id}` | Soft-delete task; refused in `in_progress`, `merging`, or a review gate (including renamed `reviewer` gates in canonical phase `review`) |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
 | POST   | `/api/v1/tasks/{id}/actions` | Apply one offered closed verb and parameters at an exact Task version |

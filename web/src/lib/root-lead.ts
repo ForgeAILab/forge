@@ -1,4 +1,5 @@
 import { getApiErrorCode } from '@/lib/api-error'
+import { isReviewState } from '@/lib/workflow-utils'
 import type {
   Agent,
   RoleDefinition,
@@ -160,8 +161,9 @@ export function roleAssignmentErrorMessage(error: unknown): string | undefined {
 export function rootHoldsRuns(
   task: Pick<Task, 'parent_task_id' | 'status' | 'effective_lead' | 'condition'>,
   hasSubtasks: boolean,
+  workflow?: Pick<WorkflowDefinition, 'states'>,
 ): boolean {
-  if (task.parent_task_id != null || task.status === 'review') return false
+  if (task.parent_task_id != null || isReviewState(task.status, workflow)) return false
   const condition = task.condition
   const waitsOnSubtasks =
     condition?.kind === 'parked' &&

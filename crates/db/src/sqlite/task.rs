@@ -2512,8 +2512,14 @@ impl TaskRepo for SqliteDb {
 
     async fn soft_delete(&self, input: crate::SoftDeleteTask) -> Result<Task> {
         let mut task = self.get_task_required(&input.id, true).await?;
+        let workflow: String =
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id = ?")
+                .bind(&task.project_id)
+                .fetch_one(&self.pool)
+                .await?;
         if task.deleted_at.is_some()
-            || matches!(task.status.as_str(), "in_progress" | "review" | "merging")
+            || matches!(task.status.as_str(), "in_progress" | "merging")
+            || crate::budget::review_states_from_json(&workflow).contains(&task.status)
         {
             return Err(DbError::InvalidSoftDelete);
         }

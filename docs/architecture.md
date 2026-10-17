@@ -6047,6 +6047,11 @@ outside the write transaction; the transaction rechecks attempt and Task entry.
 
 ### Deletion, recovery and operational limits
 
+Task soft deletion refuses implementation (`in_progress`), integration
+(`merging`), and review states. Review states use the shared
+`db::budget::is_review_state` rule: the built-in `review` state or a gate
+with role `reviewer` and canonical phase `review`, including renamed gates.
+
 The unresolved-integration guard refuses repository/location/Project deletion
 and default-location change with `409 integration_unresolved` while an effect
 is outstanding or its result is unknown. Other resource guards can refuse
@@ -6275,6 +6280,11 @@ root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution
 decisions.
+
+The web's coordination-root launch guard reads the Task's workflow states.
+Its review exception uses the shared review-gate rule (built-in `review`, or
+a `reviewer` gate with canonical phase `review`), so renamed review gates
+offer the same launch controls.
 
 **Root lifecycle (kickoff and the lead).** One rule for every coordination
 root: its subtasks run only while it is in an implementation (`Active`) state
@@ -10489,7 +10499,12 @@ an unchanged commit, worktree and environment; never of a red one; the
 3,600-second wall limit and per-command timeouts; machine run-cap admission),
 `carry_review_authority` (always skipped: a same-state entry is not a
 merge-contention bridge), `dispatch_role_agent` for an assigned reviewer, and
-the `after_enter` cascades. Because the entry runs under the workflow's
+the `after_enter` cascades. A re-run keeps reviewer dispatch in this durable
+entry, including when requested through an owner action. It does not defer
+that hook to the dispatcher: without checks, the hook opens the replacement
+Review before launching its reviewer, so recovery cannot keep reconciling
+the cancelled attempt's completed execution. With checks, those finish before
+the dispatch hook runs. Because the entry runs under the workflow's
 authority and not the user's, it is routed as an automatic entry: failed CI
 settles through `review_failure_target` (remediation, or the exhausted-budget
 blocker when the budget was already spent) instead of parking a user-managed

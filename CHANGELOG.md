@@ -75,6 +75,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Recheck Review now re-dispatches the assigned reviewer when a Task has no
+  review checks, for both the built-in and renamed review gates. Checks still
+  finish before reviewer dispatch. Renamed review gates also refuse Task soft
+  deletion during review and allow coordination-root runs in the web UI using
+  the same review-gate rule as the server.
 - Custom review gates named differently from `review` now use the same review
   lifecycle as the default gate when they have the `reviewer` role and
   `canonical_phase: review`. Agent verdicts advance Tasks through integration;

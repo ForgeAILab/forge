@@ -1466,7 +1466,12 @@ impl WorkflowExecution<'_> {
                 .map(|i| (from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len() + i) as i64);
             let mut admission_agent_id=dispatch_index.and(cascade_payload.admission_agent_id);
             let role_unassigned = if let Some(role)=crate::workflow::effective_role(to_state) { crate::task_hierarchy::effective_role_assignment(&self.db,&producing,role).await?.is_none_or(|r| r.assignment.assignee_id.is_none()) } else { false };
-            let action_dispatch = crate::TaskService::task_action_command_active() && !entry_retry;
+            // A review re-run must execute its dispatch hook as part of the
+            // entry. With no checks, that hook opens the replacement Review;
+            // deferring it leaves recovery reconciling the cancelled attempt.
+            let action_dispatch = crate::TaskService::task_action_command_active()
+                && !entry_retry
+                && bridge.review_rerun_requester().is_none();
             let should_defer_dispatch=(defer_dispatch_until.is_some() || action_dispatch) && (to_state.kind!=StateKind::Active || action_dispatch) && dispatch_index.is_some();
             let deferred_marker=should_defer_dispatch.then(||serde_json::json!({"target_state":target_state,"not_before":defer_dispatch_until.clone().unwrap_or_else(now_rfc3339),"reason":if crate::TaskService::task_action_command_active(){"task action dispatch"}else{"board drag dispatch cooldown"}}).to_string());
             // Optional, unassigned planning is an imminent fast role entry:

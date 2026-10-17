@@ -21,6 +21,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+#[path = "happy_path/recheck_review.rs"]
+mod recheck_review;
+
 #[tokio::test]
 async fn open_item_4_durable_task_command_error_keeps_its_rest_status_and_fields() {
     let directory = common::TestDir::new("durable-command-error");

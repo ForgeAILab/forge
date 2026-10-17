@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '@/api/client'
+import type { StateDefinition } from '@/types/generated'
 import {
   effectiveLead,
   isLeadCandidate,
@@ -171,6 +172,28 @@ describe('launching a run on a coordination root', () => {
         false,
       ),
     ).toBe(true)
+  })
+
+  it('allows a renamed review gate by its kind, reviewer role and canonical phase', () => {
+    const review = {
+      name: 'qa_review',
+      kind: 'gate',
+      role: 'reviewer',
+      canonical_phase: 'review',
+    } as StateDefinition
+    const task = { ...root, status: 'qa_review' }
+    expect(rootHoldsRuns(task, true, { states: [review] })).toBe(false)
+    expect(rootHoldsRuns(task, false, { states: [review] })).toBe(false)
+    for (const state of [
+      { ...review, kind: 'active' as const },
+      { ...review, role: 'coder' },
+      { ...review, canonical_phase: 'working' as const },
+      { ...review, canonical_phase: null },
+      { ...review, name: 'other_gate' },
+    ]) {
+      expect(rootHoldsRuns(task, true, { states: [state] })).toBe(true)
+    }
+    expect(rootHoldsRuns(task, true)).toBe(true)
   })
 
   it('leaves a plain Task and a subtask launchable', () => {

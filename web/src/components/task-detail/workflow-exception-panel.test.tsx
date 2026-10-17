@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Offer, Task } from '@/types/generated'
+import type { Offer, StateDefinition, Task } from '@/types/generated'
 import { WorkflowExceptionPanel } from './workflow-exception-panel'
 const { mutate, relations } = vi.hoisted(() => ({
   mutate: vi.fn(),
@@ -48,6 +48,25 @@ beforeEach(() => {
   relations.subtasks = []
 })
 describe('WorkflowExceptionPanel offers', () => {
+  it('offers interactive launch on a coordination root in its renamed review gate', () => {
+    relations.subtasks = [{ id: 'subtask' }]
+    render(
+      <WorkflowExceptionPanel
+        task={{ ...task([retry]), status: 'qa_review' }}
+        workflow={{
+          states: [
+            {
+              name: 'qa_review',
+              kind: 'gate',
+              role: 'reviewer',
+              canonical_phase: 'review',
+            } as StateDefinition,
+          ],
+        }}
+      />,
+    )
+    expect(screen.getByRole('button', { name: 'Open interactive' })).toBeTruthy()
+  })
   it('hides interactive launch on a coordination root with a workflow exception', () => {
     relations.subtasks = [{ id: 'subtask' }]
     render(<WorkflowExceptionPanel task={{ ...task([retry]), status: 'in_progress' }} />)
