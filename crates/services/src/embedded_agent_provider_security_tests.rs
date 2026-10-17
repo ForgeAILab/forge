@@ -119,6 +119,13 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
     for ip in [
         "0.0.0.1",
         "0.255.255.255",
+        "192.88.99.0",
+        "192.88.99.1",
+        "192.88.99.255",
+        "64:ff9b::192.88.99.1",
+        "2002:c058:6301::",
+        "::ffff:192.88.99.1",
+        "::192.88.99.1",
         "64:ff9b::7f00:1",
         "64:ff9b::a00:1",
         "64:ff9b::a9fe:a9fe",
@@ -141,7 +148,7 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
         "::169.254.169.254",
     ] {
         let address: IpAddr = ip.parse().unwrap();
-        assert!(restricted_provider_ip(address), "{ip}");
+        assert!(is_restricted_public_address(address), "{ip}");
         let host = match address {
             IpAddr::V4(_) => ip.to_owned(),
             IpAddr::V6(_) => format!("[{ip}]"),
@@ -172,7 +179,7 @@ async fn provider_endpoints_reject_transition_and_zero_network_addresses() {
         "2606:4700:4700::1111",
     ] {
         assert!(
-            !restricted_provider_ip(ip.parse().unwrap()),
+            !is_restricted_public_address(ip.parse().unwrap()),
             "public control {ip}"
         );
     }

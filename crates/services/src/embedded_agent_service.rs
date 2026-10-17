@@ -12,7 +12,7 @@ use std::{
 use cli_adapters::codex::codex_reasoning_efforts_for_model;
 #[cfg(test)]
 use cli_adapters::codex::CODEX_REASONING_EFFORTS;
-use config::PublicSearchConfig;
+use config::{is_restricted_public_address, PublicSearchConfig};
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
@@ -24,7 +24,6 @@ use db::{
 };
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
-use forge_agent_host::network_policy::restricted_provider_ip;
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
     CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
@@ -2466,7 +2465,7 @@ async fn provider_url_addresses(
     if addresses.is_empty()
         || addresses
             .iter()
-            .any(|address| restricted_provider_ip(address.ip()))
+            .any(|address| is_restricted_public_address(address.ip()))
     {
         return Err("base_url must not target a private or local address");
     }

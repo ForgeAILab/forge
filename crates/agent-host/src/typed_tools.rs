@@ -1678,12 +1678,8 @@ fn public_https_origin(origin: &str) -> bool {
         Some(url::Host::Domain(domain)) => {
             !crate::network_policy::restricted_provider_hostname(domain)
         }
-        Some(url::Host::Ipv4(address)) => {
-            !crate::network_policy::restricted_provider_ip(address.into())
-        }
-        Some(url::Host::Ipv6(address)) => {
-            !crate::network_policy::restricted_provider_ip(address.into())
-        }
+        Some(url::Host::Ipv4(address)) => !config::is_restricted_public_address(address.into()),
+        Some(url::Host::Ipv6(address)) => !config::is_restricted_public_address(address.into()),
         None => false,
     }
 }
@@ -6137,6 +6133,10 @@ mod public_origin_security_tests {
     fn fetch_gate_rejects_transition_and_zero_network_origins() {
         for origin in [
             "https://0.1.2.3",
+            "https://192.88.99.1",
+            "https://[64:ff9b::192.88.99.1]",
+            "https://[2002:c058:6301::]",
+            "https://[::ffff:192.88.99.1]",
             "https://[64:ff9b::7f00:1]",
             "https://[64:ff9b:1::1]",
             "https://[2002:7f00:1::]",

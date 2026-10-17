@@ -46,7 +46,7 @@ api → mcp-server
 api / mcp-server / forge-solo → services-agents → services → db
 api / mcp-server / forge-solo → services
 services-agents / services → events / agent-host / executors / workspace → git
-agent-host → agent-runtime
+agent-host → agent-runtime / config
 forge-cli / forge-solo → config
 forge-solo → api-types / review / cli-adapters / operation-registry
 api / review → db (finding ledger and round-policy projection)
@@ -87,14 +87,29 @@ sync/async spawn helpers retry only `ExecutableFileBusy`, five retries with
 their original behavior. Compiler-cache probes, supervised processes, and direct
 opencode/Gemini/Smith launches use these bounded retries.
 
-Provider probes, native requests and web fetch share the destination policy in
-`agent-host::network_policy`. Well-known NAT64 `64:ff9b::/96` addresses apply
-the IPv4 policy to the final 32 bits, as 6to4 does to its embedded IPv4 address.
-Local-use NAT64 `64:ff9b:1::/48` and Teredo remain refused. Public search retains
-its separate, stricter transition-address policy, defined once in
-`config::is_blocked_public_search_address` for the endpoint check, the resolver
-and result URLs, and blocks IPv4 IETF protocol
-assignments at `192.0.0.0/24` and TEST-NET-1 at `192.0.2.0/24`.
+Provider probes, native requests, web fetch and public search share
+`config::is_restricted_public_address`. `config` has no internal crate
+dependencies, so `agent-host` can use this implementation without a cycle.
+Well-known NAT64 `64:ff9b::/96` addresses apply the IPv4 policy to the final
+32 bits in every consumer, as provider/fetch 6to4 and mapped/compatible
+addresses do to their embedded IPv4 destination. Local-use NAT64
+`64:ff9b:1::/48` and Teredo remain refused. Every consumer rejects IPv4 IETF
+protocol assignments at `192.0.0.0/24`, TEST-NET-1 at `192.0.2.0/24`, and
+former 6to4 relay anycast at `192.88.99.0/24`, including IPv6 forms embedding
+those destinations.
+
+`config::is_blocked_public_search_address` adds public search's existing
+conservative IPv6 exclusions to that common policy for endpoint validation,
+the request resolver and result URLs. These are deliberate differences:
+public search refuses all IPv4-mapped/compatible and 6to4 addresses even when
+their embedded IPv4 is public; discard-only `100::/64`; `2001:1::/32` through
+`2001:5::/32` (including benchmarking and special-use assignments);
+documentation `2001:db8::/32`; ORCHID `2001:10::/28` and ORCHIDv2
+`2001:20::/28`; and the existing conservative documentation guard
+`3ff0::/12`. Provider/fetch continues to admit these when the common policy
+does not reject them. The shared address table in
+`services::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
+checks agreement and each documented exclusion.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and
 the admission-time price resolution (`pricing::auto`). It sits below `services`
@@ -231,13 +246,15 @@ database. Shared shutdown and worker identity contracts live in core
 `worker_runtime::assembly`; graph-dependent dead-letter registration lives in
 `ForgeRuntime::dead_letter_service` in `services-agents`.
 
-`forge-agent-host::network_policy` owns the shared restricted-IP and hostname
-predicates used by provider-entry validation, service probes, native provider
-transport and the web fetch tool's authorization gate and transport. Public
+`config::is_restricted_public_address` owns the shared IP policy used by
+provider-entry validation, service probes, native provider transport, the web
+fetch tool's authorization gate and transport, and public search.
+`forge-agent-host::network_policy` owns provider/fetch hostname checks. Public
 search (`services::native_tools` request resolver and result filter, and
-`config` endpoint validation) keeps its own stricter filter. Provider connection
-tests and health probes share a client builder that resolves and validates once,
-pins those addresses and disables redirects and proxies.
+`config` endpoint validation) adds the deliberate IPv6 exclusions listed
+above. Provider connection tests and health probes share a client builder that
+resolves and validates once, pins those addresses and disables redirects and
+proxies.
 
 The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
 `prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with

@@ -224,6 +224,34 @@ fn public_search_defaults_to_disabled_and_bounded_limits() {
 }
 
 #[test]
+fn public_search_nat64_applies_embedded_ipv4_policy() {
+    for (host, blocked) in [
+        ("64:ff9b::8.8.8.8", false),
+        ("64:ff9b::1.1.1.1", false),
+        ("64:ff9b::10.0.0.1", true),
+        ("64:ff9b::127.0.0.1", true),
+        ("64:ff9b::169.254.169.254", true),
+        ("64:ff9b::192.88.99.1", true),
+        ("64:ff9b:1::8.8.8.8", true),
+        ("64:ff9b:1:1234:5678:9abc:808:808", true),
+        // Outside both the well-known /96 and local-use /48.
+        ("64:ff9b:0:1::", false),
+        ("64:ff9b:2::", false),
+    ] {
+        assert_eq!(
+            crate::is_blocked_public_search_address(host.parse().unwrap()),
+            blocked,
+            "{host}"
+        );
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://[{host}]/search")),
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_err(), blocked, "{host}");
+    }
+}
+
+#[test]
 fn public_search_ietf_protocol_assignments_are_only_a_slash24() {
     for (host, allowed) in [
         ("192.0.1.1", true),

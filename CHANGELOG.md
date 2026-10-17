@@ -8,6 +8,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
+- Public search and provider/fetch checks share one restricted-address policy:
+  well-known NAT64 `64:ff9b::/96` checks its embedded IPv4 destination, and
+  `192.88.99.0/24` (former 6to4 relay anycast) is refused by every consumer,
+  including IPv6 forms carrying those IPv4 addresses. Local-use NAT64
+  `64:ff9b:1::/48` remains refused. Public search retains its documented
+  additional IPv6 exclusions.
 - Provider connection tests and health probes share one HTTP client policy:
   resolve and validate the endpoint once, pin the approved addresses, and
   disable redirects and proxies so requests cannot reach an unchecked host.
@@ -16,7 +22,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   destinations, including when reading stored provider metadata. The same
   predicate protects native provider requests and the web fetch tool (its
   authorization gate and transport). Public search keeps its own, stricter
-  address filter.
+  IPv6 exclusions over the shared address policy.
 - Remote daemon registration, reports and WebSocket connections reject every
   reserved `embedded:` identity, including this server's own identity. Internal
   embedded daemon registration and reporting continue through their service path.
@@ -30,6 +36,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Provider and fetch destinations in `192.88.99.0/24`, including IPv6 forms
+  embedding those addresses, are now rejected as former 6to4 relay anycast.
 - Remote daemon clients using any `embedded:` machine id now receive HTTP 409
   `machine_id_reserved`, including re-registration and authenticated report or
   reconnect attempts. These ids are reserved for the in-process server daemon.

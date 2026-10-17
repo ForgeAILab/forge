@@ -36,7 +36,8 @@ use agent_runtime::core::error::RuntimeError;
 use agent_runtime::harness::{FetchRequest, FetchResponse, FetchTransport};
 use async_trait::async_trait;
 
-use crate::network_policy::{restricted_provider_hostname, restricted_provider_ip};
+use crate::network_policy::restricted_provider_hostname;
+use config::is_restricted_public_address;
 
 /// Redirect hops followed inside one authorized origin.
 const MAX_REDIRECTS: u8 = 3;
@@ -258,7 +259,7 @@ async fn pinned_client(url: &url::Url, timeout: Duration) -> Result<reqwest::Cli
     // refuse the name, because the client may use any of them.
     if addresses
         .iter()
-        .any(|address| restricted_provider_ip(address.ip()))
+        .any(|address| is_restricted_public_address(address.ip()))
     {
         return Err(RuntimeError::tool(
             "fetch refuses a host that resolves into this host's own network",
@@ -326,6 +327,10 @@ mod tests {
     async fn fetch_rejects_transition_and_zero_network_urls_before_io() {
         for endpoint in [
             "https://0.1.2.3/",
+            "https://192.88.99.1/",
+            "https://[64:ff9b::192.88.99.1]/",
+            "https://[2002:c058:6301::]/",
+            "https://[::ffff:192.88.99.1]/",
             "https://[64:ff9b::7f00:1]/",
             "https://[64:ff9b:1::1]/",
             "https://[2002:7f00:1::]/",

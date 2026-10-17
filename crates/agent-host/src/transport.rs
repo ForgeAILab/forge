@@ -1,4 +1,5 @@
-use crate::network_policy::{restricted_provider_hostname, restricted_provider_ip};
+use crate::network_policy::restricted_provider_hostname;
+use config::is_restricted_public_address;
 
 use std::{
     fmt,
@@ -206,7 +207,7 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
     if addresses.is_empty()
         || addresses
             .iter()
-            .any(|address| restricted_provider_ip(address.ip()))
+            .any(|address| is_restricted_public_address(address.ip()))
     {
         return Err(ProviderError::new(
             ProviderErrorKind::Network,
@@ -248,6 +249,10 @@ mod tests {
     async fn native_provider_rejects_transition_and_zero_network_urls_before_io() {
         for url in [
             "https://0.1.2.3/v1",
+            "https://192.88.99.1/v1",
+            "https://[64:ff9b::192.88.99.1]/v1",
+            "https://[2002:c058:6301::]/v1",
+            "https://[::ffff:192.88.99.1]/v1",
             "https://[64:ff9b::7f00:1]/v1",
             "https://[64:ff9b:1::1]/v1",
             "https://[2002:7f00:1::]/v1",
