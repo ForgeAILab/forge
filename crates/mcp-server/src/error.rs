@@ -303,6 +303,14 @@ impl McpToolError {
             .as_ref()
             .and_then(|data| data.get("code"))
             .and_then(Value::as_str);
+        if detail_code == Some(executors::server_commands::CODE) {
+            return (
+                OutcomeCode::ServerCommandsDisabled,
+                executors::server_commands::MESSAGE,
+                None,
+                false,
+            );
+        }
         if matches!(detail_code, Some("idempotency_conflict")) {
             return (
                 OutcomeCode::IdempotencyConflict,
@@ -439,6 +447,9 @@ impl From<ServiceError> for McpToolError {
                 Self::new(-32029, "dependency gate").with_data(json!({ "code": "setup_required" }))
             }
             ServiceError::NotFound { entity, id } => Self::not_found(entity, id),
+            ServiceError::ServerCommandsDisabled => Self::new(-32602, executors::server_commands::MESSAGE).with_data(json!({"code": executors::server_commands::CODE})),
+            ServiceError::ServerAgentsDisabled => Self::new(-32602, executors::server_commands::AGENTS_MESSAGE).with_data(json!({"code": executors::server_commands::AGENTS_CODE})),
+            ServiceError::ServerLocationRefused { message } => Self::new(-32602, message).with_data(json!({"code": executors::server_commands::LOCATION_CODE})),
             ServiceError::InvalidOperation { message } => Self::new(-32602, message),
             ServiceError::AuthorizationDenied { message } => {
                 Self::new(-32003, message).with_data(json!({ "code": "authorization.invalid" }))
@@ -742,6 +753,20 @@ impl From<DbError> for McpToolError {
 #[cfg(test)]
 mod merge_tests {
     use super::*;
+
+    #[test]
+    fn demo_command_refusal_keeps_its_code_in_mcp_outcome() {
+        let error = McpToolError::from(ServiceError::ServerCommandsDisabled);
+        assert_eq!(error.code, -32602);
+        assert_eq!(
+            error.details.data.as_ref().unwrap()["code"],
+            "server_commands_disabled"
+        );
+        let outcome = error.into_outcome();
+        assert_eq!(outcome["code"], "server_commands_disabled");
+        assert_eq!(outcome["status"], "failed");
+        assert_eq!(outcome["safe_message"], "This demo does not run commands");
+    }
 
     #[test]
     fn chat_retry_and_daemon_target_errors_keep_specific_codes() {

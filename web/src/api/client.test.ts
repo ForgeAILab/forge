@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { useAuthStore } from '@/stores/auth'
+import { refreshAccess, useAuthStore } from '@/stores/auth'
 
 import { apiFetch } from './client'
 
@@ -31,6 +31,69 @@ describe('apiFetch', () => {
     )
 
     await expect(apiFetch<{ ok: boolean }>('/status')).resolves.toEqual({ ok: true })
+  })
+})
+
+describe('cookie-only API requests', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+    useAuthStore.getState().clearAuth()
+  })
+
+  const seedCookieUser = () => useAuthStore.setState({
+    accessToken: null,
+    refreshToken: null,
+    user: { id: 'cookie', email: 'cookie@example.com', display_name: null, is_admin: false, created_at: '' },
+  })
+
+  it('omits Authorization when there is no stored token', async () => {
+    seedCookieUser()
+    const fetchSpy = vi.spyOn(window, 'fetch').mockResolvedValue(new Response('{}'))
+    await apiFetch('/projects')
+    const headers = fetchSpy.mock.calls[0][1]?.headers as Headers
+    expect(headers.has('authorization')).toBe(false)
+  })
+
+  it('refreshes with an empty object and retries using cookies without storing tokens', async () => {
+    seedCookieUser()
+    const fetchSpy = vi.spyOn(window, 'fetch')
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'new', refresh_token: 'new-refresh', token_type: 'Bearer', expires_in: 900 })))
+      .mockResolvedValueOnce(new Response('{}'))
+    await expect(apiFetch('/projects')).resolves.toEqual({})
+    expect(fetchSpy.mock.calls[1]).toEqual(['/api/v1/auth/refresh', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    }])
+    expect((fetchSpy.mock.calls[2][1]?.headers as Headers).has('authorization')).toBe(false)
+    expect(useAuthStore.getState().accessToken).toBeNull()
+    expect(useAuthStore.getState().refreshToken).toBeNull()
+  })
+
+  it('shares a single cookie refresh across concurrent callers', async () => {
+    seedCookieUser()
+    const fetchSpy = vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify({ access_token: 'new', refresh_token: 'new-refresh', token_type: 'Bearer', expires_in: 900 })))
+    await expect(Promise.all([refreshAccess(), refreshAccess()])).resolves.toEqual([null, null])
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('replaces a stored access token after refreshing through the cookie', async () => {
+    seedCookieUser()
+    useAuthStore.setState({ accessToken: 'expired' })
+    const fetchSpy = vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify({ access_token: 'new', refresh_token: 'new-refresh', token_type: 'Bearer', expires_in: 900 })))
+    await expect(refreshAccess()).resolves.toBe('new')
+    expect(fetchSpy.mock.calls[0][1]?.body).toBe('{}')
+    expect(useAuthStore.getState().accessToken).toBe('new')
+  })
+
+  it('clears the cookie-only user and goes to login after a rejected refresh', async () => {
+    seedCookieUser()
+    const location = { origin: 'http://localhost', href: '/projects' }
+    vi.stubGlobal('window', { location })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 401 })))
+    await expect(apiFetch('/projects')).rejects.toMatchObject({ status: 401 })
+    expect(useAuthStore.getState().user).toBeNull()
+    expect(location.href).toBe('/login')
   })
 })
 

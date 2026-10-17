@@ -70,6 +70,10 @@ impl IntegrationService {
     }
 
     pub async fn sync_integration(&self, integration: &ProjectIntegration) -> Result<SyncResult> {
+        // Demo: a token reference names a variable of the server's environment.
+        crate::server_commands::ensure_server_files_allowed(
+            "integrations read their token from the server's environment",
+        )?;
         let _ = &self.event_bus;
         let token = resolve_token(&integration.token_secret_ref)
             .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
@@ -165,6 +169,10 @@ impl IntegrationService {
     }
 
     async fn validate_create(&self, input: &CreateProjectIntegration) -> Result<()> {
+        // Demo: a token reference names a variable of the server's environment.
+        crate::server_commands::ensure_server_files_allowed(
+            "integrations read their token from the server's environment",
+        )?;
         validate_required("id", &input.id)?;
         validate_required("project_id", &input.project_id)?;
         validate_required("base_url", &input.base_url)?;
@@ -184,6 +192,10 @@ impl IntegrationService {
     }
 
     async fn validate_update(&self, input: &UpdateProjectIntegration) -> Result<()> {
+        // Demo: a token reference names a variable of the server's environment.
+        crate::server_commands::ensure_server_files_allowed(
+            "integrations read their token from the server's environment",
+        )?;
         validate_required("id", &input.id)?;
         let existing = IntegrationRepo::get_by_id(&*self.db, &input.id)
             .await?

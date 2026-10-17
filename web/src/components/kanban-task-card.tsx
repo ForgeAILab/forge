@@ -6,6 +6,7 @@ import { AgentAssigneeDropdown } from '@/components/task-controls'
 import { Avatar } from '@/components/ui/avatar'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
 import { TaskCapacityNotice } from '@/components/task-capacity-notice'
+import { TaskTypeBadge } from '@/components/task-type-badge'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -119,6 +120,7 @@ export function KanbanTaskCard({
                 )}
               </div>
               <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                <TaskTypeBadge taskType={task.task_type} />
                 {task.priority !== undefined && (
                   <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-micro font-medium text-muted-foreground">
                     P{task.priority}

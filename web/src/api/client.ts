@@ -94,7 +94,7 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
     }
   }
 
-  const makeHeaders = (overrideToken?: string) => {
+  const makeHeaders = (overrideToken?: string | null) => {
     const h = new Headers(headers)
     const isFormDataBody = typeof FormData !== 'undefined' && fetchInit.body instanceof FormData
     if (!h.has('content-type') && !isFormDataBody) {
@@ -113,7 +113,7 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
   })
 
   if (response.status === 401) {
-    let newToken: string
+    let newToken: string | null
     try {
       newToken = await refreshAccess()
     } catch (error) {
@@ -130,6 +130,11 @@ async function apiResponse(path: string, init?: ApiFetchInit): Promise<Response>
       ...fetchInit,
       headers: makeHeaders(newToken),
     })
+    if (response.status === 401) {
+      useAuthStore.getState().clearAuth()
+      window.location.href = '/login'
+      throw new ApiError('Unauthorized', 401)
+    }
   }
 
   if (allowNotModified && response.status === 304) return response

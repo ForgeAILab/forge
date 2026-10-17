@@ -17,6 +17,20 @@ Everything for it lives in [`deploy/demo/`](../deploy/demo/):
 
 The root `docker-compose.yml` is the ordinary self-host file and is unrelated.
 
+Over HTTPS, username/password sign-in returns HttpOnly `__Host-forge_session` and
+`__Host-forge_refresh` cookies as well as the existing JSON tokens. TestSprite can
+capture the session cookie after signing in and continue with authenticated
+requests, including when the browser starts with empty localStorage. If the
+access cookie has expired, startup tries the refresh cookie once before signing
+the visitor out. The demo's `FORGE_PUBLIC_BASE_URL=https://…` enables these
+HTTPS-only cookies even though Cloudflare and Traefik forward HTTP to the
+container. Both have `Secure`, `Path=/`, and no `Domain`; only refresh and
+logout read the refresh cookie. Plain HTTP sets no session cookies and the web
+app continues to use localStorage tokens. Cookie-authenticated
+writes must satisfy the same-origin CSRF rule described in
+[API authentication](api.md#authentication). This behavior is covered by local
+API and web tests; a live TestSprite run is not part of this change's verification.
+
 ## Live URL
 
 <!-- OWNER: fill in once the instance is up. Do not publish a URL here before
@@ -31,11 +45,12 @@ _Not published yet._
   a placeholder Agent (`Null Default`), a placeholder daemon record and 14
   Tasks spread over `backlog`, `todo`, `in_progress`, `review`, `done` and
   `blocked`.
-- **No agent daemon.** `--no-embedded-daemon`: nothing on the host launches a
-  coding agent.
+- **No embedded execution daemon.** Demo mode skips its startup; the deployment
+  also passes `--no-embedded-daemon`. Server CLI/shell Agent launches, native
+  agent turns and Chat turns are refused (see below).
 - **No MCP endpoint.** `--no-mcp`: `POST /mcp` is not served.
 - **No provider credentials.** The instance is started without any model
-  provider key.
+  provider key, and demo mode refuses adding one.
 - **Disposable.** There is no volume. `/data` is a memory-backed filesystem
   with a size cap, and the entrypoint empties it at every start. Every deploy,
   every restart and every crash recovery is a new instance with the same seed
@@ -94,47 +109,82 @@ Registration is open: anyone who reaches the URL can create an account and sign
 in. Through the product, a visitor's account is an ordinary one.
 
 A visitor who registers their own account starts with no Projects and can use
-the product as an ordinary user: create Projects and Tasks of their own.
-Nothing they create runs an agent, because no daemon is attached and no
-provider is configured.
+the product as an ordinary user: create Projects and Tasks of their own, move
+Tasks through the board, comment, and register a repository that is an
+`https://` remote at a public address.
 
-**Known limit — read before publishing the URL.** `--no-embedded-daemon` stops
-agent runs. It does not remove every place where the server process itself
-starts a shell command: Project lifecycle hooks and review check steps are
-`bash -lc` commands run by the server
-(`crates/services/src/lifecycle/runner.rs` and the review check runner under
-`crates/review/`), and any signed-in user can create a Project
-and edit its settings. Whether a visitor can make one of those commands run on
-an instance without a daemon has not been tested. Until it is, treat a
-signed-in visitor as someone who may be able to run a command **inside the
-`forge` container**, as the user the server runs as. Such a visitor can:
+**The server is a manager only.** `--demo` switches on one process-wide policy
+that Project settings cannot turn off. It refuses three things, each with HTTP
+**422** and a code of its own:
 
-- read and change the instance's database and signing key, and so make any
-  account an administrator and read or change every other visitor's data;
-- **open connections from the container.** The service sits on Dokploy's
-  shared proxy network, which has a route to the internet and to every other
-  application on that network. A command in the container can send data out,
-  fetch tools, scan or call the other applications that Dokploy hosts, and
-  reach services of the host that listen on Docker's bridge addresses. The
-  earlier design of this demo had no outbound network; with Dokploy's proxy
-  that is not possible, because the proxy must reach the service over a
-  shared network. This makes the limit above worse than it was.
+- **Commands** (`server_commands_disabled`, "This demo does not run
+  commands"): Script lifecycle hooks, review CI and setup steps, review
+  `verify` (app start, readiness commands and scripted checks), environment
+  checks and setup, scaffolding, server CLI/shell Agent executors, native
+  command tools, interactive terminals and compiler-cache helpers. Project
+  settings, Task overrides and workflow/template writes that contain them are
+  refused. Commands that are already stored (seeded, template-derived) are
+  refused before spawning: Script hooks record failed results (asynchronous
+  ones also as a Task comment), a review entry that requires CI or verify parks
+  the Task in `review` with `server_commands_disabled` before opening a Review
+  attempt or queuing a check. It spends no review, infrastructure or verify
+  retries and leaves no suspended check consumer. Remove the configuration and
+  retry the entry, or cancel the Task. Environment checks return failed results.
+- **Agents** (`server_agents_disabled`, "This demo does not run agents or
+  connect model providers"): adding a provider credential (`POST
+  /api/v1/providers`) or starting a provider authorization, and admitting a
+  Chat turn whose responder is a native (embedded) Agent (send, retry,
+  handoff, Genesis); Project Agent wakes admit no native turn. Any native turn
+  that reaches the agent runtime by another path (inquiries, native Task
+  executions, topic rotation) fails with the same code before a provider
+  request. CLI Agents placed on a remote daemon, and Chats answered by them,
+  are not affected: they run on the daemon's machine.
+- **Server files and data** (`server_location_refused`): a repository or
+  repository location on the server's filesystem (a local path, `file://`, any
+  non-`https` URL, or a host that is local, private or resolves to such an
+  address; the provider-request address policy is reused), a branch name Git
+  could read as an option, a server-owned repository location (including a
+  `shared_mount`; daemon-owned locations, paths on the daemon's machine, stay
+  allowed), Project
+  environment assets (they copy server files into a worktree), issue-tracker
+  integrations (their token is read from the server's environment) and writes
+  of agent configuration files (`POST /api/v1/config/mcp`). Stored
+  repositories with a local path are refused before Git runs against them.
 
-What the container still keeps from them: the host's filesystem and Docker
-socket (nothing is mounted), Linux capabilities, and more memory, CPU or
-processes than the limits allow. Storage: the root filesystem is read-only,
-and the only writable places are memory-backed filesystems with a size cap
-each (`/data`, `/data/logs`, `/tmp`, and Docker's own 64 MB `/dev/shm`), all
-counted against the memory limit. That list was drawn up by reading where
-Forge writes (data directory, log directory, the system temp directory,
-`HOME`, which the entrypoint points into `/tmp`); it was not confirmed on a
-running container, where a write to any other path now fails instead of
-filling the host's disk.
+Seeding (`--demo`) and the entrypoint's account setup are unaffected: the
+seeded repository is `https://example.com/demo.git` with no local path. Demo
+mode also skips embedded-daemon startup. Ordinary installations keep their
+behavior.
 
-**Consequences for where to host it.** Do not put the demo on a Dokploy server
-that also runs anything you care about. Use a server (or at least a Dokploy
-instance) that hosts only the demo, and keep services on it from listening on
-all interfaces.
+**What remains.** Forge still performs its own Git operations (clone, fetch,
+worktree, merge and inspection) for public `https://` repositories, so
+repository setup can consume CPU, memory and storage and makes outbound
+connections to the hosts visitors name. Every Git process of the demo server
+runs with command-scope configuration that repositories cannot override: it
+follows no HTTP redirect (a remote that answers with one fails to clone; use
+the address the host serves directly, for example with `.git`), speaks no
+network protocol but `https` (local paths and bundles keep Git's default policy
+for Forge's own transfers), runs no repository hook or filesystem monitor,
+discovers no bare repository inside checked-out content, recurses into no
+submodule, aborts a transfer slower than 1000 bytes/s for 60 seconds, and never
+prompts for credentials. The public-address check resolves the name when it is
+checked and Git resolves it again when it connects, so a hostile name server
+can still point that one `https` connection at another address; certificate
+verification then fails unless that address serves a valid certificate for the
+name. A visitor can connect
+their own `forge-daemon`; whatever it runs, it runs on their machine. The
+container remains attached to Dokploy's shared proxy network, which can reach
+the internet and other applications on that network. This policy removes
+server-side command execution, agent turns and server file access by
+configuration; it does not isolate the network. Use a dedicated demo host or
+instance and keep unrelated services off that shared network.
+
+The container still has a read-only root filesystem, no host filesystem or
+Docker-socket mounts, dropped Linux capabilities, and memory, CPU and process
+limits. Its writable places are capped memory-backed filesystems (`/data`,
+`/data/logs`, `/tmp` and Docker's 64 MB `/dev/shm`), counted against the memory
+limit. These deployment properties were reviewed from configuration; this
+change was verified without starting the demo container.
 
 Other limits:
 
@@ -156,11 +206,11 @@ Other limits:
   on the host** (`docker inspect`) and to anyone who can read the Dokploy
   application's environment. Inside the container, the Forge process does not
   carry them, but the init process (`init: true`, there to reap orphaned
-  child processes) keeps the environment it was started with: a visitor who
-  can run commands in the container can read both passwords from it.
+  child processes) keeps the environment it was started with. The demo
+  command refusal does not change host/operator access to those secrets.
 
-A visitor cannot use MCP, cannot use a model provider that the instance owner
-paid for (there is none), and cannot keep anything across a restart.
+A visitor cannot use MCP, cannot connect any model provider or run any agent
+turn on the server, and cannot keep anything across a restart.
 
 ## Setting it up in Dokploy
 
@@ -229,8 +279,8 @@ does not. Two ways to let Dokploy pull it:
 - **Registry credential in Dokploy.** **Settings → Registry**, URL `ghcr.io`,
   a GitHub user and a classic token. Dokploy's guide asks for
   `write:packages`; `read:packages` is enough for pulling. This stores a
-  GitHub token on a server that, per the limit above, strangers may be able
-  to run commands on, and it is not confirmed that Dokploy applies registry
+  GitHub token on a server that runs a public instance with open
+  registration, and it is not confirmed that Dokploy applies registry
   credentials to the image pulls of a Compose application.
 
 ## Resetting and taking it offline

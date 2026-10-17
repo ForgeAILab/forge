@@ -21,6 +21,7 @@ pub async fn run_workspace_command(
     seconds: u64,
     limit: usize,
 ) -> Result<std::process::Output, String> {
+    executors::server_commands::ensure_allowed().map_err(|e| e.to_string())?;
     let mut command = workspace_command(path, step, env);
     command
         .env_remove("GIT_DIR")
@@ -35,6 +36,7 @@ pub(crate) async fn bounded_output(
     seconds: u64,
     limit: usize,
 ) -> Result<std::process::Output, String> {
+    executors::server_commands::ensure_allowed().map_err(|e| e.to_string())?;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
     let mut child = command

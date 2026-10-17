@@ -234,6 +234,8 @@ impl ProviderAuthorizationService {
         request: StartProviderAuthorizationRequest,
         request_origin: Option<String>,
     ) -> Result<ProviderAuthorizationOperation> {
+        executors::server_commands::ensure_agents_allowed()
+            .map_err(|_| ServiceError::ServerAgentsDisabled)?;
         let since = (Utc::now() - ChronoDuration::minutes(1)).to_rfc3339();
         let recent = self
             .db

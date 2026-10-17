@@ -273,6 +273,8 @@ impl TaskExecutor for AdapterExecutor {
     }
 
     async fn execute(&self, mut ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+        crate::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let runtime_scope = ctx.agent_config.clone();
         let (kind, config) = resolve_context_config(&runtime_scope)?;
         let adapter = self.registry.get(&kind).ok_or_else(|| {

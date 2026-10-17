@@ -15,6 +15,7 @@ import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
+import { TaskTypeBadge } from '@/components/task-type-badge'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import { Input } from '@/components/ui/input'
@@ -61,7 +62,7 @@ interface TaskOverviewPanelProps {
   agentName: (agentId?: string | null) => string | undefined
   // handlers
   onUpdateTitle: (title: string) => void
-  onUpdateDescription: (description: string | null) => void
+  onUpdateDescription: (description: string) => void
   onUpdatePriority: (priority: number) => void
   onStatusChange: (status: string) => void
   onAssigneeChange: (roleName: string, selection: AssigneeSelection) => void
@@ -179,7 +180,7 @@ export function TaskOverviewPanel({
       setEditingDescription(false)
       return
     }
-    onUpdateDescription(description.length > 0 ? description : null)
+    onUpdateDescription(description)
     setEditingDescription(false)
   }
 
@@ -246,36 +247,39 @@ export function TaskOverviewPanel({
           />
         ) : task ? (
           <>
-            {editingTitle ? (
-              <div className="space-y-2">
-                <Input
-                  autoFocus
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  onKeyDown={onTitleKeyDown}
-                />
-                <div className="flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    disabled={updatePending || !titleDraft.trim()}
-                    onClick={handleSaveTitle}
-                  >
-                    Save
-                  </Button>
-                  <Button size="sm" variant="outline" type="button" onClick={handleCancelTitleEdit}>
-                    Cancel
-                  </Button>
+            <div className="space-y-2">
+              <TaskTypeBadge taskType={task.task_type} />
+              {editingTitle ? (
+                <div className="space-y-2">
+                  <Input
+                    autoFocus
+                    value={titleDraft}
+                    onChange={(e) => setTitleDraft(e.target.value)}
+                    onKeyDown={onTitleKeyDown}
+                  />
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      disabled={updatePending || !titleDraft.trim()}
+                      onClick={handleSaveTitle}
+                    >
+                      Save
+                    </Button>
+                    <Button size="sm" variant="outline" type="button" onClick={handleCancelTitleEdit}>
+                      Cancel
+                    </Button>
+                  </div>
                 </div>
-              </div>
-            ) : (
-              <button
-                className="-mx-1 block w-full rounded-md px-1 py-0.5 text-left text-xl font-semibold hover:bg-accent"
-                type="button"
-                onClick={() => setEditingTitle(true)}
-              >
-                {stripRunSuffix(task.title, runSuffix)}
-              </button>
-            )}
+              ) : (
+                <button
+                  className="-mx-1 block w-full rounded-md px-1 py-0.5 text-left text-xl font-semibold hover:bg-accent"
+                  type="button"
+                  onClick={() => setEditingTitle(true)}
+                >
+                  {stripRunSuffix(task.title, runSuffix)}
+                </button>
+              )}
+            </div>
 
             {task.workflow_health ? (
               <div className="flex flex-wrap items-center gap-2">

@@ -151,6 +151,8 @@ impl CodingExecutorAdapter for CursorAdapter {
         // Owns the execution's temp directory until this execution returns.
         executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = crate::command::run_in_task_worktree(&mut command, &ctx);
+        executors::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {
@@ -563,6 +565,9 @@ fn detect_cursor_availability() -> AvailabilityInfo {
 }
 
 fn cursor_status_authenticated() -> bool {
+    if executors::server_commands::ensure_allowed().is_err() {
+        return false;
+    }
     let mut command = std::process::Command::new("cursor-agent");
     // This availability probe runs from the embedded daemon while Solo owns
     // the terminal. Do not let Cursor inspect or mutate the controlling PTY.

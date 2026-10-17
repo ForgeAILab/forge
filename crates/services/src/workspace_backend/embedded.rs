@@ -395,6 +395,17 @@ impl EmbeddedWorkspaceBackend {
     }
 
     async fn repo_source(&self, location: &RepoLocation) -> Result<String> {
+        // Demo: only Forge's own managed clone of a remote is a server source.
+        if executors::server_commands::manager_only()
+            && (location.kind != RepoLocationKind::ManagedClone
+                || Path::new(&location.path)
+                    != self.merge_service.managed_repo_path(&location.repo_id))
+        {
+            return Err(crate::server_commands::location_refused(
+                "a path on the server's filesystem cannot be a repository location",
+            )
+            .into());
+        }
         if Path::new(&location.path).exists() || location.kind != RepoLocationKind::ManagedClone {
             return Ok(location.path.clone());
         }

@@ -84,6 +84,33 @@ Prefer to build from source? `cargo run -p forge-cli -- --demo`.
 
 Running a public demo instance, and the pull-request check that tests it → [docs/demo-instance.md](docs/demo-instance.md).
 
+## Live demo
+
+**https://forge.oc.mai1015.com** — a throwaway Forge instance with a seeded
+`Demo` project (14 tasks across every state). Register an account to look
+around. Its data lives in memory and is wiped on every redeploy. In demo mode
+the server runs no command from user configuration and no agent of its own;
+see [what a visitor can and cannot do](docs/demo-instance.md#what-a-visitor-can-and-cannot-do).
+
+Every pull request builds a fresh demo image, deploys it to that URL, waits
+until the exact build is serving, and runs a [TestSprite](https://www.testsprite.com)
+browser suite against it. The check passes only when that build is live and
+the suite passes. The suite covers:
+
+| Area | Tests |
+|---|---|
+| Task detail (open, edit title and description, priority, Escape, full page) | 10 |
+| App shell and navigation (sidebar, brand, project switcher, theme, account menu) | 8 |
+| Kanban board (create, move, search, filter, card actions) | 7 |
+| Project settings (general, repositories, members, workflow, analytics, MCP) | 6 |
+| Account pages (profile, settings, access tokens, usage) | 4 |
+| Tasks table (open, sort, filter, combined filters) | 4 |
+| Project overview (counts, charter state, chat entry points) | 4 |
+| Task creation (board dialog, quick create, task types) | 4 |
+| Task comments and task status moves | 6 |
+
+How it is wired → [docs/demo-instance.md](docs/demo-instance.md#how-the-pull-request-check-works).
+
 ## Core concepts
 
 <picture>

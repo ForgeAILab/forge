@@ -38,6 +38,11 @@ pub async fn validate_project_settings(
     project_id: Option<&str>,
     user_id: Option<&str>,
 ) -> Result<()> {
+    crate::server_commands::validate_configuration(settings)?;
+    crate::server_commands::validate_configuration(
+        &serde_json::to_value(workflow)
+            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+    )?;
     if operation_registry::mcp::contains_script_hooks(settings) {
         if let (Some(project_id), Some(user_id)) = (project_id, user_id) {
             let owner = ProjectRepo::get_by_id(db, project_id)

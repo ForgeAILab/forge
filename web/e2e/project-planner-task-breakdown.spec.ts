@@ -395,9 +395,7 @@ function requirePlanningApproval(workflow: WorkflowDefinition): WorkflowDefiniti
         gate_config: {
           reject_target: 'planning',
           max_rejections: 2,
-          approve_label: 'Approve plan',
           reject_label: null,
-          requires_user_approval: true,
           ...state.gate_config,
           requires_user_approval: true,
           approve_label: state.gate_config?.approve_label ?? 'Approve plan',

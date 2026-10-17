@@ -21,7 +21,7 @@ import { isProjectSettingsTab } from '@/components/settings/project-settings-tab
 import type { TaskDetailTab } from '@/pages/TaskDetailPage'
 import type { TaskListSortBy, TaskListSortOrder } from '@/pages/TaskListPage'
 import type { PaginatedResponse, Project } from '@/types/generated'
-import { useAuthStore } from '@/stores/auth'
+import { restoreSession, useAuthStore } from '@/stores/auth'
 
 const AccountPage = lazy(() =>
   import('@/pages/AccountPage').then((module) => ({ default: module.AccountPage })),
@@ -122,9 +122,10 @@ function requireServerAdmin() {
 
 const rootRoute = createRootRouteWithContext<RouterContext>()({
   component: RootRouteComponent,
-  beforeLoad: ({ location }) => {
-    const { accessToken } = useAuthStore.getState()
-    if (!accessToken && !PUBLIC_PATHS.includes(location.pathname)) {
+  beforeLoad: async ({ location }) => {
+    await restoreSession()
+    const { accessToken, user } = useAuthStore.getState()
+    if (!accessToken && !user && !PUBLIC_PATHS.includes(location.pathname)) {
       throw redirect({
         to: '/login',
         search: { redirect: location.pathname !== '/' ? location.pathname : undefined },
@@ -136,8 +137,9 @@ const rootRoute = createRootRouteWithContext<RouterContext>()({
 function RootRouteComponent() {
   const queryClient = rootRoute.useRouteContext({ select: (ctx) => ctx.queryClient })
   const accessToken = useAuthStore((s) => s.accessToken)
+  const signedIn = useAuthStore((s) => Boolean(s.accessToken || s.user))
   const pathname = useRouterState({ select: (s) => s.location.pathname })
-  useSSE(queryClient, accessToken)
+  useSSE(queryClient, accessToken, signedIn)
 
   const content = (
     <Suspense
@@ -581,8 +583,8 @@ const loginRoute = createRoute({
       typeof search.redirect_params === 'string' ? search.redirect_params : undefined,
   }),
   beforeLoad: () => {
-    const { accessToken } = useAuthStore.getState()
-    if (accessToken) throw redirect({ to: '/' })
+    const { accessToken, user } = useAuthStore.getState()
+    if (accessToken || user) throw redirect({ to: '/' })
   },
   component: LoginPage,
 })
@@ -598,8 +600,8 @@ const registerRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/register',
   beforeLoad: () => {
-    const { accessToken } = useAuthStore.getState()
-    if (accessToken) throw redirect({ to: '/' })
+    const { accessToken, user } = useAuthStore.getState()
+    if (accessToken || user) throw redirect({ to: '/' })
   },
   component: RegisterPage,
 })

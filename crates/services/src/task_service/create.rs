@@ -108,6 +108,7 @@ impl TaskService {
         let title = title.into();
         validate_required("project_id", &project_id)?;
         validate_required("title", &title)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
 
         let mut unique_dependency_ids = HashSet::with_capacity(dependency_ids.len());
         for dependency_id in &dependency_ids {
@@ -259,7 +260,7 @@ impl TaskService {
             is_automation: false,
             priority: priority.unwrap_or(0),
             task_state_config,
-            merge_config: serialize_config(merge_config)?,
+            merge_config: super::validation::serialize_merge_config(merge_config)?,
             plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),
@@ -454,6 +455,7 @@ impl TaskService {
         let title = title.into();
         validate_required("project_id", &project_id)?;
         validate_required("title", &title)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
 
         let project = ProjectRepo::get_by_id(&*self.db, &project_id)
             .await?
@@ -488,7 +490,7 @@ impl TaskService {
             is_automation: true,
             priority: 0,
             task_state_config,
-            merge_config: serialize_config(merge_config)?,
+            merge_config: super::validation::serialize_merge_config(merge_config)?,
             plan: None,
             created_at: now.clone(),
             updated_at: now.clone(),

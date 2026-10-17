@@ -17,6 +17,7 @@ pub mod log_writer;
 #[allow(unsafe_code)]
 pub mod run_process;
 pub mod sandbox;
+pub mod server_commands;
 pub mod shell;
 
 pub use adapter::{

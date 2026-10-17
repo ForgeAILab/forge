@@ -204,7 +204,7 @@ export function TaskDetailPage({
     updateTask.mutate({ taskId: task.id, body: { title, version: task.version } })
   }
 
-  const onUpdateDescription = (description: string | null) => {
+  const onUpdateDescription = (description: string) => {
     if (!task) return
     updateTask.mutate({
       taskId: task.id,

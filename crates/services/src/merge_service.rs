@@ -519,6 +519,7 @@ impl MergeService {
     }
 
     pub(crate) async fn resolve_repo_source(&self, repo: &db::Repo) -> Result<String> {
+        crate::server_commands::ensure_repository_allowed(repo).await?;
         if let Some(local_path) = repo
             .local_path
             .as_deref()
@@ -545,7 +546,7 @@ impl MergeService {
         ensure_managed_clone(remote_url, &managed).await
     }
 
-    fn managed_repo_path(&self, repo_id: &str) -> PathBuf {
+    pub(crate) fn managed_repo_path(&self, repo_id: &str) -> PathBuf {
         self.workspace_root.join(".repos").join(repo_id)
     }
 }
@@ -608,6 +609,7 @@ pub(crate) fn target_branch(
             .map(str::trim)
             .filter(|target_branch| !target_branch.is_empty())
         {
+            crate::server_commands::validate_branch_name(target_branch)?;
             return Ok(target_branch.to_owned());
         }
     }
@@ -615,6 +617,7 @@ pub(crate) fn target_branch(
     if repo_default_branch.is_empty() {
         Ok("main".to_owned())
     } else {
+        crate::server_commands::validate_branch_name(repo_default_branch)?;
         Ok(repo_default_branch.to_owned())
     }
 }

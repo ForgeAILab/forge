@@ -395,8 +395,22 @@ impl WakeTurns for WakeTurnConsumer {
             return Ok(None);
         };
         let service = AgentTurnAdmissionService::new(Arc::clone(&self.db));
-        if service.resolve(&chat).await?.readiness != AgentTurnReadiness::Ready {
+        let responder = service.resolve(&chat).await?;
+        if responder.readiness != AgentTurnReadiness::Ready {
             return Ok(None);
+        }
+        // Demo: a native responder would run in the server process, so the
+        // wake admits no turn; a CLI responder runs on its daemon.
+        if executors::server_commands::manager_only() {
+            if let Some(profile_id) = responder.profile_id.as_deref() {
+                if crate::agent_turn_admission::AgentResponderStore::responder_runs_in_server(
+                    &*self.db, profile_id,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
+            }
         }
         let delivery = if attention.attention_type == "delivery_followup" {
             Some(

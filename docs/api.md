@@ -4,14 +4,83 @@ All endpoints are under `/api/v1/`. The MCP endpoint is `POST /mcp`. By default,
 Forge binds loopback on an OS-selected port, persists it in `~/.forge/server.json`,
 and reuses it on later starts.
 
-Authentication is required on all non-exempt routes. Requests must carry a
-`Bearer` token — either a session JWT obtained via `POST /api/v1/auth/login`
-or a personal access token (PAT) prefixed `fg_` issued at
-`POST /api/v1/auth/tokens`. MCP clients can additionally use an OAuth 2.1
-access token (see `/.well-known/oauth-authorization-server`). The
-`register`, `login`, `refresh`, and `logout` routes are the only exempt ones.
+## Authentication
+
+Authentication is required on all non-exempt routes. REST takes an explicit
+credential first: an `Authorization: Bearer` token, else the `?token=` query
+fallback (for clients such as EventSource). Only a request with neither, and
+with no `Authorization` header at all, is authenticated by the
+`__Host-forge_session` cookie; an invalid or non-Bearer explicit credential is
+never rescued by the cookie. All use the same token validation and authentication errors
+(`401 missing_token`, `invalid_token`, or `token_expired`). A Bearer token can
+be a session JWT obtained via `POST /api/v1/auth/login` or a personal access
+token (PAT) prefixed `fg_` issued at `POST /api/v1/auth/tokens`. Cookie-only
+EventSource connections can use `/api/v1/events` without a query credential.
+MCP keeps explicit token authentication, including OAuth 2.1 access tokens
+(see `/.well-known/oauth-authorization-server`); it does not accept session
+cookies. The `register`, `login`, `refresh`, and `logout` auth routes are
+exempt from access-token authentication.
 Do not expose Forge to the public internet without an authenticating reverse
 proxy in front of it.
+
+Over HTTPS, successful registration, login and refresh responses set two
+host-only cookies alongside the unchanged JSON token response:
+
+| Cookie | Value | Path | Max-Age |
+|---|---|---|---|
+| `__Host-forge_session` | Access token | `/` | Access-token lifetime, currently 900 seconds |
+| `__Host-forge_refresh` | Refresh token | `/` | Refresh-token lifetime, currently 604800 seconds |
+
+Both cookies always have `HttpOnly`, `SameSite=Strict`, `Secure`, `Path=/`, and
+no `Domain`. The `__Host-` prefix prevents sibling subdomains from planting
+these cookies. Cookies are issued only when the configured public origin
+(`FORGE_PUBLIC_BASE_URL`) uses HTTPS, the request itself uses HTTPS, or a loopback
+proxy peer supplies `X-Forwarded-Proto: https`. Forwarded scheme headers from other peers are
+untrusted and ignored; remote/container reverse proxies must configure the
+public base URL. Plain HTTP, including `http://127.0.0.1`, sets no session or
+refresh cookie: cookies ignore ports and could otherwise expose a live token
+to another local web server. The web app continues to work through its existing
+localStorage tokens on HTTP.
+
+`POST /api/v1/auth/refresh` takes `refresh_token` from its JSON
+body first, then `__Host-forge_refresh`. Send `{}` or omit the body to use
+the cookie.
+Only refresh and logout read this cookie; ordinary REST authentication and MCP
+never use it, despite its `Path=/`. Rotation invalidates the old refresh token
+and, over HTTPS, sets both cookies again.
+`POST /api/v1/auth/logout` uses the same credential precedence, revokes the
+selected refresh token, and clears both cookies with `Max-Age=0` and the same
+paths and attributes, including `Secure`, even over plain HTTP. Access JWTs
+already copied by a client remain valid until their normal expiry.
+
+**CSRF:** a request authenticated only by the cookie that carries
+`Sec-Fetch-Site` is refused with `403 csrf_rejected` unless the value is
+`same-origin` or `none`, whatever its method. `SameSite=Strict` does not
+separate ports on one host or sibling subdomains, so a `same-site` page could
+otherwise embed cookie-authenticated reads. Unsafe requests (`POST`, `PUT`,
+`PATCH`, `DELETE`, and other non-safe methods) authenticated only by a cookie
+always require same-origin evidence: only when `Sec-Fetch-Site` is absent may
+`Origin` supply it, and its scheme, host and port must match the configured
+public origin, or the request's own serving origin when no public URL is
+configured. Cross-site, same-site, foreign/null Origin, and missing evidence
+are refused with `403 csrf_rejected`. A matching Origin does not override a
+rejected `Sec-Fetch-Site`. Safe-method requests without Fetch Metadata (older
+or non-browser clients) are accepted. Cookie-based refresh and logout
+follow this rule even without an access cookie. Credential-free logout also
+requires this evidence before clearing cookies, even if SameSite withheld
+them. Explicit Bearer requests and
+explicit refresh-token bodies keep their existing behavior.
+
+The web app continues to persist password-login tokens in `forge-auth`
+localStorage. On startup without a stored access token it checks
+`GET /api/v1/auth/me` using same-origin cookies before making an auth-guard
+decision. If that lookup returns `401`, startup sends one empty-body
+`POST /api/v1/auth/refresh` using the refresh cookie and retries `/auth/me` once
+on success. A failed refresh or retried lookup clears the user and returns to
+`/login`; there is no retry loop. A cookie-only session keeps the returned user
+without copying tokens into storage; API requests omit Authorization,
+subsequent API refreshes send `{}`, and SSE uses cookies. Rejected sessions
+clear the user and return to `/login`.
 
 For the conceptual model behind these endpoints see
 [architecture.md](architecture.md).
@@ -200,7 +269,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/relations` | Read direct subtask, dependency, and dependent summaries without scanning the Project task list |
 | GET    | `/api/v1/tasks/{id}/findings` | Current review-window findings (same Project read authority as Task reviews) |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
-| PATCH  | `/api/v1/tasks/{id}` | Update task |
+| PATCH  | `/api/v1/tasks/{id}` | Update task; send `description: ""` to clear it (omitted or `null` leaves it unchanged) |
 | DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
@@ -5096,6 +5165,54 @@ All errors render as:
 }
 ```
 
+In demo mode (`forge --demo`), command-bearing Project settings, Task state
+configuration, workflow/template definitions and scaffold configuration are
+refused with HTTP **422**, code `server_commands_disabled`, and message
+`This demo does not run commands`. This includes Script lifecycle hooks,
+review `ci_steps`/`setup_steps`, non-null `ReviewConfig.verify` (app start,
+readiness commands and scripted checks), environment check commands and Project
+command allowlists. Empty CI/setup/environment-check lists and `verify: null`
+can be saved to remove configuration. REST and
+MCP use the shared domain validation; MCP reports `-32602` with
+`data.code: "server_commands_disabled"`. Native orchestration outcomes use the
+same code with status `failed`. Stored commands are also refused at execution:
+hook/check results retain the reason and review entry requiring CI or verify
+parks the Task in `review` with `server_commands_disabled`, before creating a
+Review attempt or check consumer. No review, infrastructure or verify retry
+budget is spent, and no hooks step stays suspended. Remove the configuration
+and retry the entry, or cancel the Task. Native Chat command tools also refuse
+execution, including when a visitor connects their own provider credential;
+other native tools keep their permissions.
+Forge's built-in Git operations remain available, under a fixed policy: in
+demo mode every Git process of the server follows no HTTP redirect, uses no
+network protocol but `https`, and runs no repository hook or filesystem monitor
+(see [Public demo instance](demo-instance.md#what-a-visitor-can-and-cannot-do)).
+Normal mode is unchanged.
+
+The same demo switch refuses two more things, also with HTTP **422**:
+
+- `server_agents_disabled` ("This demo does not run agents or connect model
+  providers"): `POST /api/v1/providers`, `POST /api/v1/provider-authorizations`
+  and admission of a Chat turn answered by a native (embedded) Agent (`POST
+  /api/v1/agent-chats/{id}/messages`, turn retry, handoffs, Genesis start);
+  Chats answered by a CLI Agent on a daemon are admitted. Native turns queued
+  by any other path fail in the agent runtime with the same code before a
+  provider request. MCP reports
+  `-32602` with `data.code: "server_agents_disabled"`; native orchestration
+  outcomes use the `server_commands_disabled` outcome code.
+- `server_location_refused` (message starts "This demo reads nothing from the
+  server and accepts only https:// repositories at a public address", followed
+  by the reason): repository create/update (`local_path`, a `file://` or other
+  non-`https` `remote_url`, a local/private host or one that resolves to a
+  private address, a `default_branch` that is not a valid Git branch name), a Task
+  `merge_config.target_branch` that is not a valid Git branch name,
+  repository sync of a stored local path, registering a server-owned or
+  `shared_mount` repository location (daemon-owned locations are accepted), Project settings with
+  `environment.assets`, `POST`/`PATCH /api/v1/projects/{id}/integration` and
+  integration sync, and `POST /api/v1/config/mcp`. MCP reports `-32602` with
+  `data.code: "server_location_refused"`; native outcomes use
+  `validation_error`.
+
 Common HTTP mappings:
 
 | Status | When |
@@ -5471,6 +5588,7 @@ records when the operation produced them.
 | `transient_failure` | The operation may succeed after the bounded retry guidance is followed. |
 | `internal_failure` | The operation failed without a safe caller-facing diagnosis. |
 | `validation_error` | The operation or its closed arguments are invalid. |
+| `server_commands_disabled` | Demo mode refuses configured server commands and server-side agent turns. |
 
 `status` is one of `succeeded`, `approval_required`, `setup_required`, or
 `failed`. `ok` maps to `succeeded`; `approval_required` and `setup_required`
@@ -6377,6 +6495,13 @@ the normal review path; an explicit retry-window reset restores the allowance.
 `default_review_config`, and Task `task_state_config`; it follows the same merge
 order as `ci_steps`. Project and Task writes validate field paths such as
 `verify.ready_command` and `verify.checks.0.name`.
+
+Demo mode refuses any non-null `verify` at the shared Project, Task and
+workflow/settings write boundary with the command refusal described in
+[Errors](#errors), including through MCP. Stored verify configuration and Project
+defaults are refused before a Review attempt or durable check is created; the
+Task parks in `review` with `server_commands_disabled` and no retry budget is
+spent. Its start, readiness and check commands never run.
 
 | Field | Default | Constraint |
 |---|---|---|
