@@ -6827,7 +6827,10 @@ without user authentication. Authenticated remote reports and WebSocket reconnec
 for reserved identities return the same error and do not modify daemon state.
 Errors use the standard `{code, message, details, request_id}` response shape.
 The server's embedded daemon registers and reports directly through its internal
-service path; it does not use these HTTP routes.
+service path; it does not use these HTTP routes. Its identity is never
+account-owned: if an earlier remote registration claimed it, the embedded
+daemon's next registration clears the owner, restores `global` visibility and
+rotates the credential, so the claimant's token stops working.
 
 ### Task budget projections
 

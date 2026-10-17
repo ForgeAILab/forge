@@ -317,6 +317,29 @@ impl SqliteDb {
         })
     }
 
+    /// Clear an account claim on a reserved `embedded:` identity. Only the
+    /// server's in-process daemon may hold one, and it is never account-owned;
+    /// returns whether a claim was released.
+    pub async fn release_embedded_daemon_claim(
+        &self,
+        machine_id: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if !machine_id.starts_with("embedded:") {
+            return Ok(false);
+        }
+        let released = sqlx::query(
+            "UPDATE daemon SET owner_id = NULL, visibility = 'global', updated_at = ?, \
+             version = version + 1 \
+             WHERE machine_id = ? AND owner_id IS NOT NULL AND removed_at IS NULL",
+        )
+        .bind(updated_at)
+        .bind(machine_id)
+        .execute(self.pool())
+        .await?;
+        Ok(released.rows_affected() > 0)
+    }
+
     pub async fn daemon_removed(&self, id: &str) -> Result<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM daemon WHERE id=? AND removed_at IS NOT NULL)",

@@ -154,7 +154,10 @@ impl EmbeddedDaemon {
             }
         }
 
-        let registration = self.service.register(self.registration_input()).await?;
+        let registration = self
+            .service
+            .register_embedded(self.registration_input())
+            .await?;
         let credentials = DaemonCredentials {
             daemon_id: registration.daemon_id,
             token: registration.plaintext_token,
@@ -661,6 +664,66 @@ mod tests {
         assert_eq!(registered.owner_id, None);
         assert_eq!(registered.visibility, "global");
         assert!(registered.last_report_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn embedded_daemon_reclaims_an_identity_claimed_by_an_account() {
+        use db::DaemonRepo;
+        let tempdir = tempfile::tempdir().expect("tempdir creates");
+        let db = test_db().await;
+        let daemon = EmbeddedDaemon::new(
+            Arc::clone(&db),
+            Arc::new(EventBus::new(16)),
+            Arc::new(AdapterRegistry::new()),
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("workspaces"),
+        )
+        .await
+        .unwrap();
+        daemon
+            .scan_and_report()
+            .await
+            .expect("first report succeeds");
+        // Before reserved ids were refused over HTTP, an account could
+        // re-register this identity: it took ownership and rotated the token.
+        sqlx::query("INSERT INTO \"user\" (id, email, password_hash, is_admin, created_at, updated_at) VALUES ('intruder', 'intruder@example.invalid', 'hash', 0, ?, ?)")
+            .bind(db::now_rfc3339())
+            .bind(db::now_rfc3339())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let claim = DaemonService::new(Arc::clone(&db), Arc::new(EventBus::new(16)))
+            .register(DaemonRegisterInput {
+                owner_id: Some("intruder".to_owned()),
+                visibility: Some("account".to_owned()),
+                ..daemon.registration_input()
+            })
+            .await
+            .unwrap();
+
+        daemon
+            .scan_and_report()
+            .await
+            .expect("embedded daemon registers again");
+        let row = DaemonRepo::get_by_machine_id(&*db, &embedded_machine_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.owner_id, None);
+        assert_eq!(row.visibility, "global");
+        assert!(row.last_report_at.is_some());
+        assert!(daemon
+            .service
+            .authenticate(&claim.daemon_id, &claim.plaintext_token)
+            .await
+            .is_err());
+        let credentials = daemon.read_credentials().unwrap().unwrap();
+        assert_eq!(credentials.daemon_id, row.id);
+        daemon
+            .service
+            .authenticate(&credentials.daemon_id, &credentials.token)
+            .await
+            .expect("embedded credential is current");
     }
 
     #[tokio::test]

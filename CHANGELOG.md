@@ -20,6 +20,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Remote daemon registration, reports and WebSocket connections reject every
   reserved `embedded:` identity, including this server's own identity. Internal
   embedded daemon registration and reporting continue through their service path.
+  If an account registration claimed this server's embedded identity before
+  this release, the embedded daemon releases the claim (owner cleared,
+  visibility global, credential rotated) on its next registration instead of
+  failing with `machine_owned` on every report.
 - MCP configuration reads and writes require an instance administrator before
   accessing server files or returning their paths. Project/local scope with a
   Project id also enforces Project visibility and owner/admin roles for writes.
