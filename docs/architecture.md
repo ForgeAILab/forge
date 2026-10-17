@@ -203,7 +203,9 @@ database. Shared shutdown and worker identity contracts live in core
 
 `forge-agent-host::network_policy` owns the shared restricted-IP and hostname
 predicates used by provider-entry validation, service probes, native provider
-transport, web fetch and public-search endpoint admission. Provider connection
+transport and the web fetch tool's authorization gate and transport. Public
+search (`services::native_tools` request resolver and result filter, and
+`config` endpoint validation) keeps its own stricter filter. Provider connection
 tests and health probes share a client builder that resolves and validates once,
 pins those addresses and disables redirects and proxies.
 

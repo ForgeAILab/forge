@@ -325,8 +325,11 @@ addresses. They do not follow redirects or use proxies. Endpoint checks also
 apply when loading stored metadata. Restricted destinations include `0.0.0.0/8`,
 the NAT64 prefixes `64:ff9b::/96` and `64:ff9b:1::/48`, Teredo `2001::/32`,
 and 6to4 (`2002::/16`), IPv4-mapped and IPv4-compatible IPv6 addresses whose
-embedded IPv4 address is restricted. Native provider transport, web fetch and
-public-search endpoint admission use the same address predicate.
+embedded IPv4 address is restricted. Native provider transport and the web
+fetch tool (authorization gate and transport) use the same address predicate.
+Public search validates its endpoint and result URLs with its own, stricter
+filter, which refuses every IPv4-mapped/compatible, NAT64, 6to4 and Teredo
+address outright.
 
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`

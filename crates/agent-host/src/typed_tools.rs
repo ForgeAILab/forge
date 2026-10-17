@@ -6135,7 +6135,7 @@ mod proposal_registry_tests;
 #[cfg(test)]
 mod public_origin_security_tests {
     #[test]
-    fn public_search_rejects_transition_and_zero_network_origins() {
+    fn fetch_gate_rejects_transition_and_zero_network_origins() {
         for origin in [
             "https://0.1.2.3",
             "https://[64:ff9b::7f00:1]",

@@ -14,7 +14,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Provider endpoint checks now reject `0.0.0.0/8`, NAT64 and Teredo prefixes,
   and 6to4, IPv4-mapped and IPv4-compatible addresses carrying restricted IPv4
   destinations, including when reading stored provider metadata. The same
-  predicate protects native provider requests, web fetch and public search.
+  predicate protects native provider requests and the web fetch tool (its
+  authorization gate and transport). Public search keeps its own, stricter
+  address filter.
 - Remote daemon registration, reports and WebSocket connections reject every
   reserved `embedded:` identity, including this server's own identity. Internal
   embedded daemon registration and reporting continue through their service path.
