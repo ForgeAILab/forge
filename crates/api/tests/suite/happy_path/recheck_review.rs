@@ -378,7 +378,9 @@ async fn retry_verify(gate: &str) {
                     .iter()
                     .any(|review| review.status == db::ReviewStatus::AwaitingHuman)
             {
-                return current;
+                // `current` was read before the Review settled; read it again
+                // so its offers reflect the settled Review.
+                return common::drain(&harness.state, &harness.app, &task.id).await;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
