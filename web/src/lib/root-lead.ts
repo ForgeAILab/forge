@@ -171,7 +171,51 @@ function hasReviewPhase(state: StateDefinition): boolean {
   return state.kind === 'gate' && (gateName.includes('review') || gateName.includes('merge'))
 }
 
-/** The review run admitted by the server's RootRolePolicy::allows_execution. */
+/** The server's WorkflowDefinition::outgoing_trigger_targets without the system-only fail and retry. */
+function manualTargets(states: StateDefinition[], from: string): string[] {
+  const index = states.findIndex((state) => state.name === from)
+  if (index < 0) return []
+  const state = states[index]
+  const triggers = state.triggers ?? {}
+  const targets = (['accept', 'reject'] as const).flatMap((trigger) => {
+    const to = triggers[trigger]?.to
+    return to === undefined ? [] : [to]
+  })
+  const next = states[index + 1]
+  if (!triggers.accept && state.kind !== 'terminal' && next) targets.push(next.name)
+  return targets
+}
+
+/** The server's WorkflowDefinition::coordination_planning_state: the lead's state. */
+function coordinationPlanningState(
+  states: StateDefinition[],
+  implementationRole: string | null,
+): StateDefinition | undefined {
+  for (const initial of states.filter((state) => state.kind === 'initial')) {
+    let cursor = initial.name
+    for (let step = 0; step < states.length; step += 1) {
+      const next = manualTargets(states, cursor)
+        .map((target) =>
+          states.find(
+            (state) => state.name === target && (state.kind === 'active' || state.kind === 'gate'),
+          ),
+        )
+        .find((state) => state !== undefined)
+      if (!next || next.kind === 'active') break
+      if (next.canonical_phase !== 'review' && next.role != null) {
+        return next.role !== 'coder' && next.role !== implementationRole ? next : undefined
+      }
+      cursor = next.name
+    }
+  }
+  return undefined
+}
+
+/**
+ * The review run admitted by the server's RootRolePolicy::allows_execution:
+ * `execution_role_for_state` gives the planning state to the lead first, and
+ * any other state whose phase resolves to review to its effective role.
+ */
 function rootCanRunReview(status: string, workflow?: Pick<WorkflowDefinition, 'states'>): boolean {
   if (!workflow) return status === 'review'
   const state = workflow.states.find((candidate) => candidate.name === status)
@@ -180,6 +224,7 @@ function rootCanRunReview(status: string, workflow?: Pick<WorkflowDefinition, 's
   const implementationRole =
     effectiveRole(implementation) ??
     effectiveRole(workflow.states.find((candidate) => candidate.kind === 'active'))
+  if (coordinationPlanningState(workflow.states, implementationRole)?.name === status) return false
   const role = effectiveRole(state)
   return role !== null && role !== 'coder' && role !== implementationRole
 }

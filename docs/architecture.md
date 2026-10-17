@@ -6626,7 +6626,10 @@ The web's coordination-root run control follows the review execution rule:
 resolve the state's phase from its explicit phase, recognized column, legacy
 name, then kind/name fallback, and require an effective role other than `coder`
 or the workflow's implementation role. This admits custom review roles and
-implicit review phases. It does not use the Task's projected `canonical_phase`:
+implicit review phases. As in `RootRolePolicy::execution_role_for_state`, the
+coordination planning state belongs to the lead first, even when its phase
+resolves to review (a planning gate named `plan_review`), so it is never a
+review run. It does not use the Task's projected `canonical_phase`:
 `merge_failed` can project `review` while its implementation role cannot run on
 the root.
 

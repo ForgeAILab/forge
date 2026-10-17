@@ -235,6 +235,28 @@ describe('launching a run on a coordination root', () => {
     }
   })
 
+  it('holds the planning gate, which runs the lead, even when its phase resolves to review', () => {
+    // RootRolePolicy::execution_role_for_state answers the planning state
+    // with the lead before it looks at the phase.
+    const states = [
+      { name: 'todo', kind: 'initial', role: null, canonical_phase: null, column: 'Todo' },
+      { name: 'plan_review', kind: 'gate', role: 'planner', canonical_phase: null, column: 'Planning' },
+      { name: 'in_progress', kind: 'active', role: 'coder', canonical_phase: null, column: 'In Progress' },
+      { name: 'qa_review', kind: 'gate', role: 'reviewer', canonical_phase: null, column: 'Quality' },
+    ] as StateDefinition[]
+    expect(rootHoldsRuns({ ...root, status: 'plan_review' }, true, { states })).toBe(true)
+    // The review-named gate after implementation is the aggregate review.
+    expect(rootHoldsRuns({ ...root, status: 'qa_review' }, true, { states })).toBe(false)
+    // An explicit reject is followed before the implicit accept to the next
+    // state, and the system-only fail never is: qa_review plans here.
+    const routed = [
+      { ...states[0], triggers: { fail: { to: 'plan_review' }, reject: { to: 'qa_review' } } },
+      ...states.slice(1),
+    ] as StateDefinition[]
+    expect(rootHoldsRuns({ ...root, status: 'plan_review' }, true, { states: routed })).toBe(false)
+    expect(rootHoldsRuns({ ...root, status: 'qa_review' }, true, { states: routed })).toBe(true)
+  })
+
   it('keeps merge_failed roots held even when the Task projects the review phase', () => {
     const task = { ...root, status: 'merge_failed', canonical_phase: 'review' as const }
     const state = { name: 'merge_failed', kind: 'active', role: 'coder', column: 'Review', canonical_phase: 'review' } as StateDefinition
