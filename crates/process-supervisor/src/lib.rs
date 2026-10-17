@@ -14,6 +14,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub mod executable;
+
 #[derive(Debug, Clone, Copy)]
 pub enum Capture {
     All,
@@ -317,7 +319,7 @@ pub async fn run_observed(
     command.process_group(0).kill_on_drop(false);
     #[cfg(not(unix))]
     command.kill_on_drop(true);
-    let mut child = command.spawn()?;
+    let mut child = executable::spawn(command).await?;
     let mut stdout_pipe = child.stdout.take().expect("piped stdout");
     let mut stderr_pipe = child.stderr.take().expect("piped stderr");
     let leader = child.id();

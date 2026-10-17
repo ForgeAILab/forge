@@ -224,6 +224,26 @@ fn public_search_defaults_to_disabled_and_bounded_limits() {
 }
 
 #[test]
+fn public_search_ietf_protocol_assignments_are_only_a_slash24() {
+    for (host, allowed) in [
+        ("192.0.1.1", true),
+        ("192.0.3.1", true),
+        ("192.0.255.1", true),
+        ("192.0.0.8", false),
+        ("192.0.2.1", false),
+        ("192.88.99.1", false),
+        ("198.51.100.1", false),
+        ("203.0.113.1", false),
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_ok(), allowed, "{host}");
+    }
+}
+
+#[test]
 fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
     for endpoint in [
         "http://search.example.test",

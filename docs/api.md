@@ -292,6 +292,7 @@ capacity is a placement wait, independent of Agent availability.
 
 | GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
 | GET / POST | `/api/v1/config/mcp` | Administrator-only read/install/uninstall of MCP configuration on the server; Project/local scope with a Project id also requires Project visibility (read) or owner/admin role (write) |
+| GET | `/api/v1/config/mcp/endpoint` | Signed-in connection URL only; Project/local scope with a Project id requires Project visibility |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner or an administrator |
 | GET    | `/api/v1/daemons/{id}/removal` | Preview a removal for its owner or an administrator: Tasks to re-place and Agents to retire |
@@ -2336,8 +2337,21 @@ Authorized responses retain `config_path`, `url`, `expected_url`, `installed`
 and `agents`. Requests accept `agent` (`claude`, `cursor`, `codex`), `scope`
 (`project`, `local`, `user`), optional `project_id` and `public_base_url`;
 POST additionally accepts `action` (`install`, `uninstall`). The web MCP controls
-call these routes only for administrators; other users see the browser-origin
-MCP URL (`/mcp`, with `?project_id=` in Project scope) for their own client.
+call these routes only for administrators.
+
+`GET /api/v1/config/mcp/endpoint` is a separate, signed-in read for configuring
+the caller's own MCP client. It accepts only `scope` (`project`, the default;
+`local`; or `user`) and optional `project_id`. Project scope requires a non-empty
+Project id; Project/local scope with an id requires Project visibility, including
+for instance administrators. Hidden and unknown Projects both return HTTP 404
+`not_found`; missing authentication returns HTTP 401. Account (`user`) scope
+requires only a signed-in account. The response is exactly `{"url":"https://forge.example/mcp"}`
+(with `?project_id=` and the encoded id in Project scope). The URL uses the origin
+of configured `server.public_base_url`, falling back to `http://<server.bind>`
+when unset. Caller-supplied base URLs are not accepted. This route never reads
+client configuration files and returns no paths, credentials, or install state.
+Non-administrator web controls use this read and withhold the copy action until
+it succeeds.
 
 
 ### Daemon run limits

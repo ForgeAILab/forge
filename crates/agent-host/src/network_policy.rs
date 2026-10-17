@@ -39,10 +39,17 @@ pub fn restricted_provider_ip(ip: IpAddr) -> bool {
                 || (segments[0] & 0xffc0) == 0xfec0
                 || (segments[0] & 0xfe00) == 0xfc00
                 || segments[0] >= 0xff00
-                // NAT64 and Teredo can translate/tunnel to otherwise restricted
-                // destinations; refuse these transition prefixes entirely.
-                || (segments[0] == 0x64 && segments[1] == 0xff9b
-                    && (segments[2..6] == [0, 0, 0, 0] || segments[2] == 1))
+                // The well-known NAT64 /96 carries its IPv4 destination in
+                // the last 32 bits. Apply the same policy to that destination.
+                || (segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+                    && restricted_provider_ip(IpAddr::V4(std::net::Ipv4Addr::new(
+                        (segments[6] >> 8) as u8,
+                        segments[6] as u8,
+                        (segments[7] >> 8) as u8,
+                        segments[7] as u8,
+                    ))))
+                // Local-use NAT64 /48 and Teredo have no admitted public mapping.
+                || (segments[..3] == [0x64, 0xff9b, 1])
                 || (segments[0] == 0x2001 && segments[1] == 0)
                 // A 6to4 address carries its IPv4 destination in bits 16..48.
                 || (segments[0] == 0x2002
@@ -55,6 +62,33 @@ pub fn restricted_provider_ip(ip: IpAddr) -> bool {
                 || address
                     .to_ipv4()
                     .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nat64_applies_embedded_ipv4_policy() {
+        for address in ["64:ff9b::8.8.8.8", "64:ff9b::1.1.1.1"] {
+            assert!(
+                !restricted_provider_ip(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in [
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "64:ff9b:1::8.8.8.8",
+            "64:ff9b:1:1234:5678:9abc:808:808",
+        ] {
+            assert!(
+                restricted_provider_ip(address.parse().unwrap()),
+                "{address}"
+            );
         }
     }
 }

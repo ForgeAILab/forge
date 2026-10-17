@@ -618,7 +618,8 @@ fn is_private_or_local_host(host: &str) -> bool {
                 || address.is_broadcast()
                 || octets[0] == 0
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
                 || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
                 || (octets[0] == 198 && (18..=19).contains(&octets[1]))
                 || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)

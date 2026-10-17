@@ -1474,7 +1474,6 @@ mod tests {
     /// future of a single-threaded runtime keeps being polled meanwhile.
     #[test]
     fn a_slow_compiler_cache_server_start_never_stalls_the_runtime() {
-        use std::os::unix::fs::PermissionsExt;
         use std::time::Duration;
         const START: Duration = Duration::from_secs(2);
         let dir = tempfile::tempdir().unwrap();
@@ -1482,7 +1481,7 @@ mod tests {
         let worktree = cache_tests::linked_worktree(&root, "t1", "repo-slow");
         let wrapper = dir.path().join("bin").join("sccache");
         fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
-        fs::write(
+        process_supervisor::executable::write_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\n[ \"$1\" = --start-server ] && sleep {}\nexit 0\n",
@@ -1490,7 +1489,6 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
         compiler_cache::install(&root, Some(cache_tests::cache(&root, &wrapper)));
         let store = root.join(CACHE_DIR).join("repo-slow");
 

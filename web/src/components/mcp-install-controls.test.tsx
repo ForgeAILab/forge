@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { apiFetch } from '@/api/client'
@@ -19,16 +19,15 @@ const user = {
   created_at: '2026-10-05T00:00:00Z',
 }
 
-const configCalls = () =>
-  vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/config/mcp')
+const configCalls = () => vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/config/mcp')
 
-function mount() {
+function mount(scope: 'project' | 'local' | 'user' = 'project', projectId = 'project-1') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
-      <McpInstallControls scope="project" projectId="project-1" />
+      <McpInstallControls scope={scope} projectId={scope === 'user' ? undefined : projectId} />
     </QueryClientProvider>,
   )
 }
@@ -38,24 +37,64 @@ beforeEach(() => {
   vi.mocked(apiFetch).mockImplementation(async (path: string) =>
     path === '/clis'
       ? { items: [] }
-      : {
-          installed: false,
-          url: null,
-          expected_url: 'http://forge.test/mcp?project_id=project-1',
-          config_path: '/srv/repo/.claude/settings.json',
-          agents: ['claude', 'cursor', 'codex'],
-        },
+      : path === '/config/mcp/endpoint'
+        ? { url: 'https://public.forge.test/mcp?project_id=project-1' }
+        : {
+            installed: false,
+            url: null,
+            expected_url: 'http://forge.test/mcp?project_id=project-1',
+            config_path: '/srv/repo/.claude/settings.json',
+            agents: ['claude', 'cursor', 'codex'],
+          },
   )
 })
 
 describe('MCP install controls', () => {
-  it('gives a non-administrator the URL without reading or offering server configuration', () => {
+  it('gives a non-administrator the configured public URL without reading server configuration', async () => {
     useAuthStore.setState({ user })
     mount()
-    expect(screen.getByText(`${window.location.origin}/mcp?project_id=project-1`)).toBeTruthy()
+    const url = 'https://public.forge.test/mcp?project_id=project-1'
+    expect(await screen.findByText(url)).toBeTruthy()
+    expect(apiFetch).toHaveBeenCalledWith('/config/mcp/endpoint', {
+      search: { scope: 'project', project_id: 'project-1' },
+    })
+    const writeText = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
+    fireEvent.click(screen.getByRole('button', { name: 'Copy to clipboard' }))
+    expect(writeText).toHaveBeenCalledWith(url)
     expect(screen.getByText(/requires a Forge administrator/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Install' })).toBeNull()
     expect(screen.queryByText('/srv/repo/.claude/settings.json')).toBeNull()
+    expect(configCalls()).toHaveLength(0)
+  })
+
+  it.each(['local', 'user'] as const)('reads the server endpoint in %s scope', async (scope) => {
+    useAuthStore.setState({ user })
+    vi.mocked(apiFetch).mockResolvedValue({ url: 'https://public.forge.test/mcp' })
+    mount(scope)
+    expect(await screen.findByText('https://public.forge.test/mcp')).toBeTruthy()
+    expect(apiFetch).toHaveBeenCalledWith('/config/mcp/endpoint', {
+      search: scope === 'user' ? { scope } : { scope, project_id: 'project-1' },
+    })
+    expect(configCalls()).toHaveLength(0)
+  })
+
+  it('does not offer a browser-derived URL while loading or after a refused read', async () => {
+    useAuthStore.setState({ user })
+    let reject!: (error: Error) => void
+    vi.mocked(apiFetch).mockImplementation((path) =>
+      path === '/clis'
+        ? Promise.resolve({ items: [] })
+        : new Promise((_resolve, fail) => {
+            reject = fail
+          }),
+    )
+    mount()
+    expect(screen.queryByRole('button', { name: 'Copy to clipboard' })).toBeNull()
+    reject(new Error('not_found'))
+    expect(await screen.findByText('Unable to load MCP URL.')).toBeTruthy()
+    expect(screen.queryByText(`${window.location.origin}/mcp?project_id=project-1`)).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Copy to clipboard' })).toBeNull()
     expect(configCalls()).toHaveLength(0)
   })
 

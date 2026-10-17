@@ -4,7 +4,8 @@ use std::{
 };
 
 use api_types::{
-    McpAction, McpAgent, McpConfigActionRequest, McpConfigQuery, McpConfigResponse, McpScope,
+    McpAction, McpAgent, McpConfigActionRequest, McpConfigQuery, McpConfigResponse,
+    McpEndpointQuery, McpEndpointResponse, McpScope,
 };
 use axum::{
     extract::{Query, State},
@@ -23,6 +24,25 @@ use crate::{
     state::AppState,
 };
 use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
+
+pub async fn get_mcp_endpoint(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Query(params): Query<McpEndpointQuery>,
+) -> ApiResult<Json<McpEndpointResponse>> {
+    let scope = parse_scope(params.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        params.project_id.as_deref(),
+        ProjectAccess::Read,
+    )
+    .await?;
+    Ok(Json(McpEndpointResponse {
+        url: mcp_url_for_scope_from_request(&state, None, &scope, params.project_id.as_deref())?,
+    }))
+}
 
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,

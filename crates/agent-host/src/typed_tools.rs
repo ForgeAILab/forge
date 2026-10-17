@@ -3638,7 +3638,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn native_command_gets_the_shared_compiler_cache() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("ws");
         let worktree = root.join("t").join("repo");
@@ -3659,8 +3658,8 @@ mod tests {
         )
         .unwrap();
         let wrapper = temp.path().join("kache");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        process_supervisor::executable::write_executable(&wrapper, "#!/bin/sh\nexec \"$@\"\n")
+            .unwrap();
         executors::compiler_cache::install(
             &root,
             Some(executors::compiler_cache::CompilerCache {

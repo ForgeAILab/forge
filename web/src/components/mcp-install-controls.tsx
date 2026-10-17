@@ -1,7 +1,12 @@
 import { useState } from 'react'
 import { Check, Copy } from '@phosphor-icons/react'
 import { toast } from 'sonner'
-import { useCliProjectionQuery, useMcpConfigQuery, useUpdateMcpConfig } from '@/api/hooks'
+import {
+  useCliProjectionQuery,
+  useMcpConfigQuery,
+  useMcpEndpointQuery,
+  useUpdateMcpConfig,
+} from '@/api/hooks'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -58,15 +63,6 @@ function getCliCommand(agent: McpInstallAgent, mcpUrl: string): string {
   }
 }
 
-// The address this browser reaches Forge on; the server derives the same URL
-// when no public base URL is configured.
-function browserMcpUrl(scope: McpInstallScope, projectId?: string): string {
-  const base = `${window.location.origin}/mcp`
-  return scope === 'project' && projectId
-    ? `${base}?project_id=${encodeURIComponent(projectId)}`
-    : base
-}
-
 function getCommandLabel(agent: McpInstallAgent): string {
   switch (agent) {
     case 'claude':
@@ -121,6 +117,7 @@ export function McpInstallControls({
   // Server-side MCP configuration is administrator-only: other users get the
   // URL to configure their own client, without reading the server's files.
   const isAdmin = useAuthStore((state) => state.user?.is_admin === true)
+  const endpointQuery = useMcpEndpointQuery(scope, projectId, !isAdmin)
 
   const claudeQuery = useMcpConfigQuery('claude', scope, projectId, isAdmin)
   const cursorQuery = useMcpConfigQuery('cursor', scope, projectId, isAdmin)
@@ -129,7 +126,7 @@ export function McpInstallControls({
   const [pendingAgent, setPendingAgent] = useState<McpInstallAgent | 'all' | null>(null)
 
   if (!isAdmin) {
-    const manualUrl = browserMcpUrl(scope, projectId)
+    const manualUrl = endpointQuery.data?.url
     return (
       <div className={cn('space-y-3', compact && 'mt-3')}>
         <div>
@@ -137,10 +134,20 @@ export function McpInstallControls({
             MCP Server URL
           </p>
           <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-3 py-2">
-            <code className="min-w-0 flex-1 truncate font-mono text-sm text-foreground">
-              {manualUrl}
-            </code>
-            <CopyButton text={manualUrl} />
+            {manualUrl ? (
+              <>
+                <code className="min-w-0 flex-1 truncate font-mono text-sm text-foreground">
+                  {manualUrl}
+                </code>
+                <CopyButton text={manualUrl} />
+              </>
+            ) : endpointQuery.isError ? (
+              <p role="alert" className="text-sm text-muted-foreground">
+                Unable to load MCP URL.
+              </p>
+            ) : (
+              <Skeleton className="h-5 w-72" />
+            )}
           </div>
         </div>
         <p className="text-xs text-muted-foreground">

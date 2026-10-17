@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+from executable_fixture import write_executable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -21,7 +22,7 @@ class IntegrationLaneGateTests(unittest.TestCase):
             tmp = pathlib.Path(scratch)
             (tmp / 'responses.json').write_text(json.dumps(responses))
             gh = tmp / 'gh'
-            gh.write_text(
+            write_executable(gh,
                 '#!/usr/bin/env python3\nimport json, pathlib, sys\n'
                 'root = pathlib.Path(__file__).parent\n'
                 "with (root / 'calls.jsonl').open('a') as log:\n"
@@ -33,10 +34,8 @@ class IntegrationLaneGateTests(unittest.TestCase):
                 "print(response.get('output', ''))\n"
                 "sys.exit(response.get('exit', 0))\n"
             )
-            gh.chmod(0o755)
             sleep = tmp / 'sleep'
-            sleep.write_text('#!/bin/bash\nexit 0\n')
-            sleep.chmod(0o755)
+            write_executable(sleep, '#!/bin/bash\nexit 0\n')
             env = dict(os.environ, PATH=str(tmp) + os.pathsep + os.environ['PATH'],
                        REPO='owner/repo', SHA='exact-head-sha', LANE_BRANCH='next/v0.14')
             run = subprocess.run(['/bin/bash', '-c', script], env=env,

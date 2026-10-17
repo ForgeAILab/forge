@@ -47,6 +47,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+process-supervisor = { path = "../process-supervisor" }
 db = { path = "../db", features = ["test-template"] }
 jsonschema = { version = "0.28", default-features = false }
 tempfile = "3"

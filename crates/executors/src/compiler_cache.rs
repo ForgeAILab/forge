@@ -497,7 +497,7 @@ fn run_bounded(
     command: &mut std::process::Command,
     timeout: Duration,
 ) -> io::Result<std::process::ExitStatus> {
-    let mut child = command.spawn()?;
+    let mut child = process_supervisor::executable::spawn_std(command)?;
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
@@ -542,6 +542,9 @@ fn real_path(path: PathBuf) -> PathBuf {
 /// store is writable by the runs that use it, so a run can leave a link
 /// where Forge is about to write.
 fn write_replacing(path: &Path, contents: &str, executable: bool) -> io::Result<()> {
+    if executable {
+        return process_supervisor::executable::write_executable(path, contents);
+    }
     use std::io::Write;
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let name = path
@@ -564,13 +567,6 @@ fn write_replacing(path: &Path, contents: &str, executable: bool) -> io::Result<
             .create_new(true)
             .open(&staged)?;
         file.write_all(contents.as_bytes())?;
-        #[cfg(unix)]
-        if executable {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o755))?;
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
         drop(file);
         fs::rename(&staged, path)
     })();
@@ -1351,10 +1347,9 @@ pub(crate) mod tests {
     /// `arguments|SCCACHE_DIR|KACHE_CACHE_DIR|TMPDIR` to `<dir>/calls`, answers
     /// `--start-server`, and otherwise runs the command it wraps.
     pub(crate) fn fake_wrapper(dir: &Path, name: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(dir).unwrap();
         let path = dir.join(name);
-        fs::write(
+        process_supervisor::executable::write_executable(
             &path,
             format!(
                 "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nprintf '%s|%s|%s|%s\\n' \"$*\" \"${{SCCACHE_DIR:-}}\" \"${{KACHE_CACHE_DIR:-}}\" \"${{TMPDIR:-}}\" >> '{}'\nif [ \"$1\" = --start-server ]; then\n  n=0\n  while [ -e '{}' ] && [ ! -S \"$SCCACHE_SERVER_UDS\" ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done\n  exit 0\nfi\nexec \"$@\"\n",
@@ -1363,7 +1358,6 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
 
@@ -1475,7 +1469,6 @@ pub(crate) mod tests {
         );
         // A known wrapper that does not run, or never returns, is off before
         // any run is handed it. A program Forge does not know is not probed.
-        use std::os::unix::fs::PermissionsExt;
         for (name, body) in [
             ("broken/kache", "#!/bin/sh\nexit 1\n"),
             ("hung/sccache", "#!/bin/sh\nexec sleep 600\n"),
@@ -1483,8 +1476,7 @@ pub(crate) mod tests {
         ] {
             let program = base.join(name);
             fs::create_dir_all(program.parent().unwrap()).unwrap();
-            fs::write(&program, body).unwrap();
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            process_supervisor::executable::write_executable(&program, body).unwrap();
             let started = Instant::now();
             let resolved = CompilerCache::resolve(&config(program.to_str().unwrap()), &root, None);
             assert_eq!(resolved.is_some(), name == "other/cachepot", "{name}");
@@ -1759,8 +1751,7 @@ pub(crate) mod tests {
         // is too long for a Unix socket.
         let failing = dir.path().join("failing").join("sccache");
         fs::create_dir_all(failing.parent().unwrap()).unwrap();
-        fs::write(&failing, "#!/bin/sh\nexit 3\n").unwrap();
-        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+        process_supervisor::executable::write_executable(&failing, "#!/bin/sh\nexit 3\n").unwrap();
         assert_eq!(cache(&root, &failing).for_worktree(&worktree), None);
         assert!(WARNED_SERVER.load(Ordering::Relaxed));
         let mut long = cache(&root, &fake_wrapper(&dir.path().join("ok"), "sccache"));
@@ -1780,7 +1771,7 @@ pub(crate) mod tests {
         // a server that hangs at start costs a bounded number of waits.
         let store = root.join(CACHE_DIR).join("repo-a");
         assert!(server_start_given_up(&store));
-        fs::write(&failing, "#!/bin/sh\nexit 0\n").unwrap();
+        process_supervisor::executable::write_executable(&failing, "#!/bin/sh\nexit 0\n").unwrap();
         assert_eq!(cache(&root, &failing).for_worktree(&worktree), None);
         note_server_start(&store, true);
         assert!(!server_start_given_up(&store));

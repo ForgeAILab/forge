@@ -1,8 +1,6 @@
 use super::super::*;
 use crate::task_service::tests::helpers::{seed_execution, seed_role_assignment};
 use db::{PageRequest, SortBy, SortOrder};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn review_details_accept_forge_metadata_and_refuse_unknown_fields() {
@@ -986,7 +984,7 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
     let worktree = workspace_path.as_path();
     let marker = repo_dir.path().join("fsmonitor-ran");
     let monitor = worktree.join("fsmonitor.sh");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &monitor,
         format!(
             "#!/bin/sh\nprintf ran > \"{}\"\nprintf 'token\\n'\n",
@@ -994,11 +992,6 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
         ),
     )
     .expect("fsmonitor script writes");
-    let mut permissions = std::fs::metadata(&monitor)
-        .expect("fsmonitor metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&monitor, permissions).expect("fsmonitor becomes executable");
     let config = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)

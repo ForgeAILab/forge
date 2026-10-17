@@ -312,3 +312,162 @@ async fn providers_reject_legacy_transition_endpoints_before_sending_test_reques
         );
     }
 }
+
+#[tokio::test]
+async fn mcp_endpoint_returns_only_configured_public_url_to_project_viewers_and_accounts() {
+    let root = common::TestDir::new("mcp-endpoint-public");
+    let harness = common::test_app(root.path(), "mcp-endpoint-public").await;
+    let now = db::now_rfc3339();
+    ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: "endpoint-project".into(),
+            name: "Endpoint".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: Some("test-user-id".into()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    // No repository is configured, and invalid config files cannot be read.
+    std::fs::create_dir_all(root.path().join(".claude")).unwrap();
+    std::fs::write(
+        root.path().join(".claude/settings.json"),
+        "invalid private config",
+    )
+    .unwrap();
+    let mut state = (*harness.state).clone();
+    let mut config = (*state.effective_config).clone();
+    config.server.public_base_url = Some("https://public.forge.example/app?token=private".into());
+    state.effective_config = std::sync::Arc::new(config);
+    let app = api::build_router(state, root.path());
+    for (query, url) in [
+        (
+            "scope=project&project_id=endpoint-project",
+            "https://public.forge.example/mcp?project_id=endpoint-project",
+        ),
+        (
+            "scope=local&project_id=endpoint-project",
+            "https://public.forge.example/mcp",
+        ),
+        ("scope=user", "https://public.forge.example/mcp"),
+    ] {
+        let response: Value = common::empty_request_with_bearer(
+            &app,
+            Method::GET,
+            &format!("/api/v1/config/mcp/endpoint?{query}"),
+            &common::test_jwt(),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(response, json!({"url": url}));
+    }
+    // The public read cannot accept a caller-controlled base URL.
+    let response = app.oneshot(Request::builder()
+        .uri("/api/v1/config/mcp/endpoint?scope=user&public_base_url=https://attacker.invalid")
+        .header(header::AUTHORIZATION, format!("Bearer {}", common::test_jwt()))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mcp_endpoint_requires_authentication_and_project_visibility() {
+    let root = common::TestDir::new("mcp-endpoint-auth");
+    let harness = common::test_app(root.path(), "mcp-endpoint-auth").await;
+    let now = db::now_rfc3339();
+    UserRepo::create_user(
+        &*harness.state.db,
+        &db::User {
+            id: "endpoint-owner".into(),
+            email: "endpoint-owner@example.invalid".into(),
+            password_hash: "unused".into(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: "hidden-endpoint".into(),
+            name: "Hidden".into(),
+            settings: "{}".into(),
+            workflow_definition: "{}".into(),
+            primary_repo_id: None,
+            owner_id: Some("endpoint-owner".into()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/config/mcp/endpoint?scope=user")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    for token in [common::test_jwt(), common::admin_jwt()] {
+        for scope in ["project", "local"] {
+            for project in ["hidden-endpoint", "missing-endpoint"] {
+                let error: ErrorResponse = common::empty_request_with_bearer(
+                    &harness.app,
+                    Method::GET,
+                    &format!("/api/v1/config/mcp/endpoint?scope={scope}&project_id={project}"),
+                    &token,
+                    StatusCode::NOT_FOUND,
+                )
+                .await;
+                assert_eq!(error.code, "not_found");
+            }
+        }
+    }
+    ProjectMemberRepo::add_member(
+        &*harness.state.db,
+        db::CreateProjectMember {
+            id: db::new_uuid_v4(),
+            project_id: "hidden-endpoint".into(),
+            user_id: "test-user-id".into(),
+            role: "viewer".into(),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    let response: Value = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/config/mcp/endpoint?scope=project&project_id=hidden-endpoint",
+        &common::test_jwt(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.as_object().unwrap().len(), 1);
+    assert!(response["url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/mcp?project_id=hidden-endpoint"));
+    let error: ErrorResponse = common::empty_request_with_bearer(
+        &harness.app,
+        Method::GET,
+        "/api/v1/config/mcp/endpoint?scope=project",
+        &common::test_jwt(),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(error.code, "project_id_required");
+}

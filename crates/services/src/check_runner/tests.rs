@@ -3468,7 +3468,6 @@ async fn the_salt_is_created_once_survives_a_restart_and_no_identity_holds_a_val
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
-    use std::os::unix::fs::PermissionsExt;
     let f = canonical_fixture().await;
     let step = f.counting_step();
     let off = f.request("k", &step).await;
@@ -3497,8 +3496,7 @@ async fn the_compiler_cache_wrapper_does_not_change_a_check_identity() {
     )
     .unwrap();
     let wrapper = f.temp.path().join("kache");
-    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    process_supervisor::executable::write_executable(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
     executors::compiler_cache::install(
         &root,
         Some(executors::compiler_cache::CompilerCache {

@@ -127,6 +127,14 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ## 5. Components
 
+### MCP connection URL
+
+Reuse the existing bordered muted URL row, mono text, copy button and Skeleton.
+For non-administrators, read only the scoped server endpoint; show the Skeleton
+while loading and an inline muted error with `role="alert"` if the read fails.
+Withhold the URL and copy action until it succeeds. Server install controls remain
+administrator-only. Preserve existing spacing, focus, responsive and motion rules.
+
 ### Button and icon button
 
 - **Structure:** semantic `button`, optional Phosphor icon, label or accessible name.

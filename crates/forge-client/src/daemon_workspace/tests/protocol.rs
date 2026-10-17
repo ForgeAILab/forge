@@ -1983,7 +1983,6 @@ async fn a_process_that_outlives_a_preempted_workspace_run_loses_its_temp_dir() 
 #[cfg(unix)]
 #[tokio::test]
 async fn workspace_run_gets_this_machines_shared_compiler_cache() {
-    use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new().await;
     let root = fixture.dir.path();
     let worktree = root
@@ -1993,8 +1992,7 @@ async fn workspace_run_gets_this_machines_shared_compiler_cache() {
     let repository =
         executors::compiler_cache::repository_id(&worktree).expect("a linked worktree");
     let wrapper = root.join("kache");
-    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    process_supervisor::executable::write_executable(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
     let cache_dir = root.join(executors::compiler_cache::CACHE_DIR);
     executors::compiler_cache::install(
         root,

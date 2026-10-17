@@ -92,6 +92,7 @@ fn export_typescript_to(out_dir: &std::path::Path) {
 
     std::fs::create_dir_all(out_dir).expect("create types output directory");
     std::env::set_current_dir(out_dir).expect("switch to types output directory");
+    McpEndpointResponse::export().expect("export McpEndpointResponse");
     RemoveDaemonResponse::export().expect("export RemoveDaemonResponse");
     RemoveDaemonPreview::export().expect("export RemoveDaemonPreview");
 

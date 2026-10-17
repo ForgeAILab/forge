@@ -4101,7 +4101,7 @@ fn is_blocked_public_address(address: IpAddr) -> bool {
                 || address.is_broadcast()
                 || (octets[0] == 0)
                 || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
                 || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
                 || (octets[0] == 198 && (18..=19).contains(&octets[1]))
@@ -7050,6 +7050,31 @@ mod tests {
             "http://example.com/result"
         );
         assert!(normalize_public_result_url("https://example.com/\u{000a}").is_err());
+    }
+
+    #[test]
+    fn public_search_ietf_protocol_assignments_are_only_a_slash24() {
+        for (host, allowed) in [
+            ("192.0.1.1", true),
+            ("192.0.3.1", true),
+            ("192.0.255.1", true),
+            ("192.0.0.8", false),
+            ("192.0.2.1", false),
+            ("192.88.99.1", false),
+            ("198.51.100.1", false),
+            ("203.0.113.1", false),
+        ] {
+            assert_eq!(
+                is_blocked_public_address(host.parse().unwrap()),
+                !allowed,
+                "{host}"
+            );
+            assert_eq!(
+                normalize_public_result_url(&format!("https://{host}/result")).is_ok(),
+                allowed,
+                "{host}"
+            );
+        }
     }
 
     #[test]

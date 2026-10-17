@@ -259,8 +259,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn commits_dirty_worktree_and_returns_new_sha() {
@@ -701,10 +699,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_executable(path: &Path, body: &str) {
-        fs::write(path, body).expect("script writes");
-        let mut permissions = fs::metadata(path).expect("script metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("script becomes executable");
+        process_supervisor::executable::write_executable(path, body).expect("script writes");
     }
 }
 

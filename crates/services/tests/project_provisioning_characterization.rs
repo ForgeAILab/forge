@@ -1003,18 +1003,7 @@ async fn fake_create_spark(exit_code: i32) -> PathBuf {
          if [ {exit_code} -ne 0 ]; then echo 'Unknown pack \"nope\". Registered packs: db-sqlite' >&2; exit {exit_code}; fi\n\
          echo 'Created'\n"
     );
-    tokio::fs::write(&script, body)
-        .await
-        .expect("fake command writes");
-    let mut permissions = tokio::fs::metadata(&script)
-        .await
-        .expect("fake command metadata")
-        .permissions();
-    use std::os::unix::fs::PermissionsExt;
-    permissions.set_mode(0o755);
-    tokio::fs::set_permissions(&script, permissions)
-        .await
-        .expect("fake command becomes executable");
+    process_supervisor::executable::write_executable(&script, body).expect("fake command writes");
     script
 }
 

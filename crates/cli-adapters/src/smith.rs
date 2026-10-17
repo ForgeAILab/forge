@@ -223,7 +223,7 @@ impl CodingExecutorAdapter for SmithAdapter {
         executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
-        let mut child = cmd.spawn()?;
+        let mut child = process_supervisor::executable::spawn(&mut cmd).await?;
 
         let stdout = child
             .stdout

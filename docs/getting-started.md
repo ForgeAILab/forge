@@ -873,7 +873,9 @@ the response body, and the request deadline. Result text is marked as
 untrusted external data and is never persisted as a user decision. Forge
 disables redirects and ambient proxy/cookie/auth state, revalidates DNS
 addresses at connect time, and rejects private, special-use, and
-IPv4-mapped IPv6 targets. The tool is omitted when
+IPv4-mapped IPv6 targets. The IETF protocol-assignments block is `192.0.0.0/24`,
+and TEST-NET-1 remains `192.0.2.0/24`; other public addresses in `192.0.0.0/16`
+are allowed. The tool is omitted when
 `public_search.endpoint` is unset; invalid configuration is rejected before
 startup. Direct `web.search` proposals are not persisted as `AgentAction`
 rows.

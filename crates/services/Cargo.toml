@@ -65,6 +65,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 which = "*"
 
 [dev-dependencies]
+process-supervisor = { path = "../process-supervisor" }
 tracing-subscriber.workspace = true
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }

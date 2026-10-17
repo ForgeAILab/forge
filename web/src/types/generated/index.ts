@@ -1,4 +1,5 @@
 export * from './api'
+export type { McpEndpointResponse } from './bindings/McpEndpointResponse'
 export type { CommitmentResponse } from './bindings/CommitmentResponse'
 export type { CreateCommitmentRequest } from './bindings/CreateCommitmentRequest'
 export type { UpdateCommitmentRequest } from './bindings/UpdateCommitmentRequest'

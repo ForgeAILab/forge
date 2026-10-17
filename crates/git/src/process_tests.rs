@@ -1,4 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -33,8 +32,7 @@ async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
 fn install_hook(repo: &Path, name: &str, body: &str) {
     let hook = repo.join(".git/hooks").join(name);
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    std::fs::write(&hook, body).unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    process_supervisor::executable::write_executable(&hook, body).unwrap();
 }
 
 /// `git commit -a` holds `index.lock` while its pre-commit hook runs, so

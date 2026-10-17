@@ -59,12 +59,33 @@ services / review / forge-client → check-executor → process-supervisor
                                                   → executors / api-types
 ```
 
-`process-supervisor` is a leaf (tokio only): `git` cannot depend on `executors`
+`process-supervisor` is a leaf (tokio and tempfile): `git` cannot depend on `executors`
 or `review`, and `forge-client` must not pull in `services`, so the one
 process-group implementation that Git, CI steps and daemon helpers share lives
 below all of them. `check-executor` sits between: it needs `git` (managed
 checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 `services`, `review` and `forge-client`; it depends on neither `services` nor `db`.
+
+`executors` and `cli-adapters` also use `process-supervisor`'s executable helpers.
+Script publication stages in a private sibling directory, writes from a separate
+Unix process, waits for that writer to exit, fsyncs through a read-only descriptor,
+and renames into place. The multithreaded parent never opens the executable inode
+for writing, so another fork cannot inherit a writable descriptor and make even
+an indirectly invoked Git hook fail with Linux `ETXTBSY`. All fake executable
+fixtures and the generated compiler-cache launcher use this publisher.
+`scripts/write-executable.sh` is embedded in Rust; Python CI fixtures use the
+same writer through `scripts/executable_fixture.py`. The shared
+sync/async spawn helpers retry only `ExecutableFileBusy`, five retries with
+10/20/40/80/160 ms delays; other spawn errors and process exit failures retain
+their original behavior. Compiler-cache probes, supervised processes, and direct
+opencode/Gemini/Smith launches use these bounded retries.
+
+Provider probes, native requests and web fetch share the destination policy in
+`agent-host::network_policy`. Well-known NAT64 `64:ff9b::/96` addresses apply
+the IPv4 policy to the final 32 bits, as 6to4 does to its embedded IPv4 address.
+Local-use NAT64 `64:ff9b:1::/48` and Teredo remain refused. Public search retains
+its separate, stricter transition-address policy and blocks IPv4 IETF protocol
+assignments at `192.0.0.0/24` and TEST-NET-1 at `192.0.2.0/24`.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and
 the admission-time price resolution (`pricing::auto`). It sits below `services`

@@ -11,6 +11,7 @@ path = "src/lib.rs"
 test-support = []
 
 [dependencies]
+process-supervisor = { path = "../process-supervisor" }
 api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 git = { path = "../git" }

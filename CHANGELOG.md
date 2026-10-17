@@ -11,7 +11,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Provider connection tests and health probes share one HTTP client policy:
   resolve and validate the endpoint once, pin the approved addresses, and
   disable redirects and proxies so requests cannot reach an unchecked host.
-- Provider endpoint checks now reject `0.0.0.0/8`, NAT64 and Teredo prefixes,
+- Provider endpoint checks now reject `0.0.0.0/8`, local-use NAT64 and Teredo prefixes,
   and 6to4, IPv4-mapped and IPv4-compatible addresses carrying restricted IPv4
   destinations, including when reading stored provider metadata. The same
   predicate protects native provider requests and the web fetch tool (its
@@ -39,6 +39,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project viewer/member return HTTP 403 `insufficient_role`. The web MCP
   controls show other users only the MCP URL for their own client, with no
   install buttons and no server config reads.
+
+### Fixed
+
+- Well-known NAT64 (`64:ff9b::/96`) provider and fetch destinations now apply
+  the IPv4 policy to the embedded address, allowing public IPv4 services on
+  DNS64 networks while refusing private, loopback and metadata targets.
+- Public search limits the IETF protocol-assignments block to `192.0.0.0/24`,
+  allowing public addresses such as `192.0.1.1` while retaining TEST-NET blocks.
+- Non-administrator MCP controls read only the server-derived endpoint URL
+  through authenticated `GET /api/v1/config/mcp/endpoint`, with Project
+  visibility checks and no filesystem paths, credentials or install state.
+- Fake executable fixtures and generated compiler-cache launchers publish
+  fully closed scripts atomically. Process spawns retry transient Linux
+  `ETXTBSY` errors within a bounded delay.
 
 ## [0.14.0] - 2026-10-16
 

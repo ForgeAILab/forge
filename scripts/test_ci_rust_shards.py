@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from executable_fixture import write_executable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("ci_rust_shards", ROOT / "scripts/ci_rust_shards.py")
@@ -140,13 +141,12 @@ class ShellTests(unittest.TestCase):
             tmp = pathlib.Path(scratch)
             cargo = tmp / "cargo"
             log = tmp / "commands.jsonl"
-            cargo.write_text(
+            write_executable(cargo,
                 "#!/usr/bin/env python3\nimport json, os, sys\n"
                 "with open(os.environ['CI_TEST_COMMAND_LOG'], 'a') as out:\n"
                 "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "sys.exit(1 if sys.argv[1] == os.environ.get('CI_TEST_FAIL') else 0)\n"
             )
-            cargo.chmod(0o755)
             env = dict(os.environ, PATH=str(tmp) + os.pathsep + os.environ["PATH"],
                        CI_TEST_COMMAND_LOG=str(log), CI_RUST_TIMINGS="1" if timings else "",
                        CI_TEST_FAIL=failing or "")
