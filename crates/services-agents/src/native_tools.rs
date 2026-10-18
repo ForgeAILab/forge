@@ -5179,6 +5179,54 @@ mod tests {
         }
     }
 
+    /// The native lead boundary itself: the registry's principal rule and the
+    /// `lead_run` adapter refuse a running Task session that leads no root.
+    /// The core lead-operation tests reach `TaskService` through a test
+    /// double, so this is where the native path is held.
+    #[tokio::test]
+    async fn a_run_that_leads_no_root_is_refused_every_lead_operation_natively() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        for (operation, payload) in [
+            ("lead.read", json!({})),
+            (
+                "lead.subtask",
+                json!({"action": "create", "title": "smuggled"}),
+            ),
+            (
+                "lead.recover",
+                json!({"task_id": fixture.task_id, "action": {"verb": "cancel"}, "version": 1}),
+            ),
+            (
+                "lead.handoff",
+                json!({"task_id": fixture.task_id, "note": "note"}),
+            ),
+            ("lead.request_input", json!({"question": "may I?"})),
+        ] {
+            let denied = ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                operation,
+                json!({"operation": operation, "payload": payload, "dedupe_key": operation, "correlation_id": operation}),
+            )
+            .await
+            .expect_err("a run that leads no coordination root is refused");
+            let denied = format!("{denied:?}");
+            assert!(
+                denied.contains("OperationNotInScope") || denied.contains("operation_not_in_scope"),
+                "{operation}: {denied}"
+            );
+        }
+        let children: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(children, 0);
+    }
+
     #[tokio::test]
     async fn native_task_registered_records_bind_exact_execution_and_refuse_forgery() {
         let fixture = native_plan_fixture_with_permissions(
