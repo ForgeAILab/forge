@@ -35,10 +35,11 @@ cargo test                           # Full test suite (CI only)
 cargo test -p db --features test-template --test main <module>::<test-filter> # Focused integration test
 cargo test -p db --lib <test-filter> # Focused unit test
 cargo test -p services --features test-support --test main <module>::<test-filter>
+cargo test -p services-agents --features test-support --test main <module>::<test-filter>
 cargo test -p api --test main happy_path::<test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
-cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings
+cargo clippy --workspace --all-targets --features db/test-template,services-agents/test-support,services/test-support -- -D warnings
 cargo fmt --all
 FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
 ```
@@ -47,13 +48,13 @@ During local agent work, run only the focused tests directly related to the file
 
 DB, services and most API integration tests are modules under `tests/suite/`, selected
 with `cargo test -p <crate> --test main <original-file-stem>::<test-name>`.
-The `services` and `db` integration targets need their test feature
-(`--features test-support` / `--features test-template`): a named target
-without it is a Cargo error, and a plain `cargo test -p services` or
+The `services`, `services-agents` and `db` integration targets need their test
+feature (`--features test-support` / `--features test-template`): a named
+target without it is a Cargo error, and a plain `cargo test -p services` or
 `cargo test -p db` runs the unit tests only and skips them without a message.
 The clippy command names the same features so that linting those targets does
 not depend on another crate's dev-dependencies.
-Neither crate may dev-depend on itself (it compiles the lib twice in series);
+No crate may dev-depend on itself (it compiles the lib twice in series);
 see [docs/ci.md](docs/ci.md#test-features-and-required-features).
 Services keeps `project_provisioning_characterization` separate; services-agents
 keeps `main_project_create_command` separate for process isolation.

@@ -23,14 +23,14 @@ The Rust gates run as eight parallel jobs, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
-| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
+| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,services-agents/test-support,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
 | `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service:: task_dispatcher:: workspace_root::` |
 | `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service:: --skip task_dispatcher:: --skip workspace_root::` |
 | `Rust test (services-integration)` | `cargo test -p services --features test-support --test '*' --examples --no-fail-fast -- --test-threads=4` |
 | `Rust test (api-a)` | API binary selection from `scripts/ci_rust_shards.py`, with four libtest threads |
 | `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
 | `Rust test (db)` | `cargo test -p db --features test-template --all-targets --no-fail-fast` |
-| `Rust test (rest)` | `cargo test --workspace --exclude services --exclude api --exclude db --all-targets --no-fail-fast` |
+| `Rust test (rest)` | `cargo test --workspace --all-targets --features services-agents/test-support --exclude api --exclude db --exclude services --no-fail-fast` |
 | `Rust` | requires all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
 
 `Rust` is the name to use in branch protection. On normal runs it also runs
@@ -51,9 +51,11 @@ exists (cargo only warns about an unknown `--exclude`), and the workflow matrix
 lists exactly the shards the script defines. Services lib filters must be
 exact complements and its integration shard
 uses `--features test-support --test '*' --examples`, because `--tests` also
-runs lib tests. Every target that declares `required-features` (the services
-and db integration targets, see [below](#test-features-and-required-features))
-must be selected with those features by each shard that builds it, and
+runs lib tests. Every target that declares `required-features` (the services,
+services-agents and db integration targets, see
+[below](#test-features-and-required-features)) must be selected with those
+features by each shard that builds it (the catch-all passes its features as
+`package/feature`, listed in `REST_FEATURES`), and
 `scripts/ci-rust.sh` must name the same features for clippy and the
 whole-workspace run; a package that dev-depends on itself fails the check. This
 retains the example targets previously built by `--all-targets`; a new services
@@ -65,14 +67,18 @@ the package-to-shard table and compiles nothing, so it also runs locally.
 
 Run locally, `./scripts/ci-rust.sh` without arguments still runs fmt, clippy
 and `cargo test --workspace --all-targets --features
-db/test-template,services/test-support --no-fail-fast` in one pass. Like
+db/test-template,services-agents/test-support,services/test-support
+--no-fail-fast` in one pass. Like
 the shards, its test stage now explicitly uses `--test-threads=4`.
 
 A shard resolves Cargo features for its own packages, where the single
 workspace run unified them across all members. The workspace's own test
 features are unaffected for every crate that tests *another* crate:
 `services/test-support`, `cli-adapters/test-support` and `db/test-template`
-are requested by the dev-dependencies of each crate that needs them.
+are requested by the dev-dependencies of each crate that needs them. A crate's
+own feature is the exception: only `api` dev-depends on
+`services-agents/test-support`, and `api` is not in `rest`, so `rest` names
+that feature itself.
 
 ### Test features and required-features
 
@@ -98,12 +104,14 @@ What replaced it:
   feature. `db` also lists `rusqlite` and `tempfile` as dev-dependencies for
   that reason.
 - The feature-gated integration targets (`services`: `main`,
-  `project_provisioning_characterization`; `db`: `main`) declare
+  `project_provisioning_characterization`; `services-agents`: `main`; `db`:
+  `main`) declare
   `required-features` in `Cargo.toml` and are built with the feature:
 
   ```bash
   cargo test -p services --features test-support --test main attention_service::test_name
   cargo test -p services --features test-support --test '*'   # both targets
+  cargo test -p services-agents --features test-support --test main native_chat_tool_exchanges::test_name
   cargo test -p db --features test-template --test main file_backed_migration::test_name
   ```
 

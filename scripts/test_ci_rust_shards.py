@@ -87,9 +87,33 @@ class CoverageTests(unittest.TestCase):
                             for error in shards.coverage_errors(self.workspace)))
 
     def test_ci_script_names_the_workspace_features(self):
+        self.workspace["services-agents"] = {"targets": [
+            {"name": "main", "kind": ["test"], "required-features": ["test-support"]}]}
         self.assertEqual(shards.script_errors(self.workspace), [])
         self.assertEqual(shards.workspace_feature_args(self.workspace),
-                         ["--features", "db/test-template,services/test-support"])
+                         ["--features", "db/test-template,services-agents/test-support,"
+                                        "services/test-support"])
+
+    def test_rest_passes_the_qualified_feature_of_its_gated_target(self):
+        # A shard resolves features for its own packages: the catch-all does
+        # not see api's dev-dependency on services-agents/test-support.
+        self.workspace["services-agents"] = {
+            "features": {"test-support": ["services/test-support"]},
+            "targets": [{"name": "services-agents", "kind": ["lib"]},
+                        {"name": "main", "kind": ["test"],
+                         "required-features": ["test-support"]}]}
+        self.assertIn("services-agents/test-support",
+                      shards.passed_features(shards.cargo_args("rest")))
+        self.assertEqual(shards.coverage_errors(self.workspace), [])
+        self.assertEqual(shards.rest_feature_errors(self.workspace), [])
+        with patch.object(shards, "REST_FEATURES", []):
+            self.assertTrue(any("rest selects services-agents target 'main' without --features "
+                                "services-agents/test-support" in error
+                                for error in shards.coverage_errors(self.workspace)))
+        with patch.object(shards, "REST_FEATURES", ["services-agents/fixtures"]):
+            self.assertTrue(shards.rest_feature_errors(self.workspace))
+        with patch.object(shards, "REST_FEATURES", ["services/test-support"]):
+            self.assertTrue(shards.rest_feature_errors(self.workspace))
 
     def test_new_services_target_needs_explicit_coverage(self):
         self.workspace["services"]["targets"].append({"name": "new-bin", "kind": ["bin"]})
@@ -202,7 +226,8 @@ class ShellTests(unittest.TestCase):
         run, commands = self.commands(failing="fmt")
         self.assertEqual(run.returncode, 1)
         self.assertEqual([cmd[0] for cmd in commands], ["fmt", "clippy", "test"])
-        features = ["--features", "db/test-template,services/test-support"]
+        features = ["--features",
+                    "db/test-template,services-agents/test-support,services/test-support"]
         self.assertEqual(commands[1], ["clippy", "--workspace", "--all-targets", *features,
                                        "--", "-D", "warnings"])
         self.assertEqual(commands[-1], ["test", "--workspace", "--all-targets", *features,

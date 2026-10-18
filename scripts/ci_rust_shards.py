@@ -61,6 +61,12 @@ SHARDS = {
     # Catch-all by exclusion: a new workspace crate needs no edit here.
     "rest": None,
 }
+# Features the catch-all passes, as `package/feature`. The catch-all resolves
+# features for its own packages only, so a gated target in one of them (e.g.
+# services-agents `main`, whose fixtures are `services-agents/test-support`
+# items) is listed here; `check` fails until it is, and fails on an entry that
+# names no catch-all package or an undeclared feature.
+REST_FEATURES = ["services-agents/test-support"]
 
 # Green CI 38227423555 measured model_workflow at 304.87s and all other API
 # targets at 384.67s. After consolidation, local successful runs at 4d7d91c9
@@ -101,6 +107,8 @@ def cargo_args(shard):
     if args is not None:
         return list(args)
     args = ["--workspace", "--all-targets"]
+    if REST_FEATURES:
+        args += ["--features", ",".join(REST_FEATURES)]
     for pkg in named_packages():
         args += ["--exclude", pkg]
     return args
@@ -180,6 +188,19 @@ def feature_errors(workspace):
                 errors.append(f"{pkg} dev-depends on itself: `cargo test -p {pkg} --lib` "
                               "would compile the lib twice in series; use "
                               "required-features on its targets instead")
+    return errors
+
+
+def rest_feature_errors(workspace):
+    """A catch-all feature that no longer names a catch-all package feature."""
+    errors = []
+    rest = selected("rest", workspace)
+    for name in REST_FEATURES:
+        pkg, _, feature = name.partition("/")
+        if pkg not in rest:
+            errors.append(f"rest feature '{name}' names no package of the rest shard")
+        elif feature not in workspace[pkg].get("features", {}):
+            errors.append(f"rest feature '{name}' is not declared by {pkg}")
     return errors
 
 
@@ -294,6 +315,7 @@ def check():
             errors.append(f"shard package '{pkg}' is not a workspace package")
 
     errors.extend(coverage_errors(workspace))
+    errors.extend(rest_feature_errors(workspace))
     errors.extend(script_errors(workspace))
     rows = []
     for pkg in sorted(workspace):

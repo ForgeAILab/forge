@@ -8,6 +8,13 @@ description = "Forge's agents, chat services, and shared runtime composition"
 [lib]
 path = "src/lib.rs"
 
+# The integration suite uses `test-support` fixtures of this crate (e.g.
+# `EmbeddedAgentService::with_native_backend`), so it is gated like the
+# services and db suites; see docs/ci.md#test-features-and-required-features.
+[[test]]
+name = "main"
+required-features = ["test-support"]
+
 [[test]]
 name = "main_project_create_command"
 
