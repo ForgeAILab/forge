@@ -335,6 +335,41 @@ unless a backup exists. Removing neither is required for ordinary upgrades.
 
 ## Configuration
 
+### Outbound proxies
+
+Forge honours `HTTPS_PROXY`/`https_proxy`, `ALL_PROXY`/`all_proxy`, and
+`NO_PROXY`/`no_proxy` for native provider requests, provider health probes and
+connection tests, fetch, and public search. Each client takes one environment
+snapshot. Selection uses reqwest's system-proxy rules: uppercase takes
+precedence over lowercase; a usable HTTPS proxy takes precedence over the
+all-protocol proxy. `NO_PROXY` supports hostname/domain matches, literal IPs,
+CIDR ranges and `*`; matching targets take the direct path.
+
+Target checks always run first: HTTPS without URL credentials, restricted
+hostname refusal, and local DNS resolution with refusal if **any** answer is
+restricted. Literal IP targets are checked without DNS. Public search retains
+its stricter address policy. Direct connections, including `NO_PROXY` matches,
+pin the validated addresses. Proxied requests use a CONNECT tunnel, preserving
+the target name for TLS SNI and Host. The operator-configured proxy address may
+be local or private and is not subjected to target restrictions. Proxy URL
+credentials are sent as proxy authentication and are excluded from client
+errors and logs.
+
+Accepted limitation: the proxy resolves the target name independently, so
+local validation cannot pin that second DNS answer or prevent rebinding at the
+proxy. Operate the proxy with an appropriate destination policy. Automatic
+HTTP redirects remain disabled; fetch's existing explicit same-origin hops
+each repeat target validation. These rules also apply in demo mode.
+
+Agent CLIs and Forge's git commands inherit the operator's proxy environment.
+Otherwise cleared Task command and review/verify check environments also
+receive all eight standard variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY`, and their lowercase variants). Existing command/Project overrides
+keep their precedence. Set these variables in the environment of each Forge
+server or daemon that executes network operations.
+
+### Configuration file
+
 Precedence: **CLI flags > env vars > config file > defaults**.
 
 Config lookup happens first: `--data-dir` > `FORGE_DATA_DIR` > `~/.forge`
@@ -838,8 +873,9 @@ directly with the runtime's `fetch` tool, which returns it as Markdown, text,
 or raw content behind an untrusted-content notice. It needs no configuration.
 
 Forge's transport bounds it: `https` only, no credentials in the URL, the
-connection pinned to addresses Forge resolved and checked so a public hostname
-cannot resolve into this machine's network, redirects followed only inside the
+target resolved and checked before connecting, direct connections pinned to
+the accepted addresses, environment proxies honoured as described above,
+redirects followed only inside the
 authorized origin, a 2 MiB body cap, and the turn's own deadline. A Task worker
 needs its Task read permission; a chat needs the same permission that gates the
 search tool below.
@@ -877,8 +913,8 @@ The endpoint must return bounded JSON in the form
 Forge caps queries at 512 characters, results at 10, title/snippet lengths,
 the response body, and the request deadline. Result text is marked as
 untrusted external data and is never persisted as a user decision. Forge
-disables redirects and ambient proxy/cookie/auth state, revalidates DNS
-addresses at connect time, and rejects private, special-use, and
+disables automatic redirects and ambient cookie/target-auth state, honours
+environment proxies, validates DNS before connecting, and rejects private, special-use, and
 IPv4-mapped IPv6 targets. The IETF protocol-assignments block is `192.0.0.0/24`,
 and TEST-NET-1 remains `192.0.2.0/24`; other public addresses in `192.0.0.0/16`
 are allowed. The tool is omitted when

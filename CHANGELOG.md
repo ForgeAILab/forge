@@ -29,8 +29,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   including IPv6 forms carrying those IPv4 addresses. Public search retains its
   documented additional IPv6 exclusions.
 - Provider connection tests and health probes share one HTTP client policy:
-  resolve and validate the endpoint once, pin the approved addresses, and
-  disable redirects and proxies so requests cannot reach an unchecked host.
+  resolve and validate the endpoint before connecting, disable automatic
+  redirects, and honour environment proxies. Direct requests pin the approved
+  addresses; proxy tunnels preserve the target name for the proxy to resolve.
 - Provider endpoint checks now reject `0.0.0.0/8`, local-use NAT64 and Teredo prefixes,
   and 6to4, IPv4-mapped and IPv4-compatible addresses carrying restricted IPv4
   destinations, including when reading stored provider metadata. The same
@@ -78,6 +79,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
+  lowercase variants, provider probes and connection tests, public search,
+  native provider requests, fetch, and network-capable child processes. Target
+  validation runs before proxy connections; direct connections retain DNS
+  pinning. A proxy's own DNS resolution remains under the operator's control.
 - Owner-only review parks no longer wake the Project Agent or create a redundant
   owner escalation. Mission Control shows each Task action and Resolve according
   to server authority and Project role, including ordinary actions for members

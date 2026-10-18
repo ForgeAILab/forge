@@ -1359,6 +1359,7 @@ dependencies = [
  "executors",
  "futures-util",
  "hex",
+ "hyper-util",
  "jsonschema",
  "nix 0.28.0",
  "operation-registry",

@@ -12,6 +12,7 @@ mod native;
 mod network_policy;
 pub mod operation_catalog;
 pub(crate) mod operation_contract;
+pub mod outbound_http;
 mod protected_store;
 mod tool_preview;
 mod transport;

@@ -1,9 +1,6 @@
-use config::{is_restricted_public_address, is_restricted_public_hostname};
+use crate::outbound_http::{ProxyEnvironment, PublicAddressPolicy, public_http_client_builder};
 
-use std::{
-    fmt,
-    net::{IpAddr, SocketAddr},
-};
+use std::fmt;
 
 use agent_runtime::{
     core::provider::{ProviderError, ProviderErrorKind},
@@ -21,7 +18,8 @@ impl ReqwestTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
-        let (client, url) = provider_client_for_url(&request.url).await?;
+        let (client, url) =
+            provider_client_for_url(&request.url, &ProxyEnvironment::from_env()).await?;
         let mut builder = client.post(url).body(request.body);
         for (name, value) in request.headers {
             builder = builder.header(name, value);
@@ -165,7 +163,10 @@ fn coarse_duration(seconds: u64) -> String {
     format!("{}d {}h", hours / 24, hours % 24)
 }
 
-async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String), ProviderError> {
+async fn provider_client_for_url(
+    url: &str,
+    proxies: &ProxyEnvironment,
+) -> Result<(reqwest::Client, String), ProviderError> {
     let parsed = url::Url::parse(url)
         .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
     if parsed.scheme() != "https"
@@ -178,44 +179,9 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
             "provider URL rejected",
         ));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
-    let addresses = match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            if is_restricted_public_hostname(domain) {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Network,
-                    "provider URL rejected",
-                ));
-            }
-            tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|_| {
-                    ProviderError::new(ProviderErrorKind::Network, "provider URL rejected")
-                })?
-                .collect::<Vec<_>>()
-        }
-        Some(url::Host::Ipv4(address)) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        Some(url::Host::Ipv6(address)) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        None => Vec::new(),
-    };
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| is_restricted_public_address(address.ip()))
-    {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Network,
-            "provider URL rejected",
-        ));
-    }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, &addresses)
+    let client = public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
+        .await
+        .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?
         .build()
         .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "HTTP client setup failed"))?;
     Ok((client, url.to_owned()))
@@ -268,7 +234,12 @@ mod tests {
             "https://[::ffff:0.1.2.3]/v1",
             "https://[::0.1.2.3]/v1",
         ] {
-            assert!(provider_client_for_url(url).await.is_err(), "{url}");
+            assert!(
+                provider_client_for_url(url, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
+                "{url}"
+            );
         }
     }
 
@@ -282,7 +253,12 @@ mod tests {
             "https://user:pass@example.com/v1/chat/completions",
             "https://example.com/v1/chat/completions#fragment",
         ] {
-            assert!(provider_client_for_url(url).await.is_err(), "{url}");
+            assert!(
+                provider_client_for_url(url, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
+                "{url}"
+            );
         }
     }
 }
@@ -364,5 +340,27 @@ mod usage_limit_tests {
         let body = r#"{"error":{"type":"rate_limit_exceeded","resets_in_seconds":7200}}"#;
         let message = usage_limit_rejection(body).expect("long reset is a spent window");
         assert!(message.message.contains("2h"), "{message:?}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    #[tokio::test]
+    async fn native_provider_uses_environment_proxy() {
+        let (proxies, proxy) = crate::outbound_http::proxy_tests::listener(502).await;
+        let client = provider_client_for_url("https://93.184.215.14/x", &proxies)
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            client
+                .get("https://93.184.215.14/x")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .is_err()
+        );
+        assert_eq!(proxy.await.unwrap(), "CONNECT 93.184.215.14:443 HTTP/1.1");
     }
 }

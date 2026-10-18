@@ -344,7 +344,8 @@ pub fn redacted_tail(
 /// Build a command. The two frozen legacy policies and the canonical CI
 /// policy inherit the owner's environment through a login shell, with the
 /// Project values on top; every other policy clears it and sees only the
-/// spec's declared keys. All use the owner's current budget.
+/// spec's declared keys plus the operator's standard proxy variables. All use
+/// the owner's current budget.
 ///
 /// Legacy policies pass the declared keys and refuse when one is missing. The
 /// canonical policy passes the Project environment in force now, whole: a
@@ -407,7 +408,7 @@ fn sandboxed_command(
         .current_dir(path)
         .envs(&env);
     if cleared {
-        // Nothing of this process's environment reaches the child, so its
+        // Only proxy variables pass through from this process, so its
         // `CARGO_TARGET_DIR` cannot stand in for the Task root's.
         executors::run_process::apply_sandboxed_cleared(&mut command, &env, sandbox);
     } else {

@@ -8,11 +8,13 @@
 //! Two things make that delegation safe, and neither is URL validation —
 //! the runtime already did that:
 //!
-//! - **The connection is pinned to addresses this host resolved and checked.**
+//! - **The target is resolved and checked before connecting.**
 //!   A hostname that resolves to a private or loopback address is refused
-//!   before any socket opens, and `resolve_to_addrs` keeps the client from
+//!   before any socket opens. On direct requests, `resolve_to_addrs` keeps the client from
 //!   re-resolving it to something else afterwards, which is what closes the
-//!   DNS-rebinding window a URL check alone leaves open.
+//!   DNS-rebinding window a URL check alone leaves open. With an environment
+//!   proxy, the CONNECT tunnel preserves the target name; the proxy resolves
+//!   it again, so pinning cannot protect that second resolution.
 //! - **Redirects are followed by this transport, one hop at a time, and only
 //!   within the origin the runtime authorized.** A cross-origin redirect is
 //!   reported back with its target instead of being followed, so reaching it
@@ -27,7 +29,6 @@
 //! leaves `accept-encoding` to reqwest so its compression features stay in
 //! charge of decoding.
 
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use agent_runtime::core::cancel::Cancellation;
@@ -36,7 +37,7 @@ use agent_runtime::core::error::RuntimeError;
 use agent_runtime::harness::{FetchRequest, FetchResponse, FetchTransport};
 use async_trait::async_trait;
 
-use config::{is_restricted_public_address, is_restricted_public_hostname};
+use crate::outbound_http::{ProxyEnvironment, PublicAddressPolicy, public_http_client_builder};
 
 /// Redirect hops followed inside one authorized origin.
 const MAX_REDIRECTS: u8 = 3;
@@ -113,7 +114,7 @@ impl FetchTransport for ForgeFetchTransport {
             if cancellation.is_cancelled() {
                 return Err(RuntimeError::cancelled("fetch cancelled"));
             }
-            let client = pinned_client(&url, timeout).await?;
+            let client = pinned_client(&url, timeout, &ProxyEnvironment::from_env()).await?;
             let mut builder = client.get(url.as_str());
             for (name, value) in default_headers() {
                 builder = builder.header(name, value);
@@ -218,55 +219,15 @@ async fn bounded_body(
     Ok(body)
 }
 
-/// One HTTPS client pinned to addresses this host resolved and accepted.
-async fn pinned_client(url: &url::Url, timeout: Duration) -> Result<reqwest::Client, RuntimeError> {
-    if url.scheme() != "https" {
-        return Err(RuntimeError::tool(
-            "fetch requires an https URL: Forge does not send plaintext requests on the host's \
-             behalf",
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(RuntimeError::tool("fetch URL must not carry credentials"));
-    }
-    let host = url
-        .host_str()
-        .ok_or_else(|| RuntimeError::tool("fetch URL has no host"))?;
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| RuntimeError::tool("fetch URL has no port"))?;
-    let addresses = match url.host() {
-        Some(url::Host::Domain(domain)) => {
-            if is_restricted_public_hostname(domain) {
-                return Err(RuntimeError::tool(
-                    "fetch refuses hostnames that name this host's own network",
-                ));
-            }
-            tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|_| RuntimeError::tool("fetch could not resolve the host"))?
-                .collect::<Vec<_>>()
-        }
-        Some(url::Host::Ipv4(address)) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        Some(url::Host::Ipv6(address)) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        None => Vec::new(),
-    };
-    if addresses.is_empty() {
-        return Err(RuntimeError::tool("fetch could not resolve the host"));
-    }
-    // Every resolved address must be public: one private answer is enough to
-    // refuse the name, because the client may use any of them.
-    if addresses
-        .iter()
-        .any(|address| is_restricted_public_address(address.ip()))
-    {
-        return Err(RuntimeError::tool(
-            "fetch refuses a host that resolves into this host's own network",
-        ));
-    }
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, &addresses)
+/// One validated HTTPS client using the operator's proxy snapshot.
+async fn pinned_client(
+    url: &url::Url,
+    timeout: Duration,
+    proxies: &ProxyEnvironment,
+) -> Result<reqwest::Client, RuntimeError> {
+    public_http_client_builder(url, PublicAddressPolicy::Provider, proxies)
+        .await
+        .map_err(|error| RuntimeError::tool(error.to_string()))?
         .timeout(timeout)
         .build()
         .map_err(|_| RuntimeError::tool("fetch could not build an HTTP client"))
@@ -294,7 +255,7 @@ mod tests {
             "https://user:secret@example.com/docs",
         ] {
             let url = url::Url::parse(rejected).expect("test URL parses");
-            let error = pinned_client(&url, DEFAULT_FETCH_TIMEOUT)
+            let error = pinned_client(&url, DEFAULT_FETCH_TIMEOUT, &ProxyEnvironment::default())
                 .await
                 .expect_err("policy must refuse this URL");
             assert!(
@@ -316,7 +277,9 @@ mod tests {
         ] {
             let url = url::Url::parse(rejected).expect("test URL parses");
             assert!(
-                pinned_client(&url, DEFAULT_FETCH_TIMEOUT).await.is_err(),
+                pinned_client(&url, DEFAULT_FETCH_TIMEOUT, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
                 "{rejected} must not be reachable through the fetch transport"
             );
         }
@@ -348,7 +311,9 @@ mod tests {
         ] {
             let url = url::Url::parse(endpoint).unwrap();
             assert!(
-                pinned_client(&url, DEFAULT_FETCH_TIMEOUT).await.is_err(),
+                pinned_client(&url, DEFAULT_FETCH_TIMEOUT, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
                 "{endpoint}"
             );
         }
@@ -432,5 +397,30 @@ mod tests {
         assert_eq!(fetch_timeout(Some(&generous)), DEFAULT_FETCH_TIMEOUT);
         let nearly_expired = Deadline::after(&clock, 1);
         assert_eq!(fetch_timeout(Some(&nearly_expired)), MIN_FETCH_TIMEOUT);
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    #[tokio::test]
+    async fn fetch_uses_environment_proxy() {
+        let (proxies, proxy) = crate::outbound_http::proxy_tests::listener(502).await;
+        let client = pinned_client(
+            &url::Url::parse("https://93.184.215.14/x").unwrap(),
+            Duration::from_secs(2),
+            &proxies,
+        )
+        .await
+        .unwrap();
+        assert!(
+            client
+                .get("https://93.184.215.14/x")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .is_err()
+        );
+        assert_eq!(proxy.await.unwrap(), "CONNECT 93.184.215.14:443 HTTP/1.1");
     }
 }

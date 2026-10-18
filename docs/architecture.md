@@ -103,7 +103,7 @@ ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`, and discard-only `100::/64`.
 
 `config::is_blocked_public_search_address` adds public search's existing
 conservative IPv6 exclusions to that common policy for endpoint validation,
-the request resolver and result URLs. These are deliberate differences:
+request validation and result URLs. These are deliberate differences:
 public search refuses all IPv4-mapped/compatible and 6to4 addresses even when
 their embedded IPv4 is public, while explicitly configured providers and
 fetch can reach public IPv4 destinations through these transition forms.
@@ -135,7 +135,7 @@ case and trailing dots. Matching uses whole DNS labels: `example.internal.com`,
 allowed. At request time, search rejects the entire
 hostname if resolution is empty or any answer is blocked, matching providers
 and fetch; it never filters a mixed answer down to its public members.
-The request client receives only an all-public answer set. Deterministic
+Direct clients receive only an all-public pinned answer set. Deterministic
 regressions cover hostname suffixes and mixed IPv4/IPv6 DNS answers without
 contacting DNS or an external endpoint.
 
@@ -278,11 +278,18 @@ database. Shared shutdown and worker identity contracts live in core
 provider-entry validation, service probes, native provider transport, the web
 fetch tool's authorization gate and transport, and public search.
 `config::is_restricted_public_hostname` owns the shared hostname checks. Public
-search (`services::native_tools` request resolver and result filter, and
+search (`services::native_tools` request validation and result filter, and
 `config` endpoint validation) adds the deliberate IPv6 exclusions listed
-above. Provider connection tests and health probes share a client builder that
-resolves and validates once, pins those addresses and disables redirects and
-proxies.
+above. `forge_agent_host::outbound_http::public_http_client_builder` owns the
+shared client policy for provider connection tests/health probes, native
+provider requests, fetch and public search. It resolves and validates the target
+before any connection, pins direct requests, disables automatic redirects, and
+uses a per-build proxy environment snapshot with reqwest's own proxy matcher.
+`NO_PROXY` matches use the direct pinned path. An operator-configured proxy's
+address is not target-validated; CONNECT retains target SNI/Host, but the proxy
+resolves the name itself, so pinning cannot hold through that proxy. Proxy
+userinfo is removed from URLs and carried only in sensitive authentication
+headers. See [outbound proxies](getting-started.md#outbound-proxies).
 
 The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
 `prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with
@@ -2316,8 +2323,9 @@ at all, as the owner's decision rather than whatever `PATH` offers.
 Both chat scopes and a Task worker may also fetch a public page through the
 runtime's built-in `fetch` tool, gated on the same permission as the search
 tool (a Task worker on its read permission) and on the host supplying a
-transport. Forge's transport pins each request to addresses it resolved and
-accepted, refuses anything but `https` without credentials, follows redirects
+transport. Forge's transport validates each request locally and pins direct
+requests to the accepted addresses (environment proxies resolve independently),
+refuses anything but `https` without credentials, follows redirects
 only inside the origin the runtime authorized, and caps the body — so a public
 hostname that resolves into this machine's network is refused before a socket
 opens, and a cross-origin redirect costs another authorized tool call instead

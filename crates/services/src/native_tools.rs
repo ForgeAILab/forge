@@ -43,6 +43,9 @@ use db::{
     AgentCommitmentListQuery, AgentCommitmentRepo, AgentInboxListQuery, AgentInboxRepo,
     CommandReceiptRepo, MemoryScopeGrant, SqliteDb, TaskBoardRepo,
 };
+use forge_agent_host::outbound_http::{
+    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy,
+};
 use forge_agent_host::{
     contains_authority_override, operation_contract, operation_descriptor, operation_permission,
     AgentHostError, CanonicalScope, CanonicalScopeType, CommandObservation, ForgeToolProvider,
@@ -2841,24 +2844,12 @@ impl CoordinationToolProvider {
             .append_pair("q", query.trim())
             .append_pair("limit", &limit.to_string());
 
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .dns_resolver(Arc::new(PublicSearchResolver {
-                allowed_host: endpoint
-                    .host_str()
-                    .ok_or_else(|| {
-                        AgentHostError::Configuration(
-                            "configured public search endpoint has no host".to_owned(),
-                        )
-                    })?
-                    .to_owned(),
-            }))
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-            .map_err(|_| {
-                AgentHostError::Configuration("public search client unavailable".to_owned())
-            })?;
+        let client = public_search_http_client(
+            &endpoint,
+            Duration::from_millis(config.timeout_ms),
+            &ProxyEnvironment::from_env(),
+        )
+        .await?;
         let response = client
             .get(endpoint)
             .header(ACCEPT, "application/json")
@@ -4046,54 +4037,25 @@ fn is_private_or_local_search_host(host: &str) -> bool {
     is_blocked_public_search_address(address)
 }
 
-/// Resolve the configured endpoint ourselves and pass only validated socket
-/// addresses to reqwest.  This closes DNS rebinding/private-address gaps that
-/// literal hostname checks cannot address.
-#[derive(Debug, Clone)]
-struct PublicSearchResolver {
-    allowed_host: String,
-}
-
-impl reqwest::dns::Resolve for PublicSearchResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        let allowed_host = self.allowed_host.clone();
-        Box::pin(async move {
-            let normalized_host = host.trim_end_matches('.');
-            let normalized_allowed_host = allowed_host.trim_end_matches('.');
-            if normalized_host.is_empty()
-                || !normalized_host.eq_ignore_ascii_case(normalized_allowed_host)
-                || is_private_or_local_search_host(normalized_host)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "public search resolver received an unexpected host",
-                )
-                .into());
-            }
-            let addresses = tokio::net::lookup_host((normalized_host, 0)).await?;
-            validated_public_search_addresses(addresses).map_err(Into::into)
-        })
-    }
-}
-
-fn validated_public_search_addresses(
-    addresses: impl Iterator<Item = std::net::SocketAddr>,
-) -> std::io::Result<reqwest::dns::Addrs> {
-    let addresses = addresses.collect::<Vec<_>>();
-    // Refuse the whole hostname on any blocked answer, matching provider/fetch.
-    // Never turn a mixed DNS response into an apparently safe public subset.
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| is_blocked_public_search_address(address.ip()))
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "public search endpoint did not resolve exclusively to public addresses",
-        ));
-    }
-    Ok(Box::new(addresses.into_iter()))
+async fn public_search_http_client(
+    endpoint: &url::Url,
+    timeout: Duration,
+    proxies: &ProxyEnvironment,
+) -> Result<reqwest::Client, AgentHostError> {
+    tokio::time::timeout(
+        timeout,
+        public_http_client_builder(endpoint, PublicAddressPolicy::Search, proxies),
+    )
+    .await
+    .map_err(|_| AgentHostError::Runtime("public search resolution timed out".to_owned()))?
+    .map_err(|_| {
+        AgentHostError::Configuration(
+            "public search endpoint must resolve exclusively to public addresses".to_owned(),
+        )
+    })?
+    .timeout(timeout)
+    .build()
+    .map_err(|_| AgentHostError::Configuration("public search client unavailable".to_owned()))
 }
 
 fn bounded_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -7062,17 +7024,28 @@ mod tests {
                 vec![blocked, public_v4],
                 vec![public_v6, blocked],
             ] {
-                let error = validated_public_search_addresses(addresses.into_iter())
-                    .err()
-                    .expect("one blocked answer must refuse the entire hostname");
-                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                let error = forge_agent_host::outbound_http::validate_public_addresses(
+                    addresses,
+                    PublicAddressPolicy::Search,
+                )
+                .expect_err("one blocked answer must refuse the entire hostname");
+                assert!(matches!(
+                    error,
+                    forge_agent_host::outbound_http::PublicHttpError::RestrictedAddress
+                ));
             }
         }
-        assert!(validated_public_search_addresses(std::iter::empty()).is_err());
+        assert!(forge_agent_host::outbound_http::validate_public_addresses(
+            vec![],
+            PublicAddressPolicy::Search
+        )
+        .is_err());
         let public = vec![public_v4, public_v6];
-        let approved = validated_public_search_addresses(public.clone().into_iter())
-            .expect("all-public DNS answers")
-            .collect::<Vec<_>>();
+        let approved = forge_agent_host::outbound_http::validate_public_addresses(
+            public.clone(),
+            PublicAddressPolicy::Search,
+        )
+        .expect("all-public DNS answers");
         assert_eq!(approved, public);
     }
 
@@ -7554,19 +7527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_search_resolver_rejects_unexpected_and_local_hosts() {
-        use std::str::FromStr;
-
-        let resolver = PublicSearchResolver {
-            allowed_host: "search.example.test".to_owned(),
-        };
-        let unexpected = <PublicSearchResolver as reqwest::dns::Resolve>::resolve(
-            &resolver,
-            reqwest::dns::Name::from_str("other.example.test").expect("DNS name"),
-        )
-        .await;
-        assert!(unexpected.is_err());
-
+    async fn public_search_client_rejects_local_hosts_before_resolution() {
         for host in [
             "localhost",
             "SEARCH.INTERNAL.",
@@ -7574,15 +7535,17 @@ mod tests {
             "INTERNAL.",
             "HOME.ARPA.",
         ] {
-            let resolver = PublicSearchResolver {
-                allowed_host: host.to_owned(),
-            };
-            let local = <PublicSearchResolver as reqwest::dns::Resolve>::resolve(
-                &resolver,
-                reqwest::dns::Name::from_str(host).expect("DNS name"),
-            )
-            .await;
-            assert!(local.is_err(), "{host} must not resolve for public search");
+            let endpoint = url::Url::parse(&format!("https://{host}/search")).unwrap();
+            assert!(
+                public_search_http_client(
+                    &endpoint,
+                    Duration::from_secs(1),
+                    &ProxyEnvironment::default()
+                )
+                .await
+                .is_err(),
+                "{host}"
+            );
         }
     }
     #[tokio::test]
@@ -7632,5 +7595,58 @@ mod tests {
             panic!("typed denial")
         };
         assert_eq!(outcome.denied_by, Some(DeniedBy::CharterNotAdopted));
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn public_search_uses_environment_proxy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxies = ProxyEnvironment::from_vars(|key| {
+            (key == "all_proxy").then(|| {
+                format!(
+                    "http://search-user:search-secret@{}",
+                    listener.local_addr().unwrap()
+                )
+            })
+        });
+        let endpoint = url::Url::parse("https://93.184.215.14/search").unwrap();
+        let client = public_search_http_client(&endpoint, Duration::from_secs(2), &proxies)
+            .await
+            .unwrap();
+        let server = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![];
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let n = stream.read(&mut bytes).await.unwrap();
+                assert!(n > 0 && request.len() + n < 16384);
+                request.extend_from_slice(&bytes[..n]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .starts_with("CONNECT 93.184.215.14:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 502 Rejected\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        };
+        let request = async {
+            let error = client.get(endpoint).send().await.unwrap_err();
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains("search-user") && !text.contains("search-secret"));
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(server, request);
+        })
+        .await
+        .unwrap();
     }
 }

@@ -3578,6 +3578,45 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn native_cleared_commands_receive_operator_proxy_variables() {
+        const MARKER: &str = "FORGE_NATIVE_PROXY_CHILD";
+        let keys = executors::run_process::PROXY_ENV_KEYS;
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "typed_tools::tests::native_cleared_commands_receive_operator_proxy_variables",
+                ])
+                .env(MARKER, "1")
+                .envs(keys.map(|key| (key, format!("sentinel-{key}"))))
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "native proxy child fixture failed");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let script = keys
+            .map(|key| format!("test \"${key}\" = 'sentinel-{key}'"))
+            .join(" && ");
+        let output = execute_workspace_command(
+            "sh",
+            &["-c".into(), script],
+            None,
+            &Default::default(),
+            &command_invocation_context(workspace),
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_commands_receive_project_and_machine_build_environment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {

@@ -2,17 +2,14 @@ use crate::provider_credentials::{
     default_api_key_base_url, entry_base_url, validate_provider_url_shape,
 };
 use operation_registry::authority::permission_set;
-use std::{
-    collections::BTreeSet,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use cli_adapters::codex::codex_reasoning_efforts_for_model;
 #[cfg(test)]
 use cli_adapters::codex::CODEX_REASONING_EFFORTS;
-use config::{is_restricted_public_address, PublicSearchConfig};
+#[cfg(test)]
+use config::is_restricted_public_address;
+use config::PublicSearchConfig;
 use db::{
     new_uuid_v4, now_rfc3339, AccountMainAgentBindingRepo, Agent, AgentChatRepo,
     AgentConnectionHealth, AgentConnectionHealthRepo, AgentContextScopeRepo, AgentProfile,
@@ -24,6 +21,9 @@ use db::{
 };
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
+use forge_agent_host::outbound_http::{
+    public_http_client_builder, resolve_public_url, ProxyEnvironment, PublicAddressPolicy,
+};
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
     CreateOAuthCredential, InteractionBrokerHandle, NativeAgentRuntimeBackend,
@@ -32,6 +32,8 @@ use forge_agent_host::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::net::IpAddr;
 
 use crate::{
     agent_chat_policy::guard_runtime_content,
@@ -714,9 +716,13 @@ impl EmbeddedAgentService {
             .require_owned_entry(owner_user_id, credential_id)
             .await?;
         let base_url = entry_base_url(&entry)?;
-        let client = provider_http_client(&base_url, Duration::from_secs(10))
-            .await
-            .map_err(ServiceError::invalid_operation)?;
+        let client = provider_http_client(
+            &base_url,
+            Duration::from_secs(10),
+            &ProxyEnvironment::from_env(),
+        )
+        .await
+        .map_err(ServiceError::invalid_operation)?;
         let secret = self
             .protected_store
             .acquire_provider_credential(owner_user_id, credential_id, 60_000)
@@ -2241,9 +2247,13 @@ impl EmbeddedAgentService {
             .get("base_url")
             .and_then(Value::as_str)
             .ok_or_else(|| "base_url_missing".to_owned())?;
-        let client = provider_http_client(base_url, Duration::from_secs(8))
-            .await
-            .map_err(|_| "provider_endpoint_invalid".to_owned())?;
+        let client = provider_http_client(
+            base_url,
+            Duration::from_secs(8),
+            &ProxyEnvironment::from_env(),
+        )
+        .await
+        .map_err(|_| "provider_endpoint_invalid".to_owned())?;
         let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
         // Gemini's AI Studio API rejects API keys sent as Bearer tokens; it
         // authenticates via the `x-goog-api-key` header. Every other backend
@@ -2450,51 +2460,25 @@ async fn provider_url_addresses(
     base_url: &str,
 ) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
     let parsed = validate_provider_url_shape(base_url)?;
-    let host = parsed.host().ok_or("base_url must include a host")?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or("base_url has no known port")?;
-    let addresses = match host {
-        url::Host::Ipv4(address) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        url::Host::Ipv6(address) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        url::Host::Domain(domain) => tokio::net::lookup_host((domain, port))
-            .await
-            .map_err(|_| "base_url hostname could not be resolved")?
-            .collect::<Vec<_>>(),
-    };
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| is_restricted_public_address(address.ip()))
-    {
-        return Err("base_url must not target a private or local address");
-    }
+    let addresses = resolve_public_url(&parsed, PublicAddressPolicy::Provider)
+        .await
+        .map_err(|_| "base_url must resolve exclusively to public addresses")?;
     Ok((parsed, addresses))
 }
 
-/// Resolve and validate once, then use exactly those addresses for the request.
-/// Redirects and proxies must not introduce an unvalidated destination.
+/// Provider tests and probes share native request/fetch/search egress policy.
 async fn provider_http_client(
     base_url: &str,
     timeout: Duration,
+    proxies: &ProxyEnvironment,
 ) -> std::result::Result<reqwest::Client, &'static str> {
-    let (parsed, addresses) = provider_url_addresses(base_url).await?;
-    pinned_provider_http_client_builder(&parsed, &addresses, timeout)?
+    let parsed = validate_provider_url_shape(base_url)?;
+    public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
+        .await
+        .map_err(|_| "base_url must resolve exclusively to public addresses")?
+        .timeout(timeout)
         .build()
         .map_err(|_| "provider client unavailable")
-}
-
-fn pinned_provider_http_client_builder(
-    parsed: &url::Url,
-    addresses: &[SocketAddr],
-    timeout: Duration,
-) -> std::result::Result<reqwest::ClientBuilder, &'static str> {
-    let host = parsed.host_str().ok_or("base_url must include a host")?;
-    Ok(reqwest::Client::builder()
-        .timeout(timeout)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, addresses))
 }
 
 fn validate_public_runtime_text(value: Option<&str>) -> Result<Option<String>> {

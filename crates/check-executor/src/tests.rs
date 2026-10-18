@@ -1314,3 +1314,31 @@ async fn review_verify_runtime_values_are_public_but_project_values_are_redacted
         "[REDACTED]"
     );
 }
+
+#[tokio::test]
+async fn cleared_checks_receive_operator_proxy_variables() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_CHILD";
+    let keys = executors::run_process::PROXY_ENV_KEYS;
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cleared_checks_receive_operator_proxy_variables",
+            ])
+            .env(MARKER, "1")
+            .envs(keys.map(|key| (key, format!("sentinel-{key}"))))
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "check proxy child fixture failed");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let text = keys
+        .map(|key| format!("test \"${key}\" = 'sentinel-{key}'"))
+        .join(" && ");
+    let (mut child, _) =
+        command(temp.path(), &step(&text), &BTreeMap::new(), "owner-check/1").unwrap();
+    assert!(child.output().await.unwrap().status.success());
+}
