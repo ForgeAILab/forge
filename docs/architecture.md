@@ -285,6 +285,9 @@ shared client policy for provider connection tests/health probes, native
 provider requests, fetch and public search. It resolves and validates the target
 before any connection, pins direct requests, disables automatic redirects, and
 uses a per-build proxy environment snapshot with reqwest's own proxy matcher.
+A set but unusable applicable value (`HTTPS_PROXY`, else `ALL_PROXY`) refuses
+the request (`PublicHttpError::UnusableProxy`) instead of falling through to
+the other variable or a direct connection.
 `NO_PROXY` matches use the direct pinned path. An operator-configured proxy's
 address is not target-validated; CONNECT retains target SNI/Host, but the proxy
 resolves the name itself, so pinning cannot hold through that proxy. Proxy
