@@ -6301,3 +6301,126 @@ fn embedded_bundle_comment_has_one_head_naming_the_newest_migration() {
         heads[0]
     );
 }
+
+/// Upgrading a populated database through the five logic-trigger drops keeps
+/// every row, removes all fourteen triggers and records the five migrations;
+/// today's writers then produce what the triggers did. The runner does not
+/// refuse a database that carries migrations its bundle lacks, so a binary
+/// from before the drops starts on the upgraded file with neither the
+/// triggers nor the code (an owner decision, documented here).
+#[tokio::test]
+async fn logic_trigger_drops_upgrade_a_populated_database() {
+    const LAST_WITH_TRIGGERS: i64 = 202_610_161_644;
+    const MOVED: [&str; 14] = [
+        "user_agent_chat_after_insert",
+        "project_agent_chat_after_insert",
+        "pricing_account_deletion_guard_begin",
+        "pricing_account_deletion_guard_end",
+        "agent_wake_blocker_rearm_on_reopen",
+        "genesis_topic_rotation",
+        "handoff_topic_rotation",
+        "idle_topic_rotation",
+        "published_handoff_topic_rotation",
+        "topic_rotation_origin",
+        "project_media_attachment_gc_guard_after_insert",
+        "project_release_media_pin_gc_guard_after_insert",
+        "task_media_project_asset_after_insert",
+        "task_media_project_attachment_after_delete",
+    ];
+    async fn moved_triggers(pool: &sqlx::SqlitePool) -> i64 {
+        let names = MOVED
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ({names})"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+    let old_dir = unique_temp_path("logic-trigger-drop-old");
+    fs::create_dir_all(&old_dir).unwrap();
+    copy_migrations_up_to(LAST_WITH_TRIGGERS, &old_dir);
+    let (pool, db_path) = migration_test_pool("logic-trigger-drop-db").await;
+    run_migrations_from(&pool, &old_dir).await.unwrap();
+    assert_eq!(moved_triggers(&pool).await, 14);
+    sqlx::raw_sql(
+        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
+         VALUES ('drop-user', 'drop@example.test', 'test', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');
+         INSERT INTO project (id, name, owner_id, created_at, updated_at)
+         VALUES ('drop-project', 'Drop', 'drop-user', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rows = |pool: sqlx::SqlitePool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT json_group_array(json_array(t, id)) FROM (
+                SELECT 'chat' AS t, id FROM agent_chat
+                UNION ALL SELECT 'binding', id FROM project_agent_binding
+                UNION ALL SELECT 'user', id FROM user
+                UNION ALL SELECT 'project', id FROM project
+                ORDER BY 1, 2)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let before = rows(pool.clone()).await;
+
+    let full = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    run_migrations_from(&pool, &full).await.unwrap();
+    assert_eq!(
+        moved_triggers(&pool).await,
+        0,
+        "every moved trigger is dropped"
+    );
+    assert_eq!(rows(pool.clone()).await, before, "no row is rewritten");
+    let recorded: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _migration WHERE version > ? ORDER BY version")
+            .bind(LAST_WITH_TRIGGERS)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded,
+        vec![
+            202_610_180_752,
+            202_610_180_758,
+            202_610_180_804,
+            202_610_180_812,
+            202_610_180_820
+        ]
+    );
+    let db = SqliteDb::new(pool.clone());
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "after-drop".to_owned(),
+            email: "after-drop@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: "2026-10-18T00:00:00Z".to_owned(),
+            updated_at: "2026-10-18T00:00:00Z".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(AgentChatRepo::get_main_chat(&db, "after-drop")
+        .await
+        .unwrap()
+        .is_some());
+
+    // An older bundle replays nothing and refuses nothing on the newer file.
+    run_migrations_from(&pool, &old_dir)
+        .await
+        .expect("an older bundle starts on the newer database");
+    assert_eq!(moved_triggers(&pool).await, 0);
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+    let _ = fs::remove_dir_all(old_dir);
+}
