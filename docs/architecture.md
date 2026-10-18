@@ -2388,8 +2388,9 @@ SessionJournal support is only a capability contract in this release; Forge's
 stores do not advertise it, and continue writing materialized snapshots and
 checkpoints. The opt-in flat semantic summary and external-agent features are
 also not configured. Forge retains its per-tool argument normalizers: the
-runtime turns a representable schema-invalid call into a correctable tool error,
-but does not apply Forge's historical `parameters`-envelope transformation.
+runtime turns a representable schema-invalid call into a correctable tool error
+(as the previous pin already did), but does not apply Forge's historical
+`parameters`-envelope transformation.
 
 v0.5.0 records the provider and model that produced each reasoning part
 (`producer`) in canonical history, so it reaches the encrypted snapshot and
@@ -2497,10 +2498,16 @@ fail closed.
 Runtime v0.5.0 changes the deterministic fallback algorithm revision from
 `agent-runtime-lcm-2` to `agent-runtime-lcm-3`. Resume rebuilds only derived
 metadata from the authorized active DAG; existing entries, nodes and fallback
-text remain immutable. The runtime can also discard a proven uncheckpointed
-tail through Forge's existing claim-fenced `truncate_from` implementation, and
-finalizes abandoned non-terminal checkpoints before admitting explicit new work
-without replaying indeterminate provider or tool effects.
+text remain immutable. The release's crash-safe hard admission and
+uncheckpointed-tail recovery (through `truncate_from`) target hosts with a
+SessionStore and no CheckpointStore. Forge's LCM sessions configure both, so
+hard admission is unchanged for them, and tail recovery is only a last
+fallback: a store left more than one append ahead of the saved checkpoint is
+truncated back to it instead of failing every resume. The previous pin
+already finalized an abandoned non-terminal checkpoint as failed, without
+replay, before admitting new work; v0.5.0 also closes each tool call that turn
+left unanswered with an explicit error result, so the next turn is not
+rejected as `invalid_pairing`.
 
 Within a topic, a full `project.current_state` or `project.charter` result carries
 a unique `read_ref`, and an unchanged repeat returns

@@ -101,14 +101,20 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
   `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
   and SQLite LCM timelines resume without a database migration; persisted
-  `agent-runtime-lcm-2` derived state rebuilds for the `-3` fallback algorithm
-  while retaining old nodes and text. Interrupted turns and proven
-  uncheckpointed LCM tails have the runtime's newer no-replay recovery, and a
-  schema-invalid object tool call is returned to the model as a correctable tool
-  error instead of failing the whole turn. Forge keeps native journals, external
-  agents and the flat semantic-summary alternative disabled, and retains its
-  per-tool `parameters` envelope normalizer because the runtime does not perform
-  that host-specific transformation.
+  `agent-runtime-lcm-2` derived state rebuilds once for the `-3` algorithm while
+  old nodes and their text stay as stored (downgrading is covered under
+  Breaking). What changes for users: a deterministic LCM fallback summary now
+  renders earlier tool activity as `[earlier tool call: …]` and
+  `[earlier tool result: …]` lines instead of `call name(args)` text a model
+  could copy as its reply; a turn interrupted or failed in the middle of a tool
+  step has each unanswered call closed with an explicit error result when the
+  session next takes a turn, instead of failing every later turn with
+  `invalid_pairing` (the call is never replayed); and new reasoning is replayed
+  only to the provider and model that produced it, so after a session changes
+  model its earlier reasoning is left out of requests. Reasoning stored before
+  this release keeps the previous replay rule. Schema-invalid tool calls and
+  Forge's `parameters` envelope normalizer behave as before. Native journals,
+  external agents and the flat semantic-summary alternative stay disabled.
 - Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
   lowercase variants, provider probes and connection tests, public search,
   native provider requests, fetch, and network-capable child processes. Target
