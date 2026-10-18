@@ -9,7 +9,8 @@ use std::{
 };
 use tokio::process::Command;
 
-/// Standard proxy variables passed through even to otherwise cleared children.
+/// Standard proxy variables passed through even to otherwise cleared children,
+/// as (uppercase, lowercase) pairs.
 pub const PROXY_ENV_KEYS: [&str; 8] = [
     "HTTP_PROXY",
     "http_proxy",
@@ -21,19 +22,31 @@ pub const PROXY_ENV_KEYS: [&str; 8] = [
     "no_proxy",
 ];
 
-fn inherit_proxy_environment(command: &mut Command, project: &BTreeMap<String, String>) {
+fn inherit_proxy_environment(
+    command: &mut Command,
+    project: &BTreeMap<String, String>,
+    operator: impl Fn(&str) -> Option<OsString>,
+) {
     let preset = command
         .as_std()
         .get_envs()
         .map(|(key, _)| key.to_owned())
         .collect::<Vec<_>>();
-    for key in PROXY_ENV_KEYS {
-        if !preset.iter().any(|name| name == key) {
-            if let Some(value) = project
-                .get(key)
-                .map(OsString::from)
-                .or_else(|| std::env::var_os(key))
-            {
+    let is_preset = |key: &str| preset.iter().any(|name| name == key);
+    // Each variable comes in two cases, and tools disagree on which one wins.
+    // A command or Project value in either case therefore keeps the operator's
+    // value out of both, or it could silently outrank the override.
+    for pair in PROXY_ENV_KEYS.chunks(2) {
+        let overridden = pair
+            .iter()
+            .any(|key| is_preset(key) || project.contains_key(*key));
+        for key in pair {
+            if is_preset(key) {
+                continue;
+            }
+            if let Some(value) = project.get(*key) {
+                command.env(key, value);
+            } else if let Some(value) = (!overridden).then(|| operator(key)).flatten() {
                 command.env(key, value);
             }
         }
@@ -145,7 +158,7 @@ pub fn apply_sandboxed_cleared(
     project: &BTreeMap<String, String>,
     sandbox: &SandboxEnv,
 ) {
-    inherit_proxy_environment(command, project);
+    inherit_proxy_environment(command, project, |key| std::env::var_os(key));
     apply_budget(command, machine_policy().get(), project);
     // Every key Forge sets when the Project says nothing about it.
     let forge_keys = sandbox.variables(&BTreeMap::new(), |_| false, |_| None);
@@ -433,7 +446,7 @@ mod proxy_tests {
             ("HTTPS_PROXY".into(), "project".into()),
             ("ALL_PROXY".into(), "project".into()),
         ]);
-        inherit_proxy_environment(&mut child, &project);
+        inherit_proxy_environment(&mut child, &project, |_| None);
         let values = child.as_std().get_envs().collect::<BTreeMap<_, _>>();
         assert_eq!(
             values[std::ffi::OsStr::new("HTTPS_PROXY")],
@@ -447,10 +460,54 @@ mod proxy_tests {
         // removals on an inheriting Command, where Rust retains that intent.
         let mut inheriting = Command::new("sh");
         inheriting.env_remove("http_proxy");
-        inherit_proxy_environment(&mut inheriting, &BTreeMap::new());
+        inherit_proxy_environment(&mut inheriting, &BTreeMap::new(), |_| None);
         assert!(inheriting
             .as_std()
             .get_envs()
             .any(|(key, value)| key == "http_proxy" && value.is_none()));
+    }
+
+    #[test]
+    fn a_command_or_project_proxy_value_overrides_both_cases_of_its_variable() {
+        // Tools disagree on which case wins (curl reads https_proxy first,
+        // reqwest and Go read HTTPS_PROXY first), so an operator value in the
+        // other case would silently outrank the override for some of them.
+        let mut child = Command::new("sh");
+        child.env_clear().env("HTTPS_PROXY", "command");
+        let project = BTreeMap::from([("no_proxy".into(), "project".into())]);
+        inherit_proxy_environment(&mut child, &project, |key| {
+            Some(OsString::from(format!("operator-{key}")))
+        });
+        let values = child
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = BTreeMap::from([
+            ("HTTPS_PROXY".to_owned(), Some("command".to_owned())),
+            ("no_proxy".to_owned(), Some("project".to_owned())),
+            (
+                "HTTP_PROXY".to_owned(),
+                Some("operator-HTTP_PROXY".to_owned()),
+            ),
+            (
+                "http_proxy".to_owned(),
+                Some("operator-http_proxy".to_owned()),
+            ),
+            (
+                "ALL_PROXY".to_owned(),
+                Some("operator-ALL_PROXY".to_owned()),
+            ),
+            (
+                "all_proxy".to_owned(),
+                Some("operator-all_proxy".to_owned()),
+            ),
+        ]);
+        assert_eq!(values, expected);
     }
 }

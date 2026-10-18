@@ -372,7 +372,8 @@ Agent CLIs and Forge's git commands inherit the operator's proxy environment.
 Otherwise cleared Task command and review/verify check environments also
 receive all eight standard variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
 `NO_PROXY`, and their lowercase variants). Existing command/Project overrides
-keep their precedence. Review/verify check output masks any operator proxy URL
+keep their precedence; an override in either case replaces both cases of that
+variable, since tools disagree on which case wins. Review/verify check output masks any operator proxy URL
 that carries credentials (and its `user:password` part) as `[REDACTED]`, like
 Project values; an agent's own Task command can still read the variables it is
 given. Set these variables in the environment of each Forge server or daemon
