@@ -4048,15 +4048,24 @@ async fn public_search_http_client(
     )
     .await
     .map_err(|_| AgentHostError::Runtime("public search resolution timed out".to_owned()))?
-    .map_err(|error| match error {
+    .map_err(public_search_egress_refusal)?
+    .timeout(timeout)
+    .build()
+    .map_err(|_| AgentHostError::Configuration("public search client unavailable".to_owned()))
+}
+
+/// A lookup failure is a runtime failure of this request, as it was when
+/// resolution ran inside the client; only a refused answer is configuration.
+fn public_search_egress_refusal(error: PublicHttpError) -> AgentHostError {
+    match error {
+        PublicHttpError::ResolutionFailed => {
+            AgentHostError::Runtime("public search endpoint could not be resolved".to_owned())
+        }
         PublicHttpError::UnusableProxy => AgentHostError::Configuration(error.to_string()),
         _ => AgentHostError::Configuration(
             "public search endpoint must resolve exclusively to public addresses".to_owned(),
         ),
-    })?
-    .timeout(timeout)
-    .build()
-    .map_err(|_| AgentHostError::Configuration("public search client unavailable".to_owned()))
+    }
 }
 
 fn bounded_untrusted_text(value: &str, max_chars: usize) -> String {
@@ -7649,6 +7658,18 @@ mod proxy_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn public_search_lookup_failure_is_a_runtime_failure() {
+        assert!(matches!(
+            public_search_egress_refusal(PublicHttpError::ResolutionFailed),
+            AgentHostError::Runtime(message) if message.contains("could not be resolved")
+        ));
+        assert!(matches!(
+            public_search_egress_refusal(PublicHttpError::RestrictedAddress),
+            AgentHostError::Configuration(message) if message.contains("exclusively to public")
+        ));
     }
 
     #[tokio::test]

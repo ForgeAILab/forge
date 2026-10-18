@@ -2469,8 +2469,23 @@ async fn provider_url_addresses(
     let parsed = validate_provider_url_shape(base_url)?;
     let addresses = resolve_public_url(&parsed, PublicAddressPolicy::Provider)
         .await
-        .map_err(|_| "base_url must resolve exclusively to public addresses")?;
+        .map_err(provider_egress_refusal)?;
     Ok((parsed, addresses))
+}
+
+/// The caller-facing reason for a refused provider endpoint. An unresolvable
+/// hostname and a private answer need different fixes, so they stay distinct.
+fn provider_egress_refusal(error: PublicHttpError) -> &'static str {
+    match error {
+        PublicHttpError::InvalidUrl => "base_url must be an https URL without credentials",
+        PublicHttpError::RestrictedHostname => {
+            "base_url must not target a local or private hostname"
+        }
+        PublicHttpError::ResolutionFailed => "base_url hostname could not be resolved",
+        PublicHttpError::RestrictedAddress => "base_url must not target a private or local address",
+        PublicHttpError::ClientUnavailable => "provider client unavailable",
+        PublicHttpError::UnusableProxy => UNUSABLE_PROXY_MESSAGE,
+    }
 }
 
 /// Provider tests and probes share native request/fetch/search egress policy.
@@ -2482,10 +2497,7 @@ async fn provider_http_client(
     let parsed = validate_provider_url_shape(base_url)?;
     public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
         .await
-        .map_err(|error| match error {
-            PublicHttpError::UnusableProxy => UNUSABLE_PROXY_MESSAGE,
-            _ => "base_url must resolve exclusively to public addresses",
-        })?
+        .map_err(provider_egress_refusal)?
         .timeout(timeout)
         .build()
         .map_err(|_| "provider client unavailable")

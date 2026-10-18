@@ -185,3 +185,23 @@ async fn provider_probe_and_connection_test_refuse_an_unusable_environment_proxy
         .expect_err("an unusable proxy must not fall back to a direct connection");
     assert_eq!(error, UNUSABLE_PROXY_MESSAGE);
 }
+
+#[test]
+fn provider_endpoint_refusals_keep_distinct_reasons() {
+    assert_eq!(
+        provider_egress_refusal(PublicHttpError::ResolutionFailed),
+        "base_url hostname could not be resolved"
+    );
+    assert_eq!(
+        provider_egress_refusal(PublicHttpError::RestrictedAddress),
+        "base_url must not target a private or local address"
+    );
+    assert_eq!(
+        provider_egress_refusal(PublicHttpError::RestrictedHostname),
+        "base_url must not target a local or private hostname"
+    );
+    assert_eq!(
+        provider_egress_refusal(PublicHttpError::UnusableProxy),
+        UNUSABLE_PROXY_MESSAGE
+    );
+}
