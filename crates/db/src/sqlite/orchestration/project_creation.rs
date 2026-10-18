@@ -755,6 +755,13 @@ pub(super) async fn create_project_from_charter_approval(
     .execute(&mut *tx)
     .await
     .map_err(orchestration_write_error)?;
+    super::super::logic_triggers::bootstrap_project_chat_and_binding_in_tx(
+        &mut tx,
+        &input.project.id,
+        &input.project.created_at,
+        &input.project.updated_at,
+    )
+    .await?;
 
     // The Project-create commit also schedules the durable provisioning
     // operation and its complete checkpoint set.  This is intentionally
@@ -1345,6 +1352,14 @@ pub(super) async fn create_project_from_charter_approval(
     .execute(&mut *tx)
     .await
     .map_err(orchestration_write_error)?;
+    super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+        &mut tx,
+        Some(&main_chat_id),
+        "After handoff",
+        "handoff",
+        &input.project.created_at,
+    )
+    .await?;
     sqlx::query(
         "INSERT INTO agent_chat_message (
                 id, chat_id, sequence, author_type, author_id, content,
@@ -1550,6 +1565,14 @@ pub(super) async fn create_project_from_charter_approval(
     if handed_off_genesis.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
+    super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+        &mut tx,
+        Some(&main_chat_id),
+        "After Project handoff",
+        "project.create",
+        &input.project.updated_at,
+    )
+    .await?;
     let consumed_approval = sqlx::query(
         "UPDATE project_charter_approval
              SET lifecycle = 'consumed', consumed_project_id = ?, consumed_at = ?,

@@ -1456,7 +1456,7 @@ message provenance and earlier topics remain inspectable.
 For a chat whose responder (the active Main or Project binding's identity and
 its selected Profile) is native, Genesis start, Project creation/handoff and the
 first user message after eight hours idle mark `rotation_pending` in
-`agent_chat_topic_rotation`, in the trigger's transaction. A CLI chat raises no
+`agent_chat_topic_rotation`, in the source writer's transaction. A CLI chat raises no
 automatic intent and keeps its pre-topic-working-set behaviour: its REST topic
 request rotates directly and is denied while a turn is live. A native REST request
 uses the same intent: it is denied while a Genesis session needs a decision
@@ -8147,6 +8147,17 @@ missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=30000` per connection.
+
+New database logic triggers are not allowed. Constraint/validation guards stay
+in SQLite. The remaining logic-trigger families are intentional projections or
+invalidations that must observe every writer: G02 memory FTS; G07 Task
+notification outbox; G08 board/list revisions; G09 status epoch; G10–G13
+scheduler dirty generations and wait-age; and G14 usage-read watermarks. Owner
+chat bootstrap, pricing account-delete sentinels, Attention reopen wake rearm,
+Main Chat topic rotation, and media projection/GC now live in the
+transaction-scoped helpers in `sqlite/logic_triggers.rs`, `sqlite/user_auth.rs`,
+`sqlite/attention.rs`, `sqlite/agent_chat_topic.rs`, `sqlite/task_media.rs`, and
+`sqlite/shared_media.rs`.
 
 SQLite has one writer. Every transaction that writes begins with
 `db::begin_immediate`, which records where it began until it commits or rolls

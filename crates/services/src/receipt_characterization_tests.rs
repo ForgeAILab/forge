@@ -79,15 +79,18 @@ async fn database() -> Arc<SqliteDb> {
 
 async fn insert_user(db: &SqliteDb) {
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES (?, ?, 'test', 'Characterization User', ?, ?)",
+    db::UserRepo::create_user(
+        db,
+        &db::User {
+            id: USER_ID.to_owned(),
+            email: format!("{USER_ID}@example.test"),
+            password_hash: "test".to_owned(),
+            display_name: Some("Characterization User".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
-    .bind(USER_ID)
-    .bind(format!("{USER_ID}@example.test"))
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .expect("characterization user");
 }

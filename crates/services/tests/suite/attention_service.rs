@@ -692,15 +692,19 @@ async fn retry_exhausted_agent_chat_is_suppressed_before_binding_setup() {
     let project_id = new_uuid_v4();
     let turn_job_id = new_uuid_v4();
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO project (
-             id, name, settings, workflow_definition, owner_id, created_at, updated_at
-         ) VALUES (?, 'retry-suppression-project', '{}', '{}', NULL, ?, ?)",
+    ProjectRepo::create(
+        &*db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "retry-suppression-project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&project_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .unwrap();
     let chat_id: String =

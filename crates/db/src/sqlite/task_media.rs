@@ -3,6 +3,7 @@ use super::*;
 #[async_trait]
 impl TaskMediaRepo for SqliteDb {
     async fn create_media(&self, input: CreateTaskMedia) -> Result<TaskMedia> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO task_media (id, task_id, display_filename, content_type, byte_size, storage_key, author_type, author_id, author_name, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         )
@@ -16,12 +17,17 @@ impl TaskMediaRepo for SqliteDb {
         .bind(input.author_id.as_deref())
         .bind(&input.author_name)
         .bind(&input.created_at)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
-
-        Self::get_media_by_id(self, &input.id, true)
-            .await?
-            .ok_or(DbError::NotFound)
+        super::logic_triggers::project_task_media_in_tx(&mut transaction, &input).await?;
+        let media = sqlx::query("SELECT * FROM task_media WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_task_media)?;
+        transaction.commit().await?;
+        Ok(media)
     }
 
     async fn list_media(&self, task_id: &str, page: PageRequest) -> Result<Page<TaskMedia>> {
@@ -83,32 +89,51 @@ impl TaskMediaRepo for SqliteDb {
     }
 
     async fn soft_delete_media(&self, id: &str, deleted_at: &str) -> Result<TaskMedia> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        let asset_id: Option<String> = sqlx::query_scalar(
+            "SELECT asset_id FROM task_media WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .flatten();
         let result =
             sqlx::query("UPDATE task_media SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL")
                 .bind(deleted_at)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
 
-        // V076's legacy trigger marks the additive asset as a candidate, but
-        // it cannot see Project evidence attachments.  Reconcile through the
-        // shared-media repository so a Task delete never clears bytes still
-        // referenced by evidence or an immutable release pin.
-        if let Some(asset_id) =
-            sqlx::query_scalar::<_, String>("SELECT asset_id FROM task_media WHERE id = ?")
-                .bind(id)
-                .fetch_optional(self.pool())
-                .await?
-        {
-            SharedMediaRepo::reconcile_media_asset(self, &asset_id, deleted_at).await?;
+        sqlx::query(
+            "UPDATE project_media_attachment
+             SET deleted_at = ?, availability = 'purged', updated_at = ?,
+                 version = version + 1
+             WHERE task_media_id = ? AND deleted_at IS NULL",
+        )
+        .bind(deleted_at)
+        .bind(deleted_at)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
+        if let Some(asset_id) = asset_id {
+            super::shared_media::reconcile_legacy_task_media_delete_in_tx(
+                &mut transaction,
+                &asset_id,
+                deleted_at,
+            )
+            .await?;
         }
-
-        Self::get_media_by_id(self, id, true)
-            .await?
-            .ok_or(DbError::NotFound)
+        let media = sqlx::query("SELECT * FROM task_media WHERE id = ?")
+            .bind(id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_task_media)?;
+        transaction.commit().await?;
+        Ok(media)
     }
 }

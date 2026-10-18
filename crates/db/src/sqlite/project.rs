@@ -131,6 +131,13 @@ impl ProjectRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await?;
+        super::logic_triggers::bootstrap_project_chat_and_binding_in_tx(
+            &mut transaction,
+            &input.id,
+            &input.created_at,
+            &input.updated_at,
+        )
+        .await?;
 
         // Project-member authorization is the stricter boundary used by
         // Project-local chat, artifact, media, and administration routes.
@@ -249,8 +256,8 @@ impl ProjectRepo for SqliteDb {
             .await?;
         }
 
-        // V071 triggers create the canonical Project Chat and setup binding
-        // in this transaction.  Record all three durable facts before the
+        // Project creation materializes the canonical Project Chat and setup
+        // binding in this transaction. Record all three durable facts before the
         // commit as well, so a rollback can never leave a ledger that claims
         // a Project exists without its singular chat/binding state.
         let (chat_id, chat_status): (String, String) = sqlx::query_as(

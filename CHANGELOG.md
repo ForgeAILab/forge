@@ -162,6 +162,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Five small internal SQLite logic-trigger families now run in the owning
+  repository transactions; database guards and the intentionally global
+  projection/invalidation trigger families are unchanged.
 - Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
   `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
   and SQLite LCM timelines resume without a database migration; persisted

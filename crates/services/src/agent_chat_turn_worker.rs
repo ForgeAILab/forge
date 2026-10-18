@@ -6053,6 +6053,23 @@ mod tests {
         Arc::new(SqliteDb::new(pool))
     }
 
+    async fn seed_chat_user(db: &SqliteDb, id: &str, email: &str, now: &str) {
+        db::UserRepo::create_user(
+            db,
+            &db::User {
+                id: id.to_owned(),
+                email: email.to_owned(),
+                password_hash: "test".to_owned(),
+                display_name: None,
+                is_admin: false,
+                created_at: now.to_owned(),
+                updated_at: now.to_owned(),
+            },
+        )
+        .await
+        .expect("chat test user creates");
+    }
+
     struct BlockingTurnRunner {
         entered: tokio::sync::mpsc::UnboundedSender<(String, CancellationToken)>,
         cancelled: tokio::sync::mpsc::UnboundedSender<String>,
@@ -6075,8 +6092,7 @@ mod tests {
 
     async fn seed_restart_chat(db: &SqliteDb) -> String {
         let now = now_rfc3339();
-        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('turn-owner', 'turn@example.test', 'test', ?, ?)")
-            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        seed_chat_user(db, "turn-owner", "turn@example.test", &now).await;
         db::AgentRepo::create_identity_with_profile(
             db,
             db::CreateAgentIdentity {
@@ -6357,8 +6373,7 @@ mod tests {
     async fn supervised_chat_shutdown_drains_and_refunds_active_claim() {
         let db = worker_test_db().await;
         let now = now_rfc3339();
-        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('shutdown-owner', 'shutdown@example.test', 'test', ?, ?)")
-            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        seed_chat_user(&db, "shutdown-owner", "shutdown@example.test", &now).await;
         let chat = db::AgentChatRepo::get_main_chat(&*db, "shutdown-owner")
             .await
             .unwrap()
@@ -6472,8 +6487,7 @@ mod tests {
     async fn server_shutdown_refunds_claim_without_changing_invocation_identity() {
         let db = worker_test_db().await;
         let now = now_rfc3339();
-        sqlx::query("INSERT INTO user (id, email, password_hash, created_at, updated_at) VALUES ('shutdown-owner', 'shutdown@example.test', 'test', ?, ?)")
-            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        seed_chat_user(&db, "shutdown-owner", "shutdown@example.test", &now).await;
         let chat = db::AgentChatRepo::get_main_chat(&*db, "shutdown-owner")
             .await
             .unwrap()

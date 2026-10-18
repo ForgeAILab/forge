@@ -11,6 +11,7 @@ use std::sync::Arc;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
     CreateAgentProfile, CreateProject, CreateRepo, ProjectRepo, RepoRepo, SqliteDb, UpdateProject,
+    User, UserRepo,
 };
 use events::EventBus;
 use forge_agent_host::{
@@ -52,16 +53,18 @@ async fn database() -> Arc<SqliteDb> {
 }
 
 async fn seed_identity(db: &SqliteDb, permissions: &str) {
-    sqlx::query(
-        "INSERT INTO user
-         (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES (?, ?, 'test', 'Direct command classification user', ?, ?)",
+    UserRepo::create_user(
+        db,
+        &User {
+            id: USER_ID.to_owned(),
+            email: "direct-classification@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: Some("Direct command classification user".to_owned()),
+            is_admin: false,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
     )
-    .bind(USER_ID)
-    .bind("direct-classification@example.test")
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
     .await
     .expect("user");
 

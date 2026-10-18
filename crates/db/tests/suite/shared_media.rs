@@ -6,6 +6,30 @@ use db::{
 };
 use sqlx::SqlitePool;
 
+type ProjectedAssetRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+);
+type DeletedAssetRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+);
+
 async fn fixture() -> (SqliteDb, String, String) {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
@@ -233,6 +257,264 @@ async fn create_release(db: &SqliteDb, project_id: &str) {
     .execute(db.pool())
     .await
     .expect("release");
+}
+
+#[tokio::test]
+async fn media_projection_rows_versions_and_rollback_match_trigger_contract() {
+    let (db, project_id, task_id) = fixture().await;
+    let created_at = "2026-10-18T08:20:00Z";
+    let deleted_at = "2026-10-18T08:21:00Z";
+    let checksum = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    sqlx::query(
+        "INSERT INTO media_asset (
+            id, project_id, display_filename, content_type, byte_size, storage_key,
+            checksum, availability, gc_state, gc_candidate_at, gc_lease_owner,
+            gc_lease_expires_at, version, created_at, updated_at
+         ) VALUES (
+            'shared-storage-asset', ?, 'shared-original.png', 'image/png', 4,
+            'shared/storage-key', ?, 'available', 'gc_candidate',
+            '2026-10-18T08:00:00Z', 'stale-worker', '2026-10-18T08:10:00Z',
+            7, '2026-10-18T08:00:00Z', '2026-10-18T08:00:00Z'
+         )",
+    )
+    .bind(&project_id)
+    .bind(checksum)
+    .execute(db.pool())
+    .await
+    .expect("shared storage asset inserts");
+
+    let media = TaskMediaRepo::create_media(
+        &db,
+        CreateTaskMedia {
+            id: "duplicate-storage-task-media".to_owned(),
+            task_id: task_id.clone(),
+            display_filename: "task-proof.png".to_owned(),
+            content_type: "image/png".to_owned(),
+            byte_size: 4,
+            storage_key: "shared/storage-key".to_owned(),
+            author_type: CommentAuthorType::User,
+            author_id: Some("user-media".to_owned()),
+            author_name: "Tester".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("Task media projects onto the existing storage asset");
+    let mapped_asset_id: Option<String> =
+        sqlx::query_scalar("SELECT asset_id FROM task_media WHERE id = ?")
+            .bind(&media.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Task media asset mapping");
+    assert_eq!(mapped_asset_id.as_deref(), Some("shared-storage-asset"));
+    let projected_asset: ProjectedAssetRow = sqlx::query_as(
+        "SELECT id, legacy_task_media_id, display_filename, content_type, byte_size,
+                gc_state, availability, gc_candidate_at, gc_lease_owner,
+                gc_lease_expires_at, version, updated_at
+         FROM media_asset WHERE id = 'shared-storage-asset'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("projected asset reads");
+    assert_eq!(
+        projected_asset,
+        (
+            "shared-storage-asset".to_owned(),
+            None,
+            "shared-original.png".to_owned(),
+            "image/png".to_owned(),
+            4,
+            "referenced".to_owned(),
+            "available".to_owned(),
+            None,
+            None,
+            None,
+            8,
+            created_at.to_owned(),
+        )
+    );
+    let attachment_identity: (String, String, String, String, String, String, String) =
+        sqlx::query_as(
+            "SELECT id, project_id, asset_id, attachment_kind, task_media_id, task_id,
+                    acceptance_check_ids_json
+             FROM project_media_attachment
+             WHERE task_media_id = 'duplicate-storage-task-media'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("Task attachment identity reads");
+    assert_eq!(
+        attachment_identity,
+        (
+            "task-media-attachment:duplicate-storage-task-media".to_owned(),
+            project_id.clone(),
+            "shared-storage-asset".to_owned(),
+            "task".to_owned(),
+            "duplicate-storage-task-media".to_owned(),
+            task_id.clone(),
+            "[]".to_owned(),
+        )
+    );
+    let attachment_state: (String, Option<String>, String, i64, String, String) = sqlx::query_as(
+        "SELECT evidence_kind, deleted_at, availability, version, created_at, updated_at
+         FROM project_media_attachment
+         WHERE task_media_id = 'duplicate-storage-task-media'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("Task attachment reads");
+    assert_eq!(
+        attachment_state,
+        (
+            "screenshot".to_owned(),
+            None,
+            "available".to_owned(),
+            1,
+            created_at.to_owned(),
+            created_at.to_owned(),
+        )
+    );
+
+    TaskMediaRepo::soft_delete_media(&db, &media.id, deleted_at)
+        .await
+        .expect("Task media soft deletes");
+    let deleted_asset: DeletedAssetRow = sqlx::query_as(
+        "SELECT gc_state, gc_candidate_at, deleted_at, gc_lease_owner,
+                gc_lease_expires_at, version, updated_at
+         FROM media_asset WHERE id = 'shared-storage-asset'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("soft-deleted asset reads");
+    assert_eq!(
+        deleted_asset,
+        (
+            "gc_candidate".to_owned(),
+            Some(deleted_at.to_owned()),
+            Some(deleted_at.to_owned()),
+            None,
+            None,
+            9,
+            deleted_at.to_owned(),
+        )
+    );
+    let deleted_attachment: (String, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT availability, deleted_at, version, updated_at
+         FROM project_media_attachment
+         WHERE task_media_id = 'duplicate-storage-task-media'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("soft-deleted attachment reads");
+    assert_eq!(
+        deleted_attachment,
+        (
+            "purged".to_owned(),
+            Some(deleted_at.to_owned()),
+            2,
+            deleted_at.to_owned(),
+        )
+    );
+
+    create_release(&db, &project_id).await;
+    let pinned_media = upload(&db, &task_id, "single-bump-pinned").await;
+    SharedMediaRepo::create_project_release_media_pin(
+        &db,
+        CreateProjectReleaseMediaPin {
+            id: "single-bump-pin".to_owned(),
+            project_id: project_id.clone(),
+            release_id: "release-media".to_owned(),
+            asset_id: pinned_media.id.clone(),
+            attachment_id: None,
+            legacy_task_media_id: Some(pinned_media.id.clone()),
+            asset_checksum: checksum.to_owned(),
+            attachment_digest: "single-bump-attachment".to_owned(),
+            availability: "available".to_owned(),
+            pin_digest: "single-bump-pin-digest".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("release pin creates");
+    let version_before_delete: i64 =
+        sqlx::query_scalar("SELECT version FROM media_asset WHERE id = ?")
+            .bind(&pinned_media.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("pinned version before delete");
+    TaskMediaRepo::soft_delete_media(&db, &pinned_media.id, deleted_at)
+        .await
+        .expect("pinned Task media soft deletes");
+    let pinned_state: (String, Option<String>, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT gc_state, gc_candidate_at, deleted_at, version, updated_at
+         FROM media_asset WHERE id = ?",
+    )
+    .bind(&pinned_media.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("pinned asset state");
+    assert_eq!(
+        pinned_state,
+        (
+            "referenced".to_owned(),
+            None,
+            None,
+            version_before_delete + 1,
+            deleted_at.to_owned(),
+        ),
+        "an immutable release pin wins and soft delete bumps the asset once"
+    );
+
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_task_media_projection
+         BEFORE INSERT ON project_media_attachment
+         WHEN NEW.task_media_id = 'rollback-task-media'
+         BEGIN SELECT RAISE(ABORT, 'injected Task media projection failure'); END;",
+    )
+    .execute(db.pool())
+    .await
+    .expect("projection failpoint installs");
+    let failed = TaskMediaRepo::create_media(
+        &db,
+        CreateTaskMedia {
+            id: "rollback-task-media".to_owned(),
+            task_id,
+            display_filename: "rollback.png".to_owned(),
+            content_type: "image/png".to_owned(),
+            byte_size: 4,
+            storage_key: "rollback/storage-key".to_owned(),
+            author_type: CommentAuthorType::User,
+            author_id: Some("user-media".to_owned()),
+            author_name: "Tester".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await;
+    assert!(failed.is_err());
+    let rolled_back: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM task_media WHERE id = 'rollback-task-media'),
+           (SELECT COUNT(*) FROM media_asset WHERE id = 'rollback-task-media'),
+           (SELECT COUNT(*) FROM project_media_attachment
+            WHERE task_media_id = 'rollback-task-media')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("projection rollback counts");
+    assert_eq!(rolled_back, (0, 0, 0));
+
+    let moved_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+            'project_media_attachment_gc_guard_after_insert',
+            'project_release_media_pin_gc_guard_after_insert',
+            'task_media_project_asset_after_insert',
+            'task_media_project_attachment_after_delete'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("trigger catalog");
+    assert_eq!(moved_triggers, 0);
 }
 
 #[tokio::test]

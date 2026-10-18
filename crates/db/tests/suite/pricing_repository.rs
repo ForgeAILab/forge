@@ -1,14 +1,17 @@
 use db::{
     create_sqlite_pool, now_rfc3339, run_migrations, ActivatePricingCatalog,
-    CostCoverageReasonCode, CreatePricingCatalogSnapshot, CreatePricingRateRevision,
-    CreatePricingSelection, CreatePricingSubject, CreatePricingSubjectBinding,
-    CreatePricingSubjectRevision, CreateUsageEvent, CreateUsageInvocation, NanoUsdPerMillion,
-    PageRequest, PricingAdmissionProvenanceKind, PricingCatalogModelQuery, PricingCatalogRepo,
-    PricingCatalogSourceKind, PricingCatalogStateKind, PricingDomainKind, PricingRateSourceKind,
-    PricingSelectionStatus, PricingSubjectKind, PricingSubjectRepo, PricingSubjectState,
-    RateBuckets, SettleUsageInvocation, SortBy, SortOrder, SqliteDb, StartUsageInvocation,
-    TokenCounters, UsageEventProvenanceKind, UsageEventReportMode, UsageInvocationLifecycle,
-    UsageLedgerRepo, UsageSurface, UsageTelemetryState,
+    CostCoverageReasonCode, CostEstimateRevisionState, CostEstimationRunStatus,
+    CreateCostEstimateRevision, CreateCostEstimationPreview, CreateCostEstimationRun,
+    CreatePricingCatalogSnapshot, CreatePricingRateRevision, CreatePricingSelection,
+    CreatePricingSubject, CreatePricingSubjectBinding, CreatePricingSubjectRevision,
+    CreateUsageEvent, CreateUsageInvocation, NanoUsdPerMillion, PageRequest,
+    PricingAdmissionProvenanceKind, PricingCatalogFreshness, PricingCatalogModelQuery,
+    PricingCatalogRepo, PricingCatalogSourceKind, PricingCatalogStateKind, PricingDomainKind,
+    PricingRateSourceKind, PricingSelectionStatus, PricingSubjectKind, PricingSubjectRepo,
+    PricingSubjectState, ProjectRepo, RateBuckets, RetrospectiveEstimateRepo,
+    SettleUsageInvocation, SortBy, SortOrder, SqliteDb, StartUsageInvocation, TokenCounters,
+    UsageEventProvenanceKind, UsageEventReportMode, UsageInvocationLifecycle, UsageLedgerRepo,
+    UsageSurface, UsageTelemetryState, User, UserRepo,
 };
 
 async fn db() -> SqliteDb {
@@ -163,6 +166,458 @@ async fn window_invocation(db: &SqliteDb) -> String {
     .await
     .expect("window invocation settles");
     settled.id
+}
+
+#[tokio::test]
+async fn account_pricing_teardown_cascades_children_and_failure_rolls_back_sentinel() {
+    let db = db().await;
+    let now = "2026-10-18T07:58:00Z".to_owned();
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "owner-1".to_owned(),
+            email: "owner-1@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: Some("Pricing owner".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("owner creates");
+
+    let subject = PricingSubjectRepo::create_pricing_subject(
+        &db,
+        CreatePricingSubject {
+            id: "delete-subject".to_owned(),
+            owner_user_id: "owner-1".to_owned(),
+            subject_kind: PricingSubjectKind::ProviderEntry,
+            provider_entry_id: Some("delete-provider".to_owned()),
+            daemon_id: None,
+            executor_type: None,
+            current_revision_id: None,
+            state: PricingSubjectState::Active,
+            last_idempotency_key: Some("delete-subject-key".to_owned()),
+            last_update_digest: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("subject creates");
+    let revision = PricingSubjectRepo::create_pricing_subject_revision(
+        &db,
+        CreatePricingSubjectRevision {
+            id: "delete-subject-revision".to_owned(),
+            subject_id: subject.id.clone(),
+            owner_user_id: "owner-1".to_owned(),
+            revision: 1,
+            revision_digest: "delete-subject-digest".to_owned(),
+            subject_kind: PricingSubjectKind::ProviderEntry,
+            provider_entry_id: Some("delete-provider".to_owned()),
+            daemon_id: None,
+            executor_type: None,
+            provider_kind: "openai".to_owned(),
+            credential_method: "api_key".to_owned(),
+            endpoint_class: "https://api.openai.com/v1".to_owned(),
+            runtime_fingerprint: None,
+            schema_revision: "pricing-subject-v1".to_owned(),
+            non_secret_identity_json: "{}".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("subject revision creates");
+    let rate = PricingCatalogRepo::create_pricing_rate_revision(
+        &db,
+        CreatePricingRateRevision {
+            id: "delete-rate".to_owned(),
+            source_kind: PricingRateSourceKind::ManualOverride,
+            owner_user_id: Some("owner-1".to_owned()),
+            catalog_snapshot_id: None,
+            catalog_provider_id: None,
+            catalog_model_id: None,
+            pricing_subject_revision_id: Some(revision.id.clone()),
+            pricing_subject_revision_digest: Some(revision.revision_digest.clone()),
+            runtime_model: Some("delete-model".to_owned()),
+            source_model_key: Some("delete-model".to_owned()),
+            source_last_updated: None,
+            currency: "USD".to_owned(),
+            rates: RateBuckets::new(Some(10), Some(20), None, None),
+            tiers_json: "[]".to_owned(),
+            legacy_context_over_200k_json: None,
+            context_tier_state: "none".to_owned(),
+            received_rates_json: "{}".to_owned(),
+            rate_digest: "delete-rate-digest".to_owned(),
+            effective_at: now.clone(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("rate creates");
+    PricingSubjectRepo::create_pricing_subject_binding(
+        &db,
+        CreatePricingSubjectBinding {
+            id: "delete-binding".to_owned(),
+            owner_user_id: "owner-1".to_owned(),
+            subject_id: subject.id,
+            subject_revision_id: revision.id,
+            subject_revision_digest: revision.revision_digest,
+            scope_key: String::new(),
+            runtime_model: "delete-model".to_owned(),
+            source_kind: PricingRateSourceKind::ManualOverride,
+            catalog_provider_id: None,
+            catalog_model_id: None,
+            rate_revision_id: rate.id,
+            binding_digest: "delete-binding-digest".to_owned(),
+            effective_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("binding creates");
+
+    let account_selection = UsageLedgerRepo::create_pricing_selection(
+        &db,
+        CreatePricingSelection {
+            id: "delete-account-selection".to_owned(),
+            owner_user_id: Some("owner-1".to_owned()),
+            project_id: None,
+            domain_kind: PricingDomainKind::Chat,
+            surface: UsageSurface::MainChat,
+            source_id: "delete-main-chat".to_owned(),
+            execution_id: None,
+            task_id: None,
+            candidate_key: Some("delete-candidate".to_owned()),
+            attempt_ordinal: 0,
+            subject_id: None,
+            subject_revision_id: None,
+            subject_revision_digest: None,
+            binding_id: None,
+            rate_revision_id: None,
+            catalog_snapshot_id: None,
+            catalog_freshness: None,
+            runtime_model: Some("delete-model".to_owned()),
+            admitted_provider_id: Some("openai".to_owned()),
+            admitted_model_id: Some("delete-model".to_owned()),
+            source_kind: None,
+            provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+            selection_status: PricingSelectionStatus::Unpriced,
+            selection_reason: Some(CostCoverageReasonCode::MissingBinding),
+            selection_digest: "delete-selection-digest".to_owned(),
+            selected_at: now.clone(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account selection creates");
+    let admitted = UsageLedgerRepo::create_usage_invocation(
+        &db,
+        CreateUsageInvocation {
+            id: "delete-account-invocation".to_owned(),
+            owner_user_id: Some("owner-1".to_owned()),
+            project_id: None,
+            domain_kind: PricingDomainKind::Chat,
+            surface: UsageSurface::MainChat,
+            source_id: "delete-main-chat".to_owned(),
+            execution_id: None,
+            task_id: None,
+            domain_idempotency_key: "delete-account-invocation-key".to_owned(),
+            candidate_key: Some("delete-candidate".to_owned()),
+            attempt_ordinal: 0,
+            pricing_selection_id: account_selection.id,
+            admitted_provider_id: Some("openai".to_owned()),
+            admitted_model_id: Some("delete-model".to_owned()),
+            admitted_runtime_model: Some("delete-model".to_owned()),
+            pricing_subject_id: None,
+            pricing_subject_revision_id: None,
+            subject_revision_digest: None,
+            agent_id: None,
+            profile_id: None,
+            agent_name_snapshot: None,
+            project_name_snapshot: None,
+            executor_type: Some("embedded".to_owned()),
+            backend_kind: Some("native".to_owned()),
+            provenance_kind: PricingAdmissionProvenanceKind::Runtime,
+            admitted_at: now.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account invocation creates");
+    let started = UsageLedgerRepo::start_usage_invocation(
+        &db,
+        StartUsageInvocation {
+            id: admitted.id,
+            expected_version: admitted.version,
+            started_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account invocation starts");
+    let settled = UsageLedgerRepo::settle_usage_invocation(
+        &db,
+        SettleUsageInvocation {
+            id: started.id,
+            expected_version: started.version,
+            telemetry_state: UsageTelemetryState::Metered,
+            terminal_reason: None,
+            settled_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account invocation settles");
+    UsageLedgerRepo::append_usage_event(
+        &db,
+        CreateUsageEvent {
+            id: "delete-account-event".to_owned(),
+            invocation_id: settled.id,
+            owner_user_id: Some("owner-1".to_owned()),
+            project_id: None,
+            surface: UsageSurface::MainChat,
+            source_id: "delete-main-chat".to_owned(),
+            execution_id: None,
+            task_id: None,
+            event_idempotency_key: "delete-account-event-key".to_owned(),
+            source_report_id: "delete-account-report".to_owned(),
+            report_sequence: 0,
+            report_mode: UsageEventReportMode::Delta,
+            provenance_kind: UsageEventProvenanceKind::RuntimeReport,
+            legacy_source_table: None,
+            legacy_source_id: None,
+            legacy_provider_raw: None,
+            legacy_provider_sqlite_type: None,
+            legacy_provider_sql_literal: None,
+            legacy_model_raw: None,
+            legacy_model_sqlite_type: None,
+            legacy_model_sql_literal: None,
+            legacy_counter_values_json: "{}".to_owned(),
+            legacy_cost_usd_raw: None,
+            legacy_created_at_raw: None,
+            legacy_project_owner_raw: None,
+            legacy_invalid_usage: false,
+            provider_id: Some("openai".to_owned()),
+            model_id: Some("delete-model".to_owned()),
+            runtime_model: Some("delete-model".to_owned()),
+            candidate_key: Some("delete-candidate".to_owned()),
+            attempt_ordinal: 0,
+            agent_id: None,
+            profile_id: None,
+            agent_name_snapshot: None,
+            project_name_snapshot: None,
+            executor_type: Some("embedded".to_owned()),
+            pricing_subject_revision_id: None,
+            subject_revision_digest: None,
+            telemetry_state: UsageTelemetryState::Metered,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            context_tokens: None,
+            selected_tier: None,
+            provider_reported_nano_usd: None,
+            legacy_reported_cost_usd: None,
+            estimated_nano_usd: None,
+            cost_kind: db::UsageCostKind::None,
+            rate_revision_id: None,
+            catalog_snapshot_id: None,
+            formula_revision: None,
+            retrospective: false,
+            coverage_reason_code: Some(CostCoverageReasonCode::MissingBinding),
+            occurred_at: now.clone(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account event creates");
+
+    seed_project(&db, "project-1", "owner-1").await;
+    let project_invocation = window_invocation(&db).await;
+    let project_event = window_event(&project_invocation, "delete-project-event", 0, &now);
+    UsageLedgerRepo::append_usage_event(&db, project_event)
+        .await
+        .expect("Project event creates");
+    let snapshot = PricingCatalogRepo::create_pricing_catalog_snapshot(
+        &db,
+        CreatePricingCatalogSnapshot {
+            id: "delete-snapshot".to_owned(),
+            source_kind: PricingCatalogSourceKind::ModelsDevCatalog,
+            source_url: "https://models.dev/api.json".to_owned(),
+            http_etag: None,
+            payload_sha256: "a".repeat(64),
+            parser_revision: "models-dev-api-v1".to_owned(),
+            revision_digest: "delete-snapshot-digest".to_owned(),
+            payload_json: "{}".to_owned(),
+            fetched_at: now.clone(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("snapshot creates");
+    let preview = RetrospectiveEstimateRepo::create_cost_estimation_preview(
+        &db,
+        CreateCostEstimationPreview {
+            id: "delete-preview".to_owned(),
+            owner_user_id: "owner-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            catalog_snapshot_id: snapshot.id.clone(),
+            catalog_freshness: PricingCatalogFreshness::Fresh,
+            usage_set_digest: "delete-usage-set".to_owned(),
+            window_from: None,
+            window_to: None,
+            filters_json: "{}".to_owned(),
+            eligible_event_count: 1,
+            unmatched_event_count: 1,
+            already_reported_event_count: 0,
+            projected_cost_summary_json: "{}".to_owned(),
+            idempotency_key: "delete-preview-key".to_owned(),
+            expires_at: "2026-10-19T07:58:00Z".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("estimate preview creates");
+    let run = RetrospectiveEstimateRepo::create_cost_estimation_run(
+        &db,
+        CreateCostEstimationRun {
+            id: "delete-run".to_owned(),
+            owner_user_id: "owner-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            preview_id: preview.id,
+            catalog_snapshot_id: snapshot.id,
+            usage_set_digest: "delete-usage-set".to_owned(),
+            status: CostEstimationRunStatus::Pending,
+            cost_summary_json: "{}".to_owned(),
+            idempotency_key: "delete-run-key".to_owned(),
+            supersedes_run_id: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("estimate run creates");
+    RetrospectiveEstimateRepo::create_cost_estimate_revision(
+        &db,
+        CreateCostEstimateRevision {
+            id: "delete-estimate".to_owned(),
+            run_id: run.id,
+            owner_user_id: "owner-1".to_owned(),
+            project_id: "project-1".to_owned(),
+            usage_event_id: "delete-project-event".to_owned(),
+            revision: 1,
+            supersedes_revision_id: None,
+            state: CostEstimateRevisionState::Unmatched,
+            rate_revision_id: None,
+            catalog_snapshot_id: None,
+            estimated_nano_usd: None,
+            formula_revision: None,
+            reason_code: Some(CostCoverageReasonCode::MissingBinding),
+            estimate_digest: "delete-estimate-digest".to_owned(),
+            created_at: now.clone(),
+        },
+    )
+    .await
+    .expect("estimate revision creates");
+
+    // Estimate rows are Project-scoped and use the Project teardown guard;
+    // exercise that cascade before the account-scoped sentinel cascade.
+    ProjectRepo::delete(&db, "project-1")
+        .await
+        .expect("owned Project pricing rows cascade");
+    for (table, id) in [
+        ("cost_estimation_preview", "delete-preview"),
+        ("cost_estimation_run", "delete-run"),
+        ("cost_estimate_revision", "delete-estimate"),
+        ("pricing_selection", "window-selection"),
+        ("usage_invocation", "window-invocation"),
+        ("usage_event", "delete-project-event"),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE id = ?"))
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Project cascade count");
+        assert_eq!(count, 0, "{table} Project child cascades");
+    }
+
+    assert!(UserRepo::delete_user(&db, "owner-1")
+        .await
+        .expect("account pricing teardown succeeds"));
+    for (table, id) in [
+        ("pricing_subject", "delete-subject"),
+        ("pricing_subject_binding", "delete-binding"),
+        ("pricing_selection", "delete-account-selection"),
+        ("usage_invocation", "delete-account-invocation"),
+        ("usage_event", "delete-account-event"),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE id = ?"))
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("account cascade count");
+        assert_eq!(count, 0, "{table} account child cascades");
+    }
+    let sentinel_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pricing_account_deletion_guard")
+            .fetch_one(db.pool())
+            .await
+            .expect("sentinel count");
+    assert_eq!(sentinel_count, 0);
+
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "rollback-owner".to_owned(),
+            email: "rollback-owner@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("rollback owner creates");
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_rollback_owner_delete
+         BEFORE DELETE ON user WHEN OLD.id = 'rollback-owner'
+         BEGIN SELECT RAISE(ABORT, 'injected account delete failure'); END;",
+    )
+    .execute(db.pool())
+    .await
+    .expect("failure trigger installs");
+    assert!(UserRepo::delete_user(&db, "rollback-owner").await.is_err());
+    let rollback_owner: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user WHERE id = 'rollback-owner'")
+            .fetch_one(db.pool())
+            .await
+            .expect("rollback owner count");
+    let rollback_sentinel: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pricing_account_deletion_guard WHERE owner_user_id = 'rollback-owner'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("rollback sentinel count");
+    assert_eq!((rollback_owner, rollback_sentinel), (1, 0));
+
+    let moved_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN (
+             'pricing_account_deletion_guard_begin',
+             'pricing_account_deletion_guard_end'
+           )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("trigger catalog");
+    assert_eq!(moved_triggers, 0);
 }
 
 fn window_event(

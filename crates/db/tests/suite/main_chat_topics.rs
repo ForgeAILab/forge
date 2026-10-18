@@ -15,9 +15,10 @@ use db::{
     create_sqlite_pool, now_rfc3339, run_migrations_from, topic_divider_message,
     AgentChatMessageAuthorType, AgentChatMessageRepo, AgentChatMessageStatus, AgentChatRepo,
     AgentChatTopicDenialReason, AgentChatTopicRepo, AgentChatTopicTransactionRepo,
-    AgentChatTurnJobRepo, AgentRepo, AgentStatus, CreateAgentChatMessage, CreateAgentChatTopic,
-    CreateAgentChatTurnJob, CreateAgentIdentity, CreateAgentProfile, RotateAgentChatTopic,
-    SqliteDb, User, UserRepo,
+    AgentChatTurnJobRepo, AgentHandoffRepo, AgentRepo, AgentStatus, CreateAgentChatMessage,
+    CreateAgentChatTopic, CreateAgentChatTurnJob, CreateAgentHandoff, CreateAgentIdentity,
+    CreateAgentProfile, CreateProject, InsertProductGenesisSessionInTxInput, ProjectRepo,
+    RotateAgentChatTopic, SqliteDb, User, UserRepo,
 };
 use std::{
     fs,
@@ -109,6 +110,45 @@ async fn create_user(db: &SqliteDb, id: &str, now: &str) {
     )
     .await
     .expect("user creates");
+}
+
+async fn insert_genesis_fixture_in_tx(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    account_id: &str,
+    chat_id: &str,
+    lifecycle: &str,
+    now: &str,
+) {
+    db.insert_product_genesis_session_in_tx(
+        transaction,
+        InsertProductGenesisSessionInTxInput {
+            id,
+            account_id,
+            chat_id,
+            prompt_revision: "test",
+            prompt_body: "idea",
+            maturity: "mvp",
+            initial_idea: None,
+            preferred_identity_id: None,
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .await
+    .expect("Genesis fixture inserts through repository writer");
+    if lifecycle != "discovering" {
+        sqlx::query(
+            "UPDATE product_genesis_session SET lifecycle = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(lifecycle)
+        .bind(now)
+        .bind(id)
+        .execute(&mut **transaction)
+        .await
+        .expect("Genesis fixture lifecycle advances");
+    }
 }
 
 fn message_fixture(id: &str, chat_id: &str, content: &str, now: &str) -> CreateAgentChatMessage {
@@ -408,20 +448,18 @@ async fn rotate_is_denied_while_a_genesis_session_needs_a_decision() {
     let (db, chat_id) = database_with_ready_main_chat("rotate-genesis").await;
     let account_id = "rotate-genesis-account";
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO product_genesis_session (
-            id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
-            lifecycle, version, created_at, updated_at
-         ) VALUES (?, ?, ?, 'v1', 'prompt body', 'mvp', 'discovering', 1, ?, ?)",
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    insert_genesis_fixture_in_tx(
+        &db,
+        &mut tx,
+        "genesis-pending",
+        account_id,
+        &chat_id,
+        "discovering",
+        &now,
     )
-    .bind("genesis-pending")
-    .bind(account_id)
-    .bind(&chat_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
-    .await
-    .expect("pending genesis session inserts");
+    .await;
+    tx.commit().await.unwrap();
 
     let denial = AgentChatTopicTransactionRepo::rotate_agent_chat_topic(
         &db,
@@ -533,8 +571,16 @@ async fn genesis_mark_is_atomic_and_idle_user_message_marks_one_durable_intent()
     let account = bind_main_agent(&db, &chat_id, "native").await;
     let now = now_rfc3339();
     let mut tx = db::begin_immediate(db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('atomic-genesis', ?, ?, 'test', 'idea', 'mvp', 'discovering', 1, ?, ?)")
-        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+    insert_genesis_fixture_in_tx(
+        &db,
+        &mut tx,
+        "atomic-genesis",
+        &account,
+        &chat_id,
+        "discovering",
+        &now,
+    )
+    .await;
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
             .bind(&chat_id)
@@ -610,8 +656,18 @@ async fn a_cli_chat_neither_rotates_nor_loses_history_after_eight_idle_hours() {
     .await;
     append_user_message(&db, &chat_id, &account, "cli-after", "2026-08-10T09:00:00Z").await;
     let now = now_rfc3339();
-    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('cli-genesis', ?, ?, 'test', 'idea', 'mvp', 'discovering', 1, ?, ?)")
-        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    insert_genesis_fixture_in_tx(
+        &db,
+        &mut tx,
+        "cli-genesis",
+        &account,
+        &chat_id,
+        "discovering",
+        &now,
+    )
+    .await;
+    tx.commit().await.unwrap();
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_topic_rotation WHERE chat_id = ?")
             .bind(&chat_id)
@@ -642,8 +698,18 @@ async fn a_topic_request_is_denied_while_genesis_needs_a_decision() {
     let (db, chat_id) = database_with_ready_main_chat("request-genesis").await;
     let account = bind_main_agent(&db, &chat_id, "native").await;
     let now = now_rfc3339();
-    sqlx::query("INSERT INTO product_genesis_session (id, account_id, main_chat_id, prompt_revision, prompt_body, maturity, lifecycle, version, created_at, updated_at) VALUES ('request-genesis', ?, ?, 'test', 'idea', 'mvp', 'ready_for_project', 1, ?, ?)")
-        .bind(&account).bind(&chat_id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    insert_genesis_fixture_in_tx(
+        &db,
+        &mut tx,
+        "request-genesis",
+        &account,
+        &chat_id,
+        "ready_for_project",
+        &now,
+    )
+    .await;
+    tx.commit().await.unwrap();
     // Genesis itself raised its rotation; a user request may not add to it.
     let error = AgentChatTopicTransactionRepo::request_agent_chat_topic(
         &db,
@@ -662,4 +728,171 @@ async fn a_topic_request_is_denied_while_genesis_needs_a_decision() {
             .await
             .unwrap();
     assert_eq!(label, "Product Genesis");
+}
+
+#[tokio::test]
+async fn published_handoff_keeps_first_pending_rotation_and_assigns_live_origin() {
+    let (db, chat_id) = database_with_ready_main_chat("handoff-rotation").await;
+    let account = bind_main_agent(&db, &chat_id, "native").await;
+    let now = "2026-10-18T08:12:00Z";
+    append_user_message(&db, &chat_id, &account, "origin-message", now).await;
+    let (identity_id, profile_id): (String, String) = sqlx::query_as(
+        "SELECT identity_id, profile_id FROM account_main_agent_binding
+         WHERE account_id = ? AND state = 'active'",
+    )
+    .bind(&account)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    AgentChatTurnJobRepo::create_agent_chat_turn_job(
+        &db,
+        CreateAgentChatTurnJob {
+            id: "origin-turn".to_owned(),
+            chat_id: chat_id.clone(),
+            triggering_message_id: "origin-message".to_owned(),
+            responder_identity_id: identity_id.clone(),
+            profile_id: profile_id.clone(),
+            responder_binding_id: None,
+            responder_binding_version: None,
+            responder_identity_version: None,
+            profile_version: None,
+            operating_skill_revision_id: None,
+            policy_revision: None,
+            policy_digest: None,
+            permission_policy_digest: None,
+            tool_policy_digest: None,
+            admission_digest: None,
+            canonical_scope_provenance_json: None,
+            canonical_scope_type: "agent_chat".to_owned(),
+            canonical_scope_id: chat_id.clone(),
+            dedupe_key: "origin-turn-dedupe".to_owned(),
+            max_attempts: 3,
+            correlation_id: "origin-turn-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("origin turn creates");
+    sqlx::query("UPDATE agent_chat_turn_job SET status = 'leased' WHERE id = 'origin-turn'")
+        .execute(db.pool())
+        .await
+        .expect("origin turn becomes live");
+
+    let explicit_id = AgentChatTopicTransactionRepo::request_agent_chat_topic(
+        &db,
+        rotate_input(&chat_id, "explicit-origin", "Explicit topic"),
+    )
+    .await
+    .expect("explicit request creates");
+    let explicit_origin: Option<String> =
+        sqlx::query_scalar("SELECT origin_turn_id FROM agent_chat_topic_rotation WHERE id = ?")
+            .bind(&explicit_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("explicit origin reads");
+    assert_eq!(explicit_origin.as_deref(), Some("origin-turn"));
+    sqlx::query("DELETE FROM agent_chat_topic_rotation WHERE chat_id = ?")
+        .bind(&chat_id)
+        .execute(db.pool())
+        .await
+        .expect("explicit intent clears for the next writer");
+
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: "handoff-target-project".to_owned(),
+            name: "Handoff Target".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(account.clone()),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("handoff target Project creates");
+    let target_chat: String = sqlx::query_scalar(
+        "SELECT id FROM agent_chat
+         WHERE kind = 'project' AND project_id = 'handoff-target-project'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("target Project Chat");
+    AgentHandoffRepo::create_agent_handoff(
+        &db,
+        CreateAgentHandoff {
+            id: "published-handoff".to_owned(),
+            source_chat_id: chat_id.clone(),
+            target_chat_id: target_chat,
+            source_message_id: Some("origin-message".to_owned()),
+            source_turn_job_id: Some("origin-turn".to_owned()),
+            author_identity_id: Some(identity_id),
+            content: "handoff".to_owned(),
+            content_guard_json: "{}".to_owned(),
+            source_revisions_json: "{}".to_owned(),
+            correlation_id: "published-handoff-correlation".to_owned(),
+            causation_id: None,
+            dedupe_key: "published-handoff-dedupe".to_owned(),
+            created_at: now.to_owned(),
+            updated_at: now.to_owned(),
+        },
+    )
+    .await
+    .expect("published handoff creates");
+    let rotation: (String, String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT id, label, cause, created_at, origin_turn_id
+         FROM agent_chat_topic_rotation WHERE chat_id = ?",
+    )
+    .bind(&chat_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("handoff rotation reads");
+    uuid::Uuid::parse_str(&rotation.0).expect("application-generated rotation UUID");
+    assert_eq!(
+        (rotation.1, rotation.2, rotation.3, rotation.4),
+        (
+            "After handoff".to_owned(),
+            "handoff".to_owned(),
+            now.to_owned(),
+            Some("origin-turn".to_owned())
+        )
+    );
+
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    insert_genesis_fixture_in_tx(
+        &db,
+        &mut tx,
+        "pending-after-handoff",
+        &account,
+        &chat_id,
+        "discovering",
+        now,
+    )
+    .await;
+    tx.commit().await.unwrap();
+    let still_first: (String, String) =
+        sqlx::query_as("SELECT id, cause FROM agent_chat_topic_rotation WHERE chat_id = ?")
+            .bind(&chat_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        (still_first.0, still_first.1),
+        (rotation.0, "handoff".to_owned())
+    );
+
+    let moved_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+            'genesis_topic_rotation', 'handoff_topic_rotation', 'idle_topic_rotation',
+            'published_handoff_topic_rotation', 'topic_rotation_origin'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("trigger catalog");
+    assert_eq!(moved_triggers, 0);
 }

@@ -20,6 +20,7 @@ use api_types::WorkflowTrigger;
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
     CreateAgentProfile, CreateProject, CreateRepo, ProjectRepo, RepoRepo, SqliteDb, UpdateProject,
+    User, UserRepo,
 };
 use events::EventBus;
 use forge_agent_host::{
@@ -73,16 +74,18 @@ async fn fixture_with_charter(with_task_service: bool, adopted: bool) -> Fixture
     run_migrations(&pool).await.expect("migrations");
     let db = Arc::new(SqliteDb::new(pool));
 
-    sqlx::query(
-        "INSERT INTO user
-         (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES (?, ?, 'test', 'Scope composition user', ?, ?)",
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: USER_ID.to_owned(),
+            email: "scope-composition@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: Some("Scope composition user".to_owned()),
+            is_admin: false,
+            created_at: NOW.to_owned(),
+            updated_at: NOW.to_owned(),
+        },
     )
-    .bind(USER_ID)
-    .bind("scope-composition@example.test")
-    .bind(NOW)
-    .bind(NOW)
-    .execute(db.pool())
     .await
     .expect("user");
 

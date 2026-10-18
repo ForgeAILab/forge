@@ -196,7 +196,7 @@ impl SqliteDb {
         connection: &mut sqlx::SqliteConnection,
         input: InsertMainGenesisSessionInTxInput<'_>,
     ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
-        Ok(sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO product_genesis_session (
                 id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
                 initial_idea, lifecycle, source_message_ids_json,
@@ -214,8 +214,19 @@ impl SqliteDb {
         .bind(input.preferred_identity_id)
         .bind(input.created_at)
         .bind(input.updated_at)
-        .execute(connection)
-        .await?)
+        .execute(&mut *connection)
+        .await?;
+        if result.rows_affected() > 0 {
+            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+                connection,
+                Some(input.chat_id),
+                "Product Genesis",
+                "genesis.start",
+                input.created_at,
+            )
+            .await?;
+        }
+        Ok(result)
     }
 }
 
@@ -437,7 +448,7 @@ impl SqliteDb {
         connection: &mut sqlx::SqliteConnection,
         input: InsertProductGenesisSessionInTxInput<'_>,
     ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
-        Ok(sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO product_genesis_session (
                 id, account_id, main_chat_id, prompt_revision, prompt_body, maturity,
                 initial_idea, lifecycle, source_message_ids_json,
@@ -454,8 +465,19 @@ impl SqliteDb {
         .bind(input.preferred_identity_id)
         .bind(input.created_at)
         .bind(input.updated_at)
-        .execute(connection)
-        .await?)
+        .execute(&mut *connection)
+        .await?;
+        if result.rows_affected() > 0 {
+            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+                connection,
+                Some(input.chat_id),
+                "Product Genesis",
+                "genesis.start",
+                input.created_at,
+            )
+            .await?;
+        }
+        Ok(result)
     }
 }
 
@@ -500,7 +522,8 @@ impl SqliteDb {
         &self,
         input: TransitionProductGenesisSessionInput<'_>,
     ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
-        Ok(sqlx::query(
+        let mut transaction = crate::begin_immediate(self.pool()).await?;
+        let result = sqlx::query(
             "UPDATE product_genesis_session
              SET lifecycle = ?, project_id = COALESCE(?, project_id),
                  handoff_id = COALESCE(?, handoff_id), failure_reason = ?,
@@ -513,13 +536,30 @@ impl SqliteDb {
         .bind(input.project_id)
         .bind(input.handoff_id)
         .bind(input.failure_reason)
-        .bind(input.updated_at)
+        .bind(&input.updated_at)
         .bind(input.session_id)
         .bind(input.version)
         .bind(input.discovering_target)
         .bind(input.ready_target)
-        .execute(self.pool())
-        .await?)
+        .execute(&mut *transaction)
+        .await?;
+        if result.rows_affected() > 0 && input.lifecycle == "handed_off" {
+            let chat_id: Option<String> =
+                sqlx::query_scalar("SELECT main_chat_id FROM product_genesis_session WHERE id = ?")
+                    .bind(input.session_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+                &mut transaction,
+                chat_id.as_deref(),
+                "After Project handoff",
+                "project.create",
+                &input.updated_at,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(result)
     }
 }
 

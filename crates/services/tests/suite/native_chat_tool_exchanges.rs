@@ -32,7 +32,7 @@ use agent_runtime::core::provider::{Capabilities, FinishReason, ProviderStreamEv
 use agent_runtime::provider::fake::{usage_event, FakeProvider, ScriptedStream};
 use db::{
     create_sqlite_pool, new_uuid_v4, now_rfc3339, run_migrations, AgentRepo, AgentStatus,
-    CreateAgentIdentity, CreateAgentProfile, SqliteDb,
+    CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectRepo, SqliteDb, User, UserRepo,
 };
 use forge_agent_host::{
     AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType, Message,
@@ -58,13 +58,18 @@ async fn sqlite_db() -> Arc<SqliteDb> {
     run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(SqliteDb::new(pool));
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES ('user-1', 'user-1@example.test', 'test', NULL, ?, ?)",
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: "user-1".to_owned(),
+            email: "user-1@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now,
+        },
     )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .expect("user creates");
     db
@@ -2402,8 +2407,21 @@ async fn project_chat_fixture() -> ChatFixture {
     .await;
     let project = new_uuid_v4();
     let now = now_rfc3339();
-    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Measurement Project', 'user-1', 1, ?, ?)")
-        .bind(&project).bind(&now).bind(&now).execute(fixture.db.pool()).await.unwrap();
+    ProjectRepo::create(
+        &*fixture.db,
+        CreateProject {
+            id: project.clone(),
+            name: "Measurement Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("user-1".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .unwrap();
     let project_chat: String = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id = ?")
         .bind(&project)
         .fetch_one(fixture.db.pool())

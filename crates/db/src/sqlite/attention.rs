@@ -105,6 +105,8 @@ impl AttentionRepo for SqliteDb {
         &self,
         input: UpdateAttentionLifecycle,
     ) -> Result<AttentionProjection> {
+        let mut tx = crate::begin_immediate(&self.pool).await?;
+        let previous = self.get_attention_in_tx(&mut tx, &input.id).await?;
         let mut set_parts = vec![
             "status = ?".to_owned(),
             "version = version + 1".to_owned(),
@@ -144,17 +146,27 @@ impl AttentionRepo for SqliteDb {
         let result = statement
             .bind(&input.id)
             .bind(input.expected_version)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         if result.rows_affected() == 0 {
-            return match self.get_attention(&input.id).await? {
+            return match previous.as_ref() {
                 Some(_) => Err(DbError::VersionConflict),
                 None => Err(DbError::NotFound),
             };
         }
-        self.get_attention(&input.id)
+        let updated = self
+            .get_attention_in_tx(&mut tx, &input.id)
             .await?
-            .ok_or(DbError::NotFound)
+            .ok_or(DbError::NotFound)?;
+        super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+            &mut tx,
+            &input.id,
+            &previous.ok_or(DbError::NotFound)?.status,
+            &updated.status,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     async fn resolve_attention_by_dedupe(
@@ -216,6 +228,11 @@ impl SqliteDb {
         tx: &mut Transaction<'_, Sqlite>,
         input: CreateAttentionProjection,
     ) -> Result<AttentionProjection> {
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM attention_projection WHERE dedupe_key = ?")
+                .bind(&input.dedupe_key)
+                .fetch_optional(&mut **tx)
+                .await?;
         sqlx::query(
             "INSERT INTO attention_projection (
                 id, attention_type, scope_type, scope_id, identity_id,
@@ -279,13 +296,23 @@ impl SqliteDb {
         .execute(&mut **tx)
         .await?;
 
-        sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
+        let current = sqlx::query("SELECT * FROM attention_projection WHERE dedupe_key = ?")
             .bind(&input.dedupe_key)
             .fetch_optional(&mut **tx)
             .await?
             .map(map_attention_projection)
             .transpose()?
-            .ok_or(DbError::NotFound)
+            .ok_or(DbError::NotFound)?;
+        if let Some((attention_id, previous_status)) = previous {
+            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+                tx,
+                &attention_id,
+                &previous_status,
+                &current.status,
+            )
+            .await?;
+        }
+        Ok(current)
     }
     pub async fn resolve_attention_by_dedupe_in_tx(
         &self,
@@ -772,6 +799,11 @@ impl SqliteDb {
         connection: &mut sqlx::SqliteConnection,
         input: UpsertEnvironmentWaitAttentionInTxInput<'_>,
     ) -> crate::Result<u64> {
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM attention_projection WHERE dedupe_key = ?")
+                .bind(&input.dedupe_key)
+                .fetch_optional(&mut *connection)
+                .await?;
         let result = sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'environment_not_ready', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'wait') ON CONFLICT(dedupe_key) DO UPDATE SET status = 'open', summary = excluded.summary, details_json = excluded.details_json, source_event_id = excluded.source_event_id, resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL, updated_at = excluded.updated_at, version = attention_projection.version + 1")
             .bind(input.id)
             .bind(input.project_id)
@@ -781,8 +813,17 @@ impl SqliteDb {
             .bind(input.dedupe_key)
             .bind(input.occurred_at)
             .bind(input.updated_at)
-            .execute(connection)
+            .execute(&mut *connection)
             .await?;
+        if let Some((attention_id, previous_status)) = previous {
+            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+                connection,
+                &attention_id,
+                &previous_status,
+                "open",
+            )
+            .await?;
+        }
         Ok(result.rows_affected())
     }
 }
@@ -804,7 +845,22 @@ impl SqliteDb {
         connection: &mut sqlx::SqliteConnection,
         input: UpsertPlacementRefusalAttentionInTxInput<'_>,
     ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
-        Ok(sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1").bind(input.id).bind(input.project_id).bind(input.event_id).bind(input.summary).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).execute(connection).await?)
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM attention_projection WHERE dedupe_key = ?")
+                .bind(&input.dedupe_key)
+                .fetch_optional(&mut *connection)
+                .await?;
+        let result = sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1").bind(input.id).bind(input.project_id).bind(input.event_id).bind(input.summary).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).execute(&mut *connection).await?;
+        if let Some((attention_id, previous_status)) = previous {
+            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+                connection,
+                &attention_id,
+                &previous_status,
+                "open",
+            )
+            .await?;
+        }
+        Ok(result)
     }
 }
 
@@ -908,13 +964,28 @@ impl SqliteDb {
         connection: &mut sqlx::SqliteConnection,
         input: RecordWorkspaceWaitAttentionInTxInput<'_>,
     ) -> crate::Result<sqlx::sqlite::SqliteQueryResult> {
-        Ok(sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id,
+        let previous: Option<(String, String)> =
+            sqlx::query_as("SELECT id, status FROM attention_projection WHERE dedupe_key = ?")
+                .bind(input.dedupe_key)
+                .fetch_optional(&mut *connection)
+                .await?;
+        let result = sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id,
         source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at,
         updated_at, recommended_action, source_sequence)
         VALUES (?, ?, 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'recover_task', ?)
         ON CONFLICT(dedupe_key) DO UPDATE SET summary = excluded.summary, details_json = excluded.details_json,
         source_event_id = excluded.source_event_id, status = 'open', resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL,
-        updated_at = excluded.updated_at, version = attention_projection.version + 1").bind(input.id).bind(input.kind).bind(input.project_id).bind(input.event_id).bind(input.reason).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).bind(input.sequence).execute(connection).await?)
+        updated_at = excluded.updated_at, version = attention_projection.version + 1").bind(input.id).bind(input.kind).bind(input.project_id).bind(input.event_id).bind(input.reason).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).bind(input.sequence).execute(&mut *connection).await?;
+        if let Some((attention_id, previous_status)) = previous {
+            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+                connection,
+                &attention_id,
+                &previous_status,
+                "open",
+            )
+            .await?;
+        }
+        Ok(result)
     }
 }
 

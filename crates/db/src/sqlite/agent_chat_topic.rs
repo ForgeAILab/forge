@@ -61,6 +61,12 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         // A pending intent keeps its id (its crash-recovery identity) and
         // takes the newest requested label and summary. Automatic triggers
         // stay INSERT OR IGNORE, so they never overwrite a user's request.
+        let pending_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation WHERE chat_id = ?)",
+        )
+        .bind(&input.topic.chat_id)
+        .fetch_one(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO agent_chat_topic_rotation
                  (chat_id, id, label, requested_summary, cause, created_at)
@@ -76,6 +82,13 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         .bind(&input.topic.created_at)
         .execute(&mut *tx)
         .await?;
+        if !pending_exists {
+            super::logic_triggers::assign_topic_rotation_origin_in_tx(
+                &mut tx,
+                &input.topic.chat_id,
+            )
+            .await?;
+        }
         let id = sqlx::query_scalar("SELECT id FROM agent_chat_topic_rotation WHERE chat_id = ?")
             .bind(&input.topic.chat_id)
             .fetch_one(&mut *tx)

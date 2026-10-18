@@ -1548,15 +1548,19 @@ async fn bound_project(db: &SqliteDb, identity_id: &str, profile_id: &str) -> (S
     )
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO project (id, name, owner_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+    ProjectRepo::create(
+        db,
+        CreateProject {
+            id: project_id.clone(),
+            name: "wake-turn-project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some(account_id.clone()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&project_id)
-    .bind("wake-turn-project")
-    .bind(&account_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .unwrap();
     sqlx::query("UPDATE agent_identity SET owner_id = ? WHERE id = ?")

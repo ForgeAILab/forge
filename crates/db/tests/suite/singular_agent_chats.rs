@@ -12,6 +12,32 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+type BootstrapChatRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    i64,
+    String,
+    String,
+);
+type BootstrapBindingRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    String,
+    String,
+);
+
 async fn database() -> SqliteDb {
     database_url("sqlite::memory:").await
 }
@@ -339,6 +365,188 @@ async fn project_creation_with_selection_is_ready_and_bound_once() {
     .await
     .expect("current binding count");
     assert_eq!(current_count, 1);
+}
+
+#[tokio::test]
+async fn owner_chat_bootstrap_matches_legacy_rows_and_rolls_back() {
+    let db = database().await;
+    let now = "2026-10-18T07:52:00.000Z".to_owned();
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "bootstrap-account".to_owned(),
+            email: "bootstrap@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("account creates with Main Chat");
+
+    let account_chat: BootstrapChatRow = sqlx::query_as(
+        "SELECT id, kind, account_id, project_id, status, instruction_revision,
+                    message_count, version, created_at, updated_at
+             FROM agent_chat WHERE account_id = 'bootstrap-account'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("account Main Chat row");
+    uuid::Uuid::parse_str(&account_chat.0).expect("code-generated account chat UUID");
+    assert_eq!(
+        (
+            &account_chat.1,
+            account_chat.2.as_deref(),
+            account_chat.3.as_deref(),
+            &account_chat.4,
+            account_chat.5,
+            account_chat.6,
+            account_chat.7,
+            &account_chat.8,
+            &account_chat.9
+        ),
+        (
+            &"account_main".to_owned(),
+            Some("bootstrap-account"),
+            None,
+            &"agent_setup_required".to_owned(),
+            0,
+            0,
+            1,
+            &now,
+            &now
+        ),
+    );
+
+    ProjectRepo::create(
+        &db,
+        CreateProject {
+            id: "bootstrap-project".to_owned(),
+            name: "Bootstrap Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("bootstrap-account".to_owned()),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
+    )
+    .await
+    .expect("Project creates with setup rows");
+
+    let project_chat: BootstrapChatRow = sqlx::query_as(
+        "SELECT id, kind, account_id, project_id, status, instruction_revision,
+                    message_count, version, created_at, updated_at
+             FROM agent_chat WHERE project_id = 'bootstrap-project'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("Project Chat row");
+    uuid::Uuid::parse_str(&project_chat.0).expect("code-generated Project chat UUID");
+    assert_eq!(
+        (
+            &project_chat.1,
+            project_chat.2.as_deref(),
+            project_chat.3.as_deref(),
+            &project_chat.4,
+            project_chat.5,
+            project_chat.6,
+            project_chat.7,
+            &project_chat.8,
+            &project_chat.9
+        ),
+        (
+            &"project".to_owned(),
+            None,
+            Some("bootstrap-project"),
+            &"agent_setup_required".to_owned(),
+            0,
+            0,
+            1,
+            &now,
+            &now
+        ),
+    );
+    let setup_binding: BootstrapBindingRow = sqlx::query_as(
+        "SELECT id, identity_id, profile_id, state, autonomy_policy_json,
+                    permission_ceiling_json, subscriptions_json, wake_budget, version,
+                    created_at, updated_at
+             FROM project_agent_binding WHERE project_id = 'bootstrap-project'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("Project setup binding row");
+    uuid::Uuid::parse_str(&setup_binding.0).expect("code-generated setup binding UUID");
+    assert_eq!(
+        (
+            setup_binding.1,
+            setup_binding.2,
+            setup_binding.3,
+            setup_binding.4,
+            setup_binding.5,
+            setup_binding.6,
+            setup_binding.7,
+            setup_binding.8,
+            setup_binding.9,
+            setup_binding.10
+        ),
+        (
+            None,
+            None,
+            "agent_setup_required".to_owned(),
+            "{}".to_owned(),
+            "{}".to_owned(),
+            "[]".to_owned(),
+            10,
+            1,
+            now.clone(),
+            now.clone()
+        ),
+    );
+
+    let failure = ProjectRepo::create_with_agent_binding(
+        &db,
+        CreateProject {
+            id: "rolled-back-project".to_owned(),
+            name: "Must Roll Back".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("bootstrap-account".to_owned()),
+            created_at: now.clone(),
+            updated_at: now,
+        },
+        Some("missing-identity".to_owned()),
+        Some("missing-profile".to_owned()),
+    )
+    .await;
+    assert!(failure.is_err(), "invalid selected binding must fail");
+    for table in ["project", "agent_chat", "project_agent_binding"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE {} = 'rolled-back-project'",
+            if table == "project" {
+                "id"
+            } else {
+                "project_id"
+            }
+        ))
+        .fetch_one(db.pool())
+        .await
+        .expect("rollback count");
+        assert_eq!(count, 0, "{table} row rolls back with source transaction");
+    }
+
+    let moved_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger'
+           AND name IN ('user_agent_chat_after_insert', 'project_agent_chat_after_insert')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("trigger catalog");
+    assert_eq!(moved_triggers, 0);
 }
 
 #[tokio::test]

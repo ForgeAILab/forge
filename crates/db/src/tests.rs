@@ -11403,18 +11403,23 @@ async fn append_agent_chat_message_allocates_sequences_and_replays_by_id() {
 async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
-         VALUES ('genesis-user', 'genesis@example.test', 'test', ?, ?)",
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "genesis-user".to_owned(),
+            email: "genesis@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .expect("user fixture");
     let project_id = seed_project(&db, "Genesis teardown", Some("genesis-user".to_owned())).await;
 
-    // The account's Main Chat is created by trigger when the user row lands.
+    // Account creation materializes the account's Main Chat atomically.
     let main_chat_id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM agent_chat WHERE account_id = 'genesis-user' AND kind = 'account_main'",
     )

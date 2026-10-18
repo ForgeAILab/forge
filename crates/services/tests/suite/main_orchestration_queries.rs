@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use db::{
     create_sqlite_pool, run_migrations, AgentRepo, AgentStatus, CreateAgentIdentity,
-    CreateAgentProfile, SqliteDb,
+    CreateAgentProfile, SqliteDb, User, UserRepo,
 };
 use forge_agent_host::ForgeToolProvider;
 use forge_agent_host::{
@@ -27,15 +27,18 @@ async fn fixture() -> Arc<SqliteDb> {
     run_migrations(&pool).await.expect("migrations");
     let db = Arc::new(SqliteDb::new(pool));
     let now = db::now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
-         VALUES (?, ?, 'test', 'Query User', ?, ?)",
+    UserRepo::create_user(
+        &*db,
+        &User {
+            id: ACCOUNT_ID.to_owned(),
+            email: "query@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: Some("Query User".to_owned()),
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(ACCOUNT_ID)
-    .bind("query@example.test")
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .expect("user");
 

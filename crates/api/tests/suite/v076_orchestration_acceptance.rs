@@ -117,10 +117,26 @@ async fn split_prompt_preserves_turn_manifest_sources_revisions_and_digests() {
     let harness = common::test_app(workspace.path(), "split-prompt-manifest").await;
     let project_id = "11111111-1111-4111-8111-111111111111";
     let time = "2026-10-01T00:00:00Z";
-    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Manifest Project', 'test-user-id', 4, ?, ?)")
-        .bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, 'test-user-id', 'admin', ?, ?)")
-        .bind(db::new_uuid_v4()).bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
+    db::ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: project_id.to_owned(),
+            name: "Manifest Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("test-user-id".to_owned()),
+            created_at: time.to_owned(),
+            updated_at: time.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project SET version = 4 WHERE id = ?")
+        .bind(project_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let agent = connect_agent(
         &harness.app,
         &common::test_jwt(),
