@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TaskCapacityNotice } from '@/components/task-capacity-notice'
 import { TaskTypeBadge } from '@/components/task-type-badge'
+import { TaskEditSaveError } from '@/components/task-detail/task-edit-save-error'
 import { taskStatusColors } from '@/components/task-controls'
 import { cn } from '@/lib/cn'
 import type { KeyboardEvent } from 'react'
@@ -16,6 +17,7 @@ interface TaskDetailHeaderProps {
   editingTitle: boolean
   titleDraft: string
   updatePending: boolean
+  updateError?: unknown
   onTitleChange: (value: string) => void
   onTitleKeyDown: (event: KeyboardEvent<HTMLInputElement>) => void
   onSaveTitle: () => void
@@ -30,6 +32,7 @@ export function TaskDetailHeader({
   editingTitle,
   titleDraft,
   updatePending,
+  updateError,
   onTitleChange,
   onTitleKeyDown,
   onSaveTitle,
@@ -52,7 +55,9 @@ export function TaskDetailHeader({
                 colors?.text ?? 'text-muted-foreground',
               )}
             >
-              <span className={cn('h-1.5 w-1.5 rounded-full', colors?.dot ?? 'bg-muted-foreground')} />
+              <span
+                className={cn('h-1.5 w-1.5 rounded-full', colors?.dot ?? 'bg-muted-foreground')}
+              />
               {task.status.replace('_', ' ')}
             </span>
           ) : (
@@ -91,14 +96,11 @@ export function TaskDetailHeader({
                 >
                   Save
                 </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={onCancelTitle}
-                >
+                <Button size="sm" variant="outline" onClick={onCancelTitle}>
                   Cancel
                 </Button>
               </div>
+              <TaskEditSaveError error={updateError} field="title" />
             </div>
           ) : (
             <button

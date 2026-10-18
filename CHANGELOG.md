@@ -35,8 +35,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
-- Clearing a Task description now persists an empty value from both the board
-  detail dialog and the full-page detail view, restoring the empty-description prompt.
+- Task-detail title saves now reconcile unrelated concurrent Task writes instead
+  of silently leaving the old title, and show the current title for same-field conflicts.
+- Clearing a Task description now persists an empty value, restores the
+  empty-description prompt, and preserves the blank draft with the current value visible on conflict.
 - Non-default Task types are visible on Kanban cards and Task detail headers.
 - The header brand is a consistently labelled Forge home link to `/`, using the
   existing home routing for accounts with and without Projects.

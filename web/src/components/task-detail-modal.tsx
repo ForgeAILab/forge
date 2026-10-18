@@ -25,6 +25,7 @@ import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banne
 import { TaskExecutionApprovalNotice } from '@/features/project-execution/TaskExecutionApprovalNotice'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskHistoryPanel } from '@/components/task-detail/task-history-panel'
+import { TaskEditSaveError } from '@/components/task-detail/task-edit-save-error'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -34,6 +35,7 @@ import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/a
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
 import type { Review } from '@/types/generated'
+import { TaskFieldConflictError, taskFieldValuesEqual } from '@/api/task-update-conflict'
 
 function formatDate(value?: string | null): string {
   if (!value) return '-'
@@ -90,8 +92,12 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
 
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
+  const [titleEditBase, setTitleEditBase] = useState<Task | undefined>()
+  const [titleSaveError, setTitleSaveError] = useState<unknown>()
   const [editingDescription, setEditingDescription] = useState(false)
   const [descriptionDraft, setDescriptionDraft] = useState('')
+  const [descriptionEditBase, setDescriptionEditBase] = useState<Task | undefined>()
+  const [descriptionSaveError, setDescriptionSaveError] = useState<unknown>()
   const [priorityDraft, setPriorityDraft] = useState('')
 
   const task = taskDetailQuery.data?.task
@@ -114,12 +120,12 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   useEffect(() => {
     if (!task) return
     const timeout = window.setTimeout(() => {
-      setTitleDraft(task.title)
-      setDescriptionDraft(task.description ?? '')
+      if (!editingTitle) setTitleDraft(task.title)
+      if (!editingDescription) setDescriptionDraft(task.description ?? '')
       setPriorityDraft(String(task.priority))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [task])
+  }, [editingDescription, editingTitle, task])
 
   useEffect(() => {
     if (open) return
@@ -127,6 +133,10 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     const timeout = window.setTimeout(() => {
       setEditingTitle(false)
       setEditingDescription(false)
+      setTitleEditBase(undefined)
+      setDescriptionEditBase(undefined)
+      setTitleSaveError(undefined)
+      setDescriptionSaveError(undefined)
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [open])
@@ -148,11 +158,31 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     if (!title || title === task.title) {
       setTitleDraft(task.title)
       setEditingTitle(false)
+      setTitleEditBase(undefined)
+      setTitleSaveError(undefined)
       return
     }
+    const expectedTask = titleEditBase ?? task
+    if (!taskFieldValuesEqual('title', task.title, expectedTask.title)) {
+      const conflict = new TaskFieldConflictError(task, ['title'])
+      setTitleEditBase(task)
+      setTitleSaveError(conflict)
+      return
+    }
+    setTitleSaveError(undefined)
     updateTask.mutate(
-      { taskId: task.id, body: { title, version: task.version } },
-      { onSuccess: () => setEditingTitle(false) },
+      { taskId: task.id, body: { title, version: task.version }, expectedTask },
+      {
+        onSuccess: () => {
+          setEditingTitle(false)
+          setTitleEditBase(undefined)
+          setTitleSaveError(undefined)
+        },
+        onError: (error) => {
+          if (error instanceof TaskFieldConflictError) setTitleEditBase(error.currentTask)
+          setTitleSaveError(error)
+        },
+      },
     )
   }
 
@@ -163,17 +193,38 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     if (description === normalizedCurrent) {
       setDescriptionDraft(task.description ?? '')
       setEditingDescription(false)
+      setDescriptionEditBase(undefined)
+      setDescriptionSaveError(undefined)
       return
     }
+    const expectedTask = descriptionEditBase ?? task
+    if (!taskFieldValuesEqual('description', task.description, expectedTask.description)) {
+      const conflict = new TaskFieldConflictError(task, ['description'])
+      setDescriptionEditBase(task)
+      setDescriptionSaveError(conflict)
+      return
+    }
+    setDescriptionSaveError(undefined)
     updateTask.mutate(
       {
         taskId: task.id,
+        expectedTask,
         body: {
           description,
           version: task.version,
         },
       },
-      { onSuccess: () => setEditingDescription(false) },
+      {
+        onSuccess: () => {
+          setEditingDescription(false)
+          setDescriptionEditBase(undefined)
+          setDescriptionSaveError(undefined)
+        },
+        onError: (error) => {
+          if (error instanceof TaskFieldConflictError) setDescriptionEditBase(error.currentTask)
+          setDescriptionSaveError(error)
+        },
+      },
     )
   }
 
@@ -195,6 +246,8 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     if (event.key === 'Escape') {
       setTitleDraft(task?.title ?? '')
       setEditingTitle(false)
+      setTitleEditBase(undefined)
+      setTitleSaveError(undefined)
     }
   }
 
@@ -234,11 +287,6 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     )
   }
 
-
-
-
-
-
   const openFullPage = () => {
     onClose()
     void navigate({ to: '/tasks/$taskId', params: { taskId } })
@@ -274,12 +322,21 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
           editingTitle={editingTitle}
           titleDraft={titleDraft}
           updatePending={updateTask.isPending}
+          updateError={titleSaveError}
           onCancelTitle={() => {
             setTitleDraft(task?.title ?? '')
             setEditingTitle(false)
+            setTitleEditBase(undefined)
+            setTitleSaveError(undefined)
           }}
           onClose={onClose}
-          onEditTitle={() => setEditingTitle(true)}
+          onEditTitle={() => {
+            if (!task) return
+            setTitleDraft(task.title)
+            setTitleEditBase(task)
+            setTitleSaveError(undefined)
+            setEditingTitle(true)
+          }}
           onOpenFullPage={openFullPage}
           onSaveTitle={saveTitle}
           onTitleChange={setTitleDraft}
@@ -313,7 +370,9 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                     <ModalWorkspaceErrorBanner
                       taskId={taskId}
                       errorInfo={errorInfo}
-                      needsReset={task.condition.details.diagnostic?.type === 'workspace_reset_required'}
+                      needsReset={
+                        task.condition.details.diagnostic?.type === 'workspace_reset_required'
+                      }
                     />
                   ) : (
                     <div
@@ -347,6 +406,8 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                           if (e.key === 'Escape') {
                             setDescriptionDraft(task.description ?? '')
                             setEditingDescription(false)
+                            setDescriptionEditBase(undefined)
+                            setDescriptionSaveError(undefined)
                           }
                         }}
                       />
@@ -360,17 +421,25 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                           onClick={() => {
                             setDescriptionDraft(task.description ?? '')
                             setEditingDescription(false)
+                            setDescriptionEditBase(undefined)
+                            setDescriptionSaveError(undefined)
                           }}
                         >
                           Cancel
                         </Button>
                       </div>
+                      <TaskEditSaveError error={descriptionSaveError} field="description" />
                     </div>
                   ) : task.description?.trim() ? (
                     <button
                       className="block w-full cursor-pointer rounded-lg border border-dashed p-3 text-left transition-colors hover:border-border hover:bg-accent"
                       type="button"
-                      onClick={() => setEditingDescription(true)}
+                      onClick={() => {
+                        setDescriptionDraft(task.description ?? '')
+                        setDescriptionEditBase(task)
+                        setDescriptionSaveError(undefined)
+                        setEditingDescription(true)
+                      }}
                     >
                       <MarkdownView content={task.description} />
                     </button>
@@ -378,7 +447,12 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                     <button
                       className="block w-full cursor-pointer rounded-lg border border-dashed p-3 text-left text-sm text-muted-foreground transition-colors hover:border-border hover:bg-accent"
                       type="button"
-                      onClick={() => setEditingDescription(true)}
+                      onClick={() => {
+                        setDescriptionDraft(task.description ?? '')
+                        setDescriptionEditBase(task)
+                        setDescriptionSaveError(undefined)
+                        setEditingDescription(true)
+                      }}
                     >
                       <span className="italic opacity-60">Click to add a description…</span>
                     </button>
@@ -477,9 +551,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             savePriority={savePriority}
             setPriorityDraft={setPriorityDraft}
             task={task}
-            transitionPending={
-              transitionTask.isPending
-            }
+            transitionPending={transitionTask.isPending}
             workflow={workflow}
             onStatusChange={onStatusChange}
           />

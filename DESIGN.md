@@ -227,7 +227,7 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 - **Structure:** selecting a Kanban card opens one bounded dialog without leaving the board context. The task header and description lead; workflow exceptions, dependencies, runs, and history follow; editable phase, assignees, priority, timestamps, and observability are supporting details.
 - **Responsive:** at 1024px and above, content and the 288px supporting-detail rail may scroll independently. Below 1024px, the dialog becomes one ordered column and one scroll owner: primary task content first, supporting details second. The content column must never remain beside the rail when doing so would make readable text narrower than the card minimum.
-- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. The dialog closes on Escape and restores the board context.
+- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. A stale save refetches current Task truth, reapplies once when the edited field is unchanged, and otherwise keeps the draft open beside a warning that names the current field value. The dialog closes on Escape and restores the board context.
 - **Accessibility:** the task title labels the dialog, close and full-page actions remain visible, headings preserve a logical order, and all identifiers wrap without horizontal overflow.
 
 ### Drag handle

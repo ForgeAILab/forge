@@ -1,11 +1,12 @@
 import type { ComponentProps, ReactNode } from 'react'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { useTaskDetailQuery, useUpdateTask } from '@/api/hooks'
+import { qk } from '@/api/query-keys'
 import { TaskOverviewPanel } from '@/pages/task-detail/TaskOverviewPanel'
 import { taskListItem } from '@/test-utils/task-list-item'
-import type { Task, UpdateTaskRequest } from '@/types/generated'
+import type { Task, TaskDetailResponse, UpdateTaskRequest } from '@/types/generated'
 import { TaskDetailModal } from './task-detail-modal'
 
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
@@ -92,8 +93,12 @@ function FullPage() {
   return (
     <TaskOverviewPanel
       {...fullPageProps(task)}
-      onUpdateDescription={(description) =>
-        update.mutate({ taskId: task.id, body: { description, version: task.version } })
+      onUpdateDescription={(description, expectedTask) =>
+        update.mutateAsync({
+          taskId: task.id,
+          body: { description, version: task.version },
+          expectedTask,
+        })
       }
     />
   )
@@ -105,7 +110,9 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-function setup(view: 'modal' | 'full page') {
+type ConflictKind = 'unrelated-field' | 'description'
+
+function setup(view: 'modal' | 'full page', options: { firstPatchConflict?: ConflictKind } = {}) {
   let stored: Task = {
     ...taskListItem(),
     title: 'Notification schema',
@@ -116,16 +123,38 @@ function setup(view: 'modal' | 'full page') {
     execution_observability: undefined,
   }
   const patches: UpdateTaskRequest[] = []
+  let conflictPending = options.firstPatchConflict !== undefined
   vi.spyOn(window, 'fetch').mockImplementation(async (input, init) => {
     const path = new URL(String(input)).pathname
     if (path === '/api/v1/tasks/task-1' && init?.method === 'PATCH') {
       const body: UpdateTaskRequest = JSON.parse(String(init.body))
       patches.push(body)
+      if (conflictPending) {
+        conflictPending = false
+        stored = {
+          ...stored,
+          ...(options.firstPatchConflict === 'description'
+            ? { description: 'Description from another client' }
+            : { priority: stored.priority + 1 }),
+          version: stored.version + 1,
+        }
+        return Response.json(
+          {
+            code: 'version_conflict',
+            message: 'resource version conflict',
+            details: null,
+            request_id: 'request-conflict',
+          },
+          { status: 409 },
+        )
+      }
       // Match the current API contract: null/omitted means no change, "" clears.
+      if (body.title != null) stored = { ...stored, title: body.title }
       if (body.description != null) stored = { ...stored, description: body.description }
       stored = { ...stored, version: stored.version + 1 }
       return Response.json(stored)
     }
+    if (path === '/api/v1/tasks/task-1') return Response.json(stored)
     if (path === '/api/v1/tasks/task-1/detail') {
       return Response.json({
         task: stored,
@@ -145,6 +174,37 @@ function setup(view: 'modal' | 'full page') {
     view === 'modal' ? <TaskDetailModal taskId="task-1" open onClose={vi.fn()} /> : <FullPage />
   return { ui, Wrapper, patches, stored: () => stored }
 }
+
+describe('Task detail title editing', () => {
+  it('shows a successful title save', async () => {
+    const test = setup('modal')
+    render(test.ui, { wrapper: test.Wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: 'Notification schema' }))
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'Notification schema v2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await screen.findByRole('button', { name: 'Notification schema v2' })
+    expect(test.patches).toEqual([{ title: 'Notification schema v2', version: 1 }])
+  })
+
+  it('retries a 409 when only another field changed', async () => {
+    const test = setup('modal', { firstPatchConflict: 'unrelated-field' })
+    render(test.ui, { wrapper: test.Wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: 'Notification schema' }))
+    fireEvent.change(screen.getByRole('textbox'), {
+      target: { value: 'Notification schema v2' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await screen.findByRole('button', { name: 'Notification schema v2' })
+    expect(test.patches).toEqual([
+      { title: 'Notification schema v2', version: 1 },
+      { title: 'Notification schema v2', version: 2 },
+    ])
+    expect(test.stored().priority).toBe(1)
+  })
+})
 
 describe.each(['modal', 'full page'] as const)('Task description in %s', (view) => {
   it.each(['', '   '])(
@@ -192,6 +252,53 @@ describe.each(['modal', 'full page'] as const)('Task description in %s', (view) 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.getByRole('button', { name: 'Updated description' })).toBeTruthy()
     expect(test.patches).toEqual([{ description: 'Updated description', version: 1 }])
+  })
+})
+
+describe('Task detail description conflicts', () => {
+  it('keeps a cleared draft open and shows the current value after a same-field 409', async () => {
+    const test = setup('modal', { firstPatchConflict: 'description' })
+    render(test.ui, { wrapper: test.Wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: 'Original description' }))
+    const editor = screen.getByRole('textbox', { name: 'Markdown editor' })
+    fireEvent.change(editor, { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('Description from another client')
+    expect((editor as HTMLTextAreaElement).value).toBe('')
+    expect(screen.queryByRole('button', { name: 'Click to add a description…' })).toBeNull()
+    expect(test.patches).toEqual([{ description: '', version: 1 }])
+  })
+
+  it('preserves the draft when a live detail refresh changes the same field', async () => {
+    const test = setup('modal')
+    render(test.ui, { wrapper: test.Wrapper })
+    fireEvent.click(await screen.findByRole('button', { name: 'Original description' }))
+    const editor = screen.getByRole('textbox', { name: 'Markdown editor' })
+    fireEvent.change(editor, { target: { value: '' } })
+
+    act(() => {
+      client.setQueryData<TaskDetailResponse>(qk.taskDetail('task-1'), (current) =>
+        current
+          ? {
+              ...current,
+              task: {
+                ...current.task,
+                description: 'Description received over the live refresh',
+                version: current.task.version + 1,
+              },
+            }
+          : current,
+      )
+    })
+
+    await waitFor(() => expect((editor as HTMLTextAreaElement).value).toBe(''))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('Description received over the live refresh')
+    expect((editor as HTMLTextAreaElement).value).toBe('')
+    expect(test.patches).toEqual([])
   })
 })
 
