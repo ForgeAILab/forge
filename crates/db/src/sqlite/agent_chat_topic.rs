@@ -83,11 +83,7 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         .execute(&mut *tx)
         .await?;
         if !pending_exists {
-            super::logic_triggers::assign_topic_rotation_origin_in_tx(
-                &mut tx,
-                &input.topic.chat_id,
-            )
-            .await?;
+            assign_topic_rotation_origin_in_tx(&mut tx, &input.topic.chat_id).await?;
         }
         let id = sqlx::query_scalar("SELECT id FROM agent_chat_topic_rotation WHERE chat_id = ?")
             .bind(&input.topic.chat_id)
@@ -800,4 +796,101 @@ impl SqliteDb {
         .fetch_one(self.pool())
         .await?)
     }
+}
+
+/// A new rotation intent records the chat's newest live turn as its origin.
+pub(super) async fn assign_topic_rotation_origin_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    chat_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE agent_chat_topic_rotation
+         SET origin_turn_id = (
+             SELECT id FROM agent_chat_turn_job
+             WHERE chat_id = ? AND status IN ('leased', 'awaiting_input')
+             ORDER BY created_at DESC LIMIT 1
+         )
+         WHERE chat_id = ?",
+    )
+    .bind(chat_id)
+    .bind(chat_id)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// Marks the first pending automatic rotation for a chat whose responder is
+/// native; a pending intent (automatic or requested) is never overwritten.
+pub(super) async fn enqueue_native_topic_rotation_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    chat_id: Option<&str>,
+    label: &str,
+    cause: &str,
+    created_at: &str,
+) -> Result<bool> {
+    let Some(chat_id) = chat_id else {
+        return Ok(false);
+    };
+    let inserted = sqlx::query(
+        "INSERT OR IGNORE INTO agent_chat_topic_rotation (
+            chat_id, id, label, cause, created_at
+         )
+         SELECT ?, ?, ?, ?, ?
+         WHERE EXISTS (
+             SELECT 1
+             FROM agent_chat c
+             JOIN agent_identity i ON i.id = COALESCE(
+                 (SELECT b.identity_id FROM account_main_agent_binding b
+                  WHERE b.account_id = c.account_id AND b.state = 'active'),
+                 (SELECT b.identity_id FROM project_agent_binding b
+                  WHERE b.project_id = c.project_id AND b.state = 'active')
+             )
+             JOIN agent_profile p ON p.id = i.selected_profile_id
+             WHERE c.id = ? AND p.backend_kind = 'native'
+         )",
+    )
+    .bind(chat_id)
+    .bind(crate::new_uuid_v4())
+    .bind(label)
+    .bind(cause)
+    .bind(created_at)
+    .bind(chat_id)
+    .execute(&mut *connection)
+    .await?
+    .rows_affected()
+        > 0;
+    if inserted {
+        assign_topic_rotation_origin_in_tx(connection, chat_id).await?;
+    }
+    Ok(inserted)
+}
+
+/// A user message after eight idle hours (user/agent messages only, excluding
+/// the new one) marks an automatic rotation.
+pub(super) async fn enqueue_idle_topic_rotation_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    message_id: &str,
+    chat_id: &str,
+    author_type: &str,
+    created_at: &str,
+) -> Result<bool> {
+    if author_type != "user" {
+        return Ok(false);
+    }
+    let idle: Option<i64> = sqlx::query_scalar(
+        "SELECT julianday(?) - (
+             SELECT MAX(julianday(created_at)) FROM agent_chat_message
+             WHERE chat_id = ? AND id <> ? AND author_type IN ('user', 'agent')
+         ) >= 8.0 / 24.0",
+    )
+    .bind(created_at)
+    .bind(chat_id)
+    .bind(message_id)
+    .fetch_one(&mut *connection)
+    .await?;
+    if idle != Some(1) {
+        return Ok(false);
+    }
+    enqueue_native_topic_rotation_in_tx(connection, Some(chat_id), "After idle", "idle", created_at)
+        .await
 }

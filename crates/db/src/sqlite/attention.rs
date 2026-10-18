@@ -158,7 +158,7 @@ impl AttentionRepo for SqliteDb {
             .get_attention_in_tx(&mut tx, &input.id)
             .await?
             .ok_or(DbError::NotFound)?;
-        super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+        rearm_attention_wake_on_reopen_in_tx(
             &mut tx,
             &input.id,
             &previous.ok_or(DbError::NotFound)?.status,
@@ -304,7 +304,7 @@ impl SqliteDb {
             .transpose()?
             .ok_or(DbError::NotFound)?;
         if let Some((attention_id, previous_status)) = previous {
-            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+            rearm_attention_wake_on_reopen_in_tx(
                 tx,
                 &attention_id,
                 &previous_status,
@@ -816,7 +816,7 @@ impl SqliteDb {
             .execute(&mut *connection)
             .await?;
         if let Some((attention_id, previous_status)) = previous {
-            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+            rearm_attention_wake_on_reopen_in_tx(
                 connection,
                 &attention_id,
                 &previous_status,
@@ -852,7 +852,7 @@ impl SqliteDb {
                 .await?;
         let result = sqlx::query("INSERT INTO attention_projection (id, attention_type, scope_type, scope_id, source_event_id, priority, status, summary, details_json, dedupe_key, occurred_at, updated_at, recommended_action) VALUES (?, 'human_input_required', 'project', ?, ?, 80, 'open', ?, ?, ?, ?, ?, 'configure_environment') ON CONFLICT(dedupe_key) DO UPDATE SET status='open', summary=excluded.summary, details_json=excluded.details_json, updated_at=excluded.updated_at, resolved_at=NULL, version=attention_projection.version+1").bind(input.id).bind(input.project_id).bind(input.event_id).bind(input.summary).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).execute(&mut *connection).await?;
         if let Some((attention_id, previous_status)) = previous {
-            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+            rearm_attention_wake_on_reopen_in_tx(
                 connection,
                 &attention_id,
                 &previous_status,
@@ -977,7 +977,7 @@ impl SqliteDb {
         source_event_id = excluded.source_event_id, status = 'open', resolved_at = NULL, acknowledged_at = NULL, snoozed_until = NULL,
         updated_at = excluded.updated_at, version = attention_projection.version + 1").bind(input.id).bind(input.kind).bind(input.project_id).bind(input.event_id).bind(input.reason).bind(input.details_json).bind(input.dedupe_key).bind(input.occurred_at).bind(input.updated_at).bind(input.sequence).execute(&mut *connection).await?;
         if let Some((attention_id, previous_status)) = previous {
-            super::logic_triggers::rearm_attention_wake_on_reopen_in_tx(
+            rearm_attention_wake_on_reopen_in_tx(
                 connection,
                 &attention_id,
                 &previous_status,
@@ -1172,4 +1172,34 @@ impl SqliteDb {
             .bind(observed_at).bind(observed_at).bind(event).bind(project).bind(command).bind(observed_at).execute(self.pool()).await?;
         Ok(())
     }
+}
+
+/// Reopening a resolved Attention item re-arms its wakes: blockers held by a
+/// finished turn and the latest wake decision are cleared in the same transaction.
+pub(super) async fn rearm_attention_wake_on_reopen_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    attention_id: &str,
+    previous_status: &str,
+    current_status: &str,
+) -> Result<()> {
+    if previous_status != "resolved" || current_status == "resolved" {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "DELETE FROM agent_wake_blocker
+         WHERE attention_id = ?
+           AND turn_job_id IN (
+             SELECT id FROM agent_chat_turn_job
+             WHERE status IN ('succeeded', 'failed', 'cancelled')
+           )",
+    )
+    .bind(attention_id)
+    .execute(&mut *connection)
+    .await?;
+    sqlx::query("DELETE FROM agent_wake_attention_latest WHERE attention_id = ?")
+        .bind(attention_id)
+        .execute(connection)
+        .await?;
+    Ok(())
 }

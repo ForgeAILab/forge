@@ -131,7 +131,7 @@ impl ProjectRepo for SqliteDb {
             .bind(&input.updated_at)
             .execute(&mut *transaction)
             .await?;
-        super::logic_triggers::bootstrap_project_chat_and_binding_in_tx(
+        bootstrap_project_chat_and_binding_in_tx(
             &mut transaction,
             &input.id,
             &input.created_at,
@@ -2133,4 +2133,53 @@ impl SqliteDb {
                 .map(|row| WorkflowProjectAuthorityRow { row }),
         )
     }
+}
+
+/// Every Project gets its canonical Project Chat and setup-required binding in
+/// the transaction that creates it, before any binding is selected or replaced.
+pub(super) async fn bootstrap_project_chat_and_binding_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    project_id: &str,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agent_chat (
+            id, kind, account_id, project_id, status,
+            instruction_revision, message_count, version, created_at, updated_at
+         )
+         SELECT ?, 'project', NULL, ?, 'agent_setup_required', 0, 0, 1, ?, ?
+         WHERE NOT EXISTS (
+            SELECT 1 FROM agent_chat
+            WHERE kind = 'project' AND project_id = ?
+         )",
+    )
+    .bind(crate::new_uuid_v4())
+    .bind(project_id)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(project_id)
+    .execute(&mut *connection)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO project_agent_binding (
+            id, project_id, identity_id, profile_id, state,
+            autonomy_policy_json, permission_ceiling_json, subscriptions_json,
+            wake_budget, version, created_at, updated_at
+         )
+         SELECT ?, ?, NULL, NULL, 'agent_setup_required', '{}', '{}', '[]', 10, 1, ?, ?
+         WHERE NOT EXISTS (
+            SELECT 1 FROM project_agent_binding
+            WHERE project_id = ? AND state IN ('active', 'agent_setup_required')
+         )",
+    )
+    .bind(crate::new_uuid_v4())
+    .bind(project_id)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(project_id)
+    .execute(connection)
+    .await?;
+    Ok(())
 }

@@ -755,7 +755,7 @@ pub(super) async fn create_project_from_charter_approval(
     .execute(&mut *tx)
     .await
     .map_err(orchestration_write_error)?;
-    super::super::logic_triggers::bootstrap_project_chat_and_binding_in_tx(
+    super::super::project::bootstrap_project_chat_and_binding_in_tx(
         &mut tx,
         &input.project.id,
         &input.project.created_at,
@@ -1352,7 +1352,7 @@ pub(super) async fn create_project_from_charter_approval(
     .execute(&mut *tx)
     .await
     .map_err(orchestration_write_error)?;
-    super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+    super::super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
         &mut tx,
         Some(&main_chat_id),
         "After handoff",
@@ -1565,7 +1565,7 @@ pub(super) async fn create_project_from_charter_approval(
     if handed_off_genesis.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
     }
-    super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+    super::super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
         &mut tx,
         Some(&main_chat_id),
         "After Project handoff",

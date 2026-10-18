@@ -19,7 +19,7 @@ impl TaskMediaRepo for SqliteDb {
         .bind(&input.created_at)
         .execute(&mut *transaction)
         .await?;
-        super::logic_triggers::project_task_media_in_tx(&mut transaction, &input).await?;
+        project_task_media_in_tx(&mut transaction, &input).await?;
         let media = sqlx::query("SELECT * FROM task_media WHERE id = ?")
             .bind(&input.id)
             .fetch_one(&mut *transaction)
@@ -136,4 +136,88 @@ impl TaskMediaRepo for SqliteDb {
         transaction.commit().await?;
         Ok(media)
     }
+}
+
+/// Projects a new Task media row into the shared media model: its asset, the
+/// Task's asset id, the Task attachment, then the asset's reference state.
+pub(super) async fn project_task_media_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    input: &CreateTaskMedia,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO media_asset (
+            id, project_id, legacy_task_media_id, display_filename, content_type,
+            byte_size, storage_key, checksum, availability, gc_state,
+            created_at, updated_at
+         )
+         SELECT ?, t.project_id, ?, ?, ?, ?, ?, NULL, 'available', 'referenced', ?, ?
+         FROM task t WHERE t.id = ?",
+    )
+    .bind(&input.id)
+    .bind(&input.id)
+    .bind(&input.display_filename)
+    .bind(&input.content_type)
+    .bind(input.byte_size)
+    .bind(&input.storage_key)
+    .bind(&input.created_at)
+    .bind(&input.created_at)
+    .bind(&input.task_id)
+    .execute(&mut *connection)
+    .await?;
+
+    sqlx::query(
+        "UPDATE task_media
+         SET asset_id = COALESCE(
+             asset_id,
+             (SELECT id FROM media_asset WHERE storage_key = ? ORDER BY id LIMIT 1)
+         )
+         WHERE id = ?",
+    )
+    .bind(&input.storage_key)
+    .bind(&input.id)
+    .execute(&mut *connection)
+    .await?;
+
+    let attachment = sqlx::query(
+        "INSERT OR IGNORE INTO project_media_attachment (
+            id, project_id, asset_id, attachment_kind, task_media_id, task_id,
+            acceptance_check_ids_json, evidence_kind, availability,
+            project_url, author_type, author_id, authorization_json,
+            version, created_at, updated_at
+         )
+         SELECT
+            'task-media-attachment:' || ?, t.project_id, tm.asset_id, 'task', ?, ?, '[]',
+            CASE
+                WHEN ? LIKE 'image/%' THEN 'screenshot'
+                WHEN ? LIKE 'video/%' THEN 'walkthrough_video'
+                ELSE 'other'
+            END,
+            'available',
+            '/api/v1/projects/' || t.project_id || '/media/' || tm.asset_id,
+            ?, ?, '{}', 1, ?, ?
+         FROM task_media tm
+         JOIN task t ON t.id = tm.task_id
+         WHERE tm.id = ? AND tm.asset_id IS NOT NULL",
+    )
+    .bind(&input.id)
+    .bind(&input.id)
+    .bind(&input.task_id)
+    .bind(&input.content_type)
+    .bind(&input.content_type)
+    .bind(input.author_type.to_string())
+    .bind(input.author_id.as_deref())
+    .bind(&input.created_at)
+    .bind(&input.created_at)
+    .bind(&input.id)
+    .execute(&mut *connection)
+    .await?;
+    if attachment.rows_affected() > 0 {
+        let asset_id: String = sqlx::query_scalar("SELECT asset_id FROM task_media WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *connection)
+            .await?;
+        super::shared_media::reconcile_media_asset_in_tx(connection, &asset_id, &input.created_at)
+            .await?;
+    }
+    Ok(())
 }

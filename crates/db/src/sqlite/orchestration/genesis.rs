@@ -217,7 +217,7 @@ impl SqliteDb {
         .execute(&mut *connection)
         .await?;
         if result.rows_affected() > 0 {
-            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+            super::super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
                 connection,
                 Some(input.chat_id),
                 "Product Genesis",
@@ -468,7 +468,7 @@ impl SqliteDb {
         .execute(&mut *connection)
         .await?;
         if result.rows_affected() > 0 {
-            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+            super::super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
                 connection,
                 Some(input.chat_id),
                 "Product Genesis",
@@ -549,7 +549,7 @@ impl SqliteDb {
                     .bind(input.session_id)
                     .fetch_one(&mut *transaction)
                     .await?;
-            super::super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+            super::super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
                 &mut transaction,
                 chat_id.as_deref(),
                 "After Project handoff",

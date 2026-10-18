@@ -8161,12 +8161,25 @@ New database logic triggers are not allowed. Constraint/validation guards stay
 in SQLite. The remaining logic-trigger families are intentional projections or
 invalidations that must observe every writer: G02 memory FTS; G07 Task
 notification outbox; G08 board/list revisions; G09 status epoch; G10–G13
-scheduler dirty generations and wait-age; and G14 usage-read watermarks. Owner
-chat bootstrap, pricing account-delete sentinels, Attention reopen wake rearm,
-Main Chat topic rotation, and media projection/GC now live in the
-transaction-scoped helpers in `sqlite/logic_triggers.rs`, `sqlite/user_auth.rs`,
-`sqlite/attention.rs`, `sqlite/agent_chat_topic.rs`, `sqlite/task_media.rs`, and
-`sqlite/shared_media.rs`.
+scheduler dirty generations and wait-age; and G14 usage-read watermarks.
+
+Five former logic triggers (dropped by V202610180752–V202610180820) are now
+repository code that runs in the source writer's transaction. A trigger saw
+every writer; this code sees only the writers that call it, so any new
+statement that writes one of these source rows must go through the named
+writer or call its helper:
+
+| Behaviour | Source write | Where it lives (`crates/db/src/sqlite/`) |
+|---|---|---|
+| Account Main Chat bootstrap | insert `user` | `user_auth.rs` `create_user` → `bootstrap_account_main_chat_in_tx` |
+| Project Chat and setup binding | insert `project` | `project.rs` `bootstrap_project_chat_and_binding_in_tx`, called by `ProjectRepo` creation and Charter-approval Project creation |
+| Pricing account-deletion sentinel | delete `user` | `user_auth.rs` `delete_user` |
+| Attention reopen wake rearm | `attention_projection.status` from `resolved` to anything else, including upserts | `attention.rs` `rearm_attention_wake_on_reopen_in_tx` |
+| Main Chat topic rotation and its origin turn | insert `product_genesis_session`, Genesis `lifecycle` to `handed_off`, insert `agent_handoff`, user `agent_chat_message`, insert `agent_chat_topic_rotation` | `agent_chat_topic.rs` `enqueue_native_topic_rotation_in_tx`, `enqueue_idle_topic_rotation_in_tx`, `assign_topic_rotation_origin_in_tx` |
+| Task media projection and GC state | insert `task_media`, soft delete of `task_media`, insert `project_media_attachment` or `project_release_media_pin` | `task_media.rs` `project_task_media_in_tx` and `soft_delete_media`; `shared_media.rs` `reconcile_media_asset_in_tx` |
+
+Out-of-tree writers follow the same rule: `scripts/perf_fixture.py` writes the
+Project Chat and setup binding for the Projects it inserts with raw SQL.
 
 SQLite has one writer. Every transaction that writes begins with
 `db::begin_immediate`, which records where it began until it commits or rolls

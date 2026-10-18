@@ -1062,7 +1062,7 @@ impl AgentHandoffRepo for SqliteDb {
         .execute(&mut *transaction)
         .await
         .map_err(map_chat_write_error)?;
-        super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+        super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
             &mut transaction,
             Some(&input.source_chat_id),
             "After handoff",
@@ -2000,7 +2000,7 @@ impl AgentChatTransactionRepo for SqliteDb {
         if handoff.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
-        super::logic_triggers::enqueue_native_topic_rotation_in_tx(
+        super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
             &mut transaction,
             Some(&input.handoff.source_chat_id),
             "After handoff",
@@ -2295,7 +2295,7 @@ pub(super) async fn insert_chat_message(
     .execute(&mut **transaction)
     .await
     .map_err(map_chat_write_error)?;
-    super::logic_triggers::enqueue_idle_topic_rotation_in_tx(
+    super::agent_chat_topic::enqueue_idle_topic_rotation_in_tx(
         transaction,
         &input.id,
         &input.chat_id,
