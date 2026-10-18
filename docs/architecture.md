@@ -2381,6 +2381,16 @@ live diagnostic window therefore preserves the same canonical state identity.
 Forge links context provenance from the latest manifest in the live session
 after the turn; it does not reconstruct historical replay from a checkpoint.
 
+The runtime pin is v0.5.0 (`82f5aac`). Its materialized session snapshots stay
+unversioned and its checkpoints remain schema 3 / transition revision 4, so
+Forge keeps the same encrypted store and database schema. Runtime schema-4
+SessionJournal support is only a capability contract in this release; Forge's
+stores do not advertise it, and continue writing materialized snapshots and
+checkpoints. The opt-in flat semantic summary and external-agent features are
+also not configured. Forge retains its per-tool argument normalizers: the
+runtime turns a representable schema-invalid call into a correctable tool error,
+but does not apply Forge's historical `parameters`-envelope transformation.
+
 Native turn failures project runtime failure classes into Forge's existing
 typed categories: policy denial, context overflow, authentication, quota,
 provider-stage request rejection, and typed turn limits retain their evidence.
@@ -2475,6 +2485,14 @@ seeds are sealed in the protected store.
 U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
 a Forge policy-revision bump. Strict binding and authorization mismatches still
 fail closed.
+
+Runtime v0.5.0 changes the deterministic fallback algorithm revision from
+`agent-runtime-lcm-2` to `agent-runtime-lcm-3`. Resume rebuilds only derived
+metadata from the authorized active DAG; existing entries, nodes and fallback
+text remain immutable. The runtime can also discard a proven uncheckpointed
+tail through Forge's existing claim-fenced `truncate_from` implementation, and
+finalizes abandoned non-terminal checkpoints before admitting explicit new work
+without replaying indeterminate provider or tool effects.
 
 Within a topic, a full `project.current_state` or `project.charter` result carries
 a unique `read_ref`, and an unchanged repeat returns

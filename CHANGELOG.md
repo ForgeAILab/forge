@@ -85,6 +85,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
+  `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
+  and SQLite LCM timelines resume without a database migration; persisted
+  `agent-runtime-lcm-2` derived state rebuilds for the `-3` fallback algorithm
+  while retaining old nodes and text. Interrupted turns and proven
+  uncheckpointed LCM tails have the runtime's newer no-replay recovery, and a
+  schema-invalid object tool call is returned to the model as a correctable tool
+  error instead of failing the whole turn. Forge keeps native journals, external
+  agents and the flat semantic-summary alternative disabled, and retains its
+  per-tool `parameters` envelope normalizer because the runtime does not perform
+  that host-specific transformation.
 - Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
   lowercase variants, provider probes and connection tests, public search,
   native provider requests, fetch, and network-capable child processes. Target
