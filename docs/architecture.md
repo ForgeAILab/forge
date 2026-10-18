@@ -285,14 +285,21 @@ shared client policy for provider connection tests/health probes, native
 provider requests, fetch and public search. It resolves and validates the target
 before any connection, pins direct requests, disables automatic redirects, and
 uses a per-build proxy environment snapshot with reqwest's own proxy matcher.
-A set but unusable applicable value (`HTTPS_PROXY`, else `ALL_PROXY`) refuses
-the request (`PublicHttpError::UnusableProxy`) instead of falling through to
+Unless `NO_PROXY=*` disables proxies, a set but unusable applicable value
+(`HTTPS_PROXY`, else `ALL_PROXY`) refuses the request
+(`PublicHttpError::UnusableProxy`) instead of falling through to
 the other variable or a direct connection.
-`NO_PROXY` matches use the direct pinned path. An operator-configured proxy's
+`NO_PROXY` matches use the direct pinned path. A `*` entry anywhere in its
+comma-separated list, with optional surrounding whitespace, disables proxies
+for every target, including literal IPv4/IPv6 addresses, matching curl.
+Other exclusion forms retain reqwest's semantics. An operator-configured proxy's
 address is not target-validated; CONNECT retains target SNI/Host, but the proxy
 resolves the name itself, so pinning cannot hold through that proxy. Proxy
 userinfo is removed from URLs and carried only in sensitive authentication
-headers. See [outbound proxies](getting-started.md#outbound-proxies).
+headers. Public search shares one timeout budget between local resolution and
+the HTTP request. Check receipts redact credentialed operator proxy URLs,
+their percent-decoded Basic authentication tokens, and all
+`Proxy-Authorization:` header values. See [outbound proxies](getting-started.md#outbound-proxies).
 
 The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
 `prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with

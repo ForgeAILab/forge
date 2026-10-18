@@ -4042,16 +4042,34 @@ async fn public_search_http_client(
     timeout: Duration,
     proxies: &ProxyEnvironment,
 ) -> Result<reqwest::Client, AgentHostError> {
-    tokio::time::timeout(
+    public_search_http_client_with_builder(
         timeout,
         public_http_client_builder(endpoint, PublicAddressPolicy::Search, proxies),
     )
     .await
-    .map_err(|_| AgentHostError::Runtime("public search resolution timed out".to_owned()))?
-    .map_err(public_search_egress_refusal)?
-    .timeout(timeout)
-    .build()
-    .map_err(|_| AgentHostError::Configuration("public search client unavailable".to_owned()))
+}
+
+/// Keep resolution and the subsequent request within one budget. The future
+/// seam lets tests spend resolution time without performing external DNS.
+async fn public_search_http_client_with_builder(
+    timeout: Duration,
+    builder: impl std::future::Future<Output = Result<reqwest::ClientBuilder, PublicHttpError>>,
+) -> Result<reqwest::Client, AgentHostError> {
+    let started = tokio::time::Instant::now();
+    let builder = tokio::time::timeout(timeout, builder)
+        .await
+        .map_err(|_| AgentHostError::Runtime("public search resolution timed out".to_owned()))?
+        .map_err(public_search_egress_refusal)?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(AgentHostError::Runtime(
+            "public search resolution timed out".to_owned(),
+        ));
+    }
+    builder
+        .timeout(remaining)
+        .build()
+        .map_err(|_| AgentHostError::Configuration("public search client unavailable".to_owned()))
 }
 
 /// A lookup failure is a runtime failure of this request, as it was when
@@ -7615,6 +7633,51 @@ mod proxy_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn public_search_timeout_shares_resolution_and_request_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/search", listener.local_addr().unwrap());
+        let timeout = Duration::from_secs(1);
+        let started = tokio::time::Instant::now();
+        let client = public_search_http_client_with_builder(timeout, async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            Ok(reqwest::Client::builder().no_proxy())
+        })
+        .await
+        .unwrap();
+        let request = async {
+            let error = client.get(endpoint).send().await.unwrap_err();
+            assert!(error.is_timeout());
+        };
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Keep the local connection open without sending a response.
+            std::future::pending::<()>().await;
+            drop(stream);
+        };
+        tokio::select! {
+            () = request => {}
+            () = server => panic!("server must wait for the request timeout"),
+        }
+        assert!(
+            started.elapsed() <= timeout + Duration::from_millis(10),
+            "resolution must consume part of the request budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_search_timeout_refuses_exhausted_budget() {
+        let error = public_search_http_client_with_builder(Duration::ZERO, async {
+            // Timeout polls a ready resolver before its timer. An exhausted
+            // budget must still refuse building a client.
+            Ok(reqwest::Client::builder().no_proxy())
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AgentHostError::Runtime(message)
+            if message == "public search resolution timed out"));
+    }
 
     #[tokio::test]
     async fn public_search_uses_environment_proxy() {

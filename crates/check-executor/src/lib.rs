@@ -3,6 +3,7 @@ mod failures;
 pub use failures::strip_ansi;
 
 use api_types::*;
+use base64::Engine;
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -323,12 +324,23 @@ fn redacted(
             }
         }
     }
-    let text = executors::environment::redact_environment_values(&text, env);
+    let text = redact_check_output(&text, env);
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
 }
+/// Curl's verbose output includes this header, including authentication
+/// methods and credentials that need not appear in the proxy URL snapshot.
+fn redact_check_output(text: &str, env: &BTreeMap<String, String>) -> String {
+    static PROXY_AUTHORIZATION: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)(\bproxy-authorization:[\t ]*)[^\r\n]*").unwrap()
+        });
+    let text = PROXY_AUTHORIZATION.replace_all(text, "${1}[REDACTED]");
+    executors::environment::redact_environment_values(&text, env)
+}
 /// Redaction values for a check's output: the Project's values plus every
-/// operator proxy URL that carries credentials. Those reach the child too
+/// operator proxy URL that carries credentials, its decoded userinfo, and its
+/// Basic authentication token. Those reach the child too
 /// (cleared policies receive the proxy variables explicitly, the others
 /// inherit them), and a step that prints one must not persist it.
 fn with_operator_proxy_credentials(
@@ -349,6 +361,20 @@ fn with_operator_proxy_credentials(
         // Keys no Project can declare, so a Project value is never replaced.
         if !userinfo.is_empty() {
             env.insert(format!("\0proxy-userinfo:{key}"), userinfo.to_owned());
+            // Curl decodes each URL component before encoding username:password.
+            // Work in bytes so non-UTF-8 percent escapes keep their exact token.
+            let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+            let mut credentials =
+                percent_encoding::percent_decode_str(username).collect::<Vec<_>>();
+            credentials.push(b':');
+            credentials.extend(percent_encoding::percent_decode_str(password));
+            env.insert(
+                format!("\0proxy-basic:{key}"),
+                base64::engine::general_purpose::STANDARD.encode(&credentials),
+            );
+            if let Ok(decoded) = String::from_utf8(credentials) {
+                env.insert(format!("\0proxy-decoded-userinfo:{key}"), decoded);
+            }
         }
         env.insert(format!("\0proxy:{key}"), value);
     }
@@ -1117,8 +1143,8 @@ pub fn command_outcome(
     started_at: String,
     finished_at: String,
 ) -> CheckCommandOutcome {
-    let stderr = executors::environment::redact_environment_values(&strip_ansi(output.stderr), env);
-    let stdout = executors::environment::redact_environment_values(&strip_ansi(output.stdout), env);
+    let stderr = redact_check_output(&strip_ansi(output.stderr), env);
+    let stdout = redact_check_output(&strip_ansi(output.stdout), env);
     let combined = if stdout.is_empty() {
         stderr.clone()
     } else if stderr.is_empty() {

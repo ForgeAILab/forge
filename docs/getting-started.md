@@ -345,11 +345,14 @@ precedence over lowercase, even when the uppercase value is empty; a set HTTPS
 proxy takes precedence over the all-protocol proxy, and an empty HTTPS value
 falls back to it. `NO_PROXY` supports
 hostname/domain matches (an entry also matches its subdomains), literal IPs,
-CIDR ranges and `*`; matching targets take the direct path. As in reqwest
-(unlike curl), `*` and domain entries never match a literal-IP target (list the
-IP or a CIDR range), and entries carrying a port or IPv6 brackets match
-nothing. A proxy value that is set but is not a usable `http://`
-or `https://` proxy URL (unparseable, or another scheme such as `socks5h://`)
+CIDR ranges and `*`; matching targets take the direct path. As in curl, a `*`
+entry anywhere in the comma-separated list (with optional surrounding whitespace)
+disables proxies for every target, including literal IPv4 and IPv6 addresses.
+Other forms follow reqwest: domain entries never match literal-IP targets
+(list the IP or a CIDR range), and entries carrying a port or IPv6 brackets
+match nothing. Unless `NO_PROXY=*` disables proxies, a proxy value that is set
+but is not a usable `http://` or `https://` proxy URL (unparseable, or another
+scheme such as `socks5h://`)
 fails closed: every such request is refused with an error naming the
 variables, never sent through the other variable or directly.
 
@@ -375,8 +378,10 @@ receive all eight standard variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
 `NO_PROXY`, and their lowercase variants). Existing command/Project overrides
 keep their precedence; an override in either case replaces both cases of that
 variable, since tools disagree on which case wins. Review/verify check output masks any operator proxy URL
-that carries credentials (and its `user:password` part) as `[REDACTED]`, like
-Project values; an agent's own Task command can still read the variables it is
+that carries credentials, its `user:password` part, and the standard base64
+token of its percent-decoded credentials as `[REDACTED]`, like
+Project values. All `Proxy-Authorization:` header values are also masked;
+an agent's own Task command can still read the variables it is
 given. Set these variables in the environment of each Forge server or daemon
 that executes network operations.
 

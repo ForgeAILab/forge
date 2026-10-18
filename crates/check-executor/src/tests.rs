@@ -1392,3 +1392,107 @@ async fn operator_proxy_credentials_are_redacted_from_check_output() {
         assert!(!text.contains("leaked-secret"), "{policy}");
     }
 }
+
+#[tokio::test]
+async fn proxy_basic_tokens_and_authorization_headers_are_redacted_from_receipts() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_BASIC_REDACTION_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::proxy_basic_tokens_and_authorization_headers_are_redacted_from_receipts",
+            ])
+            .env(MARKER, "1")
+            .env(
+                "HTTPS_PROXY",
+                "http://%70roxy-user:p%40ss%3Asecret@127.0.0.1:9",
+            )
+            .env("all_proxy", "http://other-user:other-secret@127.0.0.1:9")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "proxy Basic redaction child fixture failed"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    // Generate the tokens inside the step, so the receipt's command text does
+    // not itself contain a token. Decode the URL escapes curl would decode.
+    let script = r#"
+        credentials=${HTTPS_PROXY#*://}; credentials=${credentials%@*}
+        credentials=${credentials//%70/p}
+        credentials=${credentials//%40/@}
+        credentials=${credentials//%3A/:}
+        token=$(printf '%s' "$credentials" | base64 | tr -d '\n')
+        credentials=${all_proxy#*://}; credentials=${credentials%@*}
+        other=$(printf '%s' "$credentials" | base64 | tr -d '\n')
+        unknown=$(printf 'unlisted:header-secret' | base64 | tr -d '\n')
+        printf '%s\n%s\n' "$token" "$other"
+        printf '> Proxy-Authorization: Basic %s\r\n' "$unknown" >&2
+        printf 'proxy-AUTHORIZATION:\tDigest header-only-secret\n' >&2
+        printf 'test %s ... FAILED\n' "$token"
+        printf 'test Proxy-Authorization: Basic %s ... FAILED\n' "$unknown"
+        printf 'ordinary-output\n'
+        exit 1
+    "#;
+    for policy in ["owner-check/1", CANONICAL_CI_POLICY] {
+        let receipt = run_command(
+            temp.path(),
+            &step(script),
+            &BTreeMap::new(),
+            policy,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &CancellationToken::new(),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.outcome, CheckExecutionOutcome::Failed, "{policy}");
+        let text = serde_json::to_string(&receipt).unwrap();
+        for credentials in [
+            "proxy-user:p@ss:secret",
+            "other-user:other-secret",
+            "unlisted:header-secret",
+        ] {
+            let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+            assert!(!text.contains(&token), "{policy}: token leaked");
+        }
+        assert!(!receipt.stderr_tail.contains("header-only-secret"));
+        assert!(receipt
+            .stderr_tail
+            .contains("> Proxy-Authorization: [REDACTED]"));
+        assert!(receipt
+            .stderr_tail
+            .contains("proxy-AUTHORIZATION:\t[REDACTED]"));
+        assert!(receipt.stdout_tail.contains("ordinary-output"));
+        assert!(!receipt.failures.is_empty());
+    }
+}
+
+#[test]
+fn operator_proxy_basic_tokens_decode_userinfo_for_all_proxy_variables() {
+    for key in executors::run_process::PROXY_ENV_KEYS {
+        for (userinfo, credentials) in [
+            (
+                "%70roxy-user:p%40ss%3Asecret",
+                b"proxy-user:p@ss:secret".as_slice(),
+            ),
+            ("username", b"username:".as_slice()),
+            (":password", b":password".as_slice()),
+            ("user:%FF", b"user:\xff".as_slice()),
+        ] {
+            let env = with_operator_proxy_credentials(BTreeMap::new(), |name| {
+                (name == key).then(|| format!("http://{userinfo}@127.0.0.1:9"))
+            });
+            let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+            assert_eq!(
+                redacted(token.as_bytes(), false, false, &env, 512).0,
+                "[REDACTED]",
+                "{key}"
+            );
+        }
+    }
+}

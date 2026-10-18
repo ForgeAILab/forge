@@ -13,10 +13,12 @@ use hyper_util::client::proxy::matcher::Matcher;
 pub const UNUSABLE_PROXY_MESSAGE: &str = "public request refuses an unusable HTTPS_PROXY/ALL_PROXY \
      value: only http:// and https:// proxy URLs are supported";
 
-/// A per-client snapshot, using reqwest's own system-proxy matcher and precedence.
+/// A per-client snapshot, using reqwest's system-proxy matcher and precedence,
+/// with curl's `NO_PROXY=*` override for every target, including literal IPs.
 /// Deliberately has no Debug implementation: proxy configuration can hold secrets.
 pub struct ProxyEnvironment {
     matcher: Matcher,
+    bypass_all: bool,
     /// The value that applies to https targets is set but unusable.
     unusable: bool,
 }
@@ -25,6 +27,7 @@ impl Default for ProxyEnvironment {
     fn default() -> Self {
         Self {
             matcher: Matcher::builder().build(),
+            bypass_all: false,
             unusable: false,
         }
     }
@@ -41,6 +44,7 @@ impl ProxyEnvironment {
         let https = first("HTTPS_PROXY", "https_proxy");
         let all = first("ALL_PROXY", "all_proxy");
         let no = first("NO_PROXY", "no_proxy");
+        let bypass_all = no.split(',').any(|entry| entry.trim() == "*");
         // The matcher would quietly skip an unparseable or unsupported value,
         // falling through to ALL_PROXY or to a direct connection. Forge fails
         // closed instead: the value that applies to https targets must be usable.
@@ -48,11 +52,15 @@ impl ProxyEnvironment {
         let unusable = !applicable.is_empty() && !usable_proxy(applicable);
         Self {
             matcher: Matcher::builder().https(https).all(all).no(no).build(),
+            bypass_all,
             unusable,
         }
     }
 
     fn proxy_for(&self, url: &url::Url) -> Result<Option<reqwest::Proxy>, PublicHttpError> {
+        if self.bypass_all {
+            return Ok(None);
+        }
         if self.unusable {
             return Err(PublicHttpError::UnusableProxy);
         }
@@ -412,6 +420,7 @@ pub(crate) mod proxy_tests {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| (*value).to_owned())
             });
+            env.proxy_for(url).unwrap()?;
             let uri = url.as_str().parse().unwrap();
             env.matcher
                 .intercept(&uri)
@@ -476,12 +485,12 @@ pub(crate) mod proxy_tests {
             );
         }
         assert!(selected(&[], &target).is_none());
-        // reqwest's matcher, not curl's: `*` and domain entries never match a
-        // literal IP target, and entries with a port or IPv6 brackets match nothing.
+        // Forge uses curl's wildcard semantics. Other exclusions retain
+        // reqwest's rules: ports and IPv6 brackets match nothing.
         let literal = url::Url::parse("https://93.184.215.14/x").unwrap();
         let v6 = url::Url::parse("https://[2606:4700::1]/x").unwrap();
         for (exclusion, url, bypassed) in [
-            ("*", &literal, false),
+            ("*", &literal, true),
             ("api.example.test:443", &target, false),
             ("[2606:4700::1]", &v6, false),
             ("2606:4700::1", &v6, true),
@@ -503,6 +512,34 @@ pub(crate) mod proxy_tests {
         }
         // Plaintext HTTP_PROXY never applies to these https targets.
         assert!(selected(&[("HTTP_PROXY", "http://127.0.0.1:1234")], &target).is_none());
+    }
+
+    #[test]
+    fn no_proxy_wildcard_bypasses_every_target() {
+        for key in ["NO_PROXY", "no_proxy"] {
+            for exclusion in ["*", "  * \t", "other.test, * , example.test"] {
+                for proxy in ["http://127.0.0.1:9", "socks5h://127.0.0.1:9"] {
+                    let proxies = ProxyEnvironment::from_vars(|name| match name {
+                        "HTTPS_PROXY" => Some(proxy.to_owned()),
+                        name if name == key => Some(exclusion.to_owned()),
+                        _ => None,
+                    });
+                    for target in [
+                        "https://api.example.test/x",
+                        "https://93.184.215.14/x",
+                        "https://[2606:4700::1]/x",
+                    ] {
+                        assert!(
+                            proxies
+                                .proxy_for(&url::Url::parse(target).unwrap())
+                                .unwrap()
+                                .is_none(),
+                            "{key}={exclusion}, {target}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -542,8 +579,11 @@ pub(crate) mod proxy_tests {
                     ("HTTPS_PROXY", unusable.clone()),
                     ("ALL_PROXY", valid.clone()),
                 ],
-                // NO_PROXY does not turn a misconfiguration into a direct path.
-                vec![("HTTPS_PROXY", unusable.clone()), ("NO_PROXY", "*".into())],
+                // Specific exclusions retain the fail-closed configuration check.
+                vec![
+                    ("HTTPS_PROXY", unusable.clone()),
+                    ("NO_PROXY", "93.184.215.14".into()),
+                ],
             ] {
                 let error = build(values).await.expect_err(&unusable);
                 assert!(
@@ -565,6 +605,8 @@ pub(crate) mod proxy_tests {
             vec![("HTTPS_PROXY", "https://127.0.0.1:9".into())],
             vec![("HTTPS_PROXY", "127.0.0.1:9".into())],
             vec![("HTTP_PROXY", "ftp://x".into())],
+            // Curl's wildcard disables proxies altogether, even unusable ones.
+            vec![("HTTPS_PROXY", "ftp://x".into()), ("NO_PROXY", "*".into())],
         ] {
             assert!(build(values).await.is_ok());
         }

@@ -658,9 +658,11 @@ name = "check-executor"
 version = "0.14.0"
 dependencies = [
  "api-types",
+ "base64",
  "chrono",
  "executors",
  "git",
+ "percent-encoding",
  "process-supervisor",
  "quick-xml",
  "regex",
