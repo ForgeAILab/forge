@@ -1153,7 +1153,7 @@ async fn supervisor_backoff_resets_after_a_healthy_period() {
 async fn worker_runtime_migration_removes_only_memory_delivery_metadata() {
     let db = database().await;
     let event = append(&db, "wanted", "legacy").await;
-    for name in [crate::memory_consumer_name(), "unmigrated"] {
+    for name in [crate::test_support::memory_consumer_name(), "unmigrated"] {
         legacy_delivery(&db, name).await;
         sqlx::query("INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at) VALUES (?, ?, ?, ?)")
             .bind(name).bind(&event.id).bind(&event.id).bind(db::now_rfc3339()).execute(db.pool()).await.unwrap();
@@ -1175,7 +1175,7 @@ async fn worker_runtime_migration_removes_only_memory_delivery_metadata() {
     for table in ["event_processing_lease", "event_projection_receipt"] {
         let query = format!("SELECT COUNT(*) FROM {table} WHERE consumer_name = ?");
         let memory: i64 = sqlx::query_scalar(&query)
-            .bind(crate::memory_consumer_name())
+            .bind(crate::test_support::memory_consumer_name())
             .fetch_one(db.pool())
             .await
             .unwrap();

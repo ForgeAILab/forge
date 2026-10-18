@@ -109,7 +109,7 @@ async fn test_app(workspace_root: &Path) -> Harness {
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
     let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));

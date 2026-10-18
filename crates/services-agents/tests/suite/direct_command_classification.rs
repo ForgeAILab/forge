@@ -6,6 +6,7 @@
 //! writes and `task.propose` must use a direct command receipt, and
 //! consequential/denied operations must stop at the policy boundary.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use db::{

@@ -1,8 +1,8 @@
-use crate::provider_credentials::{
-    default_api_key_base_url, entry_base_url, validate_provider_url_shape,
-};
 use operation_registry::authority::permission_set;
-use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
+use services::provider_credentials::{
+    default_api_key_base_url, entry_base_url, provider_url_addresses, validate_provider_url_shape,
+};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use cli_adapters::codex::codex_reasoning_efforts_for_model;
 #[cfg(test)]
@@ -22,8 +22,8 @@ use db::{
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
 use forge_agent_host::outbound_http::{
-    public_http_client_builder, resolve_public_url, ProxyEnvironment, PublicAddressPolicy,
-    PublicHttpError, UNUSABLE_PROXY_MESSAGE,
+    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy, PublicHttpError,
+    UNUSABLE_PROXY_MESSAGE,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
@@ -476,7 +476,7 @@ impl EmbeddedAgentService {
     /// Resolve the Project Agent's workspace, provisioning it on first use.
     pub async fn project_agent_workspace(&self, project_id: &str) -> Option<std::path::PathBuf> {
         let (_, workspaces_root) = self.workspace_roots()?;
-        match crate::task_service::project_agent_workspace::ensure_project_agent_workspace(
+        match crate::task_service::ensure_project_agent_workspace(
             &self.db,
             &workspaces_root,
             project_id,
@@ -499,12 +499,7 @@ impl EmbeddedAgentService {
     /// all: it is where Main and its inquiries keep findings and notes.
     pub async fn main_agent_workspace(&self, account_id: &str) -> Option<std::path::PathBuf> {
         let (_, workspaces_root) = self.workspace_roots()?;
-        match crate::task_service::workspace::ensure_main_agent_workspace(
-            &workspaces_root,
-            account_id,
-        )
-        .await
-        {
+        match crate::task_service::ensure_main_agent_workspace(&workspaces_root, account_id).await {
             Ok(workspace) => Some(workspace),
             // Main still works without a scratch directory; it just cannot
             // keep notes or dispatch an inquiry. Log rather than swallow.
@@ -523,7 +518,7 @@ impl EmbeddedAgentService {
         inquiry_id: &str,
     ) -> Option<std::path::PathBuf> {
         let (_, workspaces_root) = self.workspace_roots()?;
-        match crate::task_service::workspace::ensure_inquiry_workspace(
+        match crate::task_service::ensure_inquiry_workspace(
             &workspaces_root,
             account_id,
             inquiry_id,
@@ -2463,16 +2458,6 @@ fn rfc3339_from_unix_seconds(seconds: i64) -> Option<String> {
 
 fn now_unix_seconds() -> i64 {
     chrono::Utc::now().timestamp()
-}
-
-pub(crate) async fn provider_url_addresses(
-    base_url: &str,
-) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
-    let parsed = validate_provider_url_shape(base_url)?;
-    let addresses = resolve_public_url(&parsed, PublicAddressPolicy::Provider)
-        .await
-        .map_err(provider_egress_refusal)?;
-    Ok((parsed, addresses))
 }
 
 /// The caller-facing reason for a refused provider endpoint. An unresolvable

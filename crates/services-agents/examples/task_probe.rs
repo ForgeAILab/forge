@@ -6,7 +6,7 @@ use std::sync::Arc;
 use db::{create_sqlite_pool, SqliteDb};
 use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
 use serde_json::json;
-use services::CoordinationToolProvider;
+use services_agents::CoordinationToolProvider;
 
 const TASKS: &[(&str, &str)] = &[
     ("Scaffold app shell and localStorage state module", "Create the client-only application shell with a reactive state module that reads and writes the todo list to localStorage (plan item pi-1)."),

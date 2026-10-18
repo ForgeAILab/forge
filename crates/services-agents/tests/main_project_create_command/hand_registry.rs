@@ -1,8 +1,8 @@
 //! Literal hand-path receipts from 33e2a974, reached via the real approved
 //! Charter/create fixture above and the native milestone-definition command.
 use super::*;
+use crate::forge_services::CoordinationToolProvider;
 use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
-use services::CoordinationToolProvider;
 
 const POLICY: &str = r#"{"permissions":["read_project","read_agent_chat","propose_project","propose_discovery","read_account","handoff"]}"#;
 
@@ -104,7 +104,7 @@ async fn replay_case(operation: &str) {
     let path = temp.path().join("checkpoint.sqlite");
     std::fs::write(
         &path,
-        include_bytes!("../fixtures/hand_registry_base.sqlite"),
+        include_bytes!("../../../services/tests/fixtures/hand_registry_base.sqlite"),
     )
     .unwrap();
     let db = Arc::new(SqliteDb::new(
@@ -112,8 +112,10 @@ async fn replay_case(operation: &str) {
             .await
             .unwrap(),
     ));
-    let checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let case = &checkpoint[operation];
     let call_scope = scope(
         case["scope_id"].as_str().unwrap(),
@@ -171,7 +173,7 @@ async fn evidence_replays_literal_hand_receipt() {
 async fn open_checkpoint(path: &std::path::Path) -> Arc<SqliteDb> {
     std::fs::write(
         path,
-        include_bytes!("../fixtures/hand_registry_base.sqlite"),
+        include_bytes!("../../../services/tests/fixtures/hand_registry_base.sqlite"),
     )
     .unwrap();
     Arc::new(SqliteDb::new(
@@ -276,8 +278,10 @@ async fn evidence_attach_and_authority_match_hand_base() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("checkpoint.sqlite");
     let db = open_checkpoint(&path).await;
-    let mut checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let mut checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     if let Some(dir) = std::env::var_os("FORGE_E2_CAPTURE_DIR").map(PathBuf::from) {
         let original = &checkpoint["project.evidence"];
         let mut arguments = original["arguments"].clone();
@@ -412,8 +416,10 @@ async fn adoption_and_amendment_replay_literal_hand_receipts() {
         replay_case("project.charter.adoption.setup").await;
         let temp = tempfile::tempdir().unwrap();
         let db = open_checkpoint(&temp.path().join("checkpoint.sqlite")).await;
-        let checkpoint: Value =
-            serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+        let checkpoint: Value = serde_json::from_str(include_str!(
+            "../../../services/tests/fixtures/hand_registry_base.json"
+        ))
+        .unwrap();
         let actual = authority_table(
             db,
             &checkpoint["project.charter.adoption"],
@@ -426,8 +432,10 @@ async fn adoption_and_amendment_replay_literal_hand_receipts() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("checkpoint.sqlite");
     let db = open_checkpoint(&path).await;
-    let mut checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let mut checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let project_id = checkpoint["project_id"].as_str().unwrap().to_owned();
     let version: i64 = sqlx::query_scalar("SELECT version FROM project_charter WHERE id=?")
         .bind(CHARTER_ID)
@@ -499,8 +507,10 @@ async fn main_draft_replays_literal_hand_receipt() {
         replay_case("charter.draft").await;
         let temp = tempfile::tempdir().unwrap();
         let db = open_checkpoint(&temp.path().join("checkpoint.sqlite")).await;
-        let checkpoint: Value =
-            serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+        let checkpoint: Value = serde_json::from_str(include_str!(
+            "../../../services/tests/fixtures/hand_registry_base.json"
+        ))
+        .unwrap();
         assert_eq!(
             authority_table(db, &checkpoint["charter.draft"], temp.path().join("media")).await,
             checkpoint["charter.draft"]["authority"]
@@ -510,8 +520,10 @@ async fn main_draft_replays_literal_hand_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("checkpoint.sqlite");
     let db = open_checkpoint(&path).await;
-    let mut checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let mut checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let main_chat: String =
         sqlx::query_scalar("SELECT id FROM agent_chat WHERE kind='account_main'")
             .fetch_one(db.pool())
@@ -557,8 +569,10 @@ async fn replaced_main_binding_replay(operation: &str) {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("checkpoint.sqlite");
     let db = open_checkpoint(&path).await;
-    let checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let case = &checkpoint[operation];
     create_identity(
         &db,
@@ -612,12 +626,14 @@ async fn main_draft_owned_unbound_replay_preserves_base() {
 
 #[tokio::test]
 async fn main_draft_contract_matches_domain_fields_and_refuses_unknowns() {
-    let checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let case = &checkpoint["charter.draft"];
     let mut payload = case["arguments"]["payload"].clone();
     payload.as_object_mut().unwrap().remove("action");
-    let request: services::MainGenesisCharterDraftRequest =
+    let request: crate::forge_services::MainGenesisCharterDraftRequest =
         serde_json::from_value(payload).unwrap();
     let fields = serde_json::to_value(request).unwrap();
     let spec = operation_registry::PROPOSAL_CATALOG
@@ -670,8 +686,10 @@ async fn genesis_start_replays_literal_hand_receipt() {
         replay_case("genesis.start").await;
         let temp = tempfile::tempdir().unwrap();
         let db = open_checkpoint(&temp.path().join("checkpoint.sqlite")).await;
-        let checkpoint: Value =
-            serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+        let checkpoint: Value = serde_json::from_str(include_str!(
+            "../../../services/tests/fixtures/hand_registry_base.json"
+        ))
+        .unwrap();
         assert_eq!(
             authority_table(db, &checkpoint["genesis.start"], temp.path().join("media")).await,
             checkpoint["genesis.start"]["authority"]
@@ -681,8 +699,10 @@ async fn genesis_start_replays_literal_hand_receipt() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("checkpoint.sqlite");
     let db = open_checkpoint(&path).await;
-    let mut checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let mut checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let genesis = ProductGenesisService::for_sqlite(db.clone());
     let id = checkpoint["charter.draft"]["arguments"]["payload"]["genesis_session_id"]
         .as_str()
@@ -749,8 +769,10 @@ async fn genesis_start_contract_is_native_only_and_refuses_unknowns() {
         ["maturity", "preferred_project_agent_identity_id"]
     );
     spec.validate_arguments(&json!({})).unwrap();
-    let checkpoint: Value =
-        serde_json::from_str(include_str!("../fixtures/hand_registry_base.json")).unwrap();
+    let checkpoint: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/hand_registry_base.json"
+    ))
+    .unwrap();
     let case = &checkpoint["genesis.start"];
     let temp = tempfile::tempdir().unwrap();
     let db = open_checkpoint(&temp.path().join("checkpoint.sqlite")).await;

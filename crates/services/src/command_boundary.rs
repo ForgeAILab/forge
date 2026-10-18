@@ -16,8 +16,8 @@ pub const COMMAND_INPUT_DIGEST_SCHEMA: &str = "forge.command-input/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandPrincipal {
-    pub(crate) principal_type: String,
-    pub(crate) principal_id: String,
+    pub principal_type: String,
+    pub principal_id: String,
 }
 
 impl CommandPrincipal {
@@ -63,8 +63,8 @@ impl From<forge_agent_host::CanonicalScopeType> for CommandScopeType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandScope {
-    pub(crate) scope_type: CommandScopeType,
-    pub(crate) scope_id: String,
+    pub scope_type: CommandScopeType,
+    pub scope_id: String,
 }
 
 impl From<&forge_agent_host::CanonicalScope> for CommandScope {
@@ -96,20 +96,20 @@ pub struct ExpectedCommandState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuthorizationProvenance {
-    pub(crate) policy_result: String,
-    pub(crate) policy_revision: Option<String>,
-    pub(crate) policy_digest: Option<String>,
-    pub(crate) requested_permission: Option<String>,
+    pub policy_result: String,
+    pub policy_revision: Option<String>,
+    pub policy_digest: Option<String>,
+    pub requested_permission: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentActionProvenance {
-    pub(crate) action_id: String,
-    pub(crate) expected_action_version: i64,
-    pub(crate) attempt: i64,
-    pub(crate) execution_idempotency_key: String,
-    pub(crate) executed_by_type: String,
-    pub(crate) executed_by_id: String,
+    pub action_id: String,
+    pub expected_action_version: i64,
+    pub attempt: i64,
+    pub execution_idempotency_key: String,
+    pub executed_by_type: String,
+    pub executed_by_id: String,
 }
 
 impl AgentActionProvenance {
@@ -135,18 +135,18 @@ impl AgentActionProvenance {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandContext {
-    pub(crate) principal: CommandPrincipal,
-    pub(crate) canonical_scope: CommandScope,
-    pub(crate) operation: String,
-    pub(crate) idempotency_key: String,
-    pub(crate) input_digest: String,
+    pub principal: CommandPrincipal,
+    pub canonical_scope: CommandScope,
+    pub operation: String,
+    pub idempotency_key: String,
+    pub input_digest: String,
     #[serde(default)]
-    pub(crate) expected_state: ExpectedCommandState,
-    pub(crate) authorization_provenance: Option<AuthorizationProvenance>,
-    pub(crate) action_provenance: Option<AgentActionProvenance>,
-    pub(crate) correlation_id: String,
-    pub(crate) causation_id: Option<String>,
-    pub(crate) causation_depth: i64,
+    pub expected_state: ExpectedCommandState,
+    pub authorization_provenance: Option<AuthorizationProvenance>,
+    pub action_provenance: Option<AgentActionProvenance>,
+    pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub causation_depth: i64,
 }
 
 #[derive(Serialize)]
@@ -164,7 +164,7 @@ struct CommandDigestEnvelope<'a, T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NewCommandContext {
+pub struct NewCommandContext {
     pub principal: CommandPrincipal,
     pub canonical_scope: CommandScope,
     pub operation: String,
@@ -178,7 +178,7 @@ pub(crate) struct NewCommandContext {
 }
 
 impl CommandContext {
-    pub(crate) fn from_authorized_input<T: Serialize>(
+    pub fn from_authorized_input<T: Serialize>(
         context: NewCommandContext,
         input: &T,
     ) -> std::result::Result<Self, serde_json::Error> {

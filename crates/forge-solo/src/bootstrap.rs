@@ -325,7 +325,7 @@ struct CandidateEvaluation {
 #[derive(Clone)]
 pub struct SoloBootstrapService {
     db: Arc<SqliteDb>,
-    embedded_agents: Option<Arc<services::EmbeddedAgentService>>,
+    embedded_agents: Option<Arc<services_agents::EmbeddedAgentService>>,
     config_providers: config::ProviderDeclarations,
 }
 
@@ -352,7 +352,10 @@ impl SoloBootstrapService {
     /// declarations are ignored and Solo keeps its CLI-harness-only candidate
     /// set.
     #[must_use]
-    pub fn with_embedded_agents(mut self, service: Arc<services::EmbeddedAgentService>) -> Self {
+    pub fn with_embedded_agents(
+        mut self,
+        service: Arc<services_agents::EmbeddedAgentService>,
+    ) -> Self {
         self.embedded_agents = Some(service);
         self
     }
@@ -872,7 +875,7 @@ impl SoloBootstrapService {
                 None => {
                     match embedded
                         .connect_api_key_credential(
-                            services::embedded_agent_service::ConnectApiKeyCredential {
+                            services_agents::embedded_agent_service::ConnectApiKeyCredential {
                                 owner_user_id: owner_id.to_owned(),
                                 provider: declaration.kind.clone(),
                                 label: label.clone(),
@@ -904,7 +907,7 @@ impl SoloBootstrapService {
                 }
                 if let Err(error) = embedded
                     .create_agent_from_entry(
-                        services::embedded_agent_service::CreateEmbeddedAgent {
+                        services_agents::embedded_agent_service::CreateEmbeddedAgent {
                             owner_user_id: owner_id.to_owned(),
                             name,
                             description: Some(format!(
@@ -916,9 +919,9 @@ impl SoloBootstrapService {
                             reasoning_effort: model.reasoning_effort.clone(),
                             system_prompt: None,
                             account_permission_ceiling:
-                                services::embedded_agent_service::default_profile_tool_policy(),
+                                services_agents::embedded_agent_service::default_profile_tool_policy(),
                             tool_policy:
-                                services::embedded_agent_service::default_profile_tool_policy(),
+                                services_agents::embedded_agent_service::default_profile_tool_policy(),
                             context_tokens: model.context_tokens,
                             max_input_tokens: model.max_input_tokens,
                             max_output_tokens: model.max_output_tokens,
@@ -1558,9 +1561,9 @@ impl SoloBootstrapService {
         if binding.state != PROJECT_AGENT_BINDING_SETUP_STATE {
             return Ok(binding.clone());
         }
-        let agent_chat_service = services::AgentChatService::new(Arc::clone(&self.db));
+        let agent_chat_service = services_agents::AgentChatService::new(Arc::clone(&self.db));
         agent_chat_service
-            .set_project_binding(services::SetProjectAgentBindingInput {
+            .set_project_binding(services_agents::SetProjectAgentBindingInput {
                 actor_user_id: metadata.owner_id.clone(),
                 project_id: project.id.clone(),
                 identity_id: Some(identity_id.to_owned()),
@@ -2423,8 +2426,9 @@ mod tests {
                 permission_policy: Some("scoped_proposals".to_owned()),
                 prompt_template: None,
                 capabilities_json: "[]".to_owned(),
-                tool_policy_json: services::embedded_agent_service::default_profile_tool_policy()
-                    .to_string(),
+                tool_policy_json:
+                    services_agents::embedded_agent_service::default_profile_tool_policy()
+                        .to_string(),
                 config_json: "{}".to_owned(),
                 credential_ref: Some(handle_id.clone()),
                 daemon_id: None,
@@ -2824,8 +2828,8 @@ mod tests {
         // typed Agent Chat admission path can now accept a user message, but
         // the Project remains Charter-gated and therefore has no Task
         // mutation authority.
-        let admitted = services::AgentChatService::new(Arc::clone(&db))
-            .send_message(services::SendAgentChatMessageInput {
+        let admitted = services_agents::AgentChatService::new(Arc::clone(&db))
+            .send_message(services_agents::SendAgentChatMessageInput {
                 actor_user_id: selected.owner_id.clone(),
                 chat_id: selected.project_chat_id.clone(),
                 content: "Please explain the Project Charter adoption choices.".to_owned(),

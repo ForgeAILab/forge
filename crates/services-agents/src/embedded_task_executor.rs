@@ -32,10 +32,13 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use services::{
+use crate::{
     embedded_agent_service::{CreateScopedSession, EmbeddedAgentService, RequestedCanonicalScope},
+    ContextManifestInput, ContextManifestService, ContextSourceInput,
+};
+use services::{
     turn_log_sink::{TurnLogSink, TurnProgressObserver},
-    ContextManifestInput, ContextManifestService, ContextSourceInput, Result, ServiceError,
+    Result, ServiceError,
 };
 
 mod review_correction;
@@ -336,7 +339,7 @@ impl EmbeddedTaskExecutor {
 
         let native_provider = {
             let (context_tokens, max_input_tokens, max_output_tokens) =
-                services::embedded_agent_service::effective_native_limits(
+                crate::embedded_agent_service::effective_native_limits(
                     &provider,
                     config.context_tokens,
                     config.max_input_tokens,

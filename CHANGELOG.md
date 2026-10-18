@@ -162,6 +162,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **The remaining agent/chat implementation moved from `services` to
+  `services-agents` (internal).** Agent Chat policy, admission, workers and
+  memory projection; inquiries; context manifests and usage; embedded agents;
+  default-agent setup; Main/Project orchestration adapters; native tools;
+  topic rotation; and wake delivery now sit above the Task/workflow core.
+  Core reaches agent-owned behavior only through narrow injected contracts;
+  there is no `services → services-agents` dependency and no REST, MCP, CLI,
+  event, storage, or user-visible behavior change.
 - Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
   `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
   and SQLite LCM timelines resume without a database migration; persisted

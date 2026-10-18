@@ -6,6 +6,13 @@
 //! Project/Chat/binding/handoff/event/receipt/action execution are one durable
 //! outcome.
 
+mod forge_services {
+    pub use ::services::*;
+    pub use ::services_agents::*;
+}
+
+use crate::forge_services as services;
+
 use std::{path::PathBuf, sync::Arc};
 
 use api_types::ProductMaturity;
@@ -1518,7 +1525,7 @@ const HANDOFF_ACCEPTED: &str = "selected executor cannot run a legacy CLI Agent 
 /// invalid packet (`db::project_orchestration::
 /// charter_approval_create_rolls_back_on_invalid_handoff_packet`). Those cases
 /// are covered field-by-field by the validator matrix in
-/// `services::agent_chat_turn_worker`.
+/// `services_agents::agent_chat_turn_worker`.
 #[tokio::test]
 async fn project_turn_uses_issued_handoff_without_rewalking_mutable_main_history() {
     #[derive(Clone, Copy)]
@@ -1703,14 +1710,14 @@ async fn pre_change_main_create_prepared_pending_and_edited_actions_execute_exac
     }
 }
 
-#[path = "common/pre_change_main_runtime.rs"]
+#[path = "../../services/tests/common/pre_change_main_runtime.rs"]
 mod pre_change_main_runtime;
 
 #[tokio::test]
 async fn main_create_literal_checkpoints_resume_real_provider_then_approve_execute_and_replay() {
     use forge_agent_host::{CanonicalScope, CanonicalScopeType, WorkspaceAccess};
     let fixtures: Value = serde_json::from_str(include_str!(
-        "common/main_proposal_checkpoints_pre_change.json"
+        "../../services/tests/common/main_proposal_checkpoints_pre_change.json"
     ))
     .unwrap();
     for form in ["prepared", "approval_pending", "approval_edited"] {

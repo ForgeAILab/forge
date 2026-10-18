@@ -73,12 +73,12 @@ pub async fn save_genesis_charter_revision(
         &user.user_id,
         "project_charter.revision.save",
     )?;
-    let result = services::MainGenesisCommandService::new(state.db.clone())
-        .execute(services::MainGenesisDraftCommandInput {
-            principal: services::MainGenesisDraftPrincipal::User {
+    let result = services_agents::MainGenesisCommandService::new(state.db.clone())
+        .execute(services_agents::MainGenesisDraftCommandInput {
+            principal: services_agents::MainGenesisDraftPrincipal::User {
                 user_id: user.user_id.clone(),
             },
-            request: services::MainGenesisCharterDraftRequest {
+            request: services_agents::MainGenesisCharterDraftRequest {
                 genesis_session_id: Some(session_id),
                 charter_id: request.charter_id,
                 expected_charter_version: Some(request.mutation.expected_version),

@@ -227,7 +227,7 @@ impl ProjectArtifactCommandService {
     /// back. Everything else about the row -- the governing Charter and
     /// baseline revisions, the definition revision, the check version -- is
     /// derived here rather than accepted from the caller.
-    pub(crate) async fn record_validation_with_context(
+    pub async fn record_validation_with_context(
         &self,
         command: ProjectValidationCommand,
         context: CommandContext,
@@ -505,7 +505,7 @@ impl ProjectArtifactCommandService {
         Ok(observations)
     }
 
-    pub(crate) async fn attach_evidence_with_context(
+    pub async fn attach_evidence_with_context(
         &self,
         command: ProjectEvidenceCommand,
         context: CommandContext,
@@ -757,7 +757,7 @@ impl ProjectArtifactCommandService {
             .await
     }
 
-    pub(crate) async fn save_document_revision_with_context(
+    pub async fn save_document_revision_with_context(
         &self,
         command: ProjectDocumentRevisionCommand,
         context: CommandContext,
@@ -1051,7 +1051,7 @@ impl ProjectArtifactCommandService {
         self.replay_document_approval(&context).await
     }
 
-    pub(crate) async fn approve_document_with_context(
+    pub async fn approve_document_with_context(
         &self,
         command: ProjectDocumentApprovalCommand,
         context: CommandContext,

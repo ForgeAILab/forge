@@ -15,9 +15,10 @@ use axum::{
     Json,
 };
 use db::new_uuid_v4;
-use services::{
+use services::ProductGenesisService;
+use services_agents::{
     MainGenesisCommandService, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
-    MainGenesisStartRequest, ProductGenesisService,
+    MainGenesisStartRequest,
 };
 
 use crate::{

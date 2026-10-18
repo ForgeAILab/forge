@@ -20,10 +20,6 @@ name = "main"
 required-features = ["test-support"]
 
 [[test]]
-name = "main_project_create_command"
-required-features = ["test-support"]
-
-[[test]]
 name = "project_provisioning_characterization"
 required-features = ["test-support"]
 

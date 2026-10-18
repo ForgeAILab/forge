@@ -13,29 +13,116 @@ use api_types::{
     ProvenanceRef, ProvenanceSourceKind, RevisionProvenance,
 };
 use db::{
-    now_rfc3339, run_migrations, AgentAction, AgentActionPolicyResult, AgentActionRepo,
-    AgentActionStatus, AgentRepo, AgentStatus, CreateAgentAction, CreateAgentIdentity,
-    CreateAgentProfile, CreateProject, ProjectRepo, SqliteDb,
+    now_rfc3339, run_migrations, AgentAction, AgentActionApprovalDecision, AgentActionPolicyResult,
+    AgentActionRepo, AgentActionStatus, AgentRepo, AgentStatus, CreateAgentAction,
+    CreateAgentIdentity, CreateAgentProfile, CreateProject, ProjectRepo, SqliteDb,
 };
 use events::EventBus;
 use forge_agent_host::{
     CanonicalScope, CanonicalScopeType, WorkspaceAccess, MAIN_CHARTER_DRAFT_OPERATION,
     MAIN_GENESIS_PROJECT_AGENT_SELECT_OPERATION, MAIN_GENESIS_START_OPERATION,
-    PROJECT_DOCUMENT_OPERATION,
+    MAIN_PROJECT_CREATE_OPERATION, PROJECT_DOCUMENT_OPERATION,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::{
     test_support::arm_after_domain_commit, AgentActionService, AgentChatService,
+    ApproveActionInput, ExecuteMainOrchestrationActionInput,
     ExecuteProjectOrchestrationActionInput, ExecuteTaskProposalInput,
     MainGenesisCharterDraftRequest, MainGenesisCommandService, MainGenesisDraftCommandInput,
     MainGenesisDraftPrincipal, MainGenesisProjectAgentSelectCommandInput,
     MainGenesisProjectAgentSelectRequest, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
-    MainGenesisStartRequest, ProjectArtifactCommandService, ProjectCommandAuthorization,
-    ProjectDocumentCreateCommand, ProjectOrchestrationActionService, SendAgentChatMessageInput,
-    ServiceError, TaskService, MAIN_BASELINE_OPERATING_SKILL_REVISION,
+    MainGenesisStartRequest, MainOrchestrationActionService, ProjectArtifactCommandService,
+    ProjectCommandAuthorization, ProjectDocumentCreateCommand, ProjectOrchestrationActionService,
+    ProposeActionInput, SendAgentChatMessageInput, ServiceError, TaskService,
+    MAIN_BASELINE_OPERATING_SKILL_REVISION,
 };
+
+#[tokio::test]
+async fn main_orchestration_project_create_is_user_only_and_draft_is_direct() {
+    let (db, _chat_id, main_agent_id) = main_fixture().await;
+    let actions = AgentActionService::new(Arc::clone(&db));
+    let draft = actions
+        .propose(ProposeActionInput {
+            id: None,
+            actor_identity_id: main_agent_id.clone(),
+            scope_type: "account".to_owned(),
+            scope_id: USER_ID.to_owned(),
+            operation: MAIN_CHARTER_DRAFT_OPERATION.to_owned(),
+            payload_json: r#"{"action":"save_revision"}"#.to_owned(),
+            dedupe_key: "main-draft-1".to_owned(),
+            correlation_id: "main-draft-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_discovery".to_owned(),
+            policy_reason: None,
+            target_type: Some("account".to_owned()),
+            target_id: Some(USER_ID.to_owned()),
+        })
+        .await;
+    assert!(
+        draft.is_err(),
+        "Main Charter drafts do not enter AgentAction"
+    );
+    let draft_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_action WHERE operation = ?")
+            .bind(MAIN_CHARTER_DRAFT_OPERATION)
+            .fetch_one(db.pool())
+            .await
+            .expect("draft action count");
+    assert_eq!(draft_count, 0);
+
+    let create = actions
+        .propose(ProposeActionInput {
+            id: None,
+            actor_identity_id: main_agent_id.clone(),
+            scope_type: "account".to_owned(),
+            scope_id: USER_ID.to_owned(),
+            operation: MAIN_PROJECT_CREATE_OPERATION.to_owned(),
+            payload_json: r#"{"action":"create_from_approval","approval_id":"approval-1"}"#
+                .to_owned(),
+            dedupe_key: "main-create-1".to_owned(),
+            correlation_id: "main-create-correlation".to_owned(),
+            causation_id: None,
+            causation_depth: 0,
+            requested_permission: "propose_project".to_owned(),
+            policy_reason: None,
+            target_type: Some("account".to_owned()),
+            target_id: Some(USER_ID.to_owned()),
+        })
+        .await
+        .expect("Main Project create proposal");
+    assert_eq!(
+        create.policy_result,
+        AgentActionPolicyResult::ApprovalRequired
+    );
+    assert_eq!(create.status, AgentActionStatus::PendingApproval);
+    assert!(actions
+        .approve(ApproveActionInput {
+            action_id: create.id.clone(),
+            expected_version: create.version,
+            approver_identity_id: main_agent_id.clone(),
+            decision: AgentActionApprovalDecision::Approved,
+            reason: None,
+        })
+        .await
+        .is_err());
+
+    let typed_create = MainOrchestrationActionService::new(Arc::clone(&db))
+        .execute(ExecuteMainOrchestrationActionInput {
+            action_id: create.id,
+            expected_version: create.version,
+            executed_by_type: "agent".to_owned(),
+            executed_by_id: main_agent_id,
+            idempotency_key: "main-create-execution".to_owned(),
+        })
+        .await;
+    assert!(
+        typed_create.is_err(),
+        "Project creation must remain user-only"
+    );
+}
 
 const USER_ID: &str = "characterization-user";
 
@@ -1449,7 +1536,8 @@ async fn task_proposal_failure_rolls_back_and_retry_replays_exact_receipt() {
     )
     .await;
     let action_service = AgentActionService::new(Arc::clone(&fixture.db));
-    let task_service = TaskService::new(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)));
+    let task_service =
+        TaskService::new_for_test(Arc::clone(&fixture.db), Arc::new(EventBus::new(16)));
 
     // Fail at the old seam where the Task used to be committed before the
     // action/command receipt.  The atomic TaskService command must roll back

@@ -24,7 +24,8 @@ use tokio::{
 };
 use url::Url;
 
-use services::{embedded_agent_service::ConnectOAuthCredential, Result, ServiceError};
+use crate::embedded_agent_service::{ConnectOAuthCredential, EmbeddedAgentService};
+use services::{Result, ServiceError};
 
 const OPENAI_ISSUER: &str = "https://auth.openai.com";
 const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -48,7 +49,7 @@ const LOOPBACK_CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Clone)]
 pub struct ProviderAuthorizationService {
     db: Arc<SqliteDb>,
-    embedded_agents: Arc<services::embedded_agent_service::EmbeddedAgentService>,
+    embedded_agents: Arc<EmbeddedAgentService>,
     protected_store: Arc<SqliteProtectedRuntimeStore>,
     trusted_origins: Arc<RwLock<Vec<String>>>,
     client: reqwest::Client,
@@ -118,7 +119,7 @@ struct OidcDiscovery {
 impl ProviderAuthorizationService {
     pub fn new(
         db: Arc<SqliteDb>,
-        embedded_agents: Arc<services::embedded_agent_service::EmbeddedAgentService>,
+        embedded_agents: Arc<EmbeddedAgentService>,
         trusted_origins: Vec<String>,
     ) -> Self {
         Self {
@@ -1685,7 +1686,7 @@ mod tests {
         )
         .await
         .expect("owner creates");
-        let embedded = Arc::new(services::embedded_agent_service::EmbeddedAgentService::new(
+        let embedded = Arc::new(EmbeddedAgentService::new(
             Arc::clone(&db),
             b"provider-auth-test-key",
         ));
@@ -1732,7 +1733,7 @@ mod tests {
             .expect("pool creates");
         db::run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
-        let embedded = Arc::new(services::embedded_agent_service::EmbeddedAgentService::new(
+        let embedded = Arc::new(EmbeddedAgentService::new(
             Arc::clone(&db),
             b"provider-auth-test-key",
         ));

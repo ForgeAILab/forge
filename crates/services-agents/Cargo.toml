@@ -8,12 +8,17 @@ description = "Forge's agents, chat services, and shared runtime composition"
 [lib]
 path = "src/lib.rs"
 
+[[test]]
+name = "main_project_create_command"
+
 [features]
 test-support = ["services/test-support"]
 
 [dependencies]
 services = { path = "../services" }
+cli-adapters = { path = "../cli-adapters" }
 git = { path = "../git" }
+operation-registry = { path = "../operation-registry" }
 async-trait = "0.1"
 base64 = "0.22"
 hex = "0.4"
@@ -21,6 +26,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+serde_path_to_error = "0.1"
 sha2 = "0.11"
 tokio-util = "0.7"
 url = "2"
@@ -41,6 +47,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 agent-runtime.workspace = true
+cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = "../services", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
 tempfile = "3"

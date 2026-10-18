@@ -55,8 +55,8 @@ The clippy command names the same features so that linting those targets does
 not depend on another crate's dev-dependencies.
 Neither crate may dev-depend on itself (it compiles the lib twice in series);
 see [docs/ci.md](docs/ci.md#test-features-and-required-features).
-Services keeps `project_provisioning_characterization` and
-`main_project_create_command` as separate targets for process isolation.
+Services keeps `project_provisioning_characterization` separate; services-agents
+keeps `main_project_create_command` separate for process isolation.
 API keeps seven process-isolated targets; see
 [docs/ci.md](docs/ci.md#api-binary-split-and-isolation) for the list.
 See [docs/ci.md](docs/ci.md#services-unit-split-and-integration-inventory) for
@@ -123,6 +123,7 @@ forge-solo owns its Solo bootstrap and session services
 
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
 - **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, builds the shared graph through `services_agents::ForgeRuntimeBuilder`, and hands it to `AppState::from_runtime_arc()`. `AppState` is `Clone` (shared services use `Arc`) and used as Axum state.
+- **Agent boundary** — `services-agents` owns Agent Chat, embedded-agent, native-tool, wake-delivery, and Main/Project orchestration implementations. It depends on `services`; core never depends back. Core uses the narrow `WakeTurns`, task `ExecutionSupport`, and `AgentEventConsumerNames` contracts, wired by `ForgeRuntimeBuilder`.
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.

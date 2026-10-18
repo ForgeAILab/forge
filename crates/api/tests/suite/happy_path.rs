@@ -723,7 +723,7 @@ async fn test_app_with_registry(
     .await
     .expect("seed test user");
     let adapter_registry = Arc::new(registry);
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));

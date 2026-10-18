@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::Value;
+use sha2::Digest;
 
 async fn fixture(ci: &[&str], verify: serde_json::Value) -> FailedCiFixture {
     let mut f = failed_ci_fixture(3, FailurePolicy::Block).await;
@@ -438,7 +439,10 @@ async fn review_verify_daemon_records_not_run_without_starting_a_check() {
     assert!(prompt.user.contains("placement_unsupported"));
 }
 
-struct EvidenceSupport(crate::native_tools::CoordinationToolProvider);
+struct EvidenceSupport {
+    db: Arc<db::SqliteDb>,
+    media_root: std::path::PathBuf,
+}
 #[async_trait::async_trait]
 impl crate::task_service::execution::ExecutionSupport for EvidenceSupport {
     async fn inject_provider_env(&self, _: &mut serde_json::Value) -> crate::Result<()> {
@@ -466,10 +470,49 @@ impl crate::task_service::execution::ExecutionSupport for EvidenceSupport {
         caption: &str,
         bytes: &[u8],
     ) -> crate::Result<String> {
-        self.0
-            .capture_verify_evidence(task, id, filename, kind, caption, bytes)
-            .await
-            .map_err(|e| crate::ServiceError::invalid_operation(e.to_string()))
+        let _ = caption;
+        if let Some(existing) = db::TaskMediaRepo::get_media_by_id(&*self.db, id, false).await? {
+            return Ok(existing.id);
+        }
+        let storage_key = format!("{task}/{id}__{filename}");
+        let destination = self.media_root.join(&storage_key);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| crate::ServiceError::Domain(error.to_string()))?;
+        }
+        std::fs::write(&destination, bytes)
+            .map_err(|error| crate::ServiceError::Domain(error.to_string()))?;
+        let content_type = match kind {
+            "screenshot" if filename.ends_with(".png") => "image/png",
+            "screenshot" => "image/*",
+            "log" | "report" => "text/plain",
+            _ => "application/octet-stream",
+        };
+        let media = db::TaskMediaRepo::create_media(
+            &*self.db,
+            db::CreateTaskMedia {
+                id: id.to_owned(),
+                task_id: task.to_owned(),
+                display_filename: filename.to_owned(),
+                content_type: content_type.to_owned(),
+                byte_size: bytes.len() as i64,
+                storage_key,
+                author_type: db::CommentAuthorType::System,
+                author_id: None,
+                author_name: "Forge Verify".to_owned(),
+                created_at: db::now_rfc3339(),
+            },
+        )
+        .await?;
+        db::SharedMediaRepo::set_media_asset_checksum(
+            &*self.db,
+            &media.id,
+            bytes.len() as i64,
+            &hex::encode(sha2::Sha256::digest(bytes)),
+            &db::now_rfc3339(),
+        )
+        .await?;
+        Ok(media.id)
     }
 }
 #[tokio::test]
@@ -481,12 +524,13 @@ dd if=/dev/zero of="$FORGE_VERIFY_DIR/large.log" bs=1 count=1 seek=26214400 2>/d
 printf '%s' '{"verdict":"pass","summary":"Two screens exercised","evidence":[{"path":"./one.png","kind":"screenshot","caption":"first"},{"path":"two.png","kind":"screenshot","caption":"second"},{"path":"escape","kind":"log","caption":"escape"},{"path":"large.log","kind":"log","caption":"oversize"},{"path":"one.png","kind":"unknown","caption":"bad kind"}]}' > "$FORGE_VERIFY_REPORT""#}]})).await;
     super::rerun_review::seed_reviewer_agent(&f).await;
     let media = f._workspace_root.path().join("media");
-    let provider = crate::native_tools::CoordinationToolProvider::new(f.db.clone());
-    provider.set_media_root(media.clone());
     f.engine = f
         .engine
         .clone()
-        .with_provider_credential_env(Arc::new(EvidenceSupport(provider)));
+        .with_provider_credential_env(Arc::new(EvidenceSupport {
+            db: f.db.clone(),
+            media_root: media.clone(),
+        }));
     let (_, review, details) = enter(&f).await;
     assert_eq!(review.status, db::ReviewStatus::Running, "{details}");
     assert_eq!(details["verify"]["status"], "pass");
@@ -737,12 +781,13 @@ async fn review_verify_app_log_report_and_text_evidence_are_ansi_free_and_redact
     .await;
     set_project_env(&f, "VERIFY_SECRET", SECRET).await;
     let media = f._workspace_root.path().join("media");
-    let provider = crate::native_tools::CoordinationToolProvider::new(f.db.clone());
-    provider.set_media_root(media.clone());
     f.engine = f
         .engine
         .clone()
-        .with_provider_credential_env(Arc::new(EvidenceSupport(provider)));
+        .with_provider_credential_env(Arc::new(EvidenceSupport {
+            db: f.db.clone(),
+            media_root: media.clone(),
+        }));
     let (_, review, details) = enter(&f).await;
     assert_eq!(details["verify"]["status"], "fail", "{details}");
     let tail = details["verify"]["app_log_tail"].as_str().unwrap();
@@ -880,12 +925,14 @@ json.dump({'verdict':'pass','evidence':[{'path':n+'.bin','kind':'other'} for n i
 PY"#},
         {"name":"second","command":r#"printf '%s' '{"verdict":"pass","evidence":[{"path":"three.bin","kind":"other"}]}' > "$FORGE_VERIFY_REPORT""#}
     ]})).await;
-    let provider = crate::native_tools::CoordinationToolProvider::new(f.db.clone());
-    provider.set_media_root(f._workspace_root.path().join("media"));
+    let media_root = f._workspace_root.path().join("media");
     f.engine = f
         .engine
         .clone()
-        .with_provider_credential_env(Arc::new(EvidenceSupport(provider)));
+        .with_provider_credential_env(Arc::new(EvidenceSupport {
+            db: f.db.clone(),
+            media_root,
+        }));
     let (_, _, details) = enter(&f).await;
     let verify = &details["verify"];
     assert_eq!(verify["status"], "pass", "{details}");

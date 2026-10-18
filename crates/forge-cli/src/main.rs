@@ -240,7 +240,7 @@ async fn run() {
         media_storage_root(&effective_config.forge.data_dir),
     ));
 
-    match services::ensure_default_agents(&db, &adapter_registry).await {
+    match services_agents::ensure_default_agents(&db, &adapter_registry).await {
         Ok(agents) => info!(agent_count = agents.len(), "default agents ready"),
         Err(error) => warn!(%error, "default agent upsert failed"),
     }

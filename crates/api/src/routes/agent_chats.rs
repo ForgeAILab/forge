@@ -30,11 +30,11 @@ use db::{
     SortOrder,
 };
 use serde_json::{json, Value};
-use services::{
-    CancelAgentChatTurnInput, CreateAgentHandoffInput, ProductGenesisService,
-    SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
+use services::ProductGenesisService;
+use services_agents::{
+    CancelAgentChatTurnInput, CreateAgentHandoffInput, SendAgentChatMessageInput,
+    SetMainAgentBindingInput, SetProjectAgentBindingInput, StartMainChatTopicInput,
 };
-use services_agents::StartMainChatTopicInput;
 
 use crate::{
     errors::{ApiError, ApiResult},
@@ -389,7 +389,7 @@ pub async fn retry_agent_chat_turn(
     .await?;
     let job = state
         .agent_chat_service
-        .retry_turn(services::RetryAgentChatTurnInput {
+        .retry_turn(services_agents::RetryAgentChatTurnInput {
             actor_user_id: user.user_id,
             chat_id,
             turn_job_id: turn_id,

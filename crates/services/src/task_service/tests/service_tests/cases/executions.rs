@@ -2224,10 +2224,9 @@ async fn approval_gated_planner_completion_waits_for_human() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let embedded = Arc::new(crate::EmbeddedAgentService::new(
-        Arc::clone(&db),
-        b"approval-gated-planner-test-key",
-    ));
+    let embedded = Arc::new(crate::test_support::TestExecutionSupport::new(Arc::clone(
+        &db,
+    )));
     let service = TaskService::new(Arc::clone(&db), event_bus)
         .with_task_executor(Arc::new(OutboxPlanExecutor {
             plan: "- [ ] approved implementation\n",
@@ -9091,10 +9090,9 @@ async fn planner_completion_advances_default_planning_gate() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let embedded = Arc::new(crate::EmbeddedAgentService::new(
-        Arc::clone(&db),
-        b"planner-outbox-test-key",
-    ));
+    let embedded = Arc::new(crate::test_support::TestExecutionSupport::new(Arc::clone(
+        &db,
+    )));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .with_task_executor(Arc::new(OutboxPlanExecutor {
             plan: "- [ ] implement the plan\n",

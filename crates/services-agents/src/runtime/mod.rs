@@ -22,16 +22,21 @@ use executors::{AdapterRegistry, FallbackExecutor, TaskExecutor};
 use tokio::{sync::watch, task::JoinHandle};
 use workspace::RepoCacheLockManager;
 
-use services::worker_runtime::assembly::{RuntimeWorker, ShutdownSignal, COMMON_WORKERS};
+use services::worker_runtime::assembly::{
+    AgentEventConsumerNames, RuntimeWorker, ShutdownSignal, COMMON_WORKERS,
+};
 
-use crate::{MainChatTopicService, ProviderAuthorizationService};
+use crate::{
+    AgentChatMemoryConsumer, AgentChatService, AgentChatTurnLogRoot, AgentChatTurnWorker,
+    EmbeddedAgentService, EmbeddedInquiryRunner, MainChatTopicService,
+    ProviderAuthorizationService, TopicRotationCoordinator, WakeTurnConsumer,
+};
 use services::{
-    AgentActionService, AgentChatMemoryConsumer, AgentChatTurnLogRoot, AgentChatTurnWorker,
-    AgentInboxService, AgentService, AttentionService, AuthService, CommitmentService,
-    CoordinationOutcomeConsumer, CrashRecovery, DaemonService, DomainEventBroadcastConsumer,
-    EmbeddedAgentService, EmbeddedInquiryRunner, HeartbeatMonitor, MemoryService, MergeService,
+    AgentActionService, AgentInboxService, AgentService, AttentionService, AuthService,
+    CommitmentService, CoordinationOutcomeConsumer, CrashRecovery, DaemonService,
+    DomainEventBroadcastConsumer, HeartbeatMonitor, MemoryService, MergeService,
     NotificationService, OperatorStatusEmitter, OperatorStatusService, ProjectHookService,
-    TaskDispatcher, TaskService, TerminalActivityTracker, TerminalService, WakeTurnConsumer,
+    TaskDispatcher, TaskService, TerminalActivityTracker, TerminalService,
     WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
 
@@ -39,6 +44,18 @@ mod storage_maintenance;
 use storage_maintenance::StorageMaintenanceWorker;
 
 const SUPERVISOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct RuntimeAgentEventConsumerNames;
+
+impl AgentEventConsumerNames for RuntimeAgentEventConsumerNames {
+    fn memory_consumer_name(&self) -> &'static str {
+        crate::memory_consumer_name()
+    }
+
+    fn wake_turn_consumer_name(&self) -> &'static str {
+        crate::wake_turn_consumer_name()
+    }
+}
 
 /// Explicit runtime assembly modes.  This is a composition choice rather
 /// than a rollout flag: both modes use the same graph, but only the server
@@ -134,7 +151,7 @@ pub struct ForgeRuntime {
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
-    pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
+    pub agent_chat_service: Arc<AgentChatService<SqliteDb>>,
     pub main_chat_topic_service: Arc<MainChatTopicService<SqliteDb>>,
     pub agent_inquiry_service: Arc<crate::agent_inquiry_service::AgentInquiryService<SqliteDb>>,
     pub agent_chat_turn_worker: Arc<AgentChatTurnWorker>,
@@ -513,14 +530,14 @@ impl ForgeRuntimeBuilder {
             effective_config.server.project_working_set_target_tokens,
             effective_config.server.project_working_set_hard_tokens,
         );
-        let agent_chat_service = Arc::new(services::AgentChatService::new(Arc::clone(&self.db)));
+        let agent_chat_service = Arc::new(AgentChatService::new(Arc::clone(&self.db)));
         let main_chat_topic_service = Arc::new(
             MainChatTopicService::new(
                 Arc::clone(&self.db),
                 Arc::clone(&agent_chat_service),
                 services::ProductGenesisService::for_sqlite(Arc::clone(&self.db)),
             )
-            .with_rotator(Arc::new(services::TopicRotationCoordinator::new(
+            .with_rotator(Arc::new(TopicRotationCoordinator::new(
                 self.db.clone(),
                 embedded_agent_service.clone(),
             ))),
@@ -634,6 +651,7 @@ impl ForgeRuntimeBuilder {
                 Arc::clone(&workspace_backend_router),
             )
             .with_run_process_policy(Arc::clone(&run_process_policy))
+            .with_agent_event_consumer_names(Arc::new(RuntimeAgentEventConsumerNames))
             .with_consumer_stall_seconds(effective_config.server.event_consumer_stall_seconds)
             .with_daemon_connections(Arc::clone(&daemon_connections)),
         );
@@ -1412,18 +1430,18 @@ mod tests {
         for has_cursor in [false, true] {
             if has_cursor {
                 sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, '2000-01-01T00:00:00Z')")
-                    .bind(services::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
+                    .bind(crate::memory_consumer_name()).execute(runtime.db.pool()).await.unwrap();
             }
             let status = service.compute_status().await.unwrap();
             assert_eq!(status.event_consumers.len(), 6);
             assert!(status
                 .event_consumers
                 .iter()
-                .all(|consumer| consumer.consumer_name != services::memory_consumer_name()));
+                .all(|consumer| consumer.consumer_name != crate::memory_consumer_name()));
             assert!(!status
                 .recent_errors
                 .iter()
-                .any(|error| error.entity_id == services::memory_consumer_name()));
+                .any(|error| error.entity_id == crate::memory_consumer_name()));
         }
     }
 

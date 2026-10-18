@@ -24,10 +24,12 @@ use forge_agent_host::{is_project_orchestration_operation, MAIN_PROJECT_CREATE_O
 use serde_json::Value;
 use services::{
     ApproveActionInput, AskQuestionInput, CommitmentEvidenceInput, CompleteCommitmentInput,
-    CreateCommitmentInput, DirectTaskProposalInput, ExecuteActionInput,
-    ExecuteMainOrchestrationActionInput, ExecuteProjectOrchestrationActionInput,
-    MainOrchestrationActionService, ProjectOrchestrationActionService, ProposeActionInput,
+    CreateCommitmentInput, DirectTaskProposalInput, ExecuteActionInput, ProposeActionInput,
     TaskProposalPayload, TransferCommitmentInput, UpdateCommitmentInput,
+};
+use services_agents::{
+    ExecuteMainOrchestrationActionInput, ExecuteProjectOrchestrationActionInput,
+    MainOrchestrationActionService, ProjectOrchestrationActionService,
 };
 
 use crate::{

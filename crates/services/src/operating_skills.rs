@@ -492,7 +492,7 @@ fn append_state_rules(rendered: &mut String, refresh: &str) {
 /// Holds for both Main cards: the baseline card names no Genesis session.
 const GENESIS_SESSION_RULE: &str = "Genesis session IDs in chat history are historical; a session is active only if the state card names it.\n";
 
-pub(crate) fn replace_rendered_skill_body(
+pub fn replace_rendered_skill_body(
     rendered: String,
     persisted_body: Option<&str>,
     current_body: &str,

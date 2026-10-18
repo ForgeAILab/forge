@@ -2,34 +2,24 @@
 
 pub mod adaptive_task_operations;
 pub(crate) mod agent_capacity;
-pub mod agent_chat_memory_consumer;
-pub mod agent_chat_policy;
-pub mod agent_chat_service;
-pub mod agent_chat_turn_policy;
-pub mod agent_chat_turn_worker;
-pub mod agent_inquiry_runner;
 pub mod agent_service;
-pub mod agent_turn_admission;
 pub mod attention_service;
 pub mod auth_service;
+pub mod bounded_file;
 pub mod chat_notices;
-pub(crate) mod chat_usage;
 pub mod check_runner;
 pub mod command_boundary;
-pub mod context_manifest;
 pub mod coordination_consumer;
 pub mod coordination_service;
 pub mod daemon_monitor;
 pub mod daemon_service;
 pub mod daemon_transport;
 pub mod dead_letter_service;
-pub mod default_agents;
 pub(crate) mod deferred_dispatch;
 pub mod demo;
 pub mod diff;
 pub mod domain_event_broadcast;
 pub mod domain_event_service;
-pub mod embedded_agent_service;
 pub mod embedded_daemon;
 pub mod environment_surfaces;
 pub mod execution_setup;
@@ -43,14 +33,10 @@ pub mod integration_service;
 pub mod integration_steps;
 pub mod integration_worker;
 pub mod lifecycle;
-pub mod main_genesis_commands;
-pub mod main_orchestration_actions;
-pub mod main_orchestration_queries;
 pub mod memory;
 pub mod merge_service;
 pub mod milestone_orchestration;
 pub mod milestone_runtime;
-pub mod native_tools;
 pub mod notification_service;
 pub mod oauth_service;
 pub mod operating_skills;
@@ -60,7 +46,6 @@ pub mod orchestration_authorization;
 pub mod placement;
 pub mod plan_artifact;
 pub mod product_genesis;
-pub mod project_agent_actions;
 pub mod project_agent_selection;
 pub mod project_artifact_commands;
 pub mod project_charter_commands;
@@ -99,7 +84,6 @@ pub mod turn_log_sink;
 pub mod types;
 pub mod usage_projection;
 pub(crate) mod wake_blocker;
-pub mod wake_turn_consumer;
 pub mod wake_turns;
 pub mod worker_runtime;
 pub mod workflow;
@@ -116,49 +100,17 @@ pub mod workspace_root;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-#[cfg(test)]
-mod receipt_characterization_tests;
-
 pub use adaptive_task_operations::{
     adaptive_task_operation_supported_values, parse_persisted_adaptive_envelope,
     validate_adaptive_task_operations, ADAPTIVE_ALLOWED_TASK_OPERATIONS_FIELD,
 };
-pub use agent_chat_memory_consumer::{memory_consumer_name, AgentChatMemoryConsumer};
-pub use agent_chat_policy::{AgentChatOperation, AgentChatPolicyError, AgentChatScope};
-pub use agent_chat_service::{
-    AdmittedAgentChatMessage, AgentChatHandoffOutcome, AgentChatService, CancelAgentChatTurnInput,
-    CommittedAgentChatResponse, CreateAgentHandoffInput, RetryAgentChatTurnInput,
-    SendAgentChatMessageInput, SetMainAgentBindingInput, SetProjectAgentBindingInput,
-};
-pub use agent_chat_turn_policy::{
-    bounded_error as bounded_agent_chat_error, claim as claim_agent_chat_turn,
-    failure_after_claim as fail_agent_chat_turn_after_claim,
-    recover_expired as recover_expired_agent_chat_turn,
-    FailureDecision as AgentChatFailureDecision, LeaseDecision as AgentChatLeaseDecision,
-};
-pub use agent_chat_turn_worker::{
-    AgentChatTurnLogRoot, AgentChatTurnRunOutcome, AgentChatTurnRunner, AgentChatTurnWorker,
-    CliAgentChatSessionBackend, CompletedAgentChatTurn, FederatedAgentChatTurnRunner,
-};
-pub use agent_inquiry_runner::{
-    EmbeddedInquiryRunner, InquiryOutcome, InquiryRequest, InquiryRunner,
-};
 pub use agent_service::AgentService;
-pub use agent_turn_admission::{
-    admission_digest, content_digest, handoff_admission_digest, handoff_content_digest,
-    handoff_content_digest_with_sources, AgentResponderStore, AgentTurnAdmissionInput,
-    AgentTurnAdmissionService, AgentTurnAdmitInput, AgentTurnPrepareInput, AgentTurnReadiness,
-    AgentTurnTrigger, PreparedAgentTurnAdmission, ResolvedAgentResponder,
-};
 pub use attention_service::{
     wake_attention_incident_digest, AttentionProjectionRun, AttentionService, WakeAdmissionRequest,
     WakeAdmissionResult, WakeSetupReason, WakeSuppressionReason, MAX_WAKE_REACTION_DEPTH,
 };
 pub use auth_service::AuthService;
 pub use command_boundary::*;
-pub use context_manifest::{
-    fragment_fingerprint, ContextManifestInput, ContextManifestService, ContextSourceInput,
-};
 pub use coordination_consumer::{
     coordination_consumer_name, CoordinationOutcomeConsumer, CoordinationOutcomeRun,
 };
@@ -177,13 +129,11 @@ pub use daemon_transport::{
     DaemonConnectionRegistry, EmbeddedExecutionProvider, EmbeddedFilesystemProvider,
     ExecutionProvider, FilesystemProvider, RemoteExecutionProvider, RemoteFilesystemProvider,
 };
-pub use default_agents::ensure_default_agents;
 pub use deferred_dispatch::wake_task_dispatch;
 pub use demo::install_demo_data;
 pub use diff::DiffService;
 pub use domain_event_broadcast::DomainEventBroadcastConsumer;
 pub use domain_event_service::DomainEventService;
-pub use embedded_agent_service::{EmbeddedAgentService, ProviderEntryTestOutcome};
 pub use embedded_daemon::EmbeddedDaemon;
 pub use execution_setup::{
     canonical_task_capability, classify_task_execution, eligible_project_execution_agents,
@@ -195,17 +145,6 @@ pub use execution_setup::{
 };
 pub use external_sync::ExternalSyncService;
 pub use integration_service::IntegrationService;
-pub use main_genesis_commands::{
-    MainGenesisCharterDraftRequest, MainGenesisCharterDraftResult, MainGenesisCommandService,
-    MainGenesisDraftCommandInput, MainGenesisDraftPrincipal,
-    MainGenesisProjectAgentSelectCommandInput, MainGenesisProjectAgentSelectRequest,
-    MainGenesisProjectAgentSelectResult, MainGenesisStartCommandInput, MainGenesisStartPrincipal,
-    MainGenesisStartRequest, MainGenesisStartResult,
-};
-pub use main_orchestration_actions::{
-    ExecuteMainOrchestrationActionInput, MainOrchestrationActionService,
-};
-pub use main_orchestration_queries::MainOrchestrationQueryService;
 pub use memory::{
     BackfillSummary, BackfillTypeResult, MemoryAccessContext, MemoryCreator, MemoryItemInput,
     MemoryLifecycleInput, MemoryPublicationInput, MemoryReferences, MemorySearchResult,
@@ -222,7 +161,6 @@ pub use milestone_orchestration::{
     MILESTONE_READINESS_DIGEST_SCHEMA_VERSION, MILESTONE_RELEASE_DIGEST_SCHEMA_VERSION,
 };
 pub use milestone_runtime::MilestoneRuntime;
-pub use native_tools::CoordinationToolProvider;
 pub use notification_service::NotificationService;
 pub use oauth_service::{OAuthError, OAuthService};
 pub use operating_skills::{
@@ -249,10 +187,6 @@ pub use product_genesis::{
     validate_genesis_transition, GenesisLifecycleError, GenesisPromptContext,
     NewProductGenesisSession, ProductGenesisService, ProductGenesisStart, ProductGenesisStore,
     SqliteProductGenesisStore, TransitionProductGenesis, PRODUCT_GENESIS_PROMPT_VERSION,
-};
-pub use project_agent_actions::{
-    DirectProjectCommandResult, ExecuteDirectProjectCommandInput,
-    ExecuteProjectOrchestrationActionInput, ProjectOrchestrationActionService,
 };
 pub use project_agent_selection::{
     current_project_agent_operating_skill_revision, list_genesis_project_agents,
@@ -330,7 +264,6 @@ pub use usage_projection::{
     usage_aggregate_for_source, usage_aggregate_for_source_state, usage_aggregate_for_task,
     usage_breakdowns_for_invocation, usage_breakdowns_for_source, UsageDomainRun,
 };
-pub use wake_turn_consumer::{wake_turn_consumer_name, WakeTurnConsumer, WakeTurnRun};
 pub use worker_runtime::assembly::{RuntimeWorker, ShutdownSignal};
 pub use workflow::template_service::WorkflowTemplateService;
 pub use workspace_cleanup::{GcSettings, WorkspaceCleanupScheduler};
@@ -750,8 +683,5 @@ mod execution_admission_error_tests {
 }
 
 pub mod project_escalation;
-
-mod topic_rotation;
-pub use topic_rotation::{TopicRotationCoordinator, TopicRotator};
 
 pub mod check_owner;

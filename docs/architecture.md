@@ -23,8 +23,8 @@ crates/
 ├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
 ├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
-├── services/      # Task core, workflow engine, shared domain services
-├── services-agents/ # Shared composition root, inquiry/topic services, provider authorization, embedded executor
+├── services/      # Task/workflow core and transport-neutral domain contracts
+├── services-agents/ # Agent Chat, native tools, orchestration adapters, embedded agents, and runtime composition
 ├── pricing/       # models.dev catalog, price resolution at admission, cost estimation
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
@@ -58,6 +58,15 @@ services / review / forge-client → check-executor → process-supervisor
                                                   → git → process-supervisor
                                                   → executors / api-types
 ```
+
+`services-agents` is strictly above `services`: core never depends on the
+agent crate. Core callers reach upper-layer behavior through narrow contracts
+owned by `services`, including `WakeTurns`, task `ExecutionSupport`, and
+`AgentEventConsumerNames`; `ForgeRuntimeBuilder` supplies their concrete agent
+implementations. Agent Chat policy/turn workers, inquiries, context manifests,
+default agents, Genesis and Project orchestration adapters, native tools,
+topic rotation, wake delivery, and the embedded agent service all live in
+`services-agents`.
 
 `process-supervisor` is a leaf (tokio and tempfile): `git` cannot depend on `executors`
 or `review`, and `forge-client` must not pull in `services`, so the one
@@ -115,7 +124,7 @@ an endpoint and untrusted result metadata, while provider/fetch deliberately
 admits otherwise public destinations outside the shared special-use ranges.
 Keeping these broader guards search-only preserves that provider/fetch
 boundary without relaxing search's existing restrictions. The shared address table in
-`services::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
+`services_agents::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
 checks agreement and each documented exclusion.
 `config::network_policy::tests::shared_policy_changes_only_intended_address_verdicts`
 compares both predicates with verbatim copies of their pre-sharing versions
@@ -278,7 +287,7 @@ database. Shared shutdown and worker identity contracts live in core
 provider-entry validation, service probes, native provider transport, the web
 fetch tool's authorization gate and transport, and public search.
 `config::is_restricted_public_hostname` owns the shared hostname checks. Public
-search (`services::native_tools` request validation and result filter, and
+search (`services_agents::native_tools` request validation and result filter, and
 `config` endpoint validation) adds the deliberate IPv6 exclusions listed
 above. `forge_agent_host::outbound_http::public_http_client_builder` owns the
 shared client policy for provider connection tests/health probes, native

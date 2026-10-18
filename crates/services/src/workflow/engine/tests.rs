@@ -4150,13 +4150,11 @@ async fn system_review_ci_infrastructure_retry_is_capped_and_does_not_create_att
     let metadata: serde_json::Value =
         serde_json::from_str(result.task.metadata_json.as_deref().unwrap()).unwrap();
     assert_eq!(metadata["concurrent_ci_note"], "retained");
-    let feed = crate::AttentionService::new(
-        fixture.db.clone(),
-        Arc::new(crate::WakeTurnConsumer::new(fixture.db.clone())),
-    )
-    .mission_control_home("test-user", None, 50)
-    .await
-    .unwrap();
+    let feed =
+        crate::AttentionService::new(fixture.db.clone(), crate::test_support::noop_wake_turns())
+            .mission_control_home("test-user", None, 50)
+            .await
+            .unwrap();
     let item = feed
         .needs_attention
         .iter()

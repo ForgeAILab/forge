@@ -501,7 +501,7 @@ impl EmbeddedInquiryRunner {
         // sub-agent and the caller compose paths against.
         let findings_relative_path = format!(
             "{}/{inquiry_id}/{FINDINGS_FILENAME}",
-            crate::task_service::workspace::MAIN_AGENT_INQUIRIES_DIR
+            crate::task_service::MAIN_AGENT_INQUIRIES_DIR
         );
 
         // Register before the row becomes visible so a REST cancellation

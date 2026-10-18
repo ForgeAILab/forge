@@ -315,7 +315,7 @@ async fn record_entry_outcome_inner(
 
 /// Record provider auth evidence before it becomes the chat Configuration class.
 /// Local profile/configuration errors never enter this path.
-pub(crate) async fn record_chat_auth_rejection(db: &SqliteDb, credential_id: &str) -> Result<()> {
+pub async fn record_chat_auth_rejection(db: &SqliteDb, credential_id: &str) -> Result<()> {
     let Some(handle) = CredentialHandleRepo::get_credential_handle(db, credential_id).await? else {
         return Ok(());
     };

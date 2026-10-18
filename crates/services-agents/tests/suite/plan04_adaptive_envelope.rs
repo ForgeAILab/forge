@@ -5,6 +5,7 @@
 //! split, sequence, and replace preserve its governance/provenance while an
 //! envelope or fixed-boundary crossing is durable reconciliation truth.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use db::{

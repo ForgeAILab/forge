@@ -374,10 +374,7 @@ async fn redetection_after_resolution_counts_only_newer_handoffs() {
         handoff(&db, "project-1", task, &["shared.rs"], &timestamp(120)).await;
     }
     run(&db).await;
-    let attention = AttentionService::new(
-        Arc::clone(&db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&db))),
-    );
+    let attention = AttentionService::new(Arc::clone(&db), crate::test_support::noop_wake_turns());
     attention.project_once(100).await.unwrap();
     sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, version = version + 1 WHERE attention_type = 'conflict_hotspot'")
         .bind(now_rfc3339()).execute(db.pool()).await.unwrap();
@@ -460,10 +457,7 @@ async fn audit39b_pending_refresh_reopens_resolved_item_and_skips_boundary() {
         handoff(&db, "project-1", task, &["shared.rs"], &timestamp(120)).await;
     }
     run(&db).await;
-    let attention = AttentionService::new(
-        Arc::clone(&db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&db))),
-    );
+    let attention = AttentionService::new(Arc::clone(&db), crate::test_support::noop_wake_turns());
     attention.project_once(100).await.unwrap();
     // A fourth handoff must not enqueue a refresh ahead of the user resolution.
     handoff(&db, "project-1", "four", &["shared.rs"], &timestamp(90)).await;
@@ -670,13 +664,10 @@ async fn acknowledged_and_snoozed_episodes_do_not_emit_again() {
         handoff(&db, "project-1", task, &["shared.rs"], &now_rfc3339()).await;
     }
     run(&db).await;
-    AttentionService::new(
-        Arc::clone(&db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&db))),
-    )
-    .project_once(100)
-    .await
-    .unwrap();
+    AttentionService::new(Arc::clone(&db), crate::test_support::noop_wake_turns())
+        .project_once(100)
+        .await
+        .unwrap();
     sqlx::query("UPDATE attention_projection SET status = 'acknowledged', snoozed_until = ?, version = version + 1 WHERE attention_type = 'conflict_hotspot'")
         .bind((Utc::now() + Duration::days(1)).to_rfc3339()).execute(db.pool()).await.unwrap();
     for task in ["four", "five", "six"] {

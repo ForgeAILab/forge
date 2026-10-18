@@ -557,7 +557,7 @@ async fn lead_call(
     key: &str,
 ) -> std::result::Result<Value, forge_agent_host::AgentHostError> {
     let runtime = session(db, agent, task_id).await;
-    let provider = services::CoordinationToolProvider::new(Arc::clone(db));
+    let provider = services_agents::CoordinationToolProvider::new(Arc::clone(db));
     provider.set_task_service(Arc::clone(service));
     ForgeToolProvider::propose(
         &provider,
@@ -1621,7 +1621,7 @@ impl World {
         registry.register(Box::new(ScriptedAdapter(Arc::clone(&script))));
         *probe.script.lock().unwrap() = Some(Arc::clone(&script));
         let registry = Arc::new(registry);
-        services::ensure_default_agents(db.as_ref(), &registry)
+        services_agents::ensure_default_agents(db.as_ref(), &registry)
             .await
             .expect("default agents upsert");
         let event_bus = Arc::new(events::EventBus::new(1024));

@@ -6749,6 +6749,7 @@ mod tests {
             include_str!("../../db/src/sqlite/agent.rs"),
             include_str!("../../db/src/sqlite/agent_chat.rs"),
             include_str!("../../db/src/sqlite/orchestration.rs"),
+            include_str!("../../db/src/sqlite/orchestration/turn_admission.rs"),
         ];
         let mut statements = 0;
         for db_source in db_sources {
@@ -7425,7 +7426,7 @@ mod tests {
         }
         assert_card_has_no_audit_metadata(&first_card);
         assert_card_has_no_audit_metadata(&second_card);
-        let before = include_str!("../tests/fixtures/project_chat_prompt_before.txt");
+        let before = include_str!("../../services/tests/fixtures/project_chat_prompt_before.txt");
         println!(
             "Project fixture characters: before system={}, state=0; after system={}, state={}",
             before.chars().count(),

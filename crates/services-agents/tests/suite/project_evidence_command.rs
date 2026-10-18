@@ -6,6 +6,7 @@
 //! identity and domain outcome shape, while only the action path links an
 //! AgentAction execution.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use db::{

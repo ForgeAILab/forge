@@ -97,13 +97,13 @@ What replaced it:
   `#[cfg(any(test, feature = "..."))]`, so the unit tests see them without the
   feature. `db` also lists `rusqlite` and `tempfile` as dev-dependencies for
   that reason.
-- The integration targets (`services`: `main`, `main_project_create_command`,
+- The feature-gated integration targets (`services`: `main`,
   `project_provisioning_characterization`; `db`: `main`) declare
   `required-features` in `Cargo.toml` and are built with the feature:
 
   ```bash
   cargo test -p services --features test-support --test main attention_service::test_name
-  cargo test -p services --features test-support --test '*'   # all three targets
+  cargo test -p services --features test-support --test '*'   # both targets
   cargo test -p db --features test-template --test main file_backed_migration::test_name
   ```
 
@@ -425,8 +425,9 @@ replay. DB integration files now share `tests/main.rs`, with their original
 file stems as modules under `tests/suite/`. Services uses the same layout,
 except `project_provisioning_characterization` stays in a separate binary:
 its scaffold tests mutate `FORGE_SCAFFOLD_COMMAND` under their existing lock.
-`main_project_create_command` also stays separate to preserve its shared
-turn-log root and optional capture fixtures. Other fixtures use isolated pools,
+`services-agents` keeps `main_project_create_command` separate to preserve its
+shared turn-log root and optional capture fixtures; the catch-all `rest` shard
+runs that target with the rest of the crate. Other fixtures use isolated pools,
 unique temporary paths, immutable statics or atomic filename counters. The
 API integration targets are consolidated and isolated as described below. Full workspace test execution remains
 a CI responsibility.
