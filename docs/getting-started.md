@@ -341,8 +341,9 @@ Forge honours `HTTPS_PROXY`/`https_proxy`, `ALL_PROXY`/`all_proxy`, and
 `NO_PROXY`/`no_proxy` for native provider requests, provider health probes and
 connection tests, fetch, and public search. Each client takes one environment
 snapshot. Selection uses reqwest's system-proxy rules: uppercase takes
-precedence over lowercase, an empty value counts as unset, and a set HTTPS
-proxy takes precedence over the all-protocol proxy. `NO_PROXY` supports
+precedence over lowercase, even when the uppercase value is empty; a set HTTPS
+proxy takes precedence over the all-protocol proxy, and an empty HTTPS value
+falls back to it. `NO_PROXY` supports
 hostname/domain matches (an entry also matches its subdomains), literal IPs,
 CIDR ranges and `*`; matching targets take the direct path. As in reqwest
 (unlike curl), `*` and domain entries never match a literal-IP target (list the

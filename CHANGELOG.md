@@ -69,8 +69,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   embedding those addresses, are now rejected as former 6to4 relay anycast.
 - A set but unusable `HTTPS_PROXY`/`ALL_PROXY` value (unparseable, or a
   non-HTTP scheme such as `socks5h://`) now refuses native provider requests
-  and fetch. v0.14.0 ignored such a value and connected directly, or used
-  `ALL_PROXY` when only `HTTPS_PROXY` was unusable. Fix or unset the variable.
+  and fetch. v0.14.0 ignored an unparseable value and connected directly (or
+  used `ALL_PROXY` when only `HTTPS_PROXY` was unusable), and failed a SOCKS
+  value only at connect time. Fix or unset the variable.
 - Remote daemon clients using any `embedded:` machine id now receive HTTP 409
   `machine_id_reserved`, including re-registration and authenticated report or
   reconnect attempts. These ids are reserved for the in-process server daemon.
