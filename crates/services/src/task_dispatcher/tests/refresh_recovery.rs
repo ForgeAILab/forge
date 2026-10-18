@@ -127,13 +127,10 @@ async fn unrecoverable_review_refresh_parks_once_instead_of_appending_commands()
                 "{offers:?}"
             );
         }
-        crate::AttentionService::new(
-            fixture.db.clone(),
-            std::sync::Arc::new(crate::WakeTurnConsumer::new(fixture.db.clone())),
-        )
-        .project_once(100)
-        .await
-        .unwrap();
+        crate::AttentionService::new(fixture.db.clone(), crate::test_support::noop_wake_turns())
+            .project_once(100)
+            .await
+            .unwrap();
         let attention: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attention_projection WHERE status='open' AND json_extract(details_json,'$.entity_id')=?")
             .bind(id).fetch_one(fixture.db.pool()).await.unwrap();
         assert_eq!(attention, 1);

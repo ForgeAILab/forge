@@ -4229,7 +4229,7 @@ fn bounded_error_message(error: &ServiceError) -> String {
 }
 
 /// Close a Chat turn incident through Attention's resolver so snoozes are cleared.
-pub(crate) async fn resolve_turn_incident<D: db::AttentionRepo>(
+pub async fn resolve_turn_incident<D: db::AttentionRepo>(
     db: &D,
     chat_id: &str,
     turn_id: &str,
@@ -4352,7 +4352,7 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = Arc::new(SqliteDb::new(pool));
-        AttentionService::new(Arc::clone(&db), Arc::new(crate::WakeTurnConsumer::new(db)))
+        AttentionService::new(Arc::clone(&db), crate::test_support::noop_wake_turns())
     }
 
     async fn append_projection_event(

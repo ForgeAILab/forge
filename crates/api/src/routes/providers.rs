@@ -23,7 +23,7 @@ use db::{
 };
 use forge_agent_host::{AgentHostError, CredentialRevocationOutcome, Secret};
 use serde_json::Value;
-use services::embedded_agent_service::ConnectApiKeyCredential;
+use services_agents::embedded_agent_service::ConnectApiKeyCredential;
 
 use crate::{
     errors::{ApiError, ApiResult},

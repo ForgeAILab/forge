@@ -862,7 +862,7 @@ async fn condition(db: &db::SqliteDb, task: &str) -> String {
 async fn open_attention(steps: &Steps, task: &str) -> i64 {
     let attention = crate::AttentionService::new(
         Arc::clone(&steps.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&steps.db))),
+        crate::test_support::noop_wake_turns(),
     );
     while attention.project_once(100).await.unwrap().processed_events > 0 {}
     sqlx::query_scalar(

@@ -6,6 +6,7 @@
 //! Main, Project, and Task operation registries deliver the same structured
 //! outcome contract to the runtime.
 
+use crate::test_services as services;
 use std::{collections::BTreeSet, sync::Arc};
 
 use agent_runtime::core::{
@@ -2846,13 +2847,13 @@ async fn capture_base_selection(f: &Fixture) -> services::MainGenesisProjectAgen
         .unwrap()
 }
 
-#[path = "../common/pre_change_main_runtime.rs"]
+#[path = "../../../services/tests/common/pre_change_main_runtime.rs"]
 mod pre_change_main_runtime;
 
 #[tokio::test]
 async fn main_selection_literal_checkpoints_resume_real_provider_and_same_base_receipt() {
     let fixtures: Value = serde_json::from_str(include_str!(
-        "../common/main_proposal_checkpoints_pre_change.json"
+        "../../../services/tests/common/main_proposal_checkpoints_pre_change.json"
     ))
     .unwrap();
     for form in ["prepared", "approval_pending", "approval_edited"] {
@@ -3310,8 +3311,10 @@ async fn capture_project_proposal_case(operation: &'static str) {
         let snapshot = normalized_generated_values(
             json!({"arguments":arguments,"first":first,"escalations":count}),
         );
-        let fixtures: Value =
-            serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../services/tests/fixtures/project_registry_base.json"
+        ))
+        .unwrap();
         assert_eq!(
             snapshot, fixtures[operation],
             "{operation} hand-path fixture"
@@ -3344,8 +3347,10 @@ async fn capture_project_proposal_case(operation: &'static str) {
         let snapshot = normalized_generated_values(
             json!({"arguments":arguments,"first":first,"action":{"payload":serde_json::from_str::<Value>(&row.get::<String,_>("payload_json")).unwrap(),"payload_hash":row.get::<String,_>("payload_hash"),"policy_result":row.get::<String,_>("policy_result"),"status":row.get::<String,_>("status")}}),
         );
-        let fixtures: Value =
-            serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../services/tests/fixtures/project_registry_base.json"
+        ))
+        .unwrap();
         assert_eq!(
             snapshot, fixtures[operation],
             "{operation} hand-path fixture"
@@ -3384,8 +3389,10 @@ async fn capture_project_proposal_case(operation: &'static str) {
     // Preserve every other field (including every receipt digest).
     let snapshot =
         normalized_generated_values(json!({"arguments":arguments,"first":first,"receipt":receipt}));
-    let fixtures: Value =
-        serde_json::from_str(include_str!("../fixtures/project_registry_base.json")).unwrap();
+    let fixtures: Value = serde_json::from_str(include_str!(
+        "../../../services/tests/fixtures/project_registry_base.json"
+    ))
+    .unwrap();
     assert_eq!(
         snapshot, fixtures[operation],
         "{operation} hand-path fixture"

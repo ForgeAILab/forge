@@ -6,9 +6,12 @@
 //! call their shared command services, while approval-required mutations
 //! retain an `AgentAction` envelope.
 
-use crate::task_service::execution::{ExecutionOutboxInput, ExecutionOutboxReport};
 #[cfg(test)]
 use forge_agent_host::PROJECT_CURRENT_STATE_OPERATION;
+use services::{
+    bounded_file::read_bounded_regular_file,
+    task_service::execution::{ExecutionOutboxInput, ExecutionOutboxReport},
+};
 mod project_proposals;
 mod registered_proposals;
 mod registered_reads;
@@ -20,8 +23,7 @@ use std::collections::BTreeSet;
 
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
-    io::Read,
+    fs,
     net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{Arc, RwLock},
@@ -4765,74 +4767,6 @@ fn resolve_outbox_artifact(
     Ok((PathBuf::from(path), outbox.to_path_buf(), true))
 }
 
-/// Open and read a regular file within one allowed root while enforcing the
-/// byte limit on the opened handle. The metadata comparison prevents a leaf
-/// replacement between validation and open from being accepted, and outbox
-/// callers also require a single link so a hard link cannot turn the outbox
-/// into a read channel for another file.
-pub(crate) fn read_bounded_regular_file(
-    path: &Path,
-    allowed_root: &Path,
-    max_bytes: u64,
-    require_single_link: bool,
-) -> Result<Option<Vec<u8>>, String> {
-    let leaf_metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    if !leaf_metadata.file_type().is_file() {
-        return Err("not a regular file".to_owned());
-    }
-
-    let canonical_root = fs::canonicalize(allowed_root).map_err(|error| error.to_string())?;
-    let canonical_path = fs::canonicalize(path).map_err(|error| error.to_string())?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err("path escapes its allowed root".to_owned());
-    }
-    let path_metadata = fs::symlink_metadata(&canonical_path).map_err(|error| error.to_string())?;
-    if !path_metadata.file_type().is_file() {
-        return Err("not a regular file".to_owned());
-    }
-    let file = File::open(&canonical_path).map_err(|error| error.to_string())?;
-    let opened_metadata = file.metadata().map_err(|error| error.to_string())?;
-    if !same_open_file(&path_metadata, &opened_metadata) {
-        return Err("file changed while it was being opened".to_owned());
-    }
-    #[cfg(unix)]
-    if require_single_link {
-        use std::os::unix::fs::MetadataExt;
-        if opened_metadata.nlink() != 1 {
-            return Err("file must not be a hard link".to_owned());
-        }
-    }
-    if opened_metadata.len() > max_bytes {
-        return Err(format!("exceeds the {max_bytes} byte limit"));
-    }
-
-    let mut bytes = Vec::with_capacity(usize::try_from(opened_metadata.len()).unwrap_or(0));
-    file.take(max_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(format!("exceeds the {max_bytes} byte limit"));
-    }
-    Ok(Some(bytes))
-}
-
-#[cfg(unix)]
-fn same_open_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_open_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.file_type() == right.file_type()
-        && left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-}
-
 const MAX_CAPTURED_EVIDENCE_BYTES: i64 = 25 * 1024 * 1024;
 
 /// A worklog entry is a summary the next role reads, not a transcript.
@@ -5242,6 +5176,126 @@ mod tests {
                 scope_id: task_id,
                 workspace_access: WorkspaceAccess::TaskWrite,
             },
+        }
+    }
+
+    /// The native lead boundary itself: the registry's principal rule and the
+    /// `lead_run` adapter refuse a running Task session that leads no root.
+    /// The core lead-operation tests reach `TaskService` through a test
+    /// double, so this is where the native path is held.
+    #[tokio::test]
+    async fn a_run_that_leads_no_root_is_refused_every_lead_operation_natively() {
+        let fixture = native_plan_fixture("planner", "planner").await;
+        for (operation, payload) in [
+            ("lead.read", json!({})),
+            (
+                "lead.subtask",
+                json!({"action": "create", "title": "smuggled"}),
+            ),
+            (
+                "lead.recover",
+                json!({"task_id": fixture.task_id, "action": {"verb": "cancel"}, "version": 1}),
+            ),
+            (
+                "lead.handoff",
+                json!({"task_id": fixture.task_id, "note": "note"}),
+            ),
+            ("lead.request_input", json!({"question": "may I?"})),
+        ] {
+            let denied = ForgeToolProvider::propose(
+                &fixture.provider,
+                &fixture.agent_id,
+                &fixture.scope,
+                &fixture.runtime_session_id,
+                operation,
+                json!({"operation": operation, "payload": payload, "dedupe_key": operation, "correlation_id": operation}),
+            )
+            .await
+            .expect_err("a run that leads no coordination root is refused");
+            let denied = format!("{denied:?}");
+            assert!(
+                denied.contains("OperationNotInScope") || denied.contains("operation_not_in_scope"),
+                "{operation}: {denied}"
+            );
+        }
+        let children: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE parent_task_id = ?")
+                .bind(&fixture.task_id)
+                .fetch_one(fixture.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(children, 0);
+    }
+
+    /// The verify hook's evidence store as production wires it: TaskService's
+    /// `ExecutionSupport` is the embedded agent service, which stores through
+    /// this provider. Core verify tests use a storage double instead.
+    #[tokio::test]
+    async fn verify_evidence_capture_through_execution_support_is_bounded_and_idempotent() {
+        use services::task_service::execution::ExecutionSupport;
+        let fixture = native_plan_fixture("coder", "coder").await;
+        let media = tempfile::tempdir().unwrap();
+        let embedded =
+            crate::EmbeddedAgentService::new(Arc::clone(&fixture.db), b"verify-evidence-test-key");
+        embedded.set_media_root(media.path().to_path_buf());
+        let media_id = db::new_uuid_v4();
+        for _ in 0..2 {
+            let stored = embedded
+                .capture_verify_evidence(
+                    &fixture.task_id,
+                    &media_id,
+                    "screen.png",
+                    "screenshot",
+                    "first screen",
+                    b"png bytes",
+                )
+                .await
+                .expect("verify evidence stores");
+            assert_eq!(stored, media_id);
+        }
+        let rows = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a replayed capture resolves the same artifact"
+        );
+        let row = &rows[0];
+        assert_eq!(row.content_type, "image/png");
+        assert_eq!(row.author_type, db::CommentAuthorType::System);
+        assert_eq!(row.author_name, "Forge Verify");
+        assert_eq!(
+            row.storage_key,
+            format!("{}/{media_id}__screen.png", fixture.task_id)
+        );
+        assert_eq!(
+            std::fs::read(media.path().join(&row.storage_key)).unwrap(),
+            b"png bytes"
+        );
+        let asset = db::SharedMediaRepo::get_media_asset_for_task_media(&*fixture.db, &media_id)
+            .await
+            .unwrap()
+            .expect("captured artifact has a media asset");
+        assert_eq!(
+            asset.checksum.as_deref(),
+            Some(hex::encode(Sha256::digest(b"png bytes")).as_str())
+        );
+        for bytes in [
+            Vec::new(),
+            vec![0_u8; MAX_CAPTURED_EVIDENCE_BYTES as usize + 1],
+        ] {
+            embedded
+                .capture_verify_evidence(
+                    &fixture.task_id,
+                    &db::new_uuid_v4(),
+                    "out.log",
+                    "log",
+                    "bounded",
+                    &bytes,
+                )
+                .await
+                .expect_err("verify evidence is 1 byte to 25 MiB");
         }
     }
 
@@ -6593,14 +6647,15 @@ mod tests {
         sqlx::query("INSERT INTO task (id, project_id, title, status, created_at, updated_at) VALUES (?, ?, 'Paused work', 'todo', ?, ?)")
             .bind(&paused_task).bind(&scope.scope_id).bind(db::now_rfc3339()).bind(db::now_rfc3339())
             .execute(fixture.db.pool()).await.unwrap();
-        let refusal = TaskService::new(fixture.db.clone(), Arc::new(events::EventBus::new(16)))
-            .claim_task(
-                paused_task,
-                crate::Assignee::Agent(fixture.agent_id.clone()),
-                None,
-            )
-            .await
-            .expect_err("real claim evaluator rejects the paused Project");
+        let refusal =
+            TaskService::new_for_test(fixture.db.clone(), Arc::new(events::EventBus::new(16)))
+                .claim_task(
+                    paused_task,
+                    crate::Assignee::Agent(fixture.agent_id.clone()),
+                    None,
+                )
+                .await
+                .expect_err("real claim evaluator rejects the paused Project");
         let error = fixture
             .provider
             .structured_boundary_error(

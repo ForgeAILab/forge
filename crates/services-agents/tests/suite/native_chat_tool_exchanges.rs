@@ -24,6 +24,7 @@
 //! The last section holds the usage-ledger cases for the same persisted
 //! session: every provider call is recorded once, by the turn that made it.
 
+use crate::test_services as services;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

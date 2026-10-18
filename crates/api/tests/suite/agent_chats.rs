@@ -1165,7 +1165,7 @@ async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
     ] {
         assert!(kinds.contains(kind), "missing {kind}");
     }
-    let service = services::agent_chat_service::AgentChatService::new(h.state.db.clone());
+    let service = services_agents::agent_chat_service::AgentChatService::new(h.state.db.clone());
     for ledger in [false, true] {
         for terminal in ["completed", "failed", "cancelled"] {
             let admitted: SendAgentChatMessageResponse = common::json_request_with_bearer(
@@ -1211,14 +1211,15 @@ async fn agent_chat_read_notifications_relay_ids_without_message_bodies() {
                 .unwrap();
             let expected = match terminal {
                 "completed" => {
-                    let response = services::agent_chat_service::AppendAgentChatSuccessInput {
-                        content: "Completed response".to_owned(),
-                        model: None,
-                        session_id: None,
-                        context_manifest_id: None,
-                        token_usage_json: None,
-                        duration_ms: None,
-                    };
+                    let response =
+                        services_agents::agent_chat_service::AppendAgentChatSuccessInput {
+                            content: "Completed response".to_owned(),
+                            model: None,
+                            session_id: None,
+                            context_manifest_id: None,
+                            token_usage_json: None,
+                            duration_ms: None,
+                        };
                     // Success has one service path; it settles usage even
                     // when there is none to settle.
                     service

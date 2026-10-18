@@ -16,11 +16,9 @@ use db::{
     ExecutionRepo, SelectAgentProfile,
 };
 use forge_agent_host::{AgentHostError, InteractionAnswer, InteractionAnswerValue};
-use services::{
-    agent_service::compute_effective_status,
-    embedded_agent_service::{
-        ConnectEmbeddedProfile, CreateEmbeddedAgent, CreateScopedSession, RequestedCanonicalScope,
-    },
+use services::agent_service::compute_effective_status;
+use services_agents::embedded_agent_service::{
+    ConnectEmbeddedProfile, CreateEmbeddedAgent, CreateScopedSession, RequestedCanonicalScope,
 };
 
 use crate::{
@@ -47,9 +45,9 @@ pub async fn create_embedded_agent(
             account_permission_ceiling: request
                 .account_permission_ceiling
                 .unwrap_or_else(default_account_permissions),
-            tool_policy: request
-                .tool_policy
-                .unwrap_or_else(services::embedded_agent_service::default_profile_tool_policy),
+            tool_policy: request.tool_policy.unwrap_or_else(
+                services_agents::embedded_agent_service::default_profile_tool_policy,
+            ),
             context_tokens: request.context_tokens,
             max_input_tokens: request.max_input_tokens,
             max_output_tokens: request.max_output_tokens,
@@ -82,9 +80,9 @@ pub async fn connect_embedded_profile(
             reasoning_effort: request.reasoning_effort,
             system_prompt: request.system_prompt,
             permission_policy: request.permission_policy,
-            tool_policy: request
-                .tool_policy
-                .unwrap_or_else(services::embedded_agent_service::default_profile_tool_policy),
+            tool_policy: request.tool_policy.unwrap_or_else(
+                services_agents::embedded_agent_service::default_profile_tool_policy,
+            ),
             context_tokens: request.context_tokens,
             max_input_tokens: request.max_input_tokens,
             max_output_tokens: request.max_output_tokens,
@@ -710,5 +708,5 @@ fn parse_json(value: &str) -> serde_json::Value {
 fn default_account_permissions() -> serde_json::Value {
     // The profile ceiling and the account ceiling start from the same broad
     // default; scope admission remains the decisive intersection.
-    services::embedded_agent_service::default_profile_tool_policy()
+    services_agents::embedded_agent_service::default_profile_tool_policy()
 }

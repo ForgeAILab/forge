@@ -39,15 +39,17 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use services::{
+    project_artifact_commands::ProjectCommandAuthorization,
+    project_charter_commands::{ProjectCharterApprovalCommand, ProjectCharterCommandService},
+    task_service::TaskService,
+    Result, ServiceError,
+};
+use services_agents::{
     agent_chat_service::{
         AgentChatService, CancelAgentChatTurnInput, RetryAgentChatTurnInput,
         SendAgentChatMessageInput,
     },
     agent_chat_turn_worker::AgentChatTurnLogRoot,
-    project_artifact_commands::ProjectCommandAuthorization,
-    project_charter_commands::{ProjectCharterApprovalCommand, ProjectCharterCommandService},
-    task_service::TaskService,
-    Result, ServiceError,
 };
 
 /// Contract revision for the presentation-neutral Solo facade.  This is a

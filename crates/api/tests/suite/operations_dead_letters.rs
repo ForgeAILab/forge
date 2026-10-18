@@ -33,7 +33,7 @@ async fn test_app(root: &std::path::Path) -> Harness {
     .await
     .unwrap();
     let registry = std::sync::Arc::new(cli_adapters::test_support::test_registry());
-    services::ensure_default_agents(&db, &registry)
+    services_agents::ensure_default_agents(&db, &registry)
         .await
         .unwrap();
     let mut config = config::ForgeConfig::with_data_dir(data.path().to_path_buf());

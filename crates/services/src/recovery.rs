@@ -7297,10 +7297,7 @@ pub(crate) mod tests {
         let service = TaskService::new(db.clone(), bus)
             .with_daemon_connections(registry.clone())
             .with_provider_credential_env(Arc::new(
-                crate::embedded_agent_service::EmbeddedAgentService::new(
-                    db.clone(),
-                    b"owner-outbox-test-key",
-                ),
+                crate::test_support::TestExecutionSupport::new(db.clone()),
             ));
         let router = (*service.workspace_backend_router())
             .clone()

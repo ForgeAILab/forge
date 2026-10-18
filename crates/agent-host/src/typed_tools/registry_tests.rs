@@ -443,7 +443,7 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
         .split("fn ")
         .next()
         .unwrap();
-    let dispatcher = include_str!("../../../services/src/native_tools.rs")
+    let dispatcher = include_str!("../../../services-agents/src/native_tools.rs")
         .split("let result = if let Some(spec) = registered_reads::CATALOG")
         .nth(1)
         .unwrap()
@@ -464,7 +464,7 @@ fn main_registered_reads_have_no_hand_schema_validator_or_dispatch_arm() {
             assert!(!source.contains(marker), "remaining hand layer: {marker}");
         }
     }
-    let queries = include_str!("../../../services/src/main_orchestration_queries.rs");
+    let queries = include_str!("../../../services-agents/src/main_orchestration_queries.rs");
     assert!(!queries.contains("pub async fn execute("));
     assert!(!queries.contains("parse_query"));
     for id in operation_registry::main_reads::IDS {

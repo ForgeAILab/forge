@@ -118,7 +118,7 @@ impl ProjectMilestoneCommandService {
     /// Execute a native Project-Agent milestone/readiness/release-request
     /// proposal.  The adapter contributes only its admitted action and
     /// command context; payload-derived authorization is not trusted here.
-    pub(crate) async fn execute_project_agent_command(
+    pub async fn execute_project_agent_command(
         &self,
         action: &AgentAction,
         project_id: &str,

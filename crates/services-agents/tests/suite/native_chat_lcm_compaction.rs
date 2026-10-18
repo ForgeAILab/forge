@@ -10,6 +10,7 @@
 //! an embedded-agent capability only; the CLI chat backend advertises
 //! `lcm: false` and is intentionally out of scope here.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use agent_runtime::core::provider::{

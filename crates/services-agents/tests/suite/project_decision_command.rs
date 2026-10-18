@@ -5,6 +5,7 @@
 //! tests below remain as coverage for action provenance; the user tests cover
 //! service-level replay, approval, and rejection behavior.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use api_types::{DecisionCandidateContext, DecisionClass};

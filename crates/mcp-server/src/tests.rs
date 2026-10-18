@@ -16,7 +16,8 @@ use db::{
 };
 use events::EventBus;
 use serde_json::{json, Value};
-use services::{ServiceError, SetMainAgentBindingInput, SetProjectAgentBindingInput};
+use services::ServiceError;
+use services_agents::{SetMainAgentBindingInput, SetProjectAgentBindingInput};
 
 use crate::{
     error::McpToolError,

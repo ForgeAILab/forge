@@ -115,10 +115,8 @@ async fn no_change_twice_parks_without_another_review_or_check() {
 #[tokio::test]
 async fn review_park_attention_names_the_reason_and_offers_owner_actions() {
     let f = red_fixture().await;
-    let attention = crate::AttentionService::new(
-        f.db.clone(),
-        Arc::new(crate::WakeTurnConsumer::new(f.db.clone())),
-    );
+    let attention =
+        crate::AttentionService::new(f.db.clone(), crate::test_support::noop_wake_turns());
     attention.project_once(100).await.unwrap();
     repair(&f).await;
     enter(&f, workflow_actor()).await;

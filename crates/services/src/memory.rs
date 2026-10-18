@@ -554,7 +554,7 @@ where
     /// Build the projection for one finalized Agent Chat message without
     /// writing it. WorkerRuntime performs this preparation before opening the
     /// short transaction that applies the item and advances its cursor.
-    pub(crate) fn prepare_agent_chat_message_event(
+    pub fn prepare_agent_chat_message_event(
         &self,
         event: &DomainEvent,
         chat: &AgentChat,

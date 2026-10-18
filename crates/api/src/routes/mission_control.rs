@@ -10,7 +10,8 @@ use axum::{
 use std::sync::Arc;
 
 use db::{PageRequest, SortBy, SortOrder};
-use services::{attention_service, AttentionService, WakeTurnConsumer};
+use services::{attention_service, AttentionService};
+use services_agents::WakeTurnConsumer;
 
 use crate::{errors::ApiResult, routes::auth::AuthenticatedUser, state::AppState};
 

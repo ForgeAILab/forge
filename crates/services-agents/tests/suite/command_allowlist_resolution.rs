@@ -6,6 +6,7 @@
 //! the same server do not have to share one list, and neither can a model
 //! choose its own.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use config::CommandPolicyConfig;

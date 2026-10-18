@@ -36,6 +36,8 @@ pub struct OperatorStatusService {
     usage_cache: Arc<UsageLedgerIndex>,
     consumer_stall_seconds: u32,
     expected_event_consumers: RwLock<Vec<&'static str>>,
+    agent_event_consumer_names:
+        Option<Arc<dyn crate::worker_runtime::assembly::AgentEventConsumerNames>>,
     event_relay: RwLock<Option<Arc<crate::DomainEventBroadcastConsumer>>>,
     relay_enabled: AtomicBool,
     daemon_connections: Option<Arc<crate::daemon_transport::DaemonConnectionRegistry>>,
@@ -61,6 +63,7 @@ impl OperatorStatusService {
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            agent_event_consumer_names: None,
             event_relay: RwLock::new(None),
             relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
@@ -89,6 +92,7 @@ impl OperatorStatusService {
             usage_cache: Arc::new(UsageLedgerIndex::new(Arc::clone(&db))),
             consumer_stall_seconds: config::DEFAULT_EVENT_CONSUMER_STALL_SECONDS,
             expected_event_consumers: RwLock::new(Vec::new()),
+            agent_event_consumer_names: None,
             event_relay: RwLock::new(None),
             relay_enabled: AtomicBool::new(false),
             daemon_connections: None,
@@ -130,6 +134,14 @@ impl OperatorStatusService {
         self
     }
 
+    pub fn with_agent_event_consumer_names(
+        mut self,
+        names: Arc<dyn crate::worker_runtime::assembly::AgentEventConsumerNames>,
+    ) -> Self {
+        self.agent_event_consumer_names = Some(names);
+        self
+    }
+
     /// Monitor only durable consumers owned by the process's started workers.
     /// Persisted cursors from other assemblies are not evidence of a live worker.
     pub fn set_runtime_workers(&self, workers: &[crate::worker_runtime::assembly::RuntimeWorker]) {
@@ -143,7 +155,9 @@ impl OperatorStatusService {
             .write()
             .expect("event consumer set lock") = workers
             .iter()
-            .filter_map(|worker| worker.event_consumer_name())
+            .filter_map(|worker| {
+                worker.event_consumer_name(self.agent_event_consumer_names.as_deref())
+            })
             .collect();
     }
 
@@ -1237,7 +1251,9 @@ mod tests {
             .expect("pool creates");
         run_migrations(&pool).await.expect("migrations run");
         let db = Arc::new(SqliteDb::new(pool));
-        let service = OperatorStatusService::new(Arc::clone(&db));
+        let service = OperatorStatusService::new(Arc::clone(&db)).with_agent_event_consumer_names(
+            Arc::new(crate::test_support::TestAgentEventConsumerNames),
+        );
         service.set_runtime_workers(&crate::worker_runtime::assembly::COMMON_WORKERS);
         (db, service)
     }
@@ -2363,10 +2379,12 @@ mod tests {
         let old = (now - Duration::minutes(10)).to_rfc3339();
         sqlx::query("INSERT INTO domain_event (sequence, id, event_type, entity_type, entity_id, actor_type, scope_type, scope_id, correlation_id, created_at) VALUES (1, 'processed', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?), (10, 'pending', 'test', 'test', 'test', 'system', 'system', 'system', 'test', ?)")
             .bind(&old).bind(&old).execute(db.pool()).await.unwrap();
-        for consumer in crate::worker_runtime::assembly::COMMON_WORKERS
-            .into_iter()
-            .filter_map(|worker| worker.event_consumer_name())
-        {
+        let consumers = service
+            .expected_event_consumers
+            .read()
+            .expect("event consumer set lock")
+            .clone();
+        for consumer in consumers {
             sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 10, ?) ON CONFLICT(consumer_name) DO UPDATE SET last_sequence = 10, updated_at = excluded.updated_at")
                 .bind(consumer).bind(&old).execute(db.pool()).await.unwrap();
         }
@@ -2415,13 +2433,10 @@ mod tests {
         service.set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Memory]);
         let now = Utc::now();
         let old = (now - Duration::minutes(10)).to_rfc3339();
-        let name = crate::memory_consumer_name();
+        let name = crate::test_support::memory_consumer_name();
         sqlx::query("INSERT INTO event_consumer_cursor (consumer_name, last_sequence, updated_at) VALUES (?, 0, ?)")
             .bind(name).bind(&old).execute(db.pool()).await.unwrap();
-        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
-            .run_once(1)
-            .await
-            .unwrap();
+        crate::test_support::initialize_agent_event_consumer(&db, name).await;
         // Model a worker that has been running for ten minutes; a newly
         // initialized worker gets time to drain an upgraded checkpoint.
         sqlx::query("UPDATE worker_health SET created_at = ? WHERE worker_name = ?")
@@ -2460,8 +2475,8 @@ mod tests {
             .any(|issue| issue.entity_id == name
                 && issue.error.contains("persistent worker failure")));
         assert_eq!(status.overall_severity, OperatorSeverity::Attention);
-        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
-            .run_once(10)
+        crate::worker_runtime::WorkerHealth::new(Arc::clone(&db), name)
+            .clear_error_if_set(db::HealthErrorKind::Runtime)
             .await
             .unwrap();
         sync_fixtures(&service).await;
@@ -2487,11 +2502,8 @@ mod tests {
     async fn consumer_deferral_text_and_dead_letters_have_distinct_operator_lifetimes() {
         let (db, service) = test_service().await;
         service.set_runtime_workers(&[crate::worker_runtime::assembly::RuntimeWorker::Memory]);
-        let name = crate::memory_consumer_name();
-        crate::AgentChatMemoryConsumer::new(Arc::clone(&db))
-            .run_once(1)
-            .await
-            .unwrap();
+        let name = crate::test_support::memory_consumer_name();
+        crate::test_support::initialize_agent_event_consumer(&db, name).await;
         let health = db::WorkerHealth::new(Arc::clone(&db), name);
         let mut tx = db::begin_immediate(db.pool()).await.unwrap();
         health

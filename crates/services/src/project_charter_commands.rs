@@ -123,7 +123,7 @@ impl ProjectCharterCommandService {
         self.save_revision_with_context(command, context).await
     }
 
-    pub(crate) async fn save_revision_with_context(
+    pub async fn save_revision_with_context(
         &self,
         command: ProjectCharterRevisionCommand,
         context: CommandContext,

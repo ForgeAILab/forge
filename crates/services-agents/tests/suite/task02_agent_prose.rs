@@ -5,6 +5,7 @@
 //! review/validation/git/evidence records, or rewrite Task history.  Reads back
 //! to the planner contain only bounded, server-owned metadata.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use db::{

@@ -101,7 +101,7 @@ impl ProjectDecisionCommandService {
     /// Execute the Project Agent's bounded implementation-Decision policy.
     /// Baseline and adaptive-envelope validation live here with the shared
     /// Decision writes; the native adapter supplies only admitted provenance.
-    pub(crate) async fn execute_project_agent_command(
+    pub async fn execute_project_agent_command(
         &self,
         action: &AgentAction,
         project_id: &str,

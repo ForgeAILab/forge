@@ -7439,7 +7439,7 @@ mod tests {
         }
         assert_card_has_no_audit_metadata(&first_card);
         assert_card_has_no_audit_metadata(&second_card);
-        let before = include_str!("../tests/fixtures/project_chat_prompt_before.txt");
+        let before = include_str!("../../services/tests/fixtures/project_chat_prompt_before.txt");
         println!(
             "Project fixture characters: before system={}, state=0; after system={}, state={}",
             before.chars().count(),

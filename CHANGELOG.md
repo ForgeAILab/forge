@@ -162,6 +162,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- **The remaining agent/chat implementation moved from `services` to
+  `services-agents` (internal).** Agent Chat policy, admission, workers and
+  memory projection; inquiries; context manifests and usage; embedded agents;
+  default-agent setup; Main/Project orchestration adapters; native tools;
+  topic rotation; and wake delivery now sit above the Task/workflow core.
+  Core reaches agent-owned behavior only through narrow injected contracts;
+  there is no `services → services-agents` dependency and no REST, MCP, CLI,
+  event, storage, or user-visible behavior change.
 - Five small internal SQLite logic-trigger families now run in the owning
   repository transactions; database guards and the intentionally global
   projection/invalidation trigger families are unchanged.

@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use db::SqliteDb;
 use events::EventBus;
-use services::{AgentChatService, AgentService, TaskService};
+use services::{AgentService, TaskService};
+use services_agents::AgentChatService;
 
 #[derive(Clone)]
 pub struct AppState {
