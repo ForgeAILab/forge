@@ -343,8 +343,11 @@ connection tests, fetch, and public search. Each client takes one environment
 snapshot. Selection uses reqwest's system-proxy rules: uppercase takes
 precedence over lowercase, an empty value counts as unset, and a set HTTPS
 proxy takes precedence over the all-protocol proxy. `NO_PROXY` supports
-hostname/domain matches, literal IPs, CIDR ranges and `*`; matching targets
-take the direct path. A proxy value that is set but is not a usable `http://`
+hostname/domain matches (an entry also matches its subdomains), literal IPs,
+CIDR ranges and `*`; matching targets take the direct path. As in reqwest
+(unlike curl), `*` and domain entries never match a literal-IP target (list the
+IP or a CIDR range), and entries carrying a port or IPv6 brackets match
+nothing. A proxy value that is set but is not a usable `http://`
 or `https://` proxy URL (unparseable, or another scheme such as `socks5h://`)
 fails closed: every such request is refused with an error naming the
 variables, never sent through the other variable or directly.

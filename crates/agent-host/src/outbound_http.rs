@@ -413,7 +413,9 @@ pub(crate) mod proxy_tests {
                     .map(|(_, value)| (*value).to_owned())
             });
             let uri = url.as_str().parse().unwrap();
-            env.matcher.intercept(&uri).map(|proxy| proxy.uri().to_string())
+            env.matcher
+                .intercept(&uri)
+                .map(|proxy| proxy.uri().to_string())
         };
         for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
             assert_eq!(
@@ -474,6 +476,33 @@ pub(crate) mod proxy_tests {
             );
         }
         assert!(selected(&[], &target).is_none());
+        // reqwest's matcher, not curl's: `*` and domain entries never match a
+        // literal IP target, and entries with a port or IPv6 brackets match nothing.
+        let literal = url::Url::parse("https://93.184.215.14/x").unwrap();
+        let v6 = url::Url::parse("https://[2606:4700::1]/x").unwrap();
+        for (exclusion, url, bypassed) in [
+            ("*", &literal, false),
+            ("api.example.test:443", &target, false),
+            ("[2606:4700::1]", &v6, false),
+            ("2606:4700::1", &v6, true),
+            ("API.Example.TEST", &target, true),
+            ("xample.test", &target, false),
+        ] {
+            assert_eq!(
+                selected(
+                    &[
+                        ("ALL_PROXY", "http://127.0.0.1:1234"),
+                        ("NO_PROXY", exclusion)
+                    ],
+                    url
+                )
+                .is_none(),
+                bypassed,
+                "{exclusion}"
+            );
+        }
+        // Plaintext HTTP_PROXY never applies to these https targets.
+        assert!(selected(&[("HTTP_PROXY", "http://127.0.0.1:1234")], &target).is_none());
     }
 
     #[tokio::test]
@@ -509,12 +538,18 @@ pub(crate) mod proxy_tests {
                 vec![("ALL_PROXY", unusable.clone())],
                 vec![("all_proxy", unusable.clone())],
                 // An unusable HTTPS value never falls through to ALL_PROXY.
-                vec![("HTTPS_PROXY", unusable.clone()), ("ALL_PROXY", valid.clone())],
+                vec![
+                    ("HTTPS_PROXY", unusable.clone()),
+                    ("ALL_PROXY", valid.clone()),
+                ],
                 // NO_PROXY does not turn a misconfiguration into a direct path.
                 vec![("HTTPS_PROXY", unusable.clone()), ("NO_PROXY", "*".into())],
             ] {
                 let error = build(values).await.expect_err(&unusable);
-                assert!(matches!(error, PublicHttpError::UnusableProxy), "{unusable}");
+                assert!(
+                    matches!(error, PublicHttpError::UnusableProxy),
+                    "{unusable}"
+                );
                 let text = format!("{error} {error:?}");
                 assert!(!text.contains("unusable-secret") && !text.contains("127.0.0.1"));
             }
@@ -522,7 +557,10 @@ pub(crate) mod proxy_tests {
         // ALL_PROXY does not apply when a usable HTTPS value is set, and an
         // empty value means unset.
         for values in [
-            vec![("HTTPS_PROXY", valid.clone()), ("ALL_PROXY", "ftp://x".into())],
+            vec![
+                ("HTTPS_PROXY", valid.clone()),
+                ("ALL_PROXY", "ftp://x".into()),
+            ],
             vec![("HTTPS_PROXY", String::new()), ("ALL_PROXY", valid.clone())],
             vec![("HTTPS_PROXY", "https://127.0.0.1:9".into())],
             vec![("HTTPS_PROXY", "127.0.0.1:9".into())],
