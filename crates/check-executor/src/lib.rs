@@ -327,6 +327,33 @@ fn redacted(
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
 }
+/// Redaction values for a check's output: the Project's values plus every
+/// operator proxy URL that carries credentials. Those reach the child too
+/// (cleared policies receive the proxy variables explicitly, the others
+/// inherit them), and a step that prints one must not persist it.
+fn with_operator_proxy_credentials(
+    mut env: BTreeMap<String, String>,
+    operator: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    for key in executors::run_process::PROXY_ENV_KEYS {
+        let Some(value) = operator(key) else {
+            continue;
+        };
+        let rest = value
+            .split_once("://")
+            .map_or(value.as_str(), |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let Some((userinfo, _)) = authority.rsplit_once('@') else {
+            continue;
+        };
+        // Keys no Project can declare, so a Project value is never replaced.
+        if !userinfo.is_empty() {
+            env.insert(format!("\0proxy-userinfo:{key}"), userinfo.to_owned());
+        }
+        env.insert(format!("\0proxy:{key}"), value);
+    }
+    env
+}
 /// The bounded, ANSI-free, redacted tail of output that did not come through
 /// a command pipe (a verify app's own log file), masked exactly like command
 /// output tails. `truncated`: the bytes are the end of a longer stream, so
@@ -498,6 +525,7 @@ async fn run_command_group(
         executors::sandbox::RunPurpose::Check,
     );
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
+    let env = with_operator_proxy_credentials(env, |key| std::env::var(key).ok());
     // An isolated directory prevents one step from inheriting another's reports.
     // Reports are optional evidence: a directory that cannot be made leaves the
     // command without one rather than failing it as infrastructure.

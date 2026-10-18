@@ -1342,3 +1342,53 @@ async fn cleared_checks_receive_operator_proxy_variables() {
         command(temp.path(), &step(&text), &BTreeMap::new(), "owner-check/1").unwrap();
     assert!(child.output().await.unwrap().status.success());
 }
+
+#[tokio::test]
+async fn operator_proxy_credentials_are_redacted_from_check_output() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_REDACTION_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::operator_proxy_credentials_are_redacted_from_check_output",
+            ])
+            .env(MARKER, "1")
+            .env("HTTPS_PROXY", "http://proxy-user:leaked-secret@127.0.0.1:9")
+            .env("NO_PROXY", "localhost")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "proxy redaction child fixture failed"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    for policy in ["owner-check/1", CANONICAL_CI_POLICY] {
+        let receipt = run_command(
+            temp.path(),
+            &step(
+                "printf '%s|localhost' \"$HTTPS_PROXY\"; \
+                 printf 'proxy-user:leaked-secret@' >&2; exit 1",
+            ),
+            &BTreeMap::new(),
+            policy,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &CancellationToken::new(),
+            512,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.outcome, CheckExecutionOutcome::Failed, "{policy}");
+        for tail in [&receipt.stdout_tail, &receipt.stderr_tail] {
+            assert!(!tail.contains("leaked-secret"), "{policy}: {tail}");
+            assert!(tail.contains("[REDACTED]"), "{policy}: {tail}");
+        }
+        // Credential-free proxy values are not redaction values.
+        assert!(receipt.stdout_tail.ends_with("|localhost"), "{policy}");
+        let text = format!("{:?}", receipt.failures);
+        assert!(!text.contains("leaked-secret"), "{policy}");
+    }
+}
