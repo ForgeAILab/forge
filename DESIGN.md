@@ -197,6 +197,9 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 ### App shell navigation
 
+- The header brand is a link to `/` named “Forge home”. Home resolves to the
+  first authorized Project's Kanban, or Main Chat when no Project is available.
+  The sidebar's Kanban and Main Agent links remain separate destinations.
 - **Structure:** skip link, compact utility top bar, Project switcher, persistent desktop navigation sidebar, mobile navigation dialog, account utilities, and the main landmark. Sidebar groups are Account (`Main Agent`), Project (`Kanban`, `Project Agent`, `Tasks`, `Overview`, `Project settings`), and Workspace.
 - **Primary hierarchy:** Kanban is the default destination whenever an authorized Project exists. Main Agent is the one account-level chat entry; Project Agent opens only the selected Project's chat. Scope descriptions distinguish them without adding duplicate launchers.
 - **States:** active link, hover, active press, visible focus, disabled Project links when no Project exists, loading Project selection, and open/closed mobile dialog.
@@ -218,6 +221,11 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 ### Kanban task card
 
+- Non-default Task types use the existing outline Badge with visible labels
+  “Planning Task”, “Discovery”, or “Sub Task” and a screen-reader “Task type”
+  prefix. The same badge appears in the modal header and full-page Task overview.
+  Standard (`task`) Tasks omit it. Metadata wraps at narrow widths; no new tokens
+  or interaction states are introduced.
 - **Structure:** draggable article, detail-navigation body, status/assignment metadata, dedicated drag handle, and overflow menu.
 - **States:** default, hover, active press, keyboard focus within, dragging, committing/busy, disabled ordering, blocked/error, terminal-muted.
 - **Accessibility:** the card body and drag handle are separate targets; the handle is a visible button-like control with an accessible name and at least a 32px target. Keyboard drag uses the DnD library controls.
@@ -227,7 +235,7 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 - **Structure:** selecting a Kanban card opens one bounded dialog without leaving the board context. The task header and description lead; workflow exceptions, dependencies, runs, and history follow; editable phase, assignees, priority, timestamps, and observability are supporting details.
 - **Responsive:** at 1024px and above, content and the 288px supporting-detail rail may scroll independently. Below 1024px, the dialog becomes one ordered column and one scroll owner: primary task content first, supporting details second. The content column must never remain beside the rail when doing so would make readable text narrower than the card minimum.
-- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. The dialog closes on Escape and restores the board context.
+- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. A stale save refetches current Task truth, reapplies once when the edited field is unchanged, and otherwise keeps the draft open beside a warning that names the current field value. The dialog closes on Escape and restores the board context.
 - **Accessibility:** the task title labels the dialog, close and full-page actions remain visible, headings preserve a logical order, and all identifiers wrap without horizontal overflow.
 
 ### Drag handle

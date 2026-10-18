@@ -324,6 +324,12 @@ pub fn handoff_content_digest_with_sources(
 #[async_trait]
 pub trait AgentResponderStore: Send + Sync {
     async fn resolve_agent_responder(&self, chat: &AgentChat) -> Result<ResolvedAgentResponder>;
+
+    /// Whether the responder's Profile runs natively, inside the server
+    /// process. Stores without Profiles answer `false`.
+    async fn responder_runs_in_server(&self, _profile_id: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Shared admission preparation service.  It does not execute a model turn;
@@ -366,6 +372,15 @@ where
         request: AgentTurnPrepareInput<'_>,
     ) -> Result<PreparedAgentTurnAdmission> {
         let responder = self.resolve(request.chat).await?;
+        // Demo: a native Chat turn runs an agent in the server process. A CLI
+        // responder runs on its daemon and is admitted as before.
+        if executors::server_commands::manager_only() {
+            if let Some(profile_id) = responder.profile_id.as_deref() {
+                if self.db.responder_runs_in_server(profile_id).await? {
+                    executors::server_commands::ensure_agents_allowed()?;
+                }
+            }
+        }
         responder.require_frozen()?;
         let admission_digest = {
             let digest_input = AgentTurnAdmissionInput {
@@ -428,6 +443,12 @@ where
 
 #[async_trait]
 impl AgentResponderStore for SqliteDb {
+    async fn responder_runs_in_server(&self, profile_id: &str) -> Result<bool> {
+        Ok(db::AgentProfileRepo::get_profile(self, profile_id)
+            .await?
+            .is_some_and(|profile| profile.backend_kind == "native"))
+    }
+
     async fn resolve_agent_responder(&self, chat: &AgentChat) -> Result<ResolvedAgentResponder> {
         if chat.kind != MAIN_CHAT_KIND && chat.kind != PROJECT_CHAT_KIND {
             return Ok(ResolvedAgentResponder::unavailable(chat));

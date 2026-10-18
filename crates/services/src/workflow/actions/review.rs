@@ -125,6 +125,11 @@ impl HookAction for RunCiSteps {
             Ok(task) => task,
             Err(reason) => return HookResult::Failed { reason },
         };
+        // Refuse stored/default commands before opening an attempt or asking
+        // for a check. Verify also runs when the CI bundle is empty.
+        if let Err(error) = crate::server_commands::validate_configuration(&ctx.state_config) {
+            return interrupt_ci(ctx, &task, &error.to_string(), false, false).await;
+        }
         match prepare_review_entry(ctx, &task).await {
             Ok(Some(result)) => return result,
             Ok(None) => {}

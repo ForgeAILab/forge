@@ -133,8 +133,8 @@ export function OAuthAuthorizePage() {
   const rawSearch = useSearch({ strict: false }) as Partial<Record<string, unknown>>
   const oauthParams = useMemo(() => pickOAuthParams(rawSearch), [rawSearch])
   const redirectParams = useMemo(() => JSON.stringify(oauthParams), [oauthParams])
-  const accessToken = useAuthStore((s) => s.accessToken)
-  const contextQuery = useOAuthAuthorizeContext(accessToken ? oauthParams : {})
+  const signedIn = useAuthStore((s) => Boolean(s.accessToken || s.user))
+  const contextQuery = useOAuthAuthorizeContext(signedIn ? oauthParams : {})
   const approveMutation = useOAuthApprove()
   const [actionError, setActionError] = useState<string | null>(null)
 
@@ -143,13 +143,13 @@ export function OAuthAuthorizePage() {
   )
 
   useEffect(() => {
-    if (accessToken) return
+    if (signedIn) return
     void navigate({
       to: '/login',
       search: { redirect: '/oauth/authorize/consent', redirect_params: redirectParams },
       replace: true,
     })
-  }, [accessToken, navigate, redirectParams])
+  }, [signedIn, navigate, redirectParams])
 
   async function handleDecision(decision: OAuthApproveRequest['decision']) {
     setActionError(null)
@@ -167,7 +167,7 @@ export function OAuthAuthorizePage() {
     }
   }
 
-  if (!accessToken) {
+  if (!signedIn) {
     return <LoadingCard />
   }
 

@@ -1053,6 +1053,7 @@ pub(super) async fn resolve_repo_source(
     repo: &db::Repo,
     workspace_root: &std::path::Path,
 ) -> Result<String> {
+    crate::server_commands::ensure_repository_allowed(repo).await?;
     if let Some(local_path) = repo
         .local_path
         .as_deref()

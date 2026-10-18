@@ -14,7 +14,9 @@ import { TaskBlockingBanner } from '@/components/task-detail/task-blocking-banne
 import { TaskRoleAssignees, TaskStepCheck } from '@/components/task-detail/task-role-assignees'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { TaskExternalLinks } from '@/components/task-detail/task-external-links'
+import { TaskEditSaveError } from '@/components/task-detail/task-edit-save-error'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
+import { TaskTypeBadge } from '@/components/task-type-badge'
 import { Button } from '@/components/ui/button'
 import { CollapsibleSection } from '@/components/ui/collapsible-section'
 import { Input } from '@/components/ui/input'
@@ -23,6 +25,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { productTerm } from '@/lib/i18n'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { cn } from '@/lib/cn'
+import { TaskFieldConflictError, taskFieldValuesEqual } from '@/api/task-update-conflict'
 import type { Agent, RoleDefinition, Task, WorkflowDefinition } from '@/types/generated'
 import {
   budgetValue,
@@ -60,8 +63,8 @@ interface TaskOverviewPanelProps {
   workflowRetryBudgets: Record<string, unknown> | undefined
   agentName: (agentId?: string | null) => string | undefined
   // handlers
-  onUpdateTitle: (title: string) => void
-  onUpdateDescription: (description: string | null) => void
+  onUpdateTitle: (title: string, expectedTask: Task) => Promise<unknown> | unknown
+  onUpdateDescription: (description: string, expectedTask: Task) => Promise<unknown> | unknown
   onUpdatePriority: (priority: number) => void
   onStatusChange: (status: string) => void
   onAssigneeChange: (roleName: string, selection: AssigneeSelection) => void
@@ -109,8 +112,12 @@ export function TaskOverviewPanel({
 }: TaskOverviewPanelProps) {
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
+  const [titleEditBase, setTitleEditBase] = useState<Task | undefined>()
+  const [titleSaveError, setTitleSaveError] = useState<unknown>()
   const [editingDescription, setEditingDescription] = useState(false)
   const [descriptionDraft, setDescriptionDraft] = useState('')
+  const [descriptionEditBase, setDescriptionEditBase] = useState<Task | undefined>()
+  const [descriptionSaveError, setDescriptionSaveError] = useState<unknown>()
   const [priorityDraft, setPriorityDraft] = useState('')
   const [reviewRetryOverride, setReviewRetryOverride] = useState('')
   const [reviewProgressOverride, setReviewProgressOverride] = useState('')
@@ -123,8 +130,8 @@ export function TaskOverviewPanel({
   useEffect(() => {
     if (!task) return
     const timeout = window.setTimeout(() => {
-      setTitleDraft(task.title)
-      setDescriptionDraft(task.description ?? '')
+      if (!editingTitle) setTitleDraft(task.title)
+      if (!editingDescription) setDescriptionDraft(task.description ?? '')
       setPriorityDraft(String(task.priority))
       const taskStateConfig = readTaskStateConfig(task)
       setReviewRetryOverride(retryBudgetFromConfig(taskStateConfig, 'review'))
@@ -133,7 +140,7 @@ export function TaskOverviewPanel({
       setExecutionRetryOverride(retryBudgetFromConfig(taskStateConfig, 'execution'))
     }, 0)
     return () => window.clearTimeout(timeout)
-  }, [task])
+  }, [editingDescription, editingTitle, task])
 
   const remainingBudgets = task
     ? visibleRemainingBudgets(task.remaining_retries, task.retry_limits)
@@ -152,41 +159,77 @@ export function TaskOverviewPanel({
     return '(server limit unavailable)'
   }
 
-  const handleSaveTitle = () => {
+  const handleSaveTitle = async () => {
     if (!task) return
     const title = titleDraft.trim()
     if (!title || title === task.title) {
       setTitleDraft(task.title)
       setEditingTitle(false)
+      setTitleEditBase(undefined)
+      setTitleSaveError(undefined)
       return
     }
-    onUpdateTitle(title)
-    setEditingTitle(false)
+    const expectedTask = titleEditBase ?? task
+    if (!taskFieldValuesEqual('title', task.title, expectedTask.title)) {
+      const conflict = new TaskFieldConflictError(task, ['title'])
+      setTitleEditBase(task)
+      setTitleSaveError(conflict)
+      return
+    }
+    setTitleSaveError(undefined)
+    try {
+      await onUpdateTitle(title, expectedTask)
+      setEditingTitle(false)
+      setTitleEditBase(undefined)
+    } catch (error) {
+      if (error instanceof TaskFieldConflictError) setTitleEditBase(error.currentTask)
+      setTitleSaveError(error)
+    }
   }
 
   const handleCancelTitleEdit = () => {
     if (!task) return
     setTitleDraft(task.title)
     setEditingTitle(false)
+    setTitleEditBase(undefined)
+    setTitleSaveError(undefined)
   }
 
-  const handleSaveDescription = () => {
+  const handleSaveDescription = async () => {
     if (!task) return
     const description = descriptionDraft.trim()
     const normalizedCurrent = (task.description ?? '').trim()
     if (description === normalizedCurrent) {
       setDescriptionDraft(task.description ?? '')
       setEditingDescription(false)
+      setDescriptionEditBase(undefined)
+      setDescriptionSaveError(undefined)
       return
     }
-    onUpdateDescription(description.length > 0 ? description : null)
-    setEditingDescription(false)
+    const expectedTask = descriptionEditBase ?? task
+    if (!taskFieldValuesEqual('description', task.description, expectedTask.description)) {
+      const conflict = new TaskFieldConflictError(task, ['description'])
+      setDescriptionEditBase(task)
+      setDescriptionSaveError(conflict)
+      return
+    }
+    setDescriptionSaveError(undefined)
+    try {
+      await onUpdateDescription(description, expectedTask)
+      setEditingDescription(false)
+      setDescriptionEditBase(undefined)
+    } catch (error) {
+      if (error instanceof TaskFieldConflictError) setDescriptionEditBase(error.currentTask)
+      setDescriptionSaveError(error)
+    }
   }
 
   const handleCancelDescriptionEdit = () => {
     if (!task) return
     setDescriptionDraft(task.description ?? '')
     setEditingDescription(false)
+    setDescriptionEditBase(undefined)
+    setDescriptionSaveError(undefined)
   }
 
   const handleSavePriority = () => {
@@ -246,36 +289,50 @@ export function TaskOverviewPanel({
           />
         ) : task ? (
           <>
-            {editingTitle ? (
-              <div className="space-y-2">
-                <Input
-                  autoFocus
-                  value={titleDraft}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  onKeyDown={onTitleKeyDown}
-                />
-                <div className="flex items-center gap-2">
-                  <Button
-                    size="sm"
-                    disabled={updatePending || !titleDraft.trim()}
-                    onClick={handleSaveTitle}
-                  >
-                    Save
-                  </Button>
-                  <Button size="sm" variant="outline" type="button" onClick={handleCancelTitleEdit}>
-                    Cancel
-                  </Button>
+            <div className="space-y-2">
+              <TaskTypeBadge taskType={task.task_type} />
+              {editingTitle ? (
+                <div className="space-y-2">
+                  <Input
+                    autoFocus
+                    value={titleDraft}
+                    onChange={(e) => setTitleDraft(e.target.value)}
+                    onKeyDown={onTitleKeyDown}
+                  />
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      disabled={updatePending || !titleDraft.trim()}
+                      onClick={handleSaveTitle}
+                    >
+                      Save
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      type="button"
+                      onClick={handleCancelTitleEdit}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                  <TaskEditSaveError error={titleSaveError} field="title" />
                 </div>
-              </div>
-            ) : (
-              <button
-                className="-mx-1 block w-full rounded-md px-1 py-0.5 text-left text-xl font-semibold hover:bg-accent"
-                type="button"
-                onClick={() => setEditingTitle(true)}
-              >
-                {stripRunSuffix(task.title, runSuffix)}
-              </button>
-            )}
+              ) : (
+                <button
+                  className="-mx-1 block w-full rounded-md px-1 py-0.5 text-left text-xl font-semibold hover:bg-accent"
+                  type="button"
+                  onClick={() => {
+                    setTitleDraft(task.title)
+                    setTitleEditBase(task)
+                    setTitleSaveError(undefined)
+                    setEditingTitle(true)
+                  }}
+                >
+                  {stripRunSuffix(task.title, runSuffix)}
+                </button>
+              )}
+            </div>
 
             {task.workflow_health ? (
               <div className="flex flex-wrap items-center gap-2">
@@ -369,12 +426,18 @@ export function TaskOverviewPanel({
                       Cancel
                     </Button>
                   </div>
+                  <TaskEditSaveError error={descriptionSaveError} field="description" />
                 </div>
               ) : task.description?.trim() ? (
                 <button
                   className="block w-full rounded-lg border border-dashed p-3 text-left transition-colors hover:border-border hover:bg-accent"
                   type="button"
-                  onClick={() => setEditingDescription(true)}
+                  onClick={() => {
+                    setDescriptionDraft(task.description ?? '')
+                    setDescriptionEditBase(task)
+                    setDescriptionSaveError(undefined)
+                    setEditingDescription(true)
+                  }}
                 >
                   <MarkdownView content={task.description} />
                 </button>
@@ -382,7 +445,12 @@ export function TaskOverviewPanel({
                 <button
                   className="block w-full rounded-lg border border-dashed p-3 text-left text-sm text-muted-foreground transition-colors hover:border-border hover:bg-accent"
                   type="button"
-                  onClick={() => setEditingDescription(true)}
+                  onClick={() => {
+                    setDescriptionDraft(task.description ?? '')
+                    setDescriptionEditBase(task)
+                    setDescriptionSaveError(undefined)
+                    setEditingDescription(true)
+                  }}
                 >
                   <span className="italic opacity-60">Click to add a description…</span>
                 </button>

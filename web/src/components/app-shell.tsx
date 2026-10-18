@@ -313,12 +313,10 @@ function UserMenu() {
   const { refreshToken, clearAuth } = useAuthStore()
 
   async function handleLogout() {
-    if (refreshToken) {
-      try {
-        await logoutApi({ refresh_token: refreshToken })
-      } catch {
-        // Server-side revocation failure is non-fatal; still clear local state
-      }
+    try {
+      await logoutApi(refreshToken ? { refresh_token: refreshToken } : {})
+    } catch {
+      // Server-side revocation failure is non-fatal; still clear local state
     }
     clearAuth()
     void navigate({ to: '/login', search: { redirect: undefined } })
@@ -454,24 +452,13 @@ export function AppShell({ children }: { children: ReactNode }) {
             >
               <List size={19} aria-hidden />
             </button>
-            {projectId ? (
-              <Link
-                to="/projects/$projectId/board"
-                params={{ projectId }}
-                aria-label="Open Kanban"
-                className="flex shrink-0 items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <ForgeBrand />
-              </Link>
-            ) : (
-              <Link
-                to="/chat"
-                aria-label="Open Main Agent chat"
-                className="flex shrink-0 items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <ForgeBrand />
-              </Link>
-            )}
+            <Link
+              to="/"
+              aria-label="Forge home"
+              className="flex shrink-0 items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <ForgeBrand />
+            </Link>
             <div className="min-w-0 flex-1 md:w-56 md:flex-none">
               <ProjectSwitcher projectId={projectId} />
             </div>

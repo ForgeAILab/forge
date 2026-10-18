@@ -242,6 +242,8 @@ impl CodingExecutorAdapter for GeminiAdapter {
         // Owns the execution's temp directory until this execution returns.
         let _run_scope = enter_task_worktree(&mut cmd, &ctx, &config);
 
+        executors::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut child = process_supervisor::executable::spawn(&mut cmd).await?;
 
         let stdin = child

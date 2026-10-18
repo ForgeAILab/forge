@@ -149,6 +149,7 @@ impl CompilerCache {
         workspace_root: &Path,
         path_var: Option<OsString>,
     ) -> Option<Self> {
+        crate::server_commands::ensure_allowed().ok()?;
         let name = config.wrapper.as_deref().map(str::trim)?;
         if name.is_empty() {
             return None;
@@ -497,6 +498,7 @@ fn run_bounded(
     command: &mut std::process::Command,
     timeout: Duration,
 ) -> io::Result<std::process::ExitStatus> {
+    crate::server_commands::ensure_allowed().map_err(io::Error::other)?;
     let mut child = process_supervisor::executable::spawn_std(command)?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -916,6 +918,7 @@ fn lock_for_start(dir: &Path, wait: Duration) -> io::Result<fs::File> {
 /// store, a socket per store (which is what makes the store per repository)
 /// and no idle exit, before any run can.
 fn ensure_sccache_server(wrapper: &Path, dir: &Path, socket: &Path, size: &str) -> io::Result<()> {
+    crate::server_commands::ensure_allowed().map_err(io::Error::other)?;
     #[cfg(unix)]
     {
         let running = || sccache_running(socket);

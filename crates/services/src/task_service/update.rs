@@ -9,6 +9,9 @@ impl TaskService {
         request: UpdateTaskRequest,
     ) -> Result<Task> {
         let task_id: String = task_id.into();
+        if let Some(config) = &request.task_state_config {
+            crate::server_commands::validate_configuration(config)?;
+        }
         if !db::task_writer::owns_task(&task_id)
             && (request.review_requirement_ids.is_some()
                 || request.parent_task_id.is_some()
@@ -41,7 +44,7 @@ impl TaskService {
             parent_task_id,
             version,
         } = request;
-        let merge_config = serialize_config(merge_config)?;
+        let merge_config = super::validation::serialize_merge_config(merge_config)?;
         let requested_state_config = serialize_config(task_state_config)?;
         reject_retired_auditor_config(requested_state_config.as_deref())?;
         let task_state_config = if let Some(requirement_ids) = review_requirement_ids.as_deref() {

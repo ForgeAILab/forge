@@ -37,6 +37,30 @@ pub struct LifecycleHookRun {
 }
 
 impl LifecycleHookRunner {
+    fn refused_script(ctx: &LifecycleHookContext, index: usize, command: &str) -> LifecycleHookRun {
+        let error = executors::server_commands::ServerCommandsDisabled.to_string();
+        let working_dir = working_dir(ctx);
+        let environment_preview = environment_preview(ctx);
+        LifecycleHookRun {
+            index,
+            entry: json!({"event": event_name(&ctx.event), "hook_type": "script", "command": command,
+                "status": "failed", "code": executors::server_commands::CODE, "error": error,
+                "working_dir": working_dir, "duration_ms": 0, "timeout": false,
+                "environment": environment_preview}),
+            status: "failed".into(),
+            exit_code: None,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            error: Some(error),
+            command: Some(command.to_owned()),
+            working_dir,
+            duration_ms: 0,
+            log_path: None,
+            environment_preview,
+        }
+    }
+
     pub async fn run_hooks(
         ctx: LifecycleHookContext,
         hooks: &[api_types::LifecycleHookDef],
@@ -270,6 +294,11 @@ impl LifecycleHookRunner {
         timeout_seconds: u64,
         workspace: &ResolvedWorkspace,
     ) -> crate::Result<LifecycleHookRun> {
+        if workspace.placement.owner_kind == db::PlacementOwnerKind::Server
+            && executors::server_commands::ensure_allowed().is_err()
+        {
+            return Ok(Self::refused_script(ctx, index, command));
+        }
         let start = Instant::now();
         let working_dir = working_dir(ctx);
         let environment_preview = environment_preview(ctx);
@@ -380,6 +409,9 @@ impl LifecycleHookRunner {
         command: &str,
         timeout_seconds: u64,
     ) -> LifecycleHookRun {
+        if executors::server_commands::ensure_allowed().is_err() {
+            return Self::refused_script(ctx, index, command);
+        }
         let start = Instant::now();
         let working_dir = working_dir(ctx);
         let timeout_seconds = if timeout_seconds == 0 {

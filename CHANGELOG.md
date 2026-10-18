@@ -49,6 +49,46 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - MCP configuration reads and writes require an instance administrator before
   accessing server files or returning their paths. Project/local scope with a
   Project id also enforces Project visibility and owner/admin roles for writes.
+- Demo mode refuses every command the server would run from user configuration.
+  Command-bearing Project, Task and workflow writes return `422 server_commands_disabled`;
+  stored hooks, checks, environment setup, scaffolds, executors, native Chat
+  command tools and terminals refuse before spawn. Review entries requiring CI
+  or verify park with the reason before creating a Review attempt or check.
+- Demo mode runs no agent in the server process and reads nothing from the
+  server through configuration. Adding provider credentials or authorizations
+  and admitting native Chat turns return `422 server_agents_disabled`; any
+  native turn queued another way fails with that code before a provider
+  request. CLI Agents on remote daemons are unaffected.
+  Repositories must be `https://` remotes at a public address: local paths,
+  `file://` and other non-https remotes, private hosts, option-like branch
+  names and server-owned repository locations return
+  `422 server_location_refused`, and a stored local-path repository is refused
+  before Git runs. Environment assets (server files copied into worktrees),
+  issue-tracker integrations (tokens read from the server environment) and
+  `POST /api/v1/config/mcp` (agent config files written on the server) are
+  refused the same way.
+- Demo mode restricts Forge's own Git against visitor-named repositories.
+  Every Git process of the server follows no HTTP redirect and speaks no
+  network protocol but `https`, so a public remote can no longer redirect a
+  clone or fetch to an internal or plain-http host (and through it clone an
+  internal repository). Repository hooks, filesystem monitors, bare
+  repositories embedded in checked-out content, submodule recursion and
+  credential prompts are disabled, and a transfer slower than 1000 bytes/s
+  for 60 seconds aborts. Repositories cannot override this configuration.
+  Automatic Git finalization reapplies the demo policy after clearing inherited Git configuration.
+- Issue browser session cookies only over HTTPS, avoiding live-token exposure
+  to other ports on a local HTTP host. Both cookies use the `__Host-` prefix,
+  `Secure`, `Path=/`, and no `Domain` to prevent sibling-subdomain cookie
+  planting. The refresh cookie is read only by refresh and logout; logout
+  still clears both cookies on HTTP.
+- Cookie-authenticated unsafe REST requests, including cookie-based refresh
+  and logout, require same-origin Fetch Metadata or Origin evidence and reject
+  failures with `403 csrf_rejected`. Explicit Bearer requests are unaffected.
+  Cookie-authenticated requests of any method whose `Sec-Fetch-Site` is
+  `same-site` or `cross-site` are refused the same way.
+  An explicit credential (any `Authorization` header, or `?token=`) always
+  decides the request: the session cookie never overrides it or stands in for
+  an invalid one.
 
 ### Breaking
 
@@ -82,6 +122,30 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project viewer/member return HTTP 403 `insufficient_role`. The web MCP
   controls show other users only the MCP URL for their own client, with no
   install buttons and no server config reads.
+- `forge --demo` no longer executes configured server commands, including review
+  `verify` (app start, readiness and scripted checks), or starts the embedded
+  daemon. It refuses provider credentials and Chat/agent turns, and
+  accepts only public `https://` repositories (no server paths, environment
+  assets, integrations or MCP config file writes). Git operations performed by
+  Forge remain available, but in demo mode Git follows no HTTP redirect and
+  speaks no network protocol but `https`: a repository whose host answers
+  with a redirect no longer clones.
+- Session cookie names are now `__Host-forge_session` and
+  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
+  unprefixed cookies are no longer read. Registration, login and refresh no
+  longer set cookies on plain HTTP; localStorage token authentication remains
+  available.
+
+### Added
+
+- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
+  registration, login and refresh, with matching logout cleanup.
+  REST, web startup and SSE support cookie-only sessions while password-login
+  JSON tokens and existing localStorage behavior remain available. TestSprite
+  can capture a session credential after username/password sign-in.
+- Web startup revives a cookie-only session after an expired access cookie:
+  one empty-body refresh request, then one `/auth/me` retry. Failed revival
+  returns to `/login` without a loop or storing the returned tokens.
 
 ### Changed
 
@@ -143,6 +207,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Fake executable fixtures and generated compiler-cache launchers publish
   fully closed scripts atomically. Process spawns retry transient Linux
   `ETXTBSY` errors within a bounded delay.
+- Task-detail title saves now reconcile unrelated concurrent Task writes instead
+  of silently leaving the old title, and show the current title for same-field conflicts.
+- Clearing a Task description now persists an empty value, restores the
+  empty-description prompt, and preserves the blank draft with the current value visible on conflict.
+- Non-default Task types are visible on Kanban cards and Task detail headers.
+- The header brand is a consistently labelled Forge home link to `/`, using the
+  existing home routing for accounts with and without Projects.
 
 ## [0.14.0] - 2026-10-16
 

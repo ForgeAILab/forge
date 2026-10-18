@@ -86,9 +86,13 @@ pub async fn get_mcp_config(
 
 pub async fn update_mcp_config(
     State(state): State<AppState>,
-    RequireAdmin(user): RequireAdmin,
+    user: AuthenticatedUser,
     Json(body): Json<McpConfigActionRequest>,
 ) -> ApiResult<Json<McpConfigResponse>> {
+    services::server_commands::ensure_server_files_allowed(
+        "agent configuration files on the server are not written",
+    )?;
+    let user = require_admin(user)?;
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
     authorize_config_project(
@@ -153,6 +157,16 @@ pub async fn update_mcp_config(
         config_path: config_path.to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
+}
+
+fn require_admin(user: AuthenticatedUser) -> ApiResult<AuthenticatedUser> {
+    if !user.is_admin {
+        return Err(ApiError::forbidden_with_code(
+            "admin_required",
+            "Admin access required",
+        ));
+    }
+    Ok(user)
 }
 
 async fn authorize_config_project(
@@ -1038,7 +1052,7 @@ command = "other"
     ) -> McpConfigResponse {
         update_mcp_config(
             State(state.clone()),
-            RequireAdmin(test_authenticated_user()),
+            test_authenticated_user(),
             Json(McpConfigActionRequest {
                 agent: agent.to_owned(),
                 scope: scope.map(str::to_owned),

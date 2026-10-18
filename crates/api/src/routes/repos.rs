@@ -40,6 +40,12 @@ pub async fn create_repo(
             format!("project {project_id} already has a primary repo"),
         ));
     }
+    services::server_commands::validate_repository_input(
+        request.remote_url.as_deref(),
+        request.local_path.as_deref(),
+        request.default_branch.as_deref(),
+    )
+    .await?;
     let local_path = normalize_optional_local_path(request.local_path)?;
     let remote_url = normalize_repo_remote_url(request.remote_url);
     let name = request.name.unwrap_or_else(|| {
@@ -130,6 +136,12 @@ pub async fn update_repo(
         error.mask_not_found(crate::errors::ApiError::not_found("repo", id.clone()))
     })?;
 
+    services::server_commands::validate_repository_input(
+        request.remote_url.as_ref().and_then(Option::as_deref),
+        request.local_path.as_ref().and_then(Option::as_deref),
+        request.default_branch.as_deref(),
+    )
+    .await?;
     let local_path = normalize_update_local_path(request.local_path)?;
     let repo = RepoRepo::update(
         &*state.db,
@@ -191,6 +203,7 @@ pub async fn sync_repo(
     let repo = RepoRepo::get_by_id(&*state.db, &id)
         .await?
         .ok_or_else(|| ApiError::not_found("repo", id.clone()))?;
+    services::server_commands::ensure_repository_allowed(&repo).await?;
     let local_path = repo.local_path.ok_or_else(|| {
         ApiError::bad_request_with_code(
             "repo.no_local_path",

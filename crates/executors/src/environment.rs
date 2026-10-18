@@ -169,6 +169,14 @@ pub async fn materialize_assets(
     worktree: &Path,
     assets: &[EnvironmentAsset],
 ) -> Result<(), String> {
+    // Demo: an asset source is a file on the server's filesystem.
+    if !assets.is_empty() && crate::server_commands::manager_only() {
+        return Err(format!(
+            "{}: {}: environment assets copy files from the server",
+            crate::server_commands::LOCATION_CODE,
+            crate::server_commands::LOCATION_MESSAGE
+        ));
+    }
     let worktree = worktree.to_path_buf();
     let assets = assets.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -421,6 +429,14 @@ pub async fn run_environment_check(
     env: &BTreeMap<String, String>,
     check: &EnvironmentCheck,
 ) -> EnvironmentCheckResult {
+    if let Err(error) = crate::server_commands::ensure_allowed() {
+        return EnvironmentCheckResult {
+            passed: false,
+            exit_code: None,
+            timed_out: false,
+            output_tail: error.to_string(),
+        };
+    }
     let run_scope =
         crate::sandbox::SandboxEnv::for_command(worktree, crate::sandbox::RunPurpose::Probe);
     let mut command = environment_check_command(worktree, env, check, run_scope.env());

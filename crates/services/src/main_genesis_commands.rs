@@ -1562,6 +1562,10 @@ impl MainGenesisCommandService {
                 ));
             }
         }
+        crate::server_commands::validate_configuration(
+            &serde_json::to_value(&request.content)
+                .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
+        )?;
         if request.content.identity.maturity != request.maturity {
             return Err(ServiceError::Conflict(
                 "Charter identity maturity must match the requested Charter maturity".to_owned(),

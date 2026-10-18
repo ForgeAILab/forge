@@ -1370,6 +1370,7 @@ impl ProjectOrchestrationActionService {
                     "project.review_config requires a positive expected_project_version",
                 )
             })?;
+        crate::server_commands::validate_configuration(payload)?;
         let (ci_steps, setup_steps) = validated_project_review_steps(payload)?;
         let project = ProjectRepo::get_by_id(&*self.db, project_id)
             .await?

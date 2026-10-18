@@ -125,7 +125,20 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    let token = extract_bearer_token(req.headers()).or_else(|| extract_query_token(req.uri()));
+    // An explicit credential (any Authorization header, or `?token=`) always
+    // decides the request; the ambient cookie only stands in when there is none.
+    let explicit = extract_bearer_token(req.headers()).or_else(|| extract_query_token(req.uri()));
+    let session = if explicit.is_none()
+        && !req
+            .headers()
+            .contains_key(axum::http::header::AUTHORIZATION)
+    {
+        crate::session::cookie(req.headers(), crate::session::SESSION_COOKIE)
+    } else {
+        None
+    };
+    let cookie_only = session.is_some();
+    let token = explicit.or_else(|| session.map(str::to_owned));
 
     let Some(token) = token else {
         return unauthorized_response("missing_token", "Authentication required");
@@ -139,6 +152,17 @@ pub async fn auth_middleware(
 
     match result {
         Ok((user_id, email, is_admin)) => {
+            if cookie_only {
+                let context = crate::session::SessionContext::from_request(
+                    &state,
+                    req.headers(),
+                    req.uri(),
+                    req.extensions(),
+                );
+                if let Err(error) = context.check_csrf(req.headers(), req.method()) {
+                    return error.into_response();
+                }
+            }
             req.extensions_mut()
                 .insert(crate::routes::auth::AuthenticatedUser {
                     user_id,

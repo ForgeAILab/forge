@@ -22,6 +22,7 @@ pub mod middleware;
 mod path_input;
 pub mod project_slots;
 pub mod routes;
+mod session;
 pub mod state;
 
 pub use state::AppState;

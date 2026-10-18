@@ -1101,6 +1101,53 @@ assigned explicitly. Read-only planning/discovery and write-capable
 implementation both derive authority from the current Charter and their Task
 workflow.
 
+#### Demo server command policy
+
+The CLI enables `executors::server_commands` once, before runtime composition,
+when `--demo` is present. The process-wide decision is monotonic and cannot be
+changed by stored settings. No new flag, database field or daemon policy is
+introduced. Demo startup also omits the embedded daemon. Normal server and
+separate daemon processes keep their existing behavior.
+
+`services::server_commands::validate_configuration` is shared by Project
+settings, workflow/template validation, Task overrides and Charter scaffold
+writes, including native command boundaries. Refusals are typed
+`ServiceError::ServerCommandsDisabled`: REST 422, MCP `-32602`, and code
+`server_commands_disabled` with the message "This demo does not run commands".
+Execution sources independently consult the same decision before shell probes,
+hook/check/environment commands, scaffold processes, CLI/shell executors,
+native Chat command tools, compiler-cache helpers or embedded terminals can start. Stored asynchronous
+hooks also leave the ordinary hook-not-run comment on the Task. Review entry
+with configured CI or non-null `ReviewConfig.verify` (app start, readiness and
+scripted checks) records the refusal through the existing interruption park in
+`review`, before creating a Review attempt or check consumer. It spends no
+review, infrastructure or verify retries and leaves no suspended hooks step.
+Stored durable checks return unstarted infrastructure receipts carrying the refusal. Forge's
+own Git operations remain allowed. `executors::server_commands::disable()` also
+appends `executors::server_commands::git_config_policy(true)` to the process environment
+(`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, plus
+`GIT_TERMINAL_PROMPT=0`), which every Git child inherits as command-scope
+configuration a repository cannot override: no HTTP redirect, no network
+protocol but `https` (`file` keeps Git's `user` default for local transfers and
+bundles), `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
+`safe.bareRepository=explicit`, no submodule recursion and a low-speed abort.
+Automatic finalization discards inherited Git configuration and reapplies this
+same policy from index zero with its own count and every key/value, plus
+`GIT_TERMINAL_PROMPT=0`. Inherited operator entries cannot enter that count;
+normal-mode finalization continues to discard inherited configuration.
+
+The same switch also makes the demo server a manager only for agents and
+server files. `executors::server_commands::ensure_agents_allowed` refuses
+provider credential creation, provider authorization, Chat turn admission
+(`AgentTurnAdmissionService::prepare`) and, as the source guard,
+`NativeAgentRuntimeBackend::run_turn`/`fork_topic` (`ServiceError::ServerAgentsDisabled`,
+`server_agents_disabled`). `services::server_commands::validate_repository_input`
+/ `ensure_repository_allowed` accept only `https://` remotes at a public
+address (the provider-request address policy) and valid branch names, at write
+time and before Git touches a stored repository; server-owned repository
+locations, environment assets, integrations and MCP config file writes are
+refused with `ServiceError::ServerLocationRefused` (`server_location_refused`).
+
 #### Project environment
 
 `ProjectSettings.environment` (`env`, `assets`, `checks`,

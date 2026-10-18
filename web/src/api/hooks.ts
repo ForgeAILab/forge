@@ -59,6 +59,13 @@ import {
 import { qk } from '@/api/query-keys'
 import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
 import {
+  TaskFieldConflictError,
+  taskFieldValue,
+  taskFieldValuesEqual,
+  type TaskConflictField,
+  type TaskConflictValue,
+} from '@/api/task-update-conflict'
+import {
   getApiErrorCode,
   isTaskBusy,
   isTransientApiError,
@@ -621,15 +628,105 @@ export function useCreateTask(projectId: string) {
   })
 }
 
+type UpdateTaskMutation = {
+  taskId: string
+  body: UpdateTaskRequest
+  expectedTask?: Task
+}
+
+const conflictAwareTaskFields: TaskConflictField[] = ['title', 'description', 'priority']
+
+function requestedConflictFields(body: UpdateTaskRequest): TaskConflictField[] {
+  return conflictAwareTaskFields.filter((field) => {
+    const value = body[field]
+    return value !== undefined && !(field === 'description' && value === null)
+  })
+}
+
+function requestedTaskFieldValue(
+  body: UpdateTaskRequest,
+  field: TaskConflictField,
+): TaskConflictValue {
+  return body[field]
+}
+
+function cacheUpdatedTask(queryClient: ReturnType<typeof useQueryClient>, task: Task): void {
+  queryClient.setQueryData(qk.task(task.id), task)
+  queryClient.setQueryData<TaskDetailResponse>(qk.taskDetail(task.id), (current) =>
+    current ? { ...current, task } : current,
+  )
+}
+
+function isTaskVersionConflict(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    getApiErrorCode(error) === 'version_conflict'
+  )
+}
+
 export function useUpdateTask() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ taskId, body }: { taskId: string; body: UpdateTaskRequest }) =>
-      apiFetch<Task>(`/tasks/${taskId}`, {
-        method: 'PATCH',
-        body: JSON.stringify(body),
-      }),
+    mutationFn: async ({ taskId, body, expectedTask }: UpdateTaskMutation) => {
+      const patch = (request: UpdateTaskRequest) =>
+        apiFetch<Task>(`/tasks/${taskId}`, {
+          method: 'PATCH',
+          body: JSON.stringify(request),
+        })
+
+      try {
+        return await patch(body)
+      } catch (error) {
+        const fields = requestedConflictFields(body)
+        if (
+          !isTaskVersionConflict(error) ||
+          !expectedTask ||
+          expectedTask.id !== taskId ||
+          fields.length === 0
+        ) {
+          throw error
+        }
+
+        const latest = await apiFetch<Task>(`/tasks/${taskId}`)
+        cacheUpdatedTask(queryClient, latest)
+        void queryClient.invalidateQueries({ queryKey: qk.projectTasks(latest.project_id) })
+
+        const conflictingFields = fields.filter((field) => {
+          const currentValue = taskFieldValue(latest, field)
+          const expectedValue = taskFieldValue(expectedTask, field)
+          const requestedValue = requestedTaskFieldValue(body, field)
+          return (
+            !taskFieldValuesEqual(field, currentValue, expectedValue) &&
+            !taskFieldValuesEqual(field, currentValue, requestedValue)
+          )
+        })
+        if (conflictingFields.length > 0) {
+          throw new TaskFieldConflictError(latest, conflictingFields)
+        }
+
+        const alreadyApplied = fields.every((field) =>
+          taskFieldValuesEqual(
+            field,
+            taskFieldValue(latest, field),
+            requestedTaskFieldValue(body, field),
+          ),
+        )
+        if (alreadyApplied) return latest
+
+        try {
+          return await patch({ ...body, version: latest.version })
+        } catch (retryError) {
+          if (!isTaskVersionConflict(retryError)) throw retryError
+          const newest = await apiFetch<Task>(`/tasks/${taskId}`)
+          cacheUpdatedTask(queryClient, newest)
+          void queryClient.invalidateQueries({ queryKey: qk.projectTasks(newest.project_id) })
+          throw new TaskFieldConflictError(newest, fields, true)
+        }
+      }
+    },
     onSuccess: (task) => {
+      cacheUpdatedTask(queryClient, task)
       void queryClient.invalidateQueries({ queryKey: qk.task(task.id) })
       void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
     },
@@ -707,9 +804,17 @@ export function refetchAfterTaskBusy(
 export function useTaskAction() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ taskId, ...request }: TaskActionRequest & { taskId: string }) => applyTaskAction(taskId, request),
+    mutationFn: ({ taskId, ...request }: TaskActionRequest & { taskId: string }) =>
+      applyTaskAction(taskId, request),
     onSuccess: (task) => {
-      for (const queryKey of [qk.task(task.id), qk.taskDetail(task.id), qk.executions(task.id), qk.reviews(task.id), qk.transitions(task.id), qk.projectTasks(task.project_id)]) {
+      for (const queryKey of [
+        qk.task(task.id),
+        qk.taskDetail(task.id),
+        qk.executions(task.id),
+        qk.reviews(task.id),
+        qk.transitions(task.id),
+        qk.projectTasks(task.project_id),
+      ]) {
         void queryClient.invalidateQueries({ queryKey })
       }
     },
@@ -887,7 +992,6 @@ export function useArchiveTask() {
     },
   })
 }
-
 
 export function useDuplicateTask() {
   const queryClient = useQueryClient()
@@ -1179,13 +1283,26 @@ export function useExecutorTypesQuery() {
 export function useUpdateDaemonRunLimit() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: ({ id, version, run_limit }: { id: string; version: number; run_limit: number | null }) =>
-      apiFetch<Daemon>(`/daemons/${id}`, { method: 'PATCH', body: JSON.stringify({ version, run_limit }) }),
+    mutationFn: ({
+      id,
+      version,
+      run_limit,
+    }: {
+      id: string
+      version: number
+      run_limit: number | null
+    }) =>
+      apiFetch<Daemon>(`/daemons/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ version, run_limit }),
+      }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: qk.daemons })
       void queryClient.invalidateQueries({ queryKey: qk.operationsStatus })
     },
-    onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+    onError: async () => {
+      await queryClient.invalidateQueries({ queryKey: qk.daemons })
+    },
   })
 }
 
@@ -1202,13 +1319,23 @@ export function useDaemonRemovalPreview(id: string, enabled: boolean) {
 export function useRemoveDaemon() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: (id: string) => apiFetch<RemoveDaemonResponse>(`/daemons/${id}`, { method: 'DELETE' }),
+    mutationFn: (id: string) =>
+      apiFetch<RemoveDaemonResponse>(`/daemons/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
-      for (const queryKey of [qk.daemons, qk.agents, qk.projects, ['tasks'], ['providers'], qk.operationsStatus]) {
+      for (const queryKey of [
+        qk.daemons,
+        qk.agents,
+        qk.projects,
+        ['tasks'],
+        ['providers'],
+        qk.operationsStatus,
+      ]) {
         void queryClient.invalidateQueries({ queryKey })
       }
     },
-    onError: async () => { await queryClient.invalidateQueries({ queryKey: qk.daemons }) },
+    onError: async () => {
+      await queryClient.invalidateQueries({ queryKey: qk.daemons })
+    },
   })
 }
 

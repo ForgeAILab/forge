@@ -300,6 +300,7 @@ impl TerminalService {
         rows: Option<u16>,
         cols: Option<u16>,
     ) -> Result<(TerminalSessionResponse, TerminalAttachTokenResponse), ServiceError> {
+        executors::server_commands::ensure_allowed()?;
         if !self.terminal_config.enabled {
             return Err(ServiceError::TerminalDisabled);
         }
@@ -899,6 +900,7 @@ impl TerminalService {
         rows: u16,
         cols: u16,
     ) -> Result<TerminalStartResult, ServiceError> {
+        executors::server_commands::ensure_allowed()?;
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(pty_size(rows, cols)).map_err(|error| {
             ServiceError::invalid_operation(format!("failed to open terminal PTY: {error}"))

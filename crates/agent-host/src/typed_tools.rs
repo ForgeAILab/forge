@@ -2876,6 +2876,8 @@ async fn execute_workspace_command(
     environment: &std::collections::BTreeMap<String, String>,
     ctx: &InvocationContext,
 ) -> Result<ExecutedCommand, RuntimeError> {
+    executors::server_commands::ensure_allowed()
+        .map_err(|error| RuntimeError::tool(error.to_string()))?;
     if ctx.should_stop() {
         return Err(RuntimeError::cancelled("Task command cancelled"));
     }
@@ -3574,6 +3576,55 @@ mod tests {
             deadline: Deadline::never(),
             output_limit: 16_384,
         }
+    }
+
+    /// A separate process keeps the irreversible production policy from
+    /// affecting any normal-mode tests running in this unit-test binary.
+    #[cfg(unix)]
+    #[test]
+    fn demo_native_command_guard_refuses_spawn() {
+        const CHILD: &str = "FORGE_TEST_DEMO_NATIVE_COMMAND_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "typed_tools::tests::demo_native_command_guard_refuses_spawn",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("demo native command refusal verified"),
+                "{}\n{}",
+                stdout,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        executors::server_commands::disable();
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let ctx = command_invocation_context(workspace);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(super::execute_workspace_command(
+            "sh",
+            &["-c".into(), "touch native-command-marker".into()],
+            None,
+            &Default::default(),
+            &ctx,
+        ));
+        assert!(
+            matches!(result, Err(ref error) if error.to_string().contains("server_commands_disabled"))
+        );
+        assert!(!dir.path().join("native-command-marker").exists());
+        println!("demo native command refusal verified");
     }
 
     #[cfg(unix)]
