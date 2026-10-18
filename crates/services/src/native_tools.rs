@@ -44,7 +44,7 @@ use db::{
     CommandReceiptRepo, MemoryScopeGrant, SqliteDb, TaskBoardRepo,
 };
 use forge_agent_host::outbound_http::{
-    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy,
+    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy, PublicHttpError,
 };
 use forge_agent_host::{
     contains_authority_override, operation_contract, operation_descriptor, operation_permission,
@@ -4048,10 +4048,11 @@ async fn public_search_http_client(
     )
     .await
     .map_err(|_| AgentHostError::Runtime("public search resolution timed out".to_owned()))?
-    .map_err(|_| {
-        AgentHostError::Configuration(
+    .map_err(|error| match error {
+        PublicHttpError::UnusableProxy => AgentHostError::Configuration(error.to_string()),
+        _ => AgentHostError::Configuration(
             "public search endpoint must resolve exclusively to public addresses".to_owned(),
-        )
+        ),
     })?
     .timeout(timeout)
     .build()
@@ -7648,5 +7649,20 @@ mod proxy_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_search_refuses_an_unusable_environment_proxy() {
+        let proxies = ProxyEnvironment::from_vars(|key| {
+            (key == "HTTPS_PROXY").then(|| "socks5h://127.0.0.1:1080".to_owned())
+        });
+        let endpoint = url::Url::parse("https://93.184.215.14/search").unwrap();
+        let error = public_search_http_client(&endpoint, Duration::from_secs(2), &proxies)
+            .await
+            .expect_err("an unusable proxy must not fall back to a direct connection");
+        assert!(
+            matches!(&error, AgentHostError::Configuration(message) if message.contains("HTTPS_PROXY")),
+            "{error:?}"
+        );
     }
 }

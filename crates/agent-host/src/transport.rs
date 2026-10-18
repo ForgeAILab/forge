@@ -1,4 +1,6 @@
-use crate::outbound_http::{ProxyEnvironment, PublicAddressPolicy, public_http_client_builder};
+use crate::outbound_http::{
+    ProxyEnvironment, PublicAddressPolicy, PublicHttpError, public_http_client_builder,
+};
 
 use std::fmt;
 
@@ -181,7 +183,12 @@ async fn provider_client_for_url(
     }
     let client = public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
         .await
-        .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?
+        .map_err(|error| match error {
+            PublicHttpError::UnusableProxy => {
+                ProviderError::new(ProviderErrorKind::Network, error.to_string())
+            }
+            _ => ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"),
+        })?
         .build()
         .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "HTTP client setup failed"))?;
     Ok((client, url.to_owned()))
@@ -362,5 +369,15 @@ mod proxy_tests {
                 .is_err()
         );
         assert_eq!(proxy.await.unwrap(), "CONNECT 93.184.215.14:443 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn native_provider_refuses_an_unusable_environment_proxy() {
+        let proxies =
+            ProxyEnvironment::from_vars(|key| (key == "HTTPS_PROXY").then(|| "ftp://x:1".into()));
+        let error = provider_client_for_url("https://93.184.215.14/x", &proxies)
+            .await
+            .expect_err("an unusable proxy must not fall back to a direct connection");
+        assert!(error.message.contains("HTTPS_PROXY"), "{error:?}");
     }
 }

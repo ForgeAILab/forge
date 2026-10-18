@@ -84,6 +84,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   native provider requests, fetch, and network-capable child processes. Target
   validation runs before proxy connections; direct connections retain DNS
   pinning. A proxy's own DNS resolution remains under the operator's control.
+  A set but unusable proxy value (unparseable, or a non-HTTP scheme such as
+  `socks5h://`) refuses the request instead of connecting directly; health
+  probes report it as `outbound_proxy_unusable`.
 - Owner-only review parks no longer wake the Project Agent or create a redundant
   owner escalation. Mission Control shows each Task action and Resolve according
   to server authority and Project role, including ordinary actions for members

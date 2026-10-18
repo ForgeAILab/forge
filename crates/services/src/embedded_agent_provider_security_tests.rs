@@ -174,3 +174,14 @@ async fn provider_probe_and_connection_test_use_environment_proxy() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn provider_probe_and_connection_test_refuse_an_unusable_environment_proxy() {
+    let proxies = ProxyEnvironment::from_vars(|key| {
+        (key == "ALL_PROXY").then(|| "http://bad host:3128".to_owned())
+    });
+    let error = provider_http_client("https://93.184.215.14/x", Duration::from_secs(2), &proxies)
+        .await
+        .expect_err("an unusable proxy must not fall back to a direct connection");
+    assert_eq!(error, UNUSABLE_PROXY_MESSAGE);
+}

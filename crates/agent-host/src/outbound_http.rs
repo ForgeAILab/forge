@@ -8,13 +8,25 @@ use config::{
 };
 use hyper_util::client::proxy::matcher::Matcher;
 
+/// The refusal for a proxy variable Forge cannot use. It never echoes the
+/// value, which can carry the operator's proxy credentials.
+pub const UNUSABLE_PROXY_MESSAGE: &str = "public request refuses an unusable HTTPS_PROXY/ALL_PROXY \
+     value: only http:// and https:// proxy URLs are supported";
+
 /// A per-client snapshot, using reqwest's own system-proxy matcher and precedence.
 /// Deliberately has no Debug implementation: proxy configuration can hold secrets.
-pub struct ProxyEnvironment(Matcher);
+pub struct ProxyEnvironment {
+    matcher: Matcher,
+    /// The value that applies to https targets is set but unusable.
+    unusable: bool,
+}
 
 impl Default for ProxyEnvironment {
     fn default() -> Self {
-        Self(Matcher::builder().build())
+        Self {
+            matcher: Matcher::builder().build(),
+            unusable: false,
+        }
     }
 }
 
@@ -26,20 +38,28 @@ impl ProxyEnvironment {
     /// Injection seam: never mutate the process environment to configure a client.
     pub fn from_vars(mut get: impl FnMut(&str) -> Option<String>) -> Self {
         let mut first = |upper, lower| get(upper).or_else(|| get(lower)).unwrap_or_default();
-        Self(
-            Matcher::builder()
-                .https(first("HTTPS_PROXY", "https_proxy"))
-                .all(first("ALL_PROXY", "all_proxy"))
-                .no(first("NO_PROXY", "no_proxy"))
-                .build(),
-        )
+        let https = first("HTTPS_PROXY", "https_proxy");
+        let all = first("ALL_PROXY", "all_proxy");
+        let no = first("NO_PROXY", "no_proxy");
+        // The matcher would quietly skip an unparseable or unsupported value,
+        // falling through to ALL_PROXY or to a direct connection. Forge fails
+        // closed instead: the value that applies to https targets must be usable.
+        let applicable = if https.is_empty() { &all } else { &https };
+        let unusable = !applicable.is_empty() && !usable_proxy(applicable);
+        Self {
+            matcher: Matcher::builder().https(https).all(all).no(no).build(),
+            unusable,
+        }
     }
 
     fn proxy_for(&self, url: &url::Url) -> Result<Option<reqwest::Proxy>, PublicHttpError> {
+        if self.unusable {
+            return Err(PublicHttpError::UnusableProxy);
+        }
         let uri = url[..url::Position::BeforePath]
             .parse()
             .map_err(|_| PublicHttpError::InvalidUrl)?;
-        let Some(intercept) = self.0.intercept(&uri) else {
+        let Some(intercept) = self.matcher.intercept(&uri) else {
             return Ok(None);
         };
         // Matcher strips userinfo from this URI. Authentication travels only in
@@ -54,6 +74,19 @@ impl ProxyEnvironment {
         }
         Ok(Some(proxy))
     }
+}
+
+/// Parsed exactly as the matcher parses it. This reqwest build has no SOCKS
+/// support, so only an HTTP(S) proxy can carry the CONNECT tunnel.
+fn usable_proxy(value: &str) -> bool {
+    let probe = "https://proxy-probe.invalid/"
+        .parse()
+        .expect("static probe URI parses");
+    Matcher::builder()
+        .https(value)
+        .build()
+        .intercept(&probe)
+        .is_some_and(|proxy| matches!(proxy.uri().scheme_str(), Some("http" | "https")))
 }
 
 #[derive(Clone, Copy)]
@@ -74,6 +107,8 @@ pub enum PublicHttpError {
     RestrictedAddress,
     #[error("public HTTP client unavailable")]
     ClientUnavailable,
+    #[error("{}", UNUSABLE_PROXY_MESSAGE)]
+    UnusableProxy,
 }
 
 /// Reject a mixed DNS answer as a whole, rather than keeping its public subset.
@@ -378,7 +413,7 @@ pub(crate) mod proxy_tests {
                     .map(|(_, value)| (*value).to_owned())
             });
             let uri = url.as_str().parse().unwrap();
-            env.0.intercept(&uri).map(|proxy| proxy.uri().to_string())
+            env.matcher.intercept(&uri).map(|proxy| proxy.uri().to_string())
         };
         for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
             assert_eq!(
@@ -439,6 +474,62 @@ pub(crate) mod proxy_tests {
             );
         }
         assert!(selected(&[], &target).is_none());
+    }
+
+    #[tokio::test]
+    async fn unusable_environment_proxy_fails_closed_instead_of_going_direct() {
+        let target = url::Url::parse("https://93.184.215.14/x").unwrap();
+        let build = |values: Vec<(&'static str, String)>| {
+            let proxies = ProxyEnvironment::from_vars(|key| {
+                values
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| value.clone())
+            });
+            let target = target.clone();
+            async move {
+                public_http_client_builder(&target, PublicAddressPolicy::Provider, &proxies)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        let valid = "http://127.0.0.1:9".to_owned();
+        for unusable in [
+            "http://bad host:3128",
+            "http://",
+            "/path-only",
+            "ftp://unusable-secret@127.0.0.1:21",
+            "socks5h://unusable-secret@127.0.0.1:1080",
+            "socks5://127.0.0.1:1080",
+        ] {
+            let unusable = unusable.to_owned();
+            for values in [
+                vec![("HTTPS_PROXY", unusable.clone())],
+                vec![("https_proxy", unusable.clone())],
+                vec![("ALL_PROXY", unusable.clone())],
+                vec![("all_proxy", unusable.clone())],
+                // An unusable HTTPS value never falls through to ALL_PROXY.
+                vec![("HTTPS_PROXY", unusable.clone()), ("ALL_PROXY", valid.clone())],
+                // NO_PROXY does not turn a misconfiguration into a direct path.
+                vec![("HTTPS_PROXY", unusable.clone()), ("NO_PROXY", "*".into())],
+            ] {
+                let error = build(values).await.expect_err(&unusable);
+                assert!(matches!(error, PublicHttpError::UnusableProxy), "{unusable}");
+                let text = format!("{error} {error:?}");
+                assert!(!text.contains("unusable-secret") && !text.contains("127.0.0.1"));
+            }
+        }
+        // ALL_PROXY does not apply when a usable HTTPS value is set, and an
+        // empty value means unset.
+        for values in [
+            vec![("HTTPS_PROXY", valid.clone()), ("ALL_PROXY", "ftp://x".into())],
+            vec![("HTTPS_PROXY", String::new()), ("ALL_PROXY", valid.clone())],
+            vec![("HTTPS_PROXY", "https://127.0.0.1:9".into())],
+            vec![("HTTPS_PROXY", "127.0.0.1:9".into())],
+            vec![("HTTP_PROXY", "ftp://x".into())],
+        ] {
+            assert!(build(values).await.is_ok());
+        }
     }
 
     #[tokio::test]

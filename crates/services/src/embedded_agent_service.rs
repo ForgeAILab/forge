@@ -23,6 +23,7 @@ use db::{
 use db::{PageRequest, SortBy, SortOrder};
 use forge_agent_host::outbound_http::{
     public_http_client_builder, resolve_public_url, ProxyEnvironment, PublicAddressPolicy,
+    PublicHttpError, UNUSABLE_PROXY_MESSAGE,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
@@ -2253,7 +2254,13 @@ impl EmbeddedAgentService {
             &ProxyEnvironment::from_env(),
         )
         .await
-        .map_err(|_| "provider_endpoint_invalid".to_owned())?;
+        .map_err(|message| {
+            if message == UNUSABLE_PROXY_MESSAGE {
+                "outbound_proxy_unusable".to_owned()
+            } else {
+                "provider_endpoint_invalid".to_owned()
+            }
+        })?;
         let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
         // Gemini's AI Studio API rejects API keys sent as Bearer tokens; it
         // authenticates via the `x-goog-api-key` header. Every other backend
@@ -2475,7 +2482,10 @@ async fn provider_http_client(
     let parsed = validate_provider_url_shape(base_url)?;
     public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
         .await
-        .map_err(|_| "base_url must resolve exclusively to public addresses")?
+        .map_err(|error| match error {
+            PublicHttpError::UnusableProxy => UNUSABLE_PROXY_MESSAGE,
+            _ => "base_url must resolve exclusively to public addresses",
+        })?
         .timeout(timeout)
         .build()
         .map_err(|_| "provider client unavailable")
