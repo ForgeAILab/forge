@@ -5227,6 +5227,78 @@ mod tests {
         assert_eq!(children, 0);
     }
 
+    /// The verify hook's evidence store as production wires it: TaskService's
+    /// `ExecutionSupport` is the embedded agent service, which stores through
+    /// this provider. Core verify tests use a storage double instead.
+    #[tokio::test]
+    async fn verify_evidence_capture_through_execution_support_is_bounded_and_idempotent() {
+        use services::task_service::execution::ExecutionSupport;
+        let fixture = native_plan_fixture("coder", "coder").await;
+        let media = tempfile::tempdir().unwrap();
+        let embedded =
+            crate::EmbeddedAgentService::new(Arc::clone(&fixture.db), b"verify-evidence-test-key");
+        embedded.set_media_root(media.path().to_path_buf());
+        let media_id = db::new_uuid_v4();
+        for _ in 0..2 {
+            let stored = embedded
+                .capture_verify_evidence(
+                    &fixture.task_id,
+                    &media_id,
+                    "screen.png",
+                    "screenshot",
+                    "first screen",
+                    b"png bytes",
+                )
+                .await
+                .expect("verify evidence stores");
+            assert_eq!(stored, media_id);
+        }
+        let rows = db::TaskMediaRepo::list_active_media_for_task(&*fixture.db, &fixture.task_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a replayed capture resolves the same artifact"
+        );
+        let row = &rows[0];
+        assert_eq!(row.content_type, "image/png");
+        assert_eq!(row.author_type, db::CommentAuthorType::System);
+        assert_eq!(row.author_name, "Forge Verify");
+        assert_eq!(
+            row.storage_key,
+            format!("{}/{media_id}__screen.png", fixture.task_id)
+        );
+        assert_eq!(
+            std::fs::read(media.path().join(&row.storage_key)).unwrap(),
+            b"png bytes"
+        );
+        let asset = db::SharedMediaRepo::get_media_asset_for_task_media(&*fixture.db, &media_id)
+            .await
+            .unwrap()
+            .expect("captured artifact has a media asset");
+        assert_eq!(
+            asset.checksum.as_deref(),
+            Some(hex::encode(Sha256::digest(b"png bytes")).as_str())
+        );
+        for bytes in [
+            Vec::new(),
+            vec![0_u8; MAX_CAPTURED_EVIDENCE_BYTES as usize + 1],
+        ] {
+            embedded
+                .capture_verify_evidence(
+                    &fixture.task_id,
+                    &db::new_uuid_v4(),
+                    "out.log",
+                    "log",
+                    "bounded",
+                    &bytes,
+                )
+                .await
+                .expect_err("verify evidence is 1 byte to 25 MiB");
+        }
+    }
+
     #[tokio::test]
     async fn native_task_registered_records_bind_exact_execution_and_refuse_forgery() {
         let fixture = native_plan_fixture_with_permissions(
