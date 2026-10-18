@@ -2391,6 +2391,14 @@ also not configured. Forge retains its per-tool argument normalizers: the
 runtime turns a representable schema-invalid call into a correctable tool error,
 but does not apply Forge's historical `parameters`-envelope transformation.
 
+v0.5.0 records the provider and model that produced each reasoning part
+(`producer`) in canonical history, so it reaches the encrypted snapshot and
+the SQLite LCM entry, whose content fingerprint covers it. The previous pin
+(5ee41e4, Forge v0.14.0) drops the unknown field on read and then fails the
+fingerprint check, so it cannot resume an LCM session that ran a reasoning turn
+on v0.5.0. Downgrading is therefore unsupported for those sessions; sessions
+without LCM, or without stored reasoning, still resume on the older pin.
+
 Native turn failures project runtime failure classes into Forge's existing
 typed categories: policy denial, context overflow, authentication, quota,
 provider-stage request rejection, and typed turn limits retain their evidence.

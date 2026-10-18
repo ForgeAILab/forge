@@ -82,6 +82,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   Project viewer/member return HTTP 403 `insufficient_role`. The web MCP
   controls show other users only the MCP URL for their own client, with no
   install buttons and no server config reads.
+- Upgrading to this release is one-way for native agent sessions that use
+  lossless context memory: Main and Project chats and every other non-Task
+  native agent session. Agent Runtime v0.5.0 records the producing provider
+  and model on each reasoning part it stores, and the stored LCM entry
+  fingerprints cover that field. v0.14.0 drops the field on read, cannot
+  re-verify the entries, and refuses every later turn of a session that ran a
+  turn with reasoning on this release (`LCM canonical history no longer matches
+  its protected checkpoint`, or `LCM store backend failed` once that turn has
+  been summarized). Sessions without lossless context memory, such as Task
+  sessions, have no such entries and are unaffected, as are sessions that never
+  received reasoning; upgrading again resumes a refused session unchanged. Back
+  up the data directory before upgrading if you may need to run v0.14.0 on it
+  again.
 
 ### Changed
 
