@@ -69,6 +69,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   repositories embedded in checked-out content, submodule recursion and
   credential prompts are disabled, and a transfer slower than 1000 bytes/s
   for 60 seconds aborts. Repositories cannot override this configuration.
+  Automatic Git finalization reapplies the demo policy after clearing inherited Git configuration.
 - Issue browser session cookies only over HTTPS, avoiding live-token exposure
   to other ports on a local HTTP host. Both cookies use the `__Host-` prefix,
   `Secure`, `Path=/`, and no `Domain` to prevent sibling-subdomain cookie

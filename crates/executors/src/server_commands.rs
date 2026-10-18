@@ -23,7 +23,7 @@ static DISABLED: AtomicBool = AtomicBool::new(false);
 /// filesystem monitor, a bare repository embedded in checked-out content).
 /// Local paths and bundles keep Git's default `user` policy for Forge's own
 /// transfers. Command-scope configuration outranks every repository's own.
-pub const GIT_CONFIG: &[(&str, &str)] = &[
+const GIT_CONFIG: &[(&str, &str)] = &[
     ("http.followRedirects", "false"),
     ("protocol.allow", "never"),
     ("protocol.https.allow", "always"),
@@ -38,6 +38,19 @@ pub const GIT_CONFIG: &[(&str, &str)] = &[
     ("http.lowSpeedTime", "60"),
 ];
 
+/// Trusted command-scope Git settings for the selected demo policy.
+/// Callers that discard inherited Git configuration must install these from
+/// index zero, setting every key/value and the count to this slice's length.
+/// The explicit flag also lets callers test the policy without disabling the
+/// process-wide, monotonic switch.
+pub fn git_config_policy(manager_only: bool) -> &'static [(&'static str, &'static str)] {
+    if manager_only {
+        GIT_CONFIG
+    } else {
+        &[]
+    }
+}
+
 /// Monotonic: configuration, templates and requests cannot re-enable commands.
 pub fn disable() {
     static GIT_POLICY: std::sync::Once = std::sync::Once::new();
@@ -46,18 +59,20 @@ pub fn disable() {
 }
 
 /// Every Git child inherits the process environment; Forge spawns Git from
-/// many places, and none of them clears `GIT_CONFIG_*`. Entries already in
-/// the environment are kept and these are appended after them.
+/// many places. Commands that discard inherited Git configuration reapply
+/// `git_config_policy` themselves. Entries already in the process environment
+/// are kept and these are appended after them.
 fn restrict_git() {
+    let policy = git_config_policy(manager_only());
     let base = std::env::var("GIT_CONFIG_COUNT")
         .ok()
         .and_then(|count| count.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    for (offset, (key, value)) in GIT_CONFIG.iter().enumerate() {
+    for (offset, (key, value)) in policy.iter().enumerate() {
         std::env::set_var(format!("GIT_CONFIG_KEY_{}", base + offset), key);
         std::env::set_var(format!("GIT_CONFIG_VALUE_{}", base + offset), value);
     }
-    std::env::set_var("GIT_CONFIG_COUNT", (base + GIT_CONFIG.len()).to_string());
+    std::env::set_var("GIT_CONFIG_COUNT", (base + policy.len()).to_string());
     // No credential prompt can wait on a terminal for a public remote.
     std::env::set_var("GIT_TERMINAL_PROMPT", "0");
 }
@@ -96,6 +111,13 @@ pub fn ensure_agents_allowed() -> Result<(), ServerAgentsDisabled> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_config_policy_is_empty_outside_demo() {
+        assert!(git_config_policy(false).is_empty());
+        assert_eq!(git_config_policy(true), GIT_CONFIG);
+        assert!(!git_config_policy(true).is_empty());
+    }
 
     #[test]
     fn server_commands_policy_is_monotonic_and_shared_with_agents() {

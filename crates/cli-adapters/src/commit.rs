@@ -173,6 +173,20 @@ fn hardened_git_command(worktree: &Path) -> Command {
         .env_remove("GIT_EXTERNAL_DIFF")
         .env_remove("GIT_DIFF_OPTS")
         .env("GIT_NO_LAZY_FETCH", "1");
+    let policy =
+        executors::server_commands::git_config_policy(executors::server_commands::manager_only());
+    if !policy.is_empty() {
+        // Only Forge's trusted demo settings survive configuration removal.
+        // Overwrite every index Git will read; inherited operator entries at
+        // higher indices are ignored because the count covers only this policy.
+        for (index, (key, value)) in policy.iter().enumerate() {
+            command.env(format!("GIT_CONFIG_KEY_{index}"), key);
+            command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
+        command
+            .env("GIT_CONFIG_COUNT", policy.len().to_string())
+            .env("GIT_TERMINAL_PROMPT", "0");
+    }
     command
 }
 
@@ -653,6 +667,108 @@ mod tests {
                 (key == "GIT_NO_LAZY_FETCH").then(|| value.and_then(|value| value.to_str()))
             }),
             Some(Some("1"))
+        );
+    }
+
+    #[test]
+    fn hardened_git_environment_preserves_demo_policy_without_operator_config() {
+        const CHILD: &str = "FORGE_HARDENED_GIT_DEMO_POLICY_TEST";
+        let policy = executors::server_commands::git_config_policy(true);
+        if std::env::var_os(CHILD).is_none() {
+            assert!(!executors::server_commands::manager_only());
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "commit::tests::hardened_git_environment_preserves_demo_policy_without_operator_config",
+                ])
+                .env(CHILD, "1")
+                .env("GIT_CONFIG_COUNT", (policy.len() + 2).to_string());
+            // Poison every index the hardened command will use, plus two
+            // beyond its range. Disabling demo appends its own entries later.
+            for index in 0..policy.len() + 2 {
+                child
+                    .env(format!("GIT_CONFIG_KEY_{index}"), "demo.operator")
+                    .env(format!("GIT_CONFIG_VALUE_{index}"), "inherited");
+            }
+            assert!(child.status().unwrap().success());
+            assert!(!executors::server_commands::manager_only());
+            return;
+        }
+
+        executors::server_commands::disable();
+        let worktree = tempfile::tempdir().unwrap();
+        let mut command = hardened_git_command(worktree.path());
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        let setting = |key: &str| {
+            environment
+                .get(std::ffi::OsStr::new(key))
+                .and_then(Option::as_deref)
+                .and_then(std::ffi::OsStr::to_str)
+        };
+        assert_eq!(
+            setting("GIT_CONFIG_COUNT"),
+            Some(policy.len().to_string().as_str())
+        );
+        for (index, (key, value)) in policy.iter().enumerate() {
+            assert_eq!(setting(&format!("GIT_CONFIG_KEY_{index}")), Some(*key));
+            assert_eq!(setting(&format!("GIT_CONFIG_VALUE_{index}")), Some(*value));
+        }
+        assert_eq!(setting("GIT_TERMINAL_PROMPT"), Some("0"));
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("GIT_CONFIG")),
+            Some(&None)
+        );
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new("GIT_CONFIG_PARAMETERS")),
+            Some(&None)
+        );
+
+        // Git must ignore inherited operator entries beyond the new count.
+        // Read a single synthetic key; never dump the process environment.
+        let output = command
+            .args(["config", "--get-all", "demo.operator"])
+            .as_std_mut()
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+    }
+
+    #[test]
+    fn hardened_git_environment_is_unchanged_outside_demo() {
+        assert!(!executors::server_commands::manager_only());
+        let command = hardened_git_command(Path::new("/tmp/worktree"));
+        let environment = command
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_str().unwrap(),
+                    value.map(|value| value.to_str().unwrap()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("GIT_DIR", None),
+                ("GIT_WORK_TREE", None),
+                ("GIT_INDEX_FILE", None),
+                ("GIT_COMMON_DIR", None),
+                ("GIT_OBJECT_DIRECTORY", None),
+                ("GIT_ALTERNATE_OBJECT_DIRECTORIES", None),
+                ("GIT_CONFIG", None),
+                ("GIT_CONFIG_COUNT", None),
+                ("GIT_CONFIG_PARAMETERS", None),
+                ("GIT_EXTERNAL_DIFF", None),
+                ("GIT_DIFF_OPTS", None),
+                ("GIT_NO_LAZY_FETCH", Some("1")),
+            ])
         );
     }
 

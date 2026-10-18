@@ -1024,13 +1024,17 @@ scripted checks) records the refusal through the existing interruption park in
 review, infrastructure or verify retries and leaves no suspended hooks step.
 Stored durable checks return unstarted infrastructure receipts carrying the refusal. Forge's
 own Git operations remain allowed. `executors::server_commands::disable()` also
-appends `executors::server_commands::GIT_CONFIG` to the process environment
+appends `executors::server_commands::git_config_policy(true)` to the process environment
 (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, plus
 `GIT_TERMINAL_PROMPT=0`), which every Git child inherits as command-scope
 configuration a repository cannot override: no HTTP redirect, no network
 protocol but `https` (`file` keeps Git's `user` default for local transfers and
 bundles), `core.hooksPath=/dev/null`, `core.fsmonitor=false`,
 `safe.bareRepository=explicit`, no submodule recursion and a low-speed abort.
+Automatic finalization discards inherited Git configuration and reapplies this
+same policy from index zero with its own count and every key/value, plus
+`GIT_TERMINAL_PROMPT=0`. Inherited operator entries cannot enter that count;
+normal-mode finalization continues to discard inherited configuration.
 
 The same switch also makes the demo server a manager only for agents and
 server files. `executors::server_commands::ensure_agents_allowed` refuses
