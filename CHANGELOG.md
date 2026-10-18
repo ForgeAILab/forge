@@ -148,6 +148,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   received reasoning; upgrading again resumes a refused session unchanged. Back
   up the data directory before upgrading if you may need to run v0.14.0 on it
   again.
+- Upgrading is also one-way for five database triggers that this release
+  replaces with repository code (migrations `V202610180752`–`V202610180820`).
+  The migration runner does not refuse a database written by a newer build, so
+  v0.14.0 starts on an upgraded data directory but has neither the triggers
+  nor their replacement: new accounts and Projects get no Main or Project Chat
+  and no setup binding, Main Chat topic rotations are not marked, reopening a
+  resolved Attention item does not re-arm its wakes, Task media uploads are not
+  projected into Project media, and the pricing guards can refuse deleting an
+  account with pricing history. Restore a backup taken before upgrading instead
+  of running v0.14.0 on the upgraded directory.
 
 ### Added
 
