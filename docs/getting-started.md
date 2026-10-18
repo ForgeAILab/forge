@@ -453,6 +453,12 @@ turns count toward occupancy but retain their current independent admission.
 
 ### Database space and consumer health
 
+Forge data directories cannot be opened by a build whose embedded migration
+bundle is older than the database: startup refuses before applying anything,
+names the newest unknown migration, and tells you to run the newer Forge that
+upgraded it. Restore a pre-upgrade backup to downgrade; for disposable local
+development data in `./test`, run `make clean-test` instead.
+
 Configure the consumer stall threshold with the usual
 **CLI > environment > file > default** precedence:
 

@@ -16,6 +16,10 @@ const SERVER_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 // in debug builds. Give runtime threads headroom beyond Tokio's default stack.
 const RUNTIME_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+fn format_database_open_error(error: &db::DbError) -> String {
+    format!("Forge could not open the database: {error}")
+}
+
 #[derive(Parser)]
 #[command(
     name = "forge",
@@ -161,9 +165,11 @@ async fn run() {
     let pool = db::create_sqlite_pool(&database_url)
         .await
         .expect("Failed to create database pool");
-    db::run_migrations(&pool)
-        .await
-        .expect("Failed to run migrations");
+    if let Err(error) = db::run_migrations(&pool).await {
+        eprintln!("{}", format_database_open_error(&error));
+        pool.close().await;
+        std::process::exit(1);
+    }
     let db = Arc::new(db::SqliteDb::new(pool));
     let workspace_root = settle_workspace_root(&db, &config, &config_path).await;
 
@@ -568,7 +574,9 @@ async fn migrate_workspace_root(
         let pool = db::create_sqlite_pool(&database_url)
             .await
             .map_err(|e| e.to_string())?;
-        db::run_migrations(&pool).await.map_err(|e| e.to_string())?;
+        db::run_migrations(&pool)
+            .await
+            .map_err(|error| format_database_open_error(&error))?;
         Ok::<_, String>((db::SqliteDb::new(pool), data_dir))
     };
     let (db, data_dir) = match opened.await {
@@ -840,6 +848,19 @@ mod tests {
 #[cfg(test)]
 mod migrate_workspace_root_tests {
     use super::*;
+
+    #[test]
+    fn newer_database_error_is_actionable_without_a_panic() {
+        let message = format_database_open_error(&db::DbError::DatabaseNewerThanBuild {
+            unknown: vec![(202_610_190_101, "future_schema".to_owned())],
+        });
+
+        assert!(message.contains("data directory was upgraded by a newer Forge"));
+        assert!(message.contains("V202610190101__future_schema"));
+        assert!(message.contains("Run the newer Forge"));
+        assert!(message.contains("make clean-test"));
+        assert!(!message.contains("panicked"));
+    }
 
     #[test]
     fn printed_command_reads_the_same_config_as_this_start() {

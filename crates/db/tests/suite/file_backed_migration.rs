@@ -5140,6 +5140,52 @@ async fn migration_runner_refuses_a_version_applied_under_another_name() {
 }
 
 #[tokio::test]
+async fn migration_runner_refuses_newer_database_before_pending_migration() {
+    let (pool, db_path) = migration_test_pool("newer-than-build-db").await;
+    run_migrations(&pool)
+        .await
+        .expect("embedded bundle migrates");
+    let pending_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+        .fetch_one(&pool)
+        .await
+        .expect("latest bundled version loads");
+    sqlx::query("DELETE FROM _migration WHERE version = ?")
+        .bind(pending_version)
+        .execute(&pool)
+        .await
+        .expect("pending state creates");
+    let future_version = pending_version + 1;
+    sqlx::query(
+        "INSERT INTO _migration (version, name, applied_at)
+         VALUES (?, 'future_schema', 'future')",
+    )
+    .bind(future_version)
+    .execute(&pool)
+    .await
+    .expect("future migration records");
+
+    let error = run_migrations(&pool)
+        .await
+        .expect_err("an older embedded bundle must refuse the database");
+    match error {
+        db::DbError::DatabaseNewerThanBuild { unknown } => {
+            assert_eq!(unknown, vec![(future_version, "future_schema".to_owned())]);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    let pending_still_missing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = ?")
+            .bind(pending_version)
+            .fetch_one(&pool)
+            .await
+            .expect("pending migration history reads");
+    assert_eq!(pending_still_missing, 0, "nothing pending may run");
+
+    pool.close().await;
+    let _ = fs::remove_file(db_path);
+}
+
+#[tokio::test]
 async fn timestamp_migration_merged_after_a_newer_one_still_runs() {
     let dir = unique_temp_path("timestamp-version-migrations");
     fs::create_dir_all(&dir).expect("temp migration dir creates");

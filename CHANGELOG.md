@@ -145,14 +145,17 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   its protected checkpoint`, or `LCM store backend failed` once that turn has
   been summarized). Sessions without lossless context memory, such as Task
   sessions, have no such entries and are unaffected, as are sessions that never
-  received reasoning; upgrading again resumes a refused session unchanged. Back
-  up the data directory before upgrading if you may need to run v0.14.0 on it
-  again.
+  received reasoning; upgrading again resumes a refused session unchanged.
+  Releases after v0.14.0, beginning with this one, refuse to start on a data
+  directory migrated by a still newer Forge. v0.14.0 and earlier cannot detect
+  that condition, so back up the data directory before upgrading if you may
+  need to run one of them on it again.
 - Upgrading is also one-way for five database triggers that this release
   replaces with repository code (migrations `V202610180752`–`V202610180820`).
-  The migration runner does not refuse a database written by a newer build, so
-  v0.14.0 starts on an upgraded data directory but has neither the triggers
-  nor their replacement: new accounts and Projects get no Main or Project Chat
+  Releases after v0.14.0, beginning with this one, refuse unknown migration
+  versions before applying anything. v0.14.0 and earlier cannot detect them:
+  v0.14.0 starts on an upgraded data directory but has neither the triggers nor
+  their replacement, so new accounts and Projects get no Main or Project Chat
   and no setup binding, Main Chat topic rotations are not marked, reopening a
   resolved Attention item does not re-arm its wakes, Task media uploads are not
   projected into Project media, and the pricing guards can refuse deleting an
@@ -172,6 +175,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Forge refuses to start on a data directory migrated by a newer Forge.
 - **The remaining agent/chat implementation moved from `services` to
   `services-agents` (internal).** Agent Chat policy, admission, workers and
   memory projection; inquiries; context manifests and usage; embedded agents;

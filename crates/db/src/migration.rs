@@ -3,7 +3,7 @@ use include_dir::{include_dir, Dir};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -69,7 +69,7 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
 
     migrations.sort_by_key(|(migration, _)| migration.version);
 
-    for (migration, sql) in pending_migrations(pool, migrations).await? {
+    for (migration, sql) in pending_migrations(pool, migrations, true).await? {
         apply_migration_sql(pool, &migration, &sql).await?;
     }
 
@@ -345,7 +345,10 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         .into_iter()
         .map(|migration| (migration, ()))
         .collect();
-    for (migration, ()) in pending_migrations(pool, migrations).await? {
+    // Custom directories are migration-test fixtures, not the embedded bundle
+    // that identifies this Forge build. They intentionally support replaying a
+    // historical subset against a newer fixture database.
+    for (migration, ()) in pending_migrations(pool, migrations, false).await? {
         apply_migration(pool, &migration).await?;
     }
 
@@ -359,13 +362,15 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
 /// Return the migrations the database has not applied, in version order.
 ///
 /// The `_migration` table records applied versions by number. Two files with
-/// the same number, or a database that applied a different migration under a
-/// number this build uses, would otherwise make the runner skip a migration
-/// without any error and leave its schema missing. Both are refused before
+/// the same number, a database that applied a different migration under a
+/// number this build uses, or (for the embedded production bundle) a database
+/// carrying a version this build does not ship would otherwise make the runner
+/// operate against a schema it does not understand. All are refused before
 /// anything runs. `migrations` must be sorted by version.
 async fn pending_migrations<T>(
     pool: &SqlitePool,
     migrations: Vec<(Migration, T)>,
+    refuse_unknown_applied: bool,
 ) -> Result<Vec<(Migration, T)>> {
     if let Some(pair) = migrations
         .windows(2)
@@ -384,6 +389,21 @@ async fn pending_migrations<T>(
             .await?
             .into_iter()
             .collect();
+    if refuse_unknown_applied {
+        let bundled_versions: HashSet<i64> = migrations
+            .iter()
+            .map(|(migration, _)| migration.version)
+            .collect();
+        let mut unknown: Vec<(i64, String)> = applied
+            .iter()
+            .filter(|(version, _)| !bundled_versions.contains(version))
+            .map(|(version, name)| (*version, name.clone()))
+            .collect();
+        unknown.sort();
+        if !unknown.is_empty() {
+            return Err(DbError::DatabaseNewerThanBuild { unknown });
+        }
+    }
     let mut pending = Vec::new();
     for (migration, payload) in migrations {
         match applied.get(&migration.version) {
@@ -533,6 +553,59 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_runner_refuses_newer_database_before_applying_pending_migration() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        let newest_bundled: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _migration WHERE version = ?")
+            .bind(newest_bundled)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let expected: Vec<(i64, String)> = (1..=5)
+            .map(|offset| (newest_bundled + offset, format!("future_{offset}")))
+            .collect();
+        for index in [4, 0, 2, 1, 3] {
+            let (version, name) = &expected[index];
+            sqlx::query(
+                "INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, 'future')",
+            )
+            .bind(version)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let error = run_migrations_replay(&pool).await.unwrap_err();
+        match &error {
+            DbError::DatabaseNewerThanBuild { unknown } => assert_eq!(unknown, &expected),
+            other => panic!("unexpected error: {other}"),
+        }
+        let pending_still_missing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = ?")
+                .bind(newest_bundled)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            pending_still_missing, 0,
+            "the pending bundled migration must not run"
+        );
+        let message = error.to_string();
+        assert!(message.contains("data directory was upgraded by a newer Forge"));
+        assert!(message.contains("future_5"), "{message}");
+        assert!(message.contains("5 total"), "{message}");
+        assert!(message.contains("plus 2 more"), "{message}");
+        assert!(!message.contains("future_1"), "display must stay bounded");
+        assert!(message.contains("make clean-test"), "{message}");
+    }
 
     #[tokio::test]
     async fn single_writer_upgrade_preserves_claims_causation_and_hook_script_checkpoints() {
