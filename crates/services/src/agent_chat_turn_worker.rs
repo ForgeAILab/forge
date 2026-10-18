@@ -6748,7 +6748,7 @@ mod tests {
         let db_sources = [
             include_str!("../../db/src/sqlite/agent.rs"),
             include_str!("../../db/src/sqlite/agent_chat.rs"),
-            include_str!("../../db/src/sqlite/orchestration.rs"),
+            include_str!("../../db/src/sqlite/orchestration/turn_admission.rs"),
         ];
         let mut statements = 0;
         for db_source in db_sources {
