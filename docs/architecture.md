@@ -2428,6 +2428,25 @@ live diagnostic window therefore preserves the same canonical state identity.
 Forge links context provenance from the latest manifest in the live session
 after the turn; it does not reconstruct historical replay from a checkpoint.
 
+The runtime pin is v0.5.0 (`82f5aac`). Its materialized session snapshots stay
+unversioned and its checkpoints remain schema 3 / transition revision 4, so
+Forge keeps the same encrypted store and database schema. Runtime schema-4
+SessionJournal support is only a capability contract in this release; Forge's
+stores do not advertise it, and continue writing materialized snapshots and
+checkpoints. The opt-in flat semantic summary and external-agent features are
+also not configured. Forge retains its per-tool argument normalizers: the
+runtime turns a representable schema-invalid call into a correctable tool error
+(as the previous pin already did), but does not apply Forge's historical
+`parameters`-envelope transformation.
+
+v0.5.0 records the provider and model that produced each reasoning part
+(`producer`) in canonical history, so it reaches the encrypted snapshot and
+the SQLite LCM entry, whose content fingerprint covers it. The previous pin
+(5ee41e4, Forge v0.14.0) drops the unknown field on read and then fails the
+fingerprint check, so it cannot resume an LCM session that ran a reasoning turn
+on v0.5.0. Downgrading is therefore unsupported for those sessions; sessions
+without LCM, or without stored reasoning, still resume on the older pin.
+
 Native turn failures project runtime failure classes into Forge's existing
 typed categories: policy denial, context overflow, authentication, quota,
 provider-stage request rejection, and typed turn limits retain their evidence.
@@ -2522,6 +2541,20 @@ seeds are sealed in the protected store.
 U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
 a Forge policy-revision bump. Strict binding and authorization mismatches still
 fail closed.
+
+Runtime v0.5.0 changes the deterministic fallback algorithm revision from
+`agent-runtime-lcm-2` to `agent-runtime-lcm-3`. Resume rebuilds only derived
+metadata from the authorized active DAG; existing entries, nodes and fallback
+text remain immutable. The release's crash-safe hard admission and
+uncheckpointed-tail recovery (through `truncate_from`) target hosts with a
+SessionStore and no CheckpointStore. Forge's LCM sessions configure both, so
+hard admission is unchanged for them, and tail recovery is only a last
+fallback: a store left more than one append ahead of the saved checkpoint is
+truncated back to it instead of failing every resume. The previous pin
+already finalized an abandoned non-terminal checkpoint as failed, without
+replay, before admitting new work; v0.5.0 also closes each tool call that turn
+left unanswered with an explicit error result, so the next turn is not
+rejected as `invalid_pairing`.
 
 Within a topic, a full `project.current_state` or `project.charter` result carries
 a unique `read_ref`, and an unchanged repeat returns

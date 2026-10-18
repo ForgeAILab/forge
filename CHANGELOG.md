@@ -135,6 +135,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unprefixed cookies are no longer read. Registration, login and refresh no
   longer set cookies on plain HTTP; localStorage token authentication remains
   available.
+- Upgrading to this release is one-way for native agent sessions that use
+  lossless context memory: Main and Project chats and every other non-Task
+  native agent session. Agent Runtime v0.5.0 records the producing provider
+  and model on each reasoning part it stores, and the stored LCM entry
+  fingerprints cover that field. v0.14.0 drops the field on read, cannot
+  re-verify the entries, and refuses every later turn of a session that ran a
+  turn with reasoning on this release (`LCM canonical history no longer matches
+  its protected checkpoint`, or `LCM store backend failed` once that turn has
+  been summarized). Sessions without lossless context memory, such as Task
+  sessions, have no such entries and are unaffected, as are sessions that never
+  received reasoning; upgrading again resumes a refused session unchanged. Back
+  up the data directory before upgrading if you may need to run v0.14.0 on it
+  again.
 
 ### Added
 
@@ -149,6 +162,23 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
+  `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
+  and SQLite LCM timelines resume without a database migration; persisted
+  `agent-runtime-lcm-2` derived state rebuilds once for the `-3` algorithm while
+  old nodes and their text stay as stored (downgrading is covered under
+  Breaking). What changes for users: a deterministic LCM fallback summary now
+  renders earlier tool activity as `[earlier tool call: …]` and
+  `[earlier tool result: …]` lines instead of `call name(args)` text a model
+  could copy as its reply; a turn interrupted or failed in the middle of a tool
+  step has each unanswered call closed with an explicit error result when the
+  session next takes a turn, instead of failing every later turn with
+  `invalid_pairing` (the call is never replayed); and new reasoning is replayed
+  only to the provider and model that produced it, so after a session changes
+  model its earlier reasoning is left out of requests. Reasoning stored before
+  this release keeps the previous replay rule. Schema-invalid tool calls and
+  Forge's `parameters` envelope normalizer behave as before. Native journals,
+  external agents and the flat semantic-summary alternative stay disabled.
 - Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
   lowercase variants, provider probes and connection tests, public search,
   native provider requests, fetch, and network-capable child processes. Target
