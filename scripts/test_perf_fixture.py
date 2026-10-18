@@ -125,6 +125,73 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT id FROM project_agent_binding').fetchall(),
                              [(fixture_id('deferred-project-binding'),)])
 
+    def test_project_setup_rows_match_with_and_without_the_legacy_trigger(self):
+        # Baselines before V202610180752 write the Project Chat and setup binding from
+        # an AFTER INSERT trigger; later servers write them in code. A fixture built
+        # on either must seed the same rows.
+        schema = """
+            CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT NOT NULL, owner_id TEXT,
+                workflow_definition TEXT, workflow_template_name TEXT, paused_at TEXT,
+                system_pause_reason TEXT, primary_repo_id TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+            CREATE TABLE repo (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL,
+                local_path TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE project_member (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                user_id TEXT NOT NULL, role TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+            CREATE TABLE task (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_task_id TEXT,
+                task_type TEXT NOT NULL, title TEXT NOT NULL, description TEXT, status TEXT NOT NULL,
+                priority INTEGER NOT NULL, board_position REAL NOT NULL, subtask_order INTEGER,
+                metadata_json TEXT, deleted_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE agent_chat (id TEXT PRIMARY KEY, kind TEXT NOT NULL, account_id TEXT,
+                project_id TEXT, status TEXT NOT NULL, instruction_revision INTEGER NOT NULL,
+                message_count INTEGER NOT NULL, version INTEGER NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL);
+            CREATE TABLE project_agent_binding (id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                identity_id TEXT, profile_id TEXT, state TEXT NOT NULL,
+                autonomy_policy_json TEXT NOT NULL, permission_ceiling_json TEXT NOT NULL,
+                subscriptions_json TEXT NOT NULL, wake_budget INTEGER NOT NULL,
+                version INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        """
+        legacy_trigger = """
+            CREATE TRIGGER project_agent_chat_after_insert AFTER INSERT ON project BEGIN
+                INSERT INTO agent_chat (id, kind, account_id, project_id, status,
+                    instruction_revision, message_count, version, created_at, updated_at)
+                SELECT lower(hex(randomblob(16))), 'project', NULL, NEW.id, 'agent_setup_required',
+                    0, 0, 1, NEW.created_at, NEW.updated_at
+                WHERE NOT EXISTS (SELECT 1 FROM agent_chat WHERE kind = 'project' AND project_id = NEW.id);
+                INSERT INTO project_agent_binding (id, project_id, identity_id, profile_id, state,
+                    autonomy_policy_json, permission_ceiling_json, subscriptions_json,
+                    wake_budget, version, created_at, updated_at)
+                SELECT lower(hex(randomblob(16))), NEW.id, NULL, NULL, 'agent_setup_required',
+                    '{}', '{}', '[]', 10, 1, NEW.created_at, NEW.updated_at
+                WHERE NOT EXISTS (SELECT 1 FROM project_agent_binding WHERE project_id = NEW.id
+                                  AND state IN ('active', 'agent_setup_required'));
+            END;
+        """
+        workflow = {'states': [{'name': name} for name in ('backlog', 'todo', 'in_progress', 'done')]}
+        dumps = []
+        for script in (schema + legacy_trigger, schema):
+            with closing(sqlite3.connect(':memory:')) as db, db:
+                db.executescript(script)
+                seed_deferred_project(db, SqlBuilder(db), workflow, 'owner')
+                dump = json.loads(canonical_dump(db, ['agent_chat', 'project_agent_binding']))
+                dumps.append(dump)
+        self.assertEqual(dumps[0], dumps[1])
+        project = fixture_id('deferred-project')
+        chat, binding = dumps[1]['agent_chat'], dumps[1]['project_agent_binding']
+        self.assertEqual([dict(zip(chat['columns'], row)) for row in chat['rows']],
+                         [{'id': fixture_id('deferred-project-chat'), 'kind': 'project', 'account_id': None,
+                           'project_id': project, 'status': 'agent_setup_required',
+                           'instruction_revision': 0, 'message_count': 0, 'version': 1,
+                           'created_at': timestamp(), 'updated_at': timestamp()}])
+        self.assertEqual([dict(zip(binding['columns'], row)) for row in binding['rows']],
+                         [{'id': fixture_id('deferred-project-binding'), 'project_id': project,
+                           'identity_id': None, 'profile_id': None, 'state': 'agent_setup_required',
+                           'autonomy_policy_json': '{}', 'permission_ceiling_json': '{}',
+                           'subscriptions_json': '[]', 'wake_budget': 10, 'version': 1,
+                           'created_at': timestamp(), 'updated_at': timestamp()}])
+
     @unittest.skipUnless(os.environ.get('PERF_FIXTURE_A') and os.environ.get('PERF_FIXTURE_B'),
                          'set PERF_FIXTURE_A/B to compare two built baseline fixtures')
     def test_two_real_fixture_builds_have_identical_seeded_rows(self):
