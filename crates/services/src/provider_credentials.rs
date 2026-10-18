@@ -111,7 +111,10 @@ pub async fn provider_url_addresses(
     Ok((parsed, addresses))
 }
 
-fn provider_egress_refusal(error: PublicHttpError) -> &'static str {
+/// Return the stable caller-facing reason for a refused provider endpoint.
+/// Resolution and address-policy failures remain distinct so callers can
+/// correct the relevant endpoint or environment configuration.
+pub fn provider_egress_refusal(error: PublicHttpError) -> &'static str {
     match error {
         PublicHttpError::InvalidUrl => "base_url must be an https URL without credentials",
         PublicHttpError::RestrictedHostname => {

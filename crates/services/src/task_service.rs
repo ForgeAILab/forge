@@ -984,6 +984,13 @@ impl TaskService {
         self
     }
 
+    /// Whether runtime composition supplied the agents-owned execution seam.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn has_provider_credential_env(&self) -> bool {
+        self.credential_env.is_some()
+    }
+
     fn publish(&self, event: ForgeEvent) {
         if matches!(
             event.event_type.as_str(),

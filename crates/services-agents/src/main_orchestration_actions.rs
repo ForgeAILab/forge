@@ -495,8 +495,8 @@ fn main_command_finalization(
         input_digest: command_context.input_digest().to_owned(),
         policy_result: action.policy_result.to_string(),
         correlation_id: command_context.correlation_id().to_owned(),
-        causation_id: command_context.causation_id.clone(),
-        causation_depth: command_context.causation_depth,
+        causation_id: command_context.causation_id().map(str::to_owned),
+        causation_depth: command_context.causation_depth(),
         // The domain repository replaces this template value with the event
         // generated in the same transaction before inserting the receipt.
         event_id: String::new(),

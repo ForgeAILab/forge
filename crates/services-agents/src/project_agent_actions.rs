@@ -904,11 +904,10 @@ impl ProjectOrchestrationActionService {
         })?;
         let provenance: RevisionProvenance = from_value(payload, "provenance")?;
         let authorization_event_id = command_context
-            .action_provenance
-            .as_ref()
+            .action_provenance()
             .map(|value| value.action_id.clone())
             .unwrap_or_else(|| command_context.correlation_id().to_owned());
-        let authorization_basis = if command_context.action_provenance.is_some() {
+        let authorization_basis = if command_context.action_provenance().is_some() {
             "agent_action"
         } else {
             "project_agent_binding_policy"
@@ -916,25 +915,20 @@ impl ProjectOrchestrationActionService {
         let authorization = ProjectCommandAuthorization {
             principal_type: command_context.principal().principal_type().to_owned(),
             principal_id: command_context.principal().principal_id().to_owned(),
-            policy_result: command_context
-                .authorization_provenance
-                .as_ref()
-                .map_or_else(
-                    || action.policy_result.to_string(),
-                    |value| value.policy_result.clone(),
-                ),
+            policy_result: command_context.authorization_provenance().map_or_else(
+                || action.policy_result.to_string(),
+                |value| value.policy_result.clone(),
+            ),
             policy_revision: None,
             policy_digest: command_context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.policy_digest.clone()),
             requested_permission: command_context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.requested_permission.clone()),
             correlation_id: command_context.correlation_id().to_owned(),
-            causation_id: command_context.causation_id.clone(),
-            causation_depth: command_context.causation_depth,
+            causation_id: command_context.causation_id().map(str::to_owned),
+            causation_depth: command_context.causation_depth(),
             authorization_event_id: authorization_event_id.clone(),
             authorization_basis: authorization_basis.to_owned(),
             authorization_action: "project_charter.revision.save".to_owned(),
@@ -948,7 +942,7 @@ impl ProjectOrchestrationActionService {
                 "action": "project_charter.revision.save",
                 "event_id": authorization_event_id,
                 "correlation_id": command_context.correlation_id(),
-                "causation_id": command_context.causation_id,
+                "causation_id": command_context.causation_id(),
             })
             .to_string(),
         };
@@ -1169,32 +1163,28 @@ impl ProjectOrchestrationActionService {
         let acceptance_check_ids: Vec<String> = from_value(payload, "acceptance_check_ids")?;
         let expected_milestone_version = positive_integer(payload, "expected_milestone_version")?;
         let authorization_event_id = context
-            .action_provenance
-            .as_ref()
+            .action_provenance()
             .map(|provenance| provenance.action_id.clone())
             .unwrap_or_else(|| context.correlation_id().to_owned());
         let authorization = ProjectCommandAuthorization {
             principal_type: context.principal().principal_type().to_owned(),
             principal_id: context.principal().principal_id().to_owned(),
-            policy_result: context.authorization_provenance.as_ref().map_or_else(
+            policy_result: context.authorization_provenance().map_or_else(
                 || action.policy_result.to_string(),
                 |value| value.policy_result.clone(),
             ),
             policy_revision: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.policy_revision.clone()),
             policy_digest: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.policy_digest.clone()),
             requested_permission: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.requested_permission.clone()),
             correlation_id: context.correlation_id().to_owned(),
-            causation_id: context.causation_id.clone(),
-            causation_depth: context.causation_depth,
+            causation_id: context.causation_id().map(str::to_owned),
+            causation_depth: context.causation_depth(),
             authorization_event_id: authorization_event_id.clone(),
             authorization_basis: "project_agent_binding_policy".to_owned(),
             authorization_action: "project.evidence.attach".to_owned(),
@@ -1273,24 +1263,20 @@ impl ProjectOrchestrationActionService {
             principal_type: context.principal().principal_type().to_owned(),
             principal_id: context.principal().principal_id().to_owned(),
             policy_result: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .map_or_else(|| "allowed".to_owned(), |value| value.policy_result.clone()),
             policy_revision: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.policy_revision.clone()),
             policy_digest: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.policy_digest.clone()),
             requested_permission: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .and_then(|value| value.requested_permission.clone()),
             correlation_id: context.correlation_id().to_owned(),
-            causation_id: context.causation_id.clone(),
-            causation_depth: context.causation_depth,
+            causation_id: context.causation_id().map(str::to_owned),
+            causation_depth: context.causation_depth(),
             authorization_event_id: authorization_event_id.clone(),
             authorization_basis: "project_agent_binding_policy".to_owned(),
             authorization_action: "project.validation.record".to_owned(),
@@ -1423,12 +1409,11 @@ impl ProjectOrchestrationActionService {
             idempotency_key: context.idempotency_key().to_owned(),
             input_digest: context.input_digest().to_owned(),
             policy_result: context
-                .authorization_provenance
-                .as_ref()
+                .authorization_provenance()
                 .map_or_else(|| "allowed".to_owned(), |value| value.policy_result.clone()),
             correlation_id: context.correlation_id().to_owned(),
-            causation_id: context.causation_id.clone(),
-            causation_depth: context.causation_depth,
+            causation_id: context.causation_id().map(str::to_owned),
+            causation_depth: context.causation_depth(),
             event_id: new_uuid_v4(),
             agent_action_execution_id: None,
             outcome_json,
@@ -1840,10 +1825,9 @@ fn document_command_authorization(
     context: &CommandContext,
     authorization_action: &str,
 ) -> ProjectCommandAuthorization {
-    let provenance = context.authorization_provenance.as_ref();
+    let provenance = context.authorization_provenance();
     let authorization_event_id = context
-        .action_provenance
-        .as_ref()
+        .action_provenance()
         .map(|value| value.action_id.clone())
         .unwrap_or_else(|| context.correlation_id().to_owned());
     // Document commands historically record the binding-policy basis even
@@ -1862,8 +1846,8 @@ fn document_command_authorization(
         policy_digest: provenance.and_then(|value| value.policy_digest.clone()),
         requested_permission: provenance.and_then(|value| value.requested_permission.clone()),
         correlation_id: context.correlation_id().to_owned(),
-        causation_id: context.causation_id.clone(),
-        causation_depth: context.causation_depth,
+        causation_id: context.causation_id().map(str::to_owned),
+        causation_depth: context.causation_depth(),
         authorization_event_id,
         authorization_basis: authorization_basis.to_owned(),
         authorization_action: authorization_action.to_owned(),
@@ -1876,12 +1860,11 @@ fn document_command_authorization(
             "authorization_basis": authorization_basis,
             "action": authorization_action,
             "event_id": context
-                .action_provenance
-                .as_ref()
+                .action_provenance()
                 .map(|value| value.action_id.as_str())
                 .unwrap_or_else(|| context.correlation_id()),
             "correlation_id": context.correlation_id(),
-            "causation_id": context.causation_id,
+            "causation_id": context.causation_id(),
             "occurred_at": action.created_at,
         })
         .to_string(),
@@ -1951,7 +1934,7 @@ mod tests {
         assert_eq!(context.principal().principal_type(), "agent");
         assert_eq!(context.principal().principal_id(), "agent-1");
         assert_eq!(context.canonical_scope().scope_id(), "project-1");
-        assert!(context.action_provenance.is_none());
+        assert!(context.action_provenance().is_none());
         assert_eq!(context.operation(), PROJECT_MILESTONE_OPERATION);
     }
 }

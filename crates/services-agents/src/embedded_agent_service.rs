@@ -1,6 +1,7 @@
 use operation_registry::authority::permission_set;
 use services::provider_credentials::{
-    default_api_key_base_url, entry_base_url, provider_url_addresses, validate_provider_url_shape,
+    default_api_key_base_url, entry_base_url, provider_egress_refusal, provider_url_addresses,
+    validate_provider_url_shape,
 };
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
@@ -21,9 +22,10 @@ use db::{
 };
 #[cfg(test)]
 use db::{PageRequest, SortBy, SortOrder};
+#[cfg(test)]
+use forge_agent_host::outbound_http::PublicHttpError;
 use forge_agent_host::outbound_http::{
-    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy, PublicHttpError,
-    UNUSABLE_PROXY_MESSAGE,
+    public_http_client_builder, ProxyEnvironment, PublicAddressPolicy, UNUSABLE_PROXY_MESSAGE,
 };
 use forge_agent_host::{
     AgentSessionBackend, BackendCapabilities, CanonicalScope, CanonicalScopeType, CommandAllowlist,
@@ -2458,21 +2460,6 @@ fn rfc3339_from_unix_seconds(seconds: i64) -> Option<String> {
 
 fn now_unix_seconds() -> i64 {
     chrono::Utc::now().timestamp()
-}
-
-/// The caller-facing reason for a refused provider endpoint. An unresolvable
-/// hostname and a private answer need different fixes, so they stay distinct.
-fn provider_egress_refusal(error: PublicHttpError) -> &'static str {
-    match error {
-        PublicHttpError::InvalidUrl => "base_url must be an https URL without credentials",
-        PublicHttpError::RestrictedHostname => {
-            "base_url must not target a local or private hostname"
-        }
-        PublicHttpError::ResolutionFailed => "base_url hostname could not be resolved",
-        PublicHttpError::RestrictedAddress => "base_url must not target a private or local address",
-        PublicHttpError::ClientUnavailable => "provider client unavailable",
-        PublicHttpError::UnusableProxy => UNUSABLE_PROXY_MESSAGE,
-    }
 }
 
 /// Provider tests and probes share native request/fetch/search egress policy.

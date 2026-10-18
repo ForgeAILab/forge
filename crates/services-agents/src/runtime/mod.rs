@@ -1285,6 +1285,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_builder_wires_provider_credential_execution_support() {
+        let (_data_dir, runtime) = runtime().await;
+
+        assert!(runtime.task_service.has_provider_credential_env());
+    }
+
+    #[tokio::test]
     async fn open_item_3_startup_releases_a_crash_orphaned_task_claim_before_the_first_write() {
         use db::{TaskRepo, TaskStepRepo};
         let (_data_dir, runtime) = runtime().await;

@@ -134,19 +134,35 @@ impl AgentActionProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// An authorization-bound command context whose input digest is computed by
+/// [`CommandContext::from_authorized_input`].
+///
+/// Its fields are intentionally not public, so callers outside this crate
+/// cannot bypass the authorized constructor with a struct literal.
+///
+/// ```compile_fail
+/// use services::CommandContext;
+///
+/// fn bypass_authorized_constructor(existing: CommandContext) {
+///     let _ = CommandContext {
+///         principal: existing.principal().clone(),
+///         ..existing
+///     };
+/// }
+/// ```
 pub struct CommandContext {
-    pub principal: CommandPrincipal,
-    pub canonical_scope: CommandScope,
-    pub operation: String,
-    pub idempotency_key: String,
-    pub input_digest: String,
+    pub(crate) principal: CommandPrincipal,
+    pub(crate) canonical_scope: CommandScope,
+    pub(crate) operation: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) input_digest: String,
     #[serde(default)]
-    pub expected_state: ExpectedCommandState,
-    pub authorization_provenance: Option<AuthorizationProvenance>,
-    pub action_provenance: Option<AgentActionProvenance>,
-    pub correlation_id: String,
-    pub causation_id: Option<String>,
-    pub causation_depth: i64,
+    pub(crate) expected_state: ExpectedCommandState,
+    pub(crate) authorization_provenance: Option<AuthorizationProvenance>,
+    pub(crate) action_provenance: Option<AgentActionProvenance>,
+    pub(crate) correlation_id: String,
+    pub(crate) causation_id: Option<String>,
+    pub(crate) causation_depth: i64,
 }
 
 #[derive(Serialize)]
@@ -244,8 +260,28 @@ impl CommandContext {
         &self.input_digest
     }
 
+    pub fn expected_state(&self) -> &ExpectedCommandState {
+        &self.expected_state
+    }
+
+    pub fn authorization_provenance(&self) -> Option<&AuthorizationProvenance> {
+        self.authorization_provenance.as_ref()
+    }
+
+    pub fn action_provenance(&self) -> Option<&AgentActionProvenance> {
+        self.action_provenance.as_ref()
+    }
+
     pub fn correlation_id(&self) -> &str {
         &self.correlation_id
+    }
+
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
+
+    pub fn causation_depth(&self) -> i64 {
+        self.causation_depth
     }
 }
 

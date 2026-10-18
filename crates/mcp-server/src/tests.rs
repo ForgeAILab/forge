@@ -912,8 +912,9 @@ fn known_tool_dispatch_preserves_execution_conflict_details() {
 
 #[test]
 fn known_tool_internal_failure_redacts_provider_details() {
-    let response = McpToolError::new(-32603, "database secret: 123")
-        .with_data(json!({ "details": "database secret: 123" }))
+    const PROVIDER_DETAIL_SENTINEL: &str = "provider-detail-must-not-leak-7f83c6d2-4b11-49a4-a851";
+    let response = McpToolError::new(-32603, PROVIDER_DETAIL_SENTINEL)
+        .with_data(json!({ "details": PROVIDER_DETAIL_SENTINEL }))
         .with_call_context("forge_get_task", None, Some("user-1"))
         .into_tool_response(json!(1));
     let result = response.result.expect("tool failures use a success result");
@@ -923,8 +924,8 @@ fn known_tool_internal_failure_redacts_provider_details() {
         "the operation failed"
     );
     let serialized = serde_json::to_string(&result).expect("result serializes");
-    assert!(!serialized.contains("database secret"));
-    assert!(!serialized.contains("123"));
+    assert!(!serialized.contains(PROVIDER_DETAIL_SENTINEL));
+    assert!(!serialized.contains("must-not-leak"));
 }
 
 #[test]
