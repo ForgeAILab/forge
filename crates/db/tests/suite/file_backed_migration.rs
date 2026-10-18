@@ -6277,3 +6277,27 @@ async fn check_consumer_answered_index_migration_changes_the_index_only() {
     let _ = fs::remove_file(&db_path);
     let _ = fs::remove_dir_all(&migration_dir);
 }
+
+/// The bundle comment that makes Cargo rebuild the embedded migrations names
+/// one head revision, the newest migration file.
+#[test]
+fn embedded_bundle_comment_has_one_head_naming_the_newest_migration() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let newest = fs::read_dir(&source)
+        .unwrap()
+        .filter_map(|entry| migration_version(entry.unwrap().file_name().to_str().unwrap()))
+        .max()
+        .unwrap();
+    let heads: Vec<&str> = include_str!("../../src/migration.rs")
+        .lines()
+        .filter(|line| line.contains("Embedded migration bundle revision:"))
+        .collect();
+    assert_eq!(heads.len(), 1, "one bundle revision comment: {heads:?}");
+    assert!(
+        heads[0].starts_with(&format!(
+            "// Embedded migration bundle revision: V{newest} "
+        )),
+        "the bundle revision names V{newest}: {}",
+        heads[0]
+    );
+}
