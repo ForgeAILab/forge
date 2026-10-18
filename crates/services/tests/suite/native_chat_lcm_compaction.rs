@@ -1071,3 +1071,49 @@ async fn native_task_worker_compacts_over_budget_history_without_lcm() {
     .expect("Task timeline count");
     assert_eq!(timelines, 0, "native Task turns must not create LCM state");
 }
+
+/// Demo mode is process-wide and irreversible, so the refusal runs in a child
+/// copy of this test binary; every other test here keeps the normal policy.
+#[test]
+fn demo_native_turn_is_refused_before_the_provider() {
+    const CHILD: &str = "FORGE_TEST_DEMO_NATIVE_TURN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_chat_lcm_compaction::demo_native_turn_is_refused_before_the_provider",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("demo native turn refusal verified"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    executors::server_commands::disable();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let script = ScriptedStream::new(vec![ProviderStreamEvent::TextDelta {
+            text: "must not be requested".to_owned(),
+        }]);
+        let (_db, backend, provider, request, _root) = inquiry_fixture(vec![script]).await;
+        let error = backend
+            .run_turn(request, Arc::new(NoopSink))
+            .await
+            .expect_err("a demo server runs no agent turn");
+        assert!(
+            error.to_string().contains("server_agents_disabled"),
+            "{error}"
+        );
+        assert!(provider.requests().is_empty(), "no provider request");
+    });
+    println!("demo native turn refusal verified");
+}

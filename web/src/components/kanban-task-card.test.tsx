@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { TaskListItem } from '@/types/generated'
 import { KanbanTaskCard } from './kanban-task-card'
@@ -104,6 +104,63 @@ function inQueue(overrides: Partial<NonNullable<TaskListItem['integration']>>): 
     },
   }
 }
+
+describe('Task type visibility', () => {
+  it.each([
+    ['task', null],
+    ['planning_task', 'Planning Task'],
+    ['discovery', 'Discovery'],
+    ['sub_task', 'Sub Task'],
+  ] as const)('shows the %s type on the card and detail header', (taskType, label) => {
+    const task = { ...queuedTask(), task_type: taskType, workflow_health: null }
+    const { container } = render(
+      <>
+        <KanbanTaskCard
+          task={task}
+          index={0}
+          showSubStateBadge={false}
+          dragDisabled={false}
+          movePending={false}
+          agents={[]}
+          agentNamesById={new Map()}
+          claimPending={false}
+          menuItems={null}
+          onAssignAgent={vi.fn()}
+          onClick={vi.fn()}
+          onContextMenu={vi.fn()}
+        />
+        <TaskDetailHeader
+          task={{
+            ...task,
+            execution_observability: undefined,
+            placement: null,
+            effective_coder: null,
+            effective_coder_source: null,
+          }}
+          editingTitle={false}
+          titleDraft={task.title}
+          updatePending={false}
+          onTitleChange={vi.fn()}
+          onTitleKeyDown={vi.fn()}
+          onSaveTitle={vi.fn()}
+          onCancelTitle={vi.fn()}
+          onEditTitle={vi.fn()}
+          onOpenFullPage={vi.fn()}
+          onClose={vi.fn()}
+        />
+      </>,
+    )
+    for (const surface of [screen.getByRole('article'), container.querySelector('header')!]) {
+      const scope = within(surface)
+      if (label) {
+        expect(scope.getByText(label)).toBeTruthy()
+        expect(scope.getByText('Task type:').classList.contains('sr-only')).toBe(true)
+      } else {
+        expect(scope.queryByText('Task type:')).toBeNull()
+      }
+    }
+  })
+})
 
 describe('Merge queue labels on task surfaces', () => {
   function card(task: TaskListItem) {

@@ -564,6 +564,7 @@ impl EmbeddedAgentService {
         &self,
         input: ConnectApiKeyCredential,
     ) -> Result<CredentialHandle> {
+        executors::server_commands::ensure_agents_allowed()?;
         if input.label.trim().is_empty() || input.credential.expose().trim().is_empty() {
             return Err(ServiceError::invalid_operation(
                 "label and credential are required",
@@ -615,6 +616,7 @@ impl EmbeddedAgentService {
         &self,
         input: ConnectOAuthCredential,
     ) -> Result<CredentialHandle> {
+        executors::server_commands::ensure_agents_allowed()?;
         if input.provider.trim().is_empty()
             || input.credential.access_token.trim().is_empty()
             || input.credential.refresh_token.trim().is_empty()
@@ -2459,7 +2461,7 @@ fn now_unix_seconds() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-async fn provider_url_addresses(
+pub(crate) async fn provider_url_addresses(
     base_url: &str,
 ) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
     let parsed = validate_provider_url_shape(base_url)?;

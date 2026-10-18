@@ -140,6 +140,8 @@ impl CodingExecutorAdapter for OpencodeAdapter {
         executors::sandbox::start_compiler_cache(std::path::Path::new(&ctx.worktree_path)).await;
         let _run_scope = crate::command::run_in_task_worktree(&mut cmd, &ctx);
 
+        executors::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut child = cmd.spawn()?;
 
         let stdout = child

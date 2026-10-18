@@ -74,7 +74,8 @@ API_TARGETS = {
     "api-a": ["model_workflow"],
     "api-b": ["main", "daemon_workspace_roundtrip", "daemon_plan_transport",
               "environment_provisioning", "environment_surface_lists",
-              "integration_queue_task_summary", "task_list_read_path"],
+              "integration_queue_task_summary", "task_list_read_path",
+              "demo_no_server_exec", "server_commands_normal"],
 }
 # Non-integration targets (including future bins/examples/benches) run once.
 API_OTHER_TARGETS_SHARD = "api-b"

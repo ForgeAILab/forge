@@ -315,6 +315,9 @@ pub fn outcome_for_service_error_with_correction(
     retry: Option<RetryInstruction>,
 ) -> OrchestrationOutcome {
     let (code, safe_message, default_retry, setup_requirements) = match error {
+        ServiceError::ServerCommandsDisabled => (OutcomeCode::ServerCommandsDisabled, executors::server_commands::MESSAGE, None, None),
+        ServiceError::ServerAgentsDisabled => (OutcomeCode::ServerCommandsDisabled, executors::server_commands::AGENTS_MESSAGE, None, None),
+        ServiceError::ServerLocationRefused { .. } => (OutcomeCode::ValidationError, executors::server_commands::LOCATION_MESSAGE, None, None),
         ServiceError::TaskBusy { .. } => (
             OutcomeCode::TaskBusy,
             "Task has pending steps; accepted work remains queued",

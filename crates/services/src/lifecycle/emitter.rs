@@ -358,6 +358,25 @@ impl LifecycleEventEmitter {
         let resolved = resolved.filter(|workspace| {
             !before_execution || workspace.placement.owner_kind != db::PlacementOwnerKind::Server
         });
+        // Async hooks without an execution have no execution log. Retain the
+        // refusal on the Task too, using the ordinary hook-not-run record.
+        if resolved.as_ref().is_none_or(|workspace| {
+            workspace.placement.owner_kind == db::PlacementOwnerKind::Server
+        }) && executors::server_commands::ensure_allowed().is_err()
+        {
+            for (index, hook) in hooks.iter().enumerate() {
+                if matches!(hook, LifecycleHookDef::Script { .. }) {
+                    self.record_hook_not_run(
+                        &task,
+                        event,
+                        &format!("server:{index}"),
+                        resolved_execution_id.as_deref(),
+                        &executors::server_commands::ServerCommandsDisabled.to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
         // A server workspace Forge is reclaiming or has reclaimed has no
         // worktree to expect: once the directory is gone its hooks keep the
         // primary-checkout context they always had (`on_task_done` commonly

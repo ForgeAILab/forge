@@ -526,6 +526,7 @@ impl TaskService {
         };
         let task_state_config =
             merge_review_requirement_ids(task_state_config, &payload.review_requirement_ids)?;
+        crate::server_commands::validate_serialized_configuration(task_state_config.as_deref())?;
         let metadata_json = parent.as_ref().and_then(|_| {
             db::TaskMetadata {
                 ..db::TaskMetadata::default()
@@ -548,7 +549,7 @@ impl TaskService {
             board_position: 0.0,
             subtask_order: None,
             task_state_config: task_state_config.clone(),
-            merge_config: super::validation::serialize_config(payload.merge_config.clone())?,
+            merge_config: super::validation::serialize_merge_config(payload.merge_config.clone())?,
             metadata_json: metadata_json.clone(),
             plan: None,
             error_annotation: None,

@@ -831,12 +831,22 @@ const SSE_MAX_RECONNECT_MS = 30_000
 const SSE_STABLE_CONNECTION_MS = 30_000
 const SSE_RESYNC_AFTER_OPEN_MS = 1_000
 
-export function useSSE(queryClient: QueryClient, accessToken: string | null): void {
+export function eventStreamUrl(accessToken: string | null): string {
+  return accessToken
+    ? `/api/v1/events?token=${encodeURIComponent(accessToken)}`
+    : '/api/v1/events'
+}
+
+export function useSSE(
+  queryClient: QueryClient,
+  accessToken: string | null,
+  signedIn = Boolean(accessToken),
+): void {
   useEffect(() => {
     // Return a cleanup function on every branch so ownership of the stream,
     // reconnect timer, and watchdog is explicit to both React and static
     // effect-lifecycle analysis. This branch allocates nothing.
-    if (!accessToken) return () => undefined
+    if (!signedIn) return () => undefined
 
     let cancelled = false
     let source: EventSource | null = null
@@ -871,7 +881,7 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
         clearTimeout(backoffTimer)
         backoffTimer = null
       }
-      const nextSource = new EventSource(`/api/v1/events?token=${encodeURIComponent(streamToken)}`)
+      const nextSource = new EventSource(eventStreamUrl(streamToken))
       source = nextSource
 
       // Every frame is a default `message` event (D20): the server no
@@ -944,5 +954,5 @@ export function useSSE(queryClient: QueryClient, accessToken: string | null): vo
       document.removeEventListener('visibilitychange', onVisibilityChange)
       source?.close()
     }
-  }, [queryClient, accessToken])
+  }, [queryClient, accessToken, signedIn])
 }

@@ -624,6 +624,8 @@ impl CodingExecutorAdapter for CodexAdapter {
                 .map(Path::to_path_buf),
             home: managed_codex_home,
         };
+        executors::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut child = command.group_spawn()?;
 
         let stdout = match child.inner().stdout.take() {

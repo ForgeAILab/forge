@@ -58,6 +58,9 @@ pub async fn update_mcp_config(
     user: AuthenticatedUser,
     Json(body): Json<McpConfigActionRequest>,
 ) -> ApiResult<Json<McpConfigResponse>> {
+    services::server_commands::ensure_server_files_allowed(
+        "agent configuration files on the server are not written",
+    )?;
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
     let action = parse_action(&body.action)?;

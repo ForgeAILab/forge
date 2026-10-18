@@ -83,6 +83,7 @@ pub mod provider_health;
 pub mod queue_invalidation;
 pub mod recovery;
 pub mod repo_location;
+pub mod server_commands;
 pub mod shared_media_cleanup;
 pub mod shutdown;
 pub mod task_actions;
@@ -374,6 +375,12 @@ impl LeadRefusal {
 
 #[derive(Debug, thiserror::Error, serde::Serialize)]
 pub enum ServiceError {
+    #[error("server_commands_disabled: This demo does not run commands")]
+    ServerCommandsDisabled,
+    #[error("server_agents_disabled: This demo does not run agents or connect model providers")]
+    ServerAgentsDisabled,
+    #[error("server_location_refused: {message}")]
+    ServerLocationRefused { message: String },
     #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]
     TaskBusy {
         pending_steps: i64,

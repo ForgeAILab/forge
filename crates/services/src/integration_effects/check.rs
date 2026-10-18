@@ -5,6 +5,7 @@ use std::{path::Path, time::Instant};
 
 /// Embedded commands share timeout, stdin, Git environment and output semantics.
 pub async fn run_at(path: &Path, spec: &RunSpec) -> Result<RunResult> {
+    executors::server_commands::ensure_allowed().map_err(ServiceError::from)?;
     if spec.max_output_bytes == 0
         || (spec.timeout_secs == 0 && spec.purpose != api_types::WorkspaceRunPurpose::CiStep)
     {

@@ -21,6 +21,7 @@ import {
   type ExecutionLogsParams,
 } from '@/api/hooks'
 import { apiFetch } from '@/api/client'
+import { eventStreamUrl } from '@/api/sse'
 import { ExecutionViewer, type ExecutionViewerMode } from '@/components/execution-viewer'
 import { ExecutionDetailSidebar } from '@/components/execution-detail/ExecutionDetailSidebar'
 import { ExecutionFollowUpComposer } from '@/components/execution-detail/ExecutionFollowUpComposer'
@@ -304,9 +305,9 @@ export function ExecutionDetailPage({
   }, [executionQuery.data?.status, logsQuery.data, nextLoadedSequence])
 
   useEffect(() => {
-    if (executionQuery.data?.status !== 'running' || !accessToken) return undefined
+    if (executionQuery.data?.status !== 'running') return undefined
 
-    const source = new EventSource(`/api/v1/events?token=${encodeURIComponent(accessToken)}`)
+    const source = new EventSource(eventStreamUrl(accessToken))
     const handleMessage = (event: MessageEvent<string>) => {
       const parsedLogs = parseExecutionLogEvent(event.data, executionId)
       if (parsedLogs.length === 0) return

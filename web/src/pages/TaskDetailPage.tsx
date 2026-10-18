@@ -199,16 +199,24 @@ export function TaskDetailPage({
 
   // Handlers
 
-  const onUpdateTitle = (title: string) => {
+  const onUpdateTitle = async (title: string, expectedTask: NonNullable<typeof task>) => {
     if (!task) return
-    updateTask.mutate({ taskId: task.id, body: { title, version: task.version } })
+    await updateTask.mutateAsync({
+      taskId: task.id,
+      body: { title, version: task.version },
+      expectedTask,
+    })
   }
 
-  const onUpdateDescription = (description: string | null) => {
+  const onUpdateDescription = async (
+    description: string,
+    expectedTask: NonNullable<typeof task>,
+  ) => {
     if (!task) return
-    updateTask.mutate({
+    await updateTask.mutateAsync({
       taskId: task.id,
       body: { description, version: task.version },
+      expectedTask,
     })
   }
 

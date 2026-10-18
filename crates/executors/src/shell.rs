@@ -85,6 +85,8 @@ enum OutputEvent {
 #[async_trait]
 impl TaskExecutor for ShellExecutor {
     async fn execute(&self, ctx: ExecutionContext) -> Result<ExecutionResult, ExecutorError> {
+        crate::server_commands::ensure_allowed()
+            .map_err(|e| ExecutorError::Other(e.to_string()))?;
         let mut writer = LogWriter::new(
             &ctx.logs_path,
             ctx.execution_id.clone(),
