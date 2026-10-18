@@ -12,7 +12,7 @@ impl crate::worker_runtime::assembly::AgentEventConsumerNames for TestAgentEvent
     }
 
     fn wake_turn_consumer_name(&self) -> &'static str {
-        "agent-chat-wake-turn-delivery"
+        "agent-wake-turns"
     }
 }
 
