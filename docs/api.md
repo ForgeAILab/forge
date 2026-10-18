@@ -2426,7 +2426,9 @@ while `run_nice` reports the configured increment, including on Windows.
 `GET /api/v1/config/mcp` and `POST /api/v1/config/mcp` use the same instance
 administrator requirement as Settings. A signed-in non-administrator receives HTTP 403
 `admin_required` before any server configuration file is accessed or its path
-is returned. These routes inspect or modify the server's filesystem: `scope=user`
+is returned. In demo mode (`--demo`), `POST` is refused for every caller with
+HTTP 422 `server_location_refused` before this administrator check (see
+[Errors](#errors)). These routes inspect or modify the server's filesystem: `scope=user`
 uses the server's HOME, and `scope=project` (the default) or `scope=local`
 without a Project id uses the server's current directory.
 
