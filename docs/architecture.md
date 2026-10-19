@@ -2475,10 +2475,17 @@ completion now also guarantees that runtime admission and execution gates have
 been released.
 
 Forge's custom provider transport caps HTTP error bodies at 8 KiB, extracts only
-JSON/SSE error status/code and message fields, and drops reasons reflecting sent
-credentials before and after control-character normalization. Checked reasons
-are capped at 300 characters in `provider.detail`, with numeric `http.status`;
-the provider adapters recheck them before adding them to error messages. Logs
+JSON/SSE error status/code and message fields, and drops a reason that reflects
+any non-public header value, header token or URL query value sent on that
+request. The check is stricter than the runtime's verbatim match: it also
+catches the value percent-encoded, split by whitespace or joined by invisible
+characters, ASCII case-changed, or any 16 consecutive characters of it (a
+gateway echoing a truncated key); a masked key such as `sk-proj-****…abcd`
+still passes. Checked reasons are capped at 300 characters in
+`provider.detail`, with numeric `http.status`; the provider adapters recheck
+them before adding them to error messages. Reasons a provider sends inside a
+successful (HTTP 200) stream never pass through this transport; the runtime
+adapters extract and check those with their own verbatim rule. Logs
 record only the HTTP status, never a raw body. Provider `BadRequest` now has the
 coarse runtime kind `Provider`; typed provider rejection/auth/quota evidence
 continues to govern Forge retry and recovery rather than error prose.
