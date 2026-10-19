@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:27:07Z
+updated_at: 2026-10-19T21:47:35Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -128,8 +128,8 @@ Forge honors the runtime's seven trait rules:
    All seven `JournalCommitFailurePoint` variants reach storage: `AfterObjects`,
    `AfterCheckpoint`, `AfterBatch`, `AfterPin`, `AfterHead`, `AfterIdempotency`,
    `AfterCommit`. Pre-commit cuts roll everything back; `AfterCommit` commits,
-   then loses the acknowledgement. One final pack may be staged/replaced inside
-   that transaction; packing must not erase the cut boundaries.
+   then loses the acknowledgement. The final new pack(s) may be staged/replaced
+   inside that transaction; packing must not erase the cut boundaries.
 3. **SQL fences.** Compare `expect` inside the write transaction, in SQL, against
    both revision and writer epoch. Absence matches only `(0, 0)`.
 4. **Membership/sharing and receipts.** Immutable id with different bytes
@@ -296,7 +296,8 @@ tables, which a SQLite CHECK cannot express, so storage validates it on every
 read and write. Scalar query columns must agree with the authenticated record on load.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
-(no row if all bodies exist already). Pack v1 keeps the reference's content but
+(no row if all bodies exist already), or several rows cut at the S2 logical-size
+cap when a large apply such as an import exceeds it. Pack v1 keeps the reference's content but
 splits it into two sealed units. The **index unit** is `JRPACK\0`, version byte,
 count and the id-sorted four-byte prefixes with varint body offsets/lengths. The
 **body unit** is the canonical bodies physically ordered by kind and full id,

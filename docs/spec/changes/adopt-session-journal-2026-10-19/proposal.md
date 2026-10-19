@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:27:07Z
+updated_at: 2026-10-19T21:47:35Z
 ---
 
 ## Why
@@ -31,9 +31,10 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   `V{NNN}__session_journal.sql` creates session records, pin, catalog, pack,
   membership and operation_pack tables. Allocate the unique UTC migration version
   when implementing; never edit historical migrations or discard user rows.
-- **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack;
-  S2 merges geometric tiers after terminal publication and makes a live base pack
-  during collection; S3 keeps kind-ordered bodies and prefix/offset indexes inside
+- **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack
+  (cut at a 1 MiB logical cap); S2 merges geometric tiers after terminal
+  publication and repacks small tiers into capped kind-ordered packs during
+  collection, so a purge rewrites one capped pack, not the session; S3 keeps kind-ordered bodies and prefix/offset indexes inside
   sealed packs (separate index and body units), with full-id verification.
   Membership bitmaps preserve domain and session isolation; one physical copy per
   id is shared by all holders, found through a RAM prefix index rebuilt at open

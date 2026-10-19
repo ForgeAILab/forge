@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:27:07Z
+updated_at: 2026-10-19T21:47:35Z
 completed_at:
 ---
 
@@ -89,7 +89,7 @@ No runtime bench crate becomes a production dependency.
   StateConflict (never cache staleness or a changed data_version); refresh the
   global index inside the transaction per D5; persist exactly supplied
   revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
-  order and publish one final pack. Roll back every pre-commit cut; AfterCommit
+  order and publish the final new pack (split at the 1 MiB logical cap). Roll back every pre-commit cut; AfterCommit
   commits then errors. Invalidate caches on ambiguous outcomes. Emit the D8 apply
   tracing (kind, duration, lock hold, receipt; no contents or ids).
   Focused tests: same storage target filtered separately to
