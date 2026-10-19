@@ -40,7 +40,12 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, wi
 - **THEN** the body remains readable by that holder and the release receipt counts zero for it
 
 ### Requirement: Physical pack maintenance preserves membership
-Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during collection. Physical maintenance SHALL atomically remap every holder's bitmap, including other domains/sessions, without changing runtime objects, heads, membership or replay policy; failure SHALL be retryable without undoing an acknowledged turn. Mandatory last-membership purges SHALL occur in apply even when optional geometric/base merging is disabled for conformance.
+Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during collection. Physical maintenance SHALL atomically remap every holder's bitmap, including other domains/sessions, without changing runtime objects, heads, membership or replay policy; failure SHALL be retryable without undoing an acknowledged turn. Mandatory last-membership purges SHALL occur in apply even when optional geometric/base merging is disabled for conformance. Packs SHALL be capped in logical size so that a purge or base repack rewrites only the capped packs it touches, never a whole session; `compact` SHALL run in bounded per-session transactions and SHALL NOT run a full VACUUM.
+
+#### Scenario: Purge in a long session
+- **WHEN** collection after a turn releases one superseded checkpoint body of a 4000-message session
+- **THEN** only the capped pack holding that body is rewritten
+- **AND** the session's other packs and their ciphertexts are unchanged
 
 #### Scenario: Terminal hook and collection base pack
 - **WHEN** terminal publication succeeds and equal-size pack tiers exist
@@ -63,7 +68,7 @@ Deleting an agent_session SHALL cascade its journal session, pin, catalog, membe
 ### Requirement: Forge physical disk gate against real legacy L2
 Forge SHALL run fixture B at N=4000, plain and tool, through production ForgeJournalStorage with sqlx, real AEAD, S1–S5 and collection, and compare each physical retained size with the same fixture's actual Forge legacy idle row containing two sealed blobs (L2). Both post-collection ratios SHALL be at most 2.0×; 1.5× is an aim. Runtime reference S1–S4 measurements and S5 projections SHALL NOT substitute for this Forge gate, and runtime schema 5 SHALL remain out of scope.
 
-For each layout physical bytes SHALL be page_count×page_size after truncated WAL checkpoints and VACUUM, minus its matching empty-schema/session-setup baseline, verified against file/dbstat totals. Reports SHALL include all metadata/index/crypto costs, A/B at N=100/1000/4000, grown C, before/after collection/retirement, L1 diagnostics and the temporary footprint of retained lazy-import legacy rows. L1, small-N and A/C SHALL not replace the settled B/N=4000 L2 gate.
+The gate ratios SHALL be taken after the production cadence (S2 hook and collection after every turn), and the report SHALL include cumulative write bytes against legacy, storage open time, global prefix-index memory and the longest collect gate hold. For each layout physical bytes SHALL be page_count×page_size after truncated WAL checkpoints and VACUUM, minus its matching empty-schema/session-setup baseline, verified against file/dbstat totals. Reports SHALL include all metadata/index/crypto costs, A/B at N=100/1000/4000, grown C, before/after collection/retirement, L1 diagnostics and the temporary footprint of retained lazy-import legacy rows. L1, small-N and A/C SHALL not replace the settled B/N=4000 L2 gate.
 
 #### Scenario: Forge gate passes
 - **WHEN** B/N=4000 plain and tool both measure at or below 2.0× their real legacy L2 after collection

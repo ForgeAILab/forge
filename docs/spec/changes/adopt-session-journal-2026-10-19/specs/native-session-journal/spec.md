@@ -99,6 +99,11 @@ Last-membership releases SHALL remove the body bytes from packs in that same tra
 - **THEN** SQL refuses it and all staged changes roll back
 - **AND** the refusal does not depend solely on a process cache or mutex
 
+#### Scenario: Unrelated database writes
+- **WHEN** other Forge subsystems commit to the same database file between a journal read and the next apply
+- **THEN** the apply refreshes its caches inside its own write transaction and succeeds if its expect fence still matches
+- **AND** no StateConflict is raised for cache staleness
+
 #### Scenario: Last membership in a partially live pack
 - **WHEN** an apply releases the final global membership of one slot while other slots remain held
 - **THEN** that body's bytes are purged by a transactional pack rewrite and all surviving bitmaps are remapped

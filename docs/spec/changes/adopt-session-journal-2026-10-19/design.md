@@ -343,16 +343,39 @@ This purge is mandatory even with optional S2 repacking disabled. Do not return
 compressed-byte savings, merely cleared membership counts or anticipated VACUUM
 savings in `JournalApplyReceipt`.
 
-**S2 repacking.** A Forge post-terminal hook runs async storage maintenance after
-terminal publication succeeds. Merge equal logical-byte tiers (minimum 4 KiB),
-carrying merges geometrically, rather than rewriting the whole history after
-every commit. Collection additionally builds a kind-ordered base pack from the
-session's surviving packs. Every move atomically updates **all** holders' bitmaps,
-including other domains/sessions. Repack changes physical placement only; the
-engine alone decides liveness. A failed terminal hook is retryable maintenance
-and cannot undo an acknowledged turn. `compact(domain)` repacks already-live
-members and uses bounded incremental vacuum in production; full VACUUM is an
-isolated measurement step, not a turn operation.
+**S2 repacking and rewrite cost.** A Forge post-terminal hook runs async storage
+maintenance, in its own transaction through the coordinator, after terminal
+publication succeeds. Merge equal logical-byte tiers (minimum 4 KiB), carrying
+merges geometrically. **Cap every pack at 1 MiB of logical body bytes.** This is
+an initial storage constant, tuned only through D10. Merges and the base repack
+cut kind-ordered output at the cap, so volatile kinds (heads, batches,
+checkpoints, cache plans, manifests) and stable history land in different packs.
+A purge then rewrites at most its own capped pack, never the whole session.
+Collection's base repack folds the small geometric tiers and the packs it just
+purged into capped kind-ordered packs; it does not rebuild capped packs without a
+released slot.
+
+Without these bounds, the reference behavior rewrites the whole session on every
+collection. It keeps one base pack per session, rebuilds it whenever more than
+one pack exists, and the mandatory purge rewrites it whenever any of its bodies
+dies. Collection is nudged after every terminal turn, so that is O(N) bytes per
+turn and O(N²) over a session. Neither rt-e4 nor the gate exercised it: rt-e4
+collected once at the end, and fixture B has two turns.
+
+Every move atomically updates **all** holders' bitmaps, including other
+domains/sessions. Repack changes physical placement only; the engine alone
+decides liveness. A failed terminal hook is retryable maintenance and cannot undo
+an acknowledged turn.
+
+**Compaction and vacuum.** The reference `compact(domain)` repacks every session
+of the domain in one transaction and then runs a full `VACUUM`. Forge bounds it:
+one transaction per session or per 8 MiB of rewritten logical bytes, no full
+`VACUUM`, then the existing `db::incremental_vacuum`. That helper is a no-op
+unless the database has `auto_vacuum = INCREMENTAL`, which only databases created
+empty by a recent Forge have. On older databases, later writes reuse freed pages,
+but the file does not shrink until the operator runs the existing offline
+conversion. Full `VACUUM` stays an isolated measurement step, never a turn or
+worker operation. D10 reports freelist pages and file length separately.
 
 **S4/S5 operations.** Appending an operation merges equal-count `2^tier` packs
 (binary carry) in the apply transaction; original operation/digest/result fields
@@ -415,17 +438,37 @@ recreate it in an adapter. Test current-thread and multi-thread Tokio runtimes
 with suspended storage and competing maintenance/open operations.
 
 **Read/cache consistency.** Batch pack reads, not one SQL/decrypt per object.
-Resolve ids through D4's complete global prefix index (not an LRU), then the
-reading session's membership rows; keep a bounded plaintext body LRU (initially
-64 MiB) and reuse the engine's separate R4 memo.
-Check membership on every request, including cache hits. SQLx read snapshots pair
-bitmaps with pack generation/payload; cache keys include pack id and generation,
-and repacks invalidate old slots. Refresh when another connection writes; if
-using `PRAGMA data_version`, compare only observations on the same connection,
-never values from arbitrary pool connections. An independently opened storage
-must see a completed transaction or retry, never stale cached fences/slots.
-Production journal mutations share the storage coordinator; cascades also
-invalidate affected membership caches. No full-closure prefetch on every commit.
+Reads go from the reading session's membership rows to those packs' index units
+(cached by pack id and generation), then verify the full id. Keep a bounded
+plaintext body LRU (initially 64 MiB) and reuse the engine's separate R4 memo.
+Check membership on every request, including cache hits. Each trait read runs
+in **one** read transaction on one pooled connection, so bitmaps, generations
+and units come from the same WAL snapshot. Cache keys include pack id and
+generation, so a rewrite never serves old slots.
+
+**Staleness is never a conflict.** Do not copy the reference's
+`PRAGMA data_version` check. That counter is database-wide, and Forge's other
+subsystems write the same file through the same pool all the time, so it would
+invalidate on every unrelated write. The reference's response, returning
+`conflict()` from `apply`, would surface as `StateConflict` and fail the turn.
+Only a failed `expect` fence is `StateConflict`. Inside each write transaction,
+after `BEGIN IMMEDIATE`, storage refreshes the global prefix index
+incrementally. It loads index units for pack ids above its cached high-water mark
+(the pack table's `AUTOINCREMENT` value in `sqlite_sequence`). Every admission
+candidate is re-read in that transaction: a missing row or a different
+generation reloads that pack's index unit before deciding. The write lock is
+held throughout, so nothing changes during the refresh. This keeps an
+independently opened storage correct without a database-wide counter.
+Production journal mutations go through one storage coordinator per process
+(`runtime.lock` excludes other processes). Cascaded membership deletions need no
+cache invalidation because membership is read from SQL on every request. No
+full-closure prefetch on every commit.
+
+**No journal call inside a Forge DB transaction.** Never call the engine or
+storage while holding a Forge `begin_immediate` transaction or a pooled
+connection. The pool has five connections and storage needs its own write lock,
+so such a call waits for itself until the 30 s busy or acquire timeout. Nudges
+from deletion, rotation or recovery are sent after the caller's commit.
 
 **Scalar probes.** Return native publication, tombstone and checkpoint flags
 without decrypting a pack, selecting rows by the indexed `forge_session_id`. A reservation is absent publication; a tombstone is a
@@ -541,7 +584,13 @@ with no published root has no native payload to reclaim.
 Each tick also collects dirty sessions in both domains, initially
 `max_objects = 20_000` per call and a 10 s scheduling budget. The worker checks its
 budget between calls/batches rather than claiming to preempt synchronous CPU
-inside one engine call. Engine collection owns live-closure calculation, pin and
+inside one engine call. The engine holds its write gate for the whole `collect`
+call (runtime `collect_inner`), so every commit and open in that domain waits. The
+call visits every dirty session; it is bounded by released objects, not by
+sessions or time. The 10 s budget therefore bounds the worker loop, not the gate
+hold. D10 measures the longest collect call with many dirty sessions. Above 1 s it
+is a release-review blocker and a runtime follow-up (a per-call session or time
+bound); Forge does not page sessions around the engine. Engine collection owns live-closure calculation, pin and
 root-epoch checks, catalog release, dirty clearing and S5. Storage executes
 release/receipt accounting and S2 pack work. Live sessions are collected too;
 superseded checkpoint/cache/manifest paths otherwise accumulate. Post-terminal
@@ -549,8 +598,11 @@ hooks nudge collection and perform geometric S2 maintenance; collection performs
 the base repack. No TTL, object age rule or new runtime schema is introduced.
 
 Project/Agent/chat deletion cascades per-session records and memberships. Nudge
-bounded physical cleanup (up to 5,000 candidate packs per transaction) to purge
-unheld slots/empty packs; preserve any other domain/session holder. This path is
+bounded physical cleanup to purge unheld slots and empty packs, preserving any
+other domain/session holder. Find candidates without decryption, in pages of up
+to 5,000 pack ids. A candidate is a pack with no membership row, or a pack whose
+holders' union bit count is below its clear `object_count`. Rewrite or delete at
+most 32 packs or 8 MiB of logical bytes per transaction. This path is
 explicit session deletion, not an alternate tracing collector. Tombstone records
 remain until their `agent_session` is itself deleted. Retirement does not promise
 zero disk bytes: tombstones, in-window replay results and any valid
@@ -647,6 +699,13 @@ For each case, create isolated file DBs with the same Forge schema/session setup
    the retained lazy-import legacy row. The hard gate measures steady native
    persistence versus legacy; do not hide the temporary old-plus-new footprint
    until next-release cleanup or count stale legacy data as a pack saving.
+5. **Production cadence:** run C and both B variants with the production
+   schedule: the S2 hook after every terminal turn and a collection after every
+   turn, as the worker nudge does. Report cumulative bytes written (WAL frames ×
+   page size), the largest single pack rewrite and the final physical size,
+   against the legacy store's cumulative writes for the same run. The
+   post-collection gate ratio is taken after this cadence, not only after one
+   final collection.
 
 **Hard disk gate:** both B/N=4000 variants after collection must have
 `Forge_native_physical_bytes / Forge_legacy_L2_physical_bytes ≤ 2.0`.
@@ -659,10 +718,12 @@ or change the denominator, projection, seed or acceptance threshold.
 Also report storage open time and global prefix-index RAM (and both
 extrapolated to 1M and 5M objects), per-turn bytes/WAL, turn/open/probe/import
 wall time, longest write
-transaction, geometric-merge write amplification, engine object counters,
+transaction, longest `collect` call (engine gate hold) with 100 dirty sessions,
+geometric-merge write amplification, freelist pages, engine object counters,
 last-membership receipt totals versus physical file savings, memo/cache hit/read
 counts and post-retirement metadata/operation bytes. Retain the existing focused
-performance checks: for N≥1000 delta writes ≤10% of legacy writes; N=100 native
+performance checks: for N≥1000 delta writes ≤10% of legacy writes, measured at
+the production cadence above including S2 and purge rewrites; N=100 native
 turn time ≤legacy+10%, larger N below legacy; import ≤2× one legacy resume.
 Record every pass/fail; unresolved regressions block release review rather than
 being hidden by the disk result. Output JSON plus a Markdown table in

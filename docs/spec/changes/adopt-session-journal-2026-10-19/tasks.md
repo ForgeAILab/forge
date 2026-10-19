@@ -77,7 +77,9 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
   One sqlx begin_immediate transaction/connection; SQL expect guard for existing
-  and absent records, including record=None writes; persist exactly supplied
+  and absent records, including record=None writes; only a failed fence is
+  StateConflict (never cache staleness or a changed data_version); refresh the
+  global index inside the transaction per D5; persist exactly supplied
   revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
   order and publish one final pack. Roll back every pre-commit cut; AfterCommit
   commits then errors. Invalidate caches on ambiguous outcomes.
@@ -110,12 +112,15 @@ No runtime bench crate becomes a production dependency.
   Focused test: same storage target filtered to `last_membership_receipt_and_partial_pack`.
 
 - [ ] **10. S2 maintenance and async physical compaction (≤3 h).**
-  Add async post_terminal geometric merging (minimum 4 KiB logical tiers),
-  collection base-pack repack and membership-preserving compact/incremental vacuum.
+  Add async post_terminal geometric merging (minimum 4 KiB logical tiers), the
+  1 MiB logical pack cap with kind-ordered cuts, collection base repack limited to
+  small tiers and just-purged packs, and membership-preserving compact (one
+  transaction per session or 8 MiB, no full VACUUM, then db::incremental_vacuum).
   Move every holder bitmap transactionally; retries preserve acknowledged state.
   Test-only S2 off/on knobs are not product rollout flags.
   Focused tests: same storage target filtered separately to
-  `terminal_geometric_repack` and `collection_repack_all_holders`.
+  `terminal_geometric_repack`, `collection_repack_all_holders` and
+  `purge_rewrites_only_capped_pack`.
 
 ## Conformance gate
 
@@ -221,7 +226,8 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
   Project/Agent/chat deletion cascades session metadata/memberships; nudge cleanup
-  of unheld slots/empty packs in bounded transactions. Preserve shared holders;
+  of unheld slots/empty packs: candidates from clear columns in pages of 5,000
+  pack ids, at most 32 packs or 8 MiB rewritten per transaction. Preserve shared holders;
   test partial pack cleanup and retry after restart, with no synthetic apply receipt
   for a deletion that happened outside apply. No global tracing collector.
   Focused test: same retention module filtered to `deletion_preserves_other_pack_holders`.
@@ -230,7 +236,10 @@ No runtime bench crate becomes a production dependency.
   Implement production sqlx/real-AEAD engine fixtures A/B/C and actual legacy L2
   row baseline per D10. Include empty-layout subtraction, file/dbstat agreement,
   identity-policy diagnostic, real production projection, retained legacy overlap,
-  before/after collection/retirement, operation-window and timing/read counters.
+  before/after collection/retirement, the production cadence (S2 hook and
+  collection after every turn) with cumulative write bytes, storage open time and
+  prefix-index RAM, longest collect gate hold, operation-window and timing/read
+  counters.
   Preserve exact seeds and cache assertions; JSON output plus Markdown table.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke`.
 
