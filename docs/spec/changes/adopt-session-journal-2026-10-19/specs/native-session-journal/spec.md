@@ -119,7 +119,7 @@ Forge SHALL store lossless operation records in binary-carry operation packs and
 
 #### Scenario: Window boundary and current epoch exception
 - **WHEN** collection at current revision 70 supplies the pruning floor 6
-- **THEN** records at revisions 6 through 70 survive and records below 6 are removed
+- **THEN** records at revisions 6 through 70 survive and records below 6 are removed except the epoch exception below
 - **AND** a current-writer-epoch record below the floor survives only if it is that epoch's highest-revision record
 - **AND** a replay of a pruned operation conflicts rather than becoming a new commit
 

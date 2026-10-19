@@ -49,8 +49,8 @@ Forge SHALL trigger S2 geometric-tier merging after successful terminal publicat
 
 #### Scenario: Purge in a long session
 - **WHEN** collection after a turn releases one superseded checkpoint body of a 4000-message session
-- **THEN** only the capped pack holding that body is rewritten
-- **AND** the session's other packs and their ciphertexts are unchanged
+- **THEN** the capped pack holding that body is rewritten without it, and any small geometric tiers may be folded into capped packs
+- **AND** every other capped pack with no released slot keeps its byte-identical ciphertext
 
 #### Scenario: Terminal hook and collection base pack
 - **WHEN** terminal publication succeeds and equal-size pack tiers exist
