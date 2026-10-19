@@ -1,47 +1,81 @@
 ## ADDED Requirements
 
-### Requirement: Retirement of sessions Forge will never resume
-Forge SHALL retire the journal of a native session only when the session has been replaced. A session is replaced in two cases: a successful topic rotation that recorded its successor, or a profile change that created a new runtime session.
-- Retirement SHALL be preceded by a host grant bound to the head's current revision.
-- Retirement SHALL be refused while the session has a live writer or an unresolved transfer.
-- Retirement SHALL retire the protected domain before the ordinary domain.
-- After retirement, read-only and writer latest-root opens SHALL fail with a state conflict, including after collection.
-- Forge SHALL NOT retire a session when its Task completes.
+### Requirement: Retirement of replaced and unresumable sessions
+Forge SHALL retire replaced topic/profile-rotation sources and suspended native sessions it can no longer resume: non-Agent-Chat scopes after restart and Agent Chat rows that are not their scope's dormant session. Forge SHALL preserve resumable dormant chats and reusable Task sessions; Task completion alone SHALL NOT retire a session. Engine authorization SHALL bind the current revision and refuse live writers or unresolved transfer/dependency state; protected retirement SHALL precede ordinary retirement.
 
-#### Scenario: Topic rotation source is retired
-- **WHEN** a topic rotation completes and marks its source session `replaced`
-- **THEN** within one retention tick both domains of the source are retired
-- **AND** a later open of the source session fails with a conflict instead of starting fresh
+#### Scenario: Topic rotation source
+- **WHEN** a completed rotation records its published successor and marks the source replaced
+- **THEN** the retention worker retires both source domains when the engine accepts their grants
+- **AND** the successor and chat transcript remain intact
 
-#### Scenario: Task completion keeps the session
-- **WHEN** a Task whose native session has a journal head reaches `done`
-- **THEN** the session's heads remain published and unretired
+#### Scenario: Restart distinguishes resumable and dead sessions
+- **WHEN** recovery suspends native sessions
+- **THEN** the worker retires non-Agent-Chat sessions and Agent Chat rows other than their scope's dormant session
+- **AND** it preserves resumable dormant chats and does not retire an active writer
+- **AND** it does not eagerly import legacy-only dead sessions solely for retirement; their payload cleanup stays in the next release
 
-#### Scenario: Crash between domain retirements
-- **WHEN** the process stops after retiring the protected domain and before retiring the ordinary domain
-- **THEN** the next retention tick retires the ordinary domain
+#### Scenario: Task completion
+- **WHEN** a Task reaches done and its session remains reusable
+- **THEN** the journal heads remain published and unretired
 
-### Requirement: Explicit, bounded collection without expiry
-Forge SHALL delete journal objects only through collection. Collection SHALL delete objects that no live root, retained root, reader pin, transfer pin or staging pin can reach.
-- Collection SHALL run from the retention worker, for sessions whose roots or pins changed since their last sweep.
-- Each run SHALL be bounded by an object count and a time budget.
-- A body SHALL be deleted only when no domain membership references it, in the same transaction that removes its last membership.
-- There SHALL be no retention TTL. Collection SHALL NOT expire live or retained roots.
-- Physical compaction SHALL be separate from collection, and SHALL never remove unreachable objects.
+#### Scenario: Permanent tombstone and partial retirement
+- **WHEN** the process stops between protected and ordinary retirement
+- **THEN** the next tick retries the remaining domain without resurrecting the retired one
+- **AND** latest-root opens of a retired domain conflict after collection/restart despite a surviving legacy row
 
-#### Scenario: Superseded checkpoint state is reclaimed
-- **WHEN** a live session has published several CallingModel checkpoints and the retention worker sweeps it
-- **THEN** objects reachable only from superseded checkpoints are deleted
-- **AND** the session still materializes its full history and latest checkpoint
+### Requirement: Runtime-owned bounded collection without expiry
+Forge SHALL schedule engine collect calls for dirty sessions in both domains, with an object bound and scheduling time budget, initially 20,000 objects per call and 10 seconds between budget checks. The engine SHALL own root epochs, closures, liveness, pin/dependency handling, catalog release and replay-pruning selection; storage SHALL execute atomic release/receipt writes. No TTL or age rule SHALL expire live or retained roots.
 
-#### Scenario: Shared body survives partial deletion
-- **WHEN** a body is a member of both domains and only the ordinary membership becomes unreachable
-- **THEN** collection removes the ordinary membership and keeps the body
+#### Scenario: Live superseded checkpoints
+- **WHEN** a live session has superseded checkpoints/cache/manifest paths and the worker collects it
+- **THEN** the engine releases only unreachable memberships
+- **AND** full history, the latest exact checkpoint, retained roots and pinned objects remain readable
 
-### Requirement: Deletion cascades remove journal state
-Deleting an `agent_session` row SHALL remove its journal heads, memberships, operation records and pin records in the same transaction, through foreign-key cascades. This covers Project deletion and any other cascade. The retention worker SHALL then delete bodies that no longer have any membership, in bounded batches.
+#### Scenario: Epoch conflict
+- **WHEN** roots or pins change before a scheduled collection's expected epoch is accepted
+- **THEN** the engine refuses the stale request without deletion and Forge retries later
 
-#### Scenario: Project deletion
-- **WHEN** a Project with native chat and Task sessions is deleted
-- **THEN** no journal head, membership, operation or record row of those sessions remains when the deletion commits
-- **AND** after one retention tick, no body that only those sessions referenced remains
+#### Scenario: Shared body remains referenced
+- **WHEN** ordinary collection releases a slot still held by protected or another session
+- **THEN** the body remains readable by that holder and the release receipt counts zero for it
+
+### Requirement: Physical pack maintenance preserves membership
+Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during collection. Physical maintenance SHALL atomically remap every holder's bitmap, including other domains/sessions, without changing runtime objects, heads, membership or replay policy; failure SHALL be retryable without undoing an acknowledged turn. Mandatory last-membership purges SHALL occur in apply even when optional geometric/base merging is disabled for conformance.
+
+#### Scenario: Terminal hook and collection base pack
+- **WHEN** terminal publication succeeds and equal-size pack tiers exist
+- **THEN** the async terminal hook merges them geometrically with fresh AEAD nonces
+- **AND** subsequent collection can form a kind-ordered base pack while preserving every surviving holder
+
+#### Scenario: Physical compaction
+- **WHEN** compact repacks live bodies or reclaims free SQLite pages
+- **THEN** it changes no logical membership, root epoch or operation-retention decision
+- **AND** no physical page saving is misreported as JournalApplyReceipt canonical body bytes
+
+### Requirement: Deletion cascades preserve shared holders
+Deleting an agent_session SHALL cascade its journal session, pin, catalog, membership and operation-pack rows in the deletion transaction. Pack owner labels SHALL NOT cascade shared bodies; bounded post-deletion cleanup SHALL purge unheld slots and empty packs while preserving other holders. Retirement SHALL retain its tombstone and any still-required metadata/operation results until session deletion, without promising zero physical bytes.
+
+#### Scenario: Project deletion with a shared pack
+- **WHEN** a Project is deleted and one affected pack also has a surviving session holder
+- **THEN** deleted sessions' metadata/membership rows disappear on commit
+- **AND** bounded cleanup purges only unheld slots and the survivor still opens after restart
+
+### Requirement: Forge physical disk gate against real legacy L2
+Forge SHALL run fixture B at N=4000, plain and tool, through production ForgeJournalStorage with sqlx, real AEAD, S1–S5 and collection, and compare each physical retained size with the same fixture's actual Forge legacy idle row containing two sealed blobs (L2). Both post-collection ratios SHALL be at most 2.0×; 1.5× is an aim. Runtime reference S1–S4 measurements and S5 projections SHALL NOT substitute for this Forge gate, and runtime schema 5 SHALL remain out of scope.
+
+For each layout physical bytes SHALL be page_count×page_size after truncated WAL checkpoints and VACUUM, minus its matching empty-schema/session-setup baseline, verified against file/dbstat totals. Reports SHALL include all metadata/index/crypto costs, A/B at N=100/1000/4000, grown C, before/after collection/retirement, L1 diagnostics and the temporary footprint of retained lazy-import legacy rows. L1, small-N and A/C SHALL not replace the settled B/N=4000 L2 gate.
+
+#### Scenario: Forge gate passes
+- **WHEN** B/N=4000 plain and tool both measure at or below 2.0× their real legacy L2 after collection
+- **THEN** the disk gate passes and the report separately records whether each meets the 1.5× aim
+- **AND** it identifies actual Forge results separately from the reference's 1.49096× plain/1.62353× tool S1–S4 results
+
+#### Scenario: Gate miss or temporary import overlap
+- **WHEN** a Forge ratio exceeds 2.0× or lazy import retains both old and new payloads
+- **THEN** a gate miss blocks adoption pending a storage-only fix and the old-plus-new footprint is reported separately
+- **AND** no seed, projection, denominator or threshold is silently changed to manufacture a pass
+
+#### Scenario: S5 evidence
+- **WHEN** grown fixture C is measured after engine-directed pruning
+- **THEN** the report records actual retained operation tiers and replay-boundary/current-epoch behavior
+- **AND** projected S5 numbers from the reference are not labeled measured Forge outcomes

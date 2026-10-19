@@ -1,135 +1,241 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T00:00:00Z
+updated_at: 2026-10-19T21:27:07Z
 completed_at:
 ---
 
-Each task is sized for one Codex job of at most about 3 hours. Every task names the focused
-tests to run. Run only those tests locally; CI runs the full suite. Briefs pass
-`TMPDIR` and `CARGO_TARGET_DIR` on `/Volumes/Data`. Task numbers are referenced from `design.md`.
+Execute in order. Each numbered checkbox is one Codex job, sized ≤ about 3 h;
+split an overrun rather than silently extending scope. All remain unimplemented.
+Run only the named focused tests locally; CI runs full suites. Test names below
+are proposed exact names to create where absent. Do not run a whole crate,
+workspace or all-target suite locally. Use task-specific TMPDIR/CARGO_TARGET_DIR
+on `/Volumes/Data`; do not print the process environment.
 
-## 0. Prerequisites (not Forge jobs)
-- [ ] 0.1 The runtime pin bump `82f5aac` → `1de6d7d` lands, with no adoption (separate job in flight).
-- [ ] 0.2 Owner answers Q0. The agent-runtime change that extracts the journal engine behind a storage trait (design D2, R1–R6) lands, with its own spec and its in-memory suites unchanged and green. Forge pins that immutable revision across all runtime packages (`Cargo.toml:37`, `Cargo.lock`).
+Agent-host integration targets introduced here use `--features test-support` if
+they need production test constructors. Declare required-features accordingly;
+enable it on the command line, never with a self dev-dependency. DB and
+services(-agents) integration commands below include their required test feature.
+No runtime bench crate becomes a production dependency.
 
-## 1. Conformance harness (first Forge job; needs only 0.1)
-- [ ] 1.1 Add `agent-runtime-testkit` as a `[dev-dependencies]` entry of `crates/agent-host/Cargo.toml`, from the same git source and revision as `agent-runtime`. Create `crates/agent-host/tests/session_journal_conformance.rs` with three factories:
-  - a protected factory returning `SessionJournalConformanceFixture`
-  - an ordinary factory taking `Arc<dyn JournalProjectionPolicy>`
-  - a collection factory returning `SessionJournalCollectionFixture`
+## Release gate and foundations
 
-  For now all three are backed by `InMemorySessionJournal`. Each factory is the single place the SQLite adapter swaps in later.
+- [ ] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤2 h).**
+  Use the first agent-runtime release containing extract-journal-storage-engine;
+  record its actual release/tag and immutable SHA, with one source/revision for all
+  runtime packages and testkit. Verify D2 rules 1–7/receipt, N1 compact pins, N2/R4
+  working memo, R5/R6, S5 and reviewer `a49e3e0` futures-mutex fix in that release.
+  Stop subsequent jobs if unavailable; do not implement runtime fixes in Forge or
+  invent a version. Update Cargo.toml/lockfile together.
+  Focused check: `cargo check -p forge-agent-host`; add/run
+  `cargo test -p forge-agent-host --test session_journal_dependency engine_release_contract`.
 
-  Integration tests cannot reach `test_store()` / `session_store()` (`protected_store.rs:2013-2063`) or the fixtures at `:3547`/`:3882`, because they live in `#[cfg(test)] mod tests`. Expose a test-support constructor behind a `test-support` feature of `forge-agent-host`, enabled only in its own dev-dependencies. It creates the `agent_identity`, `agent_profile`, `agent_context_scope` and `agent_session` rows and returns the store, plus a helper that seals a legacy row. Tasks 4.1 and 6.1 reuse it.
+- [ ] **2. File-backed test support and engine harness (≤2 h).**
+  Add testkit at the exact pin, file DB/temp-dir ownership, valid Forge session
+  mappings for testkit ids, test-only legacy row seeding and real decoder helpers.
+  Use explicit test-support without self dependencies. Start with engine factories
+  over volatile storage for protected/ordinary/supported and unsupported collection;
+  later jobs swap only the storage factory. Preserve the real decoder schema gate.
+  Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance engine_harness_smoke`
+  and the same command filtered to `forge_legacy_decoder_accepts_native_materialized_checkpoint`.
 
-  Add `forge_legacy_decoder_accepts_native_materialized_checkpoint`: it runs `assert_native_materialized_checkpoint_schema_guard` through Forge's real decode (seal with `SqliteProtectedRuntimeStore`, then `CheckpointStore::load_latest`).
-  Tests: `cargo test -p forge-agent-host --test session_journal_conformance`.
+- [ ] **3. Add six-table migration and cascade invariants (≤2 h).**
+  Allocate one `V{NNN}__session_journal.sql` per D4 (unique UTC version at creation).
+  Add session, pin, catalog, pack, bitmap membership and operation_pack tables,
+  required indexes/CHECKs and Forge-session mapping. Keep legacy data byte-exact.
+  Per-session rows cascade; an advisory pack owner never cascades shared bodies.
+  Focused test: `cargo test -p db --features test-template --test main session_journal_schema::migration_preserves_legacy_and_shared_packs`.
 
-## 2. Schema and storage
-- [ ] 2.1 New migration `crates/db/migrations/V{YYYYMMDDHHMM}__session_journal.sql`, timestamped after the newest migration on the branch. It creates the five tables and two indexes in design D4, with all CHECKs, and touches no existing table. Add a db test that applies the migration to a file database, inserts a session with head, membership, operation and record rows, then deletes the `agent_session` row. Every per-session row must cascade; the body row must stay.
-  Tests: `cargo test -p db session_journal_schema`.
-- [ ] 2.2 `crates/agent-host/src/session_journal/seal.rs`:
-  - HMAC key derivation for the object, operation and pin domains (`forge/session-journal/{object,operation,pin}\0`) from the existing master key
-  - XChaCha20-Poly1305 sealing with `object_key` as associated data
-  - the `FORGE-JOURNAL\0` envelope with a format byte
-  - zstd for bodies of at least 1 KiB when compression saves at least 1/8
+## JournalStorage implementation
 
-  Unit tests: round trip; associated-data swap refused; unknown format refused; no 32-byte object id appears in sealed output; threshold boundaries 1,023/1,024/1,025 bytes.
-  Tests: `cargo test -p forge-agent-host session_journal::seal`.
-- [ ] 2.3 (needs 0.2) `crates/agent-host/src/session_journal/storage.rs`: `SqliteJournalStorage` implementing the runtime storage trait (R1). It covers:
-  - one `db::begin_immediate` transaction per engine operation
-  - body `INSERT OR IGNORE`, then membership
-  - the head CAS on `revision` and `writer_epoch`
-  - writer-epoch bump on writer open
-  - operation rows with a sealed result head
-  - records for pins, dependencies and the retained catalog
-  - staging memberships
-  - deterministic failure injection at each `JournalCommitFailurePoint` cut
+- [ ] **4. Pack codec and real AEAD (≤3 h).**
+  Implement JRPACK v1, kind-ordered canonical bodies, sorted four-byte prefix/
+  varint index, exact full-id/kind verification and bounded decode. Compress whole
+  units with zstd 3; XChaCha20-Poly1305 with fresh nonces, existing keys and AAD.
+  Seal all metadata/operation units; use small catalog/pin HMAC lookup keys, no
+  per-object index. Test collisions, malformed offsets, tampering/AAD swaps and
+  absence of clear object ids/prefixes.
+  Focused tests: `cargo test -p forge-agent-host --lib session_journal::codec::`
+  and `cargo test -p forge-agent-host --lib session_journal::seal::`.
 
-  Unit tests: CAS conflict rolls back the bodies; a stale epoch is refused; the same operation with the same input returns the original head after the head has advanced; a different input conflicts.
-  Tests: `cargo test -p forge-agent-host session_journal::storage`.
-- [ ] 2.4 Read path:
-  - `open` prefetches the session-domain's published bodies in one query, up to 256 MiB of plaintext per lease
-  - a process-wide decrypted LRU of 64 MiB, filled on commit and prefetch and evicted by deletion
-  - `read` checks membership for the lease's domain
+- [ ] **5. Lossless read methods and cache consistency (≤3 h).**
+  Implement load/objects/members/operation/pins/catalog/dirty_sessions against
+  file-backed sqlx. Preserve opaque version/bytes; scalar metadata must agree with
+  authenticated payload. Batch pack reads, enforce membership on cache hits, use
+  pack generations and a bounded LRU; refresh across independent connections.
+  Dirty paging sorts runtime session ids after the opaque mapping. No one-query-
+  per-object/full-closure reread per warm commit.
+  Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_storage read_membership_metadata_and_reopen`.
 
-  Cross-domain test: a body shared by the ordinary and protected memberships survives deletion of one membership and is removed with the last. An ordinary lease cannot read a protected-only object.
-  Tests: `cargo test -p forge-agent-host session_journal::read`.
-- [ ] 2.5 Point the protected and ordinary conformance factories from 1.1 at the SQLite engine, using a fresh `file::memory:?cache=shared` pool per scenario. Fix the adapter until `assert_session_journal_conformance` and `assert_ordinary_session_journal_conformance` pass unedited.
-  Tests: `cargo test -p forge-agent-host --test session_journal_conformance protected ordinary`.
-- [ ] 2.6 `JournalCollectionHost` for the SQLite engine:
-  - `root_epoch` and `authorize_retirement` (the grant columns)
-  - `pin_transfer`, `retain_root` and `release_pin` (records)
-  - `stage_leaves`
-  - `compact` = `PRAGMA incremental_vacuum`
-  - `retained_bytes` = `SUM(encoded_len)` over distinct members
+- [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
+  One sqlx begin_immediate transaction/connection; SQL expect guard for existing
+  and absent records, including record=None writes; persist exactly supplied
+  revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
+  order and publish one final pack. Roll back every pre-commit cut; AfterCommit
+  commits then errors. Invalidate caches on ambiguous outcomes.
+  Focused tests: same storage target filtered separately to
+  `apply_atomic_cuts` and `independent_connection_expect_fences`.
 
-  Add the batched orphan-body sweep. Point the collection factory at SQLite. The collection suites and the three ordinary GC suites must pass unedited.
-  Tests: `cargo test -p forge-agent-host --test session_journal_conformance collection`.
+- [ ] **7. Pin/catalog/staging persistence (≤2 h).**
+  Execute Put/Remove records verbatim inside apply, with no private-engine parsing
+  or host closure computation. Wire retained roots and staged memberships through
+  engine async controls. Unknown engine metadata must round-trip losslessly.
+  Focused test: same storage target filtered to `pins_catalog_stage_restart`.
 
-## 3. Cut-over
-- [ ] 3.1 (needs 2.1 only) Replace the db probes. `topic_rotation_successor_has_protected_state` (`crates/db/src/sqlite/embedded_agent.rs:974`) becomes "native head published in either domain (`head_ciphertext IS NOT NULL`; a `revision 0` reservation does not count), or legacy payload non-NULL". `attention_session_checkpoint_count` (`crates/db/src/sqlite/agent.rs:1053`) becomes "legacy checkpoint, or published protected head with `has_checkpoint = 1`". Test the reservation-only case for both. Rename both to describe the new meaning and update their callers (`topic_rotation.rs:520`, `attention_service.rs:2231`).
-  Tests: `cargo test -p db session_journal_probe`, `cargo test -p services attention_continuity`.
-- [ ] 3.2 Add `SessionJournals` to `crates/agent-host/src/session_journal/mod.rs`: two engines, storage ids `forge.session-journal.v1.{ordinary,protected}`, identity projection, and the shared master key. Have `SqliteProtectedRuntimeStore` implement `SessionStore::journal()` and `CheckpointStore::journal()`, constructed in `SqliteProtectedRuntimeStore::new` (`protected_store.rs:128`). Test: a native session created, run for two turns with the testkit fake provider, and resumed writes heads in both domains and no legacy row; the second turn's commits insert no history body that the first turn already stored.
-  Tests: `cargo test -p forge-agent-host session_journal_native_turns`.
-- [ ] 3.3 Add `SessionJournals::probe` (design D5.9) and replace the full-load probes at `crates/agent-host/src/native.rs:1150-1170` and `:1596-1608`. `overhead_measured` uses R6 `JournalReader::extension`. Test the decisions for native, legacy-only, absent and retired sessions (retired must surface the runtime conflict, not "fresh"). Assert that the existence probe reads no body.
-  Tests: `cargo test -p forge-agent-host native_probe`.
-- [ ] 3.4 Delete the legacy write paths:
-  - in `protected_store.rs`: `save_checkpoint_once`, both `save` bodies, the `snapshot_digest` digest-skip and the `save_barrier` hook
-  - each trait's `save` now returns `RuntimeError::conflict("legacy session store is read-only")`
-  - the legacy write tests (`:2084-2716`); keep or move the decode, compression and legacy-read tests
+- [ ] **8. S4 operation packs and S5 directive execution (≤3 h).**
+  Binary-carry 2^tier packs hold lossless complete original results. Implement
+  replay lookup/conflicting-input behavior through the engine. Execute only its
+  explicit collection pruning directive, preserving revision>current−64 and all
+  current-epoch records; rebuild tiers atomically. Do not prune on commits or
+  copy the bench's unimplemented-S5 refusal.
+  Focused tests: same storage target filtered separately to
+  `operation_pack_replay_restart` and `engine_replay_window_edges`.
 
-  Tests: legacy `load`/`load_latest` still decode enveloped and pre-envelope rows; both `save`s refuse.
-  Tests: `cargo test -p forge-agent-host protected_store`.
-- [ ] 3.5 Credential exclusion (design D3.5). Seed an api-key credential and an OAuth bundle, run a tool turn, then force a refresh. Decrypt every body, head, operation result and record of the session, and assert no secret bytes appear.
-  Tests: `cargo test -p forge-agent-host session_journal_credentials`.
+- [ ] **9. Release, physical purge and exact receipts (≤3 h).**
+  Clear only releasing membership bits, deduplicate ids, examine every holder,
+  purge last-membership bodies in that apply, atomically remap all bitmaps and
+  return original canonical lengths/count once. Partial purges work with optional
+  S2 disabled; shared survivors remain readable across domains/sessions/reopen.
+  Focused test: same storage target filtered to `last_membership_receipt_and_partial_pack`.
 
-## 4. Import, crashes, concurrency
-- [ ] 4.1 v3 import through the real store:
-  - seed legacy rows with Forge's own legacy sealing for idle, CallingModel, ModelResponseReady, AwaitingApproval, AwaitingInteraction, ExecutingTools, ToolOutcomeReady and a cache-started state; reuse the fixtures at `protected_store.rs:3547` and `:3882` where they fit
-  - open each through the runtime
-  - assert: both heads published; the materialized snapshot and checkpoint equal the legacy decode; zero provider requests; the legacy row unchanged byte for byte
-  - assert that a second open performs no import (R5)
+- [ ] **10. S2 maintenance and async physical compaction (≤3 h).**
+  Add async post_terminal geometric merging (minimum 4 KiB logical tiers),
+  collection base-pack repack and membership-preserving compact/incremental vacuum.
+  Move every holder bitmap transactionally; retries preserve acknowledged state.
+  Test-only S2 off/on knobs are not product rollout flags.
+  Focused tests: same storage target filtered separately to
+  `terminal_geometric_repack` and `collection_repack_all_holders`.
 
-  Tests: `cargo test -p forge-agent-host session_journal_import`.
-- [ ] 4.2 Import crash cuts. Inject storage failures before and after the protected publication and before the ordinary publication, then reopen. Before the protected commit, v3 must remain authoritative. After it, the ordinary head is repaired once and no turn is replayed.
-  Tests: `cargo test -p forge-agent-host session_journal_import_crash`.
-- [ ] 4.3 Move the tests that write `protected_agent_session_state` directly onto the journal:
-  - `crates/services-agents/tests/suite/native_chat_lcm_compaction.rs:241`
-  - `native_chat_tool_exchanges.rs:1262`, `:1288`, `:2594-2596`, `:2907` (triggers become storage failure injection or triggers on `agent_session_journal_head`)
-  - `crates/services-agents/src/embedded_task_executor.rs:1448` (an unreadable state becomes a corrupt sealed head)
+## Conformance gate
 
-  Tests: the named test functions only, plus the one relevant `happy_path` case for native chat.
-- [ ] 4.4 Second-writer behaviour. Within one process, a second writer open for a live session fails with `StateConflict` before any provider I/O. Cover the turn worker, `fork_topic`, `abort_topic_fork` and the inquiry runner, and confirm each maps to its existing error (`AgentHostError::VersionConflict` for forks, `native.rs:1568-1575`). A writer dropped without shutdown releases its slot synchronously, so the next turn opens immediately.
-  Tests: `cargo test -p forge-agent-host session_journal_writer_fence`, `cargo test -p services-agents topic_rotation_concurrent_turn`.
+- [ ] **11. Storage conformance in every configuration (≤3 h).**
+  Point factories at ForgeJournalStorage. Run unedited
+  assert_journal_storage_conformance with S2 off/on and storage reopened at every
+  hydration, real AEAD and file-backed sqlx. This covers protected/ordinary,
+  arbitrary redacting policies, collection/unsupported collection, all receipt,
+  fence, sharing, metadata, paging and restart cases. Use testkit's engine host
+  impl; do not add a Forge collector.
+  Focused commands: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance storage_conformance_no_repack`,
+  then that command filtered to `storage_conformance_repack`, then
+  `storage_conformance_reopen`. Each named wrapper must pass.
 
-## 5. Retention
-- [ ] 5.1 Add the `session-journal-retention` worker in `crates/services-agents/src/` on the workers framework, with a 60 s tick, wired in `runtime/mod.rs`. Each tick:
-  - finds `replaced` sessions with an unretired head
-  - writes the revision grant and retires protected, then ordinary
-  - runs bounded `collect` per domain (`max_objects = 20_000`, 10 s budget)
-  - runs the orphan-body sweep in batches of 5,000
+- [ ] **12. Five broken-storage negative controls (≤2 h).**
+  Adapt upstream test-only fault shapes over real Forge storage: torn transaction,
+  lost write, reordered n+1, ignored epoch and shared body unlinked early. Assert
+  the five exact named failures in D6; upstream private test adapters are not
+  exported APIs. No defects ship in production.
+  Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance broken_storage_`.
 
-  `rotate_agent_chat_topic` and `rotate_agent_session` callers nudge the worker after commit. Tests:
-  - rotation retires the source, and its latest opens conflict
-  - collection reclaims bytes; the successor is untouched
-  - Project deletion leaves no body after one tick
-  - Task completion retires nothing
-  - a crash between retiring the two domains completes on the next tick
+## Cut-over and recovery
 
-  Tests: `cargo test -p services-agents session_journal_retention`.
-- [ ] 5.2 (only if the owner approves Q1 beyond `replaced`) Extend the worker to suspended native sessions Forge cannot resume: non-Agent-Chat scopes, and Agent Chat rows that are not the scope's dormant session (`embedded_agent_service.rs:1528-1542`).
-  Tests: `cargo test -p services-agents session_journal_retention_dormant`.
+- [ ] **13. Shared engine wiring and ordinary projection (≤3 h).**
+  SessionJournals owns shared storage and long-lived engines; advertise both
+  capabilities from the existing store with D2 config and D3 policy. Protect exact
+  recovery, preserve runtime-mandated fields and ordinary-only restore-critical
+  values, redact optional sensitive diagnostics. Ephemeral scopes remain empty.
+  Prove memo reuse across per-turn writer changes and cold behavior at restart.
+  Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_runtime native_delta_and_projection`
+  and the same command filtered to `writer_change_memo_and_restart`.
 
-## 6. Measurement
-- [ ] 6.1 Add the `#[ignore]` bench `crates/agent-host/tests/session_journal_bench.rs` (design D10), running legacy versus native at N=100/1000/4000 with plain and tool turns. It records per-turn bytes written, WAL growth, wall times, probe and import time, and retained bytes before and after collection and after retirement. It writes a JSON report under `$TMPDIR`.
-  Run: `cargo test -p forge-agent-host --release --test session_journal_bench -- --ignored --nocapture`.
-- [ ] 6.2 Run 6.1 on a release build and record the table and gate results (pass or fail per gate) in `docs/performance-testing.md`. Report any failed gate to the owner before release.
+- [ ] **14. Scalar DB continuity and hand-over probes (≤2 h).**
+  Replace legacy-only DB helpers/callers; published native head or eligible legacy
+  state counts, reservation does not; retired native state cannot fall back.
+  checkpoint_present keeps its meaning. No public response change.
+  Focused tests: `cargo test -p db --features test-template --test main session_journal_probe::publication_and_checkpoint_flags`
+  and `cargo test -p services --features test-support --test main attention_continuity::native_checkpoint_presence`.
 
-## 7. Docs and changelog
-- [ ] 7.1 Make the documentation changes:
-  - `CHANGELOG.md` `Unreleased`: apply the Breaking and Changed text from design D9
-  - `docs/architecture.md`: rewrite `:2412-2449`, and add the "Session journal storage" subsection and the retention worker
-  - `docs/getting-started.md:459`: import and downgrade consequences; disk note
+- [ ] **15. Per-turn/fork probes and bounded extension read (≤2 h).**
+  Replace native.rs full-snapshot probes with scalar metadata and a separate
+  JournalReader::extension(LCM_COMPONENT_ID) path. Prefer protected extension if
+  ordinary omitted it. Cover absent, reservation, legacy, native and tombstone;
+  existence reads no pack and the extension path touches no history/checkpoint.
+  Focused test: runtime target from task 13 filtered to `native_probe_and_extension`.
 
-  Validate the spec change folder.
+- [ ] **16. Delete replaced legacy writers; retain importer/baseline (≤2 h).**
+  Both production saves become typed refusals; remove old CAS/digest-skip/save
+  hooks and write-only policy paths. Keep enveloped/pre-envelope reads and
+  test-only exact legacy save-order/digest baseline helpers for D10. Do not clear
+  payloads or drop the table this release.
+  Focused tests: `cargo test -p forge-agent-host --lib protected_store::tests::legacy_read_`
+  and runtime target filtered to `legacy_writes_refuse_and_baseline_keeps_two_blobs`.
+
+- [ ] **17. Lazy import state matrix (≤3 h).**
+  Idle, snapshot-only, CallingModel, ModelResponseReady, AwaitingApproval,
+  AwaitingInteraction, ExecutingTools, ToolOutcomeReady and cache-started rows
+  import with no provider/tool I/O and byte-unchanged legacy row. Exact-first
+  where a checkpoint exists; protected equality and projected ordinary equality.
+  Second native open uses R5; no invented checkpoint for ordinary-only state.
+  Focused test: runtime target filtered to `legacy_import_state_matrix`.
+
+- [ ] **18. Import/turn crash cuts and async control regression (≤3 h).**
+  Use JournalCommitFailurePoint::ALL for equivalence/crash/restart over real SQL;
+  include before/after exact publication, ordinary repair and lost ack. No stale
+  legacy overlay or replayed model/tool operation. Suspend SQL storage and race
+  controls/open/close on current-thread and multi-thread Tokio; no sync polling.
+  Focused tests: runtime target filtered separately to `import_and_commit_crash_cuts`
+  and `async_controls_do_not_stall_worker`.
+
+- [ ] **19. Native integration fixtures and writer exclusion (≤3 h).**
+  Replace direct legacy-table test writes in native_chat_lcm_compaction,
+  native_chat_tool_exchanges and embedded_task_executor tests with journal failure
+  injection/corruption. Cover turn/fork/abort/inquiry concurrent writers and drop
+  releasing the slot before provider I/O. Run only the changed named cases.
+  Focused tests: runtime target filtered to `writer_fence_and_drop`; select the
+  affected `cargo test -p services-agents --features test-support --test main <module>::<changed_test>`
+  cases and the one relevant `cargo test -p api --test main happy_path::<native_chat_case>`.
+  Record the actual case names in the job receipt before running; no target-wide run.
+
+- [ ] **20. Credential exclusion with real packs (≤2 h).**
+  Seed API key/OAuth credentials, run a tool turn and refresh; decrypt all pack,
+  session, operation, pin/catalog payloads and assert credentials never entered
+  either domain. Keep ordinary redaction assertions separate from exact recovery.
+  Focused test: runtime target filtered to `journal_credential_exclusion`.
+
+## Lifecycle and measurement
+
+- [ ] **21. Retention worker and terminal scheduling (≤3 h).**
+  Wire the worker and rotation/recovery nudges: 60 s tick, revision grant then
+  protected/ordinary retire, bounded dirty collection (20,000 objects/call, 10 s
+  scheduling budget), S2 terminal hook. Cover replaced sources, active-writer
+  conflicts, successor safety, Task completion preservation and crash between
+  domain retirements. All engine controls are awaited.
+  Focused test: `cargo test -p services-agents --features test-support --test main session_journal_retention::rotation_and_retry`.
+
+- [ ] **22. Approved unresumable-session retirement (≤2 h).**
+  Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
+  other than the scope's dormant session. Keep resumable dormant chats, reusable
+  Task sessions and active writers. Do not import legacy-only dead rows merely
+  for retirement; leave them for next-release cleanup. Tombstones suppress fallback.
+  Focused test: same retention module filtered to `unresumable_and_dormant_restart`.
+
+- [ ] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
+  Project/Agent/chat deletion cascades session metadata/memberships; nudge cleanup
+  of unheld slots/empty packs in bounded transactions. Preserve shared holders;
+  test partial pack cleanup and retry after restart, with no synthetic apply receipt
+  for a deletion that happened outside apply. No global tracing collector.
+  Focused test: same retention module filtered to `deletion_preserves_other_pack_holders`.
+
+- [ ] **24. Forge measurement harness and smoke (≤3 h).**
+  Implement production sqlx/real-AEAD engine fixtures A/B/C and actual legacy L2
+  row baseline per D10. Include empty-layout subtraction, file/dbstat agreement,
+  identity-policy diagnostic, real production projection, retained legacy overlap,
+  before/after collection/retirement, operation-window and timing/read counters.
+  Preserve exact seeds and cache assertions; JSON output plus Markdown table.
+  Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke`.
+
+- [ ] **25. Run Forge disk/performance gate (≤3 h).**
+  Run only the named ignored release report:
+  `cargo test -p forge-agent-host --features test-support --release --test session_journal_bench forge_packed_report -- --ignored --exact --nocapture`.
+  Record all A/B N=100/1000/4000 and C results. B/N=4000 plain and tool after
+  collection must each be ≤2.0× actual Forge L2; aim 1.5×. Record D10 performance
+  checks, transaction duration and old-plus-new peak. If a gate fails, report it
+  and schedule a bounded storage-only fix/recheck; no schema-5 work or baseline
+  manipulation. Publish only actual Forge measurements, not rt-e4 projections.
+
+- [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
+  Update architecture, getting-started, performance table and Unreleased
+  Breaking/Changed entries per D9, with actual pins/results. State next-release
+  legacy cleanup, approved retirement and 64-revision/current-epoch replay.
+  Validate this change's deltas and links; verify no per-object SQL requirement or
+  stale identity/lifetime-replay/4× gate remains outside the verbatim receipt.
+  Focused checks: strict spec validation and whitespace/link review. No full code
+  suite; reuse the recorded named-test receipts, rerunning only for new changes.

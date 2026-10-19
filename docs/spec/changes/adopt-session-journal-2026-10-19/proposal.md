@@ -1,109 +1,94 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T00:00:00Z
+updated_at: 2026-10-19T21:27:07Z
 ---
 
 ## Why
 
-Every native Agent turn rewrites its whole session. `SqliteProtectedRuntimeStore` stores the
-ordinary snapshot and the protected checkpoint as one encrypted row in
-`protected_agent_session_state`, and each save serializes, compresses and re-encrypts
-the complete history (`crates/agent-host/src/protected_store.rs:1713-1715`, `:1851-1852`).
-At 4,000 messages the runtime measured this at 5.66 MB (protected) plus 1.77 MB (ordinary) of
-logical rewrite per turn. The host also decrypts the full snapshot before every turn only to
-learn whether the session exists (`crates/agent-host/src/native.rs:1150-1170`).
-
-Agent Runtime `1de6d7d` ships the opt-in `SessionJournal` capability (U9). It provides
-content-addressed immutable objects, exact protected and projected ordinary domains, fenced
-writers, idempotent commits, a one-time v3 import, and explicit retirement and collection.
-A one-message turn then submits about 43 KB protected and 12 KB ordinary at any history
-length. The owner approved Forge adopting U9 before U10, with new migrations that keep user
-data and import existing sessions on first use. Forge is the consumer the runtime's
-`consumer_open_forge` model mirrors. Until Forge adopts, none of U9's write savings reach users.
+Forge rewrites, compresses and encrypts complete native session snapshots and
+checkpoints at every persistence barrier. The runtime now has a storage-generic
+`JournalEngine<S>` on unreleased branches; Forge should consume that engine rather
+than implement journal semantics. The reference packed SQLite adapter measured
+fixture B/N=4000 at **1.49096× L2 plain and 1.62353× L2 tool after collection**.
+L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
+one-blob assumption. These are S1–S4 reference results with modeled seal lengths;
+S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
 
 ## What Changes
 
-- **Runtime prerequisite (blocking).** The journal engine (commit validation, ordinary
-  projection and re-encoding, reachability, dependency indexing, collection) is private to the
-  volatile `InMemorySessionJournal`. A runtime change extracts it behind a storage trait, so Forge
-  supplies only durable SQLite storage. Forge needs six things from it (design D2):
-  - R1: one serialized write transaction per operation
-  - R2: process-local leases with synchronous close
-  - R3: incremental per-session collection
-  - R4: a memo of validated roots across writer changes
-  - R5: native-first open
-  - R6: a bounded single-extension read
+- **Released runtime gate first.** Pin every runtime package and testkit to the
+  same immutable revision of **the first agent-runtime release containing
+  extract-journal-storage-engine**. Verify the complete trait/receipts, R1–R7,
+  N1/N2 fixes, native-first open, bounded extension reads, engine-owned 64-revision
+  replay pruning and the reviewer's futures-mutex gate correction. No invented
+  version, branch-only production pin or Forge semantic workaround.
+- **Forge implements only `JournalStorage`.** Two long-lived
+  `JournalEngine<ForgeJournalStorage>` instances share one sqlx-backed storage.
+  The runtime owns validation, projection/re-encoding, leases, closures,
+  dependencies, fences, retirement and incremental collection selection. Forge
+  supplies SQL enforcement, framing, encryption and lifecycle scheduling.
+- **Six tables, no per-object SQL layout.** One additive migration
+  `V{NNN}__session_journal.sql` creates session records, pin, catalog, pack,
+  membership and operation_pack tables. Allocate the unique UTC migration version
+  when implementing; never edit historical migrations or discard user rows.
+- **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack;
+  S2 merges geometric tiers after terminal publication and makes a live base pack
+  during collection; S3 keeps kind-ordered bodies and prefix/offset indexes inside
+  sealed packs, with full-id verification. Membership bitmaps preserve domain and
+  session isolation and permit shared bodies. S4 packs complete original operation
+  results; the engine selects S5 pruning (latest 64 revisions plus current writer
+  epoch), which storage executes only on an explicit collection directive.
+- **Keep Forge's cipher and keys.** Real XChaCha20-Poly1305, fresh 24-byte nonce,
+  authenticated row binding and existing key material/key_revision. Full object ids
+  and prefixes stay inside sealed packs; no per-object HMAC/index is needed.
+  Small catalog/pin lookup keys remain domain-separated HMACs so they do not leak
+  clear digests. The reference's simulated sealing is not production crypto.
+- **Two logical domains.** Protected state stays exact. Ordinary state uses a
+  redacting host policy under runtime constraints; restore-critical values and
+  runtime-mandated cache/manifests remain exact where required. Both domains are
+  encrypted; ordinary leases can never read protected-only slots. Credentials
+  remain excluded from both domains.
+- **One transaction per apply.** Use `db::begin_immediate` through sqlx, check
+  `expect` revision and writer epoch in SQL, stage all components and cuts, commit
+  once. Release the last membership and remove the physical body in that same
+  transaction. Return `JournalApplyReceipt` counts/canonical bytes, not compressed
+  pack savings. Await durable engine controls; no volatile sync polling on Tokio.
+- **Lazy, exact-first import.** Keep legacy read/decode methods as the runtime's
+  v3 source, including unfinished and snapshot-only sessions. Publish protected
+  first when a checkpoint exists, repair partial imports without provider/tool
+  I/O, and refuse legacy saves. Native-first open skips unnecessary legacy loads.
+  Keep the legacy table this release; import remaining resumable rows and drop it
+  next release through a separate data-preserving change.
+- **Probes and lifecycle.** Read scalar native publication/checkpoint/tombstone
+  metadata; read LCM overhead through `JournalReader::extension`. Retire replaced
+  and unresumable suspended sessions, keep resumable dormant chats and reusable
+  Task sessions. Schedule bounded dirty-session collection, terminal repacking and
+  deletion cleanup without a TTL.
+- **Acceptance.** Run `assert_journal_storage_conformance` unedited with repacking
+  off/on and reopened storage, all five Forge-backed broken-storage cases, real
+  import/equivalence/crash cuts and named integration checks. Forge's own bench
+  runs B/N=4000 through production storage against L2 from the real legacy row;
+  both plain/tool ratios must be ≤2.0× after collection (aim 1.5×).
+- **BREAKING:** the new on-disk schema requires backup-based downgrade; a second
+  concurrent writer conflicts; pruned operation replays outside the approved
+  64-revision/current-epoch window conflict. Record these in CHANGELOG during
+  implementation. No feature flag or compatibility aliases.
 
-  Forge's adapter work starts once that runtime revision is pinned.
-- **Two journal domains over one encrypted store.** `SqliteProtectedRuntimeStore::journal()` returns
-  an ordinary journal for `SessionStore` and a protected journal for `CheckpointStore`. The
-  ordinary projection is identity, which is exactly today's behaviour: the ordinary store already
-  keeps the exact snapshot, encrypted. Bodies are sealed with the existing key. They are keyed by
-  an HMAC of the object id, so no plaintext content hash reaches disk, and they are stored once
-  across both domains. Credentials still never enter either domain.
-- **New tables** in one new timestamped migration. Nothing existing changes.
-  - `agent_session_journal_head`: per session and domain, with `revision` as CAS, writer epoch,
-    sealed head, `has_checkpoint`, retirement tombstone and grant, `gc_dirty`
-  - `agent_session_journal_body`: shared sealed immutable bodies
-  - `agent_session_journal_object`: domain and session membership, including staging
-  - `agent_session_journal_operation`: idempotency and replay fences
-  - `agent_session_journal_record`: durable pins, dependency index, retained-head catalog
-- **Import on first writer open** through the runtime's v3 import, including mid-turn
-  checkpoints, with no provider or tool I/O. The legacy row is never written again.
-- **Legacy store becomes read-only.** The legacy `load`/`load_latest` methods stay, as the
-  import source. Their `save` paths are deleted and refuse with a typed conflict.
-- **Host probes move to the journal.** These now read the journal heads:
-  - the per-turn `saved` / `overhead_measured` probe
-  - the topic-fork probe
-  - topic-rotation hand-over
-  - Agent continuity `checkpoint_present`
-
-  The legacy columns are still checked for sessions that have not been imported yet.
-- **Retention.** A `session-journal-retention` worker retires sessions Forge will never resume
-  (topic-rotation sources and profile rotations; more per owner decision Q1). Each tick it
-  collects unreachable objects of changed sessions and removes orphaned bodies. There is no TTL,
-  and Task completion retires nothing. Project, Agent and chat deletion keep cascading.
-- **Conformance in Forge's suite.** `agent-runtime-testkit` becomes a dev-dependency. The protected,
-  ordinary and collection conformance suites, plus Forge's legacy-decoder schema gate, run against
-  the real SQLite adapter.
-- **BREAKING (visible):**
-  - Sessions import on their next turn. Older builds refuse the upgraded database, as for any
-    migration, so downgrading means restoring a backup.
-  - A second concurrent runtime writer on one session fails with a conflict instead of
-    silently superseding.
-  - Live long sessions retain more disk, up to about 4× the uncompressed conversation, while
-    writing about 99% less per turn.
-- Out of scope:
-  - U10 (LCM stays a second copy)
-  - a warm runtime per session
-  - redaction of the ordinary domain
-  - dropping the legacy table (a later cleanup change, design D7.6)
+Out of scope: U10/LCM-table consolidation, warm runtimes, runtime schema 5 and
+legacy-table removal in this release. The Owner Decisions receipt is unchanged.
 
 ## Impact
 
-- Affected specs: `native-session-journal` (new), `session-journal-retention` (new)
-- Affected code:
-  - agent-runtime (prerequisite, separate repository and change): journal engine and storage
-    trait (R1–R6)
-  - `Cargo.toml`: runtime pin moves to the prerequisite revision.
-    `crates/agent-host/Cargo.toml`: `agent-runtime-testkit` dev-dependency.
-  - `crates/db/migrations/V{YYYYMMDDHHMM}__session_journal.sql`, and db probes in
-    `crates/db/src/sqlite/{embedded_agent.rs,agent.rs}`
-  - `crates/agent-host/src/session_journal/` (new: storage, keys, sealing, cache, host controls),
-    `crates/agent-host/src/protected_store.rs` (`journal()`, legacy save removal),
-    `crates/agent-host/src/native.rs` (probes)
-  - `crates/services-agents/src/` (retention worker, `topic_rotation.rs` and
-    `embedded_agent_service.rs` nudges, `runtime/mod.rs` wiring)
-  - `crates/services/src/attention_service.rs` (`checkpoint_present` source)
-  - tests:
-    - `crates/agent-host/tests/session_journal_{conformance,runtime,bench}.rs`
-    - `crates/services-agents/tests/suite/native_chat_{lcm_compaction,tool_exchanges}.rs`, which
-      move off the legacy table
-  - docs: `docs/architecture.md`, `docs/getting-started.md`, `docs/performance-testing.md`,
-    `CHANGELOG.md`
-- Public surfaces:
-  - No REST, MCP, CLI or event payload changes.
-  - `AgentContinuityHealth.checkpoint_present` keeps its meaning.
-  - The on-disk layout gains five tables.
-- Overlap: the runtime pin bump job (`82f5aac` → `1de6d7d`) must land first. U10 (LCM canonical
-  journal) follows this change.
+- Affected specs: `native-session-journal`, `session-journal-retention`.
+- Future implementation: workspace runtime pin/lockfile and agent-host testkit;
+  `crates/agent-host/src/session_journal/`, `protected_store.rs`, `native.rs`;
+  one new DB migration and scalar DB probes; services-agents retention/recovery
+  wiring and nudges; continuity caller and focused native-chat tests.
+- Future docs: `docs/architecture.md`, `docs/getting-started.md`,
+  `docs/performance-testing.md`, `CHANGELOG.md`.
+- Public API/MCP/CLI/events and `checkpoint_present` meaning stay stable. The disk
+  layout gains six tables; no per-object body/index or operation-result rows.
+- This revision changes only this spec folder and the requested local report.
+  It performs no implementation, builds, release or runtime-repository edits.
+- Evidence and detailed contract: design D2–D10; reference measurements are inputs,
+  not a claim that Forge's release gates already pass.
