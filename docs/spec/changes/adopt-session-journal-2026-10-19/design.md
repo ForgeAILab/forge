@@ -309,14 +309,24 @@ isolated measurement step, not a turn operation.
 (binary carry) in the apply transaction; original operation/digest/result fields
 round-trip exactly. Identical replay returns the original head within the retained
 window; different input conflicts. The **engine** selects S5 pruning during
-collection: keep revisions `> current_revision − 64`, plus **all** results whose
-writer epoch is the current epoch. Execute `prune_operations_before` only when
-supplied, preserving the epoch exception and rebuilding operation tiers atomically.
-Forge invents no TTL or independent replay floor and never prunes during commit.
-A pruned replay returns `StateConflict` and cannot apply again. The epoch exception
-means a long-lived writer can retain more than 64 records. The reference's S4 code
-currently rejects pruning: production must implement the released directive, not
-copy that refusal or claim its S5 projection is measured behavior.
+collection and passes an **inclusive** floor:
+`prune_operations_before = current_revision.saturating_sub(64)` (runtime
+`controls.rs`, D8.6: revision current−64 survives, current−65 may be pruned; at
+revision 70 the floor is 6 and 65 records remain). Storage executes exactly the
+trait rule (`storage/mod.rs`, `VolatileJournalStorage`): within the written
+(domain, session) only, keep every record with `revision >= floor`, plus the
+**single last** record (maximum `revision`) whose `result.writer_epoch` equals
+the `writer_epoch` of the session record as it stands after this write's
+replacement record (the stored record when `record = None`). Every other
+current-epoch record below the floor is pruned; the exception is one record, not
+the whole epoch. Rebuild operation tiers atomically in the same apply. Execute
+pruning only when the directive is supplied; Forge invents no TTL or independent
+replay floor and never prunes during commit. A pruned replay returns
+`StateConflict` and cannot apply again. The reference's S4 code currently
+rejects pruning: production must implement the released directive, not copy that
+refusal or claim its S5 projection is measured behavior. If the released runtime
+states a different floor or exception, its text and conformance win and this
+section is corrected in task 1.
 
 ### D5. Forge adapter and engine-call mapping
 
@@ -493,7 +503,7 @@ bounded physical cleanup (up to 5,000 candidate packs per transaction) to purge
 unheld slots/empty packs; preserve any other domain/session holder. This path is
 explicit session deletion, not an alternate tracing collector. Tombstone records
 remain until their `agent_session` is itself deleted. Retirement does not promise
-zero disk bytes: tombstones, retained/current-epoch replay results and any valid
+zero disk bytes: tombstones, in-window replay results and any valid
 pins can remain. Measure these separately.
 
 The actual reference table below replaces the previous logical 3.8×/4× estimates.
@@ -532,8 +542,9 @@ downgrade and key continuity), `docs/performance-testing.md` (fixture and actual
 Forge table), and `CHANGELOG.md` under `Unreleased`:
 
 - `### Breaking`: journal on-disk layout/newer-database guard and backup-based
-  downgrade; concurrent writer conflicts; operation replay guaranteed for latest
-  64 revisions plus current writer epoch, older pruned replay conflicts.
+  downgrade; concurrent writer conflicts; operation replay guaranteed only for
+  revisions at or above current−64 (inclusive floor) plus the current writer
+  epoch's last operation; older pruned replays conflict.
 - `### Changed`: delta persistence through the runtime engine, encrypted packs,
   ordinary policy projection, retirement of replaced/unresumable sessions and
   bounded collection. Include measured Forge numbers after D10, not an invented
@@ -542,7 +553,8 @@ Forge table), and `CHANGELOG.md` under `Unreleased`:
 This document records proposed code/doc work only. The Owner Decisions below are
 preserved verbatim as the historical receipt, including then-candidate levers and
 older wording. The settled constraints carried into this revision are L2,
-storage-only S1–S5, 64 revisions plus current epoch and no runtime schema 5.
+storage-only S1–S5, the runtime's 64-revision window (inclusive floor plus the
+current writer epoch's last operation, D4) and no runtime schema 5.
 No new approval or decision is appended to that receipt.
 
 ### D10. Forge measurement and release gate
@@ -573,7 +585,8 @@ For each case, create isolated file DBs with the same Forge schema/session setup
    ForgeJournalStorage, with S1–S5, terminal maintenance and collection to a
    stable dirty/replay state. Measure immediately before collection, after it,
    and after retirement; include operation tiers, pins/catalog and opaque engine
-   metadata. Confirm released-window edge/current-epoch behavior and restart.
+   metadata. Confirm the released window edge (current−64 kept, current−65
+   pruned), the single current-epoch last-operation exception and restart.
 3. For **each** layout, run `wal_checkpoint(TRUNCATE)`, `VACUUM`, and a final
    truncated checkpoint. Physical retained bytes = `page_count × page_size`
    minus that same layout's empty-schema/session-setup baseline. Verify file

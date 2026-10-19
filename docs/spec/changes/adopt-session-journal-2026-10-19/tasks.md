@@ -84,9 +84,12 @@ No runtime bench crate becomes a production dependency.
 - [ ] **8. S4 operation packs and S5 directive execution (≤3 h).**
   Binary-carry 2^tier packs hold lossless complete original results. Implement
   replay lookup/conflicting-input behavior through the engine. Execute only its
-  explicit collection pruning directive, preserving revision>current−64 and all
-  current-epoch records; rebuild tiers atomically. Do not prune on commits or
-  copy the bench's unimplemented-S5 refusal.
+  explicit collection pruning directive: keep revision >= floor (floor =
+  current−64, inclusive) plus the one highest-revision record whose
+  result.writer_epoch equals the post-write record's epoch; prune the rest of
+  that domain/session only; rebuild tiers atomically. Test the edge at revision 70
+  (floor 6 kept, 5 pruned) and an old current-epoch record below the floor being
+  pruned. Do not prune on commits or copy the bench's unimplemented-S5 refusal.
   Focused tests: same storage target filtered separately to
   `operation_pack_replay_restart` and `engine_replay_window_edges`.
 
@@ -234,7 +237,8 @@ No runtime bench crate becomes a production dependency.
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
   Breaking/Changed entries per D9, with actual pins/results. State next-release
-  legacy cleanup, approved retirement and 64-revision/current-epoch replay.
+  legacy cleanup, approved retirement and the 64-revision replay window
+  (inclusive floor plus the current writer epoch's last operation).
   Validate this change's deltas and links; verify no per-object SQL requirement or
   stale identity/lifetime-replay/4× gate remains outside the verbatim receipt.
   Focused checks: strict spec validation and whitespace/link review. No full code

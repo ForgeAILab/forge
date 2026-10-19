@@ -36,8 +36,9 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   during collection; S3 keeps kind-ordered bodies and prefix/offset indexes inside
   sealed packs, with full-id verification. Membership bitmaps preserve domain and
   session isolation and permit shared bodies. S4 packs complete original operation
-  results; the engine selects S5 pruning (latest 64 revisions plus current writer
-  epoch), which storage executes only on an explicit collection directive.
+  results; the engine selects S5 pruning (inclusive floor current−64 plus the
+  current writer epoch's last operation), which storage executes only on an
+  explicit collection directive.
 - **Keep Forge's cipher and keys.** Real XChaCha20-Poly1305, fresh 24-byte nonce,
   authenticated row binding and existing key material/key_revision. Full object ids
   and prefixes stay inside sealed packs; no per-object HMAC/index is needed.
@@ -71,7 +72,8 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   both plain/tool ratios must be ≤2.0× after collection (aim 1.5×).
 - **BREAKING:** the new on-disk schema requires backup-based downgrade; a second
   concurrent writer conflicts; pruned operation replays outside the approved
-  64-revision/current-epoch window conflict. Record these in CHANGELOG during
+  64-revision window (inclusive floor plus the current writer epoch's last
+  operation) conflict. Record these in CHANGELOG during
   implementation. No feature flag or compatibility aliases.
 
 Out of scope: U10/LCM-table consolidation, warm runtimes, runtime schema 5 and

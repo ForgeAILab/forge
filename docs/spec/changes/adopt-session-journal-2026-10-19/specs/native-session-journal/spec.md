@@ -100,7 +100,7 @@ Last-membership releases SHALL remove the body bytes from packs in that same tra
 - **AND** the receipt counts that body and its canonical length exactly once, even with S2 merging disabled
 
 ### Requirement: Engine replay window with packed original results
-Forge SHALL store lossless operation records in binary-carry operation packs and let the engine select pruning only during collection. Records SHALL remain for revisions greater than current revision minus 64 and for every result in the current writer epoch; storage SHALL execute only the explicit engine pruning directive. Identical retained replays SHALL return the original head, different inputs SHALL conflict, and pruned replays SHALL conflict without applying again.
+Forge SHALL store lossless operation records in binary-carry operation packs and let the engine select pruning only during collection. When the engine supplies `prune_operations_before = floor` (current revision minus 64, saturating), storage SHALL keep, within that domain and session only, every record whose revision is at or above the floor plus the single record with the highest revision whose result writer epoch equals the session record's writer epoch after the write; it SHALL prune every other record below the floor and SHALL NOT prune without the directive. Identical retained replays SHALL return the original head, different inputs SHALL conflict, and pruned replays SHALL conflict without applying again.
 
 #### Scenario: Replay after head advance and writer change
 - **WHEN** a retained operation is retried with the same input after a later publication or writer change
@@ -108,9 +108,9 @@ Forge SHALL store lossless operation records in binary-carry operation packs and
 - **AND** no new revision or duplicate body is written
 
 #### Scenario: Window boundary and current epoch exception
-- **WHEN** collection prunes records outside the latest 64 revisions
-- **THEN** records exactly at or below the cutoff from older epochs may be removed
-- **AND** newer records and all current-epoch results survive, even if the epoch has more than 64 results
+- **WHEN** collection at current revision 70 supplies the pruning floor 6
+- **THEN** records at revisions 6 through 70 survive and records below 6 are removed
+- **AND** a current-writer-epoch record below the floor survives only if it is that epoch's highest-revision record
 - **AND** a replay of a pruned operation conflicts rather than becoming a new commit
 
 ### Requirement: One-time lazy import with exact-first authority
