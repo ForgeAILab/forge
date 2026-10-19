@@ -234,6 +234,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- New native agent profiles record the Agent Runtime revision Forge actually
+  pins in `config_json.runtime_revision`; it had stayed at `5ee41e4` since the
+  move to `82f5aac`. Existing profiles keep the value they were created with.
 - Re-running Review now cancels its previous attempt and records the new entry
   atomically, so an entry write failure leaves the previous attempt recoverable.
   A completed reviewer waiting for human approval no longer adds command steps
