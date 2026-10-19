@@ -293,6 +293,51 @@ mod tests {
     }
 
     #[test]
+    fn a_checked_reason_never_changes_the_typed_turn_failure() {
+        use api_types::TurnFailure;
+        let misleading = r#"{"error":{"code":"usage_limit_reached","message":"provider returned HTTP 401: invalid credential, quota exhausted, retry after 3600s"}}"#;
+        for (status, body, expected) in [
+            (400, "", TurnFailure::ProviderSchema),
+            (400, misleading, TurnFailure::ProviderSchema),
+            (401, "", TurnFailure::ProviderAuth),
+            (401, misleading, TurnFailure::ProviderAuth),
+            (
+                403,
+                r#"{"error":{"message":"Insufficient quota"}}"#,
+                TurnFailure::ProviderAuth,
+            ),
+            (
+                429,
+                misleading,
+                TurnFailure::Transient { retry_after: None },
+            ),
+            (
+                429,
+                r#"{"error":{"type":"usage_limit_reached","message":"limit"}}"#,
+                TurnFailure::UsageLimit { resets_at: None },
+            ),
+            (
+                503,
+                misleading,
+                TurnFailure::Transient { retry_after: None },
+            ),
+        ] {
+            let original = super::super::http_rejection(status, body, None);
+            let error = diagnostics().attach(original.clone(), status, body.as_bytes());
+            assert_eq!(
+                crate::native::provider_turn_failure(&error),
+                expected,
+                "{status} {body}"
+            );
+            assert_eq!(crate::native::provider_turn_failure(&original), expected);
+            assert_eq!(
+                (error.kind, error.retryable),
+                (original.kind, original.retryable)
+            );
+        }
+    }
+
+    #[test]
     fn json_and_gemini_sse_reasons_are_bounded_and_keep_error_classification() {
         for body in [
             r#"{"error":{"code":"invalid_request","message":"bad argument"}}"#,
