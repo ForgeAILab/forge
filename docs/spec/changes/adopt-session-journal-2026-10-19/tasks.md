@@ -19,14 +19,21 @@ No runtime bench crate becomes a production dependency.
 
 ## Release gate and foundations
 
-- [ ] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤2 h).**
+- [ ] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤3 h).**
+  Forge pins agent-runtime v0.5.0 (`82f5aac`) in agent-host, services and
+  services-agents. The engine release comes after 0.6.0–0.7.0, whose CHANGELOG
+  has Breaking entries. If the workspace is still below the latest pre-engine
+  release when this starts, first land that non-journal upgrade as separate
+  job(s) (1a, each ≤3 h, scoped by the runtime CHANGELOG, no journal adoption).
+  This job (1b) then moves only to the engine release.
   Use the first agent-runtime release containing extract-journal-storage-engine;
   record its actual release/tag and immutable SHA, with one source/revision for all
   runtime packages and testkit. Verify D2 rules 1–7/receipt, N1 compact pins, N2/R4
   working memo, R5/R6, S5 and reviewer `a49e3e0` futures-mutex fix in that release.
   Stop subsequent jobs if unavailable; do not implement runtime fixes in Forge or
-  invent a version. Update Cargo.toml/lockfile together.
-  Focused check: `cargo check -p forge-agent-host`; add/run
+  invent a version. Update Cargo.toml/lockfile together. Confirm the released S5
+  floor/exception and pruning semantics match D4, or correct D4 first.
+  Focused check: `cargo check -p forge-agent-host -p services -p services-agents`; add/run
   `cargo test -p forge-agent-host --test session_journal_dependency engine_release_contract`.
 
 - [ ] **2. File-backed test support and engine harness (≤2 h).**
@@ -58,6 +65,7 @@ No runtime bench crate becomes a production dependency.
   directory) plus a sealed zstd-3 body unit of kind-ordered canonical bodies,
   exact full-id/kind verification and bounded decode. XChaCha20-Poly1305 with
   fresh nonces, existing keys and AAD binding unit kind, pack id and generation.
+  Derive the AEAD and lookup keys from the master key with HKDF-SHA256 (D3).
   Seal all metadata/operation units; use small catalog/pin HMAC lookup keys, no
   per-object index. Test collisions, malformed offsets, tampering/AAD swaps and
   absence of clear object ids/prefixes.
@@ -82,7 +90,8 @@ No runtime bench crate becomes a production dependency.
   global index inside the transaction per D5; persist exactly supplied
   revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
   order and publish one final pack. Roll back every pre-commit cut; AfterCommit
-  commits then errors. Invalidate caches on ambiguous outcomes.
+  commits then errors. Invalidate caches on ambiguous outcomes. Emit the D8 apply
+  tracing (kind, duration, lock hold, receipt; no contents or ids).
   Focused tests: same storage target filtered separately to
   `apply_atomic_cuts` and `independent_connection_expect_fences`.
 
@@ -214,13 +223,17 @@ No runtime bench crate becomes a production dependency.
   protected/ordinary retire, bounded dirty collection (20,000 objects/call, 10 s
   scheduling budget), S2 terminal hook. Cover replaced sources, active-writer
   conflicts, successor safety, Task completion preservation and crash between
-  domain retirements. All engine controls are awaited.
+  domain retirements. All engine controls are awaited. Emit the D8 worker
+  tracing; an undecryptable session is logged once and skipped, never retired or
+  released.
   Focused test: `cargo test -p services-agents --features test-support --test main session_journal_retention::rotation_and_retry`.
 
 - [ ] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
-  other than the scope's dormant session. Keep resumable dormant chats, reusable
-  Task sessions and active writers. Do not import legacy-only dead rows merely
+  other than the scope's dormant session, where dormant is decided by calling
+  `dormant_native_chat_session_id` per (identity, scope, profile), never a
+  re-derived rule. Keep resumable dormant chats (one per profile), reusable Task
+  sessions and active writers. Test a scope with dormant chats for two profiles. Do not import legacy-only dead rows merely
   for retirement; leave them for next-release cleanup. Tombstones suppress fallback.
   Focused test: same retention module filtered to `unresumable_and_dormant_restart`.
 

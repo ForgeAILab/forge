@@ -147,9 +147,12 @@ Forge honors the runtime's seven trait rules:
 
 Construct engines with `JournalEngine::protected(storage, storage_id, config)`
 and `::ordinary(storage, storage_id, policy, config)`. Production config enables
-collection (`collection_enabled = true`) and initially uses the runtime's
-`validated_root_memo_bytes` default of 256 MiB **per engine**. The memo is bounded
-and process-local; tests also exercise zero/small budgets and collection disabled.
+collection (`collection_enabled = true`) and sets `validated_root_memo_bytes`
+explicitly to 128 MiB **per engine** (256 MiB for both) rather than the runtime
+default of 256 MiB each, because Forge runs two engines in one desktop process.
+D10 reports memo hit rates and resident memory; only that evidence raises it.
+The memo is bounded and process-local; tests also exercise zero/small budgets and
+collection disabled.
 
 The engine owns commit validation, ordinary projection/re-encoding, checkpoint
 floors, replay semantics, sequence/predecessor checks, leases, closures,
@@ -219,12 +222,25 @@ only and rebuilt at open from the index units. The old per-object
 `HMAC(id)` key and SQL id index are unnecessary: there is no clear digest/prefix
 in the database against which to confirm a guessed message. Encryption alone
 would not protect a clear catalog digest, so the small catalog lookup key remains
-`HMAC-SHA256(master_key, domain-separated catalog context || domain || session ||
-head_id)`; pin lookup keys similarly use a separate pin context. Real ids stay in
+`HMAC-SHA256(lookup_key, domain-separated catalog context || domain || session ||
+head_id)`; pin lookup keys similarly use a separate pin context. The journal's
+AEAD key and `lookup_key` are derived from the existing master key with
+HKDF-SHA256 under distinct labels (`forge/session-journal/aead/v1`,
+`forge/session-journal/lookup/v1`), so one key is never used for both
+XChaCha20-Poly1305 and HMAC. `key_revision` stays 1. Real ids stay in
 sealed metadata. Operation ids/digests/results stay inside operation packs, with
 no per-operation clear hash index. Membership bits and scalar counts expose
 structural sharing/size, not plaintext digest confirmation. AEAD protects content
 and row binding; full runtime-id verification protects lookup correctness.
+
+**Key change.** The master key is SHA-256 of the server JWT secret. Changing or
+losing that secret makes every sealed unit undecryptable, exactly as it does for
+today's legacy rows and credentials. An authentication failure is a typed error
+for that session: its open, import and collection fail closed, and the worker
+logs it once per session and continues with other sessions. Nothing is retired,
+released or deleted because of it. Deletion cleanup removes packs that have no
+membership row without decrypting them; partially held undecryptable packs stay.
+Key rotation remains unsupported.
 
 Credentials remain exclusively in the existing credential tables and
 `ProviderCredentialSource` leases. Decrypted-pack/metadata tests cover API keys,
@@ -571,6 +587,17 @@ that are not their scope's dormant session. Keep resumable dormant chats and Tas
 sessions that remain reusable; Task completion alone never retires. These are
 approved decisions, not conditional tasks or new open questions.
 
+"Dormant" means exactly what `SqliteDb::dormant_native_chat_session_id` would
+resume: the newest suspended, unreplaced native row per **(identity, context
+scope, profile)**. A scope has one dormant session per profile. The worker calls
+that same query for every profile with suspended rows in the scope and never
+re-derives the rule, so a chat for another profile stays resumable. "Task
+sessions that remain reusable" are Task sessions not suspended by a restart;
+after a restart only Agent Chat resumes. If a resume ever reaches a retired
+journal, for example after the newer dormant row was replaced, Forge starts a
+fresh session as it does for any unresumable scope. It never loops on the
+conflict or falls back to stale legacy state.
+
 A `session-journal-retention` worker uses the existing workers framework, a 60 s
 tick and post-commit rotation/recovery nudges. Retire protected then ordinary only
 after the engine accepts the revision-bound grant, no-live-writer and
@@ -607,6 +634,19 @@ explicit session deletion, not an alternate tracing collector. Tombstone records
 remain until their `agent_session` is itself deleted. Retirement does not promise
 zero disk bytes: tombstones, in-window replay results and any valid
 pins can remain. Measure these separately.
+
+**Observability.** Storage and the worker emit structured `tracing` events
+(target `forge_session_journal`) with counts and durations only, never contents,
+ids or keys. Events cover:
+
+- each apply's kind, duration, write-lock hold and receipt;
+- S2, compact and cleanup rewritten packs and bytes;
+- collect reports and gate hold;
+- retirement outcomes and conflicts;
+- decrypt/authentication failures, logged once per session.
+
+Long write holds also surface through `db::begin_immediate`'s existing
+5-second warning. No API, event payload or metrics endpoint changes.
 
 The actual reference table below replaces the previous logical 3.8×/4× estimates.
 Full A/B/C and N=100/1000/4000 results are in rt-e4 and runtime D8.4; this selection
@@ -755,7 +795,8 @@ not claim Forge has run or passed it.
 
 ## Migration Plan
 
-Execute tasks 1–26 in order: released pin gate; test support and six-table schema;
+Execute tasks 1–26 in order: released pin gate (after any separate non-journal
+runtime upgrade from v0.5.0, task 1a); test support and six-table schema;
 codec/reads/apply/pins/operations/receipts/repack; conformance and negative cases;
 engine wiring/probes/legacy refusals; import/crash/integration checks; approved
 retirement and deletion maintenance; measurement; final docs/CHANGELOG. Each task

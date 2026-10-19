@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Retirement of replaced and unresumable sessions
-Forge SHALL retire replaced topic/profile-rotation sources and suspended native sessions it can no longer resume: non-Agent-Chat scopes after restart and Agent Chat rows that are not their scope's dormant session. Forge SHALL preserve resumable dormant chats and reusable Task sessions; Task completion alone SHALL NOT retire a session. Engine authorization SHALL bind the current revision and refuse live writers or unresolved transfer/dependency state; protected retirement SHALL precede ordinary retirement.
+Forge SHALL retire replaced topic/profile-rotation sources and suspended native sessions it can no longer resume: non-Agent-Chat scopes after restart and Agent Chat rows that are not their scope's dormant session. Forge SHALL preserve resumable dormant chats and reusable Task sessions; Task completion alone SHALL NOT retire a session. The dormant session SHALL be decided per identity, context scope and profile by the same query Forge uses to resume, so each profile keeps its own dormant chat. A session undecryptable after a key change SHALL NOT be retired, released or deleted because of that failure. Engine authorization SHALL bind the current revision and refuse live writers or unresolved transfer/dependency state; protected retirement SHALL precede ordinary retirement.
 
 #### Scenario: Topic rotation source
 - **WHEN** a completed rotation records its published successor and marks the source replaced
@@ -13,6 +13,11 @@ Forge SHALL retire replaced topic/profile-rotation sources and suspended native 
 - **THEN** the worker retires non-Agent-Chat sessions and Agent Chat rows other than their scope's dormant session
 - **AND** it preserves resumable dormant chats and does not retire an active writer
 - **AND** it does not eagerly import legacy-only dead sessions solely for retirement; their payload cleanup stays in the next release
+
+#### Scenario: Dormant chats for two profiles in one scope
+- **WHEN** an Agent Chat scope has suspended native sessions for two profiles after a restart
+- **THEN** the newest unreplaced suspended session of each profile is kept as that profile's dormant session
+- **AND** only older suspended rows of each profile are retired
 
 #### Scenario: Task completion
 - **WHEN** a Task reaches done and its session remains reusable
