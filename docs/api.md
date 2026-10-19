@@ -409,7 +409,8 @@ and broader conservative guards listed in [architecture](architecture.md).
 Native turn failure messages may contain a provider's checked rejection reason
 (up to 300 characters). Reasons reflecting credentials sent on that request are
 omitted; raw HTTP bodies are never logged. Rejected requests use the runtime
-`Provider` error kind instead of `Config`. Existing REST/MCP error codes and
+`Provider` error kind, so their message reads `Provider: …` instead of
+`Config: …`. Existing REST/MCP error codes and
 structured turn failure/retry/recovery fields are unchanged; clients should use
 those fields rather than parse message text. Generic embedded-runtime REST/MCP
 failures continue to redact internal provider details.
@@ -421,7 +422,10 @@ when no provider outcome has been recorded. Health contains `status`
 `backoff_until`. A timed backoff stops new Task dispatch and leaves queued
 Agent Chat turns waiting without consuming attempts. Auth failures have a
 `null` backoff time and remain unavailable until `POST /providers/{id}/test`
-succeeds. The connection test itself updates the health row.
+succeeds. The connection test itself updates the health row. Native Agent
+Chat, Task and reviewer-correction turns record health from typed turn
+evidence only (credential rejection, usage limit, exhausted transient
+retries), never from provider message text.
 | GET    | `/api/v1/provider-authorizations/{provider}/callback` | Complete a browser callback after validating the protected state and trusted redirect origin |
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
 | POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |

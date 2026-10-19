@@ -92,8 +92,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- Native provider rejection messages now use the provider error kind and may include a bounded reason checked against sent credentials; credential-reflecting reasons and raw HTTP bodies are withheld. Error codes and typed retry/recovery decisions are unchanged.
-
 - Review parks with a `review_needs_owner` condition now use Attention category
   `review_needs_owner` instead of `execution_failed`. Clients matching category
   values must handle this owner-decision category.
@@ -177,8 +175,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D (`1de6d7d`), retaining materialized session/checkpoint stores without journal adoption.
-
+- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D
+  (`1de6d7d`), retaining materialized session/checkpoint stores without
+  journal adoption.
+- A native turn failed by a provider rejection now reads
+  `Provider: provider rejected the request…` instead of `Config: …` in Task
+  execution errors and Agent Chat failure text, and may end with the
+  provider's own reason (at most 300 characters). A reason that echoes a
+  credential sent on that request is withheld, and raw HTTP bodies are never
+  logged. Message text is not a contract: REST/MCP error codes, `TurnFailure`
+  values and retry/recovery decisions are unchanged.
 - Forge refuses to start on a data directory migrated by a newer Forge.
 - **The remaining agent/chat implementation moved from `services` to
   `services-agents` (internal).** Agent Chat policy, admission, workers and
@@ -234,6 +240,13 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native Task and reviewer-correction turns now feed provider entry health.
+  They were classified from error text, and the runtime's fixed provider
+  messages carry no HTTP status, so only usage limits were recognised. Health
+  now comes from typed evidence: a credential rejection marks the entry
+  `error` until a connection test passes (as Agent Chat already did), and a
+  usage limit or exhausted transient retries start the usual cooldown.
+  Provider wording cannot set it.
 - New native agent profiles record the Agent Runtime revision Forge actually
   pins in `config_json.runtime_revision`; it had stayed at `5ee41e4` since the
   move to `82f5aac`. Existing profiles keep the value they were created with.
