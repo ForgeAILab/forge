@@ -92,6 +92,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Native provider rejection messages now use the provider error kind and may include a bounded reason checked against sent credentials; credential-reflecting reasons and raw HTTP bodies are withheld. Error codes and typed retry/recovery decisions are unchanged.
+
 - Review parks with a `review_needs_owner` condition now use Attention category
   `review_needs_owner` instead of `execution_failed`. Clients matching category
   values must handle this owner-decision category.
@@ -174,6 +176,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   returns to `/login` without a loop or storing the returned tokens.
 
 ### Changed
+
+- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D (`1de6d7d`), retaining materialized session/checkpoint stores without journal adoption.
 
 - Forge refuses to start on a data directory migrated by a newer Forge.
 - **The remaining agent/chat implementation moved from `services` to

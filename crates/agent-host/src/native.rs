@@ -2749,6 +2749,53 @@ mod turn_failure_tests {
     use api_types::TurnFailure;
 
     #[test]
+    fn provider_rejections_keep_forge_classification_after_coarse_kind_change() {
+        use agent_runtime::core::{
+            error::{ErrorKind, FailureClass, FailureStage},
+            metadata::MetaValue,
+        };
+        for (provider_kind, runtime_kind) in [
+            (ProviderErrorKind::BadRequest, ErrorKind::Provider),
+            (ProviderErrorKind::Unsupported, ErrorKind::Config),
+        ] {
+            for retryable in [false, true] {
+                let mut original = ProviderError::new(provider_kind, "checked rejection");
+                original
+                    .metadata
+                    .insert("provider.detail", "invalid_request: bad argument");
+                original.metadata.insert("http.status", 400_i64);
+                if retryable {
+                    original = original.retry_after(1200);
+                }
+                let expected = if retryable {
+                    TurnFailure::ProviderRejected {
+                        retryable: true,
+                        retry_after: Some(1200),
+                    }
+                } else {
+                    TurnFailure::ProviderSchema
+                };
+                assert_eq!(provider_turn_failure(&original), expected);
+                let converted =
+                    RuntimeError::from(original).with_class(FailureClass::RequestRejected {
+                        stage: FailureStage::Provider,
+                    });
+                assert_eq!(converted.kind, runtime_kind);
+                assert_eq!(
+                    converted.metadata.get("http.status"),
+                    Some(&MetaValue::Int(400))
+                );
+                assert_eq!(runtime_turn_failure(&converted), expected);
+                assert!(
+                    !serde_json::to_string(&expected)
+                        .unwrap()
+                        .contains("bad argument")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn lifecycle_and_runtime_failures_keep_only_typed_evidence() {
         use agent_runtime::core::error::ErrorKind;
         for error in [

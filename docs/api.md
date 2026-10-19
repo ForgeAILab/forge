@@ -406,6 +406,14 @@ resolver and result URLs: it refuses every IPv4-mapped/compatible and 6to4
 address outright, the rest of `64:ff9b::/48` outside the well-known `/96`,
 and broader conservative guards listed in [architecture](architecture.md).
 
+Native turn failure messages may contain a provider's checked rejection reason
+(up to 300 characters). Reasons reflecting credentials sent on that request are
+omitted; raw HTTP bodies are never logged. Rejected requests use the runtime
+`Provider` error kind instead of `Config`. Existing REST/MCP error codes and
+structured turn failure/retry/recovery fields are unchanged; clients should use
+those fields rather than parse message text. Generic embedded-runtime REST/MCP
+failures continue to redact internal provider details.
+
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`
 (`healthy`, `backoff`, or `error`), `consecutive_failures`,

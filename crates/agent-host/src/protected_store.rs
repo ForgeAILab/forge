@@ -2039,7 +2039,8 @@ mod tests {
         )
     }
 
-    async fn session_store() -> (SqliteProtectedRuntimeStore, Arc<SqliteDb>, SessionSnapshot) {
+    pub(super) async fn session_store()
+    -> (SqliteProtectedRuntimeStore, Arc<SqliteDb>, SessionSnapshot) {
         let (store, db) = test_store().await;
         let now = db::now_rfc3339();
         for statement in [
@@ -3879,7 +3880,7 @@ mod tests {
         }));
     }
 
-    async fn runtime_v050_fixture_runtime(
+    pub(super) async fn runtime_v050_fixture_runtime(
         store: &SqliteProtectedRuntimeStore,
         runtime_session_id: &str,
         provider: Arc<agent_runtime::provider::fake::FakeProvider>,
@@ -3940,3 +3941,7 @@ mod tests {
             .expect("v0.5.0 runtime builds")
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_upgrade_tests.rs"]
+mod runtime_upgrade_tests;

@@ -386,14 +386,12 @@ impl EmbeddedTaskExecutor {
             .run_turn(turn_request(ctx.description.clone()), log_sink.clone())
             .await;
         self.active.write().await.remove(&ctx.execution_id);
-        if !cancellation.is_cancelled() {
-            let error_text = output.as_ref().err().map(ToString::to_string);
-            if let Err(error) = services::provider_health::record_entry_outcome(
-                &self.db,
-                credential_ref,
-                error_text.as_deref().map_or(Ok(()), Err),
-            )
-            .await
+        if let Some(outcome) =
+            native_provider_health_outcome(&output).filter(|_| !cancellation.is_cancelled())
+        {
+            if let Err(error) =
+                services::provider_health::record_entry_outcome(&self.db, credential_ref, outcome)
+                    .await
             {
                 tracing::warn!(execution_id = %ctx.execution_id, error = %error, "provider health could not be recorded");
             }
@@ -643,12 +641,13 @@ impl EmbeddedTaskExecutor {
                         )
                         .await;
                     let result = self.backend.run_turn(request, log_sink).await;
-                    if !cancellation.is_cancelled() {
-                        let error_text = result.as_ref().err().map(ToString::to_string);
+                    if let Some(outcome) = native_provider_health_outcome(&result)
+                        .filter(|_| !cancellation.is_cancelled())
+                    {
                         if let Err(error) = services::provider_health::record_entry_outcome(
                             &self.db,
                             provider.credential_ref,
-                            error_text.as_deref().map_or(Ok(()), Err),
+                            outcome,
                         )
                         .await
                         {
@@ -1253,6 +1252,28 @@ async fn validate_write_capable_delivery(
     Ok(after_sha)
 }
 
+/// Native diagnostics can quote arbitrary checked provider wording. Only typed
+/// evidence may establish entry health; fixed messages retain the existing
+/// health recorder's cooldown and redacted public-message policy.
+fn native_provider_health_outcome<T>(
+    outcome: &std::result::Result<T, AgentHostError>,
+) -> Option<std::result::Result<(), &'static str>> {
+    use api_types::TurnFailure;
+    match outcome {
+        Ok(_) => Some(Ok(())),
+        Err(AgentHostError::RuntimeWithUsage {
+            provider_auth_rejected: true,
+            ..
+        }) => Some(Err("provider returned HTTP 401")),
+        Err(AgentHostError::RuntimeWithUsage { failure, .. }) => match failure {
+            TurnFailure::UsageLimit { .. } => Some(Err("provider usage limit reached")),
+            TurnFailure::Transient { .. } => Some(Err("provider request failed before a response")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Lifecycle failures escape dispatch, preserving the Task retry boundary.
 fn native_dispatch_failure(error: AgentHostError) -> Result<ExecutionResult> {
     Err(ServiceError::invalid_operation(error.to_string()))
@@ -1346,6 +1367,57 @@ mod tests {
             .await
             .expect("initial commit creates");
         (repo, before_sha)
+    }
+
+    #[test]
+    fn checked_provider_wording_cannot_change_native_task_health() {
+        use api_types::TurnFailure;
+        for (failure, auth, expected) in [
+            (TurnFailure::ProviderSchema, false, None),
+            (
+                TurnFailure::ProviderRejected {
+                    retryable: true,
+                    retry_after: Some(1200),
+                },
+                false,
+                None,
+            ),
+            (TurnFailure::Configuration, false, None),
+            (TurnFailure::Unclassified, false, None),
+            (
+                TurnFailure::ProviderAuth,
+                true,
+                Some(Err("provider returned HTTP 401")),
+            ),
+            (
+                TurnFailure::UsageLimit { resets_at: None },
+                false,
+                Some(Err("provider usage limit reached")),
+            ),
+            (
+                TurnFailure::Transient {
+                    retry_after: Some(1200),
+                },
+                false,
+                Some(Err("provider request failed before a response")),
+            ),
+        ] {
+            let error = AgentHostError::RuntimeWithUsage {
+                message: "provider rejected the request: HTTP 401 HTTP 429 usage limit reached secret-detail".into(),
+                failure,
+                provider_auth_rejected: auth,
+                usage_reports: vec![],
+            };
+            assert_eq!(native_provider_health_outcome::<()>(&Err(error)), expected);
+        }
+        assert_eq!(
+            native_provider_health_outcome(&Ok::<_, AgentHostError>(())),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            native_provider_health_outcome::<()>(&Err(AgentHostError::Runtime("HTTP 401".into()))),
+            None
+        );
     }
 
     #[test]

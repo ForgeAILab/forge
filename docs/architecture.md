@@ -2437,7 +2437,7 @@ live diagnostic window therefore preserves the same canonical state identity.
 Forge links context provenance from the latest manifest in the live session
 after the turn; it does not reconstruct historical replay from a checkpoint.
 
-The runtime pin is v0.5.0 (`82f5aac`). Its materialized session snapshots stay
+The runtime pin is v0.7.0 plus U9 groups C/D (`1de6d7d`). Its materialized session snapshots stay
 unversioned and its checkpoints remain schema 3 / transition revision 4, so
 Forge keeps the same encrypted store and database schema. Runtime schema-4
 SessionJournal support is only a capability contract in this release; Forge's
@@ -2455,6 +2455,36 @@ the SQLite LCM entry, whose content fingerprint covers it. The previous pin
 fingerprint check, so it cannot resume an LCM session that ran a reasoning turn
 on v0.5.0. Downgrading is therefore unsupported for those sessions; sessions
 without LCM, or without stored reasoning, still resume on the older pin.
+
+The v0.7.0 default request sizer counts reasoning signatures and advertises
+`char-ratio-2`. Forge uses that default for planning and LCM (there is no host
+`ForgeLcmSizer`). Its revision changes the LCM component fingerprint, while
+resume validates the saved identity, ownership and immutable DAG before
+rebuilding derived accounting. `FORGE_LCM_POLICY_REVISION` stays
+`forge-lcm-policy-2`; no migration or LCM namespace reset is needed. The frozen
+`runtime_82f5aac_session_checkpoint_lcm.json` fixture was produced by the prior
+Forge/runtime pin and proves encrypted snapshot/checkpoint resume, compaction,
+another turn and a second resume with historical sources and nodes intact.
+
+Both Forge stores keep the default unsupported `journal()` capability. The
+runtime's native import, writer fencing, retirement and collection paths are
+not enabled; materialized snapshots remain unversioned and checkpoints remain
+schema 3 / transition revision 4. The turn backend waits for
+`TurnHandle::completed()` before persisting and releasing its active registry;
+completion now also guarantees that runtime admission and execution gates have
+been released.
+
+Forge's custom provider transport caps HTTP error bodies at 8 KiB, extracts only
+JSON/SSE error status/code and message fields, and drops reasons reflecting sent
+credentials before and after control-character normalization. Checked reasons
+are capped at 300 characters in `provider.detail`, with numeric `http.status`;
+the provider adapters recheck them before adding them to error messages. Logs
+record only the HTTP status, never a raw body. Provider `BadRequest` now has the
+coarse runtime kind `Provider`; typed provider rejection/auth/quota evidence
+continues to govern Forge retry and recovery rather than error prose.
+Native Task execution and reviewer correction likewise record provider health
+from typed auth/quota/transient evidence using fixed diagnostics, so a checked
+provider reason cannot masquerade as an HTTP status or cooldown instruction.
 
 Native turn failures project runtime failure classes into Forge's existing
 typed categories: policy denial, context overflow, authentication, quota,

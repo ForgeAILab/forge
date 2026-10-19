@@ -1,3 +1,5 @@
+mod rejection;
+
 use crate::outbound_http::{
     ProxyEnvironment, PublicAddressPolicy, PublicHttpError, public_http_client_builder,
 };
@@ -22,11 +24,12 @@ impl ReqwestTransport {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
         let (client, url) =
             provider_client_for_url(&request.url, &ProxyEnvironment::from_env()).await?;
+        let diagnostics = rejection::RequestDiagnostics::new(&request);
         let mut builder = client.post(url).body(request.body);
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
-        let response = builder.send().await.map_err(|error| {
+        let mut response = builder.send().await.map_err(|error| {
             let kind = if error.is_timeout() {
                 ProviderErrorKind::Timeout
             } else {
@@ -48,15 +51,18 @@ impl ReqwestTransport {
             // provider's credential-refresh path can never trigger; anything
             // else would otherwise be parsed as an SSE stream and fail with
             // an empty-stream error that hides the real cause.
-            let body = response
-                .bytes()
-                .await
-                .ok()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default();
-            let body_excerpt: String = body.chars().take(300).collect();
-            tracing::warn!(status, body = %body_excerpt, "provider request rejected");
-            return Err(http_rejection(status, &body, retry_after_ms));
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                let remaining = rejection::MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == rejection::MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            let error = http_rejection(status, &String::from_utf8_lossy(&body), retry_after_ms);
+            let error = diagnostics.attach(error, status, &body);
+            tracing::warn!(status, "provider request rejected");
+            return Err(error);
         }
         let headers = response
             .headers()
