@@ -34,8 +34,10 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
 - **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack;
   S2 merges geometric tiers after terminal publication and makes a live base pack
   during collection; S3 keeps kind-ordered bodies and prefix/offset indexes inside
-  sealed packs, with full-id verification. Membership bitmaps preserve domain and
-  session isolation and permit shared bodies. S4 packs complete original operation
+  sealed packs (separate index and body units), with full-id verification.
+  Membership bitmaps preserve domain and session isolation; one physical copy per
+  id is shared by all holders, found through a RAM prefix index rebuilt at open
+  from the sealed index units. S4 packs complete original operation
   results; the engine selects S5 pruning (inclusive floor current−64 plus the
   current writer epoch's last operation), which storage executes only on an
   explicit collection directive.

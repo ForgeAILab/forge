@@ -48,9 +48,10 @@ No runtime bench crate becomes a production dependency.
 ## JournalStorage implementation
 
 - [ ] **4. Pack codec and real AEAD (≤3 h).**
-  Implement JRPACK v1, kind-ordered canonical bodies, sorted four-byte prefix/
-  varint index, exact full-id/kind verification and bounded decode. Compress whole
-  units with zstd 3; XChaCha20-Poly1305 with fresh nonces, existing keys and AAD.
+  Implement JRPACK v1 as a sealed index unit (sorted four-byte prefix/varint
+  directory) plus a sealed zstd-3 body unit of kind-ordered canonical bodies,
+  exact full-id/kind verification and bounded decode. XChaCha20-Poly1305 with
+  fresh nonces, existing keys and AAD binding unit kind, pack id and generation.
   Seal all metadata/operation units; use small catalog/pin HMAC lookup keys, no
   per-object index. Test collisions, malformed offsets, tampering/AAD swaps and
   absence of clear object ids/prefixes.
@@ -60,11 +61,13 @@ No runtime bench crate becomes a production dependency.
 - [ ] **5. Lossless read methods and cache consistency (≤3 h).**
   Implement load/objects/members/operation/pins/catalog/dirty_sessions against
   file-backed sqlx. Preserve opaque version/bytes; scalar metadata must agree with
-  authenticated payload. Batch pack reads, enforce membership on cache hits, use
-  pack generations and a bounded LRU; refresh across independent connections.
-  Dirty paging sorts runtime session ids after the opaque mapping. No one-query-
-  per-object/full-closure reread per warm commit.
-  Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_storage read_membership_metadata_and_reopen`.
+  authenticated payload. Build the complete global prefix index at open from
+  index units only (D4); batch pack reads, enforce membership on cache hits, use
+  pack generations and a bounded body LRU; refresh across independent
+  connections. Dirty paging sorts runtime session ids. No one-query-per-object/
+  full-closure reread per warm commit.
+  Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_storage read_membership_metadata_and_reopen`
+  and the same target filtered to `global_index_dedups_evicted_cross_session_body`.
 
 - [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
   One sqlx begin_immediate transaction/connection; SQL expect guard for existing

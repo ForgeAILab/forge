@@ -57,13 +57,18 @@ Full object ids SHALL remain inside sealed payloads and rebuildable RAM lookup m
 - **THEN** no decrypted pack, session, operation, catalog or pin payload contains the API key, access token or refresh token
 
 ### Requirement: Six-table pack layout and lossless storage records
-Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and operation_pack tables as described in design D4, without per-object body/offset rows. JournalEngineState SHALL round-trip version and bytes opaquely; Forge SHALL implement every JournalStorage read method, ordered dirty paging and apply/compact. Packs SHALL use whole-pack zstd, kind-ordered canonical bodies and an encrypted prefix/varint offset directory, with full-id verification and no runtime schema-5 change.
+Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and operation_pack tables as described in design D4, without per-object body/offset rows. JournalEngineState SHALL round-trip version and bytes opaquely; Forge SHALL implement every JournalStorage read method, ordered dirty paging and apply/compact. Each pack SHALL hold a separately sealed prefix/varint offset index unit and a sealed zstd body unit of kind-ordered canonical bodies, with full-id verification and no runtime schema-5 change. Storage SHALL keep one physical copy per runtime id across all domains and sessions, found through a complete process-wide prefix index rebuilt at open from the index units without decrypting bodies; pack ids SHALL never be reused.
 
 #### Scenario: Batch admission and lookup after restart
 - **WHEN** an apply admits a batch of new bodies and storage is reopened
 - **THEN** the final new bodies occupy a compressed/sealed pack with bitmap memberships
-- **AND** full-id lookup is rebuilt from authenticated packs without any per-object SQL index
+- **AND** the global prefix index is rebuilt from the sealed index units without any per-object SQL index and without decrypting body units
 - **AND** unknown opaque engine-state versions/bytes are returned unchanged
+
+#### Scenario: Cross-session admission of an existing body
+- **WHEN** a session admits a body that is stored only in another session's pack, and that pack is not in the plaintext cache or the storage was just reopened
+- **THEN** storage adds a membership bit to the existing slot and writes no second copy
+- **AND** release receipts stay zero until the last holder in any domain or session releases it
 
 #### Scenario: Consistent read during repack
 - **WHEN** another connection commits a pack rewrite and bitmap remap while an object batch is being read

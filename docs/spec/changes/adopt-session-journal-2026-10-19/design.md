@@ -198,18 +198,24 @@ admission/repack unit and membership directory, not an exclusive ownership grant
 
 **Real sealing.** Keep **XChaCha20-Poly1305**, Forge's existing master-key path and
 `key_revision`; do not copy the reference's zero-tag/nonce simulation. Compress a
-whole framed pack with zstd level 3, then encrypt once with a fresh random 24-byte
-nonce and real 16-byte authentication tag. Use a versioned `FORGE-JOURNAL\0`
-envelope. Authenticate format, table kind, pack id (or metadata row key), format
-revision and key revision as associated data. Shared packs cannot bind AAD to one
-holder's domain/session; singleton metadata does bind its full domain/session key.
-Every rewrite/repack uses a fresh nonce. Seal session, pin, catalog and operation
+pack's body unit with zstd level 3, then seal its index unit and body unit
+separately (D4), each with a fresh random 24-byte nonce and a real 16-byte
+authentication tag. Use a versioned `FORGE-JOURNAL\0`
+envelope. Authenticate format, table kind, unit kind (pack index or pack body),
+pack id plus pack generation (or metadata row key), format revision and key
+revision as associated data. Pack ids are never reused (SQLite `AUTOINCREMENT`);
+a purge rewrite keeps the id and increments `generation`, a merge writes a new
+id. Binding the generation stops a stale ciphertext of the same pack from being
+swapped back in and silently misaligning holders' bitmaps. Shared packs cannot
+bind AAD to one holder's domain/session; singleton metadata does bind its full
+domain/session key. Every rewrite/repack uses a fresh nonce. Seal session, pin, catalog and operation
 payloads too. Decode/authentication errors fail closed; never treat corruption as
 an absent or fresh session. Diagnostics never print decrypted contents or keys.
 
 **Id decision.** Runtime ids remain content digests and are never rewritten.
-Full ids, four-byte prefixes and offset indexes live **inside sealed packs**; the
-full-id → pack/slot cache is RAM only and rebuildable. The old per-object
+Four-byte prefixes and offsets live in each pack's **sealed index unit**; full ids
+are recomputed from verified bodies. The process-wide prefix index (D4) is RAM
+only and rebuilt at open from the index units. The old per-object
 `HMAC(id)` key and SQL id index are unnecessary: there is no clear digest/prefix
 in the database against which to confirm a guessed message. Encryption alone
 would not protect a clear catalog digest, so the small catalog lookup key remains
@@ -244,7 +250,7 @@ seed valid mappings for testkit ids; they need not be UUIDs.
 | `agent_session_journal_session` | PK `(storage_id, role, session_id)`; Forge session FK; revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
 | `agent_session_journal_pin` | PK `(D, S, pin_key)`; session FK; key/format/nonce | Complete `JournalPinRecord`, including roots and opaque state; Put/Remove only through apply. |
 | `agent_session_journal_catalog` | PK `(D, S, head_key)`; session FK; key/format/nonce | Complete `JournalCatalogEntry`; `head_key` is keyed as in D3, not the raw digest. |
-| `agent_session_journal_pack` | Opaque pack id PK; admission/repack owner label, generation, key/format/nonce, object/logical-byte counts | Compressed and sealed pack; bodies live until their last global membership. Owner label is advisory, **not** a cascading FK that could destroy another holder's bytes. |
+| `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); admission/repack owner label, generation, key/format, object/logical-byte counts | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit; bodies live until their last global membership. Owner label is advisory, **not** a cascading FK that could destroy another holder's bytes. |
 | `agent_session_journal_membership` | PK `(D, S, pack_id)`; session FK and pack FK; bitmap; secondary index on pack_id | One bit per prefix-directory slot. No object id, per-object row or offset index in SQL. Remove empty bitmap rows. |
 | `agent_session_journal_operation_pack` | PK `(D, S, tier)`; session FK; key/format/nonce | S4 lossless original operation records in binary-carry tiers, including private digest, revision and complete result head. |
 
@@ -256,16 +262,41 @@ invariants have CHECKs; `has_checkpoint` is false without a published head and o
 retirement. Scalar query columns must agree with the authenticated record on load.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
-(no row if all bodies exist already). Uncompressed pack v1 follows the reference:
-`JRPACK\0`, version byte, count, id-sorted four-byte prefixes with varint
-body offsets/lengths, then canonical bodies physically ordered by kind and full
-id. Bitmap slot order is directory order, not body-offset order. Compress the
-whole frame, including directory, then seal it. All lengths, offsets, counts and
-schema/kind envelopes are validated on decode. A prefix collision yields several
+(no row if all bodies exist already). Pack v1 keeps the reference's content but
+splits it into two sealed units. The **index unit** is `JRPACK\0`, version byte,
+count and the id-sorted four-byte prefixes with varint body offsets/lengths. The
+**body unit** is the canonical bodies physically ordered by kind and full id,
+compressed with zstd level 3. Bitmap slot order is directory order, not
+body-offset order. The prefixes are random and do not compress, so moving them
+out of the zstd frame costs about one nonce and tag per pack, not per object;
+D10 measures it. All lengths, offsets, counts and schema/kind envelopes are
+validated on decode. A prefix collision yields several
 candidates; recompute/verify the **complete** runtime object id against the requested
 id, never accept the prefix alone. Kind is checked from the canonical envelope,
 not trusted from the batch's clustering hint. No canonical object, reference or
 `JOURNAL_SCHEMA_VERSION` changes.
+
+**Global body index (required by rule 4).** Storage keeps exactly one physical
+copy of each runtime id across all domains and sessions. Testkit
+`membership_isolation_and_receipts` admits one body under four holders in two
+sessions and expects zero receipts until the fourth release, so per-session
+copies fail conformance, and admission must find an existing body anywhere in
+the database, including packs of other sessions that are not in the plaintext
+LRU. At storage open, Forge decrypts every pack's index unit (never the body
+units) and builds a complete process-wide RAM map from prefix to
+`(pack_id, generation, slot)`, stored as compact sorted arrays (about 10–16 B per
+object). Admission looks up each new id's prefix. For each candidate it opens
+that body unit through the LRU, verifies the complete id and sets a membership
+bit; only a verified miss writes the body into the apply's new pack. A
+duplicate admission with different bytes cannot pass, because admission
+validates `JournalObject::kind()`, which rechecks the id digest. The map is
+consulted only under the storage coordinator inside the write transaction (D5)
+and is updated from that transaction's staged changes after COMMIT. No clear id,
+prefix or keyed per-object tag is stored in SQL. A keyed 8-byte tag per slot was
+rejected: B/N=4000 holds 28–32 k objects, about 0.19× L2 of extra disk. The
+reference's alternative, decoding every pack in the database at open and again
+after every `data_version` change, is not acceptable on users' databases. D10
+reports open time and index RAM.
 
 **Atomic apply and SQL fence.** Use one sqlx `db::begin_immediate` transaction for
 all components of a `JournalWrite`. For an existing row, an SQL guard with
@@ -366,8 +397,9 @@ recreate it in an adapter. Test current-thread and multi-thread Tokio runtimes
 with suspended storage and competing maintenance/open operations.
 
 **Read/cache consistency.** Batch pack reads, not one SQL/decrypt per object.
-Build full-id lookup maps from authenticated packs on hydration; keep a bounded
-plaintext pack LRU (initially 64 MiB) and reuse the engine's separate R4 memo.
+Resolve ids through D4's complete global prefix index (not an LRU), then the
+reading session's membership rows; keep a bounded plaintext body LRU (initially
+64 MiB) and reuse the engine's separate R4 memo.
 Check membership on every request, including cache hits. SQLx read snapshots pair
 bitmaps with pack generation/payload; cache keys include pack id and generation,
 and repacks invalidate old slots. Refresh when another connection writes; if
@@ -606,7 +638,9 @@ the Forge gate blocks adoption even if the reference passed. Adjust only
 storage-level packing/compression/collection; do not silently introduce schema 5
 or change the denominator, projection, seed or acceptance threshold.
 
-Also report per-turn bytes/WAL, turn/open/probe/import wall time, longest write
+Also report storage open time and global prefix-index RAM (and both
+extrapolated to 1M and 5M objects), per-turn bytes/WAL, turn/open/probe/import
+wall time, longest write
 transaction, geometric-merge write amplification, engine object counters,
 last-membership receipt totals versus physical file savings, memo/cache hit/read
 counts and post-retirement metadata/operation bytes. Retain the existing focused
@@ -632,6 +666,11 @@ not claim Forge has run or passed it.
   separately; next-release cleanup is required to remove the legacy table.
 - Shared slots require global last-membership accounting and atomic bitmap remaps.
   Receipts, independent-connection tests and all conformance configurations gate it.
+- One copy per id needs a complete RAM prefix index of every pack. Open time and
+  memory grow with the total object count, not the active sessions; D10 measures
+  and extrapolates both. The runtime's own Owner Decision Q4 ("identical bodies
+  are not shared physically across sessions") conflicts with its conformance
+  suite and reference storage; Forge follows the conformance suite.
 - Ordinary redaction must preserve restore-critical data and runtime exact fields;
   protected equality and ordinary-policy equality are different test assertions.
 
