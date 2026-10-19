@@ -239,15 +239,31 @@ post-V149 convention. Never edit a historical migration or hard-code a speculati
 next number. Preserve all legacy rows; the legacy table drop is next release.
 
 The six tables below replace the old body/object/operation-row design. `D` means
-`(storage_id, role)` and `S` the Forge `session_id`, a foreign key to
-`agent_session(id)`. Trait arguments are runtime session ids: resolve them through
-`agent_session.runtime_session_id` before SQL access. Dirty-session pagination
-orders/returns those runtime ids, never the unrelated Forge UUIDs. Test fixtures
-seed valid mappings for testkit ids; they need not be UUIDs.
+`(storage_id, role)` and `S` the trait's **runtime session id**, stored as the
+opaque TEXT the runtime passes. Keys, reads and dirty paging use it directly, so
+reads never consult a mapping: an unknown runtime id has no rows and reads as
+absent, which the conformance `stranger` cases require. Dirty paging returns
+runtime ids in runtime-id order, never Forge UUIDs.
+
+Every per-session table also has `forge_session_id TEXT NOT NULL REFERENCES
+agent_session(id) ON DELETE CASCADE`, used only for cascades and host probes,
+with an index on that column in every per-session table (SQLite otherwise scans
+the child table on each `agent_session` delete). `agent_session.runtime_session_id`
+is nullable, not unique and not indexed today. The migration adds a plain
+**non-unique** index on it, never a UNIQUE index that would fail on an existing
+database with duplicates. `apply` resolves the mapping inside its transaction;
+zero or several matching `agent_session` rows is a typed host error (not
+`StateConflict`) that writes nothing, and a row's stored mapping must match on
+later applies. Conformance test support wraps `ForgeJournalStorage` in a
+test-only decorator. Before it delegates an apply for an unseen runtime id, it
+inserts a stub `agent_session` (seeded identity/profile/scope fixture) carrying
+that id. Production storage has no such mode. Pre-seeding a list of testkit ids
+is not acceptable: the suite uses dozens of literal and formatted ids (for
+example `atomic-{point:?}`) that change upstream.
 
 | Table | Key and clear query columns | Sealed payload / lifetime |
 | --- | --- | --- |
-| `agent_session_journal_session` | PK `(storage_id, role, session_id)`; Forge session FK; revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
+| `agent_session_journal_session` | PK `(storage_id, role, runtime_session_id)`; indexed `forge_session_id` FK; revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
 | `agent_session_journal_pin` | PK `(D, S, pin_key)`; session FK; key/format/nonce | Complete `JournalPinRecord`, including roots and opaque state; Put/Remove only through apply. |
 | `agent_session_journal_catalog` | PK `(D, S, head_key)`; session FK; key/format/nonce | Complete `JournalCatalogEntry`; `head_key` is keyed as in D3, not the raw digest. |
 | `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); admission/repack owner label, generation, key/format, object/logical-byte counts | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit; bodies live until their last global membership. Owner label is advisory, **not** a cascading FK that could destroy another holder's bytes. |
@@ -257,9 +273,11 @@ seed valid mappings for testkit ids; they need not be UUIDs.
 Session, pin, catalog, membership and operation-pack rows cascade from
 `agent_session`; pack rows do not. Deleting a session must not delete a shared
 pack. A bounded post-deletion cleanup purges slots no membership holds and removes
-empty packs, preserving any other holder (D8). Bitmap bounds and scalar
-invariants have CHECKs; `has_checkpoint` is false without a published head and on
-retirement. Scalar query columns must agree with the authenticated record on load.
+empty packs, preserving any other holder (D8). In-row invariants have CHECKs:
+`has_checkpoint` is false without a published head and on retirement, and a
+bitmap is non-empty. Bitmap length against the pack's slot count spans two
+tables, which a SQLite CHECK cannot express, so storage validates it on every
+read and write. Scalar query columns must agree with the authenticated record on load.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
 (no row if all bodies exist already). Pack v1 keeps the reference's content but
@@ -410,7 +428,7 @@ Production journal mutations share the storage coordinator; cascades also
 invalidate affected membership caches. No full-closure prefetch on every commit.
 
 **Scalar probes.** Return native publication, tombstone and checkpoint flags
-without decrypting a pack. A reservation is absent publication; a tombstone is a
+without decrypting a pack, selecting rows by the indexed `forge_session_id`. A reservation is absent publication; a tombstone is a
 retired conflict, not fresh state. Consult legacy payloads only when native state
 has not taken authority; a surviving stale legacy blob must never resurrect a
 retired or advanced session. Hand-over and continuity DB helpers retain their
@@ -422,8 +440,8 @@ existence probe.
 Add `agent-runtime-testkit` at exactly the runtime pin. Run
 `assert_journal_storage_conformance(factory)` unedited against the **real
 ForgeJournalStorage**, using fresh file-backed sqlx databases and real keys.
-The factory retains its temp directory and seeds valid Forge session mappings
-for testkit runtime ids. Use an explicitly enabled test-support feature without
+The factory retains its temp directory and uses D4's test-only mapping decorator,
+which creates a stub `agent_session` for each runtime id on its first apply. Use an explicitly enabled test-support feature without
 self dev-dependencies, or a test-local support module.
 
 Run all reference configurations: (1) S2 repacking disabled, (2) enabled,

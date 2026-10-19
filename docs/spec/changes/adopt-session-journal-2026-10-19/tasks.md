@@ -30,8 +30,10 @@ No runtime bench crate becomes a production dependency.
   `cargo test -p forge-agent-host --test session_journal_dependency engine_release_contract`.
 
 - [ ] **2. File-backed test support and engine harness (≤2 h).**
-  Add testkit at the exact pin, file DB/temp-dir ownership, valid Forge session
-  mappings for testkit ids, test-only legacy row seeding and real decoder helpers.
+  Add testkit at the exact pin, file DB/temp-dir ownership, the test-only mapping
+  decorator that inserts a stub agent_session for each unseen runtime id on its
+  first apply (no pre-seeded id list), test-only legacy row seeding and real
+  decoder helpers.
   Use explicit test-support without self dependencies. Start with engine factories
   over volatile storage for protected/ordinary/supported and unsupported collection;
   later jobs swap only the storage factory. Preserve the real decoder schema gate.
@@ -40,9 +42,13 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **3. Add six-table migration and cascade invariants (≤2 h).**
   Allocate one `V{NNN}__session_journal.sql` per D4 (unique UTC version at creation).
-  Add session, pin, catalog, pack, bitmap membership and operation_pack tables,
-  required indexes/CHECKs and Forge-session mapping. Keep legacy data byte-exact.
-  Per-session rows cascade; an advisory pack owner never cascades shared bodies.
+  Add session, pin, catalog, pack, bitmap membership and operation_pack tables
+  keyed by runtime session id, with an indexed `forge_session_id` cascade FK on
+  every per-session table, a non-unique index on
+  `agent_session(runtime_session_id)` (never UNIQUE), required indexes and
+  in-row CHECKs. Keep legacy data byte-exact. Per-session rows cascade; an
+  advisory pack owner never cascades shared bodies. Test the migration on a
+  database that already holds duplicate and NULL runtime_session_id values.
   Focused test: `cargo test -p db --features test-template --test main session_journal_schema::migration_preserves_legacy_and_shared_packs`.
 
 ## JournalStorage implementation
