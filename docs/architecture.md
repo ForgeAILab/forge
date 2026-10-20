@@ -2448,8 +2448,25 @@ conflict `legacy session store is read-only`; their old CAS, digest-skip, retry,
 supersession and policy-marker write paths are gone. The exact legacy
 save-order/digest/encryption baseline exists only under tests/test-support for
 D10 measurements. No legacy payload is cleared and the legacy table remains for
-next-release cleanup. Detailed import/crash/credential matrix acceptance is still
-tracked by tasks 17–20; this cut-over does not claim those later gates passed.
+next-release cleanup. The file-backed `legacy_import_state_matrix` covers Idle,
+snapshot-only, CallingModel, ModelResponseReady, AwaitingApproval,
+AwaitingInteraction, ExecutingTools, ToolOutcomeReady and cache-started imports.
+Deferred recovery performs no provider/tool/interaction I/O, all legacy columns
+remain unchanged, checkpoint-bearing state publishes protected first, and a
+second native open makes no legacy loads. Ordinary snapshots match the host
+projection; protected checkpoints match their exact input independently.
+
+`import_and_commit_crash_cuts` exercises all seven runtime failure points across
+119 import combinations and 161 live plain/tool publication cases. A fresh SQL
+pool, storage and engine pair checks repair/recovery; every live and recovered
+publication equals the legacy oracle, including lost acknowledgements, without
+replaying model/tool operations or overlaying stale legacy state. The async
+control regression holds a real SQLite write lock while controls and writer
+open wait, and proves local close and timer progress on both current-thread and
+multi-thread Tokio runtimes. Native integration fixture adoption and decrypted
+credential-pack exclusion remain uncompleted tasks 19–20; these tests do not
+claim those gates passed.
+
 Older builds cannot resume journal-only state and refuse the newer database;
 downgrade requires a pre-upgrade backup.
 

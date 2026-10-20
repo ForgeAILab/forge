@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T11:30:20Z
+updated_at: 2026-10-20T12:23:17Z
 completed_at:
 ---
 
@@ -361,7 +361,7 @@ No runtime bench crate becomes a production dependency.
   and schema are preserved. Architecture and Unreleased entries describe cut-over
   and backup-based downgrade; later matrix/lifecycle/measurement gates remain open.
 
-- [ ] **17. Lazy import state matrix (≤3 h).**
+- [x] **17. Lazy import state matrix (≤3 h).**
   Idle, snapshot-only, CallingModel, ModelResponseReady, AwaitingApproval,
   AwaitingInteraction, ExecutingTools, ToolOutcomeReady and cache-started rows
   import with no provider/tool I/O and byte-unchanged legacy row. Exact-first
@@ -369,13 +369,32 @@ No runtime bench crate becomes a production dependency.
   Second native open uses R5; no invented checkpoint for ordinary-only state.
   Focused test: runtime target filtered to `legacy_import_state_matrix`.
 
-- [ ] **18. Import/turn crash cuts and async control regression (≤3 h).**
+  Completed: `legacy_import_state_matrix` imports nine genuine runtime-generated
+  v3 states through Forge's encrypted legacy decoder into file-backed SQL. SQL
+  publication auditing proves protected-first ordering for checkpoint-bearing
+  state; protected checkpoints equal their exact inputs and ordinary snapshots
+  equal Forge's projection. All rows stay byte-unchanged, import and second open
+  perform zero provider/tool/interaction I/O, second open performs zero legacy
+  loads, and snapshot-only import creates no protected head/checkpoint.
+
+- [x] **18. Import/turn crash cuts and async control regression (≤3 h).**
   Use JournalCommitFailurePoint::ALL for equivalence/crash/restart over real SQL;
   include before/after exact publication, ordinary repair and lost ack. No stale
   legacy overlay or replayed model/tool operation. Suspend SQL storage and race
   controls/open/close on current-thread and multi-thread Tokio; no sync polling.
   Focused tests: runtime target filtered separately to `import_and_commit_crash_cuts`
   and `async_controls_do_not_stall_worker`.
+
+  Completed: `import_and_commit_crash_cuts` passes all seven released cuts across
+  119 import combinations and all 23 live plain/tool barriers (161 turn cases),
+  280 combinations total. Real SQL rollback/publication flags, fresh pools and
+  engines, exact/projection equivalence at every live and recovered barrier,
+  exact authority, ordinary repair, lost acknowledgements, unchanged legacy
+  rows, stale-row exclusion and provider/tool replay counts are checked.
+  `async_controls_do_not_stall_worker` passes both domains on current-thread
+  and multi-thread Tokio with SQL writes genuinely suspended by an independent
+  transaction, competing controls/writer open, a ready local close and a live
+  timer. No synchronous storage polling or storage implementation change.
 
 - [ ] **19. Native integration fixtures and writer exclusion (≤3 h).**
   Replace direct legacy-table test writes in native_chat_lcm_compaction,
@@ -387,11 +406,21 @@ No runtime bench crate becomes a production dependency.
   cases and the one relevant `cargo test -p api --test main happy_path::<native_chat_case>`.
   Record the actual case names in the job receipt before running; no target-wide run.
 
+  Not completed in c3-t17-20: the replacement superseded-LCM fixture returned
+  StateConflict on both allowed attempts. The job stopped at task 18 and removed
+  the incomplete task-19 changes; attempted patch, case inventory and both logs
+  are preserved in `/Volumes/Data/tmp/refactor/c3-t17-20/`. The temporary writer
+  fence/drop and inquiry tests passed, but no partial task-19 completion is claimed.
+
 - [ ] **20. Credential exclusion with real packs (≤2 h).**
   Seed API key/OAuth credentials, run a tool turn and refresh; decrypt all pack,
   session, operation, pin/catalog payloads and assert credentials never entered
   either domain. Keep ordinary redaction assertions separate from exact recovery.
   Focused test: runtime target filtered to `journal_credential_exclusion`.
+
+  Not started in c3-t17-20 because task 19 did not pass and execution order is
+  mandatory. API-key/OAuth exclusion and the exhaustive decrypted-payload audit
+  remain required; tasks 17–18 are not substitutes for this gate.
 
 ## Lifecycle and measurement
 

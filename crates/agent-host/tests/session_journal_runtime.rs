@@ -730,3 +730,130 @@ async fn legacy_writes_refuse_and_baseline_keeps_two_blobs() {
         "refusals and digest skips leave both sealed blobs byte-exact"
     );
 }
+
+#[path = "support/import_matrix.rs"]
+mod import_matrix;
+
+#[tokio::test]
+async fn legacy_import_state_matrix() {
+    use import_matrix::*;
+    use std::sync::atomic::Ordering;
+    let cases = cases().await;
+    assert_eq!(cases.len(), 9);
+    for case in cases {
+        let (f, store) = fixture(&case.snapshot.id).await;
+        seed(&store, &case).await;
+        audit_publications(&f).await;
+        let before = legacy_row(&f).await;
+        let stores = Stores::new(store.clone());
+        let io = Arc::new(IoCounts::default());
+        let (rt, s, p) = deferred(stores.clone(), &case, io.clone()).await;
+        assert_import(&store, &case).await;
+        assert!(p.requests().is_empty());
+        assert_eq!(stores.loads.load(Ordering::SeqCst), 2);
+        let order: Vec<String> =
+            sqlx::query_scalar("SELECT role FROM import_publication_order ORDER BY n")
+                .fetch_all(f.database().pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            order,
+            if case.checkpoint.is_some() {
+                vec!["protected", "ordinary"]
+            } else {
+                vec!["ordinary"]
+            },
+            "{} exact-first",
+            case.label
+        );
+        drop(s);
+        drop(rt);
+        let loads = stores.loads.load(Ordering::SeqCst);
+        let (rt, s, p) = deferred(stores.clone(), &case, io.clone()).await;
+        assert_import(&store, &case).await;
+        assert_eq!(
+            stores.loads.load(Ordering::SeqCst),
+            loads,
+            "{} R5",
+            case.label
+        );
+        assert_eq!(stores.saves.load(Ordering::SeqCst), 0);
+        assert!(p.requests().is_empty());
+        assert_eq!(io.tools.load(Ordering::SeqCst), 0);
+        assert_eq!(io.interactions.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_row(&f).await, before);
+        println!(
+            "IMPORT {} exact={} ordinary=projected second_legacy_loads=0 provider=0 tool=0 interaction=0 legacy=byte-unchanged",
+            case.label,
+            case.checkpoint.is_some()
+        );
+        drop(s);
+        drop(rt);
+    }
+}
+
+#[path = "support/crash_matrix.rs"]
+mod crash_matrix;
+
+#[tokio::test]
+async fn import_and_commit_crash_cuts() {
+    let imports = crash_matrix::import_cuts().await;
+    crash_matrix::stale_legacy_is_not_overlaid().await;
+    let turns = crash_matrix::turn_cuts().await;
+    assert_eq!(imports, 119);
+    println!(
+        "CRASH MATRIX import={imports} turn={turns} cuts={}",
+        JournalCommitFailurePoint::ALL.len()
+    );
+}
+
+#[test]
+fn async_controls_do_not_stall_worker() {
+    for multi_thread in [false, true] {
+        let mut builder = if multi_thread {
+            tokio::runtime::Builder::new_multi_thread()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
+        builder.enable_all();
+        if multi_thread {
+            builder.worker_threads(2);
+        }
+        builder.build().unwrap().block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10),async {
+                let id=SessionId::new("suspended-sql");
+                let (f,store)=fixture(&id).await;
+                let rt=runtime(store.clone(),provider());
+                let s=rt.start_session(StartSession::create(id.clone(),vec![])).await.unwrap();
+                s.run(UserInput::text("publish")).await.unwrap();drop(s);drop(rt);drop(store);
+                let raw=Arc::new(ForgeJournalStorage::new(f.reopen().await.unwrap(),[7;32],1).unwrap());
+                for protected in [true,false] {
+                    let meter=Arc::new(metered::Metered::new(raw.clone()));
+                    let owner=SessionJournals::with_test_memo_budget(meter.clone(),JOURNAL_MEMO_BYTES);
+                    let engine=if protected {owner.protected()}else{owner.ordinary()};
+                    let retained=engine.open(&id,open("retained",JournalOpenIntent::ReadOnly)).await.unwrap();
+                    let competing=engine.open(&id,open("competing",JournalOpenIntent::ReadOnly)).await.unwrap();
+                    let closing=engine.open(&id,open("closing",JournalOpenIntent::ReadOnly)).await.unwrap();
+                    // Hold a genuine independent SQLite write transaction. The
+                    // control below enters Forge apply and suspends in sqlx.
+                    let tx=db::begin_immediate(f.database().pool()).await.unwrap();
+                    let first_engine=engine.clone();
+                    let first=tokio::spawn(async move {first_engine.retain_root(&retained).await.unwrap();first_engine.close(retained).await.unwrap();});
+                    meter.apply_entered.notified().await;
+                    let other_engine=engine.clone();
+                    let control=tokio::spawn(async move {other_engine.retain_root(&competing).await.unwrap();other_engine.close(competing).await.unwrap();});
+                    let opener=engine.clone();let open_id=id.clone();
+                    let opening=tokio::spawn(async move{opener.open(&open_id,open("racing-writer",JournalOpenIntent::ExclusiveWriter)).await});
+                    // A local close cannot wait on the durable engine gate.
+                    tokio::time::timeout(std::time::Duration::from_millis(250),engine.close(closing)).await.unwrap().unwrap();
+                    // This timer is the worker-liveness witness; no sync polling.
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    assert!(!first.is_finished());assert!(!control.is_finished());assert!(!opening.is_finished());
+                    tx.rollback().await.unwrap();first.await.unwrap();control.await.unwrap();
+                    let writer=opening.await.unwrap().unwrap();engine.close(writer).await.unwrap();
+                    println!("ASYNC multi_thread={multi_thread} domain={:?}: suspended SQL + controls/open/close + timer OK",engine.storage_id());
+                }
+            }).await.unwrap();
+        });
+    }
+}

@@ -7,12 +7,14 @@ use std::sync::{Arc, Mutex};
 pub struct Metered<S> {
     pub inner: Arc<S>,
     pub objects: Mutex<Vec<JournalObjectId>>,
+    pub apply_entered: tokio::sync::Notify,
 }
 impl<S> Metered<S> {
     pub fn new(inner: Arc<S>) -> Self {
         Self {
             inner,
             objects: Mutex::new(vec![]),
+            apply_entered: tokio::sync::Notify::new(),
         }
     }
     pub fn take(&self) -> Vec<JournalObjectId> {
@@ -79,6 +81,7 @@ impl<S: JournalStorage> JournalStorage for Metered<S> {
         self.inner.dirty_sessions(d, after, limit).await
     }
     async fn apply(&self, w: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
+        self.apply_entered.notify_one();
         self.inner.apply(w).await
     }
     async fn retained_bytes(&self, d: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
