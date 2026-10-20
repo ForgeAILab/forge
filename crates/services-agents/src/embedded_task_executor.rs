@@ -1515,11 +1515,63 @@ mod tests {
             })
             .await
             .unwrap();
-        // An unreadable persisted snapshot fails inside runtime.start_session,
-        // after the executor has admitted the Task and called its backend.
-        sqlx::query("INSERT INTO protected_agent_session_state (session_id, snapshot_ciphertext, snapshot_nonce, key_revision, updated_at) VALUES (?, ?, ?, 1, ?)")
-            .bind(&session.id).bind(vec![0u8; 32]).bind(vec![0u8; 12]).bind(&now)
-            .execute(db.pool()).await.unwrap();
+        // An earlier process (its own store and caches, the same key) runs one
+        // real runtime turn, so the runtime publishes this session's native
+        // journal itself. Its sealed pack bodies are then damaged: the next
+        // open fails authentication inside the backend, after the executor
+        // has admitted the Task and called it, and before any provider I/O.
+        {
+            use agent_runtime::core::{
+                catalog::{ModelLimits, ResolvedModelProfile},
+                content::UserInput,
+                ids::SessionId,
+                provider::{FinishReason, ModelId, ProviderStreamEvent},
+            };
+            use agent_runtime::provider::fake::ScriptedStream;
+            use agent_runtime::runtime::{RuntimeBuilder, StartSession};
+            let earlier = EmbeddedAgentService::new(db.clone(), b"task-session-open-test");
+            let store = earlier.protected_store();
+            let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+                .provider_name("fake")
+                .provider(Arc::new(FakeProvider::new(
+                    "fake",
+                    Capabilities::basic_streaming(),
+                    vec![ScriptedStream::new(vec![
+                        ProviderStreamEvent::TextDelta {
+                            text: "earlier reply".into(),
+                        },
+                        ProviderStreamEvent::Finish {
+                            reason: FinishReason::Stop,
+                        },
+                    ])],
+                )))
+                .model_profile(ResolvedModelProfile::explicit(
+                    "fake",
+                    ModelId::new("fake"),
+                    ModelLimits::new(32_000, 28_000, 4_000),
+                ))
+                .session_store(store.clone())
+                .checkpoint_store(store)
+                .build()
+                .unwrap();
+            let runtime_session = SessionId::new(session.runtime_session_id.as_deref().unwrap());
+            let handle = runtime
+                .start_session(StartSession::create(runtime_session, vec![]))
+                .await
+                .unwrap();
+            handle.run(UserInput::text("earlier turn")).await.unwrap();
+            drop(handle);
+            drop(runtime);
+        }
+        let damaged = sqlx::query(
+            "UPDATE agent_session_journal_pack SET body_payload = zeroblob(length(body_payload)) WHERE forge_session_id = ?",
+        )
+        .bind(&session.id)
+        .execute(db.pool())
+        .await
+        .unwrap()
+        .rows_affected();
+        assert!(damaged > 0, "the earlier turn published sealed packs");
         let provider = Arc::new(FakeProvider::new(
             "fake",
             Capabilities::basic_streaming(),
@@ -1554,7 +1606,7 @@ mod tests {
             .await;
         assert!(
             matches!(outcome, Err(ExecutorError::Other(ref message))
-            if message.contains("runtime failed:") && message.contains("protected state nonce is invalid")),
+            if message.contains("runtime failed:") && message.contains("invalid authenticated journal storage")),
             "{outcome:?}"
         );
         assert!(provider.requests().is_empty());
