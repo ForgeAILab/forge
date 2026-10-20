@@ -13,6 +13,10 @@ test-support = ["dep:tempfile", "db/test-template"]
 name = "session_journal_conformance"
 required-features = ["test-support"]
 
+[[test]]
+name = "session_journal_storage"
+required-features = ["test-support"]
+
 [dependencies]
 operation-registry = { path = "../operation-registry" }
 agent-runtime.workspace = true
@@ -40,6 +44,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+sha2-journal = { package = "sha2", version = "0.10.9" }
+hkdf = "0.12.4"
+hmac = "0.12.1"
 hex = "0.4"
 ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }

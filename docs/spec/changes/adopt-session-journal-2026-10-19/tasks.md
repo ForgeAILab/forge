@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:47:51Z
+updated_at: 2026-10-20T10:30:34Z
 completed_at:
 ---
 
@@ -89,7 +89,7 @@ No runtime bench crate becomes a production dependency.
 
 ## JournalStorage implementation
 
-- [ ] **4. Pack codec and real AEAD (≤3 h).**
+- [x] **4. Pack codec and real AEAD (≤3 h).**
   Implement JRPACK v1 as a sealed index unit (sorted four-byte prefix/varint
   directory) plus a sealed zstd-3 body unit of kind-ordered canonical bodies,
   exact full-id/kind verification and bounded decode. XChaCha20-Poly1305 with
@@ -101,8 +101,14 @@ No runtime bench crate becomes a production dependency.
   absence of clear object ids/prefixes.
   Focused tests: `cargo test -p forge-agent-host --lib session_journal::codec::`
   and `cargo test -p forge-agent-host --lib session_journal::seal::`.
+  Completed: JRPACK v1 separates bounded prefix/varint indexes from kind-ordered
+  zstd-3 canonical bodies; complete ids and envelope kinds are verified. Real
+  XChaCha20-Poly1305 uses fresh nonces and full row/scope/generation AAD, with
+  separate HKDF-SHA256 encryption and HMAC lookup keys from the existing master
+  key. Metadata DTOs preserve unknown engine versions and bytes. All seven
+  focused codec, sealing and opaque-metadata tests pass; no runtime wiring changed.
 
-- [ ] **5. Lossless read methods and cache consistency (≤3 h).**
+- [x] **5. Lossless read methods and cache consistency (≤3 h).**
   Implement load/objects/members/operation/pins/catalog/dirty_sessions against
   file-backed sqlx. Preserve opaque version/bytes; scalar metadata must agree with
   authenticated payload. Explicitly return JournalBodySharing::PerSession;
@@ -118,8 +124,15 @@ No runtime bench crate becomes a production dependency.
   and the same target filtered separately to `session_scoped_lazy_admission_and_reopen`
   and `retained_bytes_include_deferred_bodies` (include unrelated-session packs,
   evicted directories, independent domain/session copies and same-scope dedup).
+  Completed: file-backed sqlx reads preserve authenticated metadata and opaque
+  engine bytes, check scalar agreement and scope every body by current membership.
+  Scoped directories load sealed indexes lazily; generation checks refresh only
+  changed packs, body reads batch, and one charged 64 MiB LRU bounds directories
+  and decoded bodies together. Dirty paging uses runtime ids; retained bytes
+  include deferred and orphan copies per domain. All three named tests pass with
+  independent pools, reopen, unrelated corruption and bounded cache admission.
 
-- [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
+- [x] **6. Fenced atomic apply and seven cuts (≤3 h).**
   One sqlx begin_immediate transaction/connection; SQL expect guard for existing
   and absent records, including control writes retaining revision/epoch. Compare
   the full JournalFence (revision, writer_epoch, generation); require a replacement
@@ -136,6 +149,17 @@ No runtime bench crate becomes a production dependency.
   tracing (kind, duration, lock hold, receipt; no contents or ids).
   Focused tests: same storage target filtered separately to
   `apply_atomic_cuts` and `independent_connection_expect_fences`.
+  Completed: one BEGIN IMMEDIATE transaction enforces the full SQL fence,
+  checked zero-fence absence and exact successor generation while preserving
+  supplied revision/epoch values. Concrete ordered staging publishes capped S1
+  packs; all six pre-commit cuts roll back and AfterCommit loses only its
+  acknowledgement. Scoped cache refresh never conflicts for staleness; errors
+  and cancellation invalidate the written scope. Count/duration-only D8 tracing
+  includes receipts and lock hold. Both named tests pass, including all seven
+  cuts for new/existing records, concurrent controls, full-width counters and
+  warm admission. Pin/catalog changes and bounded sealed tier-zero operations
+  round-trip; Collect writes, release, pruning, full operation containers and compact return
+  typed Unsupported until their later tasks. Runtime wiring remains unchanged.
 
 - [ ] **7. Pin/catalog/staging persistence (≤2 h).**
   Execute Put/Remove records verbatim inside apply, with no private-engine parsing

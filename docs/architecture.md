@@ -8203,12 +8203,65 @@ empty/all-zero membership bitmaps are refused. The additive migration leaves
 every legacy `protected_agent_session_state` value unchanged. Older builds
 refuse an unknown applied migration; downgrade requires a pre-upgrade backup.
 
+`crates/agent-host/src/session_journal/` implements the encrypted sqlx storage
+boundary independently of the runtime engine. It is not connected to native
+runtime persistence yet. `codec.rs` encodes JRPACK v1: a separately sealed
+`JRPACK\0`/version/count index with sorted four-byte prefixes and bounded varint
+offsets/lengths, and a zstd level-3 body unit ordered by kind and full id. Each
+pack holds at most 1 MiB of canonical bodies. Reads verify canonical envelopes,
+kinds and complete content ids, including prefix collisions. SQL holds no
+per-object id, prefix or keyed object index.
+
+`seal.rs` derives distinct AEAD and lookup keys with HKDF-SHA256 from the exact
+master key already passed to `SqliteProtectedRuntimeStore` (SHA-256 of the
+existing protected key material/server JWT secret). The labels are
+`forge/session-journal/aead/v1` and `forge/session-journal/lookup/v1`;
+`key_revision` remains 1. Every unit uses XChaCha20-Poly1305 with a fresh 24-byte
+nonce and the `FORGE-JOURNAL\0` version-1 envelope. Length-delimited associated
+data binds the table/unit kind, full storage-id/role/runtime-session scope,
+Forge owner, row key, generation, format and key revision. Pin and catalog keys
+are separately contextualized HMAC-SHA256 values; real ids, operation results
+and opaque engine metadata remain sealed. Authentication failures fail closed.
+
+`storage.rs` serves lossless records, objects, memberships, operations, pins,
+catalogs and runtime-id-sorted dirty pages through one WAL read transaction per
+call. Loading a record and constructing storage decode no packs. Indexes hydrate
+lazily within the requested domain/session; scoped pack headers and membership
+are reread on each call, and only new or changed index units are decoded. Body
+reads batch by pack, verify full ids and enforce current membership even on
+cache hits. A shared 64 MiB charged LRU in `cache.rs` bounds directories and
+plaintext bodies together; generation keys prevent stale slots after a rewrite.
+`sharing()` declares PerSession with independent domain copies. The retained
+canonical-byte diagnostic authenticates counts against index units in bounded
+pages and includes deferred and orphan pack bodies per domain without opening
+body units.
+
+`apply.rs` uses one `db::begin_immediate` transaction and a full SQL revision/
+writer-epoch/generation guard, with checked all-zero absence and successor
+generation. It stages non-control objects, checkpoint, batch, pins/catalog,
+head/record and original operation result in the runtime's cut order. Six
+pre-commit cuts roll back; AfterCommit commits then returns an ambiguous error.
+The final new packs combine kinds and obey the logical cap. Only the written
+scope's directory refreshes; cache staleness is never a StateConflict. Cache
+publication follows commit; errors and cancellation invalidate the affected
+scope. Tracing target `forge_session_journal` reports apply kind, elapsed/lock
+hold durations, success/commit flags and physical receipt counts without ids or
+contents.
+
+Pin/catalog Put/Remove and a bounded, sealed tier-zero operation container
+round-trip through apply. S4 carry tiers/S5 pruning, membership releases/purges,
+physical maintenance and runtime wiring remain later adoption tasks. Apply
+returns typed Unsupported for Collect writes, release or pruning directives,
+and a full operation container; compact is also Unsupported. Accepted applies remove no
+bodies and return a zero physical receipt.
+
 Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings
-on the first apply for arbitrary runtime ids. Its engine conformance factories
-currently use volatile storage; native SQL journal storage and runtime wiring
-remain subsequent adoption tasks. Legacy decoder tests use the real envelope,
-checkpoint decoder and runtime schema/transition validation.
+on the first apply for arbitrary runtime ids. Read-test seeding and generation
+resealing helpers exist only under that feature. The engine conformance
+factories still use volatile storage; the focused `session_journal_storage`
+target exercises the production sqlx adapter directly. Legacy decoder tests use
+the real envelope, checkpoint decoder and runtime schema/transition validation.
 
 Migrations are files named `V{version}__{name}.sql`, embedded in the binary
 and recorded by version and name in the `_migration` table. Versions up to

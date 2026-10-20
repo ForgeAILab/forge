@@ -50,6 +50,27 @@ impl FileDb {
         Ok(Self { db, directory })
     }
 
+    /// Seed authenticated rows directly for read/corruption and boundary fixtures.
+    /// This test-only helper bypasses the apply fence.
+    pub async fn seed_journal(
+        &self,
+        storage: &crate::session_journal::ForgeJournalStorage,
+        write: agent_runtime::core::journal::JournalWrite,
+    ) -> Result<(), RuntimeError> {
+        self.ensure_session(&write.session).await?;
+        storage.seed(write).await
+    }
+
+    /// Rewrite authenticated pack units with a new generation for cache tests.
+    pub async fn reseal_journal_scope(
+        &self,
+        storage: &crate::session_journal::ForgeJournalStorage,
+        domain: &agent_runtime::core::journal::JournalDomain,
+        session: &SessionId,
+    ) -> Result<(), RuntimeError> {
+        storage.reseal_scope(domain, session).await
+    }
+
     pub fn database(&self) -> Arc<SqliteDb> {
         self.db.clone()
     }
