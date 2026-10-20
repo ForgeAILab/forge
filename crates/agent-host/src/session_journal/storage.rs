@@ -4,11 +4,7 @@ use super::{
     seal::{Binding, FORMAT, Keys, Unit, role},
     wire,
 };
-use agent_runtime::core::{
-    error::{RuntimeError, UnsupportedCapability},
-    ids::SessionId,
-    journal::*,
-};
+use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use async_trait::async_trait;
 use db::SqliteDb;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, sqlite::SqliteRow};
@@ -29,6 +25,10 @@ pub struct ForgeJournalStorage {
     pub(super) keys: Keys,
     pub(super) cache: Arc<Mutex<Cache>>,
     cpu: Arc<Semaphore>,
+    #[cfg(feature = "test-support")]
+    pub(super) repack: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-support")]
+    pub(super) compact_observations: Arc<Mutex<(u64, usize)>>,
 }
 impl fmt::Debug for ForgeJournalStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,9 +62,6 @@ pub(super) fn flag(row: &SqliteRow, name: &str) -> Result<bool, RuntimeError> {
         _ => Err(corrupt()),
     }
 }
-pub(super) fn unsupported() -> RuntimeError {
-    RuntimeError::unsupported_capability(UnsupportedCapability::SessionJournal)
-}
 pub(super) fn database_error(_: impl fmt::Display) -> RuntimeError {
     // sqlx errors may include bound data; only neutral diagnostics escape.
     RuntimeError::internal("journal database operation failed")
@@ -81,6 +78,10 @@ impl ForgeJournalStorage {
             keys: Keys::new(&master_key, key_revision)?,
             cache: Arc::new(Mutex::new(Cache::new(DEFAULT_BUDGET))),
             cpu: Arc::new(Semaphore::new(2)),
+            #[cfg(feature = "test-support")]
+            repack: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(feature = "test-support")]
+            compact_observations: Arc::new(Mutex::new((0, 0))),
         })
     }
     pub(super) fn cache_lock(&self) -> Result<MutexGuard<'_, Cache>, RuntimeError> {
@@ -416,48 +417,13 @@ impl ForgeJournalStorage {
         session: &SessionId,
         operation: &JournalOperationId,
     ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
-        let rows=sqlx::query("SELECT * FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY tier")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *conn).await.map_err(database_error)?;
-        let mut found = None;
-        for row in rows {
-            self.revision(&row)?;
-            let keys = self.keys.clone();
-            let domain = domain.clone();
-            let session = session.clone();
-            let ops = self
-                .work(move || {
-                    let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
-                    let tier = row.try_get::<i64, _>("tier").map_err(|_| corrupt())?;
-                    if tier < 0 {
-                        return Err(corrupt());
-                    }
-                    let raw = keys.open(
-                        &Binding {
-                            unit: Unit::Operations,
-                            domain: &domain,
-                            session: &session,
-                            owner: &owner,
-                            row: &tier.to_be_bytes(),
-                            generation: 0,
-                        },
-                        &row.try_get::<Vec<u8>, _>("nonce").map_err(|_| corrupt())?,
-                        &row.try_get::<Vec<u8>, _>("payload")
-                            .map_err(|_| corrupt())?,
-                        codec::PACK_CAP,
-                    )?;
-                    wire::operations(&raw)
-                })
-                .await?;
-            for op in ops {
-                if &op.operation == operation {
-                    if found.is_some() {
-                        return Err(corrupt());
-                    }
-                    found = Some(op);
-                }
-            }
-        }
-        Ok(found)
+        let packs = self
+            .operation_packs(conn, &(domain.clone(), session.clone()))
+            .await?;
+        Ok(packs
+            .into_values()
+            .flatten()
+            .find(|o| &o.operation == operation))
     }
     #[cfg(feature = "test-support")]
     pub fn cache_stats(&self) -> Result<JournalCacheStats, RuntimeError> {
@@ -790,7 +756,7 @@ impl JournalStorage for ForgeJournalStorage {
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
         self.apply_write(write).await
     }
-    async fn compact(&self, _: &JournalDomain) -> Result<(), RuntimeError> {
-        Err(unsupported())
+    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+        self.compact_domain(domain).await
     }
 }

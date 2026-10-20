@@ -3,7 +3,7 @@ use super::{
     cache::{Scope, ScopeDirectory},
     codec, conflict,
     seal::role,
-    storage::{ForgeJournalStorage, PackView, database_error, unsupported},
+    storage::{ForgeJournalStorage, PackView, database_error},
     wire,
 };
 use agent_runtime::core::{
@@ -73,12 +73,6 @@ impl ForgeJournalStorage {
             if write.expect.generation.checked_add(1) != Some(write.record.generation) {
                 return Err(conflict());
             }
-            if matches!(write.kind, JournalWriteKind::Collect)
-                || !write.release.is_empty()
-                || write.prune_operations_before.is_some()
-            {
-                return Err(unsupported());
-            }
             // Validate candidates outside the write lock; no runtime-private
             // engine metadata or closure calculation belongs in this adapter.
             let objects = write.objects.objects.clone();
@@ -108,7 +102,7 @@ impl ForgeJournalStorage {
             let locked = Instant::now();
             let staged = self.apply_on(&mut tx, &scope, &write).await;
             match staged {
-                Ok(next) => {
+                Ok((next, applied_receipt)) => {
                     let commit = tx.commit().await;
                     hold_us = locked.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     match commit {
@@ -116,7 +110,7 @@ impl ForgeJournalStorage {
                             committed = true;
                             // Publish only after COMMIT. Existing immutable bodies
                             // remain useful; new directories replace the old scope.
-                            receipt = JournalApplyReceipt::default();
+                            receipt = applied_receipt;
                             self.cache_lock()
                                 .map(|mut cache| cache.put_directory(scope.clone(), next))
                                 .and_then(|_| fail(&write, JournalCommitFailurePoint::AfterCommit))
@@ -151,7 +145,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         write: &JournalWrite,
-    ) -> Result<Arc<ScopeDirectory>, RuntimeError> {
+    ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt), RuntimeError> {
         // Full fence comparison is SQL, including the all-zero absent-record
         // case. BEGIN IMMEDIATE prevents a writer racing this absence guard.
         let matches:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=? AND revision=? AND writer_epoch=? AND generation=?) OR (?=zeroblob(8) AND ?=zeroblob(8) AND ?=zeroblob(8) AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?))")
@@ -253,13 +247,34 @@ impl ForgeJournalStorage {
             self.append_operation(conn, scope, &owner, operation)
                 .await?;
         }
+        if let Some(floor) = write.prune_operations_before {
+            self.prune_operations(conn, scope, &owner, floor, write.record.writer_epoch)
+                .await?;
+        }
         fail(write, JournalCommitFailurePoint::AfterIdempotency)?;
         // Reuse every previously read index; only the final new pack indexes
         // need decoding. There is no database-wide invalidation counter.
-        let final_views = self
+        let mut final_views = self
             .directory_from(conn, scope, false, Some(directory(&views)))
             .await?;
-        Ok(directory(&final_views))
+        let (receipt, purged) = self
+            .release_objects(
+                conn,
+                scope,
+                &owner,
+                &mut final_views,
+                &write.release,
+                matches!(write.kind, JournalWriteKind::Collect)
+                    && write.record.retirement.is_some(),
+            )
+            .await?;
+        if matches!(write.kind, JournalWriteKind::Collect) {
+            self.collection_repack(conn, scope, &purged).await?;
+        }
+        let final_views = self
+            .directory_from(conn, scope, false, Some(directory(&final_views)))
+            .await?;
+        Ok((directory(&final_views), receipt))
     }
 
     #[allow(clippy::too_many_arguments)]

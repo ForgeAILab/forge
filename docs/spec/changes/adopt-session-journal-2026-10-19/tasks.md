@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T10:30:34Z
+updated_at: 2026-10-20T10:49:50Z
 completed_at:
 ---
 
@@ -161,13 +161,18 @@ No runtime bench crate becomes a production dependency.
   round-trip; Collect writes, release, pruning, full operation containers and compact return
   typed Unsupported until their later tasks. Runtime wiring remains unchanged.
 
-- [ ] **7. Pin/catalog/staging persistence (≤2 h).**
+- [x] **7. Pin/catalog/staging persistence (≤2 h).**
   Execute Put/Remove records verbatim inside apply, with no private-engine parsing
   or host closure computation. Wire retained roots and staged memberships through
   engine async controls. Unknown engine metadata must round-trip losslessly.
   Focused test: same storage target filtered to `pins_catalog_stage_restart`.
+  Completed: engine async retained-root, staged-leaf and release-pin controls
+  persist through the existing verbatim Put/Remove apply path. The named test
+  passes across independent-pool restart, historical retained-head opening and staged
+  membership recovery; unknown engine versions/bytes and catalog removals
+  round-trip without private-engine parsing or host closure computation.
 
-- [ ] **8. S4 operation packs and S5 directive execution (≤3 h).**
+- [x] **8. S4 operation packs and S5 directive execution (≤3 h).**
   Binary-carry 2^tier packs hold lossless complete original results, capped at
   1 MiB of serialized records before compression/sealing; bound overflow segments,
   import and prune/rebuild output, and reject an oversized record atomically.
@@ -181,8 +186,14 @@ No runtime bench crate becomes a production dependency.
   pruned. Do not prune on commits; rt-e7's reference now implements/measures S5.
   Focused tests: same storage target filtered separately to
   `operation_pack_replay_restart` and `engine_replay_window_edges`.
+  Completed: sealed zstd operation packs use exact binary-count carry tiers and
+  capped overflow segments. Explicit S5 directives atomically rebuild only
+  changed packs; unchanged ciphertext survives. Both named tests pass through
+  real engines, independent-pool restart, conflicting replay, revision 70
+  (inclusive floor 6), the single current-epoch exception, rollback and scoped
+  isolation. Zero-release collection exercises S5 before body purge support.
 
-- [ ] **9. Release, deferred purge and exact physical receipts (≤3 h).**
+- [x] **9. Release, deferred purge and exact physical receipts (≤3 h).**
   Clear only releasing membership bits and deny reads immediately, including warm
   cache hits; deduplicate releases. Keep sealed dead bodies below 25% of canonical
   body bytes; the apply reaching 25%, scope emptying and retired-session collection
@@ -195,8 +206,15 @@ No runtime bench crate becomes a production dependency.
   Focused tests: same storage target filtered separately to
   `deferred_purge_threshold_and_receipts`, `retired_and_empty_scope_force_purge`
   and `independent_session_domain_copy_receipts`.
+  Completed: releases deduplicate ids and clear only the owning membership.
+  Mandatory byte-threshold, empty-scope and retired-collection purges remap
+  live survivors under a new pack generation and count original canonical
+  lengths once per removed physical copy. All three named tests pass, covering
+  warm/independent caches, same-scope re-admission, byte-vs-slot thresholds,
+  old deferred slots without new release ids, independent domain/session
+  copies, cumulative retained-byte reconciliation and engine-selected release.
 
-- [ ] **10. S2 maintenance and async physical compaction (≤3 h).**
+- [x] **10. S2 maintenance and async physical compaction (≤3 h).**
   Add async post_terminal geometric merging (minimum 4 KiB logical tiers), the
   1 MiB logical pack cap on imports/admissions/all repacks, collection base repack
   limited to fully live packs below 64 KiB or fully live survivors just purged by
@@ -209,6 +227,15 @@ No runtime bench crate becomes a production dependency.
   Focused tests: same storage target filtered separately to
   `terminal_geometric_repack`, `collection_repack_eligible_scoped_packs`,
   `purge_rewrites_only_capped_pack` and `import_and_operation_pack_caps`.
+  Completed: async post-terminal maintenance geometrically merges fully live
+  equal tiers from a 4 KiB minimum. Collection merges only small fully live
+  packs or survivors purged in that apply; stable large/deferred packs stay
+  sealed. Compact keysets one domain/session and at most 8 MiB of logical
+  inputs per transaction, preserves every membership and session generation,
+  then calls db::incremental_vacuum. All four named tests pass for bounded
+  maintenance, overflow/import/rebuild caps and atomic oversized rejection;
+  task 9's mandatory purge tests also pass with S2 off. No native runtime
+  wiring or full VACUUM was introduced.
 
 ## Conformance gate
 

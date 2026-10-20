@@ -3,6 +3,9 @@
 mod apply;
 mod cache;
 mod codec;
+mod maintenance;
+mod operations;
+mod release;
 mod rows;
 mod seal;
 mod storage;

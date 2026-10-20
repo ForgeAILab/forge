@@ -8248,12 +8248,44 @@ scope. Tracing target `forge_session_journal` reports apply kind, elapsed/lock
 hold durations, success/commit flags and physical receipt counts without ids or
 contents.
 
-Pin/catalog Put/Remove and a bounded, sealed tier-zero operation container
-round-trip through apply. S4 carry tiers/S5 pruning, membership releases/purges,
-physical maintenance and runtime wiring remain later adoption tasks. Apply
-returns typed Unsupported for Collect writes, release or pruning directives,
-and a full operation container; compact is also Unsupported. Accepted applies remove no
-bodies and return a zero physical receipt.
+Pin/catalog Put/Remove persist the supplied records verbatim, including unknown
+engine versions and bytes. Async engine retained-root, staged-leaf and pin-release
+controls survive restart without host closure computation or private metadata
+parsing. `operations.rs` seals zstd packs of complete original operation results.
+Primary tiers contain exactly `2^tier` records; a carry exceeding 1 MiB of
+serialized records leaves the occupied segment sealed and writes a capped overflow
+segment at tier 64 or above. Oversized records fail atomically. Only an explicit
+pruning directive removes operations: keep revisions at or above its inclusive
+floor and the highest-revision operation of the replacement record's writer
+epoch. Changed partial tiers become capped overflow segments; unchanged packs
+retain their ciphertext. The engine alone chooses the floor and handles replay.
+
+`release.rs` deduplicates release ids and clears only the owning membership bits.
+Read authority ends immediately, including on warm cache hits. Dead canonical
+body bytes below 25% remain sealed. Reaching 25%, emptying the scope, or collecting
+a retired session purges dead copies, including previously deferred slots absent
+from the new release list. A purge keeps the pack id, advances its generation,
+and atomically remaps surviving memberships, or deletes an empty pack. Receipts
+count each physical copy and its original canonical length only when removed;
+clearing bits, restoring a retained slot and moving live bodies count zero.
+Mandatory purges run with optional S2 merging disabled. Independent domain/session
+copies never delay each other's reclamation. Retained bytes include dead slots
+until their removal and reconcile with the physical receipts.
+
+`maintenance.rs` provides async `post_terminal(domain, session)` for later runtime
+hooks. It merges fully live equal logical-byte tiers from a 4 KiB minimum,
+carrying geometrically only when a pair fits 1 MiB. Collection's base repack uses
+only fully live packs below 64 KiB or fully live survivors purged by that apply.
+Collection leaves stable large packs sealed; both maintenance paths leave
+deferred-dead packs sealed. Repack output is partitioned by kind before cutting
+at 1 MiB; each move remaps only the owning bitmap. Explicit `compact(domain)` keysets original pack ids and
+processes one session and at most 8 MiB of rewritten logical bodies per transaction,
+without advancing the session generation or purging deferred bytes. It then calls
+`db::incremental_vacuum`, which is bounded and a no-op without incremental
+SQL auto-vacuum. There is no full VACUUM. Failed physical work can be retried
+without undoing acknowledged state. The S2 switch and compact diagnostics exist
+only under test-support. No JournalStorage method remains typed Unsupported;
+native runtime wiring and the adoption conformance gate remain later tasks.
 
 Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings

@@ -3,11 +3,11 @@ use super::{
     cache::Scope,
     codec, conflict, corrupt,
     seal::{Binding, FORMAT, Sealed, Unit, role},
-    storage::{ForgeJournalStorage, PackView, database_error, unsupported},
+    storage::{ForgeJournalStorage, PackView, database_error},
     wire,
 };
 use agent_runtime::core::{error::RuntimeError, journal::*};
-use sqlx::{Row, SqliteConnection};
+use sqlx::SqliteConnection;
 use std::collections::BTreeSet;
 
 impl ForgeJournalStorage {
@@ -301,67 +301,6 @@ impl ForgeJournalStorage {
                 }
             }
         }
-        Ok(())
-    }
-    /// Task 8 replaces this bounded tier-zero staging container with S4 carry
-    /// tiers. Until then a full container returns typed Unsupported atomically.
-    pub(super) async fn append_operation(
-        &self,
-        conn: &mut SqliteConnection,
-        scope: &Scope,
-        owner: &str,
-        operation: &JournalOperationRecord,
-    ) -> Result<(), RuntimeError> {
-        let rows=sqlx::query("SELECT * FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).fetch_all(&mut *conn).await.map_err(database_error)?;
-        let mut operations = Vec::new();
-        for row in rows {
-            self.revision(&row)?;
-            let tier: i64 = row.try_get("tier").map_err(|_| corrupt())?;
-            if tier != 0 {
-                return Err(unsupported());
-            }
-            let keys = self.keys.clone();
-            let scope = scope.clone();
-            let owner = owner.to_owned();
-            operations = self
-                .work(move || {
-                    let raw = keys.open(
-                        &Binding {
-                            unit: Unit::Operations,
-                            domain: &scope.0,
-                            session: &scope.1,
-                            owner: &owner,
-                            row: &tier.to_be_bytes(),
-                            generation: 0,
-                        },
-                        &row.try_get::<Vec<u8>, _>("nonce").map_err(|_| corrupt())?,
-                        &row.try_get::<Vec<u8>, _>("payload")
-                            .map_err(|_| corrupt())?,
-                        codec::PACK_CAP,
-                    )?;
-                    wire::operations(&raw)
-                })
-                .await?;
-        }
-        if let Some(old) = operations
-            .iter()
-            .find(|o| o.operation == operation.operation)
-        {
-            if old != operation {
-                return Err(conflict());
-            }
-            return Ok(());
-        }
-        operations.push(operation.clone());
-        let raw = self
-            .work(move || wire::operations_bytes(&operations).map_err(|_| unsupported()))
-            .await?;
-        let sealed = self
-            .seal_row(scope, owner, Unit::Operations, &0i64.to_be_bytes(), 0, raw)
-            .await?;
-        sqlx::query("INSERT INTO agent_session_journal_operation_pack (storage_id,role,runtime_session_id,forge_session_id,tier,key_revision,format,nonce,payload) VALUES (?,?,?,?,0,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,tier) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await.map_err(database_error)?;
         Ok(())
     }
     #[cfg(feature = "test-support")]

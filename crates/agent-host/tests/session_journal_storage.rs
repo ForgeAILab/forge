@@ -1059,3 +1059,1224 @@ impl tracing::Subscriber for ApplyEvents {
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
 }
+
+fn engine_config() -> JournalEngineConfig {
+    JournalEngineConfig {
+        collection_enabled: true,
+        validated_root_memo_bytes: 128 * 1024 * 1024,
+    }
+}
+fn open_request(label: &str, root: JournalRootSelection, intent: JournalOpenIntent) -> JournalOpen {
+    JournalOpen {
+        root,
+        expected_revision: None,
+        operation: JournalOperationId::new(format!("{label}-open")),
+        pin: JournalPinId::new(label),
+        intent,
+    }
+}
+// Public DTOs only: an empty snapshot has empty sequence/map roots. The engine
+// encodes all durable control objects and computes its own dependency metadata.
+fn empty_commit(
+    s: &SessionId,
+    epoch: u64,
+    operation: &str,
+    previous: Option<&JournalHead>,
+    at: u64,
+) -> JournalCommit {
+    use agent_runtime::core::{store::SessionSnapshot, usage::UsageLedger};
+    let roots = head(
+        &domain(JournalRole::Protected),
+        s,
+        JournalObjectId::from_bytes([0; 32]),
+    )
+    .snapshot;
+    let mut roots = roots;
+    roots.planned_step_count = 0;
+    roots.updated = Timestamp(at);
+    let snapshot = SessionSnapshot {
+        id: s.clone(),
+        history: vec![],
+        usage: UsageLedger::new(),
+        identity: Default::default(),
+        manifests: vec![],
+        extension_state: Default::default(),
+        updated: Timestamp(at),
+    };
+    let boundary = JournalBoundary {
+        version: 1,
+        session: s.clone(),
+        turn: None,
+        checkpoint_sequence: 0,
+        planned_step_count: 0,
+    };
+    let batch = JournalBatch {
+        session: s.clone(),
+        sequence: previous.map_or(1, |h| h.batch_sequence + 1),
+        predecessor: previous.map(|h| JournalDigest::parse(h.batch.as_str()).unwrap()),
+        expected_revision: previous.map(|h| h.revision),
+        writer_epoch: epoch,
+        operation: JournalOperationId::new(operation),
+        boundary: boundary.clone(),
+        snapshot: roots,
+        checkpoint: None,
+    };
+    let mut commit = JournalCommit {
+        batch,
+        digest: journal_history_chain(std::iter::empty()),
+        objects: vec![],
+        delta: JournalTransitionDelta {
+            boundary,
+            bootstrap: Some(Box::new(snapshot)),
+            history_append: vec![],
+            usage_append: vec![],
+            extension_updates: Default::default(),
+            extension_references: Default::default(),
+            manifests_append: vec![],
+            manifest_references: vec![],
+        },
+        checkpoint: None,
+    };
+    commit.digest = commit.input_digest().unwrap();
+    commit
+}
+
+#[tokio::test]
+async fn pins_catalog_stage_restart() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = Arc::new(MappingStorage::new(raw.clone(), f.clone()));
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("pins-stage");
+    let engine = JournalEngine::protected(mapped, d.storage_id.clone(), engine_config());
+    let writer = engine
+        .open(
+            &s,
+            open_request(
+                "retained",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ExclusiveWriter,
+            ),
+        )
+        .await
+        .unwrap();
+    let first = engine
+        .commit(
+            &writer,
+            empty_commit(&s, writer.writer_epoch().unwrap(), "first", None, 1),
+        )
+        .await
+        .unwrap();
+    engine.close(writer).await.unwrap();
+    let reader = engine
+        .open(
+            &s,
+            open_request(
+                "retained",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ReadOnly,
+            ),
+        )
+        .await
+        .unwrap();
+    engine.retain_root(&reader).await.unwrap();
+    let leaf = JournalObject::encode(
+        JournalObjectKind::Message,
+        &agent_runtime::core::content::Message::user("staged leaf"),
+    )
+    .unwrap();
+    engine
+        .stage_leaves(&reader, JournalPinId::new("staging"), vec![leaf.clone()])
+        .await
+        .unwrap();
+    engine.close(reader).await.unwrap();
+    let writer = engine
+        .open(
+            &s,
+            open_request(
+                "advance",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ExclusiveWriter,
+            ),
+        )
+        .await
+        .unwrap();
+    let second = engine
+        .commit(
+            &writer,
+            empty_commit(
+                &s,
+                writer.writer_epoch().unwrap(),
+                "second",
+                Some(&first),
+                2,
+            ),
+        )
+        .await
+        .unwrap();
+    engine.close(writer).await.unwrap();
+    let pins = raw.pins(&d, &s).await.unwrap();
+    assert_eq!(pins.len(), 2);
+    assert!(
+        pins.iter()
+            .any(|p| p.pin.as_str() == "retained" && !p.blocks_retirement)
+    );
+    assert!(
+        pins.iter().any(|p| p.pin.as_str() == "staging"
+            && p.roots.contains(&leaf.id)
+            && p.blocks_retirement)
+    );
+    let root = JournalObject::encode(JournalObjectKind::Head, &first)
+        .unwrap()
+        .id;
+    let catalog = raw.catalog(&d, &s, &root).await.unwrap().unwrap();
+    drop(engine);
+    let fresh = reopen(&f).await;
+    assert_eq!(fresh.pins(&d, &s).await.unwrap(), pins);
+    assert_eq!(fresh.catalog(&d, &s, &root).await.unwrap(), Some(catalog));
+    assert_eq!(
+        fresh
+            .objects(&d, &s, std::slice::from_ref(&leaf.id))
+            .await
+            .unwrap(),
+        vec![Some(Arc::from(leaf.bytes))]
+    );
+    let engine = JournalEngine::protected(
+        Arc::new(MappingStorage::new(fresh.clone(), f.clone())),
+        d.storage_id.clone(),
+        engine_config(),
+    );
+    let retained = engine
+        .open(
+            &s,
+            open_request(
+                "read-retained",
+                JournalRootSelection::Retained { root: root.clone() },
+                JournalOpenIntent::ReadOnly,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.head(), Some(&first));
+    engine.close(retained).await.unwrap();
+    let latest = engine
+        .open(
+            &s,
+            open_request(
+                "latest",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ReadOnly,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(latest.head(), Some(&second));
+    engine.close(latest).await.unwrap();
+
+    for p in pins {
+        engine
+            .release_pin(&s, &p.pin, engine.root_epoch().unwrap())
+            .await
+            .unwrap();
+    }
+    assert!(fresh.pins(&d, &s).await.unwrap().is_empty());
+    // Unknown metadata and ordered Put/Remove are persisted verbatim by apply.
+    let mut edit = write(&d, s.as_str(), vec![]);
+    edit.expect = fresh.load(&d, &s).await.unwrap().unwrap().fence();
+    edit.record.generation = edit.expect.generation + 1;
+    edit.operation = None;
+    let expected_pin = match edit.pins[0].clone() {
+        JournalPinChange::Put(p) => p,
+        _ => unreachable!(),
+    };
+    let expected_catalog = match edit.catalog[0].clone() {
+        JournalCatalogChange::Put(c) => c,
+        _ => unreachable!(),
+    };
+    fresh.apply(edit.clone()).await.unwrap();
+    let reopened = reopen(&f).await;
+    assert_eq!(
+        reopened.load(&d, &s).await.unwrap().unwrap().engine,
+        edit.record.engine
+    );
+    assert_eq!(
+        reopened.pins(&d, &s).await.unwrap(),
+        vec![expected_pin.clone()]
+    );
+    assert_eq!(
+        reopened
+            .catalog(&d, &s, &expected_catalog.head)
+            .await
+            .unwrap(),
+        Some(expected_catalog.clone())
+    );
+    edit.expect = edit.record.fence();
+    edit.record.generation += 1;
+    edit.pins = vec![JournalPinChange::Remove(expected_pin.pin)];
+    edit.catalog = vec![
+        JournalCatalogChange::Remove(expected_catalog.head.clone()),
+        JournalCatalogChange::Remove(root),
+    ];
+    reopened.apply(edit).await.unwrap();
+    assert!(reopened.pins(&d, &s).await.unwrap().is_empty());
+    assert!(
+        reopened
+            .catalog(&d, &s, &expected_catalog.head)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+async fn operation_rows(
+    f: &FileDb,
+    d: &JournalDomain,
+    s: &SessionId,
+) -> std::collections::BTreeMap<i64, (Vec<u8>, Vec<u8>)> {
+    sqlx::query("SELECT tier,nonce,payload FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY tier")
+        .bind(d.storage_id.as_str()).bind(if d.role == JournalRole::Protected { "protected" } else { "ordinary" }).bind(s.as_str()).fetch_all(f.database().pool()).await.unwrap().into_iter().map(|r| (r.get("tier"), (r.get("nonce"), r.get("payload")))).collect()
+}
+#[tokio::test]
+async fn operation_pack_replay_restart() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("operations");
+    let engine = JournalEngine::protected(
+        Arc::new(MappingStorage::new(raw.clone(), f.clone())),
+        d.storage_id.clone(),
+        engine_config(),
+    );
+    let writer = engine
+        .open(
+            &s,
+            open_request(
+                "writer",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ExclusiveWriter,
+            ),
+        )
+        .await
+        .unwrap();
+    let mut previous = None;
+    let mut commits = Vec::new();
+    let mut heads = Vec::new();
+    for i in 1..=6 {
+        let commit = empty_commit(
+            &s,
+            writer.writer_epoch().unwrap(),
+            &format!("op-{i}"),
+            previous.as_ref(),
+            i,
+        );
+        let h = engine.commit(&writer, commit.clone()).await.unwrap();
+        commits.push(commit);
+        heads.push(h.clone());
+        previous = Some(h);
+    }
+    assert_eq!(
+        operation_rows(&f, &d, &s)
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let before = image(&f).await;
+    assert_eq!(
+        engine.commit(&writer, commits[0].clone()).await.unwrap(),
+        heads[0]
+    );
+    let mut changed = commits[0].clone();
+    changed.delta.bootstrap.as_mut().unwrap().updated = Timestamp(999);
+    changed.digest = changed.input_digest().unwrap();
+    state_conflict(engine.commit(&writer, changed).await.unwrap_err());
+    assert_eq!(image(&f).await, before);
+    drop(engine);
+    let fresh = reopen(&f).await;
+    let engine = JournalEngine::protected(
+        Arc::new(MappingStorage::new(fresh.clone(), f.clone())),
+        d.storage_id.clone(),
+        engine_config(),
+    );
+    let writer = engine
+        .open(
+            &s,
+            open_request(
+                "successor",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ExclusiveWriter,
+            ),
+        )
+        .await
+        .unwrap();
+    for (commit, expected) in commits.into_iter().zip(heads) {
+        assert_eq!(
+            engine.commit(&writer, commit.clone()).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            fresh
+                .operation(&d, &s, &commit.batch.operation)
+                .await
+                .unwrap()
+                .unwrap()
+                .result,
+            expected
+        );
+    }
+    // Duplicate identical direct records preserve every sealed operation pack.
+    let rows = operation_rows(&f, &d, &s).await;
+    let record = fresh.load(&d, &s).await.unwrap().unwrap();
+    let mut edit = write(&d, s.as_str(), vec![]);
+    edit.expect = record.fence();
+    edit.record = record;
+    edit.record.generation += 1;
+    edit.pins.clear();
+    edit.catalog.clear();
+    edit.operation = fresh
+        .operation(&d, &s, &JournalOperationId::new("op-1"))
+        .await
+        .unwrap();
+    fresh.apply(edit.clone()).await.unwrap();
+    assert_eq!(operation_rows(&f, &d, &s).await, rows);
+    edit.expect = edit.record.fence();
+    edit.record.generation += 1;
+    edit.operation.as_mut().unwrap().result.created = Timestamp(999);
+    let before = image(&f).await;
+    state_conflict(fresh.apply(edit).await.unwrap_err());
+    assert_eq!(image(&f).await, before);
+}
+
+#[tokio::test]
+async fn engine_replay_window_edges() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let s = SessionId::new("window");
+    for role in [JournalRole::Protected, JournalRole::Ordinary] {
+        let d = domain(role);
+        let mut outsider_domain = d.clone();
+        outsider_domain.storage_id = JournalStorageId::new("other-storage");
+        for (other_d, other_s) in [(&outsider_domain, s.as_str()), (&d, "window-other")] {
+            let mut other = write(other_d, other_s, vec![]);
+            other.record.collection_dirty = false;
+            f.seed_journal(&raw, other).await.unwrap();
+        }
+        let outsider = operation_rows(&f, &outsider_domain, &s).await;
+        let other_session = operation_rows(&f, &d, &SessionId::new("window-other")).await;
+        let mapped = Arc::new(MappingStorage::new(raw.clone(), f.clone()));
+        let engine = if role == JournalRole::Protected {
+            JournalEngine::protected(mapped, d.storage_id.clone(), engine_config())
+        } else {
+            JournalEngine::ordinary(
+                mapped,
+                d.storage_id.clone(),
+                Arc::new(IdentityJournalProjection),
+                engine_config(),
+            )
+        };
+        let writer = engine
+            .open(
+                &s,
+                open_request(
+                    "writer",
+                    JournalRootSelection::Latest,
+                    JournalOpenIntent::ExclusiveWriter,
+                ),
+            )
+            .await
+            .unwrap();
+        let mut previous = None;
+        let mut commits = Vec::new();
+        let mut heads = Vec::new();
+        for revision in 1..=70 {
+            let c = empty_commit(
+                &s,
+                writer.writer_epoch().unwrap(),
+                &format!("op-{revision}"),
+                previous.as_ref(),
+                revision,
+            );
+            let h = engine.commit(&writer, c.clone()).await.unwrap();
+            previous = Some(h.clone());
+            heads.push(h);
+            commits.push(c);
+        }
+        // Commits never prune, including an older record from this same epoch.
+        assert!(
+            raw.operation(&d, &s, &commits[0].batch.operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let stable = operation_rows(&f, &d, &s).await;
+        // Zero membership budget still executes the real engine's S5 directive.
+        engine
+            .collect(JournalGcRequest {
+                storage_id: engine.storage_id(),
+                expected_root_epoch: engine.root_epoch().unwrap(),
+                max_objects: 0,
+            })
+            .await
+            .unwrap();
+        let after = operation_rows(&f, &d, &s).await;
+        for tier in [1, 2] {
+            assert_eq!(
+                stable.get(&tier),
+                after.get(&tier),
+                "unchanged tier was resealed"
+            );
+        }
+        for (i, c) in commits.iter().enumerate() {
+            assert_eq!(
+                raw.operation(&d, &s, &c.batch.operation)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                i + 1 >= 6
+            );
+        }
+        assert_eq!(
+            engine.commit(&writer, commits[5].clone()).await.unwrap(),
+            heads[5]
+        );
+        state_conflict(
+            engine
+                .commit(&writer, commits[4].clone())
+                .await
+                .unwrap_err(),
+        );
+        engine.close(writer).await.unwrap();
+        drop(engine);
+        let fresh = reopen(&f).await;
+        let mapped = Arc::new(MappingStorage::new(fresh.clone(), f.clone()));
+        let engine = if role == JournalRole::Protected {
+            JournalEngine::protected(mapped, d.storage_id.clone(), engine_config())
+        } else {
+            JournalEngine::ordinary(
+                mapped,
+                d.storage_id.clone(),
+                Arc::new(IdentityJournalProjection),
+                engine_config(),
+            )
+        };
+        let writer = engine
+            .open(
+                &s,
+                open_request(
+                    "new-writer",
+                    JournalRootSelection::Latest,
+                    JournalOpenIntent::ExclusiveWriter,
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.commit(&writer, commits[5].clone()).await.unwrap(),
+            heads[5]
+        );
+        // A directive above every revision retains only the last operation of
+        // the post-write epoch, then a newer empty epoch removes that exception.
+        let record = fresh.load(&d, &s).await.unwrap().unwrap();
+        let mut edit = write(&d, s.as_str(), vec![]);
+        edit.expect = record.fence();
+        edit.record = record;
+        edit.record.generation += 1;
+        edit.record.writer_epoch = heads[69].writer_epoch;
+        edit.operation = None;
+        edit.pins.clear();
+        edit.catalog.clear();
+        edit.prune_operations_before = Some(JournalRevision(100));
+        edit.kind = JournalWriteKind::Collect;
+        let before = image(&f).await;
+        edit.inject = Some(JournalCommitFailurePoint::AfterIdempotency);
+        assert!(fresh.apply(edit.clone()).await.is_err());
+        assert_eq!(image(&f).await, before);
+        edit.inject = None;
+        fresh.apply(edit.clone()).await.unwrap();
+        assert!(
+            fresh
+                .operation(&d, &s, &commits[68].batch.operation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fresh
+                .operation(&d, &s, &commits[69].batch.operation)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        edit.expect = edit.record.fence();
+        edit.record.generation += 1;
+        edit.record.writer_epoch += 1;
+        fresh.apply(edit).await.unwrap();
+        assert!(operation_rows(&f, &d, &s).await.is_empty());
+        assert_eq!(operation_rows(&f, &outsider_domain, &s).await, outsider);
+        assert_eq!(
+            operation_rows(&f, &d, &SessionId::new("window-other")).await,
+            other_session
+        );
+    }
+}
+
+type PackRows = Vec<(i64, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>;
+async fn pack_rows(f: &FileDb, d: &JournalDomain, s: &SessionId) -> PackRows {
+    sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,index_nonce,index_payload,body_nonce,body_payload FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY pack_id")
+        .bind(d.storage_id.as_str()).bind(if d.role == JournalRole::Protected { "protected" } else { "ordinary" }).bind(s.as_str()).fetch_all(f.database().pool()).await.unwrap().into_iter().map(|r| (r.get(0),r.get(1),r.get(2),r.get(3),r.get(4),r.get(5),r.get(6),r.get(7))).collect()
+}
+async fn edit(raw: &ForgeJournalStorage, d: &JournalDomain, s: &SessionId) -> JournalWrite {
+    control(d, s, raw.load(d, s).await.unwrap().unwrap())
+}
+fn equal_objects(prefix: &str, count: usize) -> Vec<JournalStoredObject> {
+    (0..count)
+        .map(|i| object(format!("{prefix}-{i:03}-{}", "x".repeat(100))))
+        .collect()
+}
+#[tokio::test]
+async fn deferred_purge_threshold_and_receipts() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("threshold");
+    let objects = equal_objects("equal", 8);
+    let length = objects[0].bytes.len() as u64;
+    assert!(objects.iter().all(|o| o.bytes.len() as u64 == length));
+    mapped
+        .apply(write(&d, s.as_str(), objects.clone()))
+        .await
+        .unwrap();
+    let initial = pack_rows(&f, &d, &s).await;
+    let ids: Vec<_> = objects.iter().map(|o| o.id.clone()).collect();
+    assert!(
+        raw.objects(&d, &s, &ids)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
+    let mut release = edit(&raw, &d, &s).await;
+    release.kind = JournalWriteKind::Collect;
+    release.release = vec![ids[0].clone(), ids[0].clone()];
+    assert_eq!(
+        raw.apply(release).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
+    assert_eq!(
+        pack_rows(&f, &d, &s).await,
+        initial,
+        "below 25% body units must stay sealed"
+    );
+    assert!(raw.objects(&d, &s, &ids[..1]).await.unwrap()[0].is_none());
+    let independent = reopen(&f).await;
+    assert!(independent.objects(&d, &s, &ids[..1]).await.unwrap()[0].is_none());
+    assert_eq!(raw.retained_bytes(&d).await.unwrap(), Some(length * 8));
+    let mut admit = edit(&independent, &d, &s).await;
+    admit.objects.objects = vec![objects[0].clone()];
+    assert_eq!(
+        independent.apply(admit).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
+    assert_eq!(
+        pack_rows(&f, &d, &s).await,
+        initial,
+        "same-scope re-admission must reuse the retained slot"
+    );
+    assert!(raw.objects(&d, &s, &ids[..1]).await.unwrap()[0].is_some());
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![ids[0].clone()];
+    raw.apply(release).await.unwrap();
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![ids[0].clone(), ids[1].clone(), ids[1].clone()];
+    let receipt = raw.apply(release).await.unwrap();
+    assert_eq!(
+        receipt,
+        JournalApplyReceipt {
+            reclaimed_objects: 2,
+            reclaimed_bytes: length * 2
+        }
+    );
+    let purged = pack_rows(&f, &d, &s).await;
+    assert_eq!(purged.len(), 1);
+    assert_eq!(purged[0].0, initial[0].0);
+    assert_eq!(purged[0].1, 1u64.to_be_bytes());
+    assert_eq!(purged[0].2, 6);
+    assert_ne!(purged[0].4, initial[0].4);
+    assert_ne!(purged[0].6, initial[0].6);
+    assert_eq!(raw.retained_bytes(&d).await.unwrap(), Some(length * 6));
+    let result = independent.objects(&d, &s, &ids).await.unwrap();
+    assert!(result[..2].iter().all(Option::is_none));
+    for (got, o) in result[2..].iter().zip(&objects[2..]) {
+        assert_eq!(got.as_ref(), Some(&o.bytes));
+    }
+    let mut repeat = edit(&raw, &d, &s).await;
+    repeat.release = ids[..2].to_vec();
+    assert_eq!(
+        raw.apply(repeat).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
+    // Canonical byte share, not slot share, determines the purge threshold.
+    let s = SessionId::new("unequal");
+    let mut unequal = equal_objects("small", 7);
+    unequal.push(object("large".repeat(2000)));
+    mapped
+        .apply(write(&d, s.as_str(), unequal.clone()))
+        .await
+        .unwrap();
+    let sealed = pack_rows(&f, &d, &s).await;
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = unequal[..3].iter().map(|o| o.id.clone()).collect();
+    assert_eq!(
+        raw.apply(release).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
+    assert_eq!(pack_rows(&f, &d, &s).await, sealed);
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![unequal[7].id.clone()];
+    assert_eq!(
+        raw.apply(release).await.unwrap(),
+        JournalApplyReceipt {
+            reclaimed_objects: 4,
+            reclaimed_bytes: unequal[..3]
+                .iter()
+                .chain(&unequal[7..])
+                .map(|o| o.bytes.len() as u64)
+                .sum()
+        }
+    );
+}
+
+#[tokio::test]
+async fn retired_and_empty_scope_force_purge() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let d = domain(JournalRole::Protected);
+    for retire in [false, true] {
+        let s = SessionId::new(if retire { "retired" } else { "empty" });
+        let first = equal_objects("first", 8);
+        let second = equal_objects("second", 8);
+        mapped
+            .apply(write(&d, s.as_str(), first.clone()))
+            .await
+            .unwrap();
+        let mut add = edit(&raw, &d, &s).await;
+        add.objects.objects = second.clone();
+        add.objects.objects.sort_by(|a, b| a.id.cmp(&b.id));
+        raw.apply(add).await.unwrap();
+        for o in [&first[0], &second[0]] {
+            let mut release = edit(&raw, &d, &s).await;
+            release.release = vec![o.id.clone()];
+            assert_eq!(
+                raw.apply(release).await.unwrap(),
+                JournalApplyReceipt::default()
+            );
+        }
+        let before = raw.retained_bytes(&d).await.unwrap().unwrap();
+        let mut release = edit(&raw, &d, &s).await;
+        release.kind = JournalWriteKind::Collect;
+        if retire {
+            release.record.head = None;
+            release.record.has_checkpoint = false;
+            release.record.retirement = Some(JournalRetirement {
+                session: s.clone(),
+                revision: release.record.revision,
+                root_epoch: 1,
+                retired_at: Timestamp(100),
+            });
+            // No new release ids: both old deferred slots still must be found.
+        } else {
+            release.release = first[1..]
+                .iter()
+                .chain(&second[1..])
+                .map(|o| o.id.clone())
+                .collect();
+        }
+        let receipt = raw.apply(release.clone()).await.unwrap();
+        let removed: Vec<_> = if retire {
+            vec![&first[0], &second[0]]
+        } else {
+            first.iter().chain(&second).collect()
+        };
+        assert_eq!(receipt.reclaimed_objects, removed.len() as u64);
+        assert_eq!(
+            receipt.reclaimed_bytes,
+            removed.iter().map(|o| o.bytes.len() as u64).sum::<u64>()
+        );
+        assert_eq!(
+            before - raw.retained_bytes(&d).await.unwrap().unwrap(),
+            receipt.reclaimed_bytes
+        );
+        if retire {
+            assert_eq!(raw.members(&d, &s).await.unwrap().len(), 14);
+        } else {
+            assert!(pack_rows(&f, &d, &s).await.is_empty());
+        }
+        release.expect = release.record.fence();
+        release.record.generation += 1;
+        release.release.clear();
+        assert_eq!(
+            raw.apply(release).await.unwrap(),
+            JournalApplyReceipt::default()
+        );
+    }
+}
+
+#[tokio::test]
+async fn independent_session_domain_copy_receipts() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let protected = domain(JournalRole::Protected);
+    let ordinary = domain(JournalRole::Ordinary);
+    let objects = equal_objects("shared", 8);
+    let length: u64 = objects.iter().map(|o| o.bytes.len() as u64).sum();
+    let a = SessionId::new("a");
+    let b = SessionId::new("b");
+    let scopes = [
+        (&protected, &a),
+        (&ordinary, &a),
+        (&protected, &b),
+        (&ordinary, &b),
+    ];
+    for (d, s) in scopes {
+        let mut initial = write(d, s.as_str(), objects.clone());
+        initial.record.collection_dirty = false;
+        mapped.apply(initial).await.unwrap();
+        raw.objects(d, s, &[objects[0].id.clone()]).await.unwrap();
+    }
+    let mut totals = JournalApplyReceipt::default();
+    for (n, (d, s)) in scopes.into_iter().enumerate() {
+        let untouched: Vec<_> = scopes[n + 1..].to_vec();
+        let mut release = edit(&raw, d, s).await;
+        release.release = objects
+            .iter()
+            .map(|o| o.id.clone())
+            .chain(std::iter::once(objects[0].id.clone()))
+            .collect();
+        let r = raw.apply(release).await.unwrap();
+        assert_eq!(
+            r,
+            JournalApplyReceipt {
+                reclaimed_objects: 8,
+                reclaimed_bytes: length
+            }
+        );
+        totals.reclaimed_objects += r.reclaimed_objects;
+        totals.reclaimed_bytes += r.reclaimed_bytes;
+        assert!(raw.objects(d, s, &[objects[0].id.clone()]).await.unwrap()[0].is_none());
+        for (d, s) in untouched {
+            assert_eq!(
+                raw.objects(d, s, &[objects[0].id.clone()]).await.unwrap()[0].as_ref(),
+                Some(&objects[0].bytes)
+            );
+        }
+        let remaining = raw.retained_bytes(&protected).await.unwrap().unwrap()
+            + raw.retained_bytes(&ordinary).await.unwrap().unwrap();
+        assert_eq!(length * 4 - remaining, totals.reclaimed_bytes);
+    }
+    assert_eq!(totals.reclaimed_objects, 32);
+    // Engine-selected nonempty collection release now uses the physical path.
+    let s = SessionId::new("engine-release");
+    let engine = JournalEngine::protected(
+        Arc::new(mapped),
+        protected.storage_id.clone(),
+        engine_config(),
+    );
+    let writer = engine
+        .open(
+            &s,
+            open_request(
+                "writer",
+                JournalRootSelection::Latest,
+                JournalOpenIntent::ExclusiveWriter,
+            ),
+        )
+        .await
+        .unwrap();
+    let first = engine
+        .commit(
+            &writer,
+            empty_commit(&s, writer.writer_epoch().unwrap(), "one", None, 1),
+        )
+        .await
+        .unwrap();
+    engine
+        .commit(
+            &writer,
+            empty_commit(&s, writer.writer_epoch().unwrap(), "two", Some(&first), 2),
+        )
+        .await
+        .unwrap();
+    engine.close(writer).await.unwrap();
+    let gc = engine
+        .collect(JournalGcRequest {
+            storage_id: engine.storage_id(),
+            expected_root_epoch: engine.root_epoch().unwrap(),
+            max_objects: u64::MAX,
+        })
+        .await
+        .unwrap();
+    assert!(gc.deleted > 0);
+}
+
+async fn add_objects(
+    raw: &ForgeJournalStorage,
+    d: &JournalDomain,
+    s: &SessionId,
+    mut objects: Vec<JournalStoredObject>,
+) {
+    objects.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut add = edit(raw, d, s).await;
+    add.objects.objects = objects;
+    raw.apply(add).await.unwrap();
+}
+#[tokio::test]
+async fn terminal_geometric_repack() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("geometric");
+    let objects: Vec<_> = (0..24)
+        .map(|i| object(format!("{i:03}-{}", "x".repeat(1500))))
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), vec![objects[0].clone()]))
+        .await
+        .unwrap();
+    for o in &objects[1..] {
+        add_objects(&raw, &d, &s, vec![o.clone()]).await;
+    }
+    let record = raw.load(&d, &s).await.unwrap();
+    let members = raw.members(&d, &s).await.unwrap();
+    let retained = raw.retained_bytes(&d).await.unwrap();
+    let before = pack_rows(&f, &d, &s).await;
+    assert_eq!(before.len(), 24);
+    raw.set_repacking(false);
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(pack_rows(&f, &d, &s).await, before);
+    raw.set_repacking(true);
+    raw.post_terminal(&d, &s).await.unwrap();
+    let after = pack_rows(&f, &d, &s).await;
+    assert!(after.len() <= 2);
+    let mut tiers = std::collections::BTreeSet::new();
+    for row in &after {
+        assert!(row.3 <= 1024 * 1024);
+        assert!(tiers.insert((row.3 as u64).max(4096).ilog2()));
+    }
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+    assert_eq!(raw.retained_bytes(&d).await.unwrap(), retained);
+    let settled = pack_rows(&f, &d, &s).await;
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(pack_rows(&f, &d, &s).await, settled);
+    // Equal tiers whose pair exceeds 1 MiB must stay sealed.
+    let s = SessionId::new("large-pair");
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), vec![object("a".repeat(600_000))]))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, vec![object("b".repeat(600_000))]).await;
+    let before = pack_rows(&f, &d, &s).await;
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(pack_rows(&f, &d, &s).await, before);
+    // A failed physical transaction preserves the acknowledged journal; retry
+    // succeeds after repairing the fixture's intentionally corrupted unit.
+    let s = SessionId::new("maintenance-retry");
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), vec![object("retry-a")]))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, vec![object("retry-b")]).await;
+    let rows = pack_rows(&f, &d, &s).await;
+    let target = &rows[1];
+    let record = raw.load(&d, &s).await.unwrap();
+    let members = raw.members(&d, &s).await.unwrap();
+    sqlx::query("UPDATE agent_session_journal_pack SET body_payload=zeroblob(length(body_payload)) WHERE pack_id=?").bind(target.0).execute(f.database().pool()).await.unwrap();
+    raw.set_cache_budget(0).unwrap();
+    let broken = image(&f).await;
+    assert!(raw.post_terminal(&d, &s).await.is_err());
+    assert_eq!(image(&f).await, broken);
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    sqlx::query("UPDATE agent_session_journal_pack SET body_payload=? WHERE pack_id=?")
+        .bind(&target.7)
+        .bind(target.0)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    // Repacking never removes below-threshold dead bytes or grants membership.
+    let s = SessionId::new("deferred-terminal");
+    let objects = equal_objects("deferred", 8);
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), objects.clone()))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, vec![object("small-second")]).await;
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![objects[0].id.clone()];
+    raw.apply(release).await.unwrap();
+    let before = pack_rows(&f, &d, &s).await;
+    let retained = raw.retained_bytes(&d).await.unwrap();
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(pack_rows(&f, &d, &s).await, before);
+    assert_eq!(raw.retained_bytes(&d).await.unwrap(), retained);
+    assert!(raw.objects(&d, &s, &[objects[0].id.clone()]).await.unwrap()[0].is_none());
+}
+
+#[tokio::test]
+async fn collection_repack_eligible_scoped_packs() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("base");
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    mapped
+        .apply(write(
+            &d,
+            s.as_str(),
+            vec![object("stable-a".repeat(12_000))],
+        ))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, vec![object("stable-b".repeat(12_000))]).await;
+    let stable = pack_rows(&f, &d, &s).await;
+    let deferred: Vec<_> = (0..8)
+        .map(|i| object(format!("{i}-{}", "d".repeat(10_000))))
+        .collect();
+    add_objects(&raw, &d, &s, deferred.clone()).await;
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![deferred[0].id.clone()];
+    raw.apply(release).await.unwrap();
+    let deferred_row = pack_rows(&f, &d, &s).await.pop().unwrap();
+    let purge: Vec<_> = (0..8)
+        .map(|i| object(format!("{i}-{}", "p".repeat(20_000))))
+        .collect();
+    add_objects(&raw, &d, &s, purge.clone()).await;
+    let purge_id = pack_rows(&f, &d, &s).await.last().unwrap().0;
+    for i in 0..2 {
+        add_objects(
+            &raw,
+            &d,
+            &s,
+            vec![object(format!("small-{i}{}", "s".repeat(20_000)))],
+        )
+        .await;
+    }
+    let other_d = domain(JournalRole::Ordinary);
+    mapped
+        .apply(write(&other_d, s.as_str(), equal_objects("other", 8)))
+        .await
+        .unwrap();
+    let other_s = SessionId::new("base-other");
+    mapped
+        .apply(write(&d, other_s.as_str(), equal_objects("other", 8)))
+        .await
+        .unwrap();
+    let foreign_d = pack_rows(&f, &other_d, &s).await;
+    let foreign_s = pack_rows(&f, &d, &other_s).await;
+    let before = raw.retained_bytes(&d).await.unwrap().unwrap();
+    let mut collect = edit(&raw, &d, &s).await;
+    collect.kind = JournalWriteKind::Collect;
+    collect.release = purge[..2].iter().map(|o| o.id.clone()).collect();
+    let receipt = raw.apply(collect).await.unwrap();
+    assert_eq!(receipt.reclaimed_objects, 2);
+    assert_eq!(
+        receipt.reclaimed_bytes,
+        purge[..2].iter().map(|o| o.bytes.len() as u64).sum::<u64>()
+    );
+    let after = pack_rows(&f, &d, &s).await;
+    for row in stable.iter().chain(std::iter::once(&deferred_row)) {
+        assert!(after.contains(row), "stable/deferred large pack changed");
+    }
+    assert!(!after.iter().any(|r| r.0 == purge_id));
+    assert_eq!(after.len(), 4);
+    assert!(after.iter().all(|r| r.3 <= 1024 * 1024));
+    assert_eq!(
+        before - raw.retained_bytes(&d).await.unwrap().unwrap(),
+        receipt.reclaimed_bytes
+    );
+    assert_eq!(pack_rows(&f, &other_d, &s).await, foreign_d);
+    assert_eq!(pack_rows(&f, &d, &other_s).await, foreign_s);
+    assert!(
+        raw.objects(&d, &s, &[deferred[0].id.clone()])
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    // A second collection has no small or freshly purged inputs to rewrite.
+    let mut collect = edit(&raw, &d, &s).await;
+    collect.kind = JournalWriteKind::Collect;
+    assert_eq!(
+        raw.apply(collect).await.unwrap(),
+        JournalApplyReceipt::default()
+    );
+    assert_eq!(pack_rows(&f, &d, &s).await, after);
+}
+
+#[tokio::test]
+async fn purge_rewrites_only_capped_pack() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("bounded");
+    let large: Vec<_> = (0..50)
+        .map(|i| object(format!("{i:03}{}", "L".repeat(200_000))))
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), large))
+        .await
+        .unwrap();
+    let stable = pack_rows(&f, &d, &s).await;
+    assert!(stable.len() >= 10);
+    let purge: Vec<_> = (0..8)
+        .map(|i| object(format!("{i:03}{}", "P".repeat(20_000))))
+        .collect();
+    add_objects(&raw, &d, &s, purge.clone()).await;
+    let purged_id = pack_rows(&f, &d, &s).await.last().unwrap().0;
+    let mut release = edit(&raw, &d, &s).await;
+    release.kind = JournalWriteKind::Collect;
+    release.release = purge[..2].iter().map(|o| o.id.clone()).collect();
+    let receipt = raw.apply(release).await.unwrap();
+    assert_eq!(receipt.reclaimed_objects, 2);
+    let after = pack_rows(&f, &d, &s).await;
+    for row in &stable {
+        assert!(after.contains(row));
+    }
+    assert_eq!(
+        after.iter().find(|r| r.0 == purged_id).unwrap().1,
+        1u64.to_be_bytes()
+    );
+    assert!(after.iter().all(|r| r.3 <= 1024 * 1024));
+    // Explicit compaction spans >8 MiB using several single-scope transactions.
+    // A deferred pack is deliberately excluded from every physical move.
+    let deferred = equal_objects("keep-dead", 8);
+    add_objects(&raw, &d, &s, deferred.clone()).await;
+    let mut release = edit(&raw, &d, &s).await;
+    release.release = vec![deferred[0].id.clone()];
+    raw.apply(release).await.unwrap();
+    let deferred_row = pack_rows(&f, &d, &s).await.pop().unwrap();
+    let other_d = domain(JournalRole::Ordinary);
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&other_d, s.as_str(), equal_objects("foreign", 8)))
+        .await
+        .unwrap();
+    let foreign = pack_rows(&f, &other_d, &s).await;
+    let before_members = raw.members(&d, &s).await.unwrap();
+    let before_record = raw.load(&d, &s).await.unwrap();
+    let before_bytes = raw.retained_bytes(&d).await.unwrap();
+    raw.compact(&d).await.unwrap();
+    let (transactions, max_bytes) = raw.compact_stats().unwrap();
+    assert!(transactions >= 2);
+    assert!(max_bytes <= 8 * 1024 * 1024);
+    assert!(max_bytes > 7 * 1024 * 1024);
+    assert_eq!(raw.members(&d, &s).await.unwrap(), before_members);
+    assert_eq!(raw.load(&d, &s).await.unwrap(), before_record);
+    assert_eq!(raw.retained_bytes(&d).await.unwrap(), before_bytes);
+    assert!(pack_rows(&f, &d, &s).await.contains(&deferred_row));
+    assert_eq!(pack_rows(&f, &other_d, &s).await, foreign);
+    let reopened = reopen(&f).await;
+    assert_eq!(reopened.members(&d, &s).await.unwrap(), before_members);
+    assert!(
+        reopened
+            .objects(&d, &s, &[deferred[0].id.clone()])
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    assert!(
+        pack_rows(&f, &d, &s)
+            .await
+            .iter()
+            .all(|r| r.3 <= 1024 * 1024)
+    );
+}
+
+#[tokio::test]
+async fn import_and_operation_pack_caps() {
+    const CAP: usize = 1024 * 1024;
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("caps");
+    let imported: Vec<_> = (0..7)
+        .map(|i| object(format!("{i}{}", "import".repeat(70_000))))
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), imported))
+        .await
+        .unwrap();
+    assert!(pack_rows(&f, &d, &s).await.len() >= 4);
+    assert!(
+        pack_rows(&f, &d, &s)
+            .await
+            .iter()
+            .all(|r| r.3 as usize <= CAP)
+    );
+    let mut oversized = edit(&raw, &d, &s).await;
+    oversized.objects.objects = vec![object("X".repeat(CAP))];
+    let before = image(&f).await;
+    assert!(raw.apply(oversized).await.is_err());
+    assert_eq!(image(&f).await, before);
+    let s = SessionId::new("operation-overflow");
+    let mut initial = write(&d, s.as_str(), vec![]);
+    initial.operation = None;
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(initial)
+        .await
+        .unwrap();
+    for revision in 1..=4 {
+        let mut add = edit(&raw, &d, &s).await;
+        add.record.revision = JournalRevision(revision);
+        let mut result = head(&d, &s, JournalObjectId::from_bytes([0; 32]));
+        result.revision = JournalRevision(revision);
+        add.operation = Some(JournalOperationRecord {
+            operation: JournalOperationId::new(format!("{revision}{}", "operation".repeat(40_000))),
+            digest: journal_history_chain(std::iter::empty()),
+            revision: JournalRevision(revision),
+            result,
+        });
+        raw.apply(add).await.unwrap();
+        for (tier, count, len) in raw.operation_pack_layout(&d, &s).await.unwrap() {
+            assert!(len <= CAP);
+            if tier < 64 {
+                assert_eq!(count, 1 << tier);
+            }
+        }
+    }
+    let before = operation_rows(&f, &d, &s).await;
+    assert!(before.keys().any(|t| *t >= 64));
+    let mut prune = edit(&raw, &d, &s).await;
+    prune.kind = JournalWriteKind::Collect;
+    prune.prune_operations_before = Some(JournalRevision(2));
+    raw.apply(prune).await.unwrap();
+    let after = operation_rows(&f, &d, &s).await;
+    assert_eq!(before.get(&64), after.get(&64));
+    for (tier, count, len) in raw.operation_pack_layout(&d, &s).await.unwrap() {
+        assert!(len <= CAP);
+        if tier < 64 {
+            assert_eq!(count, 1 << tier);
+        }
+    }
+    let mut huge = edit(&raw, &d, &s).await;
+    huge.operation = Some(JournalOperationRecord {
+        operation: JournalOperationId::new("x".repeat(CAP)),
+        digest: journal_history_chain(std::iter::empty()),
+        revision: JournalRevision(5),
+        result: head(&d, &s, JournalObjectId::from_bytes([0; 32])),
+    });
+    let before = image(&f).await;
+    state_conflict(raw.apply(huge).await.unwrap_err());
+    assert_eq!(image(&f).await, before);
+    let fresh = reopen(&f).await;
+    assert_eq!(
+        fresh.operation_pack_layout(&d, &s).await.unwrap(),
+        raw.operation_pack_layout(&d, &s).await.unwrap()
+    );
+}
