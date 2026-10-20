@@ -439,6 +439,28 @@ mod tests {
         assert!(decode_body(&db, &pa.body).is_err());
     }
     #[test]
+    fn frames_declaring_more_than_a_two_mib_window_are_refused() {
+        let objects = vec![object(1)];
+        let pack = encode(&objects).unwrap();
+        let directory = decode_index(&pack.index, pack.count, pack.canonical_bytes).unwrap();
+        let raw = zstd::stream::decode_all(pack.body.as_slice()).unwrap();
+        // A hand-built frame: no content size, one raw last block, and a
+        // Window_Descriptor of windowLog = 10 + exponent (+ mantissa eighths).
+        let frame = |descriptor: u8| {
+            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, descriptor];
+            frame.extend_from_slice(&(((raw.len() as u32) << 3) | 1).to_le_bytes()[..3]);
+            frame.extend_from_slice(&raw);
+            frame
+        };
+        assert_eq!(decode_body(&directory, &frame(8 << 3)).unwrap(), objects);
+        assert_eq!(decode_body(&directory, &frame(11 << 3)).unwrap(), objects);
+        // 2 MiB + 256 KiB, 4 MiB and 2 GiB windows are refused before any
+        // window allocation, even though the content itself is valid.
+        for descriptor in [(11 << 3) | 1, 12 << 3, 21 << 3] {
+            assert!(decode_body(&directory, &frame(descriptor)).is_err());
+        }
+    }
+    #[test]
     fn kind_ordered_bodies_and_capped_split() {
         let mut objects = vec![object(1), object(2)];
         let o = JournalObject::encode(JournalObjectKind::StateValue, &serde_json::json!({"x":1}))
