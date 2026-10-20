@@ -2921,3 +2921,111 @@ async fn warm_commit_writes_only_its_delta() {
     );
     assert!(frames <= 64, "{frames} WAL pages for one warm turn");
 }
+
+/// Drop the apply future after its `limit`-th poll. Ready(None) = cancelled.
+async fn cancel_after<F: std::future::Future>(future: F, limit: usize) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut polls = 0;
+    std::future::poll_fn(|cx| {
+        if polls == limit {
+            return std::task::Poll::Ready(None);
+        }
+        polls += 1;
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await
+}
+
+/// Cancelling an apply at every await point (staging, release/purge, commit)
+/// leaves exactly the old or the new state, never releases the write lock
+/// late, and never leaves the warm cache disagreeing with a fresh storage.
+#[tokio::test]
+async fn apply_cancelled_at_every_await_is_atomic() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("cancelled");
+    let mut seed = write(&d, s.as_str(), vec![object("cancel-genesis")]);
+    seed.operation = None;
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(seed)
+        .await
+        .unwrap();
+    let mut previous: Option<JournalStoredObject> = None;
+    let (mut cancelled, mut committed_while_cancelled) = (0, 0);
+    for limit in 1.. {
+        let before = raw.load(&d, &s).await.unwrap().unwrap();
+        let body = object(format!("cancel-{limit}-{}", "c".repeat(2048)));
+        let mut w = control(&d, &s, before.clone());
+        w.kind = JournalWriteKind::Collect;
+        w.objects = JournalObjectBatch {
+            objects: vec![body.clone()],
+        };
+        // Releasing the previous body empties its pack: a purge to cancel in.
+        w.release = previous.iter().map(|o| o.id.clone()).collect();
+        w.operation = Some(JournalOperationRecord {
+            operation: JournalOperationId::new(format!("cancel-{limit}")),
+            digest: journal_history_chain(std::iter::empty()),
+            revision: before.revision,
+            result: head(&d, &s, body.id.clone()),
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cancel_after(raw.apply(w.clone()), limit),
+        )
+        .await
+        .expect("apply hung");
+        let fresh = ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+        let record = fresh.load(&d, &s).await.unwrap().unwrap();
+        let committed = record == w.record;
+        assert!(committed || record == before, "limit {limit}: mixed record");
+        let ids: Vec<_> = std::iter::once(body.id.clone())
+            .chain(previous.iter().map(|o| o.id.clone()))
+            .collect();
+        let found = fresh.objects(&d, &s, &ids).await.unwrap();
+        let op = fresh
+            .operation(&d, &s, &JournalOperationId::new(format!("cancel-{limit}")))
+            .await
+            .unwrap();
+        if committed {
+            assert_eq!(found[0].as_ref(), Some(&body.bytes), "limit {limit}");
+            assert!(found.get(1).is_none_or(Option::is_none), "limit {limit}");
+            assert!(op.is_some());
+        } else {
+            assert!(found[0].is_none(), "limit {limit}");
+            assert!(found.get(1).is_none_or(Option::is_some), "limit {limit}");
+            assert!(op.is_none());
+        }
+        // The warm storage agrees with a fresh one after the cancellation.
+        assert_eq!(raw.load(&d, &s).await.unwrap(), Some(record.clone()));
+        assert_eq!(raw.objects(&d, &s, &ids).await.unwrap(), found);
+        assert_eq!(
+            raw.members(&d, &s).await.unwrap(),
+            fresh.members(&d, &s).await.unwrap()
+        );
+        assert_eq!(
+            raw.retained_bytes(&d).await.unwrap(),
+            fresh.retained_bytes(&d).await.unwrap()
+        );
+        match outcome {
+            Some(result) => {
+                result.unwrap();
+                break;
+            }
+            None => {
+                cancelled += 1;
+                if committed {
+                    committed_while_cancelled += 1;
+                }
+            }
+        }
+        if committed {
+            previous = Some(body);
+        }
+    }
+    assert!(cancelled > 5);
+    eprintln!(
+        "apply cancellation: {cancelled} await points, {committed_while_cancelled} committed before the drop"
+    );
+}
