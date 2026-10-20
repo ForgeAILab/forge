@@ -359,6 +359,7 @@ impl ForgeJournalStorage {
             T::PackBody(id) => (Unit::PackBody, id, "body_nonce", "body_payload", false),
             T::PackBodyCanonical(id) => (Unit::PackBody, id, "body_nonce", "body_payload", true),
             T::Operations(tier) => (Unit::Operations, tier, "nonce", "payload", true),
+            T::OperationsFrame(tier) => (Unit::Operations, tier, "nonce", "payload", false),
         };
         let (table, key) = match kind {
             Unit::Operations => ("agent_session_journal_operation_pack", "tier"),

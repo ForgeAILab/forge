@@ -3029,3 +3029,73 @@ async fn apply_cancelled_at_every_await_is_atomic() {
         "apply cancellation: {cancelled} await points, {committed_while_cancelled} committed before the drop"
     );
 }
+
+/// Operation tiers use the same bounded inflation as pack bodies: a frame
+/// declaring a window above 2 MiB or inflating past the 1 MiB record cap is
+/// refused even though AEAD accepts the resealed unit.
+#[tokio::test]
+async fn operation_frames_are_bounded() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("operation-frames");
+    f.seed_journal(&raw, write(&d, s.as_str(), vec![object("frames")]))
+        .await
+        .unwrap();
+    let op = JournalOperationId::new("operation");
+    let fresh = || ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+    let original = fresh().operation(&d, &s, &op).await.unwrap().unwrap();
+    let pool = f.database().pool().clone();
+    let saved: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT nonce,payload FROM agent_session_journal_operation_pack WHERE runtime_session_id='operation-frames' AND tier=0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let restore = || async {
+        sqlx::query("UPDATE agent_session_journal_operation_pack SET nonce=?,payload=? WHERE runtime_session_id='operation-frames' AND tier=0")
+            .bind(&saved.0).bind(&saved.1).execute(&pool).await.unwrap();
+    };
+    // Valid records in a raw-block frame that declares the given window.
+    let window = |descriptor: u8| {
+        move |bytes: &mut Vec<u8>| {
+            let records = zstd::stream::decode_all(bytes.as_slice()).unwrap();
+            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, descriptor];
+            frame.extend_from_slice(&(((records.len() as u32) << 3) | 1).to_le_bytes()[..3]);
+            frame.extend_from_slice(&records);
+            *bytes = frame;
+        }
+    };
+    raw.reseal_unit_for_test(&d, &s, TestSealedUnit::OperationsFrame(0), window(11 << 3))
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh().operation(&d, &s, &op).await.unwrap(),
+        Some(original.clone())
+    );
+    for descriptor in [(11 << 3) | 1, 12 << 3] {
+        restore().await;
+        raw.reseal_unit_for_test(
+            &d,
+            &s,
+            TestSealedUnit::OperationsFrame(0),
+            window(descriptor),
+        )
+        .await
+        .unwrap();
+        assert!(fresh().operation(&d, &s, &op).await.is_err());
+    }
+    // Inflation past the 1 MiB serialized-record cap.
+    restore().await;
+    raw.reseal_unit_for_test(&d, &s, TestSealedUnit::OperationsFrame(0), |bytes| {
+        *bytes = zstd::stream::encode_all(vec![b' '; 1024 * 1024 + 1].as_slice(), 3).unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(fresh().operation(&d, &s, &op).await.is_err());
+    restore().await;
+    assert_eq!(
+        fresh().operation(&d, &s, &op).await.unwrap(),
+        Some(original)
+    );
+}

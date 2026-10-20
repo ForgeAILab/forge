@@ -26,6 +26,8 @@ pub enum TestSealedUnit {
     PackBodyCanonical(i64),
     /// An operation pack's decompressed records, by tier.
     Operations(i64),
+    /// An operation pack's compressed frame, by tier.
+    OperationsFrame(i64),
 }
 
 use agent_runtime::core::error::{
