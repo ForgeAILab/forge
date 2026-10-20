@@ -339,6 +339,88 @@ impl ForgeJournalStorage {
         self.cache_lock()?.invalidate(&scope);
         Ok(())
     }
+    /// Test-only: open one sealed unit with its real binding, let `mutate`
+    /// change the plaintext (decompressed for canonical bodies and operation
+    /// packs), and reseal it under the same binding. AEAD then accepts the
+    /// unit, so only the bounded decoders stand between the change and a read.
+    #[cfg(feature = "test-support")]
+    pub async fn reseal_unit_for_test(
+        &self,
+        domain: &JournalDomain,
+        session: &agent_runtime::core::ids::SessionId,
+        unit: super::TestSealedUnit,
+        mutate: impl FnOnce(&mut Vec<u8>) + Send + 'static,
+    ) -> Result<(), RuntimeError> {
+        use super::TestSealedUnit as T;
+        use sqlx::Row;
+        let scope = (domain.clone(), session.clone());
+        let (kind, id, nonce, payload, inflate) = match unit {
+            T::PackIndex(id) => (Unit::PackIndex, id, "index_nonce", "index_payload", false),
+            T::PackBody(id) => (Unit::PackBody, id, "body_nonce", "body_payload", false),
+            T::PackBodyCanonical(id) => (Unit::PackBody, id, "body_nonce", "body_payload", true),
+            T::Operations(tier) => (Unit::Operations, tier, "nonce", "payload", true),
+        };
+        let (table, key) = match kind {
+            Unit::Operations => ("agent_session_journal_operation_pack", "tier"),
+            _ => ("agent_session_journal_pack", "pack_id"),
+        };
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(database_error)?;
+        let row = sqlx::query(&format!(
+            "SELECT * FROM {table} WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
+        ))
+        .bind(domain.storage_id.as_str())
+        .bind(role(domain))
+        .bind(session.as_str())
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
+        let generation = match kind {
+            Unit::Operations => 0,
+            _ => super::storage::counter(&row, "generation")?,
+        };
+        let row_key = id.to_be_bytes();
+        let binding = Binding {
+            unit: kind,
+            domain,
+            session,
+            owner: &owner,
+            row: &row_key,
+            generation,
+        };
+        let mut plain = self.keys.open(
+            &binding,
+            &row.try_get::<Vec<u8>, _>(nonce).map_err(|_| corrupt())?,
+            &row.try_get::<Vec<u8>, _>(payload).map_err(|_| corrupt())?,
+            usize::MAX,
+        )?;
+        if inflate {
+            plain = zstd::stream::decode_all(plain.as_slice()).map_err(|_| corrupt())?;
+        }
+        mutate(&mut plain);
+        if inflate {
+            plain = zstd::stream::encode_all(plain.as_slice(), 3).map_err(|_| corrupt())?;
+        }
+        let sealed = self.keys.seal(&binding, &plain)?;
+        sqlx::query(&format!(
+            "UPDATE {table} SET {nonce}=?,{payload}=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
+        ))
+        .bind(sealed.nonce)
+        .bind(sealed.payload)
+        .bind(domain.storage_id.as_str())
+        .bind(role(domain))
+        .bind(session.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        tx.commit().await.map_err(database_error)?;
+        self.cache_lock()?.invalidate(&scope);
+        Ok(())
+    }
     /// Test-only generation rewrite, without changing bodies or membership.
     #[cfg(feature = "test-support")]
     pub(crate) async fn reseal_scope(
