@@ -2578,3 +2578,166 @@ async fn relabelled_rows_fail_closed() {
     assert!(fresh().retained_bytes(&ordinary).await.is_err());
     assert!(fresh().retained_bytes(&d).await.is_ok());
 }
+
+fn model_operation(
+    d: &JournalDomain,
+    s: &SessionId,
+    id: &str,
+    revision: u64,
+    epoch: u64,
+    variant: u64,
+) -> JournalOperationRecord {
+    let mut h = head(d, s, JournalObjectId::from_bytes([variant as u8; 32]));
+    h.revision = JournalRevision(revision);
+    h.writer_epoch = epoch;
+    h.batch_sequence = variant;
+    JournalOperationRecord {
+        operation: JournalOperationId::new(id),
+        digest: journal_history_chain(std::iter::empty()),
+        revision: JournalRevision(revision),
+        result: h,
+    }
+}
+
+/// S4/S5 against a plain map model (the volatile reference's rule): binary
+/// carry and capped overflow under many appends, exact/conflicting replays,
+/// explicit inclusive prune floors with the single current-epoch exception,
+/// writer-epoch changes and independent-pool reopen. Every step compares every
+/// id ever written and checks the sealed tier shape and 1 MiB cap.
+#[tokio::test]
+async fn operation_packs_match_model() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("ops-model");
+    let mut seed_write = write(&d, s.as_str(), vec![object("ops-model")]);
+    seed_write.operation = None;
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(seed_write)
+        .await
+        .unwrap();
+    let mut st = raw.clone();
+    let mut record = st.load(&d, &s).await.unwrap().unwrap();
+    let mut model = std::collections::BTreeMap::<String, JournalOperationRecord>::new();
+    let mut seen = Vec::<String>::new();
+    let mut state = 0x1234_5678_9abc_def1u64;
+    let (mut revision, mut epoch) = (record.revision.0, record.writer_epoch);
+    let (mut overflow_rows, mut max_rows, mut conflicts) = (0usize, 0usize, 0usize);
+    for step in 0..300u32 {
+        let roll = xorshift(&mut state) % 100;
+        let mut w = control(&d, &s, record.clone());
+        w.kind = JournalWriteKind::Commit;
+        // Phase one fills large records until carries overflow the cap;
+        // phase two mixes small appends, replays, prunes and epoch changes.
+        let large = step < 72;
+        if !large && roll < 12 {
+            let floor = if roll < 8 {
+                revision.saturating_sub(64)
+            } else {
+                xorshift(&mut state) % (revision + 5)
+            };
+            if roll % 3 == 0 {
+                epoch += 1;
+                w.record.writer_epoch = epoch;
+            }
+            w.kind = JournalWriteKind::Collect;
+            w.prune_operations_before = Some(JournalRevision(floor));
+            st.apply(w.clone()).await.unwrap();
+            let last = model
+                .values()
+                .filter(|o| o.result.writer_epoch == epoch)
+                .map(|o| o.revision)
+                .max();
+            model.retain(|_, o| {
+                o.revision.0 >= floor
+                    || (o.result.writer_epoch == epoch && Some(o.revision) == last)
+            });
+            record = w.record;
+        } else if !large && roll < 20 && !model.is_empty() {
+            let pick = model
+                .keys()
+                .nth(xorshift(&mut state) as usize % model.len())
+                .unwrap()
+                .clone();
+            let old = model[&pick].clone();
+            if roll < 16 {
+                // Identical replay is a no-op on the operation packs.
+                let before = operation_rows(&f, &d, &s).await;
+                w.operation = Some(old);
+                st.apply(w.clone()).await.unwrap();
+                assert_eq!(operation_rows(&f, &d, &s).await, before);
+                record = w.record;
+            } else {
+                // Different input under a retained id conflicts with no effects.
+                let mut changed = old.clone();
+                changed.result.batch_sequence += 1;
+                w.operation = Some(changed);
+                let before = image(&f).await;
+                state_conflict(st.apply(w).await.unwrap_err());
+                assert_eq!(image(&f).await, before);
+                conflicts += 1;
+            }
+        } else if !large && roll < 23 {
+            epoch += 1;
+            w.record.writer_epoch = epoch;
+            st.apply(w.clone()).await.unwrap();
+            record = w.record;
+        } else if !large && roll < 26 {
+            st = reopen(&f).await;
+        } else {
+            revision += 1;
+            let size = if large {
+                16 * 1024 + xorshift(&mut state) as usize % 512
+            } else {
+                xorshift(&mut state) as usize % 2048
+            };
+            let id = format!("op-{step:04}-{}", "p".repeat(size));
+            let op = model_operation(&d, &s, &id, revision, epoch, step as u64);
+            w.record.revision = JournalRevision(revision);
+            w.operation = Some(op.clone());
+            st.apply(w.clone()).await.unwrap();
+            model.insert(id.clone(), op);
+            seen.push(id);
+            record = w.record;
+        }
+        if large && step % 4 != 3 {
+            continue;
+        }
+        let layout = st.operation_pack_layout(&d, &s).await.unwrap();
+        let mut total = 0;
+        for (tier, count, bytes) in &layout {
+            assert!(
+                *bytes <= 1024 * 1024,
+                "step {step}: tier {tier} holds {bytes} bytes"
+            );
+            if *tier < 64 {
+                assert_eq!(*count, 1usize << tier, "step {step}: tier {tier}");
+            }
+            total += count;
+        }
+        assert_eq!(total, model.len(), "step {step}");
+        overflow_rows = overflow_rows.max(layout.iter().filter(|l| l.0 >= 64).count());
+        max_rows = max_rows.max(layout.len());
+        if step % 10 == 3 || step >= 290 {
+            for id in &seen {
+                let id_key = JournalOperationId::new(id.as_str());
+                assert_eq!(
+                    st.operation(&d, &s, &id_key).await.unwrap().as_ref(),
+                    model.get(id),
+                    "step {step}"
+                );
+            }
+        }
+    }
+    assert!(
+        overflow_rows > 0,
+        "the cap never forced an overflow segment"
+    );
+    assert!(conflicts > 0);
+    // Steady state under the S5 window stays a handful of sealed rows.
+    let final_rows = st.operation_pack_layout(&d, &s).await.unwrap().len();
+    eprintln!(
+        "operation model: {} retained, {final_rows} rows, max {max_rows} rows, max {overflow_rows} overflow rows, {conflicts} conflicts",
+        model.len()
+    );
+}
