@@ -857,3 +857,137 @@ fn async_controls_do_not_stall_worker() {
         });
     }
 }
+
+/// One exclusive writer per session across both journal domains: competing
+/// turn, fork and abort-fork operations from other runtimes over the same
+/// store conflict before any provider I/O; ephemeral inquiries over the same
+/// session id coexist without taking or releasing that slot; dropping the
+/// holder releases the slot, so the next writer opens without provider I/O.
+#[tokio::test]
+async fn writer_fence_and_drop() {
+    use agent_runtime::core::error::ErrorKind;
+    use agent_runtime::runtime::{ForkLcm, ForkSeed, ForkSession};
+
+    let id = SessionId::new("writer-fence");
+    let child = SessionId::new("writer-child");
+    let (f, store) = fixture(&id).await;
+    f.ensure_session(&child).await.unwrap();
+
+    // A real published turn, so every competitor resumes native state.
+    let seed_runtime = runtime(store.clone(), provider());
+    let seed = seed_runtime
+        .start_session(StartSession::create(id.clone(), vec![]))
+        .await
+        .unwrap();
+    seed.run(UserInput::text("seed")).await.unwrap();
+    drop(seed);
+    drop(seed_runtime);
+
+    // No scripted replies: any provider request by a contender is a failure.
+    let p = import_matrix::fake(vec![], import_matrix::Profile::Plain);
+    let a = runtime(store.clone(), p.clone());
+    let b = runtime(store.clone(), p.clone());
+    let (first, second) = tokio::join!(
+        a.start_session(StartSession::resume(id.clone())),
+        b.start_session(StartSession::resume(id.clone())),
+    );
+    assert_ne!(
+        first.is_ok(),
+        second.is_ok(),
+        "exactly one of two concurrent turn writers opens"
+    );
+    let held = first.or(second).unwrap();
+
+    let turn_runtime = runtime(store.clone(), p.clone());
+    let fork_runtime = runtime(store.clone(), p.clone());
+    let abort_runtime = runtime(store.clone(), p.clone());
+    let (turn, fork, abort) = tokio::join!(
+        turn_runtime.start_session(StartSession::resume(id.clone())),
+        fork_runtime.fork_session(ForkSession {
+            from: id.clone(),
+            new_id: child.clone(),
+            seed: ForkSeed::Empty,
+            lcm: ForkLcm::NewTimeline,
+        }),
+        abort_runtime.abort_fork(&id),
+    );
+    for (operation, error) in [
+        ("turn", turn.err()),
+        ("fork", fork.err()),
+        ("abort", abort.err()),
+    ] {
+        let error = error.unwrap_or_else(|| panic!("{operation} must lose to the held writer"));
+        assert_eq!(error.kind, ErrorKind::Conflict, "{operation}: {error:?}");
+    }
+    assert!(
+        p.requests().is_empty(),
+        "every losing writer fails before provider I/O"
+    );
+
+    // Inquiries reuse authority metadata but are ephemeral: two of them run
+    // concurrently beside the held writer and neither steals nor frees it.
+    let inquiry_provider = provider();
+    let inquiry_a = runtime(store.clone(), inquiry_provider.clone());
+    let inquiry_b = runtime(store.clone(), inquiry_provider.clone());
+    let mut start = StartSession::ephemeral(vec![]);
+    start.session_id = Some(id.clone());
+    let (ia, ib) = tokio::join!(
+        inquiry_a.start_session(start.clone()),
+        inquiry_b.start_session(start),
+    );
+    let (ia, ib) = (ia.unwrap(), ib.unwrap());
+    let (ra, rb) = tokio::join!(
+        ia.run(UserInput::text("inquiry-a")),
+        ib.run(UserInput::text("inquiry-b")),
+    );
+    ra.unwrap();
+    rb.unwrap();
+    assert_eq!(inquiry_provider.requests().len(), 2);
+    drop((ia, ib, inquiry_a, inquiry_b));
+    assert_eq!(
+        turn_runtime
+            .start_session(StartSession::resume(id.clone()))
+            .await
+            .err()
+            .map(|error| error.kind),
+        Some(ErrorKind::Conflict),
+        "finished inquiries leave the held writer in place"
+    );
+
+    // Dropping the holder releases both domain slots locally; each next
+    // writer opens without reaching the provider.
+    drop(held);
+    drop((a, b));
+    let restored = turn_runtime
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    drop(restored);
+    abort_runtime.abort_fork(&id).await.unwrap();
+    let restored = turn_runtime
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    drop(restored);
+    let forked = fork_runtime
+        .fork_session(ForkSession {
+            from: id.clone(),
+            new_id: child.clone(),
+            seed: ForkSeed::Empty,
+            lcm: ForkLcm::NewTimeline,
+        })
+        .await
+        .unwrap();
+    drop(forked);
+    // A completed fork supersedes its parent; the successor released its
+    // own slot on drop and opens again.
+    let restored = turn_runtime
+        .start_session(StartSession::resume(child))
+        .await
+        .unwrap();
+    drop(restored);
+    assert!(
+        p.requests().is_empty(),
+        "no writer hand-over needed provider I/O"
+    );
+}
