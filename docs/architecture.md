@@ -8285,15 +8285,29 @@ without advancing the session generation or purging deferred bytes. It then call
 SQL auto-vacuum. There is no full VACUUM. Failed physical work can be retried
 without undoing acknowledged state. The S2 switch and compact diagnostics exist
 only under test-support. No JournalStorage method remains typed Unsupported;
-native runtime wiring and the adoption conformance gate remain later tasks.
+native runtime wiring remains a later task.
 
 Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings
 on the first apply for arbitrary runtime ids. Read-test seeding and generation
-resealing helpers exist only under that feature. The engine conformance
-factories still use volatile storage; the focused `session_journal_storage`
-target exercises the production sqlx adapter directly. Legacy decoder tests use
-the real envelope, checkpoint decoder and runtime schema/transition validation.
+resealing helpers exist only under that feature. Engine conformance factories
+now use the production sqlx adapter with real AEAD. The unedited v0.8.0 testkit
+storage suite passes all 22 named cases in each of three configurations:
+`storage_conformance_no_repack`, `storage_conformance_repack`, and
+`storage_conformance_reopen` (a fresh independent pool and empty storage caches
+on every hydration load). All declare PerSession with independent domain copies;
+S2 off keeps mandatory purges enabled. The testkit supplies the engine collection
+host implementation; Forge adds no collector semantics.
+
+Seven test-target-only broken-storage decorators are each rejected at their
+named conformance case: torn transactions, lost acknowledged writes, reordered
+n+1 publication, ignored writer epoch, ignored control generation, premature
+unlinking of a remaining holder's copy, and serving released bytes to a
+non-member. Valid independent-copy releases preserve other holders and reclaim
+only their own bytes. The focused `session_journal_storage` target retains the
+codec/storage/maintenance regressions. Legacy decoder tests use the real
+envelope, checkpoint decoder and runtime schema/transition validation. This
+conformance gate does not connect journal storage to native runtime persistence.
 
 Migrations are files named `V{version}__{name}.sql`, embedded in the binary
 and recorded by version and name in the `_migration` table. Versions up to

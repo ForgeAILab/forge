@@ -622,8 +622,8 @@ purges. Collection disabled/enabled and arbitrary ordinary policies are
 covered by the suite; exercise cold/evicted/warm R4 budgets in Forge tests. Do not
 replace file-backed restart evidence with only `sqlite::memory:` tests.
 
-The suite includes primitive apply cuts, both fences, opaque metadata/body
-conflicts, ordered dirty paging, membership isolation and scope-dependent
+The suite includes primitive apply cuts, revision/epoch/control-generation fences,
+opaque metadata/body conflicts, ordered dirty paging, membership isolation and scope-dependent
 receipts, independently reclaimable session/domain copies, bounded deferred
 deletion and exact cumulative receipts on scope emptying; protected/ordinary
 journal suites;
@@ -631,7 +631,7 @@ collection, ordinary shared suffix and projected intent; and unsupported
 collection. Forge does not reimplement `JournalCollectionHost` semantics: testkit
 already implements it for `JournalEngine<S>`.
 
-Run all six deliberately broken-storage cases using Forge-backed test-only
+Run all seven deliberately broken-storage cases using Forge-backed test-only
 fault decorators, preserving the upstream named expected failures:
 
 | Defect | Required named rejection |
@@ -640,8 +640,14 @@ fault decorators, preserving the upstream named expected failures:
 | Lost acknowledged write | `journal_storage::restart_acknowledged_state` |
 | Reordered n+1 publication | `journal_storage::restart_commit_sequence` |
 | Ignored writer epoch | `journal_storage::writer_epoch_fence` |
+| Ignored control generation | `journal_storage::control_generation_fence` |
 | Shared body deleted with another holder | `journal_storage::shared_body_last_membership` |
 | Released/deferred body served to a non-member | `journal_storage::membership_isolation_and_receipts` or `journal_storage::bounded_deferred_deletion`, matching the injected path |
+
+Task 12 corrects the original six-control inventory: released v0.8.0 also
+contains the private `StaleGeneration` fault and the named
+`control_generation_fence` case. This seventh control is required alongside
+the writer-epoch control; revision and epoch may stay unchanged across controls.
 
 For the premature-deletion decorator, deliberately damage the surviving scope's
 independent copy; a correct PerSession release in A must never be labeled faulty

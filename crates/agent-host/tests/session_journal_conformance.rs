@@ -1,3 +1,7 @@
+#[path = "support/broken.rs"]
+mod broken;
+#[path = "support/reopen.rs"]
+mod reopen;
 #[path = "support/session_journal.rs"]
 mod support;
 
@@ -7,7 +11,71 @@ use agent_runtime::core::{
     checkpoint::CheckpointStore, ids::SessionId, journal::*, store::SessionStore,
 };
 use agent_runtime_testkit::conformance::journal::*;
+use agent_runtime_testkit::conformance::journal_storage::assert_journal_storage_conformance;
 use forge_agent_host::{SqliteProtectedRuntimeStore, test_support::FileDb};
+
+#[tokio::test]
+async fn storage_conformance_no_repack() {
+    assert_journal_storage_conformance(|| support::storage_with_repacking(false)).await;
+}
+
+#[tokio::test]
+async fn storage_conformance_repack() {
+    assert_journal_storage_conformance(support::storage).await;
+}
+
+#[tokio::test]
+async fn storage_conformance_reopen() {
+    assert_journal_storage_conformance(|| async {
+        std::sync::Arc::new(reopen::Reopen::new().await)
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn broken_storage_torn_transaction() {
+    broken::rejects(broken::Defect::TornTransaction, "atomic_apply_cuts").await;
+}
+
+#[tokio::test]
+async fn broken_storage_lost_write() {
+    broken::rejects(broken::Defect::LostWrite, "restart_acknowledged_state").await;
+}
+
+#[tokio::test]
+async fn broken_storage_reordered_commit() {
+    let message = broken::rejects(broken::Defect::ReorderedCommit, "restart_commit_sequence").await;
+    assert!(message.contains("acknowledged predecessor batch must survive"));
+}
+
+#[tokio::test]
+async fn broken_storage_ignored_epoch() {
+    broken::rejects(broken::Defect::StaleEpoch, "writer_epoch_fence").await;
+}
+
+#[tokio::test]
+async fn broken_storage_remaining_holder_unlinked() {
+    let message = broken::rejects(
+        broken::Defect::SharedBodyDeleted,
+        "shared_body_last_membership",
+    )
+    .await;
+    assert!(message.contains("remaining holder must open before returning a lease"));
+}
+
+#[tokio::test]
+async fn broken_storage_non_member_served() {
+    broken::rejects(
+        broken::Defect::DeadBodyServed,
+        "membership_isolation_and_receipts",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn broken_storage_ignored_control_generation() {
+    broken::rejects(broken::Defect::StaleGeneration, "control_generation_fence").await;
+}
 
 #[tokio::test]
 async fn engine_harness_smoke() {

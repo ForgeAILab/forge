@@ -189,13 +189,13 @@ Host existence, hand-over and checkpoint probes SHALL use scalar native metadata
 - **AND** current-thread and multi-thread workers remain able to make progress
 
 ### Requirement: Real-storage conformance and negative controls
-Forge SHALL run assert_journal_storage_conformance unedited over production ForgeJournalStorage with repacking off, on, and storage reopened per hydration, real sealing and file-backed restart. Every configuration SHALL declare PerSession with independent domain copies and retain mandatory threshold/retirement purges. Scope-aware receipts, remaining-holder readability, non-member isolation and bounded deferred deletion/retained-byte evidence SHALL all pass. Forge SHALL also retain equivalence/import/crash coverage through JournalCommitFailurePoint::ALL and the real legacy decoder schema guard. All six upstream broken-storage fault shapes SHALL be tested over Forge-backed decorators and rejected at their named cases; private upstream test adapters SHALL NOT be assumed exported.
+Forge SHALL run assert_journal_storage_conformance unedited over production ForgeJournalStorage with repacking off, on, and storage reopened per hydration, real sealing and file-backed restart. Every configuration SHALL declare PerSession with independent domain copies and retain mandatory threshold/retirement purges. Scope-aware receipts, remaining-holder readability, non-member isolation and bounded deferred deletion/retained-byte evidence SHALL all pass. Forge SHALL also retain equivalence/import/crash coverage through JournalCommitFailurePoint::ALL and the real legacy decoder schema guard. All seven upstream broken-storage fault shapes SHALL be tested over Forge-backed decorators and rejected at their named cases; private upstream test adapters SHALL NOT be assumed exported.
 
 #### Scenario: All configurations and policies
 - **WHEN** Forge's named storage conformance wrappers run
 - **THEN** every primitive, protected, ordinary, arbitrary-projection, collection, unsupported-collection and restart assertion passes in all three storage configurations
 
 #### Scenario: Broken storage is detected
-- **WHEN** a Forge-backed decorator introduces a torn transaction, lost write, reordered publication, stale epoch, premature deletion of a surviving holder's copy, or serving released/deferred bytes
-- **THEN** conformance rejects it at atomic_apply_cuts, restart_acknowledged_state, restart_commit_sequence, writer_epoch_fence, shared_body_last_membership, or membership_isolation_and_receipts/bounded_deferred_deletion respectively
+- **WHEN** a Forge-backed decorator introduces a torn transaction, lost write, reordered publication, stale epoch, ignored control generation, premature deletion of a surviving holder's copy, or serving released/deferred bytes
+- **THEN** conformance rejects it at atomic_apply_cuts, restart_acknowledged_state, restart_commit_sequence, writer_epoch_fence, control_generation_fence, shared_body_last_membership, or membership_isolation_and_receipts/bounded_deferred_deletion respectively
 - **AND** a passing broken backend is a test failure

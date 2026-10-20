@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:47:51Z
+updated_at: 2026-10-20T11:03:10Z
 ---
 
 ## Why
@@ -94,7 +94,7 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   Task sessions. Schedule bounded dirty-session collection, terminal repacking and
   deletion cleanup without a TTL.
 - **Acceptance.** Run `assert_journal_storage_conformance` unedited with repacking
-  off/on and reopened storage, all six Forge-backed broken-storage cases, real
+  off/on and reopened storage, all seven Forge-backed broken-storage cases, real
   import/equivalence/crash cuts and named integration checks. Forge's own bench
   runs B/N=4000 through production storage against L2 from the real legacy row;
   both plain/tool ratios must be ≤2.0× after per-turn collection (aim 1.5×).

@@ -4,17 +4,22 @@ use agent_runtime::core::journal::*;
 use agent_runtime_testkit::conformance::journal::{
     SessionJournalCollectionFixture, SessionJournalConformanceFixture,
 };
-use forge_agent_host::test_support::{FileDb, MappingStorage};
+use forge_agent_host::{
+    session_journal::ForgeJournalStorage,
+    test_support::{FileDb, MappingStorage},
+};
 
-pub type Storage = MappingStorage<VolatileJournalStorage>;
+pub type Storage = MappingStorage<ForgeJournalStorage>;
 
-// Subsequent storage jobs replace only this factory; the engines and controls
-// below continue exercising the same released testkit contracts.
 pub async fn storage() -> Arc<Storage> {
-    Arc::new(MappingStorage::new(
-        Arc::new(VolatileJournalStorage::new(JournalBodySharing::PerSession)),
-        FileDb::new().await.expect("file-backed fixture"),
-    ))
+    storage_with_repacking(true).await
+}
+
+pub async fn storage_with_repacking(repack: bool) -> Arc<Storage> {
+    let fixture = FileDb::new().await.expect("file-backed fixture");
+    let storage = ForgeJournalStorage::new(fixture.database(), [7; 32], 1).unwrap();
+    storage.set_repacking(repack);
+    Arc::new(MappingStorage::new(Arc::new(storage), fixture))
 }
 
 pub fn config(collection_enabled: bool) -> JournalEngineConfig {

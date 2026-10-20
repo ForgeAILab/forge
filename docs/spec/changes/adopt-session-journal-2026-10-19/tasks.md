@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T10:49:50Z
+updated_at: 2026-10-20T11:03:10Z
 completed_at:
 ---
 
@@ -239,7 +239,7 @@ No runtime bench crate becomes a production dependency.
 
 ## Conformance gate
 
-- [ ] **11. Storage conformance in every configuration (≤3 h).**
+- [x] **11. Storage conformance in every configuration (≤3 h).**
   Point factories at ForgeJournalStorage. Run unedited
   assert_journal_storage_conformance with S2 off/on and storage reopened at every
   hydration, all declaring PerSession with independent domain copies, real AEAD
@@ -251,15 +251,32 @@ No runtime bench crate becomes a production dependency.
   Focused commands: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance storage_conformance_no_repack`,
   then that command filtered to `storage_conformance_repack`, then
   `storage_conformance_reopen`. Each named wrapper must pass.
+  Completed: all three wrappers pass the unedited v0.8.0 suite's 22 named
+  cases each (66 case executions), over real ForgeJournalStorage, AEAD and
+  file-backed sqlx. S2 off retains mandatory purges; S2 on uses the production
+  maintenance path. Reopen discards storage caches and opens an independent
+  pool on every load over the same retained file. Testkit supplies engine
+  collection semantics. No production storage fix or runtime wiring was needed.
 
-- [ ] **12. Six broken-storage negative controls (≤2 h).**
+- [x] **12. Seven broken-storage negative controls (≤2 h).**
   Adapt upstream test-only fault shapes over real Forge storage: torn transaction,
   lost write, reordered n+1, ignored epoch, a remaining holder's copy unlinked
-  early, and released/deferred bytes served to a non-member. Assert
-  the six named failures in D6; do not flag a valid independent-copy release as
+  early, released/deferred bytes served to a non-member, and ignored control
+  generation (released v0.8.0's private StaleGeneration shape). Assert
+  the seven named failures in D6; do not flag a valid independent-copy release as
   early shared deletion. Upstream private test adapters are not
   exported APIs. No defects ship in production.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance broken_storage_`.
+  Completed: seven integration-target-only fault decorators adapt the private
+  v0.8.0 shapes over real Forge storage. Each is rejected at its exact D6 case,
+  including ignored control generation. Reordering preserves the current
+  closure but loses the acknowledged predecessor; premature unlinking fails
+  the surviving holder's fresh open. Valid independent-copy releases pass all
+  three positive suites and the four-scope physical-receipt regression.
+  D6, this inventory, the proposal and native delta now include the seventh
+  released control (StaleGeneration), correcting the original six-control list.
+  No fault adapter is part of a production module or runtime path. Evidence:
+  `/Volumes/Data/tmp/refactor/c3-t11-12/report.md`.
 
 ## Cut-over and recovery
 
