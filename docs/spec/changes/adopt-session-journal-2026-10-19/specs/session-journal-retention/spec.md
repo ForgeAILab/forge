@@ -70,12 +70,22 @@ Forge SHALL trigger S2 geometric-tier merging after successful terminal publicat
 - **AND** no physical page saving is misreported as JournalApplyReceipt canonical body bytes
 
 ### Requirement: Deletion cascades and bounded owned-pack cleanup
-Deleting an agent_session SHALL cascade its journal session, pin, catalog, membership and operation-pack rows in the deletion transaction. Pack rows SHALL retain indexed owner labels without a cascading owner FK so post-commit cleanup can delete all of the deleted session's packs, including below-threshold deferred bytes, in bounded transactions of at most 32 packs or 8 MiB retained canonical bytes, scanning candidates in pages of 5,000 pack ids. Cleanup SHALL recheck owner/membership under the write lock, resume after restart until drained, and preserve other sessions' independent copies. Removal outside apply SHALL be observed separately, not fabricated as a JournalApplyReceipt. Retirement SHALL retain its tombstone and any still-required metadata/operation results until session deletion, without promising zero physical bytes.
+Deleting an agent_session SHALL cascade its journal session, pin, catalog, membership and operation-pack rows in the deletion transaction. Pack rows SHALL retain indexed owner labels without a cascading owner FK so post-commit cleanup can delete all of the deleted session's packs, including below-threshold deferred bytes, in bounded transactions of at most 32 packs or 8 MiB retained canonical bytes, scanning candidates through an indexed orphan marker in pages of 5,000 pack ids. The marker SHALL be maintained by owner/membership cascades, and committed session deletions SHALL provide a post-commit cleanup nudge. Agent archival (the user-facing Agent deletion) and polymorphic chat deletion SHALL remove their saved sessions through these cascades. Cleanup SHALL recheck owner/membership under the write lock, resume after restart until drained, and preserve other sessions' independent copies. Removal outside apply SHALL be observed separately, not fabricated as a JournalApplyReceipt. Retirement SHALL retain its tombstone and any still-required metadata/operation results until session deletion, without promising zero physical bytes.
 
 #### Scenario: Project deletion with identical bodies in another session
 - **WHEN** a Project is deleted and another session holds identical ids in independent packs
 - **THEN** deleted sessions' metadata/membership rows disappear on commit
 - **AND** bounded cleanup drains all deleted-owner packs regardless of dead-byte share, without decrypting them, and the other session still opens after restart
+
+#### Scenario: Runtime id reused by another Forge session
+- **WHEN** a new agent_session reuses a deleted owner's runtime id
+- **THEN** old-owner packs block its first apply with the mapping error before cleanup
+- **AND** the new owner opens successfully after the old-owner packs have drained, without reusing deleted state
+
+#### Scenario: Partial cleanup and restart
+- **WHEN** orphan packs exceed one transaction's pack or byte limit
+- **THEN** cleanup commits bounded progress and returns a continuation cursor
+- **AND** a fresh process resumes from the durable orphan index without decryption or fabricated apply receipts
 
 ### Requirement: Forge physical disk gate against real legacy L2
 Forge SHALL run fixture B at N=4000, plain and tool, through production ForgeJournalStorage with sqlx, real AEAD, PerSession/independent-domain copies, S1–S5 and collection, and compare each physical retained size with the same fixture's actual Forge legacy idle row containing two sealed blobs (L2). Both post-collection ratios SHALL be at most 2.0×; 1.5× is an aim. Runtime rt-e7's measured PerSession S1–S5 numbers, which share bodies across a session's domains, SHALL NOT substitute for this Forge gate, and runtime schema 5 SHALL remain out of scope.

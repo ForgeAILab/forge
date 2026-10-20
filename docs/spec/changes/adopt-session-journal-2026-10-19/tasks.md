@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T12:23:17Z
+updated_at: 2026-10-20T13:13:53Z
 completed_at:
 ---
 
@@ -16,6 +16,11 @@ they need production test constructors. Declare required-features accordingly;
 enable it on the command line, never with a self dev-dependency. DB and
 services(-agents) integration commands below include their required test feature.
 No runtime bench crate becomes a production dependency.
+
+Scheduling override approved on 2026-10-20: task 19 runs in a separate job;
+tasks 20, 22 and 23 proceed independently in that order. Task 21 and review D-2
+wait for a runtime release with per-session collection-failure isolation. No
+Forge workaround for that runtime limitation is part of these tasks.
 
 ## Release gate and foundations
 
@@ -416,15 +421,24 @@ No runtime bench crate becomes a production dependency.
   are preserved in `/Volumes/Data/tmp/refactor/c3-t17-20/`. The temporary writer
   fence/drop and inquiry tests passed, but no partial task-19 completion is claimed.
 
-- [ ] **20. Credential exclusion with real packs (≤2 h).**
+- [x] **20. Credential exclusion with real packs (≤2 h).**
   Seed API key/OAuth credentials, run a tool turn and refresh; decrypt all pack,
   session, operation, pin/catalog payloads and assert credentials never entered
   either domain. Keep ordinary redaction assertions separate from exact recovery.
   Focused test: runtime target filtered to `journal_credential_exclusion`.
 
-  Not started in c3-t17-20 because task 19 did not pass and execution order is
-  mandatory. API-key/OAuth exclusion and the exhaustive decrypted-payload audit
-  remain required; tasks 17–18 are not substitutes for this gate.
+  Completed: `journal_credential_exclusion` runs API-key and expired-OAuth tool
+  turns through the real OpenAI-compatible adapter, credential source and runtime
+  over file-backed SQL. A loopback refresh rotates access/refresh tokens and the
+  credential version; transport assertions prove acquisition and one tool call
+  per turn. The exhaustive test-only AEAD audit opens every pack index/body,
+  session record, operation pack, pin and catalog in both domains, including
+  decompressed canonical bodies, each framed object and deferred/unheld copies,
+  before and after reopening. JSON string escapes and nested byte vectors are
+  inspected generically without decoding runtime-private engine state. Raw, whitespace/invisible/case-folded, percent-encoded, base64 and
+  16-character-window canaries validate the exclusion check. Exact protected
+  recovery is checked separately; ordinary diagnostic redaction remains the
+  independent task-13 test. The named test passes.
 
 ## Lifecycle and measurement
 
@@ -440,7 +454,7 @@ No runtime bench crate becomes a production dependency.
   released.
   Focused test: `cargo test -p services-agents --features test-support --test main session_journal_retention::rotation_and_retry`.
 
-- [ ] **22. Approved unresumable-session retirement (≤2 h).**
+- [x] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
   other than the scope's dormant session, where dormant is decided by calling
   `dormant_native_chat_session_id` per (identity, scope, profile), never a
@@ -449,7 +463,18 @@ No runtime bench crate becomes a production dependency.
   for retirement; leave them for next-release cleanup. Tombstones suppress fallback.
   Focused test: same retention module filtered to `unresumable_and_dormant_restart`.
 
-- [ ] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
+  Completed: `SessionJournalRetention::retire_page` selects bounded native-only
+  pages and calls the task-13 engine clones through `retire_published`. Replaced
+  sources qualify; suspended non-chat rows qualify; chat rows qualify only when
+  the exact identity/scope/profile resume query chooses another dormant row.
+  Each domain is loaded authentically, granted its current revision and retired
+  protected first; conflicts defer ordinary retirement and retry later. No legacy
+  row is imported. `unresumable_and_dormant_restart` passes for two profiles in
+  one scope, startup-suspended account/Task rows, reusable completed-Task state,
+  replaced sources, shared live writers, partial retirement and cold retry.
+  Native tombstones suppress stale legacy fallback. Scheduling remains task 21.
+
+- [x] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
   Project/Agent/chat deletion cascades session metadata/memberships; nudge cleanup
   of all deleted-owner packs, including deferred dead bytes regardless of the
   25% threshold: candidates from indexed owner/orphan columns in pages of 5,000
@@ -459,6 +484,23 @@ No runtime bench crate becomes a production dependency.
   draining the deleted owner without decrypting packs or fabricating apply receipts.
   No global tracing collector.
   Focused test: same retention module filtered to `deletion_drains_owned_packs_preserves_other_copies`.
+
+  Completed: the additive deletion migration preserves sealed/legacy bytes,
+  maintains an indexed orphan marker, and wires Project/Task/physical-Agent FKs,
+  Agent archive and polymorphic chat deletion to session metadata/membership
+  cascades. Committed session deletions nudge the existing pool activity signal;
+  rollback does not. `drain_deleted_packs` calls a DB-only bounded drain: one page
+  of at most 5,000 indexed ids, owner/membership rechecks under BEGIN IMMEDIATE,
+  at most 32 packs and 8 MiB retained canonical bytes per transaction, cursor
+  continuation and restart from zero. It decrypts no packs, removes all orphan
+  bytes regardless of the 25% threshold, and reports separate cleanup counts.
+  `deletion_drains_owned_packs_preserves_other_copies` passes for real deletion
+  paths, 12.5% deferred bytes, independent copies/cold resume, unreadable deleted
+  packs, a 5,001-pack partial/restart drain and the exact 8 MiB bound. Runtime-id
+  reuse fails with the old-owner mapping error before drain and works afterward
+  on the same shared engines. The migration-preservation regression passes.
+  No global tracing collector or synthetic apply receipt was added. Task 21
+  will schedule repeated drain batches; this task tests the function directly.
 
 - [ ] **24. Forge measurement harness and smoke (≤3 h).**
   Implement production sqlx/real-AEAD engine fixtures A/B/C and actual legacy L2

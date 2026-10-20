@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T11:30:20Z
+updated_at: 2026-10-20T13:01:05Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -275,8 +275,8 @@ envelope. Authenticate format, table kind, unit kind (pack index or pack body),
 pack id plus pack generation (or metadata row key), format revision and key
 revision as associated data. Pack ids are never reused (SQLite `AUTOINCREMENT`);
 a purge rewrite keeps the id and increments `generation`, a merge writes a new
-id. Binding the generation stops a stale ciphertext of the same pack from being
-swapped back in and silently misaligning the membership bitmap. Bind each pack
+id. Binding the generation guards against bugs, stale caches and ciphertext
+swaps under the current generation that could misalign the membership bitmap. Bind each pack
 unit's AAD to its full owning domain/runtime-session key as well; singleton
 metadata also binds its full domain/session key. Every rewrite/repack uses a
 fresh nonce. Seal session, pin, catalog and operation payloads too.
@@ -301,6 +301,13 @@ sealed metadata. Operation ids/digests/results stay inside operation packs, with
 no per-operation clear hash index. Membership bits and scalar counts expose
 structure/size, not plaintext digest confirmation. AEAD protects content and row
 binding; full object-id verification protects lookup correctness.
+
+A local attacker with write access to the SQLite file is out of scope: they can
+already edit `agent_session`, credentials and the legacy table, or restore an
+older copy of the file. Per-row freshness is not provided; authenticated rows
+and clear membership bitmaps do not detect rollback of previously valid state.
+Optional later hardening could add a keyed MAC per membership row through a new
+migration. That is future work, not an adoption task.
 
 **Key change.** The master key is SHA-256 of the server JWT secret. Changing or
 losing that secret makes every sealed unit undecryptable, exactly as it does for
@@ -372,6 +379,12 @@ writer epoch (and pack generation), preserving every runtime `u64` value in SQL
 fences without narrowing to signed SQLite integers. Composite membership FKs
 also enforce the pack's complete domain/runtime-session/Forge owner key. The
 allocated migration is `V202610200941__session_journal.sql`.
+The additive `V202610201253__session_journal_deletion.sql` adds a clear
+`orphaned` pack marker and partial pack-id index. Membership insert/delete/move
+and session-deletion triggers maintain it; existing packs are backfilled from
+owner/membership existence without rewriting sealed units. Chat deletion removes
+its polymorphic context scopes; Agent archival (the user-facing Agent deletion)
+removes its sessions. Project/Task and physical Agent deletion use existing FKs.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
 (no row if all bodies exist already), or several rows cut at the S2 logical-size
@@ -740,6 +753,12 @@ journal, for example after the newer dormant row was replaced, Forge starts a
 fresh session as it does for any unresumable scope. It never loops on the
 conflict or falls back to stale legacy state.
 
+Implementation status at v0.8.0: task 22 provides the directly callable
+selection/retirement page and task 23 the directly callable deletion drain and
+durable/post-commit nudges. Worker scheduling, collection and terminal hooks
+remain task 21, deferred with review D-2 until the runtime releases per-session
+collection failure isolation. The worker contract below is not yet scheduled.
+
 A `session-journal-retention` worker uses the existing workers framework, a 60 s
 tick and post-commit rotation/recovery nudges. Retire protected then ordinary only
 after the engine accepts the revision-bound grant, no-live-writer and
@@ -777,6 +796,16 @@ membership row; recheck ownership and absence of membership under the write lock
 before deleting. Delete at most 32 packs or 8 MiB of retained canonical bytes per
 transaction and resume after restart until drained. Never reapply the 25%
 threshold to deletion cleanup. Other sessions' independent copies remain intact.
+The indexed orphan marker is the durable nudge. A pool-scoped activity signal
+also wakes after committed session deletions, using the existing domain-event
+commit/release hooks; unrelated activity wakes are harmless. Rollback does not
+wake, and startup/ticks scan the durable index from zero. The drain reads one
+candidate page, acquires its own write transaction, rechecks owner labels and
+absence of membership, and reports a cursor for the next bounded batch. A runtime
+id reused by a new `agent_session` is refused with `journal pack owner mapping
+changed` while old-owner packs remain; the same shared engines can open it once
+those packs have drained. No legacy fallback restores the deleted owner.
+
 This path is explicit session deletion, not an alternate tracing collector.
 It emits physical copy/byte totals separately, never a synthetic engine apply
 receipt for removal outside apply. Tombstone records remain until their

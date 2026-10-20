@@ -4,6 +4,7 @@ use db::{create_sqlite_pool, run_migrations_from, SqlitePool};
 use sqlx::Row;
 
 const MIGRATION: &str = "V202610200941__session_journal.sql";
+const DELETION_MIGRATION: &str = "V202610201253__session_journal_deletion.sql";
 const METADATA: [&str; 5] = ["session", "pin", "catalog", "membership", "operation_pack"];
 
 // quote(BLOB) returns the complete X'hex' literal, with no lossy text decode.
@@ -94,7 +95,16 @@ async fn migration_preserves_legacy_and_scoped_packs() {
     for entry in fs::read_dir(&bundled).unwrap() {
         let entry = entry.unwrap();
         if entry.path().extension().is_some_and(|ext| ext == "sql")
-            && entry.file_name() != MIGRATION
+            && entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .split_once("__")
+                .unwrap()
+                .0[1..]
+                .parse::<u64>()
+                .unwrap()
+                < 202610200941
         {
             fs::copy(entry.path(), migrations.join(entry.file_name())).unwrap();
         }
@@ -333,6 +343,44 @@ async fn migration_preserves_legacy_and_scoped_packs() {
         .get::<String, _>("detail")
         .contains("idx_session_journal_membership_pack")));
 
+    // Upgrade an already-populated journal without touching its sealed units,
+    // legacy payloads or membership/metadata. Backfill uses clear indexed labels.
+    let packs_before = raw_rows(&pool, "agent_session_journal_pack").await;
+    let mut metadata_before = Vec::new();
+    for table in METADATA {
+        metadata_before.push(raw_rows(&pool, &format!("agent_session_journal_{table}")).await);
+    }
+    fs::copy(
+        bundled.join(DELETION_MIGRATION),
+        migrations.join(DELETION_MIGRATION),
+    )
+    .unwrap();
+    run_migrations_from(&pool, &migrations).await.unwrap();
+    let mut packs_after = raw_rows(&pool, "agent_session_journal_pack").await;
+    for row in &mut packs_after {
+        row.truncate(packs_before[0].len());
+    }
+    assert_eq!(packs_after, packs_before);
+    for (table, before) in METADATA.into_iter().zip(metadata_before) {
+        assert_eq!(
+            raw_rows(&pool, &format!("agent_session_journal_{table}")).await,
+            before
+        );
+    }
+    assert_eq!(
+        raw_rows(&pool, "protected_agent_session_state").await,
+        legacy_before
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session_journal_pack WHERE orphaned=1"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+
     sqlx::query("DELETE FROM agent_session WHERE id = 'owner-a'")
         .execute(&pool)
         .await
@@ -370,6 +418,16 @@ async fn migration_preserves_legacy_and_scoped_packs() {
         .unwrap(),
         1024,
         "orphan retains physical-byte evidence"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT orphaned FROM agent_session_journal_pack WHERE pack_id=?"
+        )
+        .bind(pack_a)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
     );
     sqlx::query("DELETE FROM agent_session_journal_pack WHERE pack_id = ?")
         .bind(pack_a)

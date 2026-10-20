@@ -35,6 +35,7 @@ pub mod native_tools;
 pub mod project_agent_actions;
 pub mod prompt_preview;
 pub mod provider_authorization;
+pub mod session_journal_retention;
 pub mod topic_rotation;
 pub mod wake_turn_consumer;
 

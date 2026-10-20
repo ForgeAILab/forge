@@ -69,6 +69,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 ring = "0.17"
 agent-runtime-testkit.workspace = true
 process-supervisor = { path = "../process-supervisor" }

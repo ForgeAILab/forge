@@ -186,3 +186,69 @@ impl<S: JournalStorage> Drop for ExtensionLease<S> {
         }
     }
 }
+
+/// Partial progress is durable: a later retry skips an already retired domain.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetirementProgress {
+    pub retired_domains: usize,
+    pub conflicts: usize,
+}
+
+impl<S: JournalStorage> SessionJournals<S> {
+    /// Only published native roots participate. Never opens a writer or invokes
+    /// the legacy importer. All controls share the runtime's gates and leases.
+    pub async fn retire_published(
+        &self,
+        runtime_session_id: &str,
+    ) -> Result<RetirementProgress, RuntimeError> {
+        use agent_runtime::core::{
+            clock::{Clock, SystemClock},
+            error::ErrorKind,
+            ids::SessionId,
+            journal::{JournalDomain, JournalRole, SessionJournal},
+        };
+        let session = SessionId::new(runtime_session_id);
+        let mut progress = RetirementProgress::default();
+        for (engine, role) in [
+            (&self.protected, JournalRole::Protected),
+            (&self.ordinary, JournalRole::Ordinary),
+        ] {
+            let Some(record) = self
+                .storage
+                .load(
+                    &JournalDomain {
+                        storage_id: engine.storage_id(),
+                        role,
+                    },
+                    &session,
+                )
+                .await?
+            else {
+                continue;
+            };
+            if record.head.is_none() || record.retirement.is_some() {
+                continue;
+            }
+            let result = async {
+                engine
+                    .authorize_retirement(&session, record.revision, SystemClock.now())
+                    .await?;
+                engine.retire(&session, record.revision).await?;
+                Ok::<_, RuntimeError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => progress.retired_domains += 1,
+                Err(error) if error.kind == ErrorKind::Conflict => {
+                    // Protected must retire before ordinary; retry the whole
+                    // session later when its writer/pin/dependency is resolved.
+                    progress.conflicts += 1;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        tracing::debug!(target: "forge_session_journal", retired_domains=progress.retired_domains, conflicts=progress.conflicts, "retirement attempt");
+        Ok(progress)
+    }
+}

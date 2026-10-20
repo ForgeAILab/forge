@@ -2420,8 +2420,40 @@ clones of the same store. Maintenance and collection receive `store.journals()`
 and its engine clones, sharing gates, lease registries and validated roots. A
 second independent engine over a live storage/domain is unsafe for collection
 and cross-session retirement/dependency checks, even with runtime warm-read
-fences. Engines are never constructed by a turn or collector. Retention-worker
-scheduling and terminal maintenance hooks remain task 21 of the adoption change.
+fences. Engines are never constructed by a turn or collector. The `SessionJournalRetention::retire_page` operation provides a bounded native-only
+selection page for the future retention worker. Replaced sources qualify;
+suspended non-Agent-Chat sessions qualify after startup recovery. For Agent Chat,
+it calls `dormant_native_chat_session_id` for the exact identity, context scope
+and profile, preserving each profile's resumable dormant chat. Reusable Task
+sessions stay published; completion alone does not retire them. Legacy-only dead
+rows are never imported to retire them. `SessionJournals::retire_published` loads
+published records, authorizes the current revision, then retires protected before
+ordinary using the same engine clones as runtime turns. A live writer or other
+engine conflict defers retirement; retries skip an already retired domain.
+Retention-worker scheduling, collection and terminal maintenance hooks remain
+task 21, deferred until a runtime release isolates unreadable sessions during
+collection (review D-2). No retention worker is scheduled at the v0.8.0 pin.
+
+Session deletion immediately cascades journal records, pins, catalog,
+operation packs and memberships. Project/Task scopes and physical Agent deletion
+use existing FKs; the journal deletion migration also removes Agent Chat's
+polymorphic scopes on chat deletion and saved sessions on Agent archive.
+Ciphertext packs retain their owner labels for bounded physical cleanup. A clear
+orphan marker and partial pack-id index, maintained by membership/session triggers,
+provide a durable cleanup nudge. Committed session deletions also wake the existing
+pool-scoped activity signal after SQL commit/release; rollback does not wake it.
+
+`SessionJournalRetention::drain_deleted_packs` delegates to the DB-only
+`drain_session_journal_orphans`: discover up to 5,000 indexed candidate ids, then
+recheck owner labels and absence of membership under BEGIN IMMEDIATE. One call
+commits at most 32 packs and 8 MiB retained canonical bytes, including all deferred
+dead bytes irrespective of the 25% threshold. It returns a continuation cursor;
+new sweeps and restart begin at zero. No pack is decrypted and cleanup counts are
+separate from engine apply receipts. Other sessions' independent copies remain
+readable. Reusing a deleted session's runtime id fails with the pack-owner mapping
+error until its old-owner packs drain; afterward the new owner works on the same
+shared engines. Task 21 will schedule these drain batches; automatic physical
+reclamation is not active at the v0.8.0 pin.
 
 Both domains enable explicit engine collection and set 128 MiB of estimated
 validated-root memo charge independently (256 MiB combined), separate from the
@@ -2463,9 +2495,13 @@ publication equals the legacy oracle, including lost acknowledgements, without
 replaying model/tool operations or overlaying stale legacy state. The async
 control regression holds a real SQLite write lock while controls and writer
 open wait, and proves local close and timer progress on both current-thread and
-multi-thread Tokio runtimes. Native integration fixture adoption and decrypted
-credential-pack exclusion remain uncompleted tasks 19–20; these tests do not
-claim those gates passed.
+multi-thread Tokio runtimes. `journal_credential_exclusion` separately runs real provider-adapter tool turns
+with API-key/OAuth sources and token refresh, audits every decrypted journal
+unit (including framed objects, decompressed and unheld bodies) in both domains
+for raw, normalized, encoded and partial credential echoes. It also inspects JSON
+string escapes and byte vectors, then separately checks cold exact recovery.
+Ordinary diagnostic redaction remains an independent assertion. Native integration
+fixture adoption remains task 19.
 
 Older builds cannot resume journal-only state and refuse the newer database;
 downgrade requires a pre-upgrade backup.

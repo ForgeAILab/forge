@@ -1,6 +1,8 @@
 //! Forge's encrypted persistence boundary for the runtime-owned journal engine.
 //! This module is not yet connected to the native runtime stores.
 mod apply;
+#[cfg(feature = "test-support")]
+mod audit;
 mod cache;
 mod codec;
 mod maintenance;

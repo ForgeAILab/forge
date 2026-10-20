@@ -53,6 +53,7 @@ tokio = { version = "1", features = ["rt", "sync", "time", "fs", "net", "io-util
 tracing.workspace = true
 
 [dev-dependencies]
+forge-agent-host = { path = "../agent-host", features = ["test-support"] }
 agent-runtime.workspace = true
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = "../services", features = ["test-support"] }

@@ -85,6 +85,9 @@ pub use sqlite::{
     TaskOperatorRetryRow, UpdateMilestoneReadinessProjectionInput, WorkerDeadLetterIssue,
     WorkerDiagnostic, WorkspaceCleanupAttentionRow, INTEGRATION_OWNED_SQL,
 };
+pub use sqlite::{
+    JournalCleanupBatch, JOURNAL_CLEANUP_BYTES, JOURNAL_CLEANUP_PACKS, JOURNAL_CLEANUP_PAGE,
+};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;

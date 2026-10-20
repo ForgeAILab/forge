@@ -857,3 +857,11 @@ fn async_controls_do_not_stall_worker() {
         });
     }
 }
+
+#[path = "support/credential_exclusion.rs"]
+mod credential_exclusion;
+
+#[tokio::test]
+async fn journal_credential_exclusion() {
+    credential_exclusion::run().await;
+}

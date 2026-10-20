@@ -63,3 +63,27 @@ impl SqliteDb {
         })
     }
 }
+
+impl SqliteDb {
+    /// Keyset page of host rows eligible for the retention policy to examine.
+    /// An EXISTS over indexed owner labels excludes legacy-only rows without
+    /// importing them. The policy re-reads the host row before issuing controls.
+    pub async fn native_journal_retirement_page(
+        &self,
+        after: &str,
+        limit: u32,
+    ) -> crate::Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT s.id FROM agent_session s
+             WHERE s.id > ? AND s.backend_kind='native'
+               AND (s.status IN ('replaced','suspended') OR s.replaced_by_session_id IS NOT NULL)
+               AND EXISTS (SELECT 1 FROM agent_session_journal_session j
+                   WHERE j.forge_session_id=s.id AND j.runtime_session_id=s.runtime_session_id
+                     AND j.published=1 AND j.retired=0
+                     AND ((j.storage_id=? AND j.role='protected') OR (j.storage_id=? AND j.role='ordinary')))
+             ORDER BY s.id LIMIT ?",
+        )
+        .bind(after).bind(SESSION_JOURNAL_PROTECTED_STORAGE_ID).bind(SESSION_JOURNAL_ORDINARY_STORAGE_ID).bind(limit)
+        .fetch_all(self.pool()).await?)
+    }
+}

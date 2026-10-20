@@ -185,6 +185,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Deleting a Project or Agent Chat, or archiving an Agent, now removes its saved
+  native session metadata and journal memberships. Physical pack cleanup has a
+  bounded maintenance operation; automatic scheduling awaits the retention worker.
+
 - Sessions now persist through the native session journal, using agent-runtime
   v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`) and encrypted delta packs.
   Chat and Task continuity work as before; the disk layout of newly saved state

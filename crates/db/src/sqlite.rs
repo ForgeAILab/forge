@@ -77,8 +77,12 @@ use tokio::sync::Notify;
 
 mod action;
 mod agent;
+mod session_journal_cleanup;
 mod session_journal_probe;
 pub use agent::AgentOperatorPressureRow;
+pub use session_journal_cleanup::{
+    JournalCleanupBatch, JOURNAL_CLEANUP_BYTES, JOURNAL_CLEANUP_PACKS, JOURNAL_CLEANUP_PAGE,
+};
 pub use session_journal_probe::{
     SessionPersistenceFlags, SESSION_JOURNAL_ORDINARY_STORAGE_ID,
     SESSION_JOURNAL_PROTECTED_STORAGE_ID,
