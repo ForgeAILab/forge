@@ -15,9 +15,10 @@ Forge SHALL implement `JournalStorage` as `ForgeJournalStorage` and use the runt
 
 #### Scenario: Memo budget and collection leases
 - **WHEN** production engines are constructed and a collector runs while another runtime holds a lease
-- **THEN** each engine is configured with 256 MiB of estimated memo charge, 512 MiB combined, independently of the bounded storage cache and live writer working sets
+- **THEN** each engine is configured with 128 MiB of estimated memo charge, 256 MiB combined, independently of the bounded storage cache and live writer working sets
 - **AND** collection uses the same engine's shared lease registry
-- **AND** measurements report actual resident memory and the review's observed up-to-1.24× retained heap/charge caveat rather than promising a heap cap
+- **AND** memo misses cost only cold validation, affecting speed, never correctness; Forge's local, single-user use has no evidence requiring the larger runtime default
+- **AND** measurements report memo hit/miss counts and cold-validation time so the budget can be raised on evidence, plus actual resident memory and the review's observed up-to-1.24× retained heap/charge caveat (roughly 159 MiB per engine / 317 MiB combined at full charge), without promising a heap cap
 
 ### Requirement: Native journal persistence for persistent native sessions
 Every persistent native session SHALL advertise an ordinary journal through `SessionStore::journal()` and a protected journal through `CheckpointStore::journal()`. Both engines SHALL share one Forge storage instance with distinct storage ids/roles and collection enabled; each transition SHALL add only new canonical bodies and changed metadata. Ephemeral scopes SHALL remain store-less and no rollout flag SHALL select legacy writes.
@@ -33,7 +34,7 @@ Every persistent native session SHALL advertise an ordinary journal through `Ses
 - **THEN** it writes no journal session record, pack, membership or operation pack
 
 ### Requirement: Protected exact and ordinary projected domains over encrypted packs
-The protected domain SHALL preserve exact checkpoint/snapshot state. The ordinary engine SHALL apply Forge's redacting `JournalProjectionPolicy` before encoding/hashing, preserving runtime-required identity, ordering/cardinality, counters, timestamps, manifests and cache values, and all restore-critical data in ordinary-only sessions. Optional sensitive host diagnostic values SHALL be omitted or redacted; both domains SHALL use real XChaCha20-Poly1305 with the existing protected-store key material, fresh nonces and authenticated row binding.
+The protected domain SHALL preserve exact checkpoint/snapshot state. The ordinary engine SHALL apply Forge's conservative D3 redacting `JournalProjectionPolicy`, decided on 2026-10-20, before encoding/hashing, preserving runtime-required identity, ordering/cardinality, counters, timestamps, manifests and cache values, and all restore-critical data in ordinary-only sessions. Optional sensitive host diagnostic values SHALL be omitted or redacted without changing protected exactness; runtime-mandated exact cache/manifests may contain content. Both domains SHALL use real XChaCha20-Poly1305 with the existing protected-store key material, fresh nonces and authenticated row binding.
 
 Full object ids SHALL remain inside sealed payloads and rebuildable RAM lookup maps; prefix/offset indexes SHALL remain inside sealed packs, with no per-object SQL hash/index. Catalog/pin lookup keys SHALL remain domain-separated HMACs; their real ids and all operation ids/digests/results SHALL be sealed. Membership and engine lease reachability SHALL both be required to serve bytes, including cache hits. Credentials SHALL be absent from both domains.
 

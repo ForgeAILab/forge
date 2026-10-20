@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:56:23Z
+updated_at: 2026-10-20T08:22:45Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -27,7 +27,7 @@ the earlier Forge review's global-index requirement is withdrawn.
 | `/Volumes/Data/tmp/refactor/rt-e2-review/` findings N1/N2 and F2 | The release gate includes compact pin metadata, the working R4 memo and the gate/control correction; a branch snapshot is not proof these fixes shipped. |
 | `runtime:crates/agent-runtime-journal-bench/src/{packed.rs,schema.sql,codec.rs,metadata.rs}` | Reference for pack framing, bitmaps, transactions and operation tiers; not a production dependency. It uses rusqlite and modeled seal lengths, not a real cipher. |
 | `/Volumes/Data/tmp/refactor/rt-e7/{report.md,measurements.json}` and runtime D8.4 | Measured PerSession S1–S5 bytes and pack writes with capped packs and 25% dead-byte purges, at end and per turn. B/N=4000 is 1.60542× L2 plain / 1.79118× tool. |
-| `/Volumes/Data/tmp/refactor/rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. No measurements establish a 128 MiB Forge memo budget. |
+| `/Volumes/Data/tmp/refactor/rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. The owner chose 128 MiB per engine on 2026-10-20; no data shows Forge needs the larger runtime default. |
 | `runtime:crates/agent-runtime-core/src/journal/engine/{mod.rs,memo.rs}` and `journal/reader.rs` | The supplied source now implements D-1 through `ReadOperation::finish`: check current-head or durable-pin authority once per reader operation and retry via membership-scoped storage on a stale memo view. Runtime design D5's open-decision paragraph and rt-e6-review F2 describe the earlier state. |
 | `/Volumes/Data/tmp/refactor/rt-e1/report.md` and Forge `protected_store.rs` | The idle legacy row contains two sealed blobs in all 13 measured cases (L2), despite checkpoint saves temporarily NULLing the standalone snapshot. |
 
@@ -182,20 +182,24 @@ Forge honors the runtime's seven trait rules:
 Construct engines with `JournalEngine::protected(storage, storage_id, config)`
 and `::ordinary(storage, storage_id, policy, config)`. Production config enables
 collection (`collection_enabled = true`) and sets `validated_root_memo_bytes`
-explicitly to **256 MiB per engine**, the runtime default (512 MiB charged for
-both). The rt-e7 measurements used the runtime default; neither that report nor
-rt-e6-review establishes that 128 MiB preserves Forge's warm-root hit rate.
-Reducing it without evidence risks oversize rejection and eviction/cold validation
-across per-turn writers, so this revision removes the unsupported 128 MiB choice.
+explicitly to **128 MiB estimated memo charge per engine**, 256 MiB combined for
+the protected and ordinary engines, per the 2026-10-20 owner decision. Forge is a
+local, single-user app; no data shows the larger runtime default is needed. The
+rt-e7 measurements used that default, not Forge's selected budget. A memo miss,
+including after oversize rejection or eviction, costs only a cold validation:
+it affects speed, never correctness. Keep one engine per storage and domain,
+cloned into every runtime and the collector.
 This is an estimated charge limit, not a heap/RSS cap: rt-e6-review F3 measured
 retained heap at 1.007–1.240× charge, worst with many small messages. At 1.24×,
-256 MiB charge corresponds to about 317.44 MiB per engine / 634.88 MiB for both;
+128 MiB charge corresponds to about 158.72 MiB per engine / 317.44 MiB for both
+(roughly 159 MiB / 317 MiB);
 this is observed headroom, not a guaranteed bound. Live writer working sets and
 the separate 64 MiB storage cache add to that. Shared layers can instead be
 over-charged, and F4 notes that historical heads from a busy session can evict
 other sessions' current roots. D10 reports charge, actual resident memory,
-oversize/eviction counts and hit rates before any later budget change. Tests
-also exercise zero/small budgets and collection disabled.
+oversize/eviction counts, memo hit/miss counts and cold-validation time so the
+budget can be raised on evidence. Tests also exercise zero/small budgets and
+collection disabled.
 
 The engine owns commit validation, ordinary projection/re-encoding, checkpoint
 floors, replay semantics, sequence/predecessor checks, leases, closures,
@@ -223,16 +227,19 @@ The runtime validates/re-encodes the projection. Forge must not use
 `IdentityJournalProjection` as its production policy merely because old ordinary
 rows were encrypted.
 
-The conservative Forge policy removes sensitive, optional host diagnostic
-extension values and redacts diagnostic message values wherever doing so preserves
-recovery. It preserves session identity, history/usage/manifest cardinality and
-ordering, execution counters and timestamps. Runtime-owned manifests and
+The conservative Forge policy decided on 2026-10-20 removes sensitive, optional
+host diagnostic extension values and redacts diagnostic message values wherever
+doing so preserves recovery. It preserves session identity, history/usage/manifest
+cardinality and ordering, execution counters and timestamps. Runtime-owned manifests and
 `runtime.core.previous_cache` stay exact as required by the structured-delta
 contract. Restore-critical conversation/extension data must not be discarded from
 an ordinary-only session with no exact checkpoint: such values remain encrypted
 and exact until an exact recovery source exists. Import/resume equivalence tests
-cover that case. Q4 below concerns the extent of additional diagnostic redaction;
-it cannot weaken exact protected recovery or runtime field constraints.
+cover that case. The 2026-10-20 owner decision settles this conservative policy:
+omit sensitive optional diagnostics, preserve all restore-critical data and
+runtime-mandated exact fields, and make no promise that runtime cache/manifests
+contain no content. Broader free-text redaction needs explicit data examples and
+resume-equivalence evidence. Protected exactness is unchanged.
 
 Both domains use the same derived encryption-key material but separate packs,
 session records, memberships, pins, catalogs and operation packs. A pack belongs
@@ -829,12 +836,12 @@ Forge table), and `CHANGELOG.md` under `Unreleased`:
   bounded collection. Include measured Forge numbers after D10, not an invented
   99% saving or the rejected 4× target.
 
-This document records proposed code/doc work only. The Owner Decisions below are
-preserved verbatim as the historical receipt, including then-candidate levers and
-older wording. The settled constraints carried into this revision are L2,
-storage-only S1–S5, the runtime's 64-revision window (inclusive floor plus the
+This document records proposed code/doc work only. The existing 2026-10-19 Owner
+Decisions entries below are preserved verbatim as the historical receipt,
+including then-candidate levers and older wording; new entries record the two
+2026-10-20 owner decisions. Settled constraints remain L2, storage-only S1–S5,
+the runtime's 64-revision window (inclusive floor plus the
 current writer epoch's last operation, D4) and no runtime schema 5.
-No new approval or decision is appended to that receipt.
 
 ### D10. Forge measurement and release gate
 
@@ -903,8 +910,9 @@ turn/open/probe/import wall time, longest write
 transaction, longest `collect` call (engine gate hold) with 100 dirty sessions,
 geometric-merge write amplification, freelist pages, engine object counters,
 physical-copy receipt totals and canonical retained/live/deferred byte differences
-versus file savings, memo/cache charge/hit/read/eviction/oversize counts and
-resident memory (including the observed 1.24× charge headroom), and
+versus file savings, memo/cache charge/hit/miss/read/eviction/oversize counts,
+cold-validation time (so the 128 MiB per-engine memo budget can be raised on
+evidence), resident memory (including the observed 1.24× charge headroom), and
 post-retirement metadata/operation bytes. Retain the existing focused
 performance checks: for N≥1000 delta writes ≤10% of legacy writes, measured at
 the production cadence above including S2 and purge rewrites; N=100 native
@@ -933,10 +941,13 @@ not claim Forge has run or passed it.
 - Deferred dead bytes must remain unreadable and counted in retained-byte
   diagnostics until a threshold/retirement/deletion purge. Atomic remaps, exact
   physical receipts and every conformance configuration gate this behavior.
-- Per-engine memo charge is estimated, not a heap bound; 512 MiB combined charge
-  may retain about 634.88 MiB at the review's 1.24× observation, plus writer/cache
-  memory. D10 measures resident memory and cache behavior. A separate engine loses
-  shared leases/memo even with D-1's warm-read correctness check; reuse clones.
+- Per-engine memo charge is estimated, not a heap bound; 128 MiB per engine /
+  256 MiB combined charge may retain about 158.72 MiB per engine / 317.44 MiB
+  combined at the review's 1.24× observation, plus writer/cache memory. Memo misses
+  cost cold validation, affecting speed, never correctness; D10 records hit/miss
+  counts, cold-validation time and resident memory before raising the budget on
+  evidence. A separate engine loses shared leases/memo even with D-1's warm-read
+  correctness check; reuse clones.
 - Ordinary redaction must preserve restore-critical data and runtime exact fields;
   protected equality and ordinary-policy equality are different test assertions.
 
@@ -954,17 +965,9 @@ is one ≤3 h Codex job with named focused tests. No code is part of this revisi
 
 ## Open Questions
 
-Only product/data choices remain; engine release, 64-revision replay, the L2 gate,
-retirement scope and next-release legacy removal are already settled.
+None.
 
-- **Q4. How much additional ordinary diagnostic detail should remain?**
-  Recommendation: start with the conservative D3 redaction, preserve all
-  restore-critical data and runtime-mandated exact fields, and omit sensitive
-  optional diagnostics. Broader free-text redaction needs explicit data examples
-  and resume-equivalence evidence; do not promise that runtime cache/manifests
-  contain no content. This does not change protected exactness.
-
-## Owner Decisions (2026-10-19)
+## Owner Decisions (2026-10-19; additions 2026-10-20)
 
 - **Q0. Runtime prerequisite: approved.** The runtime extracts its journal
   engine behind a storage trait (D2, R1–R6) before Forge adoption starts.
@@ -1001,3 +1004,19 @@ retirement scope and next-release legacy removal are already settled.
   import on first writer open. The next release background-imports resumable
   legacy-only sessions, NULLs migrated payloads, applies Q1 to dead sessions,
   and drops the table once it is empty.
+- **Q4. Ordinary diagnostic redaction (2026-10-20): conservative.**
+  Use the conservative D3 policy: preserve all restore-critical data and
+  runtime-mandated exact fields; omit sensitive optional diagnostics. Broader
+  free-text redaction needs explicit data examples and resume-equivalence
+  evidence. Do not promise that runtime cache/manifests contain no content.
+  Protected exactness is unchanged.
+- **Q5. Memo budget (2026-10-20): 128 MiB per engine.** Configure
+  128 MiB estimated memo charge per engine, 256 MiB combined for protected
+  and ordinary. Forge is a local, single-user app; no data shows the larger
+  runtime default is needed. Memo misses cost only a cold validation: speed,
+  never correctness. The performance task must record memo hit/miss counts
+  and cold-validation time so the budget can be raised on evidence. The
+  charge is an estimate: the review measured retained heap up to 1.24× charge,
+  roughly 159 MiB per engine / 317 MiB for both at full charge, not a heap cap.
+  Keep one engine per storage and domain, cloned into every runtime and the
+  collector.

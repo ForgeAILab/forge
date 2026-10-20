@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:56:23Z
+updated_at: 2026-10-20T08:22:45Z
 ---
 
 ## Why
@@ -32,8 +32,12 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   `JournalEngine<ForgeJournalStorage>` instances share one sqlx-backed storage.
   Create exactly one engine per storage/domain and hand clones to every runtime
   instance and collector, sharing the memo and lease registry. Configure the
-  measured runtime default of **256 MiB memo charge per engine**; the review saw
-  retained heap up to 1.24× charge, so this is not an RSS cap (design D2).
+  approved **128 MiB estimated memo charge per engine**, 256 MiB combined.
+  Forge is a local, single-user app; no data shows the larger runtime default is
+  needed. Memo misses cost only cold validation, affecting speed, never
+  correctness; record hit/miss counts and cold-validation time before raising the
+  budget on evidence. The review saw retained heap up to 1.24× charge, roughly
+  159 MiB per engine / 317 MiB combined, so this is not an RSS cap (design D2).
   The runtime owns validation, projection/re-encoding, leases, closures,
   dependencies, fences, retirement and incremental collection selection. Forge
   supplies SQL enforcement, framing, encryption and lifecycle scheduling.
@@ -61,9 +65,11 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   Small catalog/pin lookup keys remain domain-separated HMACs so they do not leak
   clear digests. The reference's simulated sealing is not production crypto.
 - **Two logical domains.** Protected state stays exact. Ordinary state uses a
-  redacting host policy under runtime constraints; restore-critical values and
-  runtime-mandated cache/manifests remain exact where required. Both domains are
-  encrypted; ordinary leases can never read protected-only slots. Credentials
+  conservative D3 redacting host policy decided on 2026-10-20: preserve all
+  restore-critical values and runtime-mandated exact fields; omit sensitive
+  optional diagnostics. Runtime cache/manifests may contain content; protected
+  exactness is unchanged. Both domains are encrypted; ordinary leases can never
+  read protected-only slots. Credentials
   remain excluded from both domains.
 - **One transaction per apply.** Use `db::begin_immediate` through sqlx, check
   `expect` revision and writer epoch in SQL, stage all components and cuts, commit
@@ -99,7 +105,9 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   implementation. No feature flag or compatibility aliases.
 
 Out of scope: U10/LCM-table consolidation, warm runtimes, runtime schema 5 and
-legacy-table removal in this release. The Owner Decisions receipt is unchanged.
+legacy-table removal in this release. The existing Owner Decisions entries remain
+verbatim; two new entries record the 2026-10-20 memo-budget and conservative
+ordinary-redaction decisions.
 
 ## Impact
 

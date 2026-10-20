@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T03:56:23Z
+updated_at: 2026-10-20T08:22:45Z
 completed_at:
 ---
 
@@ -189,12 +189,16 @@ No runtime bench crate becomes a production dependency.
 - [ ] **13. Shared engine wiring and ordinary projection (≤3 h).**
   SessionJournals owns one engine per storage/domain, handing clones to every
   Runtime and maintenance/collection path so memo and lease registry stay shared;
-  never construct engines per turn or worker. Configure 256 MiB estimated memo
-  charge per engine (512 MiB total, not a heap bound; review observed up to 1.24×
-  retained heap/charge). Advertise both capabilities from the existing store with
-  D2 config and D3 policy. Protect exact
-  recovery, preserve runtime-mandated fields and ordinary-only restore-critical
-  values, redact optional sensitive diagnostics. Ephemeral scopes remain empty.
+  never construct engines per turn or worker. Configure the approved 128 MiB
+  estimated memo charge per engine (256 MiB combined, not a heap bound; review
+  observed up to 1.24× retained heap/charge, roughly 159 MiB per engine / 317 MiB
+  combined). Forge's local, single-user use has no evidence requiring the larger
+  runtime default; memo misses cost only cold validation, affecting speed, never
+  correctness. Advertise both capabilities from the existing store with D2 config
+  and implement the conservative D3 policy decided on 2026-10-20: preserve all
+  restore-critical data and runtime-mandated exact fields; omit sensitive optional
+  diagnostics. Do not promise that runtime cache/manifests contain no content;
+  protected exactness is unchanged. Ephemeral scopes remain empty.
   Prove memo reuse across per-turn writer changes, shared lease visibility to
   collection and cold behavior at restart; include zero/small budgets in tests.
   Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_runtime native_delta_and_projection`
@@ -299,9 +303,11 @@ No runtime bench crate becomes a production dependency.
   write (rt-e7 metric), separate WAL bytes and largest single-pack rewrite,
   lazy session hydration time/bounded scoped-directory cache charge with unrelated
   sessions present, longest collect gate hold, retained/live/deferred bytes and
-  physical receipts, memo/cache charge/heap/hit/eviction/oversize and timing/read
-  counters. Include C/N=4000 as a report-only supplemental shape; label its
-  collection cadence and do not claim the runtime measured it per turn.
+  physical receipts, memo/cache charge/heap/hit/miss/eviction/oversize and timing/read
+  counters, including memo hit/miss counts and cold-validation time so the 128 MiB
+  per-engine budget can be raised on evidence. Include C/N=4000 as a report-only
+  supplemental shape; label its collection cadence and do not claim the runtime
+  measured it per turn.
   Preserve exact seeds and cache assertions; JSON output plus Markdown table.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke`.
 
@@ -310,8 +316,10 @@ No runtime bench crate becomes a production dependency.
   `cargo test -p forge-agent-host --features test-support --release --test session_journal_bench forge_packed_report -- --ignored --exact --nocapture`.
   Record all A/B N=100/1000/4000 and C results. B/N=4000 plain and tool after
   collection must each be ≤2.0× actual Forge L2; aim 1.5×. Record D10 performance
-  checks, transaction duration and old-plus-new peak. If a gate fails, report it
-  and schedule a bounded storage-only fix/recheck; no schema-5 work or baseline
+  checks, memo hit/miss counts, cold-validation time, transaction duration and
+  old-plus-new peak; use this evidence for any increase to the 128 MiB per-engine
+  memo budget. If a gate fails, report it and schedule a bounded storage-only
+  fix/recheck; no schema-5 work or baseline
   manipulation. Identify rt-e7's measured reference numbers separately; publish
   only actual Forge measurements as Forge outcomes, never reference projections.
 
@@ -323,7 +331,9 @@ No runtime bench crate becomes a production dependency.
   Validate this change's deltas and links; verify no per-object SQL requirement or
   stale identity/lifetime-replay/4× gate, global-sharing/index requirement,
   immediate-purge-per-release rule or outdated runtime pin remains outside the
-  verbatim receipt. Keep the one ordinary-diagnostic-redaction question open and
-  the Owner Decisions section unchanged.
+  verbatim historical receipt. Verify the two 2026-10-20 Owner Decisions entries
+  and their 128 MiB per-engine memo budget and conservative D3 redaction are
+  reflected consistently; Open Questions is now None. Preserve every existing
+  Owner Decisions entry verbatim.
   Focused checks: strict spec validation and whitespace/link review. No full code
   suite; reuse the recorded named-test receipts, rerunning only for new changes.
