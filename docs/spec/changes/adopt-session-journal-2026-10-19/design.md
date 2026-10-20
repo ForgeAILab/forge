@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T08:22:45Z
+updated_at: 2026-10-20T09:28:35Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -13,12 +13,14 @@ implementation.
 ## Context and evidence
 
 The runtime contract is authoritative in
-[extract-journal-storage-engine](/Volumes/Data/codes/ai/agent-runtime-u9b-review/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
+[extract-journal-storage-engine](https://github.com/ForgeAILab/agent-runtime/blob/fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
 especially amended D2 rule 4, D5's per-engine memo and D8.4's measurements.
-Implementation references below use `runtime:` for the read-only
-`/Volumes/Data/codes/ai/agent-runtime-u9b-review/`, branch `integrate/engine`
-at `724d8af`. Runtime Owner Decision Q4 accepts independent per-session copies;
-the earlier Forge review's global-index requirement is withdrawn.
+Implementation references below use `runtime:` for source paths in the
+`v0.8.0` tag at immutable commit
+`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`. The local clone at
+`/Volumes/Data/codes/ai/agent-runtime-u9b-review/` is read-only; its moving HEAD
+is not release evidence. Runtime Owner Decision Q4 accepts independent
+per-session copies; the earlier Forge review's global-index requirement is withdrawn.
 
 | Evidence | Consequence for Forge |
 | --- | --- |
@@ -28,7 +30,7 @@ the earlier Forge review's global-index requirement is withdrawn.
 | `runtime:crates/agent-runtime-journal-bench/src/{packed.rs,schema.sql,codec.rs,metadata.rs}` | Reference for pack framing, bitmaps, transactions and operation tiers; not a production dependency. It uses rusqlite and modeled seal lengths, not a real cipher. |
 | `/Volumes/Data/tmp/refactor/rt-e7/{report.md,measurements.json}` and runtime D8.4 | Measured PerSession S1–S5 bytes and pack writes with capped packs and 25% dead-byte purges, at end and per turn. B/N=4000 is 1.60542× L2 plain / 1.79118× tool. |
 | `/Volumes/Data/tmp/refactor/rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. The owner chose 128 MiB per engine on 2026-10-20; no data shows Forge needs the larger runtime default. |
-| `runtime:crates/agent-runtime-core/src/journal/engine/{mod.rs,memo.rs}` and `journal/reader.rs` | The supplied source now implements D-1 through `ReadOperation::finish`: check current-head or durable-pin authority once per reader operation and retry via membership-scoped storage on a stale memo view. Runtime design D5's open-decision paragraph and rt-e6-review F2 describe the earlier state. |
+| `runtime:crates/agent-runtime-core/src/journal/engine/{mod.rs,memo.rs}` and `journal/reader.rs` | The supplied source now implements D-1 through `ReadOperation::finish`: check current-head or durable-pin authority once per reader operation and retry via membership-scoped storage on a stale memo view. Released runtime D5 records the D-1 decision and head-bound pin certificates; rt-e6-review F2 describes the earlier state. |
 | `/Volumes/Data/tmp/refactor/rt-e1/report.md` and Forge `protected_store.rs` | The idle legacy row contains two sealed blobs in all 13 measured cases (L2), despite checkpoint saves temporarily NULLing the standalone snapshot. |
 
 Today `SqliteProtectedRuntimeStore` implements both `SessionStore` and
@@ -73,13 +75,14 @@ storage/domain during the process lifetime. Clones share the validated-root memo
 and the lease registry; a new engine loses both. Writer changes therefore reuse
 warm roots and collection sees the leases used by all runtime instances.
 
-The supplied runtime source now implements D-1: warm reads finish each reader
+Released runtime v0.8.0 implements D-1: warm reads finish each reader
 operation by checking stored current-head authority or the selected historical
 root's durable pin; a stale view retries through membership-scoped storage.
 `JournalEngine::read`, reader materialization and extension reads use that path
 (`engine/mod.rs`, `engine/memo.rs::ReadOperation`, `reader.rs`). This supersedes
-rt-e6-review F2 and runtime D5's still-historical open-decision paragraph. It is
-source evidence, not a Forge test result or proof of a published release.
+rt-e6-review F2. Released runtime D5 records the resolved decision and requires
+a head-bound memo certificate for a historical pin. Task 1 verifies this in the
+published `v0.8.0` tag; it is release-source evidence, not a Forge storage test result.
 With that check, cloning remains a performance/coordination requirement for
 memo hits and shared lease state; warm-read correctness is not made conditional
 on a host having only one engine. The release gate verifies the check too.
@@ -98,10 +101,11 @@ on a host having only one engine. The release gate verifies the check too.
 
 ### D2. What Forge consumes from the runtime
 
-**Release/pin gate.** Task 1 bumps every agent-runtime package and testkit to the
-same immutable pin of **the first agent-runtime release containing
-extract-journal-storage-engine**. Do not invent a version number or treat the
-unreleased u9b branches as that release. Verify the receipt amendment, R1–R7,
+**Release/pin gate.** Task 1 pins every agent-runtime package and testkit to
+**agent-runtime v0.8.0**, the first release containing
+extract-journal-storage-engine, at immutable commit
+`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7` (annotated tag object
+`d4dfe1952eeac542d9ec0d5c88ecce07f0c9e86b`). Verify the receipt amendment, R1–R7,
 N1/N2 fixes, native-first open, bounded extension reads, S5, the amended
 PerSession/deferred-removal contract and reviewer gate fix in that release.
 Verify D-1's reader-operation authority check; Forge uses shared engine clones
@@ -134,14 +138,15 @@ Forge does not parse private engine metadata or recompute runtime roots.
 | --- | --- |
 | `JournalDomain` | `storage_id`, `role` |
 | `JournalEngineState` | `version: u32`, `bytes: Vec<u8>`; opaque, sealed; Debug exposes version/length only |
-| `JournalSessionRecord` | `revision`, `writer_epoch`, optional head `JournalObject`, `has_checkpoint`, optional `retirement`, `collection_dirty`, `engine` |
+| `JournalFence` | `revision: JournalRevision`, `writer_epoch: u64`, `generation: u64`; absent record = all zero |
+| `JournalSessionRecord` | `generation`, `revision`, `writer_epoch`, optional head `JournalObject`, `has_checkpoint`, optional `retirement`, `collection_dirty`, `engine` |
 | `JournalStoredObject` / `JournalObjectBatch` | `id`, kind hint, canonical bytes; batch `objects` in canonical id order |
 | `JournalOperationRecord` | operation id, private digest, published revision, complete original result `JournalHead` |
 | `JournalPinRecord` | pin id, `blocks_retirement`, roots, opaque engine state |
 | `JournalCatalogEntry` | head id, opaque engine state |
 | `JournalPinChange` / `JournalCatalogChange` | `Put(record)` or `Remove(id)` |
 | `JournalWriteKind` | `OpenWriter`, `Commit`, `Retire`, `Authorize`, `Pin`, `ReleasePin`, `Stage`, `Collect` (non-exhaustive) |
-| `JournalWrite` | domain, session, kind, `expect: (JournalRevision, u64)`, optional replacement record (`None` = unchanged), object batch, optional operation, pin/catalog changes, `release` ids, optional `prune_operations_before`, optional test `inject` |
+| `JournalWrite` | domain, session, kind, `expect: JournalFence`, required replacement `record: JournalSessionRecord` (generation = expect.generation + 1), object batch, optional operation, pin/catalog changes, `release` ids, optional `prune_operations_before`, optional test `inject` |
 | `JournalApplyReceipt` | `reclaimed_objects: u64`, `reclaimed_bytes: u64`; physical body copies removed by this acknowledged transaction, including previously deferred bodies, once per copy at removal time; bytes = canonical encoded lengths before compression/sealing, not pack or SQLite page bytes |
 
 Forge honors the runtime's seven trait rules:
@@ -157,7 +162,11 @@ Forge honors the runtime's seven trait rules:
    then loses the acknowledgement. The final new pack(s) may be staged/replaced
    inside that transaction; packing must not erase the cut boundaries.
 3. **SQL fences.** Compare `expect` inside the write transaction, in SQL, against
-   both revision and writer epoch. Absence matches only `(0, 0)`.
+   revision, writer epoch and control generation (`JournalFence`). Absence matches
+   only the all-zero fence. Every apply supplies a replacement session record and
+   advances its generation exactly once, even when revision/epoch are unchanged.
+   A non-successor generation or generation overflow conflicts with no effects;
+   revision and writer epoch remain exactly as supplied by the engine.
 4. **Membership/sharing and receipts.** Forge declares PerSession and chooses
    independent copies per domain as permitted by the runtime. Deduplicate only
    within `(storage_id, role, runtime_session_id)`; add membership on every
@@ -213,9 +222,10 @@ the storage-only measurement basis, not a guarantee of Forge's own file size.
 The engine write gate is `futures_util::lock::Mutex<()>`, with the cooperative
 budget behavior recorded by reviewer `a49e3e0`; never substitute a Tokio mutex
 handoff. Its short registry mutex is not held across awaits. `close`/drop and
-`revoke_writer` are I/O-free. N1's closure-sized durable pin state and N2's
-closure-sized reads on every commit are upstream defects to resolve, not opaque
-formats for Forge to optimize or algorithms for Forge to duplicate.
+`revoke_writer` are I/O-free. Released N1 pin metadata stores roots, compact
+dependency summaries, writer epochs and head-bound memo certificates rather than
+a full closure. N2/R4 reuse validated roots across warm commits/writer changes.
+Forge persists these opaque values verbatim and does not duplicate their algorithms.
 
 ### D3. Logical domains, encryption and ids at rest
 
@@ -332,7 +342,7 @@ example `atomic-{point:?}`) that change upstream.
 
 | Table | Key and clear query columns | Sealed payload / lifetime |
 | --- | --- | --- |
-| `agent_session_journal_session` | PK `(storage_id, role, runtime_session_id)`; indexed `forge_session_id` FK; revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
+| `agent_session_journal_session` | PK `(storage_id, role, runtime_session_id)`; indexed `forge_session_id` FK; generation, revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
 | `agent_session_journal_pin` | PK `(D, S, pin_key)`; session FK; key/format/nonce | Complete `JournalPinRecord`, including roots and opaque state; Put/Remove only through apply. |
 | `agent_session_journal_catalog` | PK `(D, S, head_key)`; session FK; key/format/nonce | Complete `JournalCatalogEntry`; `head_key` is keyed as in D3, not the raw digest. |
 | `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); strict owner `(D, S)` plus indexed `forge_session_id` label; generation, key/format, object/retained-canonical-byte counts; index on `(D, S, pack_id)` | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit. One domain/session owns all slots; no cross-domain/session holder is valid. Pack owner labels have no cascading FK so deletion cleanup can be bounded. Retained bytes include deferred dead slots. |
@@ -393,12 +403,16 @@ session does no work proportional to all other sessions' packs.
 **Atomic apply and SQL fence.** Use one sqlx `db::begin_immediate` transaction for
 all components of a `JournalWrite`. For an existing row, an SQL guard with
 `WHERE storage_id = ? AND role = ? AND runtime_session_id = ? AND revision = ? AND
-writer_epoch = ?` must match, including writes with `record = None`. For an absent
-row, only `expect = (0, 0)` plus a checked SQL absence guard matches. No unchecked
-upsert may overwrite a concurrent writer. Apply record replacement exactly as the
-engine supplies it; not every write increments revision (writer open advances the
-epoch; pin/collection writes can retain revision). Mismatch rolls back with the
-runtime's typed conflict, not a silent save supersession.
+writer_epoch = ? AND generation = ?` must match for every write, including
+pin/collection/authorization controls that preserve revision and epoch. For an
+absent row, only the all-zero `JournalFence` plus a checked SQL absence guard
+matches. Every write requires a replacement `JournalSessionRecord` with
+`generation = expect.generation.checked_add(1)`; reject a non-successor or overflow
+atomically. No unchecked upsert may overwrite a concurrent writer or control.
+Persist the engine-supplied revision and epoch exactly; writer open advances the
+epoch, while pin/collection writes can retain revision and epoch. Session control
+generation is independent of pack generation (the latter fences cached slots).
+Mismatch rolls back with the runtime's typed conflict, not a silent save supersession.
 
 Follow D2's ordered cuts within the same transaction: stage new packs and all
 membership additions, checkpoint/batch, pin/catalog changes, record/head and
@@ -466,8 +480,8 @@ an acknowledged turn.
 **Compaction and vacuum.** The reference `compact(domain)` repacks every session
 of the domain in one transaction and then runs a full `VACUUM`. Forge bounds it:
 one domain/session and at most 8 MiB of rewritten logical bytes per transaction,
-no full `VACUUM`, then the existing `db::incremental_vacuum`. Compact merges only eligible
-fully live packs; deferred bodies stay on the apply/retirement purge path so no
+no full `VACUUM`, then the existing `db::incremental_vacuum`. Compact changes no
+session control generation. It merges only eligible fully live packs; deferred bodies stay on the apply/retirement purge path so no
 physical body removal escapes receipt accounting. That helper is a no-op
 unless the database has `auto_vacuum = INCREMENTAL`, which only databases created
 empty by a recent Forge have. On older databases, later writes reuse freed pages,
@@ -490,17 +504,16 @@ revision 70 the floor is 6 and 65 records remain). Storage executes exactly the
 trait rule (`storage/mod.rs`, `VolatileJournalStorage`): within the written
 (domain, session) only, keep every record with `revision >= floor`, plus the
 **single last** record (maximum `revision`) whose `result.writer_epoch` equals
-the `writer_epoch` of the session record as it stands after this write's
-replacement record (the stored record when `record = None`). Every other
+the `writer_epoch` of this write's required replacement session record. Every other
 current-epoch record below the floor is pruned; the exception is one record, not
 the whole epoch. Rebuild operation tiers atomically in the same apply. Execute
 pruning only when the directive is supplied; Forge invents no TTL or independent
 replay floor and never prunes during commit. A pruned replay returns
 `StateConflict` and cannot apply again. The rt-e7 reference implements S5 and
 measures retained tiers after actual pruning; it is no longer a projection.
-If the released runtime states a different floor or exception, its text and
-conformance win and this
-section is corrected in task 1.
+Task 1 verified this floor and single-operation exception in `v0.8.0`
+(`engine/controls.rs:332`, `storage/volatile.rs:397`); no replay-rule correction
+was needed.
 
 ### D5. Forge adapter and engine-call mapping
 
@@ -510,14 +523,14 @@ implementation or private runtime-metadata decoder is needed.
 
 | Forge action | Engine/runtime call and storage effect |
 | --- | --- |
-| Session open/resume | Runtime discovers both `journal()` capabilities and calls engine `open`. Writer open issues `apply(OpenWriter)` with the old fence and durable epoch advance. The second local writer conflicts before provider I/O. Read-only roots are engine-authorized. |
+| Session open/resume | Runtime discovers both `journal()` capabilities and calls engine `open`. Writer open issues `apply(OpenWriter)` with the full old `JournalFence` and a required replacement record advancing epoch and generation. The second local writer conflicts before provider I/O. Read-only roots are engine-authorized. |
 | Turn commit / idle publication | Runtime calls `commit`; engine validates exact/projected candidates, sequence and replay, then calls storage `apply(Commit)`. Forge adds no semantic CAS/retry algorithm. Run the post-terminal S2 hook after successful terminal publication. |
 | Checkpoint barrier | Runtime checkpoint persistence calls protected `commit` with the exact checkpoint; ordinary publication follows runtime policy. Failures preserve existing no-replay/model/tool barriers. |
 | Checkpoint and snapshot reads | `JournalReader` over an engine lease. The host's LCM probe calls `extension(LCM_COMPONENT_ID)` for `fixed_overhead_tokens`; it reads map paths and one opaque extension, not history or a structured cache tree. Use the protected view if the ordinary policy omitted that extension. |
 | Shutdown / dropped turn | `close` / runtime lease drop release local slots/pins without storage I/O; no synchronous durable control adapter. |
 | Retirement | Await `authorize_retirement(session, expected_revision, at)`, then `retire(session, expected_revision)`, protected first, then ordinary; engine checks writer/pin/dependency/grant conditions. |
 | Collection scheduling | Observe `engine.root_epoch()` synchronously (I/O-free), then await `collect(JournalGcRequest { storage_id, expected_root_epoch, max_objects })`; retry an epoch conflict later. Engine pages `dirty_sessions`, computes release and S5 directives. |
-| Restart | Recreate storage/caches and the two engines. Durable records, epochs, operation results, grants, pins/catalog and tombstones survive; leases, reader pins and validation memo do not. First open validates cold and issues a newer writer epoch. |
+| Restart | Recreate storage/caches and the two engines. Durable records, writer epochs, control generations, operation results, grants, pins/catalog and tombstones survive; leases, reader pins and validation memo do not. First open validates cold and issues a newer writer epoch. |
 | Transfer/staging/conformance controls | Await engine `pin_transfer`, `retain_root`, `release_pin`, `stage_leaves`, `compact`; never serialize a host-computed closure. |
 
 **sqlx, not rusqlite.** Reuse Forge's sqlx pool, transactions, busy policy and error
@@ -924,7 +937,7 @@ not claim Forge has run or passed it.
 
 ## Risks / Trade-offs
 
-- The prerequisite is unreleased. The first task verifies the released contract,
+- The prerequisite is released as `v0.8.0`. Task 1 verifies the tagged contract,
   including upstream N1/N2, gate and S5 fixes; Forge must not work around them by
   owning engine semantics.
 - Validation/policy CPU can still be O(N); R4 avoids repeated cold closure reads

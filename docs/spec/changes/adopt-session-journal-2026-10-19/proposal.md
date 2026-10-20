@@ -1,13 +1,13 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T08:22:45Z
+updated_at: 2026-10-20T09:28:35Z
 ---
 
 ## Why
 
 Forge rewrites, compresses and encrypts complete native session snapshots and
 checkpoints at every persistence barrier. The runtime now has a storage-generic
-`JournalEngine<S>` on unreleased branches; Forge should consume that engine rather
+`JournalEngine<S>` in release `v0.8.0`; Forge should consume that engine rather
 than implement journal semantics. The reference packed SQLite adapter measured
 fixture B/N=4000 at **1.60542× L2 plain and 1.79118× L2 tool**, both with
 collect-at-end and per-turn collection.
@@ -27,7 +27,8 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   extension reads, engine-owned 64-revision replay pruning, D-1's reader-operation
   authority check and the reviewer's futures-mutex gate correction. No invented
   version, branch-only production pin or Forge semantic workaround. The rebased
-  workspace currently pins `1de6d7d` (0.7.0 + U9 groups C/D), not the engine release.
+  baseline pinned `1de6d7d` (0.7.0 + U9 groups C/D); task 1 moves it to `v0.8.0`
+  at `fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`.
 - **Forge implements only `JournalStorage`.** Two long-lived
   `JournalEngine<ForgeJournalStorage>` instances share one sqlx-backed storage.
   Create exactly one engine per storage/domain and hand clones to every runtime
@@ -72,8 +73,9 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   read protected-only slots. Credentials
   remain excluded from both domains.
 - **One transaction per apply.** Use `db::begin_immediate` through sqlx, check
-  `expect` revision and writer epoch in SQL, stage all components and cuts, commit
-  once. Release membership immediately; sealed packs may retain unserved dead
+  the full `JournalFence` revision, writer epoch and control generation in SQL,
+  require a replacement session record advancing generation exactly once, stage
+  all components and cuts, commit once. Release membership immediately; sealed packs may retain unserved dead
   bytes below 25% of canonical body bytes. The apply reaching 25%, an empty scope,
   or retired-session collection purges them; bounded deletion cleanup drains the
   deleted session's packs. Return `JournalApplyReceipt` physical copy counts and
@@ -120,7 +122,8 @@ ordinary-redaction decisions.
   `docs/performance-testing.md`, `CHANGELOG.md`.
 - Public API/MCP/CLI/events and `checkpoint_present` meaning stay stable. The disk
   layout gains six tables; no per-object body/index or operation-result rows.
-- This revision changes only this spec folder and the requested local report.
-  It performs no implementation, builds, release or runtime-repository edits.
+- Task 1 implements only the released dependency pin, release contract test and
+  associated documentation/spec alignment. Native storage adoption remains in
+  subsequent tasks; the runtime repository remains read-only.
 - Evidence and detailed contract: design D2–D10; reference measurements are inputs,
   not a claim that Forge's release gates already pass.

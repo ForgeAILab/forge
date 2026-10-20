@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Consume the released storage-generic runtime engine
-Forge SHALL implement `JournalStorage` as `ForgeJournalStorage` and use the runtime's `JournalEngine<ForgeJournalStorage>` for protected and ordinary journal semantics. Adoption SHALL start by pinning all runtime packages and testkit to the same immutable revision of the first agent-runtime release containing extract-journal-storage-engine, including amended D2 rules 1–7, `JournalBodySharing::PerSession`, physical-copy `JournalApplyReceipt`, `retained_bytes`, the N1/N2 fixes, D-1's reader-operation authority check, the corrected futures mutex gate, native-first open, bounded extension reads and engine-owned replay pruning. Forge SHALL NOT copy the runtime's validation, closure, lease, dependency, replay or collection algorithms.
+Forge SHALL implement `JournalStorage` as `ForgeJournalStorage` and use the runtime's `JournalEngine<ForgeJournalStorage>` for protected and ordinary journal semantics. Adoption SHALL start by pinning all runtime packages and testkit to the same immutable revision of the first agent-runtime release containing extract-journal-storage-engine, (`v0.8.0`, `fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`), including amended D2 rules 1–7, `JournalBodySharing::PerSession`, physical-copy `JournalApplyReceipt`, `retained_bytes`, the N1/N2 fixes, D-1's reader-operation authority check, the corrected futures mutex gate, native-first open, bounded extension reads and engine-owned replay pruning. Forge SHALL NOT copy the runtime's validation, closure, lease, dependency, replay or collection algorithms.
 
 #### Scenario: The prerequisite release is unavailable
 - **WHEN** the released runtime pin cannot satisfy the complete consumed contract
@@ -95,7 +95,7 @@ Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and ope
 - **AND** a zero limit returns no sessions
 
 ### Requirement: Atomic fenced apply with deletion receipts
-Every JournalWrite SHALL run in one sqlx BEGIN IMMEDIATE transaction on one connection, preserving the runtime's ordered cut points, all memberships, pin/catalog changes, replacement record and operation packs. SQL SHALL enforce both expect fields inside that transaction, including writes without record replacement; absence SHALL match only revision/epoch zero. A mismatch SHALL be a typed runtime state conflict with no effects; other ambiguous errors SHALL invalidate caches for reload.
+Every JournalWrite SHALL run in one sqlx BEGIN IMMEDIATE transaction on one connection, preserving the runtime's ordered cut points, all memberships, pin/catalog changes, replacement record and operation packs. SQL SHALL enforce all three `JournalFence` fields (revision, writer_epoch, generation) inside that transaction for every write, including controls preserving revision/epoch; absence SHALL match only the all-zero fence. Every write SHALL carry a required replacement session record with generation exactly expect.generation + 1; overflow or a non-successor generation SHALL conflict atomically. The session generation SHALL be persisted independently of pack generations. A mismatch SHALL be a typed runtime state conflict with no effects; other ambiguous errors SHALL invalidate caches for reload.
 
 Releases SHALL end membership read authority immediately. A sealed pack MAY retain dead bodies below 25% of its physically retained canonical body bytes, never serving them; the apply reaching 25% or more SHALL purge all its dead slots transactionally. An empty domain/session scope and collection of a retired session SHALL purge all that scope's dead bytes, including earlier deferred bytes without new release ids. Purges SHALL run even with optional S2 merging disabled. JournalApplyReceipt SHALL count physical body copies and their original canonical encoded lengths before compression/sealing exactly once at removal time, including previously deferred bodies. Clearing bits, moving live bodies or reclaiming SQLite pages SHALL count zero. Forge SHALL return `Some` from `retained_bytes(domain)` with canonical bytes physically retained in that domain's session packs, including deferred dead bodies; this diagnostic SHALL NOT control liveness or stand for file size.
 
@@ -109,9 +109,18 @@ Releases SHALL end membership read authority immediately. A sealed pack MAY reta
 - **AND** retry within the retained replay window returns the original result without reapplying
 
 #### Scenario: Stale SQL fence
-- **WHEN** a writer or a record=None collection/pin write presents a stale revision or writer epoch
+- **WHEN** a writer or a collection/pin/authorization write presents a stale revision, writer epoch or control generation
 - **THEN** SQL refuses it and all staged changes roll back
 - **AND** the refusal does not depend solely on a process cache or mutex
+
+#### Scenario: Concurrent controls at the same revision and writer epoch
+- **WHEN** two controls prepare writes from the same session fence and one commits
+- **THEN** the second control conflicts on generation even though revision and writer epoch still match
+- **AND** pins, retirement grants and dependency candidates from the first control are preserved
+
+#### Scenario: Invalid successor generation
+- **WHEN** a write supplies a non-successor generation or expect.generation cannot be incremented
+- **THEN** the apply conflicts without any effects
 
 #### Scenario: Unrelated database writes
 - **WHEN** other Forge subsystems commit to the same database file between a journal read and the next apply

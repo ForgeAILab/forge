@@ -1,11 +1,11 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T08:22:45Z
+updated_at: 2026-10-20T09:28:35Z
 completed_at:
 ---
 
 Execute in order. Each numbered checkbox is one Codex job, sized ≤ about 3 h;
-split an overrun rather than silently extending scope. All remain unimplemented.
+split an overrun rather than silently extending scope. Checkboxes record completion.
 Run only the named focused tests locally; CI runs full suites. Test names below
 are proposed exact names to create where absent. Do not run a whole crate,
 workspace or all-target suite locally. Use task-specific TMPDIR/CARGO_TARGET_DIR
@@ -19,8 +19,8 @@ No runtime bench crate becomes a production dependency.
 
 ## Release gate and foundations
 
-- [ ] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤3 h).**
-  The rebased workspace Cargo.toml/Cargo.lock already pin agent-runtime
+- [x] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤3 h).**
+  The baseline workspace Cargo.toml/Cargo.lock pinned agent-runtime
   **0.7.0 + U9 groups C/D** at `1de6d7d`
   (`1de6d7d34d2cfe4fc35791bca440932602539cf7` in the lockfile), shared by
   agent-host, services and services-agents. No separate pre-0.7 upgrade job is
@@ -31,17 +31,29 @@ No runtime bench crate becomes a production dependency.
   working memo, R5/R6, S5, JournalBodySharing::PerSession, the amended 25%
   deferred-removal/physical-copy receipt rules, retained_bytes, scope-aware
   conformance, D-1's reader-operation authority check and reviewer `a49e3e0`
-  futures-mutex fix in that release. The supplied runtime source implements D-1
-  despite the older open-decision paragraph in its D5; task 13 uses engine clones
+  futures-mutex fix in that release. Released runtime D5 records the resolved D-1
+  decision, including head-bound pin memo certificates; task 13 uses engine clones
   for memo/lease reuse regardless.
   Stop subsequent jobs if unavailable; do not implement runtime fixes in Forge or
   invent a version. Update Cargo.toml/lockfile together. Confirm the released S5
   floor/exception and pruning semantics match D4, or correct D4 first.
   Focused check: `cargo check -p forge-agent-host -p services -p services-agents`; add/run
   `cargo test -p forge-agent-host --test session_journal_dependency engine_release_contract`.
+  Completed with **v0.8.0**, commit `fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`
+  (annotated tag object `d4dfe1952eeac542d9ec0d5c88ecce07f0c9e86b`). All eight
+  runtime/testkit packages use that source; the seven existing runtime packages
+  moved from 0.7.0 to 0.8.0 and 487 other packages kept their versions/sources.
+  The released full JournalFence and required replacement record are reflected
+  in D2/D4/D5, task 3/6/11 and the native-session-journal delta. S5's inclusive
+  floor and single current-epoch exception match. Both named tests passed (2/2),
+  as did the three-package check, fmt check, agent-host all-target Clippy with
+  warnings denied, strict spec validation and whitespace checks. No production
+  call-site adaptation was needed; native persistence remains materialized.
+  Upstream LCM planning changes are documented in CHANGELOG and architecture.
+  Tagged source checklist and command receipts: `/Volumes/Data/tmp/refactor/c3-t1/report.md`.
 
 - [ ] **2. File-backed test support and engine harness (≤2 h).**
-  Add testkit at the exact pin, file DB/temp-dir ownership, the test-only mapping
+  Use the testkit pinned in task 1; add file DB/temp-dir ownership, the test-only mapping
   decorator that inserts a stub agent_session for each unseen runtime id on its
   first apply (no pre-seeded id list), test-only legacy row seeding and real
   decoder helpers.
@@ -54,7 +66,8 @@ No runtime bench crate becomes a production dependency.
 - [ ] **3. Add six-table migration and cascade invariants (≤2 h).**
   Allocate one `V{NNN}__session_journal.sql` per D4 (unique UTC version at creation).
   Add session, pin, catalog, pack, bitmap membership and operation_pack tables
-  keyed by runtime session id, with an indexed `forge_session_id` cascade FK on
+  keyed by runtime session id, with session control-generation/revision/epoch columns
+  and an indexed `forge_session_id` cascade FK on
   every session-metadata/membership table, a non-unique index on
   `agent_session(runtime_session_id)` (never UNIQUE), required indexes and
   in-row CHECKs. Packs have a strict domain/runtime-session owner, indexed Forge
@@ -98,13 +111,16 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
   One sqlx begin_immediate transaction/connection; SQL expect guard for existing
-  and absent records, including record=None writes; a failed fence returns
+  and absent records, including control writes retaining revision/epoch. Compare
+  the full JournalFence (revision, writer_epoch, generation); require a replacement
+  session record with generation exactly expect.generation + 1, rejecting overflow
+  or a non-successor atomically. A failed fence returns
   StateConflict. Never use cache staleness or a changed data_version as a semantic
   conflict. Refresh only the written domain/session's pack directory inside the
   transaction per D5 without using a database-wide invalidation counter;
   preserve genuine immutable-body conflicts and persist exactly supplied
-  revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
-  order and publish the final new pack (split at the 1 MiB logical cap). Roll back
+  revisions/epochs and the supplied successor generation. Stage non-control,
+  checkpoint, batch and head in the specified cut order and publish the final new pack (split at the 1 MiB logical cap). Roll back
   every pre-commit cut; AfterCommit
   commits then errors. Invalidate caches on ambiguous outcomes. Emit the D8 apply
   tracing (kind, duration, lock hold, receipt; no contents or ids).
@@ -169,8 +185,8 @@ No runtime bench crate becomes a production dependency.
   and file-backed sqlx. Mandatory purges stay enabled with S2 off. This covers
   protected/ordinary, arbitrary redacting policies, collection/unsupported collection,
   fence, independent-copy receipts, deferred removal/retained-byte evidence,
-  metadata, paging and restart cases. Use testkit's engine host
-  impl; do not add a Forge collector.
+  metadata, paging, the control_generation_fence case and restart cases. Use
+  testkit's engine host impl; do not add a Forge collector.
   Focused commands: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance storage_conformance_no_repack`,
   then that command filtered to `storage_conformance_repack`, then
   `storage_conformance_reopen`. Each named wrapper must pass.

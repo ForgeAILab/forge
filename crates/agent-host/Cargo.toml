@@ -49,6 +49,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+agent-runtime-testkit.workspace = true
 process-supervisor = { path = "../process-supervisor" }
 db = { path = "../db", features = ["test-template"] }
 jsonschema = { version = "0.28", default-features = false }

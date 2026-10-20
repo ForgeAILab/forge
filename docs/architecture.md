@@ -2561,6 +2561,15 @@ the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction
 Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
 are removed.
 
+The pinned agent-runtime v0.8.0 uses `agent-runtime-lcm-4`: normal condensation
+carries the newest full covered-entry size tier rather than triggering on active
+node count. Depth stays logarithmic; without token pressure, the frontier can
+retain about `fanout - 1` summaries per tier and use more context. Existing
+soft/hard pressure thresholds still bound context and can trigger smaller merges
+after leaf compaction. Persisted nodes and pending operations remain resumable.
+This dependency upgrade retains Forge's encrypted snapshot/checkpoint persistence;
+native session journals and collection are introduced by later adoption tasks.
+
 The runtime measures fixed overhead only after a successful plan, so a cold
 session (new, adopted, or with no successful plan yet) would budget history
 against the whole target. On such a turn Forge sizes the system prompt, state card

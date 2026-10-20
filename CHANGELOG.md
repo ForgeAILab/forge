@@ -175,6 +175,16 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Pin agent-runtime and its testkit to v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`).
+  Forge continues using its existing encrypted snapshot/checkpoint stores;
+  native journal adoption and its collection-driven 64-revision replay window
+  remain for the subsequent session-journal tasks.
+- Native Agent Chat now uses the runtime's `agent-runtime-lcm-4` planning:
+  condensation carries a full covered-entry size tier instead of merging on
+  active-node count. Without token pressure, summaries can occupy more context;
+  existing soft/hard pressure limits still apply and persisted LCM state remains
+  resumable.
+
 - Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D
   (`1de6d7d`), retaining materialized session/checkpoint stores without
   journal adoption.
