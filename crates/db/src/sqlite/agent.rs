@@ -1050,18 +1050,6 @@ impl SqliteDb {
 }
 
 impl SqliteDb {
-    pub async fn attention_session_checkpoint_count(&self, session_id: &str) -> crate::Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM protected_agent_session_state
-                 WHERE session_id = ? AND checkpoint_turn_id IS NOT NULL",
-        )
-        .bind(session_id)
-        .fetch_one(self.pool())
-        .await?)
-    }
-}
-
-impl SqliteDb {
     pub async fn attention_actor_identity_count(&self, identity_id: &str) -> crate::Result<i64> {
         Ok(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agent_identity WHERE id = ?")

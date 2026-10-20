@@ -15,6 +15,7 @@ pub(crate) mod operation_contract;
 pub mod outbound_http;
 mod protected_store;
 pub mod session_journal;
+pub mod session_journals;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 mod tool_preview;

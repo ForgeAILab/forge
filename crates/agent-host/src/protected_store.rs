@@ -32,9 +32,15 @@ const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 const SESSION_STATE_MAGIC: &[u8] = b"FORGE-SESSION\0";
 const SESSION_STATE_FORMAT: u8 = 1;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
+#[path = "test_support/legacy_baseline.rs"]
+mod legacy_baseline;
+#[cfg(any(test, feature = "test-support"))]
 #[path = "test_support/legacy.rs"]
 mod legacy_test_support;
+
+#[path = "session_probe.rs"]
+mod session_probe;
 
 fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
     serde_json::from_slice(bytes).map_err(|_| {
@@ -132,9 +138,9 @@ pub struct SqliteProtectedRuntimeStore {
     db: Arc<SqliteDb>,
     cipher: Arc<XChaCha20Poly1305>,
     key_revision: i64,
-    snapshot_mac: ring::hmac::Context,
-    #[cfg(test)]
-    save_barrier: Option<Arc<tokio::sync::Barrier>>,
+    journals: crate::session_journals::SessionJournals,
+    #[cfg(any(test, feature = "test-support"))]
+    legacy_snapshot_mac: ring::hmac::Context,
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     revocation_client: reqwest::Client,
     gemini_revocation_endpoint: Arc<str>,
@@ -142,15 +148,23 @@ pub struct SqliteProtectedRuntimeStore {
 
 impl SqliteProtectedRuntimeStore {
     pub fn new(db: Arc<SqliteDb>, master_key: [u8; 32], key_revision: i64) -> Self {
-        // Separate the digest domain from encryption and any other keyed hashes.
-        let digest_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &master_key);
-        let mut snapshot_mac = ring::hmac::Context::with_key(&digest_key);
-        snapshot_mac.update(b"forge/protected-session/snapshot-digest\0");
+        #[cfg(any(test, feature = "test-support"))]
+        let legacy_snapshot_mac = {
+            let digest_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &master_key);
+            let mut mac = ring::hmac::Context::with_key(&digest_key);
+            mac.update(b"forge/protected-session/snapshot-digest\0");
+            mac
+        };
+        let storage = Arc::new(
+            crate::session_journal::ForgeJournalStorage::new(db.clone(), master_key, key_revision)
+                .expect("protected store key revision must be positive"),
+        );
+        let journals = crate::session_journals::SessionJournals::new(storage);
         Self {
             db,
-            snapshot_mac,
-            #[cfg(test)]
-            save_barrier: None,
+            journals,
+            #[cfg(any(test, feature = "test-support"))]
+            legacy_snapshot_mac,
             cipher: Arc::new(XChaCha20Poly1305::new((&master_key).into())),
             key_revision,
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -161,6 +175,11 @@ impl SqliteProtectedRuntimeStore {
                 .expect("credential revocation client configuration is valid"),
             gemini_revocation_endpoint: Arc::from("https://oauth2.googleapis.com/revoke"),
         }
+    }
+
+    /// The same engine clones used by every persistent runtime and maintenance.
+    pub fn journals(&self) -> crate::session_journals::SessionJournals {
+        self.journals.clone()
     }
 
     fn seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
@@ -192,6 +211,7 @@ impl SqliteProtectedRuntimeStore {
             })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn seal_session_state(&self, bytes: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -231,22 +251,6 @@ impl SqliteProtectedRuntimeStore {
         })
         .await
         .map_err(|_| RuntimeError::internal("protected session decompression task failed"))?
-    }
-
-    fn snapshot_digest(&self, snapshot: &SessionSnapshot) -> Result<String, RuntimeError> {
-        // Runtime snapshots stamp the clock on every call, even without a state change.
-        // Diagnostic manifests are a bounded recent window and are omitted from
-        // new protected checkpoints; neither belongs to canonical state identity.
-        let bytes = serde_json::to_vec(&(
-            &snapshot.id,
-            &snapshot.history,
-            &snapshot.usage,
-            &snapshot.identity,
-            &snapshot.extension_state,
-        ))?;
-        let mut mac = self.snapshot_mac.clone();
-        mac.update(&bytes);
-        Ok(hex::encode(mac.sign().as_ref()))
     }
 
     /// Internal protected-payload seam used by the interaction broker.  The
@@ -667,21 +671,18 @@ impl SqliteProtectedRuntimeStore {
         runtime_id: &str,
     ) -> Result<Option<String>, crate::AgentHostError> {
         let id = SessionId::new(runtime_id);
-        let snapshot = match SessionStore::load(self, &id)
+        let flags = self
+            .persistence_flags(&id)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-        {
-            Some(snapshot) => Some(snapshot),
-            None => CheckpointStore::load_latest(self, &id)
-                .await
-                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-                .map(|checkpoint| checkpoint.snapshot),
-        };
-        Ok(snapshot.and_then(|snapshot| {
-            snapshot
-                .extension_state
-                .get(agent_runtime::harness::LCM_COMPONENT_ID)
-                .and_then(|state| state.value.get("timeline_id"))
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let state = self
+            .persisted_extension(&id, flags, agent_runtime::harness::LCM_COMPONENT_ID)
+            .await
+            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        Ok(state.and_then(|state| {
+            state
+                .value
+                .get("timeline_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         }))
@@ -730,7 +731,7 @@ impl SqliteProtectedRuntimeStore {
         .fetch_one(self.db.pool())
         .await
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        // Decrypting the snapshot happens outside the write transaction.
+        // Reading native/legacy extension state happens outside the write transaction.
         let referenced = if successor || has_binding {
             None
         } else {
@@ -1672,125 +1673,12 @@ impl fmt::Debug for SqliteProtectedRuntimeStore {
     }
 }
 
-impl SqliteProtectedRuntimeStore {
-    async fn save_checkpoint_once(
-        &self,
-        checkpoint: &TurnCheckpoint,
-        retry: bool,
-    ) -> Result<(), RuntimeError> {
-        let forge_session_id = self.forge_session_id(&checkpoint.session).await?;
-        let fingerprint = checkpoint.operation_fingerprint.to_string();
-        let revision = i64::try_from(checkpoint.state_revision).unwrap_or(i64::MAX);
-        let row = sqlx::query(
-            "SELECT state_revision, checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint
-             FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(&forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
-        let expected_revision = row
-            .as_ref()
-            .map(|row| row.get::<i64, _>("state_revision"))
-            .unwrap_or(0);
-        if let Some(row) = &row {
-            if retry
-                && row
-                    .get::<Option<String>, _>("checkpoint_turn_id")
-                    .is_some_and(|turn| turn != checkpoint.turn.as_str())
-            {
-                return Err(RuntimeError::conflict(
-                    "protected checkpoint turn changed during retry",
-                ));
-            }
-            if row
-                .get::<Option<String>, _>("checkpoint_turn_id")
-                .as_deref()
-                == Some(checkpoint.turn.as_str())
-            {
-                if let Some(stored_revision) = row.get::<Option<i64>, _>("checkpoint_revision") {
-                    if revision < stored_revision
-                        || (revision == stored_revision
-                            && row
-                                .get::<Option<String>, _>("checkpoint_fingerprint")
-                                .as_deref()
-                                != Some(fingerprint.as_str()))
-                    {
-                        return Err(RuntimeError::conflict(
-                            "protected checkpoint revision moved backwards or changed fingerprint",
-                        ));
-                    }
-                    if revision == stored_revision {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        let digest = self.snapshot_digest(&checkpoint.snapshot)?;
-        let bytes = serde_json::to_vec(checkpoint)?;
-        let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        #[cfg(test)]
-        if !retry {
-            if let Some(barrier) = &self.save_barrier {
-                barrier.wait().await;
-            }
-        }
-        let result = sqlx::query(
-            "INSERT INTO protected_agent_session_state (
-                session_id, checkpoint_ciphertext, checkpoint_nonce,
-                checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint,
-                snapshot_digest,
-                key_revision, lcm_policy_revision, checkpoint_lcm_policy_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(session_id) DO UPDATE SET
-                checkpoint_ciphertext = excluded.checkpoint_ciphertext,
-                checkpoint_nonce = excluded.checkpoint_nonce,
-                checkpoint_turn_id = excluded.checkpoint_turn_id,
-                checkpoint_revision = excluded.checkpoint_revision,
-                checkpoint_fingerprint = excluded.checkpoint_fingerprint,
-                snapshot_ciphertext = NULL,
-                snapshot_nonce = NULL,
-                snapshot_digest = excluded.snapshot_digest,
-                key_revision = excluded.key_revision,
-                lcm_policy_revision = excluded.lcm_policy_revision,
-                checkpoint_lcm_policy_revision = excluded.checkpoint_lcm_policy_revision,
-                state_revision = protected_agent_session_state.state_revision + 1,
-                updated_at = excluded.updated_at
-             WHERE protected_agent_session_state.state_revision = ? AND (
-                protected_agent_session_state.checkpoint_revision IS NULL
-                OR excluded.checkpoint_turn_id != protected_agent_session_state.checkpoint_turn_id
-                OR excluded.checkpoint_revision > protected_agent_session_state.checkpoint_revision
-                OR (
-                    excluded.checkpoint_revision = protected_agent_session_state.checkpoint_revision
-                    AND excluded.checkpoint_fingerprint = protected_agent_session_state.checkpoint_fingerprint
-                ))",
-        )
-        .bind(forge_session_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(checkpoint.turn.as_str())
-        .bind(revision)
-        .bind(fingerprint)
-        .bind(digest)
-        .bind(self.key_revision)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(db::now_rfc3339())
-        .bind(expected_revision)
-        .execute(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected checkpoint save failed"))?;
-        if result.rows_affected() == 0 {
-            return Err(RuntimeError::conflict(
-                "protected checkpoint revision moved backwards or changed fingerprint",
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl SessionStore for SqliteProtectedRuntimeStore {
+    fn journal(&self) -> Option<Arc<dyn agent_runtime::core::journal::SessionJournal>> {
+        Some(Arc::new(self.journals.ordinary()))
+    }
+
     async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
         let forge_session_id = match self.forge_session_id(id).await {
             Ok(value) => value,
@@ -1798,7 +1686,7 @@ impl SessionStore for SqliteProtectedRuntimeStore {
             Err(error) => return Err(error),
         };
         let row = sqlx::query(
-            "SELECT snapshot_ciphertext, snapshot_nonce, lcm_policy_revision
+            "SELECT snapshot_ciphertext, snapshot_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
         )
         .bind(forge_session_id)
@@ -1828,91 +1716,17 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         }
     }
 
-    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
-        let forge_session_id = self.forge_session_id(&snapshot.id).await?;
-        let digest = self.snapshot_digest(snapshot)?;
-        let row = sqlx::query(
-            "SELECT state_revision, snapshot_digest, key_revision, lcm_policy_revision
-             FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(&forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected session load failed"))?;
-        let expected_revision = row
-            .as_ref()
-            .map(|row| row.get::<i64, _>("state_revision"))
-            .unwrap_or(0);
-        if let Some(row) = &row {
-            let stored_digest: Option<String> = row.get("snapshot_digest");
-            let current_format = row.get::<i64, _>("key_revision") == self.key_revision
-                && row
-                    .get::<Option<String>, _>("lcm_policy_revision")
-                    .as_deref()
-                    == Some(crate::FORGE_LCM_POLICY_REVISION);
-            if current_format {
-                let unchanged = match stored_digest {
-                    Some(stored) => stored == digest,
-                    None => SessionStore::load(self, &snapshot.id)
-                        .await?
-                        .map(|stored| self.snapshot_digest(&stored))
-                        .transpose()?
-                        .is_some_and(|stored| stored == digest),
-                };
-                if unchanged {
-                    return Ok(());
-                }
-            }
-        }
-        let bytes = serde_json::to_vec(snapshot)?;
-        let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        #[cfg(test)]
-        if let Some(barrier) = &self.save_barrier {
-            barrier.wait().await;
-        }
-        let result = sqlx::query(
-            "INSERT INTO protected_agent_session_state (
-                session_id, snapshot_ciphertext, snapshot_nonce, snapshot_digest,
-                key_revision, lcm_policy_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(session_id) DO UPDATE SET
-                snapshot_ciphertext = excluded.snapshot_ciphertext,
-                snapshot_nonce = excluded.snapshot_nonce,
-                snapshot_digest = excluded.snapshot_digest,
-                key_revision = excluded.key_revision,
-                checkpoint_lcm_policy_revision = CASE
-                    WHEN protected_agent_session_state.checkpoint_ciphertext IS NOT NULL THEN
-                        COALESCE(protected_agent_session_state.checkpoint_lcm_policy_revision,
-                                 protected_agent_session_state.lcm_policy_revision, '')
-                    ELSE protected_agent_session_state.checkpoint_lcm_policy_revision END,
-                lcm_policy_revision = excluded.lcm_policy_revision,
-                state_revision = protected_agent_session_state.state_revision + 1,
-                updated_at = excluded.updated_at
-             WHERE protected_agent_session_state.state_revision = ?",
-        )
-        .bind(forge_session_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(digest)
-        .bind(self.key_revision)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(db::now_rfc3339())
-        .bind(expected_revision)
-        .execute(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected session save failed"))?;
-        if result.rows_affected() == 0 {
-            // All SessionStore callers, including runtime lifecycle and turn
-            // saves, treat a lost CAS as superseded. Preserve the winner.
-            tracing::info!(session_id = %snapshot.id.as_str(),
-                "protected session save superseded by competing state");
-        }
-        Ok(())
+    async fn save(&self, _snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        Err(RuntimeError::conflict("legacy session store is read-only"))
     }
 }
 
 #[async_trait]
 impl CheckpointStore for SqliteProtectedRuntimeStore {
+    fn journal(&self) -> Option<Arc<dyn agent_runtime::core::journal::SessionJournal>> {
+        Some(Arc::new(self.journals.protected()))
+    }
+
     async fn load_latest(
         &self,
         session: &SessionId,
@@ -1923,8 +1737,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
             Err(error) => return Err(error),
         };
         let row = sqlx::query(
-            "SELECT checkpoint_ciphertext, checkpoint_nonce,
-                    COALESCE(checkpoint_lcm_policy_revision, lcm_policy_revision) AS lcm_policy_revision
+            "SELECT checkpoint_ciphertext, checkpoint_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
         )
         .bind(forge_session_id)
@@ -1969,39 +1782,8 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         }
     }
 
-    async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
-        // Runtime callers propagate save errors into the turn. A competing save
-        // is ordinary progress: reload once, then keep the winning state.
-        for retry in [false, true] {
-            match self.save_checkpoint_once(checkpoint, retry).await {
-                Err(error) if error.kind == ErrorKind::Conflict => {
-                    if !retry {
-                        // A new turn that won the CAS is authoritative. Do not
-                        // retry an older turn over it just because its turn ID
-                        // differs (which ordinarily permits starting a turn).
-                        let winner =
-                            CheckpointStore::load_latest(self, &checkpoint.session).await?;
-                        if winner.is_some_and(|winner| {
-                            winner.turn != checkpoint.turn
-                                || winner.state_revision > checkpoint.state_revision
-                                || (winner.state_revision == checkpoint.state_revision
-                                    && winner.operation_fingerprint
-                                        != checkpoint.operation_fingerprint)
-                        }) {
-                            tracing::info!(session_id = %checkpoint.session.as_str(),
-                                turn_id = %checkpoint.turn.as_str(),
-                                "protected checkpoint save superseded by competing state");
-                            return Ok(());
-                        }
-                    }
-                    tracing::info!(session_id = %checkpoint.session.as_str(),
-                        turn_id = %checkpoint.turn.as_str(), superseded = retry,
-                        "protected checkpoint save conflicted; retrying once or keeping the winner");
-                }
-                result => return result,
-            }
-        }
-        Ok(())
+    async fn save(&self, _checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        Err(RuntimeError::conflict("legacy session store is read-only"))
     }
 }
 
@@ -2071,6 +1853,43 @@ mod tests {
         (store, db, snapshot)
     }
 
+    pub(super) async fn native_snapshot(
+        store: &SqliteProtectedRuntimeStore,
+        id: &SessionId,
+    ) -> SessionSnapshot {
+        use agent_runtime::core::journal::*;
+        let journal = store.journals().ordinary();
+        let lease = journal
+            .open(
+                id,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("fixture-read"),
+                    pin: JournalPinId::new("fixture-read"),
+                    intent: JournalOpenIntent::ReadOnly,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = JournalReader::new(
+            &journal,
+            &lease,
+            JournalReadLimits {
+                objects: 100_000,
+                encoded_bytes: 64 * 1024 * 1024,
+                entries: 100_000,
+            },
+        )
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+        journal.close(lease).await.unwrap();
+        snapshot
+    }
+
     fn session_checkpoint(mut snapshot: SessionSnapshot) -> TurnCheckpoint {
         let active_history_start = snapshot.history.len();
         snapshot
@@ -2102,7 +1921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_preserves_base_lcm_policy_on_upgrade() {
+    async fn legacy_read_policy_revision() {
         use agent_runtime::{core::store::VersionedSessionState, registry::RegistryRevision};
         let (store, db, mut snapshot) = session_store().await;
         snapshot.extension_state.insert(
@@ -2114,7 +1933,10 @@ mod tests {
         );
         let checkpoint = session_checkpoint(snapshot.clone());
         let snapshot = checkpoint.snapshot.clone();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision = 'forge-lcm-policy-2', checkpoint_lcm_policy_revision = 'forge-lcm-policy-2'")
             .execute(db.pool()).await.unwrap();
         assert_eq!(
@@ -2130,11 +1952,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_digest_is_keyed_and_timestamp_independent() {
+    async fn legacy_baseline_digest_is_keyed_and_timestamp_independent() {
         let (store, db, mut snapshot) = session_store().await;
-        let digest = store.snapshot_digest(&snapshot).unwrap();
+        let digest = store.legacy_snapshot_digest(&snapshot).unwrap();
         let different_key = SqliteProtectedRuntimeStore::new(db.clone(), [8; 32], 1);
-        assert_ne!(digest, different_key.snapshot_digest(&snapshot).unwrap());
+        assert_ne!(
+            digest,
+            different_key.legacy_snapshot_digest(&snapshot).unwrap()
+        );
         // RFC 2104 HMAC, verified independently using its inner/outer pads.
         use sha2::{Digest, Sha256};
         let mut inner_pad = [0x36; 64];
@@ -2160,8 +1985,11 @@ mod tests {
         outer.update(inner.finalize());
         assert_eq!(digest, hex::encode(outer.finalize()));
         snapshot.updated = Timestamp(123);
-        assert_eq!(digest, store.snapshot_digest(&snapshot).unwrap());
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        assert_eq!(digest, store.legacy_snapshot_digest(&snapshot).unwrap());
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let stored: String =
             sqlx::query_scalar("SELECT snapshot_digest FROM protected_agent_session_state")
                 .fetch_one(db.pool())
@@ -2171,19 +1999,25 @@ mod tests {
         snapshot
             .history
             .push(agent_runtime::core::content::Message::user("changed"));
-        assert_ne!(digest, store.snapshot_digest(&snapshot).unwrap());
+        assert_ne!(digest, store.legacy_snapshot_digest(&snapshot).unwrap());
         let checkpoint = session_checkpoint(snapshot);
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let stored: String =
             sqlx::query_scalar("SELECT snapshot_digest FROM protected_agent_session_state")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(stored, store.snapshot_digest(&checkpoint.snapshot).unwrap());
+        assert_eq!(
+            stored,
+            store.legacy_snapshot_digest(&checkpoint.snapshot).unwrap()
+        );
     }
 
     #[tokio::test]
-    async fn session_state_manifest_window_does_not_change_checkpoint_digest() {
+    async fn legacy_baseline_manifest_window_does_not_change_checkpoint_digest() {
         use agent_runtime::{
             core::{
                 ids::TurnId,
@@ -2221,7 +2055,10 @@ mod tests {
             ),
         );
         // The ordinary snapshot retains diagnostics and the protected boundary.
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot.clone())
@@ -2232,15 +2069,18 @@ mod tests {
         // Model Runtime's checkpoint capture, which preserves execution state
         // and its boundary extension but leaves diagnostics in the live window.
         checkpoint.snapshot.manifests.clear();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let loaded = SessionStore::load(&store, &live.id).await.unwrap().unwrap();
         // SessionStore references the checkpoint's execution state, whose
         // serialized snapshot omits the live diagnostic window.
         assert!(loaded.manifests.is_empty());
         assert_eq!(loaded.extension_state, live.extension_state);
         assert_eq!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&loaded).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&loaded).unwrap()
         );
         let mut retained = live.clone();
         retained
@@ -2248,15 +2088,18 @@ mod tests {
             .push(TurnManifest::new(TurnId::new("latest-turn"), manifest));
         retained.manifests.remove(0);
         assert_eq!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&retained).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&retained).unwrap()
         );
         // Neither the restored state nor the live diagnostic window requires
         // a conflicting independent save over the checkpoint-backed row.
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        SessionStore::save(&store, &loaded).await.unwrap();
-        SessionStore::save(&store, &retained).await.unwrap();
+        store.save_legacy_snapshot_baseline(&loaded).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&retained)
+            .await
+            .unwrap();
         // The runtime-owned boundary remains protected even though manifests
         // are diagnostic: changing its frontier must change the digest.
         retained
@@ -2265,169 +2108,13 @@ mod tests {
             .unwrap()
             .value = serde_json::json!({"schema_version": 1, "planned_steps": 2});
         assert_ne!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&retained).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&retained).unwrap()
         );
     }
 
     #[tokio::test]
-    async fn session_state_concurrent_snapshot_save_is_superseded_without_failing() {
-        let (mut store, db, snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
-        // Synchronize after both reads/encryptions, before either CAS.
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let mut first = snapshot.clone();
-        first
-            .history
-            .push(agent_runtime::core::content::Message::user("first"));
-        let mut second = snapshot.clone();
-        second
-            .history
-            .push(agent_runtime::core::content::Message::user("second"));
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                SessionStore::save(&store, &first),
-                SessionStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        let saved = SessionStore::load(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(saved == first || saved == second);
-        let revision: i64 =
-            sqlx::query_scalar("SELECT state_revision FROM protected_agent_session_state")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(revision, 2); // Exactly one winner; the loser did not overwrite it.
-    }
-
-    #[tokio::test]
-    async fn session_state_concurrent_checkpoint_save_retries_without_failing() {
-        use agent_runtime::core::checkpoint::TurnState;
-        let (mut store, _, snapshot) = session_store().await;
-        let checkpoint = session_checkpoint(snapshot.clone());
-        let snapshot = checkpoint.snapshot.clone();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
-        let first = checkpoint
-            .transition(
-                TurnState::Planning { step: 0 },
-                snapshot.clone(),
-                1,
-                Timestamp(1),
-            )
-            .unwrap();
-        let second = first
-            .transition(
-                TurnState::Completing {
-                    finish: agent_runtime::core::event::TurnFinish::Completed,
-                    visible_output: false,
-                    provider_error_kind: None,
-                },
-                snapshot,
-                2,
-                Timestamp(2),
-            )
-            .unwrap();
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                CheckpointStore::save(&store, &first),
-                CheckpointStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        assert_eq!(
-            CheckpointStore::load_latest(&store, &second.session)
-                .await
-                .unwrap(),
-            Some(second)
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_concurrent_checkpoint_turn_is_not_overwritten_by_retry() {
-        let (mut store, db, snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
-        let first = session_checkpoint(snapshot);
-        let second = TurnCheckpoint::accepted(
-            agent_runtime::core::ids::TurnId::new("competing-turn"),
-            agent_runtime::core::content::UserInput::text("hello"),
-            first.snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                CheckpointStore::save(&store, &first),
-                CheckpointStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        let winner = CheckpointStore::load_latest(&store, &first.session)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(winner == first || winner == second);
-        let revision: i64 =
-            sqlx::query_scalar("SELECT state_revision FROM protected_agent_session_state")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(revision, 2);
-    }
-
-    #[tokio::test]
-    async fn session_state_checkpoint_retry_preserves_a_new_turn() {
-        let (store, _, snapshot) = session_store().await;
-        let candidate = session_checkpoint(snapshot);
-        let winner = TurnCheckpoint::accepted(
-            agent_runtime::core::ids::TurnId::new("winning-turn"),
-            agent_runtime::core::content::UserInput::text("hello"),
-            candidate.snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        CheckpointStore::save(&store, &winner).await.unwrap();
-        // Model a new turn landing after the retry's reload, before its CAS read.
-        let error = store
-            .save_checkpoint_once(&candidate, true)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Conflict);
-        assert_eq!(
-            CheckpointStore::load_latest(&store, &winner.session)
-                .await
-                .unwrap(),
-            Some(winner)
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_checkpoint_decode_failure_names_session() {
+    async fn legacy_read_checkpoint_decode_failure_names_session() {
         let (store, db, snapshot) = session_store().await;
         assert!(
             SessionStore::load(&store, &snapshot.id)
@@ -2436,7 +2123,10 @@ mod tests {
                 .is_none()
         );
         let checkpoint = session_checkpoint(snapshot.clone());
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let mut bad_format = SESSION_STATE_MAGIC.to_vec();
         bad_format.push(SESSION_STATE_FORMAT + 1);
         let (mut corrupt_ciphertext, nonce) = store.seal(b"{}").unwrap();
@@ -2466,7 +2156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_compressed_round_trip_and_legacy_read() {
+    async fn legacy_read_compressed_and_pre_envelope() {
         let (store, db, mut snapshot) = session_store().await;
         snapshot
             .history
@@ -2474,7 +2164,10 @@ mod tests {
                 "context ".repeat(100_000),
             ));
         let bytes = serde_json::to_vec(&snapshot).unwrap();
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let row = sqlx::query(
             "SELECT snapshot_ciphertext, snapshot_nonce FROM protected_agent_session_state",
         )
@@ -2504,18 +2197,28 @@ mod tests {
         );
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn session_state_unchanged_saves_do_not_write() {
+    async fn legacy_baseline_unchanged_saves_do_not_write() {
         let (store, db, mut snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
         for updated in 1..4 {
             snapshot.updated = Timestamp(updated);
-            SessionStore::save(&store.clone(), &snapshot).await.unwrap();
+            store
+                .clone()
+                .save_legacy_snapshot_baseline(&snapshot)
+                .await
+                .unwrap();
         }
         sqlx::query("DROP TRIGGER reject_state_write")
             .execute(db.pool())
@@ -2524,7 +2227,10 @@ mod tests {
         snapshot
             .history
             .push(agent_runtime::core::content::Message::user("changed"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot)
@@ -2541,7 +2247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_checkpoint_is_shared_idempotent_and_revision_checked() {
+    async fn legacy_baseline_checkpoint_is_shared_idempotent_and_revision_checked() {
         use agent_runtime::core::{
             checkpoint::TurnState,
             content::{Message, UserInput},
@@ -2549,7 +2255,10 @@ mod tests {
         };
         let (store, db, mut snapshot) = session_store().await;
         snapshot.history.push(Message::user("hello"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let checkpoint = TurnCheckpoint::accepted(
             TurnId::new("state-turn"),
             UserInput::text("hello"),
@@ -2573,7 +2282,10 @@ mod tests {
                 .unwrap(),
             Some(checkpoint.clone())
         );
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let row = sqlx::query("SELECT snapshot_ciphertext, snapshot_nonce, checkpoint_ciphertext FROM protected_agent_session_state")
             .fetch_one(db.pool()).await.unwrap();
         assert!(
@@ -2597,9 +2309,15 @@ mod tests {
         );
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         snapshot.updated = Timestamp(1);
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         sqlx::query("DROP TRIGGER reject_state_write")
             .execute(db.pool())
             .await
@@ -2612,11 +2330,17 @@ mod tests {
                 Timestamp(1),
             )
             .unwrap();
-        CheckpointStore::save(&store, &next).await.unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store.save_legacy_checkpoint_baseline(&next).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let mut conflicting = next.clone();
         conflicting.operation_fingerprint = checkpoint.operation_fingerprint;
-        CheckpointStore::save(&store, &conflicting).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&conflicting)
+            .await
+            .unwrap();
         assert_eq!(
             CheckpointStore::load_latest(&store, &next.session)
                 .await
@@ -2625,7 +2349,10 @@ mod tests {
         );
         // Independent extension/history progress must not replace the recovery checkpoint.
         snapshot.history.push(Message::user("later"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot)
@@ -2639,7 +2366,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_rejects_unknown_format_and_corruption() {
+    async fn legacy_read_unknown_format_and_corruption() {
         let (store, _) = test_store().await;
         let mut payload = SESSION_STATE_MAGIC.to_vec();
         payload.push(SESSION_STATE_FORMAT + 1);
@@ -2661,65 +2388,6 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ErrorKind::Serialization
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_standalone_save_preserves_checkpoint_policy_revision() {
-        use agent_runtime::{
-            core::{
-                content::{Message, UserInput},
-                ids::TurnId,
-                store::VersionedSessionState,
-            },
-            registry::RegistryRevision,
-        };
-        let (store, db, mut snapshot) = session_store().await;
-        snapshot.history.push(Message::user("hello"));
-        snapshot.extension_state.insert(
-            agent_runtime::harness::LCM_COMPONENT_ID.to_owned(),
-            VersionedSessionState::new(
-                RegistryRevision::new("old-lcm"),
-                serde_json::json!({"old": true}),
-            ),
-        );
-        let checkpoint = TurnCheckpoint::accepted(
-            TurnId::new("old-policy-turn"),
-            UserInput::text("hello"),
-            snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
-        sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision = 'old-policy', checkpoint_lcm_policy_revision = NULL")
-            .execute(db.pool()).await.unwrap();
-        let loaded = SessionStore::load(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.extension_state, snapshot.extension_state);
-        SessionStore::save(&store, &loaded).await.unwrap();
-        let checkpoint = CheckpointStore::load_latest(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            checkpoint.snapshot.extension_state,
-            snapshot.extension_state
-        );
-        let row = sqlx::query("SELECT lcm_policy_revision, checkpoint_lcm_policy_revision FROM protected_agent_session_state")
-            .fetch_one(db.pool()).await.unwrap();
-        assert_eq!(
-            row.get::<String, _>("lcm_policy_revision"),
-            crate::FORGE_LCM_POLICY_REVISION
-        );
-        assert_eq!(
-            row.get::<String, _>("checkpoint_lcm_policy_revision"),
-            "old-policy"
         );
     }
 
@@ -3832,10 +3500,7 @@ mod tests {
                 )
             })
         };
-        let saved = SessionStore::load(&store, &session_id)
-            .await
-            .expect("resumed snapshot reloads")
-            .expect("resumed snapshot exists");
+        let saved = native_snapshot(&store, &session_id).await;
         assert!(saved.history.iter().any(has_producer));
         assert_eq!(algorithm(&saved), new_algorithm.as_str());
         let last = u64::try_from(saved.history.len() - 1).expect("history index");

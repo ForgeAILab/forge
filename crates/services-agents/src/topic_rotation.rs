@@ -517,8 +517,9 @@ impl TopicRotationCoordinator {
         let successor_forge: String = row.successor_session_id()?;
         let hand_over: bool = self
             .db
-            .topic_rotation_successor_has_protected_state(&successor_forge)
-            .await?;
+            .session_persistence_flags(&successor_forge)
+            .await?
+            .saved;
         if !hand_over && responder_is_native(&self.db, chat_id).await? {
             let aborted = match self.db.get_agent_chat(chat_id).await? {
                 Some(chat) => match self.fork_request(chat_id, owner, &chat, &row, intent).await {

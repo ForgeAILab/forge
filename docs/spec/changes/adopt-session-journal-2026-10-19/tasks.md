@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T11:03:10Z
+updated_at: 2026-10-20T11:30:20Z
 completed_at:
 ---
 
@@ -280,7 +280,7 @@ No runtime bench crate becomes a production dependency.
 
 ## Cut-over and recovery
 
-- [ ] **13. Shared engine wiring and ordinary projection (≤3 h).**
+- [x] **13. Shared engine wiring and ordinary projection (≤3 h).**
   SessionJournals owns one engine per storage/domain, handing clones to every
   Runtime and maintenance/collection path so memo and lease registry stay shared;
   never construct engines per turn or worker. Configure the approved 128 MiB
@@ -299,27 +299,67 @@ No runtime bench crate becomes a production dependency.
   and the same command filtered separately to `writer_change_memo_and_restart`
   and `runtime_and_collector_share_engine_leases`.
 
-- [ ] **14. Scalar DB continuity and hand-over probes (≤2 h).**
+  Completed: the protected store owns SessionJournals with exactly one engine per
+  domain over a shared production storage. Capabilities return clones; maintenance
+  receives the same owner/clones. Both engines enable collection and use 128 MiB
+  estimated memo charge. The conservative policy removes sensitive optional
+  forge.diagnostics.* extensions and preserves all recovery data, including LCM,
+  cache and manifests. All three named tests pass: native delta/projection and
+  ephemeral behavior, per-writer memo reuse with zero/tiny budgets and cold
+  restart, and shared writer/reader lease visibility to collection. The owner is
+  outside session_journal/ to avoid the parallel storage-hardening work.
+
+- [x] **14. Scalar DB continuity and hand-over probes (≤2 h).**
   Replace legacy-only DB helpers/callers; published native head or eligible legacy
   state counts, reservation does not; retired native state cannot fall back.
   checkpoint_present keeps its meaning. No public response change.
   Focused tests: `cargo test -p db --features test-template --test main session_journal_probe::publication_and_checkpoint_flags`
   and `cargo test -p services --features test-support --test main attention_continuity::native_checkpoint_presence`.
 
-- [ ] **15. Per-turn/fork probes and bounded extension read (≤2 h).**
+  Completed: one scalar DB probe now supplies publication, retirement, saved and
+  checkpoint flags to Attention and topic hand-over. It uses indexed Forge owner
+  labels and the current runtime mapping, without reading encrypted bodies.
+  Reservations permit legacy reads; either native publication takes authority;
+  retirement in either domain suppresses all stale fallback. The two named tests
+  pass, including native checkpoint/no-checkpoint, partial retirement and legacy
+  payload eligibility. The affected services-agents compile check also passes.
+  No response type or public transport changed.
+
+- [x] **15. Per-turn/fork probes and bounded extension read (≤2 h).**
   Replace native.rs full-snapshot probes with scalar metadata and a separate
   JournalReader::extension(LCM_COMPONENT_ID) path. Prefer protected extension if
   ordinary omitted it. Cover absent, reservation, legacy, native and tombstone;
   existence reads no pack and the extension path touches no history/checkpoint.
   Focused test: runtime target from task 13 filtered to `native_probe_and_extension`.
 
-- [ ] **16. Delete replaced legacy writers; retain importer/baseline (≤2 h).**
+  Completed: per-turn and fork preparation uses scalar saved/retired flags after
+  scope authorization; ephemeral scopes bypass persistence discovery. LCM overhead
+  and timeline adoption read one extension, ordinary first with protected fallback,
+  retaining legacy decoding before native authority. The named test passes for
+  absent/reservation/legacy/native/tombstone, a genuine 1,000-message LCM session,
+  protected fallback, corrupt-pack-independent existence, and warm/cold reader
+  operations limited to Head/Batch/Map/Extension objects. Cold lease acquisition
+  still performs runtime-required root validation, separate from the bounded
+  extension operation; no host validation bypass was added.
+
+- [x] **16. Delete replaced legacy writers; retain importer/baseline (≤2 h).**
   Both production saves become typed refusals; remove old CAS/digest-skip/save
   hooks and write-only policy paths. Keep enveloped/pre-envelope reads and
   test-only exact legacy save-order/digest baseline helpers for D10. Do not clear
   payloads or drop the table this release.
   Focused tests: `cargo test -p forge-agent-host --lib protected_store::tests::legacy_read_`
   and runtime target filtered to `legacy_writes_refuse_and_baseline_keeps_two_blobs`.
+
+  Completed: both production save traits now return the specified typed read-only
+  conflict without touching the legacy table. Production CAS, digest skipping,
+  checkpoint retry/supersession, save barriers and write-only policy-marker paths
+  are removed. Four named legacy_read_ tests pass for envelopes/pre-envelope JSON,
+  policy-independent reads, corruption and session-named checkpoint failures. The
+  named runtime refusal/baseline test passes and verifies no writes, exact old
+  digest/save ordering and the real two-sealed-blob L2 baseline. Baseline helpers
+  and their HMAC dependency compile only under tests/test-support. Legacy rows
+  and schema are preserved. Architecture and Unreleased entries describe cut-over
+  and backup-based downgrade; later matrix/lifecycle/measurement gates remain open.
 
 - [ ] **17. Lazy import state matrix (≤3 h).**
   Idle, snapshot-only, CallingModel, ModelResponseReady, AwaitingApproval,

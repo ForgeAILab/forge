@@ -104,3 +104,6 @@ mod v076_data_preservation;
 mod v138_project_owned_task_repository;
 #[path = "suite/worker_dead_letter_resolution.rs"]
 mod worker_dead_letter_resolution;
+
+#[path = "suite/session_journal_probe.rs"]
+mod session_journal_probe;

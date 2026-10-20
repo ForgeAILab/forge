@@ -67,3 +67,6 @@ mod task_dependency_command;
 mod task_propose_command;
 #[path = "suite/workspace_backend_characterization.rs"]
 mod workspace_backend_characterization;
+
+#[path = "suite/attention_continuity.rs"]
+mod attention_continuity;

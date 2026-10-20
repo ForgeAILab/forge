@@ -92,6 +92,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- New native session state uses encrypted journal packs. Older Forge builds
+  cannot resume that state and refuse the newer database; downgrading requires
+  a backup taken before upgrading. Existing legacy rows remain readable and
+  are imported automatically when resumed.
+
 - Review parks with a `review_needs_owner` condition now use Attention category
   `review_needs_owner` instead of `execution_failed`. Clients matching category
   values must handle this owner-decision category.
@@ -167,7 +172,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Data-preserving session-journal foundation migration: six new tables for
   session records, pins, catalogs, owned packs, bitmap memberships and operation
   packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
-  unchanged; native runtime persistence continues using the current stores.
+  unchanged; new native session state uses the journal tables.
 
 - HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
   registration, login and refresh, with matching logout cleanup.
@@ -180,19 +185,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Pin agent-runtime and its testkit to v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`).
-  Forge continues using its existing encrypted snapshot/checkpoint stores;
-  native journal adoption and its collection-driven 64-revision replay window
-  remain for the subsequent session-journal tasks.
+- Sessions now persist through the native session journal, using agent-runtime
+  v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`) and encrypted delta packs.
+  Chat and Task continuity work as before; the disk layout of newly saved state
+  changes. Legacy rows are still read for automatic import and remain stored.
+  Protected recovery is exact; ordinary state omits optional sensitive host
+  diagnostics while preserving conversation and restore-critical state.
 - Native Agent Chat now uses the runtime's `agent-runtime-lcm-4` planning:
   condensation carries a full covered-entry size tier instead of merging on
   active-node count. Without token pressure, summaries can occupy more context;
   existing soft/hard pressure limits still apply and persisted LCM state remains
   resumable.
 
-- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D
-  (`1de6d7d`), retaining materialized session/checkpoint stores without
-  journal adoption.
 - A native turn failed by a provider rejection now reads
   `Provider: provider rejected the request…` instead of `Config: …` in Task
   execution errors and Agent Chat failure text, and may end with the
@@ -227,8 +231,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   only to the provider and model that produced it, so after a session changes
   model its earlier reasoning is left out of requests. Reasoning stored before
   this release keeps the previous replay rule. Schema-invalid tool calls and
-  Forge's `parameters` envelope normalizer behave as before. Native journals,
-  external agents and the flat semantic-summary alternative stay disabled.
+  Forge's `parameters` envelope normalizer behave as before. External agents
+  and the flat semantic-summary alternative stay disabled.
 - Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
   lowercase variants, provider probes and connection tests, public search,
   native provider requests, fetch, and network-capable child processes. Target

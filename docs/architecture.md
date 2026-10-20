@@ -2409,44 +2409,69 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
-Protected session/checkpoint payloads use a versioned zstd envelope inside
-authenticated encryption; earlier encrypted JSON rows remain readable and are
-converted on their next state change. Snapshot digests use domain-separated
-HMAC-SHA256 with the protected store key and exclude the save timestamp and
-diagnostic manifests, so unchanged saves do no encryption or database write. Checkpoints
-are idempotent by session, turn, revision, and operation fingerprint, and retain
-the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
-also serves as the session snapshot (NULL standalone snapshot columns reference
-it); only independent canonical state changes need a separate snapshot. Writes
-use the protected row's revision CAS. A competing snapshot save supersedes the
-losing save; a checkpoint save reloads and retries once if it can still advance
-the winning turn. Newer turns/revisions, conflicting fingerprints, and any
-remaining CAS conflict supersede the losing save. The store handles these races
-for every runtime caller without failing the turn. Snapshot/checkpoint LCM policy markers are tracked
-separately so a standalone save cannot relabel an older checkpoint. A checkpoint
-decode failure returns an error naming the runtime session; it cannot safely
-fall back to fresh state because that would discard provider/tool recovery
-barriers.
+Persistent native sessions use the runtime's JournalEngine over ForgeJournalStorage.
+`EmbeddedAgentService::new` constructs one `SqliteProtectedRuntimeStore` for the
+server or Solo runtime graph. That store constructs one shared storage and one
+`SessionJournals` owner (`agent-host/src/session_journals.rs`). The owner creates
+exactly one protected and one ordinary engine for the storage's process lifetime.
+`SessionStore::journal()` and `CheckpointStore::journal()` return clones of those
+engines; every per-turn RuntimeBuilder and runtime fork receives them through
+clones of the same store. Maintenance and collection receive `store.journals()`
+and its engine clones, sharing gates, lease registries and validated roots. A
+second independent engine over a live storage/domain is unsafe for collection
+and cross-session retirement/dependency checks, even with runtime warm-read
+fences. Engines are never constructed by a turn or collector. Retention-worker
+scheduling and terminal maintenance hooks remain task 21 of the adoption change.
 
-Runtime manifests are an ordered recent window (default 32 planned steps),
-not a lifetime session archive. New protected checkpoints omit this diagnostic
-window, while ordinary snapshots preserve any supplied manifests and the
-runtime-owned `runtime.manifest_boundary` extension. The boundary remains part
-of the snapshot digest. Loading the checkpoint-backed snapshot or saving the
-live diagnostic window therefore preserves the same canonical state identity.
-Forge links context provenance from the latest manifest in the live session
-after the turn; it does not reconstruct historical replay from a checkpoint.
+Both domains enable explicit engine collection and set 128 MiB of estimated
+validated-root memo charge independently (256 MiB combined), separate from the
+storage's 64 MiB cache and live writers. This is not an RSS bound: review observed
+up to 1.24 times the estimated charge, about 159 MiB per engine / 317 MiB combined.
+Clones reuse warm validation across writer changes; restart, eviction and
+oversize entries require cold validation. Zero and tiny budgets preserve results.
+Protected state is exact. The ordinary ForgeJournalProjection removes sensitive
+extensions only in the reserved optional `forge.diagnostics.*` namespace family.
+That family must never carry recovery data. Other extensions, LCM, conversation,
+identity/order/cardinality, counters, timestamps, runtime cache and manifests
+remain exact, including ordinary-only sessions before their first checkpoint.
+Cache/manifests may contain content; broader free-text redaction has no approved
+recovery-equivalence evidence. Both domains remain encrypted. Credentials stay in
+their existing protected tables and leases, outside journal state.
 
-The runtime pin is v0.7.0 plus U9 groups C/D (`1de6d7d`). Its materialized session snapshots stay
-unversioned and its checkpoints remain schema 3 / transition revision 4, so
-Forge keeps the same encrypted store and database schema. Runtime schema-4
-SessionJournal support is only a capability contract in this release; Forge's
-stores do not advertise it, and continue writing materialized snapshots and
-checkpoints. The opt-in flat semantic summary and external-agent features are
-also not configured. Forge retains its per-tool argument normalizers: the
-runtime turns a representable schema-invalid call into a correctable tool error
-(as the previous pin already did), but does not apply Forge's historical
-`parameters`-envelope transformation.
+The pin is agent-runtime v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`).
+Native-first open uses the runtime importer for eligible legacy snapshot-only or
+checkpoint-bearing state, publishing protected exact first when a checkpoint
+exists. It reads Forge's authenticated zstd envelope or pre-envelope encrypted
+JSON without rewriting the legacy row. Already native heads skip legacy loads;
+tombstones suppress fallback. Both production legacy saves return the typed
+conflict `legacy session store is read-only`; their old CAS, digest-skip, retry,
+supersession and policy-marker write paths are gone. The exact legacy
+save-order/digest/encryption baseline exists only under tests/test-support for
+D10 measurements. No legacy payload is cleared and the legacy table remains for
+next-release cleanup. Detailed import/crash/credential matrix acceptance is still
+tracked by tasks 17–20; this cut-over does not claim those later gates passed.
+Older builds cannot resume journal-only state and refuse the newer database;
+downgrade requires a pre-upgrade backup.
+
+Host saved-state, topic hand-over and Attention continuity probes use indexed
+scalar native publication/retirement/checkpoint flags plus eligible legacy payload
+presence, never packs. Writer reservations do not count as saved state. Either
+native publication takes authority from legacy data; retirement in either domain
+suppresses stale fallback. `checkpoint_present` keeps its meaning: an unretired
+published protected checkpoint or an unimported legacy checkpoint. Per-turn/fork
+preparation probes after scope authorization; ephemeral inquiries and reviewers
+attach no stores and bypass persistence discovery. LCM overhead and timeline
+adoption use `JournalReader::extension(LCM_COMPONENT_ID)` with ordinary first and
+protected fallback if that value was omitted. The bounded reader operation reads
+only head, batch, map path and the selected opaque value. Cold lease acquisition
+still validates the complete root before that operation, as required by the
+runtime; it is separate from scalar existence and is reused by later writer opens.
+
+Runtime manifests are an ordered recent window (default 32 planned steps), not
+a lifetime archive. Protected checkpoints omit the live diagnostic window while
+ordinary structured deltas preserve manifests and runtime-owned cache/boundary
+extensions exactly. Forge links context provenance from the latest live manifest
+after the turn rather than reconstructing replay from a checkpoint.
 
 v0.5.0 records the provider and model that produced each reasoning part
 (`producer`) in canonical history, so it reaches the encrypted snapshot and
@@ -2466,13 +2491,11 @@ rebuilding derived accounting. `FORGE_LCM_POLICY_REVISION` stays
 Forge/runtime pin and proves encrypted snapshot/checkpoint resume, compaction,
 another turn and a second resume with historical sources and nodes intact.
 
-Both Forge stores keep the default unsupported `journal()` capability. The
-runtime's native import, writer fencing, retirement and collection paths are
-not enabled; materialized snapshots remain unversioned and checkpoints remain
-schema 3 / transition revision 4. The turn backend waits for
-`TurnHandle::completed()` before persisting and releasing its active registry;
-completion now also guarantees that runtime admission and execution gates have
-been released.
+Materialized legacy snapshots remain unversioned and legacy checkpoints remain
+schema 3 / transition revision 4; native journal objects use the runtime's released
+journal schema. The turn backend waits for `TurnHandle::completed()` before
+persisting and releasing its active registry; completion guarantees runtime
+admission and execution gates have been released.
 
 Forge's custom provider transport caps HTTP error bodies at 8 KiB, extracts only
 JSON/SSE error status/code and message fields, and drops a reason that reflects
@@ -8174,7 +8197,7 @@ app-generated UUID v4; all timestamps are app-generated RFC3339. Journal metadat
 uses composite runtime-session keys, and journal packs use monotonic SQLite ids.
 
 `V202610200941__session_journal.sql` adds six tables as the storage foundation for
-native session journals; runtime persistence still uses the legacy stores:
+native session journals, now used by persistent native runtimes:
 
 | Table (`agent_session_journal_` prefix) | Stored unit and lifetime |
 | --- | --- |
@@ -8204,8 +8227,8 @@ every legacy `protected_agent_session_state` value unchanged. Older builds
 refuse an unknown applied migration; downgrade requires a pre-upgrade backup.
 
 `crates/agent-host/src/session_journal/` implements the encrypted sqlx storage
-boundary independently of the runtime engine. It is not connected to native
-runtime persistence yet. `codec.rs` encodes JRPACK v1: a separately sealed
+boundary independently of the runtime engine. The long-lived host owner
+connects it to both native persistence capabilities. `codec.rs` encodes JRPACK v1: a separately sealed
 `JRPACK\0`/version/count index with sorted four-byte prefixes and bounded varint
 offsets/lengths, and a zstd level-3 body unit ordered by kind and full id. Each
 pack holds at most 1 MiB of canonical bodies. Reads verify canonical envelopes,
@@ -8285,7 +8308,7 @@ without advancing the session generation or purging deferred bytes. It then call
 SQL auto-vacuum. There is no full VACUUM. Failed physical work can be retried
 without undoing acknowledged state. The S2 switch and compact diagnostics exist
 only under test-support. No JournalStorage method remains typed Unsupported;
-native runtime wiring remains a later task.
+native runtimes now use the shared engine owner described above.
 
 Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings
@@ -8307,7 +8330,8 @@ non-member. Valid independent-copy releases preserve other holders and reclaim
 only their own bytes. The focused `session_journal_storage` target retains the
 codec/storage/maintenance regressions. Legacy decoder tests use the real
 envelope, checkpoint decoder and runtime schema/transition validation. This
-conformance gate does not connect journal storage to native runtime persistence.
+conformance gate is complemented by the focused session_journal_runtime tests
+for engine ownership, projection, probes and legacy write refusals.
 
 Migrations are files named `V{version}__{name}.sql`, embedded in the binary
 and recorded by version and name in the `_migration` table. Versions up to

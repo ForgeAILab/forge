@@ -569,6 +569,7 @@ type SealedTopicSeed = (Option<Vec<u8>>, Option<Vec<u8>>);
 struct PreparedNativeRuntime {
     runtime: agent_runtime::runtime::Runtime,
     context_mode: TurnContextMode,
+    saved: bool,
     lcm_link: Option<(String, String)>,
     tool_result_summaries: Arc<Mutex<HashMap<String, ToolResultSummary>>>,
     needs_adoption: bool,
@@ -615,17 +616,6 @@ impl agent_runtime::harness::LcmTimelineResolver for TopicTimelineResolver {
         }
         Ok(binding.clone())
     }
-}
-
-/// Whether a persisted session's LCM state carries the fixed request
-/// overhead the runtime measured from a successful plan.
-fn lcm_overhead_measured(snapshot: &agent_runtime::core::store::SessionSnapshot) -> bool {
-    snapshot
-        .extension_state
-        .get(agent_runtime::harness::LCM_COMPONENT_ID)
-        .and_then(|state| state.value.get("fixed_overhead_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|tokens| tokens > 0)
 }
 
 /// The fixed, non-conversation part of a chat request (system prompt, state
@@ -675,13 +665,13 @@ fn cold_start_working_set(policy: WorkingSetPolicy, estimated_overhead: u32) -> 
 }
 
 impl NativeAgentRuntimeBackend {
-    /// `overhead_measured` is false when the session's persisted LCM state
+    /// The overhead probe checks whether the session's persisted LCM state
     /// has no measured request overhead yet (see [`cold_start_working_set`]).
     async fn prepare_runtime(
         &self,
         request: &AgentTurnRequest,
         successor: Option<&str>,
-        overhead_measured: bool,
+        probe_overhead: bool,
     ) -> Result<PreparedNativeRuntime, AgentHostError> {
         request.scope.validate()?;
         let binding = self
@@ -702,6 +692,26 @@ impl NativeAgentRuntimeBackend {
                 "native turn workspace does not match the server-issued Task workspace".to_owned(),
             ));
         }
+        let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
+        let id = SessionId::new(&request.runtime_session_id);
+        let flags = if context_mode.persistent_session {
+            self.protected_store
+                .persistence_flags(&id)
+                .await
+                .map_err(host_runtime_error)?
+        } else {
+            db::SessionPersistenceFlags::default()
+        };
+        let saved = flags.saved;
+        // Fork/abort plan no provider request and never need the cold-start set.
+        let overhead_measured = if probe_overhead && context_mode.lcm && saved {
+            self.protected_store
+                .lcm_overhead_measured(&id, flags)
+                .await
+                .map_err(host_runtime_error)?
+        } else {
+            !probe_overhead
+        };
         if successor.is_none() && request.scope.scope_type == CanonicalScopeType::AgentChat {
             let db = self.protected_store.database();
             sqlx::query("INSERT INTO agent_chat_topic (id, chat_id, sequence, label, summary, starting_message_id, starting_message_sequence, principal_type, principal_id, created_at, runtime_session_id) SELECT ?, ?, 0, 'Original conversation', NULL, NULL, 0, 'system', NULL, ?, ? WHERE NOT EXISTS (SELECT 1 FROM agent_chat_topic WHERE chat_id = ?)")
@@ -803,7 +813,7 @@ impl NativeAgentRuntimeBackend {
         ));
         let provider = self.provider(request)?;
         let model_id = ModelId::new(&request.provider.model);
-        let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
+
         let mut lcm_link = None;
         let mut needs_adoption = false;
         let lcm = if context_mode.lcm {
@@ -948,6 +958,7 @@ impl NativeAgentRuntimeBackend {
         Ok(PreparedNativeRuntime {
             runtime,
             context_mode,
+            saved,
             lcm_link,
             tool_result_summaries,
             needs_adoption,
@@ -1148,37 +1159,17 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         if request.cancellation.is_cancelled() {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
         }
-        use agent_runtime::core::store::SessionStore;
-        use agent_runtime::prelude::CheckpointStore;
         let id = SessionId::new(&request.runtime_session_id);
-        let snapshot = match self
-            .protected_store
-            .load(&id)
-            .await
-            .map_err(host_runtime_error)?
-        {
-            Some(snapshot) => Some(snapshot),
-            None => self
-                .protected_store
-                .load_latest(&id)
-                .await
-                .map_err(host_runtime_error)?
-                .map(|checkpoint| checkpoint.snapshot),
-        };
-        let saved = snapshot.is_some();
-        let overhead_measured = snapshot.as_ref().is_some_and(lcm_overhead_measured);
-        drop(snapshot);
         let PreparedNativeRuntime {
             runtime,
             context_mode,
+            saved,
             lcm_link,
             tool_result_summaries,
             needs_adoption,
             summary_cap: _,
             topic_reads,
-        } = self
-            .prepare_runtime(&request, None, overhead_measured)
-            .await?;
+        } = self.prepare_runtime(&request, None, true).await?;
         let mut topic_reads_guard = TopicReadTurnGuard {
             failed: Arc::clone(&self.failed_topic_reads),
             runtime_session_id: request.runtime_session_id.clone(),
@@ -1561,9 +1552,7 @@ impl NativeAgentRuntimeBackend {
     ) -> Result<(), AgentHostError> {
         executors::server_commands::ensure_agents_allowed()
             .map_err(|error| AgentHostError::Authority(error.to_string()))?;
-        use agent_runtime::{
-            core::store::SessionStore, lcm::LcmSummaryModel, prelude::CheckpointStore,
-        };
+        use agent_runtime::lcm::LcmSummaryModel;
         let db = self.protected_store.database();
         if self
             .active
@@ -1576,7 +1565,7 @@ impl NativeAgentRuntimeBackend {
         // A fork plans no provider request, so the cold-start working set
         // never applies to it.
         let prepared = self
-            .prepare_runtime(&request, Some(successor), true)
+            .prepare_runtime(&request, Some(successor), false)
             .await?;
         let saved_seed: Option<SealedTopicSeed> = sqlx::query_as(
             "SELECT summary_ciphertext, summary_nonce FROM agent_chat_topic_rotation WHERE id = ?",
@@ -1594,18 +1583,7 @@ impl NativeAgentRuntimeBackend {
             .map_err(|_| AgentHostError::ProtectedPersistence)?
         } else {
             let id = SessionId::new(&request.runtime_session_id);
-            let saved = self
-                .protected_store
-                .load(&id)
-                .await
-                .map_err(host_runtime_error)?
-                .is_some()
-                || self
-                    .protected_store
-                    .load_latest(&id)
-                    .await
-                    .map_err(host_runtime_error)?
-                    .is_some();
+            let saved = prepared.saved;
             let start = if saved {
                 let start = StartSession::resume(id);
                 if prepared.needs_adoption {
@@ -1740,7 +1718,7 @@ impl NativeAgentRuntimeBackend {
     /// source session, so the source keeps taking turns. A no-op when no
     /// fork is pending; refused by the runtime once the successor was saved.
     pub async fn abort_topic_fork(&self, request: AgentTurnRequest) -> Result<(), AgentHostError> {
-        let prepared = self.prepare_runtime(&request, None, true).await?;
+        let prepared = self.prepare_runtime(&request, None, false).await?;
         prepared
             .runtime
             .abort_fork(&SessionId::new(&request.runtime_session_id))

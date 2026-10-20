@@ -971,23 +971,6 @@ impl SqliteDb {
 }
 
 impl SqliteDb {
-    pub async fn topic_rotation_successor_has_protected_state(
-        &self,
-        session_id: &str,
-    ) -> crate::Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM protected_agent_session_state
-                           WHERE session_id = ?
-                             AND (snapshot_ciphertext IS NOT NULL
-                                  OR checkpoint_ciphertext IS NOT NULL))",
-        )
-        .bind(session_id)
-        .fetch_one(self.pool())
-        .await?)
-    }
-}
-
-impl SqliteDb {
     pub async fn chat_topic_summary_session_scope(
         &self,
         runtime_session_id: &str,

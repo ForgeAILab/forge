@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:47:51Z
+updated_at: 2026-10-20T11:30:20Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -83,9 +83,11 @@ root's durable pin; a stale view retries through membership-scoped storage.
 rt-e6-review F2. Released runtime D5 records the resolved decision and requires
 a head-bound memo certificate for a historical pin. Task 1 verifies this in the
 published `v0.8.0` tag; it is release-source evidence, not a Forge storage test result.
-With that check, cloning remains a performance/coordination requirement for
-memo hits and shared lease state; warm-read correctness is not made conditional
-on a host having only one engine. The release gate verifies the check too.
+That check does not make independent engines safe: collection sees only its
+engine's leases, and cross-session dependency/retirement checks are not protected
+by a same-session fence. Exactly one engine and its clones per storage/domain
+is required for correctness as well as memo reuse, matching the pinned runtime's
+development guide. The release gate verifies the warm-read check too.
 
 | Forge use | Adoption |
 | --- | --- |
@@ -249,7 +251,11 @@ cover that case. The 2026-10-20 owner decision settles this conservative policy:
 omit sensitive optional diagnostics, preserve all restore-critical data and
 runtime-mandated exact fields, and make no promise that runtime cache/manifests
 contain no content. Broader free-text redaction needs explicit data examples and
-resume-equivalence evidence. Protected exactness is unchanged.
+resume-equivalence evidence. Protected exactness is unchanged. The implementation reserves
+`forge.diagnostics.*` for optional host diagnostics and omits Sensitive values
+there; no restore-critical state may use that namespace family. Unknown
+namespaces, LCM, conversation and runtime cache/manifests remain exact because
+there is no evidence that they can safely be discarded.
 
 Both domains use the same derived encryption-key material but separate packs,
 session records, memberships, pins, catalogs and operation packs. A pack belongs
@@ -523,8 +529,10 @@ was needed.
 
 ### D5. Forge adapter and engine-call mapping
 
-Production module: `crates/agent-host/src/session_journal/` with storage, codec,
-sealing/cache and the `SessionJournals` owner. No Forge `SessionJournal` engine
+Production storage module: `crates/agent-host/src/session_journal/`, with codec,
+sealing and cache. The host `SessionJournals` owner lives alongside it in
+`crates/agent-host/src/session_journals.rs`, keeping runtime wiring separate from
+storage hardening. No Forge `SessionJournal` engine
 implementation or private runtime-metadata decoder is needed.
 
 | Forge action | Engine/runtime call and storage effect |
@@ -602,8 +610,12 @@ without decrypting a pack, selecting rows by the indexed `forge_session_id`. A r
 retired conflict, not fresh state. Consult legacy payloads only when native state
 has not taken authority; a surviving stale legacy blob must never resurrect a
 retired or advanced session. Hand-over and continuity DB helpers retain their
-public meaning. Extension decoding is a separate bounded read, never part of the
-existence probe.
+public meaning. Extension decoding is a separate bounded reader operation, never part of the
+existence probe. Acquiring an engine-issued lease on a cold or evicted root
+first performs the runtime's full-root validation (including history/checkpoint
+closure); a warm owner reuses that validation. The extension operation itself
+reads only head, batch, map path and the selected opaque value. No host adapter
+bypasses that validation to promise a history-free cold open.
 
 ### D6. Conformance and failure evidence
 

@@ -7,10 +7,14 @@ license.workspace = true
 
 [features]
 # Explicit integration-test support; never enabled through a self dependency.
-test-support = ["dep:tempfile", "db/test-template"]
+test-support = ["dep:tempfile", "dep:ring", "db/test-template"]
 
 [[test]]
 name = "session_journal_conformance"
+required-features = ["test-support"]
+
+[[test]]
+name = "session_journal_runtime"
 required-features = ["test-support"]
 
 [[test]]
@@ -48,7 +52,7 @@ sha2-journal = { package = "sha2", version = "0.10.9" }
 hkdf = "0.12.4"
 hmac = "0.12.1"
 hex = "0.4"
-ring = "0.17"
+ring = { version = "0.17", optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
 tempfile = { version = "3", optional = true }
@@ -65,6 +69,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+ring = "0.17"
 agent-runtime-testkit.workspace = true
 process-supervisor = { path = "../process-supervisor" }
 db = { path = "../db", features = ["test-template"] }
