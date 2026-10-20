@@ -185,8 +185,9 @@ impl ForgeJournalStorage {
         if views.iter().any(|v| v.index.key.owner != owner) {
             return Err(RuntimeError::internal("journal pack owner mapping changed"));
         }
+        // Admissions (including re-admitted deferred slots) follow the cut
+        // order; genuinely new bodies collect here for one final S1 pack.
         let mut pending = Vec::new();
-        let mut staged = Vec::new();
         for (step, cut) in [
             JournalCommitFailurePoint::AfterObjects,
             JournalCommitFailurePoint::AfterCheckpoint,
@@ -207,16 +208,7 @@ impl ForgeJournalStorage {
                 })
                 .cloned()
                 .collect();
-            self.stage(
-                conn,
-                scope,
-                &owner,
-                &mut views,
-                &group,
-                &mut pending,
-                &mut staged,
-            )
-            .await?;
+            pending.extend(self.admit(conn, scope, &owner, &mut views, &group).await?);
             fail(write, cut)?;
         }
         self.pin_changes(conn, scope, &owner, &write.pins).await?;
@@ -230,16 +222,16 @@ impl ForgeJournalStorage {
             .filter(|o| o.kind == JournalObjectKind::Head)
             .cloned()
             .collect();
-        self.stage(
-            conn,
-            scope,
-            &owner,
-            &mut views,
-            &heads,
-            &mut pending,
-            &mut staged,
-        )
-        .await?;
+        pending.extend(self.admit(conn, scope, &owner, &mut views, &heads).await?);
+        // Every pre-commit cut rolls back the whole transaction, so packing
+        // per cut would only rewrite unobservable intermediate rows. Encode,
+        // seal and insert the new bodies once (capped segments when large).
+        if !pending.is_empty() {
+            pending.sort_by(|a, b| a.id.cmp(&b.id));
+            for pack in self.work(move || codec::split(pending)).await? {
+                self.insert_pack(conn, scope, &owner, pack).await?;
+            }
+        }
         self.replace_record(conn, scope, &owner, &write.record, write.expect)
             .await?;
         fail(write, JournalCommitFailurePoint::AfterHead)?;
@@ -268,44 +260,19 @@ impl ForgeJournalStorage {
                     && write.record.retirement.is_some(),
             )
             .await?;
-        if matches!(write.kind, JournalWriteKind::Collect) {
+        let collect = matches!(write.kind, JournalWriteKind::Collect);
+        if collect {
             self.collection_repack(conn, scope, &purged).await?;
+        }
+        // Released bits live only in SQL. Without a purge (every removed pack
+        // counts at least one reclaimed copy) or a repack, the indexes are
+        // exactly the ones already read in this transaction.
+        if !collect && receipt.reclaimed_objects == 0 {
+            return Ok((directory(&final_views), receipt));
         }
         let final_views = self
             .directory_from(conn, scope, false, Some(directory(&final_views)))
             .await?;
         Ok((directory(&final_views), receipt))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn stage(
-        &self,
-        conn: &mut SqliteConnection,
-        scope: &Scope,
-        owner: &str,
-        views: &mut [PackView],
-        group: &[JournalStoredObject],
-        pending: &mut Vec<JournalStoredObject>,
-        staged: &mut Vec<i64>,
-    ) -> Result<(), RuntimeError> {
-        let new = self.admit(conn, scope, owner, views, group).await?;
-        if new.is_empty() {
-            return Ok(());
-        }
-        pending.extend(new);
-        pending.sort_by(|a, b| a.id.cmp(&b.id));
-        // Intermediate packs make each cut concrete inside this transaction.
-        // Replace only this apply's staging rows, then publish one final S1
-        // pack (or capped segments), independent of object-kind boundaries.
-        for id in staged.drain(..) {
-            sqlx::query("DELETE FROM agent_session_journal_pack WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
-                .bind(id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await.map_err(database_error)?;
-        }
-        let objects = pending.clone();
-        let packs = self.work(move || codec::split(objects)).await?;
-        for pack in packs {
-            staged.push(self.insert_pack(conn, scope, owner, pack).await?);
-        }
-        Ok(())
     }
 }

@@ -5,7 +5,7 @@ use agent_runtime::core::{
     journal::*,
 };
 use forge_agent_host::{
-    session_journal::ForgeJournalStorage,
+    session_journal::{ForgeJournalStorage, TestSealedUnit},
     test_support::{FileDb, MappingStorage},
 };
 use sqlx::Row;
@@ -795,7 +795,7 @@ async fn apply_atomic_cuts() {
     assert!(
         inner
             .apply(traced)
-            .with_subscriber(events.clone())
+            .with_subscriber(events.dispatch())
             .await
             .is_err()
     );
@@ -1036,6 +1036,44 @@ async fn independent_connection_expect_fences() {
 type ApplyEvent = std::collections::BTreeMap<String, String>;
 #[derive(Clone, Default)]
 struct ApplyEvents(Arc<std::sync::Mutex<Vec<ApplyEvent>>>);
+impl ApplyEvents {
+    /// With exactly one scoped dispatcher registered, tracing-core resolves a
+    /// callsite's first registration through the registering thread's default
+    /// ("just one" mode). A parallel test reaching the apply event first then
+    /// caches `Interest::never` and this capture silently sees no event. A
+    /// second, permanently registered dispatcher that enables nothing forces
+    /// `Interest::sometimes`, so every event is checked against the current
+    /// thread's dispatcher. It is registered before the capture so the level
+    /// filter only opens once both are present.
+    fn dispatch(&self) -> tracing::Dispatch {
+        static SILENT: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SILENT.get_or_init(|| tracing::Dispatch::new(Silent));
+        tracing::Dispatch::new(self.clone())
+    }
+}
+struct Silent;
+impl tracing::Subscriber for Silent {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::never()
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
 impl tracing::Subscriber for ApplyEvents {
     fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
         m.target() == "forge_session_journal"
@@ -2278,5 +2316,794 @@ async fn import_and_operation_pack_caps() {
     assert_eq!(
         fresh.operation_pack_layout(&d, &s).await.unwrap(),
         raw.operation_pack_layout(&d, &s).await.unwrap()
+    );
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+/// One random structural edit: bit flip, byte overwrite, truncation, append,
+/// swap, duplicated slice or (for the pack index) a rewritten header count.
+fn mutate_bytes(seed: u64, bytes: &mut Vec<u8>) {
+    let mut s = seed | 1;
+    let pick = |s: &mut u64, n: usize| (xorshift(s) as usize) % n.max(1);
+    match pick(&mut s, 7) {
+        0 => {
+            let i = pick(&mut s, bytes.len());
+            bytes[i] ^= 1 << pick(&mut s, 8);
+        }
+        1 => {
+            let i = pick(&mut s, bytes.len());
+            bytes[i] = xorshift(&mut s) as u8;
+        }
+        2 => bytes.truncate(pick(&mut s, bytes.len())),
+        3 => {
+            for _ in 0..=pick(&mut s, 8) {
+                bytes.push(xorshift(&mut s) as u8);
+            }
+        }
+        4 => {
+            let (i, j) = (pick(&mut s, bytes.len()), pick(&mut s, bytes.len()));
+            bytes.swap(i, j);
+        }
+        5 => {
+            let i = pick(&mut s, bytes.len());
+            let end = (i + 1 + pick(&mut s, 16)).min(bytes.len());
+            let slice = bytes[i..end].to_vec();
+            let at = pick(&mut s, bytes.len());
+            bytes.splice(at..at, slice);
+        }
+        _ => {
+            if bytes.len() >= 12 {
+                bytes[8..12].copy_from_slice(&(xorshift(&mut s) as u32 % 8).to_le_bytes());
+            }
+        }
+    }
+}
+
+/// AEAD passes after resealing with the real key and binding, so the bounded
+/// decoders alone must refuse the edit: no panic, no wrong bytes, and every
+/// full-scope read (members, retained bytes, any decoded body) fails closed.
+#[tokio::test]
+async fn resealed_unit_corruption_fails_closed() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("fuzz");
+    // A prefix-colliding pair plus mixed kinds, then a second pack.
+    let mut first = vec![object(42269u64), object(139372u64), object("alpha")];
+    let state = JournalObject::encode(
+        JournalObjectKind::StateValue,
+        &serde_json::json!({"k":[1,2,3]}),
+    )
+    .unwrap();
+    first.push(JournalStoredObject {
+        id: state.id,
+        kind: JournalObjectKind::StateValue,
+        bytes: state.bytes.into(),
+    });
+    let second = equal_objects("second", 5);
+    f.seed_journal(&raw, write(&d, s.as_str(), first.clone()))
+        .await
+        .unwrap();
+    let mut more = write(&d, s.as_str(), second.clone());
+    more.operation = None;
+    f.seed_journal(&raw, more).await.unwrap();
+    let mut ids: Vec<_> = first.iter().chain(&second).map(|o| o.id.clone()).collect();
+    ids.sort();
+    let fresh = || ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+    let expected_objects = fresh().objects(&d, &s, &ids).await.unwrap();
+    assert!(expected_objects.iter().all(Option::is_some));
+    let expected_members = fresh().members(&d, &s).await.unwrap();
+    let expected_retained = fresh().retained_bytes(&d).await.unwrap();
+    let op = JournalOperationId::new("operation");
+    assert!(fresh().operation(&d, &s, &op).await.unwrap().is_some());
+    let packs: Vec<i64> = pack_rows(&f, &d, &s).await.iter().map(|p| p.0).collect();
+    assert_eq!(packs.len(), 2);
+    let original = image(&f).await;
+    let pool = f.database().pool().clone();
+    let saved_packs = pack_rows(&f, &d, &s).await;
+    let saved_ops: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query("SELECT tier,nonce,payload FROM agent_session_journal_operation_pack WHERE runtime_session_id='fuzz'")
+        .fetch_all(&pool).await.unwrap().into_iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
+    let (mut detected, mut identical, mut false_absent) = (0, 0, 0);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for round in 0..240u64 {
+        let pack = packs[(round % 2) as usize];
+        let unit = match round % 4 {
+            0 => TestSealedUnit::PackIndex(pack),
+            1 => TestSealedUnit::PackBody(pack),
+            2 => TestSealedUnit::PackBodyCanonical(pack),
+            _ => TestSealedUnit::Operations(0),
+        };
+        let mutation = xorshift(&mut seed);
+        let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = changed.clone();
+        raw.reseal_unit_for_test(&d, &s, unit, move |bytes| {
+            let before = bytes.clone();
+            mutate_bytes(mutation, bytes);
+            flag.store(*bytes != before, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        let changed = changed.load(std::sync::atomic::Ordering::SeqCst);
+        // A fresh storage has no warm directory or body to hide the edit.
+        let objects = fresh().objects(&d, &s, &ids).await;
+        let members = fresh().members(&d, &s).await;
+        let retained = fresh().retained_bytes(&d).await;
+        let operation = fresh().operation(&d, &s, &op).await;
+        if let TestSealedUnit::Operations(_) = unit {
+            // Operation records are opaque authenticated data; the decoder
+            // bounds the frame and the tier shape and must never panic.
+            assert_eq!(objects.unwrap(), expected_objects);
+            if !changed {
+                assert!(operation.unwrap().is_some());
+            }
+        } else {
+            assert!(operation.unwrap().is_some());
+            if let Ok(found) = &objects {
+                for (got, want) in found.iter().zip(&expected_objects) {
+                    // Never different bytes; an index-only edit may hide a
+                    // candidate (absent) until its body is decoded.
+                    assert!(
+                        got.is_none() || got == want,
+                        "round {round}: wrong body served"
+                    );
+                    if got.is_none() {
+                        false_absent += 1;
+                    }
+                }
+            }
+            if changed && matches!(unit, TestSealedUnit::PackBody(_)) {
+                // A compressed frame edit may still inflate to the same bytes.
+                assert!(members.is_err() || members.unwrap() == expected_members);
+                detected += 1;
+            } else if changed {
+                assert!(
+                    members.is_err(),
+                    "round {round}: {unit:?} members accepted a changed unit"
+                );
+                if let TestSealedUnit::PackIndex(_) = unit {
+                    assert!(retained.is_err() || retained.unwrap() == expected_retained);
+                }
+                if matches!(unit, TestSealedUnit::PackBodyCanonical(_)) {
+                    assert!(
+                        objects.is_err(),
+                        "round {round}: changed canonical body served"
+                    );
+                }
+                detected += 1;
+            } else {
+                assert_eq!(members.unwrap(), expected_members);
+                assert_eq!(objects.unwrap(), expected_objects);
+                identical += 1;
+            }
+        }
+        // Restore the exact authenticated rows for the next round.
+        for p in &saved_packs {
+            sqlx::query("UPDATE agent_session_journal_pack SET index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
+                .bind(&p.4).bind(&p.5).bind(&p.6).bind(&p.7).bind(p.0).execute(&pool).await.unwrap();
+        }
+        for (tier, nonce, payload) in &saved_ops {
+            sqlx::query("UPDATE agent_session_journal_operation_pack SET nonce=?,payload=? WHERE runtime_session_id='fuzz' AND tier=?")
+                .bind(nonce).bind(payload).bind(tier).execute(&pool).await.unwrap();
+        }
+        assert_eq!(image(&f).await, original);
+    }
+    assert!(detected > 100, "{detected} detected, {identical} identical");
+    eprintln!(
+        "resealed corruption: {detected} detected, {identical} identity edits, {false_absent} index-hidden lookups"
+    );
+}
+
+/// Every sealed unit binds its complete owning domain/runtime-session/Forge
+/// key, not only its row id: rows relabelled into another scope, with
+/// matching membership and scalar columns, fail closed instead of serving the
+/// original scope's plaintext.
+#[tokio::test]
+async fn relabelled_rows_fail_closed() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let victim = object("victim secret");
+    let (a, b) = (SessionId::new("relabel-a"), SessionId::new("relabel-b"));
+    f.seed_journal(&raw, write(&d, a.as_str(), vec![victim.clone()]))
+        .await
+        .unwrap();
+    f.seed_journal(&raw, write(&d, b.as_str(), vec![object("b own")]))
+        .await
+        .unwrap();
+    let pool = f.database().pool().clone();
+    let b_owner: String = sqlx::query_scalar(
+        "SELECT forge_session_id FROM agent_session_journal_session WHERE runtime_session_id='relabel-b'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let fresh = || ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+    assert!(
+        fresh()
+            .objects(&d, &b, std::slice::from_ref(&victim.id))
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    // Session record: copy A's sealed record and every scalar column into B.
+    sqlx::query("UPDATE agent_session_journal_session SET (generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,nonce,payload) = (SELECT generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,nonce,payload FROM agent_session_journal_session WHERE runtime_session_id='relabel-a') WHERE runtime_session_id='relabel-b'")
+        .execute(&pool).await.unwrap();
+    assert!(fresh().load(&d, &b).await.is_err());
+    // Operation tier zero: same tier key, other scope.
+    sqlx::query("UPDATE agent_session_journal_operation_pack SET (nonce,payload) = (SELECT nonce,payload FROM agent_session_journal_operation_pack WHERE runtime_session_id='relabel-a' AND tier=0) WHERE runtime_session_id='relabel-b' AND tier=0")
+        .execute(&pool).await.unwrap();
+    assert!(
+        fresh()
+            .operation(&d, &b, &JournalOperationId::new("operation"))
+            .await
+            .is_err()
+    );
+    // Pin payload under B's own lookup key.
+    sqlx::query("UPDATE agent_session_journal_pin SET (nonce,payload) = (SELECT nonce,payload FROM agent_session_journal_pin WHERE runtime_session_id='relabel-a') WHERE runtime_session_id='relabel-b'")
+        .execute(&pool).await.unwrap();
+    assert!(fresh().pins(&d, &b).await.is_err());
+    // Pack: move A's pack (id and generation unchanged) to B with a held bit.
+    let a_pack: i64 = sqlx::query_scalar(
+        "SELECT pack_id FROM agent_session_journal_pack WHERE runtime_session_id='relabel-a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM agent_session_journal_membership WHERE pack_id=?")
+        .bind(a_pack)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_session_journal_pack SET runtime_session_id='relabel-b', forge_session_id=? WHERE pack_id=?")
+        .bind(&b_owner).bind(a_pack).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO agent_session_journal_membership (storage_id,role,runtime_session_id,forge_session_id,pack_id,bitmap) VALUES (?, 'protected', 'relabel-b', ?, ?, x'01')")
+        .bind(d.storage_id.as_str()).bind(&b_owner).bind(a_pack).execute(&pool).await.unwrap();
+    assert!(
+        fresh()
+            .objects(&d, &b, std::slice::from_ref(&victim.id))
+            .await
+            .is_err()
+    );
+    assert!(fresh().members(&d, &b).await.is_err());
+    assert!(fresh().retained_bytes(&d).await.is_err());
+    // The same pack relabelled to the other role of B's session.
+    sqlx::query("DELETE FROM agent_session_journal_membership WHERE pack_id=?")
+        .bind(a_pack)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_session_journal_pack SET role='ordinary' WHERE pack_id=?")
+        .bind(a_pack)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ordinary = domain(JournalRole::Ordinary);
+    assert!(fresh().retained_bytes(&ordinary).await.is_err());
+    assert!(fresh().retained_bytes(&d).await.is_ok());
+}
+
+fn model_operation(
+    d: &JournalDomain,
+    s: &SessionId,
+    id: &str,
+    revision: u64,
+    epoch: u64,
+    variant: u64,
+) -> JournalOperationRecord {
+    let mut h = head(d, s, JournalObjectId::from_bytes([variant as u8; 32]));
+    h.revision = JournalRevision(revision);
+    h.writer_epoch = epoch;
+    h.batch_sequence = variant;
+    JournalOperationRecord {
+        operation: JournalOperationId::new(id),
+        digest: journal_history_chain(std::iter::empty()),
+        revision: JournalRevision(revision),
+        result: h,
+    }
+}
+
+/// S4/S5 against a plain map model (the volatile reference's rule): binary
+/// carry and capped overflow under many appends, exact/conflicting replays,
+/// explicit inclusive prune floors with the single current-epoch exception,
+/// writer-epoch changes and independent-pool reopen. Every step compares every
+/// id ever written and checks the sealed tier shape and 1 MiB cap.
+#[tokio::test]
+async fn operation_packs_match_model() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("ops-model");
+    let mut seed_write = write(&d, s.as_str(), vec![object("ops-model")]);
+    seed_write.operation = None;
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(seed_write)
+        .await
+        .unwrap();
+    let mut st = raw.clone();
+    let mut record = st.load(&d, &s).await.unwrap().unwrap();
+    let mut model = std::collections::BTreeMap::<String, JournalOperationRecord>::new();
+    let mut seen = Vec::<String>::new();
+    let mut state = 0x1234_5678_9abc_def1u64;
+    let (mut revision, mut epoch) = (record.revision.0, record.writer_epoch);
+    let (mut overflow_rows, mut max_rows, mut conflicts) = (0usize, 0usize, 0usize);
+    for step in 0..300u32 {
+        let roll = xorshift(&mut state) % 100;
+        let mut w = control(&d, &s, record.clone());
+        w.kind = JournalWriteKind::Commit;
+        // Phase one fills large records until carries overflow the cap;
+        // phase two mixes small appends, replays, prunes and epoch changes.
+        let large = step < 72;
+        if !large && roll < 12 {
+            let floor = if roll < 8 {
+                revision.saturating_sub(64)
+            } else {
+                xorshift(&mut state) % (revision + 5)
+            };
+            if roll % 3 == 0 {
+                epoch += 1;
+                w.record.writer_epoch = epoch;
+            }
+            w.kind = JournalWriteKind::Collect;
+            w.prune_operations_before = Some(JournalRevision(floor));
+            st.apply(w.clone()).await.unwrap();
+            let last = model
+                .values()
+                .filter(|o| o.result.writer_epoch == epoch)
+                .map(|o| o.revision)
+                .max();
+            model.retain(|_, o| {
+                o.revision.0 >= floor
+                    || (o.result.writer_epoch == epoch && Some(o.revision) == last)
+            });
+            record = w.record;
+        } else if !large && roll < 20 && !model.is_empty() {
+            let pick = model
+                .keys()
+                .nth(xorshift(&mut state) as usize % model.len())
+                .unwrap()
+                .clone();
+            let old = model[&pick].clone();
+            if roll < 16 {
+                // Identical replay is a no-op on the operation packs.
+                let before = operation_rows(&f, &d, &s).await;
+                w.operation = Some(old);
+                st.apply(w.clone()).await.unwrap();
+                assert_eq!(operation_rows(&f, &d, &s).await, before);
+                record = w.record;
+            } else {
+                // Different input under a retained id conflicts with no effects.
+                let mut changed = old.clone();
+                changed.result.batch_sequence += 1;
+                w.operation = Some(changed);
+                let before = image(&f).await;
+                state_conflict(st.apply(w).await.unwrap_err());
+                assert_eq!(image(&f).await, before);
+                conflicts += 1;
+            }
+        } else if !large && roll < 23 {
+            epoch += 1;
+            w.record.writer_epoch = epoch;
+            st.apply(w.clone()).await.unwrap();
+            record = w.record;
+        } else if !large && roll < 26 {
+            st = reopen(&f).await;
+        } else {
+            revision += 1;
+            let size = if large {
+                16 * 1024 + xorshift(&mut state) as usize % 512
+            } else {
+                xorshift(&mut state) as usize % 2048
+            };
+            let id = format!("op-{step:04}-{}", "p".repeat(size));
+            let op = model_operation(&d, &s, &id, revision, epoch, step as u64);
+            w.record.revision = JournalRevision(revision);
+            w.operation = Some(op.clone());
+            st.apply(w.clone()).await.unwrap();
+            model.insert(id.clone(), op);
+            seen.push(id);
+            record = w.record;
+        }
+        if large && step % 4 != 3 {
+            continue;
+        }
+        let layout = st.operation_pack_layout(&d, &s).await.unwrap();
+        let mut total = 0;
+        for (tier, count, bytes) in &layout {
+            assert!(
+                *bytes <= 1024 * 1024,
+                "step {step}: tier {tier} holds {bytes} bytes"
+            );
+            if *tier < 64 {
+                assert_eq!(*count, 1usize << tier, "step {step}: tier {tier}");
+            }
+            total += count;
+        }
+        assert_eq!(total, model.len(), "step {step}");
+        overflow_rows = overflow_rows.max(layout.iter().filter(|l| l.0 >= 64).count());
+        max_rows = max_rows.max(layout.len());
+        if step % 10 == 3 || step >= 290 {
+            for id in &seen {
+                let id_key = JournalOperationId::new(id.as_str());
+                assert_eq!(
+                    st.operation(&d, &s, &id_key).await.unwrap().as_ref(),
+                    model.get(id),
+                    "step {step}"
+                );
+            }
+        }
+    }
+    assert!(
+        overflow_rows > 0,
+        "the cap never forced an overflow segment"
+    );
+    assert!(conflicts > 0);
+    // Steady state under the S5 window stays a handful of sealed rows.
+    let final_rows = st.operation_pack_layout(&d, &s).await.unwrap().len();
+    eprintln!(
+        "operation model: {} retained, {final_rows} rows, max {max_rows} rows, max {overflow_rows} overflow rows, {conflicts} conflicts",
+        model.len()
+    );
+}
+
+/// Counts sqlx statements once armed. sqlx logs from each connection's worker
+/// thread, so this is a process-wide subscriber: the count is exact only when
+/// the measuring test runs alone (filtered); assertions use the per-storage
+/// cache counters and the database image instead.
+#[derive(Default)]
+struct SqlCounter {
+    armed: std::sync::atomic::AtomicBool,
+    statements: std::sync::Mutex<Vec<String>>,
+}
+struct SqlCounterHandle(Arc<SqlCounter>);
+impl tracing::Subscriber for SqlCounterHandle {
+    fn register_callsite(
+        &self,
+        m: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if m.target() == "sqlx::query" {
+            tracing::subscriber::Interest::sometimes()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+    fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
+        m.target() == "sqlx::query" && self.0.armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Summary(String);
+        impl tracing::field::Visit for Summary {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "summary" {
+                    self.0 = format!("{v:?}");
+                }
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                if f.name() == "summary" {
+                    self.0 = v.to_owned();
+                }
+            }
+        }
+        let mut summary = Summary(String::new());
+        event.record(&mut summary);
+        self.0.statements.lock().unwrap().push(summary.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+fn sql_counter() -> Arc<SqlCounter> {
+    static COUNTER: std::sync::OnceLock<Arc<SqlCounter>> = std::sync::OnceLock::new();
+    COUNTER
+        .get_or_init(|| {
+            let counter = Arc::new(SqlCounter::default());
+            let _ = tracing::subscriber::set_global_default(SqlCounterHandle(counter.clone()));
+            counter
+        })
+        .clone()
+}
+
+/// D4/D5 performance shape: a warm commit of one turn on a long session
+/// writes exactly one new pack, reads no existing body or index, leaves every
+/// existing pack row byte-identical and stays a small fixed number of pages.
+#[tokio::test]
+async fn warm_commit_writes_only_its_delta() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("long-session");
+    let turn = |n: usize, w: &mut JournalWrite| {
+        // One turn: messages/state values, a batch and the head.
+        let mut objects = vec![
+            object(format!("user message {n} {}", "u".repeat(300))),
+            object(format!("assistant reply {n} {}", "a".repeat(900))),
+            object(serde_json::json!({"usage": n, "tokens": n * 17})),
+        ];
+        let batch =
+            JournalObject::encode(JournalObjectKind::Batch, &serde_json::json!({"turn": n}))
+                .unwrap();
+        objects.push(JournalStoredObject {
+            id: batch.id,
+            kind: JournalObjectKind::Batch,
+            bytes: batch.bytes.into(),
+        });
+        let mut h = head(&d, &s, objects[0].id.clone());
+        h.revision = JournalRevision(n as u64 + 1);
+        h.batch_sequence = n as u64;
+        let ho = JournalObject::encode(JournalObjectKind::Head, &h).unwrap();
+        objects.push(JournalStoredObject {
+            id: ho.id.clone(),
+            kind: JournalObjectKind::Head,
+            bytes: ho.bytes.clone().into(),
+        });
+        objects.sort_by(|a, b| a.id.cmp(&b.id));
+        w.kind = JournalWriteKind::Commit;
+        w.objects = JournalObjectBatch { objects };
+        w.record.revision = h.revision;
+        w.record.head = Some(ho);
+        w.operation = Some(JournalOperationRecord {
+            operation: JournalOperationId::new(format!("turn-{n}")),
+            digest: journal_history_chain(std::iter::empty()),
+            revision: h.revision,
+            result: h,
+        });
+    };
+    let mut first = write(&d, s.as_str(), vec![object("genesis")]);
+    first.operation = None;
+    mapped.apply(first).await.unwrap();
+    for n in 0..200 {
+        let mut w = edit(&raw, &d, &s).await;
+        turn(n, &mut w);
+        raw.apply(w).await.unwrap();
+        raw.post_terminal(&d, &s).await.unwrap();
+    }
+    // Warm this storage's directory as a running session would have it.
+    raw.members(&d, &s).await.unwrap();
+    let before_rows = pack_rows(&f, &d, &s).await;
+    let mut w = edit(&raw, &d, &s).await;
+    turn(200, &mut w);
+    let pool = f.database().pool().clone();
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sequence = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT seq FROM sqlite_sequence WHERE name='agent_session_journal_pack'",
+        )
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap()
+    };
+    let sequence_before = sequence().await;
+    let wal = f.directory().join("journal.db-wal");
+    let wal_before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let stats_before = raw.cache_stats().unwrap();
+    let counter = sql_counter();
+    counter.statements.lock().unwrap().clear();
+    counter
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    raw.apply(w).await.unwrap();
+    counter
+        .armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let statements = std::mem::take(&mut *counter.statements.lock().unwrap());
+    let stats = raw.cache_stats().unwrap();
+    let wal_after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let after_rows = pack_rows(&f, &d, &s).await;
+    // Every pre-existing pack row is byte-identical; exactly one row is new.
+    for row in &before_rows {
+        assert!(after_rows.contains(row), "pack {} was rewritten", row.0);
+    }
+    assert_eq!(after_rows.len(), before_rows.len() + 1);
+    // The new bodies are encoded, sealed and inserted once: no intermediate
+    // per-cut pack rows were written and deleted inside the transaction.
+    assert_eq!(sequence().await, sequence_before + 1);
+    assert_eq!(after_rows.last().unwrap().0, sequence_before + 1);
+    // Only the new pack's index is decoded; no existing body is read.
+    assert_eq!(stats.body_decodes - stats_before.body_decodes, 0);
+    assert_eq!(stats.index_decodes - stats_before.index_decodes, 1);
+    assert_eq!(stats.pack_queries - stats_before.pack_queries, 1);
+    let frames = wal_after.saturating_sub(wal_before.max(32)) / (4096 + 24);
+    let operation_bytes: i64 = sqlx::query_scalar("SELECT coalesce(sum(length(payload)),0) FROM agent_session_journal_operation_pack WHERE runtime_session_id='long-session'")
+        .fetch_one(&pool).await.unwrap();
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    for s in &statements {
+        *kinds.entry(s.clone()).or_default() += 1;
+    }
+    eprintln!(
+        "warm commit: {} existing packs, {} statements (exact only when run alone) {kinds:?}, WAL +{} bytes ({frames} pages), sealed operation tiers read {operation_bytes} bytes",
+        before_rows.len(),
+        statements.len(),
+        wal_after.saturating_sub(wal_before)
+    );
+    assert!(frames <= 64, "{frames} WAL pages for one warm turn");
+}
+
+/// Drop the apply future after its `limit`-th poll. Ready(None) = cancelled.
+async fn cancel_after<F: std::future::Future>(future: F, limit: usize) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut polls = 0;
+    std::future::poll_fn(|cx| {
+        if polls == limit {
+            return std::task::Poll::Ready(None);
+        }
+        polls += 1;
+        future.as_mut().poll(cx).map(Some)
+    })
+    .await
+}
+
+/// Cancelling an apply at every await point (staging, release/purge, commit)
+/// leaves exactly the old or the new state, never releases the write lock
+/// late, and never leaves the warm cache disagreeing with a fresh storage.
+#[tokio::test]
+async fn apply_cancelled_at_every_await_is_atomic() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("cancelled");
+    let mut seed = write(&d, s.as_str(), vec![object("cancel-genesis")]);
+    seed.operation = None;
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(seed)
+        .await
+        .unwrap();
+    let mut previous: Option<JournalStoredObject> = None;
+    let (mut cancelled, mut committed_while_cancelled) = (0, 0);
+    for limit in 1.. {
+        let before = raw.load(&d, &s).await.unwrap().unwrap();
+        let body = object(format!("cancel-{limit}-{}", "c".repeat(2048)));
+        let mut w = control(&d, &s, before.clone());
+        w.kind = JournalWriteKind::Collect;
+        w.objects = JournalObjectBatch {
+            objects: vec![body.clone()],
+        };
+        // Releasing the previous body empties its pack: a purge to cancel in.
+        w.release = previous.iter().map(|o| o.id.clone()).collect();
+        w.operation = Some(JournalOperationRecord {
+            operation: JournalOperationId::new(format!("cancel-{limit}")),
+            digest: journal_history_chain(std::iter::empty()),
+            revision: before.revision,
+            result: head(&d, &s, body.id.clone()),
+        });
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cancel_after(raw.apply(w.clone()), limit),
+        )
+        .await
+        .expect("apply hung");
+        let fresh = ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+        let record = fresh.load(&d, &s).await.unwrap().unwrap();
+        let committed = record == w.record;
+        assert!(committed || record == before, "limit {limit}: mixed record");
+        let ids: Vec<_> = std::iter::once(body.id.clone())
+            .chain(previous.iter().map(|o| o.id.clone()))
+            .collect();
+        let found = fresh.objects(&d, &s, &ids).await.unwrap();
+        let op = fresh
+            .operation(&d, &s, &JournalOperationId::new(format!("cancel-{limit}")))
+            .await
+            .unwrap();
+        if committed {
+            assert_eq!(found[0].as_ref(), Some(&body.bytes), "limit {limit}");
+            assert!(found.get(1).is_none_or(Option::is_none), "limit {limit}");
+            assert!(op.is_some());
+        } else {
+            assert!(found[0].is_none(), "limit {limit}");
+            assert!(found.get(1).is_none_or(Option::is_some), "limit {limit}");
+            assert!(op.is_none());
+        }
+        // The warm storage agrees with a fresh one after the cancellation.
+        assert_eq!(raw.load(&d, &s).await.unwrap(), Some(record.clone()));
+        assert_eq!(raw.objects(&d, &s, &ids).await.unwrap(), found);
+        assert_eq!(
+            raw.members(&d, &s).await.unwrap(),
+            fresh.members(&d, &s).await.unwrap()
+        );
+        assert_eq!(
+            raw.retained_bytes(&d).await.unwrap(),
+            fresh.retained_bytes(&d).await.unwrap()
+        );
+        match outcome {
+            Some(result) => {
+                result.unwrap();
+                break;
+            }
+            None => {
+                cancelled += 1;
+                if committed {
+                    committed_while_cancelled += 1;
+                }
+            }
+        }
+        if committed {
+            previous = Some(body);
+        }
+    }
+    assert!(cancelled > 5);
+    eprintln!(
+        "apply cancellation: {cancelled} await points, {committed_while_cancelled} committed before the drop"
+    );
+}
+
+/// Operation tiers use the same bounded inflation as pack bodies: a frame
+/// declaring a window above 2 MiB or inflating past the 1 MiB record cap is
+/// refused even though AEAD accepts the resealed unit.
+#[tokio::test]
+async fn operation_frames_are_bounded() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("operation-frames");
+    f.seed_journal(&raw, write(&d, s.as_str(), vec![object("frames")]))
+        .await
+        .unwrap();
+    let op = JournalOperationId::new("operation");
+    let fresh = || ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+    let original = fresh().operation(&d, &s, &op).await.unwrap().unwrap();
+    let pool = f.database().pool().clone();
+    let saved: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT nonce,payload FROM agent_session_journal_operation_pack WHERE runtime_session_id='operation-frames' AND tier=0",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let restore = || async {
+        sqlx::query("UPDATE agent_session_journal_operation_pack SET nonce=?,payload=? WHERE runtime_session_id='operation-frames' AND tier=0")
+            .bind(&saved.0).bind(&saved.1).execute(&pool).await.unwrap();
+    };
+    // Valid records in a raw-block frame that declares the given window.
+    let window = |descriptor: u8| {
+        move |bytes: &mut Vec<u8>| {
+            let records = zstd::stream::decode_all(bytes.as_slice()).unwrap();
+            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, descriptor];
+            frame.extend_from_slice(&(((records.len() as u32) << 3) | 1).to_le_bytes()[..3]);
+            frame.extend_from_slice(&records);
+            *bytes = frame;
+        }
+    };
+    raw.reseal_unit_for_test(&d, &s, TestSealedUnit::OperationsFrame(0), window(11 << 3))
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh().operation(&d, &s, &op).await.unwrap(),
+        Some(original.clone())
+    );
+    for descriptor in [(11 << 3) | 1, 12 << 3] {
+        restore().await;
+        raw.reseal_unit_for_test(
+            &d,
+            &s,
+            TestSealedUnit::OperationsFrame(0),
+            window(descriptor),
+        )
+        .await
+        .unwrap();
+        assert!(fresh().operation(&d, &s, &op).await.is_err());
+    }
+    // Inflation past the 1 MiB serialized-record cap.
+    restore().await;
+    raw.reseal_unit_for_test(&d, &s, TestSealedUnit::OperationsFrame(0), |bytes| {
+        *bytes = zstd::stream::encode_all(vec![b' '; 1024 * 1024 + 1].as_slice(), 3).unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(fresh().operation(&d, &s, &op).await.is_err());
+    restore().await;
+    assert_eq!(
+        fresh().operation(&d, &s, &op).await.unwrap(),
+        Some(original)
     );
 }

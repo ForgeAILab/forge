@@ -8278,10 +8278,15 @@ body units.
 
 `apply.rs` uses one `db::begin_immediate` transaction and a full SQL revision/
 writer-epoch/generation guard, with checked all-zero absence and successor
-generation. It stages non-control objects, checkpoint, batch, pins/catalog,
-head/record and original operation result in the runtime's cut order. Six
-pre-commit cuts roll back; AfterCommit commits then returns an ambiguous error.
-The final new packs combine kinds and obey the logical cap. Only the written
+generation. It admits non-control objects, checkpoint and batch, writes
+pins/catalog, admits the head, then writes the record and original operation
+result in the runtime's cut order. Six pre-commit cuts roll back the whole
+transaction, so the apply's genuinely new bodies are encoded, sealed and
+inserted once, as one final pack (capped segments when larger) written before
+the record; no intermediate per-cut pack rows exist. AfterCommit commits then
+returns an ambiguous error. A warm one-turn commit reads only the scope's pack
+headers/bitmaps, the new pack's index and the operation tiers, and writes one
+pack row. Only the written
 scope's directory refreshes; cache staleness is never a StateConflict. Cache
 publication follows commit; errors and cancellation invalidate the affected
 scope. Tracing target `forge_session_journal` reports apply kind, elapsed/lock

@@ -350,6 +350,117 @@ mod tests {
         assert!(decode_body(&d, &body).is_err());
     }
     #[test]
+    fn random_unit_corruption_never_panics_or_misverifies() {
+        fn next(state: &mut u64) -> usize {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state as usize
+        }
+        fn edit(state: &mut u64, bytes: &mut Vec<u8>) {
+            let n = bytes.len().max(1);
+            match next(state) % 6 {
+                0 => {
+                    let i = next(state) % n;
+                    if let Some(b) = bytes.get_mut(i) {
+                        *b ^= 1 << (next(state) % 8);
+                    }
+                }
+                1 => {
+                    let i = next(state) % n;
+                    if let Some(b) = bytes.get_mut(i) {
+                        *b = next(state) as u8;
+                    }
+                }
+                2 => bytes.truncate(next(state) % n),
+                3 => bytes.extend((0..=next(state) % 6).map(|_| next(state) as u8)),
+                4 => {
+                    let (i, j) = (next(state) % n, next(state) % n);
+                    if i < bytes.len() && j < bytes.len() {
+                        bytes.swap(i, j);
+                    }
+                }
+                _ => {
+                    // Large varints and hostile offsets inside the directory.
+                    let i = next(state) % n;
+                    bytes.splice(i.min(bytes.len())..i.min(bytes.len()), [0xff, 0xff, 0x7f]);
+                }
+            }
+        }
+        let mut objects: Vec<_> = (0..12u64).map(|n| object(n * 7919 + 3)).collect();
+        objects.extend([object(42269), object(139372)]);
+        objects.sort_by(|a, b| a.id.cmp(&b.id));
+        let pack = encode(&objects).unwrap();
+        let raw = zstd::stream::decode_all(pack.body.as_slice()).unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut accepted = 0;
+        for round in 0..3000 {
+            let (mut index, mut body) = (pack.index.clone(), pack.body.clone());
+            match round % 3 {
+                0 => edit(&mut state, &mut index),
+                1 => edit(&mut state, &mut body),
+                _ => {
+                    let mut canonical = raw.clone();
+                    edit(&mut state, &mut canonical);
+                    body = zstd::stream::encode_all(canonical.as_slice(), 3).unwrap();
+                }
+            }
+            // The clear scalar columns stay authentic; the units are edited.
+            let Ok(directory) = decode_index(&index, pack.count, pack.canonical_bytes) else {
+                continue;
+            };
+            if let Ok(decoded) = decode_body(&directory, &body) {
+                // The only acceptable success is the exact original content.
+                assert_eq!(decoded, objects, "round {round}");
+                accepted += 1;
+            }
+        }
+        assert!(accepted < 3000);
+        // An index that claims ids the body does not contain: same slot count
+        // and canonical length, different objects.
+        let a: Vec<_> = {
+            let mut v: Vec<_> = (10..14u64).map(object).collect();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        };
+        let b: Vec<_> = {
+            let mut v: Vec<_> = (20..24u64).map(object).collect();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        };
+        let (pa, pb) = (encode(&a).unwrap(), encode(&b).unwrap());
+        assert_eq!(
+            (pa.count, pa.canonical_bytes),
+            (pb.count, pb.canonical_bytes)
+        );
+        let da = decode_index(&pa.index, pa.count, pa.canonical_bytes).unwrap();
+        assert!(decode_body(&da, &pb.body).is_err());
+        let db = decode_index(&pb.index, pb.count, pb.canonical_bytes).unwrap();
+        assert!(decode_body(&db, &pa.body).is_err());
+    }
+    #[test]
+    fn frames_declaring_more_than_a_two_mib_window_are_refused() {
+        let objects = vec![object(1)];
+        let pack = encode(&objects).unwrap();
+        let directory = decode_index(&pack.index, pack.count, pack.canonical_bytes).unwrap();
+        let raw = zstd::stream::decode_all(pack.body.as_slice()).unwrap();
+        // A hand-built frame: no content size, one raw last block, and a
+        // Window_Descriptor of windowLog = 10 + exponent (+ mantissa eighths).
+        let frame = |descriptor: u8| {
+            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, descriptor];
+            frame.extend_from_slice(&(((raw.len() as u32) << 3) | 1).to_le_bytes()[..3]);
+            frame.extend_from_slice(&raw);
+            frame
+        };
+        assert_eq!(decode_body(&directory, &frame(8 << 3)).unwrap(), objects);
+        assert_eq!(decode_body(&directory, &frame(11 << 3)).unwrap(), objects);
+        // 2 MiB + 256 KiB, 4 MiB and 2 GiB windows are refused before any
+        // window allocation, even though the content itself is valid.
+        for descriptor in [(11 << 3) | 1, 12 << 3, 21 << 3] {
+            assert!(decode_body(&directory, &frame(descriptor)).is_err());
+        }
+    }
+    #[test]
     fn kind_ordered_bodies_and_capped_split() {
         let mut objects = vec![object(1), object(2)];
         let o = JournalObject::encode(JournalObjectKind::StateValue, &serde_json::json!({"x":1}))
