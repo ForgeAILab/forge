@@ -2463,9 +2463,19 @@ publication equals the legacy oracle, including lost acknowledgements, without
 replaying model/tool operations or overlaying stale legacy state. The async
 control regression holds a real SQLite write lock while controls and writer
 open wait, and proves local close and timer progress on both current-thread and
-multi-thread Tokio runtimes. Native integration fixture adoption and decrypted
-credential-pack exclusion remain uncompleted tasks 19–20; these tests do not
-claim those gates passed.
+multi-thread Tokio runtimes.
+
+`writer_fence_and_drop` holds one native writer while concurrent turn, fork and
+abort-fork writers from other runtimes conflict before provider I/O; concurrent
+ephemeral inquiries on the same id neither take nor free the slot, and dropping
+the holder releases it for the next writer, abort, fork and successor open.
+Native chat and Task integration tests no longer write legacy rows. Their
+fixture state comes from real runtime turns, and failures are injected through
+`fail_next_commit_at`, a storage fault scoped to one session's native journal
+rows, or zeroed sealed pack bodies. A superseded LCM component revision is
+produced by running turns under different Forge working-set/input-budget
+tunables; the next turn under the current tunables rebuilds and republishes both
+domains. Decrypted credential-pack exclusion remains uncompleted task 20.
 
 Older builds cannot resume journal-only state and refuse the newer database;
 downgrade requires a pre-upgrade backup.
