@@ -160,6 +160,10 @@ No runtime bench crate becomes a production dependency.
   warm admission. Pin/catalog changes and bounded sealed tier-zero operations
   round-trip; Collect writes, release, pruning, full operation containers and compact return
   typed Unsupported until their later tasks. Runtime wiring remains unchanged.
+  Review amendment (c3-storage review, 2026-10-20): admissions still follow the
+  cut order, but an apply's new bodies are now encoded, sealed and inserted once
+  before the record; per-cut staging rows were unobservable (every pre-commit
+  cut rolls back) and tripled warm-commit pack writes inside the write lock.
 
 - [x] **7. Pin/catalog/staging persistence (≤2 h).**
   Execute Put/Remove records verbatim inside apply, with no private-engine parsing
