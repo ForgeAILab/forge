@@ -795,7 +795,7 @@ async fn apply_atomic_cuts() {
     assert!(
         inner
             .apply(traced)
-            .with_subscriber(events.clone())
+            .with_subscriber(events.dispatch())
             .await
             .is_err()
     );
@@ -1036,6 +1036,44 @@ async fn independent_connection_expect_fences() {
 type ApplyEvent = std::collections::BTreeMap<String, String>;
 #[derive(Clone, Default)]
 struct ApplyEvents(Arc<std::sync::Mutex<Vec<ApplyEvent>>>);
+impl ApplyEvents {
+    /// With exactly one scoped dispatcher registered, tracing-core resolves a
+    /// callsite's first registration through the registering thread's default
+    /// ("just one" mode). A parallel test reaching the apply event first then
+    /// caches `Interest::never` and this capture silently sees no event. A
+    /// second, permanently registered dispatcher that enables nothing forces
+    /// `Interest::sometimes`, so every event is checked against the current
+    /// thread's dispatcher. It is registered before the capture so the level
+    /// filter only opens once both are present.
+    fn dispatch(&self) -> tracing::Dispatch {
+        static SILENT: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SILENT.get_or_init(|| tracing::Dispatch::new(Silent));
+        tracing::Dispatch::new(self.clone())
+    }
+}
+struct Silent;
+impl tracing::Subscriber for Silent {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::never()
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::OFF)
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
 impl tracing::Subscriber for ApplyEvents {
     fn enabled(&self, m: &tracing::Metadata<'_>) -> bool {
         m.target() == "forge_session_journal"
