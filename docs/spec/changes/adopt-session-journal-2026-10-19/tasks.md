@@ -405,7 +405,7 @@ Forge workaround for that runtime limitation is part of these tasks.
   transaction, competing controls/writer open, a ready local close and a live
   timer. No synchronous storage polling or storage implementation change.
 
-- [ ] **19. Native integration fixtures and writer exclusion (≤3 h).**
+- [x] **19. Native integration fixtures and writer exclusion (≤3 h).**
   Replace direct legacy-table test writes in native_chat_lcm_compaction,
   native_chat_tool_exchanges and embedded_task_executor tests with journal failure
   injection/corruption. Cover turn/fork/abort/inquiry concurrent writers and drop
@@ -415,11 +415,33 @@ Forge workaround for that runtime limitation is part of these tasks.
   cases and the one relevant `cargo test -p api --test main happy_path::<native_chat_case>`.
   Record the actual case names in the job receipt before running; no target-wide run.
 
-  Not completed in c3-t17-20: the replacement superseded-LCM fixture returned
-  StateConflict on both allowed attempts. The job stopped at task 18 and removed
-  the incomplete task-19 changes; attempted patch, case inventory and both logs
-  are preserved in `/Volumes/Data/tmp/refactor/c3-t17-20/`. The temporary writer
-  fence/drop and inquiry tests passed, but no partial task-19 completion is claimed.
+  Completed (second approach, c3-t19). The first attempt (c3-t17-20) hand-encoded
+  engine snapshots and published them into both domains; it failed twice with
+  StateConflict and was discarded. Every fixture now comes from real runtime
+  turns, and no test writes an engine object or a legacy row. The superseded
+  LCM revision is produced by an earlier backend running turns under a smaller
+  Main working set and input budget (both LCM component-revision inputs); a
+  fresh backend with current tunables resumes, the published revision is
+  checked to differ, both domains are republished under the current revision
+  and the next turn keeps it. Adopt's failed save cuts the ordinary engine's
+  next commit (AfterObjects): the claim is durable, neither domain advances
+  and both retries resume. The failing rotation fork uses a storage fault
+  scoped to the successor's native journal session rows; a one-shot cut is not
+  session-scoped and would hit the parent's fork intent first. The executor
+  open failure zeroes sealed pack bodies an earlier store's real turn wrote. The
+  inquiry case also asserts no native rows in any journal table. The topic-commit
+  rotation case shares that fixture and passes unchanged. `writer_fence_and_drop`
+  covers concurrent turn/fork/abort writers losing before provider I/O,
+  concurrent ephemeral inquiries, and drop releasing the slot. No API happy-path
+  case runs a native turn (its lead uses `CodingExecutorAdapter` without a
+  provider), so none was run.
+
+  Open finding, not fixed here: on a native chat turn, one cut at the protected
+  engine's next commit fails the turn before provider I/O. The ordinary domain
+  still publishes once more, and protected stays at its prior head. Every later
+  turn then fails with "canonical session history and terminal checkpoint are
+  from different boundaries", on a fresh backend and a restarted store too.
+  Reproducer: `/Volumes/Data/tmp/refactor/c3-t19/diag-protected-cut-plain.rs`.
 
 - [x] **20. Credential exclusion with real packs (≤2 h).**
   Seed API key/OAuth credentials, run a tool turn and refresh; decrypt all pack,

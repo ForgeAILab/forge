@@ -2500,8 +2500,19 @@ with API-key/OAuth sources and token refresh, audits every decrypted journal
 unit (including framed objects, decompressed and unheld bodies) in both domains
 for raw, normalized, encoded and partial credential echoes. It also inspects JSON
 string escapes and byte vectors, then separately checks cold exact recovery.
-Ordinary diagnostic redaction remains an independent assertion. Native integration
-fixture adoption remains task 19.
+Ordinary diagnostic redaction remains an independent assertion.
+
+`writer_fence_and_drop` holds one native writer while concurrent turn, fork and
+abort-fork writers from other runtimes conflict before provider I/O; concurrent
+ephemeral inquiries on the same id neither take nor free the slot, and dropping
+the holder releases it for the next writer, abort, fork and successor open.
+Native chat and Task integration tests no longer write legacy rows. Their
+fixture state comes from real runtime turns, and failures are injected through
+`fail_next_commit_at`, a storage fault scoped to one session's native journal
+rows, or zeroed sealed pack bodies. A superseded LCM component revision is
+produced by running turns under different Forge working-set/input-budget
+tunables; the next turn under the current tunables rebuilds and republishes both
+domains.
 
 Older builds cannot resume journal-only state and refuse the newer database;
 downgrade requires a pre-upgrade backup.

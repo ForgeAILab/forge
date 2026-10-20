@@ -1199,100 +1199,94 @@ async fn tool_exchange_history_reaches_hard_pressure_before_the_planner_refuses_
 
 /// A Forge-side LCM policy change must not wedge existing sessions.
 ///
-/// The runtime folds Forge's sizer, pressure policy, and summary policy into
-/// one LCM component revision, and `decode_state` refuses state written under
-/// a different one. That conflict fails the turn and is replayed on every
-/// attempt, so before the protected store tracked
-/// `FORGE_LCM_POLICY_REVISION`, shipping any change to those policies — the
-/// sizer fix above included — would have failed every turn of every live
-/// chat with no recovery path. The runtime (U6) now tolerates superseded
-/// tuning revisions and rebuilds the metadata from the durable timeline, so
-/// the host keeps the state and no longer drops it.
+/// The runtime folds Forge's LCM tunables (input budget, working set, sizer,
+/// pressure and summary policy) into one LCM component revision. Before U6,
+/// `decode_state` refused state written under a different revision; that
+/// conflict failed the turn and was replayed on every attempt, so shipping any
+/// change to those tunables — the sizer fix above included — would have failed
+/// every turn of every live chat with no recovery path. The runtime (U6) now
+/// tolerates superseded tuning revisions and rebuilds the metadata from the
+/// durable timeline, so the host keeps the state and no longer drops it.
+///
+/// The superseded state here is real: an earlier backend ("the old binary")
+/// runs turns under a different Main working set and input budget, so the
+/// runtime itself publishes both journal domains under the old revision. A
+/// fresh backend with the current tunables then resumes the chat.
 #[tokio::test]
 async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn() {
-    use agent_runtime::core::checkpoint::{CheckpointStore, TurnCheckpoint};
     use agent_runtime::core::ids::SessionId;
-    use agent_runtime::core::store::{SessionSnapshot, SessionStore};
+    use agent_runtime::harness::LCM_COMPONENT_ID;
     use agent_runtime::registry::RegistryRevision;
 
-    let fixture = chat_fixture().await;
-    let backend = NativeAgentRuntimeBackend::new(fixture.service.protected_store())
-        .with_provider_override(text_only_provider(4));
-    backend
-        .run_turn(fixture.turn("turn 0: start the chat"), Arc::new(NoopSink))
-        .await
-        .expect("the first turn completes and writes LCM component state");
+    /// The LCM component revision each native domain last published.
+    async fn published_lcm_revisions(
+        store: &forge_agent_host::SqliteProtectedRuntimeStore,
+        session: &SessionId,
+    ) -> (RegistryRevision, RegistryRevision) {
+        let flags = store
+            .persistence_flags(session)
+            .await
+            .expect("native publication flags");
+        assert!(
+            flags.ordinary_published && flags.protected_published,
+            "both native domains are published: {flags:?}"
+        );
+        let ordinary = store
+            .persisted_extension(session, flags, LCM_COMPONENT_ID)
+            .await
+            .expect("ordinary LCM state reads")
+            .expect("the ordinary domain carries LCM state")
+            .revision;
+        // Without ordinary publication the reader falls back to protected.
+        let protected_only = db::SessionPersistenceFlags {
+            ordinary_published: false,
+            ..flags
+        };
+        let protected = store
+            .persisted_extension(session, protected_only, LCM_COMPONENT_ID)
+            .await
+            .expect("protected LCM state reads")
+            .expect("the protected domain carries LCM state")
+            .revision;
+        (ordinary, protected)
+    }
 
+    let fixture = chat_fixture().await;
     let store = fixture.service.protected_store();
     let runtime_session = SessionId::new(&fixture.runtime_session_id);
-    // Emulates component state written by a binary whose LCM policy differed:
-    // the revision is exactly what the runtime compares and rejects. The
-    // checkpoint keeps its own copy of the namespace and the resume overlay
-    // reinstates it, so both copies must carry the superseded revision for
-    // this to be the state a policy change really leaves behind.
-    let stamp_superseded_state = || async {
-        let superseded = RegistryRevision::new("superseded-lcm-component");
-        let mut snapshot: SessionSnapshot = SessionStore::load(&*store, &runtime_session)
-            .await
-            .expect("snapshot loads")
-            .expect("the first turn persisted a snapshot");
-        snapshot
-            .extension_state
-            .get_mut("harness.lcm")
-            .expect("the first turn persisted LCM component state")
-            .revision = superseded.clone();
-        SessionStore::save(&*store, &snapshot)
-            .await
-            .expect("snapshot saves");
-        let mut checkpoint: TurnCheckpoint =
-            CheckpointStore::load_latest(&*store, &runtime_session)
-                .await
-                .expect("checkpoint loads")
-                .expect("the first turn persisted a checkpoint");
-        checkpoint
-            .snapshot
-            .extension_state
-            .get_mut("harness.lcm")
-            .expect("the checkpoint carries LCM component state")
-            .revision = superseded;
-        // The store treats a save with the same turn, revision and fingerprint
-        // as a replay and keeps what it has (the runtime's idempotency
-        // contract). Forget the stored revision so this rewrite, which stands
-        // in for another binary's write, replaces the checkpoint.
-        sqlx::query("UPDATE protected_agent_session_state SET checkpoint_revision = NULL")
-            .execute(fixture.db.pool())
-            .await
-            .expect("stored checkpoint revision clears");
-        CheckpointStore::save(&*store, &checkpoint)
-            .await
-            .expect("checkpoint saves");
-    };
+    let provider = text_only_provider(4);
 
-    // The marker still matches this binary, so the host keeps the state as
-    // written; the runtime (U6) rebuilds the superseded tuning metadata
-    // itself instead of rejecting it.
-    stamp_superseded_state().await;
-    backend
+    // The old binary: a smaller Main working set and input budget. Both are
+    // inputs to the LCM component revision.
+    let old_binary =
+        NativeAgentRuntimeBackend::new(Arc::clone(&store)).with_provider_override(provider.clone());
+    old_binary.set_working_sets(8_000, 10_000, 96_000, 128_000);
+    let old_turn = |input: &str| {
+        let mut request = fixture.turn(input);
+        request.provider.max_input_tokens = 10_240;
+        request
+    };
+    let first = old_binary
+        .run_turn(old_turn("turn 0: start the chat"), Arc::new(NoopSink))
+        .await
+        .expect("the first turn completes and writes LCM component state");
+    old_binary
         .run_turn(
-            fixture.turn("turn 1: continue across tuning revisions"),
+            old_turn("turn 1: continue under the old tunables"),
             Arc::new(NoopSink),
         )
         .await
-        .expect("U6 rebuilds tuning metadata without a host marker change");
+        .expect("a second turn under the old tunables completes");
+    let (old_ordinary, old_protected) = published_lcm_revisions(&store, &runtime_session).await;
+    assert_eq!(
+        old_ordinary, old_protected,
+        "the old binary published one LCM revision to both domains"
+    );
+    drop(old_binary);
 
-    // A policy change leaves exactly this behind: state from the old policy,
-    // beside the old policy's marker. The snapshot and the checkpoint each
-    // carry their own marker, and the old binary wrote both.
-    stamp_superseded_state().await;
-    sqlx::query(
-        "UPDATE protected_agent_session_state
-         SET lcm_policy_revision = ?1, checkpoint_lcm_policy_revision = ?1",
-    )
-    .bind("forge-lcm-policy-superseded")
-    .execute(fixture.db.pool())
-    .await
-    .expect("marker updates");
-
+    // The current binary: default working sets and the fixture's budget.
+    let backend =
+        NativeAgentRuntimeBackend::new(Arc::clone(&store)).with_provider_override(provider.clone());
     let output = backend
         .run_turn(
             fixture.turn("turn 2: continue after the policy change"),
@@ -1304,11 +1298,44 @@ async fn a_superseded_lcm_policy_revision_rebuilds_instead_of_failing_every_turn
         !output.text.trim().is_empty(),
         "the rebuilt session answers normally"
     );
+    let (rebuilt_ordinary, rebuilt_protected) =
+        published_lcm_revisions(&store, &runtime_session).await;
+    assert_ne!(
+        rebuilt_ordinary, old_ordinary,
+        "the resumed state was published under a superseded LCM revision"
+    );
+    assert_eq!(
+        rebuilt_ordinary, rebuilt_protected,
+        "the rebuild republished both domains under the current revision"
+    );
+
+    // Not just one lucky turn: the next turn resumes the rebuilt state.
+    backend
+        .run_turn(
+            fixture.turn("turn 3: the rebuilt chat keeps going"),
+            Arc::new(NoopSink),
+        )
+        .await
+        .expect("the turn after the rebuild completes");
+    assert_eq!(
+        published_lcm_revisions(&store, &runtime_session).await,
+        (rebuilt_ordinary.clone(), rebuilt_ordinary),
+        "unchanged tunables keep the rebuilt revision"
+    );
+
     let timeline_id = output
         .context_manifest
         .expect("native turn links a runtime context manifest")
         .lcm_timeline_id
         .expect("the rebuilt session links the same chat LCM timeline");
+    assert_eq!(
+        Some(timeline_id.as_str()),
+        first
+            .context_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.lcm_timeline_id.as_deref()),
+        "the rebuild keeps the chat's timeline"
+    );
     let entries: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_lcm_entry WHERE timeline_id = ?")
             .bind(&timeline_id)
@@ -2557,10 +2584,10 @@ async fn forty_turn_main_working_set_measurement() {
 
 // ---- topic working set: upgrade, usage and rotation admission ----
 
-/// Adopt claims generation 1 and then saves the rebuilt snapshot. If that
-/// save fails (crash, busy DB), the claim is durable but the snapshot still
-/// carries generation 0. The same session re-adopts idempotently, so the next
-/// turn resumes.
+/// Adopt claims generation 1 and then publishes the rebuilt session to the
+/// journal. If that publication fails (crash, busy DB), the claim is durable
+/// but the published state still carries generation 0. The same session
+/// re-adopts idempotently, so the next turn resumes.
 #[tokio::test]
 async fn a_failed_save_after_the_adopt_claim_does_not_wedge_the_chat() {
     let fixture = chat_fixture().await;
@@ -2590,17 +2617,34 @@ async fn a_failed_save_after_the_adopt_claim_does_not_wedge_the_chat() {
         .execute(fixture.db.pool())
         .await
         .unwrap();
-    // Crash window: the snapshot save after Adopt's claim fails.
-    sqlx::query("CREATE TRIGGER fail_snapshot_save_u BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'injected crash before snapshot save'); END;")
-        .execute(fixture.db.pool()).await.unwrap();
-    sqlx::query("CREATE TRIGGER fail_snapshot_save_i BEFORE INSERT ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'injected crash before snapshot save'); END;")
-        .execute(fixture.db.pool()).await.unwrap();
+    let journal_heads = || async {
+        sqlx::query_as::<_, (String, Vec<u8>)>(
+            "SELECT role, revision FROM agent_session_journal_session
+             WHERE forge_session_id = ? ORDER BY role",
+        )
+        .bind(&fixture.session_id)
+        .fetch_all(fixture.db.pool())
+        .await
+        .unwrap()
+    };
+    let published = journal_heads().await;
+    // Crash window: the first journal publication after Adopt's claim fails.
+    // Resume publishes the adopted session to the ordinary domain before the
+    // turn reaches its first protected checkpoint, so the ordinary engine's
+    // next commit is exactly that write; the cut rolls it back.
+    fixture
+        .service
+        .protected_store()
+        .journals()
+        .ordinary()
+        .fail_next_commit_at(agent_runtime::core::journal::JournalCommitFailurePoint::AfterObjects)
+        .expect("the publication cut arms");
     let crashed = backend
         .run_turn(fixture.turn("Upgrade turn"), Arc::new(NoopSink))
         .await;
     assert!(
         crashed.is_err(),
-        "the injected save failure fails this turn"
+        "the injected publication failure fails this turn"
     );
     let (owner, generation): (Option<String>, i64) =
         sqlx::query_as("SELECT claim_owner, claim_generation FROM agent_lcm_timeline WHERE id = ?")
@@ -2609,14 +2653,16 @@ async fn a_failed_save_after_the_adopt_claim_does_not_wedge_the_chat() {
             .await
             .unwrap();
     println!("adopt crash: after crash: owner={owner:?} generation={generation}");
-    sqlx::query("DROP TRIGGER fail_snapshot_save_u")
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
-    sqlx::query("DROP TRIGGER fail_snapshot_save_i")
-        .execute(fixture.db.pool())
-        .await
-        .unwrap();
+    assert_eq!(
+        (owner.as_deref(), generation),
+        (Some(fixture.runtime_session_id.as_str()), 1),
+        "Adopt's claim is durable although its publication failed"
+    );
+    assert_eq!(
+        journal_heads().await,
+        published,
+        "neither journal domain published anything after the claim"
+    );
     let first_retry = backend
         .run_turn(fixture.turn("Retry after restart"), Arc::new(NoopSink))
         .await;
@@ -2862,7 +2908,7 @@ fn topic_request(chat_id: &str, label: &str) -> db::RotateAgentChatTopic {
 #[cfg(feature = "test-support")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RotationBreak {
-    /// The runtime fork cannot save the successor.
+    /// The runtime fork cannot publish the successor's journal.
     Fork,
     /// The fork completes; Forge's topic commit fails.
     TopicCommit,
@@ -2903,8 +2949,11 @@ async fn abandon_a_failing_rotation(fault: RotationBreak) {
     .unwrap();
     match fault {
         RotationBreak::Fork => {
+            // A storage fault scoped to the successor: every native journal
+            // session write for it aborts inside the storage transaction, so
+            // each fork attempt fails while the source keeps publishing.
             for event in ["INSERT", "UPDATE"] {
-                sqlx::query(&format!("CREATE TRIGGER fail_successor_save_{event} BEFORE {event} ON protected_agent_session_state WHEN NEW.session_id = '{successor}' BEGIN SELECT RAISE(ABORT, 'injected successor save failure'); END;"))
+                sqlx::query(&format!("CREATE TRIGGER fail_successor_save_{event} BEFORE {event} ON agent_session_journal_session WHEN NEW.forge_session_id = '{successor}' BEGIN SELECT RAISE(ABORT, 'injected successor save failure'); END;"))
                     .execute(chat.db.pool()).await.unwrap();
             }
         }

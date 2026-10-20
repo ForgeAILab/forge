@@ -248,6 +248,26 @@ async fn native_inquiry_reused_authority_keeps_history_and_usage_fresh() {
         stored, 0,
         "ephemeral inquiries never persist restorable conversation state"
     );
+    // Nor do they reserve, publish or pack anything in either native journal
+    // domain under the reused authority metadata.
+    for table in [
+        "agent_session_journal_session",
+        "agent_session_journal_pack",
+        "agent_session_journal_membership",
+        "agent_session_journal_operation_pack",
+        "agent_session_journal_pin",
+        "agent_session_journal_catalog",
+    ] {
+        let native: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {table} WHERE forge_session_id = ? OR runtime_session_id = ?"
+        ))
+        .bind(&request.forge_session_id)
+        .bind(&request.runtime_session_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(native, 0, "an ephemeral inquiry wrote {table}");
+    }
 }
 
 #[tokio::test]
