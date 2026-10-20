@@ -14,6 +14,8 @@ pub mod operation_catalog;
 pub(crate) mod operation_contract;
 pub mod outbound_http;
 mod protected_store;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod tool_preview;
 mod transport;
 mod typed_tools;

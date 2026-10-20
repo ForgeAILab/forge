@@ -8169,8 +8169,46 @@ require `WHERE version = ?` and increment on success. Version mismatch →
 ## Database
 
 SQLite with WAL mode. Schema in
-`crates/db/migrations/V001__initial_schema.sql`. All primary keys are
-app-generated UUID v4; all timestamps are app-generated RFC3339.
+`crates/db/migrations/V001__initial_schema.sql`. Entity primary keys are
+app-generated UUID v4; all timestamps are app-generated RFC3339. Journal metadata
+uses composite runtime-session keys, and journal packs use monotonic SQLite ids.
+
+`V202610200941__session_journal.sql` adds six tables as the storage foundation for
+native session journals; runtime persistence still uses the legacy stores:
+
+| Table (`agent_session_journal_` prefix) | Stored unit and lifetime |
+| --- | --- |
+| `session` | Sealed engine record, publication/checkpoint/retirement flags and control-generation/revision/writer-epoch fence; keyed by `(storage_id, role, runtime_session_id)`. |
+| `pin` | Sealed pin record, keyed by scope plus a 32-byte keyed lookup value. |
+| `catalog` | Sealed catalog entry, keyed by scope plus a 32-byte keyed head lookup value. |
+| `pack` | Exclusive domain/runtime-session owner, Forge owner label, generation, object count and retained canonical byte count; separately sealed index and body units. `AUTOINCREMENT` pack ids are never reused. |
+| `membership` | One nonzero bitmap per scope/pack; composite FKs enforce matching runtime scope and Forge owner. Slot-count/bitmap-length agreement belongs to storage. |
+| `operation_pack` | Sealed original operation results in nonnegative binary-carry/overflow tiers. |
+
+Session, pin, catalog, membership and operation-pack rows have indexed
+`forge_session_id` foreign keys cascading from `agent_session`. Child metadata
+also cascades from its journal session. Packs have an indexed Forge owner label
+with **no owner FK**: they survive session deletion for later bounded physical
+cleanup. Pack lookup uses `(storage_id, role, runtime_session_id, pack_id)`;
+membership has a reverse `pack_id` index; dirty-session paging uses a partial
+domain/runtime-session index. A plain non-unique index on
+`agent_session(runtime_session_id)` preserves existing duplicate and NULL values.
+
+Fence counters and pack generation use eight-byte big-endian BLOBs to preserve
+the runtime's full unsigned 64-bit range in SQL comparisons. CHECKs constrain
+roles, flags, counter widths, positive key/format revisions, 24-byte nonces,
+sealed payload lengths, lookup-key widths, positive pack counts and the 1 MiB
+retained canonical body cap. A checkpoint requires a published, unretired head;
+empty/all-zero membership bitmaps are refused. The additive migration leaves
+every legacy `protected_agent_session_state` value unchanged. Older builds
+refuse an unknown applied migration; downgrade requires a pre-upgrade backup.
+
+Agent-host's explicit `test-support` feature provides file-backed fixtures whose
+storage decorators retain their temporary directories and create host mappings
+on the first apply for arbitrary runtime ids. Its engine conformance factories
+currently use volatile storage; native SQL journal storage and runtime wiring
+remain subsequent adoption tasks. Legacy decoder tests use the real envelope,
+checkpoint decoder and runtime schema/transition validation.
 
 Migrations are files named `V{version}__{name}.sql`, embedded in the binary
 and recorded by version and name in the `_migration` table. Versions up to

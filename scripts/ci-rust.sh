@@ -23,12 +23,12 @@ set -uo pipefail
 
 mode="${1:-all}"
 shard="${2:-}"
-# Targets with `required-features` (the services, services-agents and db
+# Targets with `required-features` (agent-host, services, services-agents and db
 # integration tests) are skipped without a word when the feature is absent, so
 # every whole-workspace command names them. `ci_rust_shards.py check` fails
 # unless this line lists exactly the features `cargo metadata` reports as
 # required.
-workspace_features=(--features db/test-template,services-agents/test-support,services/test-support)
+workspace_features=(--features db/test-template,forge-agent-host/test-support,services-agents/test-support,services/test-support)
 test_select=(--workspace --all-targets "${workspace_features[@]}")
 test_filters=()
 case "$mode" in

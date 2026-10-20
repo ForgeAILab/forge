@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:28:35Z
+updated_at: 2026-10-20T09:47:51Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -312,7 +312,7 @@ substitute for excluding credentials from the protected domain too.
 
 ### D4. Forge table and pack layout
 
-One additive migration: `V{NNN}__session_journal.sql`. `{NNN}` is allocated at
+One additive migration: `V{YYYYMMDDHHMM}__session_journal.sql`. `{YYYYMMDDHHMM}` is allocated at
 implementation time as a unique UTC `YYYYMMDDHHMM` version, following Forge's
 post-V149 convention. Never edit a historical migration or hard-code a speculative
 next number. Preserve all legacy rows; the legacy table drop is next release.
@@ -360,6 +360,12 @@ have CHECKs:
 bitmap is non-empty. Bitmap length against the pack's slot count spans two
 tables, which a SQLite CHECK cannot express, so storage validates it on every
 read and write. Scalar query columns must agree with the authenticated record on load.
+
+The task-3 schema uses eight-byte big-endian BLOBs for generation, revision and
+writer epoch (and pack generation), preserving every runtime `u64` value in SQL
+fences without narrowing to signed SQLite integers. Composite membership FKs
+also enforce the pack's complete domain/runtime-session/Forge owner key. The
+allocated migration is `V202610200941__session_journal.sql`.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
 (no row if all bodies exist already), or several rows cut at the S2 logical-size
@@ -662,7 +668,7 @@ full suites. This spec revision runs no code/build tests.
 
 ### D7. Lazy import and data-preserving migration
 
-The one `V{NNN}` migration creates D4's tables/indexes only; it neither rewrites
+The one `V{YYYYMMDDHHMM}` migration creates D4's tables/indexes only; it neither rewrites
 legacy payloads nor edits historical SQL. Every persistent native session becomes
 a capable pair on cut-over, without a rollout flag; ephemeral scopes stay
 store-less.

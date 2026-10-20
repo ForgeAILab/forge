@@ -66,7 +66,7 @@ SHARDS = {
 # services-agents `main`, whose fixtures are `services-agents/test-support`
 # items) is listed here; `check` fails until it is, and fails on an entry that
 # names no catch-all package or an undeclared feature.
-REST_FEATURES = ["services-agents/test-support"]
+REST_FEATURES = ["forge-agent-host/test-support", "services-agents/test-support"]
 
 # Green CI 38227423555 measured model_workflow at 304.87s and all other API
 # targets at 384.67s. After consolidation, local successful runs at 4d7d91c9

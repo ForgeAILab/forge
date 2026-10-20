@@ -1,6 +1,9 @@
 // Integration suites share one migration template and one link step.
 // Keep the original target name as the module for focused test filters.
 
+#[path = "suite/session_journal_schema.rs"]
+mod session_journal_schema;
+
 #[path = "suite/agent_chat_scopes.rs"]
 mod agent_chat_scopes;
 #[path = "suite/agent_inquiries.rs"]

@@ -32,6 +32,22 @@ const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 const SESSION_STATE_MAGIC: &[u8] = b"FORGE-SESSION\0";
 const SESSION_STATE_FORMAT: u8 = 1;
 
+#[cfg(feature = "test-support")]
+#[path = "test_support/legacy.rs"]
+mod legacy_test_support;
+
+fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        RuntimeError::new(
+            ErrorKind::Serialization,
+            format!(
+                "protected checkpoint for session {} contains invalid checkpoint JSON",
+                session.as_str()
+            ),
+        )
+    })
+}
+
 /// Logs a swallowed sqlx error before mapping it to the given fallback.
 /// Mirrors the diagnosability fix in `lcm.rs`: a bare `.map_err(|_| ...)`
 /// discarded the cause, making a SQLite busy/busy-snapshot failure
@@ -1939,15 +1955,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                             ),
                         )
                     })?;
-                let checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
-                    RuntimeError::new(
-                        ErrorKind::Serialization,
-                        format!(
-                            "protected checkpoint for session {} contains invalid checkpoint JSON",
-                            session.as_str()
-                        ),
-                    )
-                })?;
+                let checkpoint = decode_checkpoint(session, &bytes)?;
                 Ok(Some(checkpoint))
             }
             (None, None) => Ok(None),

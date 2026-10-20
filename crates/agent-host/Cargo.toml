@@ -5,6 +5,14 @@ edition = "2024"
 rust-version = "1.86"
 license.workspace = true
 
+[features]
+# Explicit integration-test support; never enabled through a self dependency.
+test-support = ["dep:tempfile", "db/test-template"]
+
+[[test]]
+name = "session_journal_conformance"
+required-features = ["test-support"]
+
 [dependencies]
 operation-registry = { path = "../operation-registry" }
 agent-runtime.workspace = true
@@ -36,6 +44,7 @@ hex = "0.4"
 ring = "0.17"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
+tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time", "process", "net", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"

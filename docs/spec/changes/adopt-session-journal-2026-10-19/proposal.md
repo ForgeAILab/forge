@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:28:35Z
+updated_at: 2026-10-20T09:47:51Z
 ---
 
 ## Why
@@ -43,7 +43,7 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   dependencies, fences, retirement and incremental collection selection. Forge
   supplies SQL enforcement, framing, encryption and lifecycle scheduling.
 - **Six tables, no per-object SQL layout.** One additive migration
-  `V{NNN}__session_journal.sql` creates session records, pin, catalog, pack,
+  `V{YYYYMMDDHHMM}__session_journal.sql` creates session records, pin, catalog, pack,
   membership and operation_pack tables. Allocate the unique UTC migration version
   when implementing; never edit historical migrations or discard user rows.
 - **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack

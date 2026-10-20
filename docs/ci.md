@@ -23,14 +23,14 @@ The Rust gates run as eight parallel jobs, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
-| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,services-agents/test-support,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
+| `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,forge-agent-host/test-support,services-agents/test-support,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
 | `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service:: task_dispatcher:: workspace_root::` |
 | `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service:: --skip task_dispatcher:: --skip workspace_root::` |
 | `Rust test (services-integration)` | `cargo test -p services --features test-support --test '*' --examples --no-fail-fast -- --test-threads=4` |
 | `Rust test (api-a)` | API binary selection from `scripts/ci_rust_shards.py`, with four libtest threads |
 | `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
 | `Rust test (db)` | `cargo test -p db --features test-template --all-targets --no-fail-fast` |
-| `Rust test (rest)` | `cargo test --workspace --all-targets --features services-agents/test-support --exclude api --exclude db --exclude services --no-fail-fast` |
+| `Rust test (rest)` | `cargo test --workspace --all-targets --features forge-agent-host/test-support,services-agents/test-support --exclude api --exclude db --exclude services --no-fail-fast` |
 | `Rust` | requires all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
 
 `Rust` is the name to use in branch protection. On normal runs it also runs
@@ -51,7 +51,7 @@ exists (cargo only warns about an unknown `--exclude`), and the workflow matrix
 lists exactly the shards the script defines. Services lib filters must be
 exact complements and its integration shard
 uses `--features test-support --test '*' --examples`, because `--tests` also
-runs lib tests. Every target that declares `required-features` (the services,
+runs lib tests. Every target that declares `required-features` (the agent-host, services,
 services-agents and db integration targets, see
 [below](#test-features-and-required-features)) must be selected with those
 features by each shard that builds it (the catch-all passes its features as
@@ -67,7 +67,7 @@ the package-to-shard table and compiles nothing, so it also runs locally.
 
 Run locally, `./scripts/ci-rust.sh` without arguments still runs fmt, clippy
 and `cargo test --workspace --all-targets --features
-db/test-template,services-agents/test-support,services/test-support
+db/test-template,forge-agent-host/test-support,services-agents/test-support,services/test-support
 --no-fail-fast` in one pass. Like
 the shards, its test stage now explicitly uses `--test-threads=4`.
 
@@ -78,11 +78,16 @@ features are unaffected for every crate that tests *another* crate:
 are requested by the dev-dependencies of each crate that needs them. A crate's
 own feature is the exception: only `api` dev-depends on
 `services-agents/test-support`, and `api` is not in `rest`, so `rest` names
-that feature itself.
+that feature itself. Agent-host likewise explicitly enables its own
+`test-support` feature for the session-journal integration target.
 
 ### Test features and required-features
 
-`services` and `db` do not dev-depend on themselves. A
+`forge-agent-host`, `services` and `db` do not dev-depend on themselves.
+Agent-host's `session_journal_conformance` target requires `test-support`; both
+the catch-all shard and workspace lint explicitly enable it. Its helpers retain
+file-backed temporary databases and expose legacy seeding/decoder seams only in
+feature-enabled builds. A
 `services = { path = ".", features = ["test-support"] }` dev-dependency made
 every `cargo test -p services --lib` build compile the services lib twice, one
 after the other: the plain lib with the feature, then the test lib, which

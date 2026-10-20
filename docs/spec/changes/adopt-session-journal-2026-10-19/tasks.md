@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T09:28:35Z
+updated_at: 2026-10-20T09:47:51Z
 completed_at:
 ---
 
@@ -52,7 +52,7 @@ No runtime bench crate becomes a production dependency.
   Upstream LCM planning changes are documented in CHANGELOG and architecture.
   Tagged source checklist and command receipts: `/Volumes/Data/tmp/refactor/c3-t1/report.md`.
 
-- [ ] **2. File-backed test support and engine harness (≤2 h).**
+- [x] **2. File-backed test support and engine harness (≤2 h).**
   Use the testkit pinned in task 1; add file DB/temp-dir ownership, the test-only mapping
   decorator that inserts a stub agent_session for each unseen runtime id on its
   first apply (no pre-seeded id list), test-only legacy row seeding and real
@@ -62,9 +62,13 @@ No runtime bench crate becomes a production dependency.
   later jobs swap only the storage factory. Preserve the real decoder schema gate.
   Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance engine_harness_smoke`
   and the same command filtered to `forge_legacy_decoder_accepts_native_materialized_checkpoint`.
+  Completed: feature-gated file-backed fixtures and on-apply mapping decorator;
+  released engine/testkit factories use volatile PerSession storage. Both named
+  tests pass, including pre-envelope/enveloped real legacy decode and the
+  unchanged runtime schema gate. CI explicitly selects the required feature.
 
-- [ ] **3. Add six-table migration and cascade invariants (≤2 h).**
-  Allocate one `V{NNN}__session_journal.sql` per D4 (unique UTC version at creation).
+- [x] **3. Add six-table migration and cascade invariants (≤2 h).**
+  Allocate one `V{YYYYMMDDHHMM}__session_journal.sql` per D4 (unique UTC version at creation).
   Add session, pin, catalog, pack, bitmap membership and operation_pack tables
   keyed by runtime session id, with session control-generation/revision/epoch columns
   and an indexed `forge_session_id` cascade FK on
@@ -76,6 +80,12 @@ No runtime bench crate becomes a production dependency.
   Per-session metadata/memberships cascade. Test the migration on a
   database that already holds duplicate and NULL runtime_session_id values.
   Focused test: `cargo test -p db --features test-template --test main session_journal_schema::migration_preserves_legacy_and_scoped_packs`.
+  Completed: `V202610200941__session_journal.sql` adds the six tables, ten
+  explicit indexes and in-row guards without rewriting legacy data. The named
+  file-backed upgrade test passes with duplicate and NULL runtime ids, byte-exact
+  legacy rows, strict scoped memberships, cascade checks and surviving packs.
+  Both migration-runner checks, fmt and two-package all-target Clippy pass.
+  Task 2–3 command receipts: `/Volumes/Data/tmp/refactor/c3-t2-3/report.md`.
 
 ## JournalStorage implementation
 

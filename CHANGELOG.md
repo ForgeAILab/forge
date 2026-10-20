@@ -164,6 +164,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
+- Data-preserving session-journal foundation migration: six new tables for
+  session records, pins, catalogs, owned packs, bitmap memberships and operation
+  packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
+  unchanged; native runtime persistence continues using the current stores.
+
 - HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
   registration, login and refresh, with matching logout cleanup.
   REST, web startup and SSE support cookie-only sessions while password-login

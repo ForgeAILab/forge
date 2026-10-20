@@ -166,7 +166,7 @@ The additive migration SHALL preserve existing data and leave protected_agent_se
 - **AND** it never overlays stale legacy data onto an advanced native head
 
 #### Scenario: Data-preserving migration and downgrade
-- **WHEN** the one new V{NNN} migration is applied
+- **WHEN** the one new V{YYYYMMDDHHMM} migration is applied
 - **THEN** it creates the pack schema without editing historical migration files or deleting legacy payloads
 - **AND** an older build refuses the newer database; downgrade uses a pre-upgrade backup
 
