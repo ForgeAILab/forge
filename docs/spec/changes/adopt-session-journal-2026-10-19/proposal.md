@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:47:35Z
+updated_at: 2026-10-20T03:56:23Z
 ---
 
 ## Why
@@ -9,21 +9,31 @@ Forge rewrites, compresses and encrypts complete native session snapshots and
 checkpoints at every persistence barrier. The runtime now has a storage-generic
 `JournalEngine<S>` on unreleased branches; Forge should consume that engine rather
 than implement journal semantics. The reference packed SQLite adapter measured
-fixture B/N=4000 at **1.49096× L2 plain and 1.62353× L2 tool after collection**.
+fixture B/N=4000 at **1.60542× L2 plain and 1.79118× L2 tool**, both with
+collect-at-end and per-turn collection.
 L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
-one-blob assumption. These are S1–S4 reference results with modeled seal lengths;
-S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
+one-blob assumption. These are measured **PerSession S1–S5** results from
+`/Volumes/Data/tmp/refactor/rt-e7/report.md`, with modeled seal lengths and
+within-session domain sharing; Forge chooses independent domain copies and must
+still prove its own real-AEAD/sqlx gate. Per-turn C/N=1000 is **1.27826× L2**;
+the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
 
 ## What Changes
 
 - **Released runtime gate first.** Pin every runtime package and testkit to the
   same immutable revision of **the first agent-runtime release containing
   extract-journal-storage-engine**. Verify the complete trait/receipts, R1–R7,
-  N1/N2 fixes, native-first open, bounded extension reads, engine-owned 64-revision
-  replay pruning and the reviewer's futures-mutex gate correction. No invented
-  version, branch-only production pin or Forge semantic workaround.
+  PerSession/deferred-removal contract, N1/N2 fixes, native-first open, bounded
+  extension reads, engine-owned 64-revision replay pruning, D-1's reader-operation
+  authority check and the reviewer's futures-mutex gate correction. No invented
+  version, branch-only production pin or Forge semantic workaround. The rebased
+  workspace currently pins `1de6d7d` (0.7.0 + U9 groups C/D), not the engine release.
 - **Forge implements only `JournalStorage`.** Two long-lived
   `JournalEngine<ForgeJournalStorage>` instances share one sqlx-backed storage.
+  Create exactly one engine per storage/domain and hand clones to every runtime
+  instance and collector, sharing the memo and lease registry. Configure the
+  measured runtime default of **256 MiB memo charge per engine**; the review saw
+  retained heap up to 1.24× charge, so this is not an RSS cap (design D2).
   The runtime owns validation, projection/re-encoding, leases, closures,
   dependencies, fences, retirement and incremental collection selection. Forge
   supplies SQL enforcement, framing, encryption and lifecycle scheduling.
@@ -33,15 +43,18 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   when implementing; never edit historical migrations or discard user rows.
 - **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack
   (cut at a 1 MiB logical cap); S2 merges geometric tiers after terminal
-  publication and repacks small tiers into capped kind-ordered packs during
-  collection, so a purge rewrites one capped pack, not the session; S3 keeps kind-ordered bodies and prefix/offset indexes inside
+  publication and repacks only fully live packs below 64 KiB or survivor packs
+  purged by that apply during collection; stable large and deferred-dead packs
+  stay sealed. Imports and every repack obey the cap. S3 keeps kind-ordered bodies
+  and prefix/offset indexes inside
   sealed packs (separate index and body units), with full-id verification.
-  Membership bitmaps preserve domain and session isolation; one physical copy per
-  id is shared by all holders, found through a RAM prefix index rebuilt at open
-  from the sealed index units. S4 packs complete original operation
+  Storage declares `JournalBodySharing::PerSession` and deduplicates only within
+  one domain/runtime-session pair; neither sessions nor the two domains share
+  copies. Lazy scoped indexes decode only the requested scope's packs; storage
+  open decodes no pack units. S4 packs complete original operation
   results; the engine selects S5 pruning (inclusive floor current−64 plus the
   current writer epoch's last operation), which storage executes only on an
-  explicit collection directive.
+  explicit collection directive. Serialized operation packs also have a 1 MiB cap.
 - **Keep Forge's cipher and keys.** Real XChaCha20-Poly1305, fresh 24-byte nonce,
   authenticated row binding and existing key material/key_revision. Full object ids
   and prefixes stay inside sealed packs; no per-object HMAC/index is needed.
@@ -54,9 +67,13 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   remain excluded from both domains.
 - **One transaction per apply.** Use `db::begin_immediate` through sqlx, check
   `expect` revision and writer epoch in SQL, stage all components and cuts, commit
-  once. Release the last membership and remove the physical body in that same
-  transaction. Return `JournalApplyReceipt` counts/canonical bytes, not compressed
-  pack savings. Await durable engine controls; no volatile sync polling on Tokio.
+  once. Release membership immediately; sealed packs may retain unserved dead
+  bytes below 25% of canonical body bytes. The apply reaching 25%, an empty scope,
+  or retired-session collection purges them; bounded deletion cleanup drains the
+  deleted session's packs. Return `JournalApplyReceipt` physical copy counts and
+  canonical bytes at removal time, including earlier deferred bytes; clearing
+  bits and moving live bodies count zero. Implement `retained_bytes` including
+  deferred bodies. Await durable engine controls; no volatile sync polling on Tokio.
 - **Lazy, exact-first import.** Keep legacy read/decode methods as the runtime's
   v3 source, including unfinished and snapshot-only sessions. Publish protected
   first when a checkpoint exists, repair partial imports without provider/tool
@@ -69,10 +86,12 @@ S5 is projected there, and Forge must still prove its own real-AEAD/sqlx gate.
   Task sessions. Schedule bounded dirty-session collection, terminal repacking and
   deletion cleanup without a TTL.
 - **Acceptance.** Run `assert_journal_storage_conformance` unedited with repacking
-  off/on and reopened storage, all five Forge-backed broken-storage cases, real
+  off/on and reopened storage, all six Forge-backed broken-storage cases, real
   import/equivalence/crash cuts and named integration checks. Forge's own bench
   runs B/N=4000 through production storage against L2 from the real legacy row;
-  both plain/tool ratios must be ≤2.0× after collection (aim 1.5×).
+  both plain/tool ratios must be ≤2.0× after per-turn collection (aim 1.5×).
+  Report cumulative pack writes and the largest collection-call write alongside
+  WAL/timing/memory evidence; the runtime's measured counters are in design D8.
 - **BREAKING:** the new on-disk schema requires backup-based downgrade; a second
   concurrent writer conflicts; pruned operation replays outside the approved
   64-revision window (inclusive floor plus the current writer epoch's last

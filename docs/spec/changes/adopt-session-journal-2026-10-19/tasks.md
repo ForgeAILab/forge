@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:47:35Z
+updated_at: 2026-10-20T03:56:23Z
 completed_at:
 ---
 
@@ -20,16 +20,20 @@ No runtime bench crate becomes a production dependency.
 ## Release gate and foundations
 
 - [ ] **1. Bump agent-runtime pin to the release containing the engine (gate; ≤3 h).**
-  Forge pins agent-runtime v0.5.0 (`82f5aac`) in agent-host, services and
-  services-agents. The engine release comes after 0.6.0–0.7.0, whose CHANGELOG
-  has Breaking entries. If the workspace is still below the latest pre-engine
-  release when this starts, first land that non-journal upgrade as separate
-  job(s) (1a, each ≤3 h, scoped by the runtime CHANGELOG, no journal adoption).
-  This job (1b) then moves only to the engine release.
+  The rebased workspace Cargo.toml/Cargo.lock already pin agent-runtime
+  **0.7.0 + U9 groups C/D** at `1de6d7d`
+  (`1de6d7d34d2cfe4fc35791bca440932602539cf7` in the lockfile), shared by
+  agent-host, services and services-agents. No separate pre-0.7 upgrade job is
+  needed; this gate moves that pin to the engine release.
   Use the first agent-runtime release containing extract-journal-storage-engine;
   record its actual release/tag and immutable SHA, with one source/revision for all
   runtime packages and testkit. Verify D2 rules 1–7/receipt, N1 compact pins, N2/R4
-  working memo, R5/R6, S5 and reviewer `a49e3e0` futures-mutex fix in that release.
+  working memo, R5/R6, S5, JournalBodySharing::PerSession, the amended 25%
+  deferred-removal/physical-copy receipt rules, retained_bytes, scope-aware
+  conformance, D-1's reader-operation authority check and reviewer `a49e3e0`
+  futures-mutex fix in that release. The supplied runtime source implements D-1
+  despite the older open-decision paragraph in its D5; task 13 uses engine clones
+  for memo/lease reuse regardless.
   Stop subsequent jobs if unavailable; do not implement runtime fixes in Forge or
   invent a version. Update Cargo.toml/lockfile together. Confirm the released S5
   floor/exception and pruning semantics match D4, or correct D4 first.
@@ -51,12 +55,14 @@ No runtime bench crate becomes a production dependency.
   Allocate one `V{NNN}__session_journal.sql` per D4 (unique UTC version at creation).
   Add session, pin, catalog, pack, bitmap membership and operation_pack tables
   keyed by runtime session id, with an indexed `forge_session_id` cascade FK on
-  every per-session table, a non-unique index on
+  every session-metadata/membership table, a non-unique index on
   `agent_session(runtime_session_id)` (never UNIQUE), required indexes and
-  in-row CHECKs. Keep legacy data byte-exact. Per-session rows cascade; an
-  advisory pack owner never cascades shared bodies. Test the migration on a
+  in-row CHECKs. Packs have a strict domain/runtime-session owner, indexed Forge
+  owner label and retained canonical byte count, without an owner cascade so
+  physical deletion stays bounded (D4/D8). Keep legacy data byte-exact.
+  Per-session metadata/memberships cascade. Test the migration on a
   database that already holds duplicate and NULL runtime_session_id values.
-  Focused test: `cargo test -p db --features test-template --test main session_journal_schema::migration_preserves_legacy_and_shared_packs`.
+  Focused test: `cargo test -p db --features test-template --test main session_journal_schema::migration_preserves_legacy_and_scoped_packs`.
 
 ## JournalStorage implementation
 
@@ -64,7 +70,8 @@ No runtime bench crate becomes a production dependency.
   Implement JRPACK v1 as a sealed index unit (sorted four-byte prefix/varint
   directory) plus a sealed zstd-3 body unit of kind-ordered canonical bodies,
   exact full-id/kind verification and bounded decode. XChaCha20-Poly1305 with
-  fresh nonces, existing keys and AAD binding unit kind, pack id and generation.
+  fresh nonces, existing keys and AAD binding unit kind, pack id, generation and
+  owning domain/runtime-session key.
   Derive the AEAD and lookup keys from the master key with HKDF-SHA256 (D3).
   Seal all metadata/operation units; use small catalog/pin HMAC lookup keys, no
   per-object index. Test collisions, malformed offsets, tampering/AAD swaps and
@@ -75,21 +82,30 @@ No runtime bench crate becomes a production dependency.
 - [ ] **5. Lossless read methods and cache consistency (≤3 h).**
   Implement load/objects/members/operation/pins/catalog/dirty_sessions against
   file-backed sqlx. Preserve opaque version/bytes; scalar metadata must agree with
-  authenticated payload. Build the complete global prefix index at open from
-  index units only (D4); batch pack reads, enforce membership on cache hits, use
-  pack generations and a bounded body LRU; refresh across independent
-  connections. Dirty paging sorts runtime session ids. No one-query-per-object/
+  authenticated payload. Explicitly return JournalBodySharing::PerSession;
+  lazily rebuild only the requested domain/session's prefix directory from its
+  sealed index units (D4). Storage open decodes no pack units. Batch pack reads,
+  enforce membership on cache hits, use pack generations and bounded directory/
+  body caches (64 MiB combined charge); refresh the scoped directory across
+  independent connections.
+  Implement retained_bytes with all retained canonical copies including deferred
+  dead bytes, independently per domain. Dirty paging sorts runtime session ids. No one-query-per-object/
   full-closure reread per warm commit.
   Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_storage read_membership_metadata_and_reopen`
-  and the same target filtered to `global_index_dedups_evicted_cross_session_body`.
+  and the same target filtered separately to `session_scoped_lazy_admission_and_reopen`
+  and `retained_bytes_include_deferred_bodies` (include unrelated-session packs,
+  evicted directories, independent domain/session copies and same-scope dedup).
 
 - [ ] **6. Fenced atomic apply and seven cuts (≤3 h).**
   One sqlx begin_immediate transaction/connection; SQL expect guard for existing
-  and absent records, including record=None writes; only a failed fence is
-  StateConflict (never cache staleness or a changed data_version); refresh the
-  global index inside the transaction per D5; persist exactly supplied
+  and absent records, including record=None writes; a failed fence returns
+  StateConflict. Never use cache staleness or a changed data_version as a semantic
+  conflict. Refresh only the written domain/session's pack directory inside the
+  transaction per D5 without using a database-wide invalidation counter;
+  preserve genuine immutable-body conflicts and persist exactly supplied
   revisions/epochs. Stage non-control/checkpoint/batch/head in the specified cut
-  order and publish the final new pack (split at the 1 MiB logical cap). Roll back every pre-commit cut; AfterCommit
+  order and publish the final new pack (split at the 1 MiB logical cap). Roll back
+  every pre-commit cut; AfterCommit
   commits then errors. Invalidate caches on ambiguous outcomes. Emit the D8 apply
   tracing (kind, duration, lock hold, receipt; no contents or ids).
   Focused tests: same storage target filtered separately to
@@ -102,65 +118,88 @@ No runtime bench crate becomes a production dependency.
   Focused test: same storage target filtered to `pins_catalog_stage_restart`.
 
 - [ ] **8. S4 operation packs and S5 directive execution (≤3 h).**
-  Binary-carry 2^tier packs hold lossless complete original results. Implement
+  Binary-carry 2^tier packs hold lossless complete original results, capped at
+  1 MiB of serialized records before compression/sealing; bound overflow segments,
+  import and prune/rebuild output, and reject an oversized record atomically.
+  Implement
   replay lookup/conflicting-input behavior through the engine. Execute only its
   explicit collection pruning directive: keep revision >= floor (floor =
   current−64, inclusive) plus the one highest-revision record whose
   result.writer_epoch equals the post-write record's epoch; prune the rest of
   that domain/session only; rebuild tiers atomically. Test the edge at revision 70
   (floor 6 kept, 5 pruned) and an old current-epoch record below the floor being
-  pruned. Do not prune on commits or copy the bench's unimplemented-S5 refusal.
+  pruned. Do not prune on commits; rt-e7's reference now implements/measures S5.
   Focused tests: same storage target filtered separately to
   `operation_pack_replay_restart` and `engine_replay_window_edges`.
 
-- [ ] **9. Release, physical purge and exact receipts (≤3 h).**
-  Clear only releasing membership bits, deduplicate ids, examine every holder,
-  purge last-membership bodies in that apply, atomically remap all bitmaps and
-  return original canonical lengths/count once. Partial purges work with optional
-  S2 disabled; shared survivors remain readable across domains/sessions/reopen.
-  Focused test: same storage target filtered to `last_membership_receipt_and_partial_pack`.
+- [ ] **9. Release, deferred purge and exact physical receipts (≤3 h).**
+  Clear only releasing membership bits and deny reads immediately, including warm
+  cache hits; deduplicate releases. Keep sealed dead bodies below 25% of canonical
+  body bytes; the apply reaching 25%, scope emptying and retired-session collection
+  purge dead bytes and atomically remap survivors even with S2 disabled. Scan all
+  retired-scope packs, including earlier deferred slots with no new release id.
+  Count physical copies/original canonical lengths only at removal, including
+  previously deferred bodies, once per copy; moving live bodies counts zero.
+  Same-scope re-admission restores a retained slot; independent domain/session
+  copies do not delay reclamation. Reconcile retained_bytes and cumulative receipts.
+  Focused tests: same storage target filtered separately to
+  `deferred_purge_threshold_and_receipts`, `retired_and_empty_scope_force_purge`
+  and `independent_session_domain_copy_receipts`.
 
 - [ ] **10. S2 maintenance and async physical compaction (≤3 h).**
   Add async post_terminal geometric merging (minimum 4 KiB logical tiers), the
-  1 MiB logical pack cap with kind-ordered cuts, collection base repack limited to
-  small tiers and just-purged packs, and membership-preserving compact (one
-  transaction per session or 8 MiB, no full VACUUM, then db::incremental_vacuum).
-  Move every holder bitmap transactionally; retries preserve acknowledged state.
+  1 MiB logical pack cap on imports/admissions/all repacks, collection base repack
+  limited to fully live packs below 64 KiB or fully live survivors just purged by
+  that apply, and membership-preserving compact (one domain/session and at most
+  8 MiB rewritten per transaction, no full VACUUM, then db::incremental_vacuum).
+  Leave stable large and deferred-dead packs sealed; terminal equal-tier pairs
+  must fit the cap. Compact never purges dead bytes outside apply receipt accounting.
+  Move only the owning scope's bitmap transactionally; retries preserve acknowledged state.
   Test-only S2 off/on knobs are not product rollout flags.
   Focused tests: same storage target filtered separately to
-  `terminal_geometric_repack`, `collection_repack_all_holders` and
-  `purge_rewrites_only_capped_pack`.
+  `terminal_geometric_repack`, `collection_repack_eligible_scoped_packs`,
+  `purge_rewrites_only_capped_pack` and `import_and_operation_pack_caps`.
 
 ## Conformance gate
 
 - [ ] **11. Storage conformance in every configuration (≤3 h).**
   Point factories at ForgeJournalStorage. Run unedited
   assert_journal_storage_conformance with S2 off/on and storage reopened at every
-  hydration, real AEAD and file-backed sqlx. This covers protected/ordinary,
-  arbitrary redacting policies, collection/unsupported collection, all receipt,
-  fence, sharing, metadata, paging and restart cases. Use testkit's engine host
+  hydration, all declaring PerSession with independent domain copies, real AEAD
+  and file-backed sqlx. Mandatory purges stay enabled with S2 off. This covers
+  protected/ordinary, arbitrary redacting policies, collection/unsupported collection,
+  fence, independent-copy receipts, deferred removal/retained-byte evidence,
+  metadata, paging and restart cases. Use testkit's engine host
   impl; do not add a Forge collector.
   Focused commands: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance storage_conformance_no_repack`,
   then that command filtered to `storage_conformance_repack`, then
   `storage_conformance_reopen`. Each named wrapper must pass.
 
-- [ ] **12. Five broken-storage negative controls (≤2 h).**
+- [ ] **12. Six broken-storage negative controls (≤2 h).**
   Adapt upstream test-only fault shapes over real Forge storage: torn transaction,
-  lost write, reordered n+1, ignored epoch and shared body unlinked early. Assert
-  the five exact named failures in D6; upstream private test adapters are not
+  lost write, reordered n+1, ignored epoch, a remaining holder's copy unlinked
+  early, and released/deferred bytes served to a non-member. Assert
+  the six named failures in D6; do not flag a valid independent-copy release as
+  early shared deletion. Upstream private test adapters are not
   exported APIs. No defects ship in production.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance broken_storage_`.
 
 ## Cut-over and recovery
 
 - [ ] **13. Shared engine wiring and ordinary projection (≤3 h).**
-  SessionJournals owns shared storage and long-lived engines; advertise both
-  capabilities from the existing store with D2 config and D3 policy. Protect exact
+  SessionJournals owns one engine per storage/domain, handing clones to every
+  Runtime and maintenance/collection path so memo and lease registry stay shared;
+  never construct engines per turn or worker. Configure 256 MiB estimated memo
+  charge per engine (512 MiB total, not a heap bound; review observed up to 1.24×
+  retained heap/charge). Advertise both capabilities from the existing store with
+  D2 config and D3 policy. Protect exact
   recovery, preserve runtime-mandated fields and ordinary-only restore-critical
   values, redact optional sensitive diagnostics. Ephemeral scopes remain empty.
-  Prove memo reuse across per-turn writer changes and cold behavior at restart.
+  Prove memo reuse across per-turn writer changes, shared lease visibility to
+  collection and cold behavior at restart; include zero/small budgets in tests.
   Focused tests: `cargo test -p forge-agent-host --features test-support --test session_journal_runtime native_delta_and_projection`
-  and the same command filtered to `writer_change_memo_and_restart`.
+  and the same command filtered separately to `writer_change_memo_and_restart`
+  and `runtime_and_collector_share_engine_leases`.
 
 - [ ] **14. Scalar DB continuity and hand-over probes (≤2 h).**
   Replace legacy-only DB helpers/callers; published native head or eligible legacy
@@ -220,10 +259,12 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **21. Retention worker and terminal scheduling (≤3 h).**
   Wire the worker and rotation/recovery nudges: 60 s tick, revision grant then
-  protected/ordinary retire, bounded dirty collection (20,000 objects/call, 10 s
-  scheduling budget), S2 terminal hook. Cover replaced sources, active-writer
+  protected/ordinary retire, bounded dirty collection (20,000 membership releases
+  per call, 10 s scheduling budget), S2 terminal hook. Cover replaced sources, active-writer
   conflicts, successor safety, Task completion preservation and crash between
-  domain retirements. All engine controls are awaited. Emit the D8 worker
+  domain retirements, forcing collection of all dead bytes in each retired
+  domain's packs, including deferred bytes below threshold. All engine controls
+  use the task-13 clones and are awaited. Emit the D8 worker
   tracing; an undecryptable session is logged once and skipped, never retired or
   released.
   Focused test: `cargo test -p services-agents --features test-support --test main session_journal_retention::rotation_and_retry`.
@@ -239,20 +280,28 @@ No runtime bench crate becomes a production dependency.
 
 - [ ] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
   Project/Agent/chat deletion cascades session metadata/memberships; nudge cleanup
-  of unheld slots/empty packs: candidates from clear columns in pages of 5,000
-  pack ids, at most 32 packs or 8 MiB rewritten per transaction. Preserve shared holders;
-  test partial pack cleanup and retry after restart, with no synthetic apply receipt
-  for a deletion that happened outside apply. No global tracing collector.
-  Focused test: same retention module filtered to `deletion_preserves_other_pack_holders`.
+  of all deleted-owner packs, including deferred dead bytes regardless of the
+  25% threshold: candidates from indexed owner/orphan columns in pages of 5,000
+  pack ids, at most 32 packs or 8 MiB retained canonical bytes per transaction.
+  Recheck owner/membership under the write lock; preserve every other session's
+  independent copies. Test partial bounded progress and retry after restart,
+  draining the deleted owner without decrypting packs or fabricating apply receipts.
+  No global tracing collector.
+  Focused test: same retention module filtered to `deletion_drains_owned_packs_preserves_other_copies`.
 
 - [ ] **24. Forge measurement harness and smoke (≤3 h).**
   Implement production sqlx/real-AEAD engine fixtures A/B/C and actual legacy L2
   row baseline per D10. Include empty-layout subtraction, file/dbstat agreement,
   identity-policy diagnostic, real production projection, retained legacy overlap,
   before/after collection/retirement, the production cadence (S2 hook and
-  collection after every turn) with cumulative write bytes, storage open time and
-  prefix-index RAM, longest collect gate hold, operation-window and timing/read
-  counters.
+  collection after every turn plus final shutdown sweep), cumulative committed
+  object/operation pack payload+nonce writes and largest single collection-call
+  write (rt-e7 metric), separate WAL bytes and largest single-pack rewrite,
+  lazy session hydration time/bounded scoped-directory cache charge with unrelated
+  sessions present, longest collect gate hold, retained/live/deferred bytes and
+  physical receipts, memo/cache charge/heap/hit/eviction/oversize and timing/read
+  counters. Include C/N=4000 as a report-only supplemental shape; label its
+  collection cadence and do not claim the runtime measured it per turn.
   Preserve exact seeds and cache assertions; JSON output plus Markdown table.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke`.
 
@@ -263,7 +312,8 @@ No runtime bench crate becomes a production dependency.
   collection must each be ≤2.0× actual Forge L2; aim 1.5×. Record D10 performance
   checks, transaction duration and old-plus-new peak. If a gate fails, report it
   and schedule a bounded storage-only fix/recheck; no schema-5 work or baseline
-  manipulation. Publish only actual Forge measurements, not rt-e4 projections.
+  manipulation. Identify rt-e7's measured reference numbers separately; publish
+  only actual Forge measurements as Forge outcomes, never reference projections.
 
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
@@ -271,6 +321,9 @@ No runtime bench crate becomes a production dependency.
   legacy cleanup, approved retirement and the 64-revision replay window
   (inclusive floor plus the current writer epoch's last operation).
   Validate this change's deltas and links; verify no per-object SQL requirement or
-  stale identity/lifetime-replay/4× gate remains outside the verbatim receipt.
+  stale identity/lifetime-replay/4× gate, global-sharing/index requirement,
+  immediate-purge-per-release rule or outdated runtime pin remains outside the
+  verbatim receipt. Keep the one ordinary-diagnostic-redaction question open and
+  the Owner Decisions section unchanged.
   Focused checks: strict spec validation and whitespace/link review. No full code
   suite; reuse the recorded named-test receipts, rerunning only for new changes.

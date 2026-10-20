@@ -1,21 +1,24 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-19T21:47:35Z
+updated_at: 2026-10-20T03:56:23Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
 
-Forge baseline: branch `spec/adopt-session-journal`, `748bee83`. This revision
-replaces the earlier request for a runtime engine and the per-object SQL layout.
-It specifies Forge adoption, not another runtime implementation.
+Forge baseline: branch `spec/adopt-session-journal`, rebased onto `next/v0.14`
+at `07937e73`. Revision 2 follows the runtime's per-session sharing contract and
+measured bounded-purge layout. It specifies Forge adoption, not another runtime
+implementation.
 
 ## Context and evidence
 
 The runtime contract is authoritative in
-[extract-journal-storage-engine](/Volumes/Data/codes/ai/agent-runtime-u9b/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
-especially D2 rules 1–7 and its `JournalApplyReceipt` amendment, D3–D5, D8 and
-Owner Decisions. Implementation references below use `runtime:` for
-`/Volumes/Data/codes/ai/agent-runtime-u9b/`.
+[extract-journal-storage-engine](/Volumes/Data/codes/ai/agent-runtime-u9b-review/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
+especially amended D2 rule 4, D5's per-engine memo and D8.4's measurements.
+Implementation references below use `runtime:` for the read-only
+`/Volumes/Data/codes/ai/agent-runtime-u9b-review/`, branch `integrate/engine`
+at `724d8af`. Runtime Owner Decision Q4 accepts independent per-session copies;
+the earlier Forge review's global-index requirement is withdrawn.
 
 | Evidence | Consequence for Forge |
 | --- | --- |
@@ -23,7 +26,9 @@ Owner Decisions. Implementation references below use `runtime:` for
 | Reviewer commit `a49e3e0` in `/Volumes/Data/codes/ai/agent-runtime-u9b-review` | The engine gate is `futures_util::lock::Mutex`, never a Tokio mutex permit handoff. This correction overrides the older D3 wording in the u9b spec/source snapshot. |
 | `/Volumes/Data/tmp/refactor/rt-e2-review/` findings N1/N2 and F2 | The release gate includes compact pin metadata, the working R4 memo and the gate/control correction; a branch snapshot is not proof these fixes shipped. |
 | `runtime:crates/agent-runtime-journal-bench/src/{packed.rs,schema.sql,codec.rs,metadata.rs}` | Reference for pack framing, bitmaps, transactions and operation tiers; not a production dependency. It uses rusqlite and modeled seal lengths, not a real cipher. |
-| `/Volumes/Data/tmp/refactor/rt-e4/{report.md,measurements.json}` | Actual reference-adapter S1–S4 SQLite bytes; B/N=4000 passes 2.0× L2. S5 remains projected in this report. |
+| `/Volumes/Data/tmp/refactor/rt-e7/{report.md,measurements.json}` and runtime D8.4 | Measured PerSession S1–S5 bytes and pack writes with capped packs and 25% dead-byte purges, at end and per turn. B/N=4000 is 1.60542× L2 plain / 1.79118× tool. |
+| `/Volumes/Data/tmp/refactor/rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. No measurements establish a 128 MiB Forge memo budget. |
+| `runtime:crates/agent-runtime-core/src/journal/engine/{mod.rs,memo.rs}` and `journal/reader.rs` | The supplied source now implements D-1 through `ReadOperation::finish`: check current-head or durable-pin authority once per reader operation and retry via membership-scoped storage on a stale memo view. Runtime design D5's open-decision paragraph and rt-e6-review F2 describe the earlier state. |
 | `/Volumes/Data/tmp/refactor/rt-e1/report.md` and Forge `protected_store.rs` | The idle legacy row contains two sealed blobs in all 13 measured cases (L2), despite checkpoint saves temporarily NULLing the standalone snapshot. |
 
 Today `SqliteProtectedRuntimeStore` implements both `SessionStore` and
@@ -61,8 +66,23 @@ daemons do not open this database. Existing migration files are immutable.
 
 `SessionJournals`, owned by the long-lived protected store/runtime service, holds
 one shared `Arc<ForgeJournalStorage>` and two long-lived
-`JournalEngine<ForgeJournalStorage>` instances. Per-turn Runtime construction
-reuses those engines, so writer changes do not discard their validated-root memo.
+`JournalEngine<ForgeJournalStorage>` instances: exactly one per storage and
+domain. Hand clones of those engines to every Runtime instance, reader, fork path
+and retention/collection worker. Never construct another engine over the same
+storage/domain during the process lifetime. Clones share the validated-root memo
+and the lease registry; a new engine loses both. Writer changes therefore reuse
+warm roots and collection sees the leases used by all runtime instances.
+
+The supplied runtime source now implements D-1: warm reads finish each reader
+operation by checking stored current-head authority or the selected historical
+root's durable pin; a stale view retries through membership-scoped storage.
+`JournalEngine::read`, reader materialization and extension reads use that path
+(`engine/mod.rs`, `engine/memo.rs::ReadOperation`, `reader.rs`). This supersedes
+rt-e6-review F2 and runtime D5's still-historical open-decision paragraph. It is
+source evidence, not a Forge test result or proof of a published release.
+With that check, cloning remains a performance/coordination requirement for
+memo hits and shared lease state; warm-read correctness is not made conditional
+on a host having only one engine. The release gate verifies the check too.
 
 | Forge use | Adoption |
 | --- | --- |
@@ -82,12 +102,17 @@ reuses those engines, so writer changes do not discard their validated-root memo
 same immutable pin of **the first agent-runtime release containing
 extract-journal-storage-engine**. Do not invent a version number or treat the
 unreleased u9b branches as that release. Verify the receipt amendment, R1–R7,
-N1/N2 fixes, native-first open, bounded extension reads, S5 and reviewer gate fix
-in that release. Missing pieces block adoption; they are not Forge engine jobs.
+N1/N2 fixes, native-first open, bounded extension reads, S5, the amended
+PerSession/deferred-removal contract and reviewer gate fix in that release.
+Verify D-1's reader-operation authority check; Forge uses shared engine clones
+regardless.
+Missing pieces block adoption; they are not Forge engine jobs.
 
-The public boundary is `JournalStorage: Send + Sync + Debug + 'static` with these
-async methods. Every result is `Result<…, RuntimeError>`; domain/session arguments
-are borrowed `&JournalDomain` / `&SessionId`.
+The public boundary is `JournalStorage: Send + Sync + Debug + 'static`.
+`sharing()` is synchronous and Forge explicitly returns
+`JournalBodySharing::PerSession` (the trait default is Global). The following
+methods are async. Every result is `Result<…, RuntimeError>`; domain/session
+arguments are borrowed `&JournalDomain` / `&SessionId`.
 
 | Method | Additional arguments | Successful result |
 | --- | --- | --- |
@@ -99,6 +124,7 @@ are borrowed `&JournalDomain` / `&SessionId`.
 | `catalog(domain, session, head)` | `&JournalObjectId` | `Option<JournalCatalogEntry>` |
 | `dirty_sessions(domain, after, limit)` | `Option<&SessionId>`, `usize` | `Vec<SessionId>`, session-id order strictly after cursor; zero limit = empty |
 | `apply(write)` | owned `JournalWrite` | `JournalApplyReceipt` |
+| `retained_bytes(domain)` | — | `Option<u64>`; Forge returns `Some` canonical body bytes physically retained, including deferred dead bytes (D4), not the trait's default `None` |
 | `compact(domain)` | — | `()`; physical work only, no membership change |
 
 DTOs are preserved losslessly, including unknown opaque engine-state versions;
@@ -116,7 +142,7 @@ Forge does not parse private engine metadata or recompute runtime roots.
 | `JournalPinChange` / `JournalCatalogChange` | `Put(record)` or `Remove(id)` |
 | `JournalWriteKind` | `OpenWriter`, `Commit`, `Retire`, `Authorize`, `Pin`, `ReleasePin`, `Stage`, `Collect` (non-exhaustive) |
 | `JournalWrite` | domain, session, kind, `expect: (JournalRevision, u64)`, optional replacement record (`None` = unchanged), object batch, optional operation, pin/catalog changes, `release` ids, optional `prune_operations_before`, optional test `inject` |
-| `JournalApplyReceipt` | `reclaimed_objects: u64`, `reclaimed_bytes: u64`; exactly last-membership bodies physically removed by this acknowledged transaction, bytes = their canonical stored body lengths, not compressed pack or SQLite page bytes |
+| `JournalApplyReceipt` | `reclaimed_objects: u64`, `reclaimed_bytes: u64`; physical body copies removed by this acknowledged transaction, including previously deferred bodies, once per copy at removal time; bytes = canonical encoded lengths before compression/sealing, not pack or SQLite page bytes |
 
 Forge honors the runtime's seven trait rules:
 
@@ -132,10 +158,18 @@ Forge honors the runtime's seven trait rules:
    inside that transaction; packing must not erase the cut boundaries.
 3. **SQL fences.** Compare `expect` inside the write transaction, in SQL, against
    both revision and writer epoch. Absence matches only `(0, 0)`.
-4. **Membership/sharing and receipts.** Immutable id with different bytes
-   conflicts. Add membership for every admitted object, even an existing shared
-   body. Delete a body only with its last membership across all domains/sessions,
-   in that transaction; count it once in the receipt. No deletion = zero receipt.
+4. **Membership/sharing and receipts.** Forge declares PerSession and chooses
+   independent copies per domain as permitted by the runtime. Deduplicate only
+   within `(storage_id, role, runtime_session_id)`; add membership on every
+   admission, including re-admission of a deferred body. An immutable id with
+   different bytes in that scope conflicts. Every held member stays readable;
+   released/non-member bodies are never served, even from a sealed pack/cache.
+   Another session or domain holding the same id does not delay reclaiming this
+   copy. Below 25% dead canonical body bytes a sealed pack may defer removal;
+   the apply reaching 25%, an empty scope, or collection of a retired session
+   purges dead bytes (D4). Deletion cleanup also purges the deleted session's
+   bytes (D8). A receipt counts each physical copy at removal, including earlier
+   deferred bytes; clearing bits and moving live bodies count zero.
 5. **Consistent reads.** Each read observes a completed apply, never a mixture of
    pre-repack bitmaps and post-repack bodies. The engine gates reads feeding a
    write; immutable bodies do not require a transaction spanning trait calls.
@@ -148,11 +182,20 @@ Forge honors the runtime's seven trait rules:
 Construct engines with `JournalEngine::protected(storage, storage_id, config)`
 and `::ordinary(storage, storage_id, policy, config)`. Production config enables
 collection (`collection_enabled = true`) and sets `validated_root_memo_bytes`
-explicitly to 128 MiB **per engine** (256 MiB for both) rather than the runtime
-default of 256 MiB each, because Forge runs two engines in one desktop process.
-D10 reports memo hit rates and resident memory; only that evidence raises it.
-The memo is bounded and process-local; tests also exercise zero/small budgets and
-collection disabled.
+explicitly to **256 MiB per engine**, the runtime default (512 MiB charged for
+both). The rt-e7 measurements used the runtime default; neither that report nor
+rt-e6-review establishes that 128 MiB preserves Forge's warm-root hit rate.
+Reducing it without evidence risks oversize rejection and eviction/cold validation
+across per-turn writers, so this revision removes the unsupported 128 MiB choice.
+This is an estimated charge limit, not a heap/RSS cap: rt-e6-review F3 measured
+retained heap at 1.007–1.240× charge, worst with many small messages. At 1.24×,
+256 MiB charge corresponds to about 317.44 MiB per engine / 634.88 MiB for both;
+this is observed headroom, not a guaranteed bound. Live writer working sets and
+the separate 64 MiB storage cache add to that. Shared layers can instead be
+over-charged, and F4 notes that historical heads from a busy session can evict
+other sessions' current roots. D10 reports charge, actual resident memory,
+oversize/eviction counts and hit rates before any later budget change. Tests
+also exercise zero/small budgets and collection disabled.
 
 The engine owns commit validation, ordinary projection/re-encoding, checkpoint
 floors, replay semantics, sequence/predecessor checks, leases, closures,
@@ -191,13 +234,14 @@ and exact until an exact recovery source exists. Import/resume equivalence tests
 cover that case. Q4 below concerns the extent of additional diagnostic redaction;
 it cannot weaken exact protected recovery or runtime field constraints.
 
-Both domains use the same key and physical pack space, with separate session
-records, pins, catalog and operation packs. A physical pack can contain objects
-held by either domain; the ordinary membership bitmap selects only its projected
-objects. Equal exact/projected bodies share slots. Different projected bodies
-have different runtime ids. The same sharing/deletion invariant holds for another
-session's membership (required by storage conformance). Per-session means the
-admission/repack unit and membership directory, not an exclusive ownership grant.
+Both domains use the same derived encryption-key material but separate packs,
+session records, memberships, pins, catalogs and operation packs. A pack belongs
+to exactly one `(storage_id, role, runtime_session_id)`; equal exact/projected
+bodies have independent physical copies. Forge chooses no cross-domain sharing
+because the domains have different redaction and recovery duties. The runtime's
+PerSession contract permits this choice; its reference shares across domains
+within a session, so its disk numbers are evidence, not a Forge prediction.
+Different sessions never share bodies, indexes or admission lookup candidates.
 
 **Real sealing.** Keep **XChaCha20-Poly1305**, Forge's existing master-key path and
 `key_revision`; do not copy the reference's zero-tag/nonce simulation. Compress a
@@ -209,16 +253,18 @@ pack id plus pack generation (or metadata row key), format revision and key
 revision as associated data. Pack ids are never reused (SQLite `AUTOINCREMENT`);
 a purge rewrite keeps the id and increments `generation`, a merge writes a new
 id. Binding the generation stops a stale ciphertext of the same pack from being
-swapped back in and silently misaligning holders' bitmaps. Shared packs cannot
-bind AAD to one holder's domain/session; singleton metadata does bind its full
-domain/session key. Every rewrite/repack uses a fresh nonce. Seal session, pin, catalog and operation
-payloads too. Decode/authentication errors fail closed; never treat corruption as
+swapped back in and silently misaligning the membership bitmap. Bind each pack
+unit's AAD to its full owning domain/runtime-session key as well; singleton
+metadata also binds its full domain/session key. Every rewrite/repack uses a
+fresh nonce. Seal session, pin, catalog and operation payloads too.
+Decode/authentication errors fail closed; never treat corruption as
 an absent or fresh session. Diagnostics never print decrypted contents or keys.
 
-**Id decision.** Runtime ids remain content digests and are never rewritten.
+**Id decision.** Runtime object ids remain content digests and are never rewritten.
 Four-byte prefixes and offsets live in each pack's **sealed index unit**; full ids
-are recomputed from verified bodies. The process-wide prefix index (D4) is RAM
-only and rebuilt at open from the index units. The old per-object
+are recomputed from verified bodies. Rebuildable RAM lookup directories (D4)
+are scoped to one domain/session and populated lazily on its first object access
+or admission; storage open decrypts no pack index or body. The old per-object
 `HMAC(id)` key and SQL id index are unnecessary: there is no clear digest/prefix
 in the database against which to confirm a guessed message. Encryption alone
 would not protect a clear catalog digest, so the small catalog lookup key remains
@@ -230,8 +276,8 @@ HKDF-SHA256 under distinct labels (`forge/session-journal/aead/v1`,
 XChaCha20-Poly1305 and HMAC. `key_revision` stays 1. Real ids stay in
 sealed metadata. Operation ids/digests/results stay inside operation packs, with
 no per-operation clear hash index. Membership bits and scalar counts expose
-structural sharing/size, not plaintext digest confirmation. AEAD protects content
-and row binding; full runtime-id verification protects lookup correctness.
+structure/size, not plaintext digest confirmation. AEAD protects content and row
+binding; full object-id verification protects lookup correctness.
 
 **Key change.** The master key is SHA-256 of the server JWT secret. Changing or
 losing that secret makes every sealed unit undecryptable, exactly as it does for
@@ -261,9 +307,9 @@ reads never consult a mapping: an unknown runtime id has no rows and reads as
 absent, which the conformance `stranger` cases require. Dirty paging returns
 runtime ids in runtime-id order, never Forge UUIDs.
 
-Every per-session table also has `forge_session_id TEXT NOT NULL REFERENCES
-agent_session(id) ON DELETE CASCADE`, used only for cascades and host probes,
-with an index on that column in every per-session table (SQLite otherwise scans
+Every session-metadata/membership table also has an indexed `forge_session_id`
+column, `TEXT NOT NULL REFERENCES agent_session(id) ON DELETE CASCADE`, used only
+for cascades and host probes (SQLite otherwise scans
 the child table on each `agent_session` delete). `agent_session.runtime_session_id`
 is nullable, not unique and not indexed today. The migration adds a plain
 **non-unique** index on it, never a UNIQUE index that would fail on an existing
@@ -282,14 +328,17 @@ example `atomic-{point:?}`) that change upstream.
 | `agent_session_journal_session` | PK `(storage_id, role, runtime_session_id)`; indexed `forge_session_id` FK; revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
 | `agent_session_journal_pin` | PK `(D, S, pin_key)`; session FK; key/format/nonce | Complete `JournalPinRecord`, including roots and opaque state; Put/Remove only through apply. |
 | `agent_session_journal_catalog` | PK `(D, S, head_key)`; session FK; key/format/nonce | Complete `JournalCatalogEntry`; `head_key` is keyed as in D3, not the raw digest. |
-| `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); admission/repack owner label, generation, key/format, object/logical-byte counts | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit; bodies live until their last global membership. Owner label is advisory, **not** a cascading FK that could destroy another holder's bytes. |
+| `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); strict owner `(D, S)` plus indexed `forge_session_id` label; generation, key/format, object/retained-canonical-byte counts; index on `(D, S, pack_id)` | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit. One domain/session owns all slots; no cross-domain/session holder is valid. Pack owner labels have no cascading FK so deletion cleanup can be bounded. Retained bytes include deferred dead slots. |
 | `agent_session_journal_membership` | PK `(D, S, pack_id)`; session FK and pack FK; bitmap; secondary index on pack_id | One bit per prefix-directory slot. No object id, per-object row or offset index in SQL. Remove empty bitmap rows. |
 | `agent_session_journal_operation_pack` | PK `(D, S, tier)`; session FK; key/format/nonce | S4 lossless original operation records in binary-carry tiers, including private digest, revision and complete result head. |
 
 Session, pin, catalog, membership and operation-pack rows cascade from
-`agent_session`; pack rows do not. Deleting a session must not delete a shared
-pack. A bounded post-deletion cleanup purges slots no membership holds and removes
-empty packs, preserving any other holder (D8). In-row invariants have CHECKs:
+`agent_session`; pack rows do not. Packs are exclusively owned, but intentionally
+outlive the row deletion until bounded post-deletion cleanup removes them (D8).
+Their runtime id and Forge owner labels remain available after the cascade;
+membership rows cannot refer to a pack owned by a different domain/session.
+An apply checks that owner and mapping inside its transaction. In-row invariants
+have CHECKs:
 `has_checkpoint` is false without a published head and on retirement, and a
 bitmap is non-empty. Bitmap length against the pack's slot count spans two
 tables, which a SQLite CHECK cannot express, so storage validates it on every
@@ -311,31 +360,32 @@ id, never accept the prefix alone. Kind is checked from the canonical envelope,
 not trusted from the batch's clustering hint. No canonical object, reference or
 `JOURNAL_SCHEMA_VERSION` changes.
 
-**Global body index (required by rule 4).** Storage keeps exactly one physical
-copy of each runtime id across all domains and sessions. Testkit
-`membership_isolation_and_receipts` admits one body under four holders in two
-sessions and expects zero receipts until the fourth release, so per-session
-copies fail conformance, and admission must find an existing body anywhere in
-the database, including packs of other sessions that are not in the plaintext
-LRU. At storage open, Forge decrypts every pack's index unit (never the body
-units) and builds a complete process-wide RAM map from prefix to
-`(pack_id, generation, slot)`, stored as compact sorted arrays (about 10–16 B per
-object). Admission looks up each new id's prefix. For each candidate it opens
-that body unit through the LRU, verifies the complete id and sets a membership
-bit; only a verified miss writes the body into the apply's new pack. A
-duplicate admission with different bytes cannot pass, because admission
-validates `JournalObject::kind()`, which rechecks the id digest. The map is
-consulted only under the storage coordinator inside the write transaction (D5)
-and is updated from that transaction's staged changes after COMMIT. No clear id,
-prefix or keyed per-object tag is stored in SQL. A keyed 8-byte tag per slot was
-rejected: B/N=4000 holds 28–32 k objects, about 0.19× L2 of extra disk. The
-reference's alternative, decoding every pack in the database at open and again
-after every `data_version` change, is not acceptable on users' databases. D10
-reports open time and index RAM.
+**Session-local admission and lazy lookup.** `sharing()` explicitly declares
+`JournalBodySharing::PerSession`. Forge further keeps the two domains separate:
+deduplication, prefix candidates, new packs and maintenance are scoped to `(D, S)`.
+No cross-session or cross-domain admission lookup occurs. Testkit branches
+`membership_isolation_and_receipts` on that declaration and accepts independent
+domain copies; the old zero-until-fourth-holder global requirement no longer
+applies to Forge.
+
+Opening storage and loading scalar/session metadata decode no pack units.
+The first object lookup, membership inventory or admission lazily reads only the
+requested domain/session's pack directory, using its indexed owner key. Rebuild
+that scope's bounded RAM prefix/offset directory from its sealed index units;
+load candidate body units through the bounded LRU and verify full ids/bytes.
+An identical admitted body already in that scope, including an unserved deferred
+slot, reuses its slot and sets membership; a verified miss adds one new copy.
+Different bytes for an existing id conflict, and `JournalObject::kind()` verifies
+the id digest and kind on admission. Other sessions and the other domain keep
+independent copies even for identical ids. Per-scope directory caches are
+evictable and generation-checked; no database-wide body map is built. Update
+caches only after COMMIT (D5). No clear id, prefix or keyed per-object tag is
+stored in SQL. As in the reference's lazy `pack.owner` lookup, opening one
+session does no work proportional to all other sessions' packs.
 
 **Atomic apply and SQL fence.** Use one sqlx `db::begin_immediate` transaction for
 all components of a `JournalWrite`. For an existing row, an SQL guard with
-`WHERE storage_id = ? AND role = ? AND session_id = ? AND revision = ? AND
+`WHERE storage_id = ? AND role = ? AND runtime_session_id = ? AND revision = ? AND
 writer_epoch = ?` must match, including writes with `record = None`. For an absent
 row, only `expect = (0, 0)` plus a checked SQL absence guard matches. No unchecked
 upsert may overwrite a concurrent writer. Apply record replacement exactly as the
@@ -350,44 +400,68 @@ transaction. Commit once; update shared caches only after success. On rollback o
 ambiguous commit acknowledgement, invalidate affected caches and reload. The
 SQL fence is required even with an in-process gate and `runtime.lock`.
 
-**Membership deletion and receipt.** Clear the releasing domain/session's bits,
-deduplicating repeated release ids. Union every holder's bitmap for each touched
-pack. A body whose union bit remains set is kept and counted zero. When the last
-bit disappears, remove its bytes by rewriting/resealing the partially live pack
-or deleting an empty pack **in the same apply**, and remap every holder's bitmap.
-Return the exact count and original canonical lengths of those removed bodies.
-This purge is mandatory even with optional S2 repacking disabled. Do not return
-compressed-byte savings, merely cleared membership counts or anticipated VACUUM
-savings in `JournalApplyReceipt`.
+**Membership deletion, deferred purge and receipt.** Clear only the written
+domain/session's bits, deduplicating repeated release ids. Read authority ends
+immediately, including on cache hits. For each touched sealed pack, compute
+`dead_bytes / retained_body_bytes` from canonical encoded lengths of unheld slots
+and all physically retained slots, before compression/sealing. Below **25%**,
+leave the ciphertext sealed and return zero for the deferred copies. The apply
+that reaches **25% or more** rewrites/reseals that pack without all dead slots,
+increments its generation and atomically remaps its membership bitmap; delete
+empty packs. An empty `(D, S)` scope purges all its dead bytes. Collection of a
+retired session scans all its domain-owned packs and forces the same purge even
+below 25%, including dead slots from prior applies with no newly released id.
+Held slots remain readable. These purges are mandatory with S2 off or on.
+
+Return the exact physical copy count and sum of original canonical encoded
+lengths removed in this acknowledged apply, including previously deferred slots,
+once per copy. Independent session/domain copies are counted independently.
+Merely clearing bits, re-admitting a retained slot, moving live bodies and
+reclaiming SQLite pages count zero. Optional maintenance does not silently remove
+deferred bodies outside this receipt path; deletion cleanup is separately
+accounted because it is outside apply (D8).
+
+**Retained-byte evidence.** Implement `retained_bytes(domain) -> Some(bytes)` as
+the sum of canonical body lengths still physically stored in that domain's
+owned session packs, including deferred dead slots, each copy once. Maintain
+the per-pack retained-byte count atomically and verify it on pack decode; use a
+consistent read snapshot. Since Forge does not share across domains, the other
+domain's copies are excluded. This diagnostic does not include metadata,
+operation records, ciphertext overhead or SQLite pages, never grants read
+authority and never decides liveness. GC evidence compares its before/after
+difference with physical apply receipts, so deferred bytes cannot disappear from
+the accounting simply because membership bits were cleared.
 
 **S2 repacking and rewrite cost.** A Forge post-terminal hook runs async storage
 maintenance, in its own transaction through the coordinator, after terminal
 publication succeeds. Merge equal logical-byte tiers (minimum 4 KiB), carrying
 merges geometrically. **Cap every pack at 1 MiB of logical body bytes.** This is
-an initial storage constant, tuned only through D10. Merges and the base repack
-cut kind-ordered output at the cap, so volatile kinds (heads, batches,
-checkpoints, cache plans, manifests) and stable history land in different packs.
-A purge then rewrites at most its own capped pack, never the whole session.
-Collection's base repack folds the small geometric tiers and the packs it just
-purged into capped kind-ordered packs; it does not rebuild capped packs without a
-released slot.
+the storage cap verified by D10. Imports, admissions, purge
+rewrites and all repacks obey the cap; reject an individual body above it
+atomically. Merges and the base repack cut kind-ordered output at the cap, so
+volatile kinds (heads, batches, checkpoints, cache plans, manifests) and stable
+history land in different packs.
+A purge rewrites only its touched capped packs, never a whole-session base pack.
+As in the amended reference, collection's base repack selects **only fully live
+packs below 64 KiB**, or fully live survivor packs already purged by that apply.
+Stable large packs and packs containing deferred dead slots stay sealed; merging
+the latter could concentrate dead bytes above 25% in an output pack. Terminal
+equal-tier merges likewise select fully live inputs and only merge a pair whose
+combined logical bytes fit the 1 MiB cap. Every move remaps the owning `(D, S)`
+bitmap atomically, without touching another scope.
 
-Without these bounds, the reference behavior rewrites the whole session on every
-collection. It keeps one base pack per session, rebuilds it whenever more than
-one pack exists, and the mandatory purge rewrites it whenever any of its bodies
-dies. Collection is nudged after every terminal turn, so that is O(N) bytes per
-turn and O(N²) over a session. Neither rt-e4 nor the gate exercised it: rt-e4
-collected once at the end, and fixture B has two turns.
-
-Every move atomically updates **all** holders' bitmaps, including other
-domains/sessions. Repack changes physical placement only; the engine alone
+The rt-e7 measurements exercise collection per turn and show bounded pack writes
+instead of the earlier whole-history rewrite behavior (D8). Retain the per-turn
+collection nudge. Repack changes physical placement only; the engine alone
 decides liveness. A failed terminal hook is retryable maintenance and cannot undo
 an acknowledged turn.
 
 **Compaction and vacuum.** The reference `compact(domain)` repacks every session
 of the domain in one transaction and then runs a full `VACUUM`. Forge bounds it:
-one transaction per session or per 8 MiB of rewritten logical bytes, no full
-`VACUUM`, then the existing `db::incremental_vacuum`. That helper is a no-op
+one domain/session and at most 8 MiB of rewritten logical bytes per transaction,
+no full `VACUUM`, then the existing `db::incremental_vacuum`. Compact merges only eligible
+fully live packs; deferred bodies stay on the apply/retirement purge path so no
+physical body removal escapes receipt accounting. That helper is a no-op
 unless the database has `auto_vacuum = INCREMENTAL`, which only databases created
 empty by a recent Forge have. On older databases, later writes reuse freed pages,
 but the file does not shrink until the operator runs the existing offline
@@ -395,8 +469,12 @@ conversion. Full `VACUUM` stays an isolated measurement step, never a turn or
 worker operation. D10 reports freelist pages and file length separately.
 
 **S4/S5 operations.** Appending an operation merges equal-count `2^tier` packs
-(binary carry) in the apply transaction; original operation/digest/result fields
-round-trip exactly. Identical replay returns the original head within the retained
+(binary carry) in the apply transaction, capped at **1 MiB of serialized operation
+records before compression/sealing**, including import and prune/rebuild output.
+If a carry would exceed the cap, leave the full segment sealed and allocate an
+overflow segment outside the carry tiers (reference keys start at tier 64);
+reject an individual oversized record atomically. Original operation/digest/result
+fields round-trip exactly. Identical replay returns the original head within the retained
 window; different input conflicts. The **engine** selects S5 pruning during
 collection and passes an **inclusive** floor:
 `prune_operations_before = current_revision.saturating_sub(64)` (runtime
@@ -411,10 +489,10 @@ current-epoch record below the floor is pruned; the exception is one record, not
 the whole epoch. Rebuild operation tiers atomically in the same apply. Execute
 pruning only when the directive is supplied; Forge invents no TTL or independent
 replay floor and never prunes during commit. A pruned replay returns
-`StateConflict` and cannot apply again. The reference's S4 code currently
-rejects pruning: production must implement the released directive, not copy that
-refusal or claim its S5 projection is measured behavior. If the released runtime
-states a different floor or exception, its text and conformance win and this
+`StateConflict` and cannot apply again. The rt-e7 reference implements S5 and
+measures retained tiers after actual pruning; it is no longer a projection.
+If the released runtime states a different floor or exception, its text and
+conformance win and this
 section is corrected in task 1.
 
 ### D5. Forge adapter and engine-call mapping
@@ -457,7 +535,10 @@ with suspended storage and competing maintenance/open operations.
 **Read/cache consistency.** Batch pack reads, not one SQL/decrypt per object.
 Reads go from the reading session's membership rows to those packs' index units
 (cached by pack id and generation), then verify the full id. Keep a bounded
-plaintext body LRU (initially 64 MiB) and reuse the engine's separate R4 memo.
+plaintext body/directory LRU (initially 64 MiB combined charged bytes) and reuse
+the engine's separate R4 memo. Charge retained scoped-directory entries as well
+as decoded bodies, evict idle scope directories, and do not retain an entry
+larger than that budget; transient per-call decode memory is separate.
 Check membership on every request, including cache hits. Each trait read runs
 in **one** read transaction on one pooled connection, so bitmaps, generations
 and units come from the same WAL snapshot. Cache keys include pack id and
@@ -468,14 +549,17 @@ generation, so a rewrite never serves old slots.
 subsystems write the same file through the same pool all the time, so it would
 invalidate on every unrelated write. The reference's response, returning
 `conflict()` from `apply`, would surface as `StateConflict` and fail the turn.
-Only a failed `expect` fence is `StateConflict`. Inside each write transaction,
-after `BEGIN IMMEDIATE`, storage refreshes the global prefix index
-incrementally. It loads index units for pack ids above its cached high-water mark
-(the pack table's `AUTOINCREMENT` value in `sqlite_sequence`). Every admission
-candidate is re-read in that transaction: a missing row or a different
-generation reloads that pack's index unit before deciding. The write lock is
-held throughout, so nothing changes during the refresh. This keeps an
-independently opened storage correct without a database-wide counter.
+Fence failures and genuine runtime contract conflicts remain typed conflicts;
+cache staleness never is. Inside each write transaction,
+after `BEGIN IMMEDIATE`, storage refreshes only the written `(D, S)` directory
+from that owner's pack ids and generations. Remove missing rows, load index units
+for new/changed rows, and re-read each admission candidate in that transaction
+before deciding; an evicted scope rebuilds lazily from the same owner query.
+The write lock is held throughout, so nothing changes during the refresh. This
+keeps an independently opened storage correct without a database-wide counter,
+global high-water mark or another session's index. Reads similarly validate their
+scoped directory against their one WAL snapshot; cache staleness causes refresh
+or retry, not a semantic conflict.
 Production journal mutations go through one storage coordinator per process
 (`runtime.lock` excludes other processes). Cascaded membership deletions need no
 cache invalidation because membership is read from SQL on every request. No
@@ -506,18 +590,22 @@ self dev-dependencies, or a test-local support module.
 
 Run all reference configurations: (1) S2 repacking disabled, (2) enabled,
 (3) storage reopened on every engine hydration over the same file, plus fresh
-engine recovery. Collection disabled/enabled and arbitrary ordinary policies are
+engine recovery. Every production-storage configuration declares PerSession with
+independent domain copies; disabling S2 never disables threshold/retirement
+purges. Collection disabled/enabled and arbitrary ordinary policies are
 covered by the suite; exercise cold/evicted/warm R4 budgets in Forge tests. Do not
 replace file-backed restart evidence with only `sqlite::memory:` tests.
 
 The suite includes primitive apply cuts, both fences, opaque metadata/body
-conflicts, ordered dirty paging, membership isolation and receipts, cross-domain
-and cross-session last-membership sharing; protected/ordinary journal suites;
+conflicts, ordered dirty paging, membership isolation and scope-dependent
+receipts, independently reclaimable session/domain copies, bounded deferred
+deletion and exact cumulative receipts on scope emptying; protected/ordinary
+journal suites;
 collection, ordinary shared suffix and projected intent; and unsupported
 collection. Forge does not reimplement `JournalCollectionHost` semantics: testkit
 already implements it for `JournalEngine<S>`.
 
-Run all five deliberately broken-storage cases using Forge-backed test-only
+Run all six deliberately broken-storage cases using Forge-backed test-only
 fault decorators, preserving the upstream named expected failures:
 
 | Defect | Required named rejection |
@@ -527,6 +615,15 @@ fault decorators, preserving the upstream named expected failures:
 | Reordered n+1 publication | `journal_storage::restart_commit_sequence` |
 | Ignored writer epoch | `journal_storage::writer_epoch_fence` |
 | Shared body deleted with another holder | `journal_storage::shared_body_last_membership` |
+| Released/deferred body served to a non-member | `journal_storage::membership_isolation_and_receipts` or `journal_storage::bounded_deferred_deletion`, matching the injected path |
+
+For the premature-deletion decorator, deliberately damage the surviving scope's
+independent copy; a correct PerSession release in A must never be labeled faulty
+just because B holds the same id. Add Forge-specific assertions that two domains
+and two sessions retain separate copies and can each reclaim them, while every
+remaining holder opens successfully. GC byte evidence uses Forge's
+`retained_bytes`, including unserved deferred bytes. Do not force Global receipt
+expectations on this adapter or add a Global product mode.
 
 The upstream broken adapters are test-only, not exported APIs. Adapt their fault
 shapes over Forge storage in Forge tests; a suite passing the broken backend is
@@ -614,25 +711,32 @@ Each tick also collects dirty sessions in both domains, initially
 budget between calls/batches rather than claiming to preempt synchronous CPU
 inside one engine call. The engine holds its write gate for the whole `collect`
 call (runtime `collect_inner`), so every commit and open in that domain waits. The
-call visits every dirty session; it is bounded by released objects, not by
-sessions or time. The 10 s budget therefore bounds the worker loop, not the gate
-hold. D10 measures the longest collect call with many dirty sessions. Above 1 s it
+call visits every dirty session; max_objects bounds membership releases, not
+previously deferred physical copy/byte removals, sessions or time. The 10 s
+budget therefore bounds the worker loop, not the gate hold.
+D10 measures the longest collect call with many dirty sessions. Above 1 s it
 is a release-review blocker and a runtime follow-up (a per-call session or time
-bound); Forge does not page sessions around the engine. Engine collection owns live-closure calculation, pin and
+bound); Forge does not page sessions around the engine. Engine collection owns
+live-closure calculation, pin and
 root-epoch checks, catalog release, dirty clearing and S5. Storage executes
 release/receipt accounting and S2 pack work. Live sessions are collected too;
 superseded checkpoint/cache/manifest paths otherwise accumulate. Post-terminal
 hooks nudge collection and perform geometric S2 maintenance; collection performs
 the base repack. No TTL, object age rule or new runtime schema is introduced.
 
-Project/Agent/chat deletion cascades per-session records and memberships. Nudge
-bounded physical cleanup to purge unheld slots and empty packs, preserving any
-other domain/session holder. Find candidates without decryption, in pages of up
-to 5,000 pack ids. A candidate is a pack with no membership row, or a pack whose
-holders' union bit count is below its clear `object_count`. Rewrite or delete at
-most 32 packs or 8 MiB of logical bytes per transaction. This path is
-explicit session deletion, not an alternate tracing collector. Tombstone records
-remain until their `agent_session` is itself deleted. Retirement does not promise
+Project/Agent/chat deletion cascades per-session metadata and memberships. After
+commit, nudge bounded physical cleanup to remove **all** packs owned by the
+deleted Forge session, including below-threshold deferred bytes; no other
+domain/session can hold those packs. Find owner/orphan candidates without
+decryption in pages of up to 5,000 pack ids. A candidate has a deleted owner or no
+membership row; recheck ownership and absence of membership under the write lock
+before deleting. Delete at most 32 packs or 8 MiB of retained canonical bytes per
+transaction and resume after restart until drained. Never reapply the 25%
+threshold to deletion cleanup. Other sessions' independent copies remain intact.
+This path is explicit session deletion, not an alternate tracing collector.
+It emits physical copy/byte totals separately, never a synthetic engine apply
+receipt for removal outside apply. Tombstone records remain until their
+`agent_session` is itself deleted. Retirement does not promise
 zero disk bytes: tombstones, in-window replay results and any valid
 pins can remain. Measure these separately.
 
@@ -641,35 +745,67 @@ pins can remain. Measure these separately.
 ids or keys. Events cover:
 
 - each apply's kind, duration, write-lock hold and receipt;
-- S2, compact and cleanup rewritten packs and bytes;
-- collect reports and gate hold;
+- S2, compact and cleanup rewritten/deleted packs and bytes;
+- collect reports and gate hold, canonical retained/live/deferred bytes, and
+  cumulative physical receipt totals separate from membership releases;
+- lazy directory/body loads and cache charge, hits, misses and eviction counts;
 - retirement outcomes and conflicts;
 - decrypt/authentication failures, logged once per session.
 
 Long write holds also surface through `db::begin_immediate`'s existing
 5-second warning. No API, event payload or metrics endpoint changes.
 
-The actual reference table below replaces the previous logical 3.8×/4× estimates.
-Full A/B/C and N=100/1000/4000 results are in rt-e4 and runtime D8.4; this selection
-shows both the release gate and the small-message lower bound.
+The actual **PerSession S1–S5** reference tables below replace the earlier S1–S4
+results and S5 projections. Source: [rt-e7 report](/Volumes/Data/tmp/refactor/rt-e7/report.md),
+[raw measurements](/Volumes/Data/tmp/refactor/rt-e7/measurements.json) and runtime
+D8.4. Collection once at the end (selected rows):
 
 | Reference fixture | N | Turn | Legacy L2 bytes | Pack bytes before / after collection | After / L2 |
 | --- | ---: | --- | ---: | ---: | ---: |
-| A | 1000 | plain | 53,248 | 344,064 / 303,104 | 5.69231× |
-| A | 4000 | plain | 204,800 | 1,126,400 / 1,089,536 | 5.32000× |
-| A | 4000 | tool | 208,896 | 1,155,072 / 1,089,536 | 5.21569× |
-| B | 100 | plain | 40,960 | 135,168 / 86,016 | 2.10000× |
-| B | 1000 | plain | 335,872 | 606,208 / 540,672 | 1.60976× |
-| B | 4000 | plain | 1,359,872 | 2,244,608 / 2,027,520 | 1.49096× |
-| B | 4000 | tool | 1,392,640 | 2,469,888 / 2,260,992 | 1.62353× |
-| C | 1000 | tool | 942,080 | 10,514,432 / 1,675,264 | 1.77826× |
+| A | 1000 | plain | 53,248 | 344,064 / 311,296 | 5.84615× |
+| A | 4000 | plain | 204,800 | 1,208,320 / 1,179,648 | 5.76000× |
+| A | 4000 | tool | 208,896 | 1,224,704 / 1,179,648 | 5.64706× |
+| B | 100 | plain | 40,960 | 135,168 / 102,400 | 2.50000× |
+| B | 1000 | plain | 335,872 | 622,592 / 577,536 | 1.71951× |
+| B | 4000 | plain | 1,359,872 | 2,387,968 / 2,183,168 | 1.60542× |
+| B | 4000 | tool | 1,392,640 | 2,719,744 / 2,494,464 | 1.79118× |
+| C | 1000 | tool | 942,080 | 11,993,088 / 1,228,800 | 1.30435× |
 
-These are **measured S1–S4**, real SQLite pages and zstd with modeled nonce/tag
-lengths, not real AEAD or Forge integration. C retains 4,002 lifetime operations;
-S5 was not implemented there. Its 879,286 B / 0.93335× payload-delta projection is
-optimistic; the report's proportional estimate is 935,498 B / 0.99301×. Neither
-is a measured S5 result. B/tool misses the optional 1.5× aim while meeting 2.0×.
-A's tiny-message overhead is report-only, not a reason to add schema 5.
+Collection **after every turn**, plus a final sweep after shutdown (all measured
+per-turn rows):
+
+| Fixture | N | Turn | L2 bytes | Final bytes | Final / L2 | Cumulative pack writes | Largest collection write |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| B | 1000 | plain | 335,872 | 577,536 | 1.71951× | 845,627 | 33,297 |
+| B | 1000 | tool | 339,968 | 622,592 | 1.83133× | 1,491,335 | 288,771 |
+| B | 4000 | plain | 1,359,872 | 2,183,168 | 1.60542× | 3,057,083 | 313,815 |
+| B | 4000 | tool | 1,392,640 | 2,494,464 | 1.79118× | 3,540,392 | 323,123 |
+| C | 1000 | tool | 942,080 | 1,204,224 | 1.27826× | 144,922,993 | 368,800 |
+
+The supplemental **C/N=4000 collect-at-end** run measured **4,886,528 bytes /
+1.22863× L2** (L2 = 3,977,216), cumulative pack writes **487,612,606 bytes** and
+largest collection write **9,208,323 bytes**. This last number is a whole
+collection call across multiple capped packs, not one oversized pack. No
+C/N=4000 per-turn result is claimed. Actual S5 pruning reduces C/N=1000 operation
+results from 4,002 to 130, and C/N=4000 from 16,002 to 130.
+
+For B/N=4000, collect-at-end and per-turn both measure **1.60542× plain /
+1.79118× tool** (about 1.61× / 1.79×). Both pass the reference 2.0× gate and
+both miss the optional 1.5× aim. B's per-turn cumulative pack writes grow 3.615×
+plain / 2.374× tool for a 4× increase in N; C/1000 has 250 measured turn samples.
+The reference reports O(N) writes in admitted bytes for these bounded fixtures,
+not whole-history rewrites per turn. Keep Forge's per-turn collection cadence.
+
+Pack-write counters include committed object/operation payloads and nonces,
+including intermediate rewrites; they exclude metadata, SQLite page/WAL overhead
+and VACUUM. Largest collection write is the largest per-domain collect-call
+counter delta. Final physical sizes include all persisted tables after
+checkpoint/VACUUM and empty-schema subtraction. These are measured SQLite/zstd
+S1–S5 results with modeled seal lengths, **not Forge integration or real AEAD**.
+The reference also shares equal bodies between a session's domains while Forge
+does not; do not project its ratio onto Forge. Forge must still pass D10 through
+production storage. A's tiny-message overhead stays report-only; schema 5 stays
+out of scope.
 
 ### D9. Rollout and documentation
 
@@ -713,9 +849,11 @@ Reuse the fixed seeded fixture definitions and cache assertions from the runtime
 bench: A tiny seeded messages; B realistic 100–800 B user text, 200–2000 B assistant
 text and 0.5–8 KiB tool JSON, N=100/1000/4000, plain and tool two-turn shapes;
 C grows to 1000 messages over 250 tool turns with a new writer per turn and a
-32-manifest window. Do not tune the seed/content to the gate. Record the ordinary
-projection used; report an identity-policy diagnostic for comparison with rt-e4
-without making identity the production policy.
+32-manifest window; report the supplemental N=4000/1000-writer-epoch shape too.
+Do not tune the seed/content to the gate. Record the ordinary projection and
+independent-domain-copy policy; report an identity-policy diagnostic for
+comparison with rt-e7 without making identity the production policy or treating
+the reference's within-session domain sharing as Forge's layout.
 
 For each case, create isolated file DBs with the same Forge schema/session setup:
 
@@ -742,8 +880,11 @@ For each case, create isolated file DBs with the same Forge schema/session setup
    until next-release cleanup or count stale legacy data as a pack saving.
 5. **Production cadence:** run C and both B variants with the production
    schedule: the S2 hook after every terminal turn and a collection after every
-   turn, as the worker nudge does. Report cumulative bytes written (WAL frames ×
-   page size), the largest single pack rewrite and the final physical size,
+   turn, as the worker nudge does, plus a final sweep after shutdown. Report
+   cumulative committed object/operation pack payload + nonce writes and the
+   largest single collection-call write by that same counter, matching rt-e7.
+   Separately report cumulative WAL frame bytes (frames × page size), the largest
+   single pack rewrite and the final physical size,
    against the legacy store's cumulative writes for the same run. The
    post-collection gate ratio is taken after this cadence, not only after one
    final collection.
@@ -756,13 +897,15 @@ the Forge gate blocks adoption even if the reference passed. Adjust only
 storage-level packing/compression/collection; do not silently introduce schema 5
 or change the denominator, projection, seed or acceptance threshold.
 
-Also report storage open time and global prefix-index RAM (and both
-extrapolated to 1M and 5M objects), per-turn bytes/WAL, turn/open/probe/import
-wall time, longest write
+Also report lazy session hydration time and bounded session-directory/body-cache
+charge with many unrelated sessions present, per-turn pack bytes/WAL,
+turn/open/probe/import wall time, longest write
 transaction, longest `collect` call (engine gate hold) with 100 dirty sessions,
 geometric-merge write amplification, freelist pages, engine object counters,
-last-membership receipt totals versus physical file savings, memo/cache hit/read
-counts and post-retirement metadata/operation bytes. Retain the existing focused
+physical-copy receipt totals and canonical retained/live/deferred byte differences
+versus file savings, memo/cache charge/hit/read/eviction/oversize counts and
+resident memory (including the observed 1.24× charge headroom), and
+post-retirement metadata/operation bytes. Retain the existing focused
 performance checks: for N≥1000 delta writes ≤10% of legacy writes, measured at
 the production cadence above including S2 and purge rewrites; N=100 native
 turn time ≤legacy+10%, larger N below legacy; import ≤2× one legacy resume.
@@ -779,25 +922,31 @@ not claim Forge has run or passed it.
 - Validation/policy CPU can still be O(N); R4 avoids repeated cold closure reads
   across writers, not all per-commit materialization. Warm-runtime work is out of
   scope. Pack/base-repack latency and the two memo budgets need measurement.
-- Both logical domains remain encrypted; physical sharing can expose equality
-  relationships and sizes. No clear content digest is stored. Key rotation remains
+- Both logical domains remain encrypted; membership bits and scalar counts expose
+  structure and sizes. No clear content digest is stored. Key rotation remains
   unsupported as today; key_revision is recorded on every sealed unit.
 - Lazy import temporarily retains old and new bytes. Disk reports show that peak
   separately; next-release cleanup is required to remove the legacy table.
-- Shared slots require global last-membership accounting and atomic bitmap remaps.
-  Receipts, independent-connection tests and all conformance configurations gate it.
-- One copy per id needs a complete RAM prefix index of every pack. Open time and
-  memory grow with the total object count, not the active sessions; D10 measures
-  and extrapolates both. The runtime's own Owner Decision Q4 ("identical bodies
-  are not shared physically across sessions") conflicts with its conformance
-  suite and reference storage; Forge follows the conformance suite.
+- Independent domain/session copies can cost more disk than the reference's
+  within-session domain sharing; D10 measures that cost through Forge's actual
+  storage. No global index is required by the amended runtime conformance.
+- Deferred dead bytes must remain unreadable and counted in retained-byte
+  diagnostics until a threshold/retirement/deletion purge. Atomic remaps, exact
+  physical receipts and every conformance configuration gate this behavior.
+- Per-engine memo charge is estimated, not a heap bound; 512 MiB combined charge
+  may retain about 634.88 MiB at the review's 1.24× observation, plus writer/cache
+  memory. D10 measures resident memory and cache behavior. A separate engine loses
+  shared leases/memo even with D-1's warm-read correctness check; reuse clones.
 - Ordinary redaction must preserve restore-critical data and runtime exact fields;
   protected equality and ordinary-policy equality are different test assertions.
 
 ## Migration Plan
 
-Execute tasks 1–26 in order: released pin gate (after any separate non-journal
-runtime upgrade from v0.5.0, task 1a); test support and six-table schema;
+The rebased workspace already pins agent-runtime **0.7.0 + U9 groups C/D** at
+`1de6d7d` (`1de6d7d34d2cfe4fc35791bca440932602539cf7` in Cargo.lock), as recorded
+by workspace Cargo.toml/Cargo.lock. Execute tasks 1–26 in order: bump that pin to
+the first released runtime containing the engine (task 1); test support and
+six-table schema;
 codec/reads/apply/pins/operations/receipts/repack; conformance and negative cases;
 engine wiring/probes/legacy refusals; import/crash/integration checks; approved
 retirement and deletion maintenance; measurement; final docs/CHANGELOG. Each task
