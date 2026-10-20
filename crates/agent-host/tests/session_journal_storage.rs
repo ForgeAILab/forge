@@ -2443,21 +2443,18 @@ async fn resealed_unit_corruption_fails_closed() {
             }
         } else {
             assert!(operation.unwrap().is_some());
-            match &objects {
-                Ok(found) => {
-                    for (got, want) in found.iter().zip(&expected_objects) {
-                        // Never different bytes; an index-only edit may hide
-                        // a candidate (absent) until its body is decoded.
-                        assert!(
-                            got.is_none() || got == want,
-                            "round {round}: wrong body served"
-                        );
-                        if got.is_none() {
-                            false_absent += 1;
-                        }
+            if let Ok(found) = &objects {
+                for (got, want) in found.iter().zip(&expected_objects) {
+                    // Never different bytes; an index-only edit may hide a
+                    // candidate (absent) until its body is decoded.
+                    assert!(
+                        got.is_none() || got == want,
+                        "round {round}: wrong body served"
+                    );
+                    if got.is_none() {
+                        false_absent += 1;
                     }
                 }
-                Err(_) => {}
             }
             if changed && matches!(unit, TestSealedUnit::PackBody(_)) {
                 // A compressed frame edit may still inflate to the same bytes.
@@ -2526,7 +2523,13 @@ async fn relabelled_rows_fail_closed() {
     .await
     .unwrap();
     let fresh = || ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
-    assert!(fresh().objects(&d, &b, &[victim.id.clone()]).await.unwrap()[0].is_none());
+    assert!(
+        fresh()
+            .objects(&d, &b, std::slice::from_ref(&victim.id))
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
     // Session record: copy A's sealed record and every scalar column into B.
     sqlx::query("UPDATE agent_session_journal_session SET (generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,nonce,payload) = (SELECT generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,nonce,payload FROM agent_session_journal_session WHERE runtime_session_id='relabel-a') WHERE runtime_session_id='relabel-b'")
         .execute(&pool).await.unwrap();
@@ -2560,7 +2563,12 @@ async fn relabelled_rows_fail_closed() {
         .bind(&b_owner).bind(a_pack).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO agent_session_journal_membership (storage_id,role,runtime_session_id,forge_session_id,pack_id,bitmap) VALUES (?, 'protected', 'relabel-b', ?, ?, x'01')")
         .bind(d.storage_id.as_str()).bind(&b_owner).bind(a_pack).execute(&pool).await.unwrap();
-    assert!(fresh().objects(&d, &b, &[victim.id.clone()]).await.is_err());
+    assert!(
+        fresh()
+            .objects(&d, &b, std::slice::from_ref(&victim.id))
+            .await
+            .is_err()
+    );
     assert!(fresh().members(&d, &b).await.is_err());
     assert!(fresh().retained_bytes(&d).await.is_err());
     // The same pack relabelled to the other role of B's session.
