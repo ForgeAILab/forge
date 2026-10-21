@@ -169,6 +169,8 @@ impl ForgeJournalStorage {
                 Err(e)
             }
         };
+        #[cfg(feature = "test-support")]
+        self.observe_write_hold(locked.elapsed().as_micros() as u64);
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
             .invalidate(&scope);
@@ -238,6 +240,8 @@ impl ForgeJournalStorage {
                         Err(e)
                     }
                 };
+                #[cfg(feature = "test-support")]
+                self.observe_write_hold(locked.elapsed().as_micros() as u64);
                 self.cache_lock()
                     .map_err(RuntimeError::retryable)?
                     .invalidate(&scope);

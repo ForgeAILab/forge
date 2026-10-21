@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T19:30:47Z
+updated_at: 2026-10-21T22:04:36Z
 completed_at:
 ---
 
@@ -588,7 +588,32 @@ No runtime bench crate becomes a production dependency.
   Preserve exact seeds and cache assertions; JSON output plus Markdown table.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke`.
 
-- [ ] **25. Run Forge disk/performance gate (≤3 h).**
+  Measurement implementation and smoke completed (2026-10-21), with an explicit
+  NOT MET telemetry remainder: production sqlx/real-AEAD A/B N=100/1000/4000
+  plain/tool and C N=1000/4000 ran at the per-turn S2/collection cadence, with
+  exact pinned seeds/cache assertions, actual two-blob L2, matched full-schema
+  baselines and file/dbstat/pointer-map agreement. The debug packed_n100_smoke
+  passes for four N=100 shapes; N=100 post-collection bytes are A 106,496/110,592
+  and B 172,032/180,224 (plain/tool). The ignored report also measures the identity
+  diagnostic, real import/retained overlap, retirement, 64-revision S5 edges,
+  cumulative transactional TEMP pack/legacy counters, WAL frames, per-turn
+  timings/amplification, physical receipts and canonical byte differences.
+  With 100 unrelated sessions / 805 packs, target hydration decodes only three
+  indexes, takes 3.753 ms and charges 452,109 bytes (24,839 directory bytes).
+  The 16 KiB cache experiment retains 14,621 bytes, evicts 396 entries and records
+  104 cumulative oversize rejections. The 100-dirty collect calls measure
+  779.050/705.695 ms protected/ordinary. Explicit cold/warm probes report 28 cold
+  misses and 28 warm hits; all 500/2,000 C runtime engine opens read no bodies.
+  Peak whole-process RSS is 2,773.59 MiB, including diagnostics/working sets.
+  Runtime v0.9.0 exposes no public RootMemo charge/heap/internal lookup,
+  eviction or oversize statistics. Those mandatory fields remain null with an
+  explanation; no private-state decoding, unsafe inspection or runtime patch
+  was used. The checkbox remains open for this telemetry gap. The approved
+  128 MiB per-engine budget and conservative D3 policy remain unchanged.
+  Outputs: /Volumes/Data/tmp/refactor/c3-t24-25/; full report/table in
+  report.md and docs/performance-testing.md.
+
+- [x] **25. Run Forge disk/performance gate (≤3 h).**
   Run only the named ignored release report:
   `cargo test -p forge-agent-host --features test-support --release --test session_journal_bench forge_packed_report -- --ignored --exact --nocapture`.
   Record all A/B N=100/1000/4000 and C results. B/N=4000 plain and tool after
@@ -599,6 +624,27 @@ No runtime bench crate becomes a production dependency.
   fix/recheck; no schema-5 work or baseline
   manipulation. Identify rt-e7's measured reference numbers separately; publish
   only actual Forge measurements as Forge outcomes, never reference projections.
+
+  Completed gate execution (2026-10-21): NOT MET for adoption. The named ignored
+  release report completed all 14 production rows, the B/100 identity diagnostic
+  and the scoped/100-dirty experiment in 6,655.24 seconds including compilation.
+  B/N=4000 post-collection physical bytes are 3,862,528 / 1,359,872 L2
+  (2.84036x plain) and 4,501,504 / 1,392,640 L2 (3.23235x tool), both above 2.0x.
+  C/N=1000 is 2,293,760 / 942,080 (2.43478x); supplemental C/N=4000 is
+  8,908,800 / 3,981,312 (2.23765x), both measured with per-turn collection.
+  One bounded storage-only candidate used one-shot zstd level 9 for object bodies;
+  its unchanged B/4000 recheck measured 2.78614x / 3.16471x, still failing.
+  The candidate was reverted exactly; its patch and JSON remain in the report.
+  No second candidate, schema-5 change, seed/projection/baseline change or memo
+  increase was attempted. B/4000 delta writes pass at 7.658% / 5.440% of legacy,
+  but turn/import checks fail; all individual D10 checks and actual overlap peaks
+  are recorded. The longest C/4000 collect call is 2,992.811 ms, above D8's 1 s
+  review bound (the separate 100-small-dirty-session calls pass). Cold validation,
+  write transactions, memo observations, cache/RSS and post-retirement metadata
+  are recorded without presenting rt-e7's modeled/shared-domain numbers as Forge
+  outcomes. Exact internal memo/heap telemetry remains the task-24 NOT MET item.
+  Full results and verification: /Volumes/Data/tmp/refactor/c3-t24-25/report.md.
+  Task 26 and the overall change completion stamp remain untouched.
 
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased

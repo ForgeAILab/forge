@@ -26,6 +26,8 @@ pub struct ForgeJournalStorage {
     pub(super) cache: Arc<Mutex<Cache>>,
     cpu: Arc<Semaphore>,
     #[cfg(feature = "test-support")]
+    max_write_hold_us: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-support")]
     record_loads: Arc<Mutex<std::collections::HashMap<(JournalDomain, SessionId), usize>>>,
     #[cfg(feature = "test-support")]
     pub(super) failed_commit_observation: Arc<std::sync::atomic::AtomicU8>,
@@ -93,6 +95,8 @@ impl ForgeJournalStorage {
             cache: Arc::new(Mutex::new(Cache::new(DEFAULT_BUDGET))),
             cpu: Arc::new(Semaphore::new(2)),
             #[cfg(feature = "test-support")]
+            max_write_hold_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
             record_loads: Arc::new(Mutex::new(Default::default())),
             #[cfg(feature = "test-support")]
             failed_commit_observation: Arc::new(std::sync::atomic::AtomicU8::new(0)),
@@ -101,6 +105,16 @@ impl ForgeJournalStorage {
             #[cfg(feature = "test-support")]
             compact_observations: Arc::new(Mutex::new((0, 0))),
         })
+    }
+    #[cfg(feature = "test-support")]
+    pub(super) fn observe_write_hold(&self, micros: u64) {
+        self.max_write_hold_us
+            .fetch_max(micros, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(feature = "test-support")]
+    pub fn max_write_hold_us_for_test(&self) -> u64 {
+        self.max_write_hold_us
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Make the first protected load after an injected commit failure fail too,
     /// leaving acceptance unresolved until the next session open.
@@ -485,6 +499,11 @@ impl ForgeJournalStorage {
             index_decodes: c.index_decodes,
             body_decodes: c.body_decodes,
             pack_queries: c.pack_queries,
+            directory_charged_bytes: c.directory_charge(),
+            hits: c.hits,
+            misses: c.misses,
+            evictions: c.evictions,
+            oversize: c.oversize,
         })
     }
     #[cfg(feature = "test-support")]
@@ -497,13 +516,18 @@ impl ForgeJournalStorage {
     }
 }
 #[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct JournalCacheStats {
     pub charged_bytes: usize,
     pub budget: usize,
     pub index_decodes: u64,
     pub body_decodes: u64,
     pub pack_queries: u64,
+    pub directory_charged_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub oversize: u64,
 }
 
 pub(super) fn validate_bitmap(bits: &[u8], count: usize) -> Result<(), RuntimeError> {

@@ -142,6 +142,8 @@ impl ForgeJournalStorage {
                 std::sync::atomic::Ordering::SeqCst,
             );
         }
+        #[cfg(feature = "test-support")]
+        self.observe_write_hold(hold_us);
         invalidation.armed = result.is_err();
         drop(invalidation);
         tracing::debug!(target:"forge_session_journal",kind=?write.kind,

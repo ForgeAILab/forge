@@ -66,6 +66,10 @@ pub(super) struct Cache {
     pub index_decodes: u64,
     pub body_decodes: u64,
     pub pack_queries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub oversize: u64,
 }
 impl Cache {
     pub fn new(budget: usize) -> Self {
@@ -77,11 +81,19 @@ impl Cache {
             index_decodes: 0,
             body_decodes: 0,
             pack_queries: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            oversize: 0,
         }
     }
     fn get(&mut self, key: &Key) -> Option<Value> {
         self.clock = self.clock.wrapping_add(1);
-        let entry = self.entries.get_mut(key)?;
+        let Some(entry) = self.entries.get_mut(key) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
         entry.touched = self.clock;
         Some(entry.value.clone())
     }
@@ -90,6 +102,7 @@ impl Cache {
             self.charge -= old.charge;
         }
         if charge > self.budget {
+            self.oversize += 1;
             return;
         }
         while self.charge > self.budget - charge {
@@ -102,6 +115,7 @@ impl Cache {
                 break;
             };
             if let Some(old) = self.entries.remove(&oldest) {
+                self.evictions += 1;
                 self.charge -= old.charge;
             }
         }
@@ -115,6 +129,14 @@ impl Cache {
                 touched: self.clock,
             },
         );
+    }
+    #[cfg(feature = "test-support")]
+    pub fn directory_charge(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|(key, _)| matches!(key, Key::Directory(_)))
+            .map(|(_, entry)| entry.charge)
+            .sum()
     }
     pub fn directory(&mut self, scope: &Scope) -> Option<Arc<ScopeDirectory>> {
         match self.get(&Key::Directory(scope.clone())) {

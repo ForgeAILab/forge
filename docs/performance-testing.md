@@ -717,3 +717,134 @@ The merge preserves constant statement counts and removes the paused-CLI probe r
 Final outputs: `/Volumes/Data/tmp/usage-merge/bench-reported1.json` and `bench-reported20.json`; commands are in `benchmark-commands.json`. Complete verification logs and exit/pass/failure records are in `verification-all.json`. All requested Rust modules/targets, type export, TypeScript checking, workspace clippy and formatting passed. The additional environment regression module passed three tests. No Rust test reported FAILED.
 
 `pnpm typecheck` unexpectedly invoked automatic dependency installation, contrary to the requested no-install constraint; the first attempt was interrupted, but the later invocation completed installation and typecheck. This deviation is recorded in `typecheck-note.log` and `web-typecheck.log`. Type generation introduced no additional tracked web diff.
+
+<!-- session-journal-d10:start -->
+## Session journal D10 measurements (2026-10-21)
+
+**Adoption gate: NOT MET.** These are actual Forge measurements at agent-runtime
+v0.9.0 / `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, from the production
+SQLx storage and real AEAD. They do not qualify this change for release.
+
+The fixed upstream seeds are history `0xbadc0ffee1234567`, provider scripts
+`0x12349876abcd5678`, and turn inputs `0x987612345678abcd`. A/B use two turns over
+N seeded messages. C grows to N messages over N/4 tool turns, with a new writer
+per turn and a 32-manifest window. Every Forge row uses the S2 terminal hook,
+collection after every turn and a final shutdown sweep. C/N=4000 is supplemental;
+its Forge per-turn result does not imply a per-turn rt-e7 reference run.
+
+L2 comes from the frozen actual Forge legacy save/digest/order helpers, with two
+separately measured ciphertexts and two nonces. Both layouts subtract the same
+full-schema/session setup after checkpoint/VACUUM. File/page/dbstat agreement
+includes verified pointer-map pages. Canonical byte/receipt counts remain
+separate from physical file bytes. TEMP counters on all five connections count
+committed pack writes, including intermediate rewrites, without main-WAL pages.
+
+**Full Forge physical results, bytes.** The rt-e7 column is reference-only: modeled sealing and sharing between a session’s domains, unlike Forge. “Turn” and “end” describe that reference’s collection cadence; Forge rows all use per-turn collection.
+
+| Fixture | Forge L1 | Actual Forge L2 | Forge before final sweep | Forge after collection | Forge/L2 | rt-e7 after / L2 ratio (cadence) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A/100 plain | 0 | 8,192 | 204,800 | 106,496 | 13.00000× | 57,344 / 7.00000× (end) |
+| A/100 tool | 0 | 8,192 | 249,856 | 110,592 | 13.50000× | 61,440 / 7.50000× (end) |
+| A/1000 plain | 20,480 | 53,248 | 598,016 | 507,904 | 9.53846× | 311,296 / 5.84615× (end) |
+| A/1000 tool | 24,576 | 53,248 | 643,072 | 503,808 | 9.46154× | 307,200 / 5.76923× (end) |
+| A/4000 plain | 90,112 | 204,800 | 1,953,792 | 1,859,584 | 9.08000× | 1,179,648 / 5.76000× (end) |
+| A/4000 tool | 94,208 | 208,896 | 1,998,848 | 1,859,584 | 8.90196× | 1,179,648 / 5.64706× (end) |
+| B/100 plain | 20,480 | 40,960 | 270,336 | 172,032 | 4.20000× | 102,400 / 2.50000× (end) |
+| B/100 tool | 20,480 | 45,056 | 323,584 | 180,224 | 4.00000× | 94,208 / 2.09091× (end) |
+| B/1000 plain | 159,744 | 335,872 | 1,110,016 | 995,328 | 2.96341× | 577,536 / 1.71951× (turn) |
+| B/1000 tool | 163,840 | 339,968 | 1,277,952 | 1,118,208 | 3.28916× | 622,592 / 1.83133× (turn) |
+| B/4000 plain | 655,360 | 1,359,872 | 4,132,864 | 3,862,528 | 2.84036× | 2,183,168 / 1.60542× (turn) |
+| B/4000 tool | 655,360 | 1,392,640 | 4,812,800 | 4,501,504 | 3.23235× | 2,494,464 / 1.79118× (turn) |
+| C/1000 tool | 454,656 | 942,080 | 2,482,176 | 2,293,760 | 2.43478× | 1,204,224 / 1.27826× (turn) |
+| C/4000 tool | 1,896,448 | 3,981,312 | 9,117,696 | 8,908,800 | 2.23765× | 4,886,528 / 1.22863× (end) |
+
+Identity-policy diagnostic B/100 plain measures 172,032 bytes versus 172,032 with production projection. The fixed fixtures contain no optional sensitive Forge diagnostic extension; identity and production projection are equal for these inputs. Identity is not the product policy.
+
+**One bounded storage-only attempt.** The only functional candidate replaces streaming zstd level 3 object-body compression with one-shot zstd level 9; canonical objects, seeds, projection, domain copies, caps, baseline and acceptance thresholds stay unchanged. The recheck runs only unchanged B/N=4000 plain/tool under the same ignored release report. Candidate disposition is recorded in `storage-fix-disposition.json`.
+
+| Candidate | Actual L2 | Native after collection | Ratio | ≤2.0× | ≤1.5× aim |
+| --- | ---: | ---: | ---: | --- | --- |
+| B/4000 plain | 1,359,872 | 3,788,800 | 2.78614× | FAIL | FAIL |
+| B/4000 tool | 1,392,640 | 4,407,296 | 3.16471× | FAIL | FAIL |
+
+The single candidate saved about 2% but both disk gates remained above 2.0× and turn/import checks still failed. It was reverted exactly to the fully measured level-3 baseline; no second storage candidate or schema-5 work was attempted. The candidate patch and its real-AEAD/sqlx recheck remain reviewable artifacts.
+
+**D10 performance checks.** Delta bytes exclude the first terminal and include later S2/collection and the final shutdown sweep. The timing column compares the last actual turn plus synchronous maintenance with the matching legacy turn; raw run-only, all turn/open samples and means are also retained. Import compares real native import with a real legacy runtime resume, without provider/tool I/O. Autocheckpoint is disabled on all five connections so cumulative frames can be counted; each turn is sampled and the WAL is truncated, identically for both stores. Forced measurement checkpoints are outside turn timing. These are measurements from this machine, not confidence intervals.
+
+| Fixture | Delta pack / legacy | ≤10% (N≥1000) | Native / legacy turn, ms | Turn check | Import / resume, ms | Import ≤2× | Max write transaction, ms | Max collect, ms |
+| --- | ---: | --- | ---: | --- | ---: | --- | ---: | ---: |
+| A/100 plain | 347.118% | n/a | 59.78 / 2.84 | FAIL | 59.82 / 0.82 | FAIL | 10.23 | 12.17 |
+| A/100 tool | 380.137% | n/a | 116.36 / 4.91 | FAIL | 61.77 / 0.76 | FAIL | 18.04 | 18.67 |
+| A/1000 plain | 50.582% | FAIL | 215.93 / 14.57 | FAIL | 420.50 / 2.29 | FAIL | 23.71 | 62.39 |
+| A/1000 tool | 49.688% | FAIL | 298.38 / 25.40 | FAIL | 447.05 / 2.36 | FAIL | 22.92 | 59.22 |
+| A/4000 plain | 12.437% | FAIL | 774.86 / 50.89 | FAIL | 1682.67 / 7.54 | FAIL | 88.58 | 236.69 |
+| A/4000 tool | 12.505% | FAIL | 1117.76 / 100.80 | FAIL | 1765.87 / 8.11 | FAIL | 91.60 | 250.15 |
+| B/100 plain | 57.301% | n/a | 83.96 / 6.99 | FAIL | 98.82 / 1.14 | FAIL | 10.22 | 13.98 |
+| B/100 tool | 115.064% | n/a | 154.36 / 12.40 | FAIL | 117.89 / 1.35 | FAIL | 27.12 | 23.95 |
+| B/1000 plain | 10.675% | FAIL | 428.82 / 47.84 | FAIL | 824.67 / 7.08 | FAIL | 36.68 | 90.49 |
+| B/1000 tool | 10.492% | FAIL | 673.55 / 90.10 | FAIL | 971.16 / 8.05 | FAIL | 40.91 | 100.55 |
+| B/4000 plain | 7.658% | PASS | 1585.06 / 201.71 | FAIL | 3361.03 / 27.53 | FAIL | 145.90 | 358.55 |
+| B/4000 tool | 5.440% | PASS | 2635.42 / 377.46 | FAIL | 3917.32 / 32.04 | FAIL | 157.21 | 423.68 |
+| C/1000 tool | 11.035% | FAIL | 930.11 / 260.08 | FAIL | 2941.98 / 32.10 | FAIL | 630.06 | 682.06 |
+| C/4000 tool | 3.214% | PASS | 3937.09 / 1324.71 | FAIL | 12294.36 / 161.12 | FAIL | 2526.39 | 2992.81 |
+
+**Writes, overlap and retirement.** WAL means cumulative WAL frames × page size, excluding WAL headers and VACUUM; TEMP measurement state contributes no main-WAL frames. Collection-call maxima exclude the separate retirement pass.
+
+| Fixture | Native pack writes | Legacy payload writes | Largest collection call | Largest pack rewrite | Native / legacy WAL | Old+new peak | Native after retirement |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A/100 plain | 247,251 | 54,769 | 46,342 | 26,846 | 2,330,624 / 143,360 | 114,688 | 20,480 |
+| A/100 tool | 363,118 | 83,364 | 47,494 | 40,010 | 3,133,440 / 241,664 | 118,784 | 20,480 |
+| A/1000 plain | 592,525 | 358,995 | 14,642 | 17,906 | 2,818,048 / 626,688 | 561,152 | 20,480 |
+| A/1000 tool | 681,638 | 531,994 | 20,595 | 20,515 | 3,620,864 / 917,504 | 557,056 | 20,480 |
+| A/4000 plain | 1,931,484 | 1,388,627 | 14,528 | 14,448 | 4,132,864 / 1,896,448 | 2,064,384 | 20,480 |
+| A/4000 tool | 2,020,054 | 2,049,358 | 17,293 | 17,213 | 4,956,160 / 2,695,168 | 2,068,480 | 20,480 |
+| B/100 plain | 312,282 | 341,158 | 18,916 | 50,586 | 2,408,448 / 651,264 | 212,992 | 20,480 |
+| B/100 tool | 623,788 | 500,517 | 116,575 | 76,098 | 3,317,760 / 933,888 | 225,280 | 20,480 |
+| B/1000 plain | 1,139,906 | 2,734,701 | 20,549 | 23,716 | 3,321,856 / 3,461,120 | 1,331,200 | 20,480 |
+| B/1000 tool | 1,376,724 | 3,896,485 | 12,610 | 31,385 | 4,112,384 / 4,747,264 | 1,458,176 | 20,480 |
+| B/4000 plain | 4,600,402 | 11,386,086 | 298,705 | 226,990 | 6,823,936 / 13,606,912 | 5,222,400 | 20,480 |
+| B/4000 tool | 5,357,652 | 16,325,355 | 303,507 | 228,840 | 8,126,464 / 18,653,184 | 5,914,624 | 20,480 |
+| C/1000 tool | 110,326,108 | 998,506,302 | 273,213 | 151,425 | 566,349,824 / 1,175,695,360 | 3,235,840 | 57,344 |
+| C/4000 tool | 546,548,246 | 16,999,152,382 | 403,616 | 201,983 | 2,409,234,432 / 19,170,725,888 | 13,062,144 | 40,960 |
+
+S2 amplification uses committed non-maintenance pack payload+nonce bytes as its denominator; it is distinct from canonical-byte amplification. The JSON includes L1, both individual ciphertext lengths, row/index/table page totals, freelists, post-retirement session/operation/pin/catalog bytes, retained/held object counts, canonical retained/live/deferred bytes and physical receipts for every case. It also records geometric S2 and total maintenance write amplification and every per-turn pack/WAL sample. These remain distinct units; canonical reclaimed bytes are never substituted for physical page savings.
+
+**Memo and cache evidence.**
+
+Cold reopened validation/open time ranges from **16.99 to 6585.18 ms** across both domains. Warm reopened-root probes classify **28 hits / 0 misses**, using zero/nonzero storage object reads. They are observable open-level counts, not internal memo-lookup counters.
+C/1000 tool: 500 runtime engine-open observations, 500 with no body reads and 0 with body reads; mean runtime resume/open 698.12 ms.
+C/4000 tool: 2000 runtime engine-open observations, 2000 with no body reads and 0 with body reads; mean runtime resume/open 3192.28 ms.
+
+With **100 unrelated sessions / 805 packs**, storage construction decodes zero units. Target hydration decodes only its **3 indexes**, takes **3.75 ms**, and charges **452,109 bytes**, including **24,839 directory bytes**, under the 64 MiB cache budget. The one-byte cache charges zero and rejects oversize entries. Under a 16 KiB budget, 100 scopes charge 14,621 bytes, with 396 evictions and 104 cumulative oversize rejections. Exact cache hit/miss/read/decode counters are in JSON.
+
+The protected collect call with 100 dirty sessions holds the engine gate for at most **779.05 ms** including call overhead: **PASS** against D8’s 1-second release-review bound. Its release allowance remains 20,000, not a session/time bound.
+The ordinary collect call with 100 dirty sessions holds the engine gate for at most **705.70 ms** including call overhead: **PASS** against D8’s 1-second release-review bound. Its release allowance remains 20,000, not a session/time bound.
+
+Peak process resident high-water memory reaches **2773.59 MiB**, measured through safe `getrusage`, not a process listing. It includes runtime working sets, full-view/import diagnostics, measurement records, allocator retention and storage caches; it is not memo heap. Keep **128 MiB estimated charge per engine** unchanged: the observed warm-root evidence does not establish a need to raise it. The review’s 1.24× observation corresponds to 158.72 MiB per engine / 317.44 MiB combined at full charge; that is reference headroom, not an observed heap cap.
+
+The longest collect call overall is C/4000 tool at **2992.81 ms**: **FAIL** against the one-second review bound, despite the passing 100-small-session calls.
+
+**NOT MET telemetry:** the pinned runtime keeps RootMemo private and exposes no charge/heap or internal hit/miss/eviction/oversize API. Those JSON fields are null with a reason; storage cache charge is an estimate, not measured allocator heap. No unsafe layout inspection, runtime patch, invented counters or production budget increase was used. Task 24 remains unchecked for these missing mandatory metrics despite the working harness; task 25 records completed gate execution and its failed verdict.
+
+
+The complete JSON, candidate patch and verification receipts are retained under
+`/Volumes/Data/tmp/refactor/c3-t24-25/`. Native-only retirement sizes exclude the
+legacy row only for measurement; production retirement retains legacy payloads.
+Old-plus-new peak is the larger of the two measured overlap layouts, not an
+in-flight WAL/allocator peak. Source and method live in
+`crates/agent-host/tests/session_journal_bench.rs` and `tests/support/bench_*.rs`.
+
+Run the small debug smoke or the full ignored report:
+
+```bash
+cargo test --offline -p forge-agent-host --features test-support --test session_journal_bench packed_n100_smoke
+cargo test --offline -p forge-agent-host --features test-support --release --test session_journal_bench forge_packed_report -- --ignored --exact --nocapture
+```
+
+`FORGE_JOURNAL_MEASUREMENT_DIR` selects the output directory. The default is
+`$TMPDIR/forge-session-journal-measurement`. For a bounded storage-candidate
+recheck, `FORGE_JOURNAL_GATE_RECHECK=1` selects only unchanged B/N=4000 plain/tool
+under the same ignored report. It is a test-harness option, not a product flag.
+The report records numeric pass/fail values while validating all measurements;
+a successful report process is not an adoption-pass signal.
+<!-- session-journal-d10:end -->
