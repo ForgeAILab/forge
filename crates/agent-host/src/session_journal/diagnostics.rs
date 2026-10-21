@@ -28,20 +28,74 @@ pub(super) fn unreadable(error: &RuntimeError) -> bool {
     error.kind == ErrorKind::Serialization && !error.retryable
 }
 
+const WARNING_SESSION_CAP: usize = 4_096;
+
+struct WarningTracker {
+    sessions: HashSet<SessionId>,
+    capacity: usize,
+    observations: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WarningDecision {
+    session: bool,
+    overflow: bool,
+}
+
+impl WarningTracker {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0);
+        Self {
+            sessions: HashSet::new(),
+            capacity,
+            observations: 0,
+        }
+    }
+
+    fn observe(&mut self, session: &SessionId) -> WarningDecision {
+        self.observations = self.observations.saturating_add(1);
+        if self.sessions.len() == self.capacity || self.sessions.contains(session) {
+            return WarningDecision {
+                session: false,
+                overflow: false,
+            };
+        }
+        self.sessions.insert(session.clone());
+        WarningDecision {
+            session: true,
+            overflow: self.sessions.len() == self.capacity,
+        }
+    }
+}
+
+fn warning_tracker() -> &'static Mutex<WarningTracker> {
+    static WARNED: OnceLock<Mutex<WarningTracker>> = OnceLock::new();
+    WARNED.get_or_init(|| Mutex::new(WarningTracker::new(WARNING_SESSION_CAP)))
+}
+
 impl ForgeJournalStorage {
-    /// One neutral warning per runtime session for the entire process, shared
-    /// by diagnostics, compaction and the retention worker. Never logs the id.
+    /// At most 4,096 once-per-session warnings per process, followed by one
+    /// capacity warning. Further observations only increment the aggregate.
     pub fn note_unreadable_session(session: &SessionId) {
-        static WARNED: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
-        let first = WARNED
-            .get_or_init(Default::default)
+        let decision = warning_tracker()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(session.clone());
-        if first {
+            .observe(session);
+        if decision.session {
             tracing::warn!(target: "forge_session_journal", skipped_sessions=1,
                 "unreadable session journal preserved; maintenance skipped");
         }
+        if decision.overflow {
+            tracing::warn!(target: "forge_session_journal", warning_session_cap=WARNING_SESSION_CAP,
+                "unreadable session warning capacity reached; further session warnings suppressed");
+        }
+    }
+
+    pub fn unreadable_session_observations() -> u64 {
+        warning_tracker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observations
     }
 
     /// Includes orphan and deferred copies, but omits an entire session when
@@ -216,5 +270,41 @@ impl ForgeJournalStorage {
             after = last;
         }
         Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_warning_tracker_caps_ids_without_eviction_and_warns_overflow_once() {
+        let mut tracker = WarningTracker::new(3);
+        let mut session_warnings = 0;
+        let mut overflow_warnings = 0;
+        for index in 0..100 {
+            let decision = tracker.observe(&SessionId::new(format!("unreadable-{index}")));
+            session_warnings += usize::from(decision.session);
+            overflow_warnings += usize::from(decision.overflow);
+            assert!(tracker.sessions.len() <= 3);
+        }
+        assert_eq!(session_warnings, 3);
+        assert_eq!(overflow_warnings, 1);
+        assert_eq!(tracker.sessions.len(), 3);
+        assert_eq!(tracker.observations, 100);
+        assert!(tracker.sessions.contains(&SessionId::new("unreadable-0")));
+        for _ in 0..10 {
+            assert_eq!(
+                tracker.observe(&SessionId::new("unreadable-0")),
+                WarningDecision {
+                    session: false,
+                    overflow: false
+                }
+            );
+        }
+        assert_eq!(
+            tracker.observations, 110,
+            "suppression does not suppress counting"
+        );
     }
 }

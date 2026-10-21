@@ -28,6 +28,18 @@ Forge SHALL retire replaced topic/profile-rotation sources and suspended native 
 - **THEN** the next tick retries the remaining domain without resurrecting the retired one
 - **AND** latest-root opens of a retired domain conflict after collection/restart despite a surviving legacy row
 
+#### Scenario: Later selection reaches a tombstone
+- **WHEN** a retired older dormant row becomes selectable after its newer sibling was replaced
+- **THEN** Forge rotates to a fresh runtime identity in the versioned host transaction, preserving identity, scope and profile
+- **AND** active reuse also checks retirement; no ready-status write activates an already retired row
+- **AND** retirement between selection and native open returns a typed outcome, with one rotation/retry and no stale legacy fallback
+- **AND** a second retirement fails the turn normally and all tombstones remain
+
+#### Scenario: Explicit resume of retired history
+- **WHEN** a client resumes a native session whose journal is retired
+- **THEN** the endpoint returns HTTP 409 `session_retired`, with unchanged host status/version
+- **AND** the client must start a new session
+
 ### Requirement: Runtime-owned bounded collection without expiry
 Forge SHALL schedule engine collect calls for dirty sessions in both domains, using clones of the same long-lived engine per storage/domain as every runtime, with an object bound and scheduling time budget, initially 20,000 membership releases per call and 10 seconds between budget checks. The engine SHALL own root epochs, closures, liveness, pin/dependency handling, catalog release and replay-pruning selection; storage SHALL execute atomic release/physical-receipt writes and report retained canonical bytes including deferred bodies. max_objects SHALL bound membership releases, not promise an equal bound on previously deferred physical removals. No TTL or age rule SHALL expire live or retained roots.
 
@@ -49,8 +61,14 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 - **WHEN** one dirty session cannot authenticate or otherwise fails non-retryably during collection
 - **THEN** the released engine reports it in unreadable_sessions, preserves its state and dirty hint, and collects other readable sessions
 - **AND** a second collect reports it again without loading its record more than once in that call
-- **AND** Forge logs it once per process without ids, contents or keys; diagnostics and compact skip the unreadable session
+- **AND** Forge logs it once per process while the non-evicting 4,096-id warning tracker has capacity, without ids, contents or keys; diagnostics and compact skip the unreadable session
 - **AND** an unreadable retirement candidate prevents retirement of either domain, while unknown dependency metadata from another session conservatively defers retirement without falsely labelling the candidate unreadable
+
+#### Scenario: Warning capacity and worker restart
+- **WHEN** unreadable observations reach 4,096 distinct runtime ids in one process
+- **THEN** the warning tracker retains at most 4,096 ids, evicts none, and emits one overflow warning when capacity is reached
+- **AND** later per-session warnings are suppressed while aggregate counters continue
+- **AND** the worker keeps no lifetime id set; unreadable/preserved counts describe the current pass after repair, deletion or worker restart
 
 ### Requirement: Physical pack maintenance preserves membership
 Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during per-turn collection. Each pack SHALL belong to one domain/runtime-session scope; maintenance SHALL remap only that scope's bitmap atomically without changing runtime objects, heads, membership or replay policy, and failure SHALL be retryable without undoing an acknowledged turn. Dead bodies SHALL become unreadable on release; sealed packs MAY defer their removal below 25% dead canonical body bytes. The apply reaching 25%, an empty scope and retired-session collection SHALL force purges even when optional merging is disabled. Receipts SHALL count physical copies and canonical encoded bytes only when removed, including earlier deferred bodies. Imports, admissions, purge rewrites and all repacks SHALL obey the 1 MiB canonical body cap; an oversized object SHALL be rejected atomically. Serialized operation packs SHALL also be capped at 1 MiB. Base repacking SHALL select only fully live packs below 64 KiB or fully live survivor packs purged by that apply; terminal equal-tier pairs SHALL fit the 1 MiB cap. Stable large and deferred-dead packs SHALL stay sealed. `compact` SHALL use bounded per-session transactions, move only eligible fully live bodies so no dead removal escapes apply receipts, and SHALL NOT run a full VACUUM.

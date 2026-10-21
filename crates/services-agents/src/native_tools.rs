@@ -3040,6 +3040,7 @@ impl CoordinationToolProvider {
             AgentHostError::AgentPaused { .. } => "agent_paused",
             AgentHostError::ProjectPaused { .. } => "project_paused",
             AgentHostError::Configuration(_) => "configuration",
+            AgentHostError::SessionRetired => "session_retired",
             AgentHostError::SessionNotFound => "session_not_found",
             AgentHostError::CredentialNotFound => "credential_not_found",
             AgentHostError::VersionConflict => "version_conflict",
@@ -3057,6 +3058,13 @@ impl CoordinationToolProvider {
         );
         let mut outcome = match error {
             AgentHostError::StructuredOutcome(outcome) => *outcome,
+            AgentHostError::SessionRetired => OrchestrationOutcome::failed(
+                OutcomeCode::ValidationError,
+                operation,
+                outcome_scope(scope),
+                &correlation_id,
+                "session history has been retired; start a new session",
+            ),
             AgentHostError::SessionNotFound | AgentHostError::CredentialNotFound => {
                 OrchestrationOutcome::failed(
                     OutcomeCode::NotFound,

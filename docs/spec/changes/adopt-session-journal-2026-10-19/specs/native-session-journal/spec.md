@@ -33,6 +33,12 @@ Every persistent native session SHALL advertise an ordinary journal through `Ses
 - **WHEN** a native turn runs without persistent context
 - **THEN** it writes no journal session record, pack, membership or operation pack
 
+#### Scenario: Terminal failure and cancellation cleanup
+- **WHEN** failed acceptance is unresolved and shutdown or persist returns the runtime's typed fencing conflict for a failed or cancelled turn
+- **THEN** Forge closes leases, removes its active registration and logs cleanup as secondary
+- **AND** the original terminal classification/message and per-turn usage envelope survive; the next request opens a fresh handle
+- **AND** genuine primary persistence failures on otherwise successful turns remain errors
+
 ### Requirement: Protected exact and ordinary projected domains over encrypted packs
 The protected domain SHALL preserve exact checkpoint/snapshot state. The ordinary engine SHALL apply Forge's conservative D3 redacting `JournalProjectionPolicy`, decided on 2026-10-20, before encoding/hashing, preserving runtime-required identity, ordering/cardinality, counters, timestamps, manifests and cache values, and all restore-critical data in ordinary-only sessions. Optional sensitive host diagnostic values SHALL be omitted or redacted without changing protected exactness; runtime-mandated exact cache/manifests may contain content. Both domains SHALL use real XChaCha20-Poly1305 with the existing protected-store key material, fresh nonces and authenticated row binding.
 

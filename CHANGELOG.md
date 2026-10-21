@@ -92,6 +92,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
+- Explicit Agent Session resume now returns `409 session_retired` when native
+  journal history was retired; clients must start a new session. Automatic native
+  selection and open races rotate to a fresh runtime id with one bounded retry.
+
 - New native session state uses encrypted journal packs. Older Forge builds
   cannot resume that state and refuse the newer database; downgrading requires
   a backup taken before upgrading. Existing legacy rows remain readable and
@@ -275,6 +279,19 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   including board moves; failed entries and unused payloads leave no orphan.
 
 ### Fixed
+
+- Native Task context manifests use the host session matching the final runtime
+  output after retirement rotation, including reviewer corrections. Retired-open
+  races no longer retain obsolete runtime ids in unchanged-read failure tracking.
+
+- Unreadable-journal warning tracking retains at most 4,096 ids per process,
+  without eviction, and emits one overflow warning before suppressing further
+  session warnings. Aggregate counters continue; worker preservation counts now
+  cover only the current pass and no longer retain repaired/deleted ids.
+
+- Cancelled native turns retain their cancellation outcome and per-turn usage
+  when shutdown or persistence is fenced by unresolved acceptance. Cleanup closes
+  leases and removes the active registration; the next request reopens normally.
 
 - Native Task and reviewer-correction turns now feed provider entry health.
   They were classified from error text, and the runtime's fixed provider

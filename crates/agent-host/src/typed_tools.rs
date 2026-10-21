@@ -3475,6 +3475,7 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
             // potentially sensitive domain payload into runtime prose.
             RuntimeError::tool("Forge tool provider returned a structured outcome")
         }
+        AgentHostError::SessionRetired => RuntimeError::conflict("session journal is retired"),
         AgentHostError::ProtectedPersistence => RuntimeError::tool("Forge tool provider failed"),
     }
 }

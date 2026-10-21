@@ -331,3 +331,111 @@ fn jwt_for(user_id: &str, email: &str) -> String {
     )
     .expect("test JWT encodes")
 }
+
+#[tokio::test]
+async fn resume_retired_non_chat_session_returns_conflict_without_activation() {
+    use agent_runtime::{
+        core::{
+            catalog::{ModelLimits, ResolvedModelProfile},
+            content::UserInput,
+            provider::{Capabilities, FinishReason, ModelId, ProviderStreamEvent},
+        },
+        provider::fake::{FakeProvider, ScriptedStream},
+        runtime::{RuntimeBuilder, StartSession},
+    };
+    let workspace = common::TestDir::new("resume-retired-session");
+    let harness = common::test_app(workspace.path(), "resume-retired-session").await;
+    let id = seed_owned_native_session(&harness.state.db).await;
+    let store = harness.state.embedded_agent_service.protected_store();
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        vec![ScriptedStream::new(vec![
+            ProviderStreamEvent::TextDelta {
+                text: "retire me".into(),
+            },
+            ProviderStreamEvent::Finish {
+                reason: FinishReason::Stop,
+            },
+        ])],
+    ));
+    let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider_name("fake")
+        .provider(provider)
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(32_000, 28_000, 4_000),
+        ))
+        .session_store(store.clone())
+        .checkpoint_store(store.clone())
+        .build()
+        .unwrap();
+    let session = runtime
+        .start_session(StartSession::create(
+            SessionId::new("runtime-session"),
+            vec![],
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("History to retire"))
+        .await
+        .unwrap()
+        .completed()
+        .await;
+    session.shutdown().await.unwrap();
+    drop(session);
+    drop(runtime);
+    harness
+        .state
+        .db
+        .suspend_stale_native_sessions(&db::now_rfc3339())
+        .await
+        .unwrap();
+    let retention = services_agents::session_journal_retention::SessionJournalRetention::new(
+        harness.state.db.clone(),
+        &store,
+    );
+    assert_eq!(retention.retire_page("").await.unwrap().retired_domains, 2);
+    let before = harness
+        .state
+        .db
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.status, "suspended");
+    for version in [before.version, before.version - 1] {
+        let error: ErrorResponse = common::json_request_with_bearer(
+            &harness.app,
+            Method::POST,
+            &format!("/api/v1/agent-sessions/{id}/resume"),
+            &common::test_jwt(),
+            json!({"version": version}),
+            StatusCode::CONFLICT,
+        )
+        .await;
+        assert_eq!(error.code, "session_retired");
+        assert!(error.message.contains("start a new session"));
+    }
+    let after = harness
+        .state
+        .db
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.runtime_session_id, before.runtime_session_id);
+    assert!(
+        harness
+            .state
+            .db
+            .session_persistence_flags(&id)
+            .await
+            .unwrap()
+            .retired
+    );
+}

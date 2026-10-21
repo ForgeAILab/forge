@@ -508,7 +508,10 @@ No runtime bench crate becomes a production dependency.
   expires. D8 tracing separates physical receipts, membership bounds, cleanup,
   readable retained/live/deferred bytes and collect-call duration (a gate-hold
   upper bound including wait). Unreadable session warnings are process-wide,
-  once per runtime session, with no ids, contents or keys.
+  capped at 4,096 non-evicting ids: once per tracked session, one overflow warning
+  at capacity, then per-session suppression with aggregate counting intact.
+  No ids, contents or keys are logged. Worker preservation counts and id
+  deduplication are current-pass only; no lifetime id set survives in the cursor.
   `rotation_and_retry` passes for a real runtime fork, successor and completed
   Task preservation, live-writer retry, cold partial-retirement recovery,
   below-threshold deferred-byte purges with retained roots in both domains,
@@ -516,6 +519,28 @@ No runtime bench crate becomes a production dependency.
   deletion drain and zero scheduling budget. The existing selection and deletion
   regressions, plus the new chat-delete and native/CLI archive tests, pass.
   Evidence: `/Volumes/Data/tmp/refactor/c3-t21/report.md`.
+
+  Review follow-up: dormant selection and active reuse rotate tombstoned native
+  rows through the existing versioned transaction. Native open reports typed
+  retirement and Chat/Task/inquiry callers retry once on a fresh runtime identity.
+  Ready-status writes guard tombstones atomically. Explicit resume refuses with
+  `409 session_retired`, without changing the row. Failed/cancelled outcomes
+  and their usage envelopes survive typed shutdown/persist fencing conflicts;
+  cleanup closes leases and removes the active registration before return.
+  The cancellation barriers cover committed/uncommitted cuts before provider I/O
+  and after provider I/O with nonzero per-turn usage. Small-cap warning and
+  repair/delete/restart regressions establish bounded tracking and per-pass counts. Regressions cover the older
+  dormant/newer replaced profile scenario, a selection/open race and non-chat
+  resume. Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix/report.md`.
+
+  Re-review follow-up: Task manifest hashing and `agent_session_id` use the host
+  row matching the final successful runtime output, including reviewer-correction
+  rotation. Corrections carry successful request ids into later turns. Native
+  unchanged-read guards begin only after a Chat open succeeds; repeated retired
+  opens cannot accumulate obsolete runtime markers. Real Task executor and
+  correction regressions check B's runtime, B's host manifest link and B's manifest
+  hash; eight repeated Chat open races check an empty failure-marker set.
+  Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix2/report.md`.
 
 - [x] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows

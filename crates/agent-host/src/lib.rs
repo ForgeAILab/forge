@@ -467,6 +467,8 @@ pub enum AgentHostError {
     AgentPaused { agent_id: String },
     #[error("Project is paused")]
     ProjectPaused { project_id: String },
+    #[error("session journal is retired")]
+    SessionRetired,
     #[error("runtime session not found")]
     SessionNotFound,
     #[error("credential handle not found")]

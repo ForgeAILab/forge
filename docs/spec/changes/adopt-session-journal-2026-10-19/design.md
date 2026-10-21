@@ -312,7 +312,7 @@ migration. That is future work, not an adoption task.
 losing that secret makes every sealed unit undecryptable, exactly as it does for
 today's legacy rows and credentials. An authentication failure is a typed error
 for that session: its open, import and collection fail closed, and the worker
-logs it once per session and continues with other sessions. Nothing is retired,
+logs it once per session up to D8's process cap and continues with other sessions. Nothing is retired,
 released or deleted because of it. Deletion cleanup removes packs that have no
 membership row without decrypting them; partially held undecryptable packs stay.
 Key rotation remains unsupported.
@@ -774,8 +774,23 @@ re-derives the rule, so a chat for another profile stays resumable. "Task
 sessions that remain reusable" are Task sessions not suspended by a restart;
 after a restart only Agent Chat resumes. If a resume ever reaches a retired
 journal, for example after the newer dormant row was replaced, Forge starts a
-fresh session as it does for any unresumable scope. It never loops on the
-conflict or falls back to stale legacy state.
+fresh session through the versioned host rotation transaction, retaining the
+identity, scope and profile and allocating a new runtime id. Active reuse checks
+retirement too. Ready-status writes check tombstones under the host write lock.
+Engine calls stay outside host transactions. If retirement wins between selection
+and native open, the backend returns typed `SessionRetired`; the caller rotates
+and retries once. A second retirement is a normal turn failure. Tombstones stay;
+there is no stale legacy fallback or reuse of a retired runtime id as fresh state.
+Explicit `POST /api/v1/agent-sessions/{id}/resume` instead refuses retired history
+with HTTP 409 `session_retired`, leaving status/version unchanged and directing
+the client to start a new session.
+
+Native terminal outcome/usage construction is independent of shutdown/persist
+cleanup. Failed and cancelled turns keep their original outcome and usage envelope
+when cleanup returns the runtime's typed unresolved-acceptance fencing conflict;
+secondary cleanup failures do not replace a primary failure. Shutdown closes
+leases and Forge removes its active registration. Genuine persistence failures
+on otherwise successful turns remain errors; every later request opens anew.
 
 Task 21 now schedules the task-22 selection function and task-23 deletion drain
 through the existing PeriodicWorkers framework in both server and Solo. The
@@ -828,7 +843,13 @@ record at most once per collect call. Storage diagnostics and compact skip and
 log a bad session; `byte_stats` exposes omitted-session counts and readable-only
 retained/live/deferred bytes. The trait's scalar retained_bytes is therefore a
 partial diagnostic in that case, never a liveness or total-file-size authority.
-A process-wide warning set logs once per runtime session, with no ids or contents.
+A capped, non-evicting process tracker retains at most 4,096 runtime ids. It
+logs each tracked session once, emits one overflow warning when the cap is
+reached, then suppresses further per-session warnings. Aggregate observations
+continue counting; no ids, contents or keys are logged. The worker retains ids
+only for deduplication within the current pass. Its `preserved_sessions` and
+`unreadable_sessions` counts cover that pass, so repaired/deleted sessions and
+worker restarts cannot grow lifetime cursor state.
 An unreadable candidate's record prevents either retirement domain from changing.
 An unreadable OTHER session may still protect a retirement candidate through
 unknown dependency metadata: the engine refuses that retirement, and Forge

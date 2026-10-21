@@ -342,6 +342,8 @@ pub async fn suspend_session(
     set_session_status(state, user, session_id, request.version, "suspended").await
 }
 
+/// Refuses retired native history with 409 `session_retired`; activation and
+/// the retirement check share the service's versioned host write transaction.
 pub async fn resume_session(
     State(state): State<AppState>,
     user: AuthenticatedUser,
@@ -539,6 +541,7 @@ fn runtime_interaction_answer(value: ProtectedInteractionAnswerValue) -> Interac
 
 fn protected_interaction_error(error: AgentHostError) -> ApiError {
     match error {
+        AgentHostError::SessionRetired => services::ServiceError::SessionRetired.into(),
         AgentHostError::SessionNotFound => ApiError::not_found_with_code(
             "protected_interaction.not_found",
             "agent_session",

@@ -576,6 +576,11 @@ impl AgentSessionRepo for SqliteDb {
             .get_agent_session(&input.id)
             .await?
             .ok_or(DbError::NotFound)?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        if input.status.as_deref().unwrap_or(&existing.status) == "ready" {
+            super::session_journal_probe::require_unretired_session(&mut transaction, &input.id)
+                .await?;
+        }
         if existing.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -601,11 +606,12 @@ impl AgentSessionRepo for SqliteDb {
         .bind(&input.updated_at)
         .bind(&input.id)
         .bind(input.expected_version)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        transaction.commit().await?;
         self.get_agent_session(&input.id)
             .await?
             .ok_or(DbError::NotFound)

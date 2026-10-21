@@ -87,3 +87,24 @@ impl SqliteDb {
         .fetch_all(self.pool()).await?)
     }
 }
+
+/// Must run in the host activation transaction, before publishing a ready row.
+pub(super) async fn require_unretired_session(
+    connection: &mut sqlx::SqliteConnection,
+    forge_session_id: &str,
+) -> crate::Result<()> {
+    let retired: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agent_session_journal_session j
+         JOIN agent_session s ON s.id=j.forge_session_id AND s.runtime_session_id=j.runtime_session_id
+         WHERE s.id=? AND s.backend_kind='native' AND j.retired=1
+           AND ((j.storage_id=? AND j.role='ordinary') OR (j.storage_id=? AND j.role='protected')))",
+    )
+    .bind(forge_session_id)
+    .bind(SESSION_JOURNAL_ORDINARY_STORAGE_ID)
+    .bind(SESSION_JOURNAL_PROTECTED_STORAGE_ID)
+    .fetch_one(connection).await?;
+    if retired {
+        return Err(crate::DbError::SessionRetired);
+    }
+    Ok(())
+}

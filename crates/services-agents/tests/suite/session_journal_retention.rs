@@ -1304,3 +1304,68 @@ async fn agent_archive_drains_sessions_including_running_cli() {
         .unwrap()
         .is_some());
 }
+
+#[tokio::test]
+async fn unreadable_counts_are_per_pass_across_repair_delete_and_restart() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    for id in ["pass-unreadable-a", "pass-unreadable-b"] {
+        publish(&f, store.clone(), id).await;
+    }
+    let original: Vec<u8> = sqlx::query_scalar("SELECT payload FROM agent_session_journal_session WHERE runtime_session_id='pass-unreadable-a' AND role='ordinary'")
+        .fetch_one(db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_session_journal_session SET payload=zeroblob(length(payload)),collection_dirty=1 WHERE runtime_session_id='pass-unreadable-a' AND role='ordinary'")
+        .execute(db.pool()).await.unwrap();
+    let policy = SessionJournalRetention::new(db.clone(), &store);
+    let mut cursor = RetentionCursor::default();
+    for _ in 0..3 {
+        let report = policy.maintain_once(&mut cursor).await.unwrap();
+        assert_eq!(
+            report.unreadable_sessions, 1,
+            "each pass counts the still-unreadable session"
+        );
+        assert_eq!(report.preserved_sessions, 1);
+    }
+    let mut restarted = RetentionCursor::default();
+    assert_eq!(
+        policy
+            .maintain_once(&mut restarted)
+            .await
+            .unwrap()
+            .preserved_sessions,
+        1
+    );
+    sqlx::query("UPDATE agent_session_journal_session SET payload=?,collection_dirty=1 WHERE runtime_session_id='pass-unreadable-a' AND role='ordinary'")
+        .bind(original).execute(db.pool()).await.unwrap();
+    let repaired = policy.maintain_once(&mut cursor).await.unwrap();
+    assert_eq!(
+        repaired.preserved_sessions, 0,
+        "repaired ids are not lifetime cursor state"
+    );
+    assert_eq!(repaired.unreadable_sessions, 0);
+    sqlx::query("UPDATE agent_session_journal_session SET payload=zeroblob(length(payload)),collection_dirty=1 WHERE runtime_session_id='pass-unreadable-b' AND role='ordinary'")
+        .execute(db.pool()).await.unwrap();
+    assert_eq!(
+        policy
+            .maintain_once(&mut cursor)
+            .await
+            .unwrap()
+            .preserved_sessions,
+        1
+    );
+    sqlx::query("DELETE FROM agent_session WHERE id=?")
+        .bind(host("pass-unreadable-b"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for cursor in [&mut cursor, &mut restarted, &mut RetentionCursor::default()] {
+        let report = policy.maintain_once(cursor).await.unwrap();
+        assert_eq!(
+            report.preserved_sessions, 0,
+            "deletion and worker restart retain no old ids"
+        );
+        assert_eq!(report.unreadable_sessions, 0);
+    }
+}
