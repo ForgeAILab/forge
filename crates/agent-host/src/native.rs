@@ -66,6 +66,10 @@ pub struct NativeAgentRuntimeBackend {
     /// Random per-backend line that identifies the contributed state card
     /// on the wire (see [`ServerStateCardProvider`]). Never sent.
     state_card_marker: String,
+    #[cfg(feature = "test-support")]
+    open_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
+    #[cfg(feature = "test-support")]
+    failure_barrier: Arc<Mutex<Option<Arc<tokio::sync::Barrier>>>>,
 }
 
 struct ActiveNativeSession {
@@ -135,6 +139,10 @@ impl NativeAgentRuntimeBackend {
             provider_override: None,
             failed_topic_reads: Arc::new(Mutex::new(HashSet::new())),
             state_card_marker: format!("[forge-state-card:{}]\n", db::new_uuid_v4()),
+            #[cfg(feature = "test-support")]
+            open_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "test-support")]
+            failure_barrier: Arc::new(Mutex::new(None)),
             working_sets: Arc::new(std::sync::RwLock::new((
                 WorkingSetPolicy {
                     target_tokens: 48_000,
@@ -168,6 +176,32 @@ impl NativeAgentRuntimeBackend {
                 hard_tokens: project_hard,
             },
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_open_barrier_for_test(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.open_barrier.lock().expect("open barrier lock") = Some(barrier);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn set_failure_barrier_for_test(&self, barrier: Arc<tokio::sync::Barrier>) {
+        *self.failure_barrier.lock().expect("failure barrier lock") = Some(barrier);
+    }
+
+    async fn retired_open_error(
+        &self,
+        forge_session_id: &str,
+        original: AgentHostError,
+    ) -> AgentHostError {
+        match self
+            .protected_store
+            .database()
+            .session_persistence_flags(forge_session_id)
+            .await
+        {
+            Ok(flags) if flags.retired => AgentHostError::SessionRetired,
+            _ => original,
+        }
     }
 
     /// Replaces outbound provider construction with an in-process runtime
@@ -694,11 +728,17 @@ impl NativeAgentRuntimeBackend {
         }
         let context_mode = turn_context_mode(&binding.scope, binding.task_role.as_deref());
         let id = SessionId::new(&request.runtime_session_id);
+        let flags = self
+            .protected_store
+            .database()
+            .session_persistence_flags(&request.forge_session_id)
+            .await
+            .map_err(|_| AgentHostError::ProtectedPersistence)?;
+        if flags.retired {
+            return Err(AgentHostError::SessionRetired);
+        }
         let flags = if context_mode.persistent_session {
-            self.protected_store
-                .persistence_flags(&id)
-                .await
-                .map_err(host_runtime_error)?
+            flags
         } else {
             db::SessionPersistenceFlags::default()
         };
@@ -1169,7 +1209,15 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             needs_adoption,
             summary_cap: _,
             topic_reads,
-        } = self.prepare_runtime(&request, None, true).await?;
+        } = match self.prepare_runtime(&request, None, true).await {
+            Ok(prepared) => prepared,
+            Err(error @ (AgentHostError::Runtime(_) | AgentHostError::ProtectedPersistence)) => {
+                return Err(self
+                    .retired_open_error(&request.forge_session_id, error)
+                    .await);
+            }
+            Err(error) => return Err(error),
+        };
         let mut topic_reads_guard = TopicReadTurnGuard {
             failed: Arc::clone(&self.failed_topic_reads),
             runtime_session_id: request.runtime_session_id.clone(),
@@ -1189,10 +1237,23 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         } else {
             StartSession::create(id, request.history)
         };
-        let session = runtime
-            .start_session(start)
-            .await
-            .map_err(host_runtime_error)?;
+        #[cfg(feature = "test-support")]
+        {
+            let barrier = self.open_barrier.lock().expect("open barrier lock").take();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+                barrier.wait().await;
+            }
+        }
+        let session = match runtime.start_session(start).await {
+            Ok(session) => session,
+            Err(error) if error.kind == agent_runtime::core::error::ErrorKind::Conflict => {
+                return Err(self
+                    .retired_open_error(&request.forge_session_id, host_runtime_error(error))
+                    .await);
+            }
+            Err(error) => return Err(host_runtime_error(error)),
+        };
         // A persistent session restores its accumulated usage ledger, so
         // everything already in it was reported by the turn that made the
         // call. Only records appended from here on belong to this turn.
@@ -1238,12 +1299,16 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         let mut provider_failure = None;
         let mut provider_auth_rejected = false;
         let mut context_overflow = false;
+        let mut cleanup = Vec::new();
+        let mut terminal_published = false;
         let finish_result = loop {
             tokio::select! {
+                biased;
                 _ = request.cancellation.cancelled() => {
                     turn.interrupt(CancelReason::UserRequested);
-                    session.shutdown().await
-                        .map_err(host_runtime_error)?;
+                    let result = session.shutdown().await;
+                    terminal_published = result.is_ok();
+                    cleanup.push(("shutdown", result));
                     break Ok(TurnFinish::Cancelled { reason: CancelReason::UserRequested });
                 }
                 event = events.next() => {
@@ -1304,6 +1369,14 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
                         }
                         RuntimeEvent::Error { error } => {
                             last_turn_error = Some(error.clone());
+                            #[cfg(feature = "test-support")]
+                            {
+                                let barrier = self.failure_barrier.lock().expect("failure barrier lock").take();
+                                if let Some(barrier) = barrier {
+                                    barrier.wait().await;
+                                    barrier.wait().await;
+                                }
+                            }
                         }
                         RuntimeEvent::TurnCompleted { finish, .. } => break Ok(finish.clone()),
                         _ => {}
@@ -1312,26 +1385,26 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             }
         };
         if finish_result.is_err() {
-            session.shutdown().await.map_err(host_runtime_error)?;
-        } else {
+            cleanup.push(("shutdown", session.shutdown().await));
+        } else if cleanup.is_empty() {
             turn.completed().await;
-        }
-        let persist_result = session.persist().await;
-        let terminal_published = persist_result.is_ok();
-        let finish = finish_result?;
-        // An unresolved acceptance fences persistence until reopen. Preserve
-        // the turn's original failure and usage rather than replacing it with
-        // the cleanup conflict. Every subsequent turn opens a fresh handle.
-        match persist_result {
-            Err(error)
-                if matches!(finish, TurnFinish::Failed)
-                    && error.kind == agent_runtime::core::error::ErrorKind::Conflict =>
-            {
-                tracing::debug!(target: "forge_session_journal", "failed turn persistence remains fenced until reopen");
+            let persist = session.persist().await;
+            terminal_published = persist.is_ok();
+            let persist_failed = persist.is_err();
+            cleanup.push(("persist", persist));
+            if persist_failed {
+                // Shutdown closes journal leases even when its final save is fenced.
+                cleanup.push(("shutdown", session.shutdown().await));
             }
-            result => result.map_err(host_runtime_error)?,
         }
         active_turn.finish();
+        let primary_failed = !matches!(
+            finish_result,
+            Ok(TurnFinish::Completed | TurnFinish::NeedsInput { .. })
+        );
+        let cleanup_result = native_turn_cleanup(primary_failed, cleanup);
+        let finish = finish_result?;
+        cleanup_result?;
         if terminal_published && context_mode.persistent_session {
             self.protected_store
                 .journals()
@@ -2747,6 +2820,31 @@ fn runtime_turn_failure(error: &RuntimeError) -> api_types::TurnFailure {
     }
 }
 
+/// Cleanup cannot replace a terminal failure or discard its usage envelope.
+fn native_turn_cleanup(
+    primary_failed: bool,
+    cleanup: Vec<(&'static str, Result<(), RuntimeError>)>,
+) -> Result<(), AgentHostError> {
+    let mut primary_cleanup_error = None;
+    for (operation, result) in cleanup {
+        if let Err(error) = result {
+            if primary_failed && error.kind == agent_runtime::core::error::ErrorKind::Conflict {
+                tracing::debug!(target: "forge_session_journal", operation,
+                    "terminal turn cleanup remains fenced until reopen");
+            } else if primary_failed || primary_cleanup_error.is_some() {
+                tracing::warn!(target: "forge_session_journal", operation, kind=?error.kind,
+                    "secondary native turn cleanup failed");
+            } else {
+                primary_cleanup_error = Some(host_runtime_error(error));
+            }
+        }
+    }
+    match primary_cleanup_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 fn host_runtime_error(error: RuntimeError) -> AgentHostError {
     AgentHostError::Runtime(error.to_string())
 }
@@ -2756,6 +2854,34 @@ mod turn_failure_tests {
     use super::*;
     use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
     use api_types::TurnFailure;
+
+    #[test]
+    fn terminal_cleanup_preserves_primary_and_successful_turn_reports_cleanup_failure() {
+        for error in [
+            RuntimeError::conflict("fenced"),
+            RuntimeError::internal("secondary"),
+        ] {
+            assert!(native_turn_cleanup(true, vec![("shutdown", Err(error))]).is_ok());
+        }
+        let error = native_turn_cleanup(
+            false,
+            vec![
+                (
+                    "persist",
+                    Err(RuntimeError::internal("primary persistence failure")),
+                ),
+                (
+                    "shutdown",
+                    Err(RuntimeError::conflict("secondary shutdown failure")),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "runtime failed: Internal: primary persistence failure"
+        );
+    }
 
     #[test]
     fn provider_rejections_keep_forge_classification_after_coarse_kind_change() {

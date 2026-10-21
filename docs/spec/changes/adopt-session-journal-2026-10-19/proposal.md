@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T19:29:31Z
+updated_at: 2026-10-21T20:15:29Z
 ---
 
 ## Why
@@ -96,7 +96,9 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   and unresumable suspended sessions, keep resumable dormant chats and reusable
   Task sessions. Schedule bounded dirty-session collection, terminal repacking and
   deletion cleanup without a TTL. An unreadable session is preserved and logged
-  once, with healthy collection continuing. Unknown dependency metadata can
+  once per tracked id up to a capped, non-evicting 4,096-id process tracker,
+  followed by one overflow warning and per-session suppression; aggregate counts
+  and healthy collection continue. Unknown dependency metadata can
   conservatively defer other retirements; Forge never overrides that refusal.
 - **Acceptance.** Run `assert_journal_storage_conformance` unedited with repacking
   off/on and reopened storage, all eight Forge-backed broken-storage cases, real
@@ -125,7 +127,9 @@ ordinary-redaction decisions.
   wiring and nudges; continuity caller and focused native-chat tests.
 - Future docs: `docs/architecture.md`, `docs/getting-started.md`,
   `docs/performance-testing.md`, `CHANGELOG.md`.
-- Public API/MCP/CLI/events and `checkpoint_present` meaning stay stable. The disk
+- Explicit Agent Session resume refuses retired history with `409 session_retired`;
+  automatic selection/open races rotate once to a fresh runtime identity. Other
+  public surfaces and `checkpoint_present` meaning stay stable. The disk
   layout gains six tables; no per-object body/index or operation-result rows.
 - Task 1 implements only the released dependency pin, release contract test and
   associated documentation/spec alignment. Native storage adoption remains in

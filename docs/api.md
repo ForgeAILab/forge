@@ -435,7 +435,7 @@ retries), never from provider message text.
 | POST   | `/api/v1/agents/{id}/effective-permissions` | Inspect the fail-closed permission intersection for one canonical scope |
 | POST   | `/api/v1/agent-sessions/{id}/rotate` | Replace a session while retaining identity/scope continuity |
 | POST   | `/api/v1/agent-sessions/{id}/suspend` | Suspend a session using its optimistic version |
-| POST   | `/api/v1/agent-sessions/{id}/resume` | Resume a session using its optimistic version |
+| POST   | `/api/v1/agent-sessions/{id}/resume` | Resume using its optimistic version; retired native history returns `409 session_retired` even with a stale version, without changing the row. Start a new session instead. |
 | POST   | `/api/v1/agent-sessions/{id}/cancel` | Explicitly cancel the active native turn when supported |
 | POST   | `/api/v1/agent-sessions/{id}/steer` | Explicitly steer the active native turn when supported |
 | GET    | `/api/v1/agent-sessions/{session_id}/interactions` | List redaction-safe pending protected interactions for an owned session |

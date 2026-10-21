@@ -2435,6 +2435,16 @@ metadata in another session can also defer retirement: Forge preserves partial
 progress and reports a deferral instead of falsely marking the healthy candidate
 unreadable or bypassing the runtime's dependency checks.
 
+Host dormant selection and active reuse probe native retirement before use and
+rotate a retired row through the versioned host transaction, preserving identity,
+scope and profile with a fresh runtime id. Ready-status writes, including topic
+handoff, guard tombstones in their host transaction. Native open reports a typed
+retirement outcome when retirement wins after selection; Chat, Task and inquiry callers
+rotate and retry once, then return any second failure normally. Engine calls run
+outside host transactions. Explicit session resume refuses retired history with
+`409 session_retired` even with a stale version and leaves the row unchanged; the
+client starts a new session. Tombstones and the prohibition on stale legacy fallback remain intact.
+
 The supervisor starts one `session-journal-retention` PeriodicWorker in server
 and Solo. It scans immediately, then on a 60-second Skip interval or a post-commit
 terminal/rotation/recovery/deletion nudge. The shared pool Notify is registered
@@ -2456,8 +2466,13 @@ Runtime v0.9.0 reports per-session non-retryable failures in `unreadable_session
 keeps their state and dirty hints, and continues healthy collection. A second
 collect reports the bad session again with at most one record load in that call.
 Conflicts skip silently; retryable/domain-wide errors abort. The worker and
-storage share a process-wide once-per-session neutral warning, without ids,
-contents or keys. Diagnostics and compact skip unreadable sessions.
+storage share a capped, non-evicting process warning tracker. It retains at most
+4,096 ids, warns once per tracked session and emits one overflow warning when
+capacity is reached. Further per-session warnings are suppressed while aggregate
+observations keep counting. Logs contain no ids, contents or keys. Diagnostics
+and compact skip unreadable sessions. The worker deduplicates unreadable ids only
+within the current pass: `preserved_sessions` and `unreadable_sessions` are
+current-pass counts, with no lifetime id set in the restartable cursor.
 `forge_session_journal` events separate retirements, conflicts, dependency
 refusals, collection receipts, readable retained/live/deferred bytes, omitted
 session counts and deletion counts. Collect-call duration is a conservative
@@ -2510,10 +2525,15 @@ their existing protected tables and leases, outside journal state.
 
 The pin is agent-runtime v0.9.0 (`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`).
 The release rolls back proven unaccepted turn input and fences unresolved
-acceptance until reopen. Forge keeps the original turn failure when post-turn
-persist returns that fencing conflict; the next request opens a fresh handle.
-Both seven-cut/both-domain wedge regressions and the unresolved-acceptance case
-cover recovery without manual repair.
+acceptance until reopen. Forge separates terminal outcomes and per-turn usage
+from shutdown/persist cleanup. Failed and cancelled turns retain their original
+classification, message and usage envelope when cleanup returns the runtime's
+typed fencing conflict; other secondary cleanup failures cannot replace a primary
+failure either. Shutdown closes leases, and the active-turn registration is
+removed before returning. A successful turn's genuine persistence failure remains
+an error, with the first cleanup failure preserved. The next request opens a fresh
+handle. Both seven-cut/both-domain wedge regressions, unresolved acceptance, and
+deterministic cancellation barriers before/after provider I/O cover recovery.
 Native-first open uses the runtime importer for eligible legacy snapshot-only or
 checkpoint-bearing state, publishing protected exact first when a checkpoint
 exists. It reads Forge's authenticated zstd envelope or pre-envelope encrypted

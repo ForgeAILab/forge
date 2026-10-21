@@ -19,8 +19,8 @@ use db::{
     AgentChatMessage, AgentChatMessageAuthorType, AgentChatMessageListQuery, AgentChatMessageRepo,
     AgentChatMessageStatus, AgentChatRepo, AgentChatTransactionRepo, AgentChatTurnJob,
     AgentChatTurnJobRepo, AgentProfile, AgentProfileRepo, AgentRepo, AgentSession,
-    CompleteAgentChatControlTransfer, CredentialHandleRepo, PageRequest, ProjectAgentBindingRepo,
-    ProjectRepo, SqliteDb, UsageInvocationLifecycle, UsageLedgerRepo,
+    AgentSessionRepo, CompleteAgentChatControlTransfer, CredentialHandleRepo, PageRequest,
+    ProjectAgentBindingRepo, ProjectRepo, SqliteDb, UsageInvocationLifecycle, UsageLedgerRepo,
 };
 use executors::{
     merge_overrides, ExecutionContext, ExecutionOutcome, ExecutionOverrides, ExecutionResult,
@@ -28,8 +28,8 @@ use executors::{
 };
 use forge_agent_host::RuntimeContextManifestLink;
 use forge_agent_host::{
-    AgentSessionBackend, AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType,
-    Message, NativeProviderConfig, Role, WorkspaceAccess, MAIN_GENESIS_START_OPERATION,
+    AgentTurnRequest, BackendCapabilities, CanonicalScope, CanonicalScopeType, Message,
+    NativeProviderConfig, Role, WorkspaceAccess, MAIN_GENESIS_START_OPERATION,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2866,57 +2866,54 @@ impl FederatedAgentChatTurnRunner {
             };
         let turn_log = self.turn_log_sink(job).await;
         let started = std::time::Instant::now();
+        let mut native_request = AgentTurnRequest {
+            forge_session_id: session.id.clone(),
+            runtime_session_id,
+            scope: CanonicalScope {
+                scope_type: CanonicalScopeType::AgentChat,
+                scope_id: job.chat_id.clone(),
+                workspace_access: turn_workspace
+                    .as_ref()
+                    .map_or(WorkspaceAccess::Deny, |_| turn_workspace_access),
+            },
+            workspace_path: turn_workspace
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            provider: {
+                let (context_tokens, max_input_tokens, max_output_tokens) =
+                    crate::embedded_agent_service::effective_native_limits(
+                        &provider,
+                        config.context_tokens,
+                        config.max_input_tokens,
+                        config.max_output_tokens,
+                    );
+                NativeProviderConfig {
+                    provider,
+                    base_url: config.base_url,
+                    model: model.clone(),
+                    reasoning_effort: profile.reasoning_effort.clone(),
+                    credential_handle_id: credential_ref.to_owned(),
+                    owner_user_id: owner_user_id.to_owned(),
+                    provider_account_id,
+                    context_tokens,
+                    max_input_tokens,
+                    max_output_tokens,
+                }
+            },
+            system_prompt: compose_system_prompt(
+                profile.prompt_template.as_deref(),
+                operating_instruction.as_deref(),
+            ),
+            history: runtime_history(&history),
+            input: input.content,
+            server_state_card: Some(state_card),
+            command_allowlist: Some(command_allowlist),
+            environment,
+            cancellation,
+        };
         let output = match self
             .embedded_agents
-            .native_backend()
-            .run_turn(
-                AgentTurnRequest {
-                    forge_session_id: session.id.clone(),
-                    runtime_session_id,
-                    scope: CanonicalScope {
-                        scope_type: CanonicalScopeType::AgentChat,
-                        scope_id: job.chat_id.clone(),
-                        workspace_access: turn_workspace
-                            .as_ref()
-                            .map_or(WorkspaceAccess::Deny, |_| turn_workspace_access),
-                    },
-                    workspace_path: turn_workspace
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                    provider: {
-                        let (context_tokens, max_input_tokens, max_output_tokens) =
-                            crate::embedded_agent_service::effective_native_limits(
-                                &provider,
-                                config.context_tokens,
-                                config.max_input_tokens,
-                                config.max_output_tokens,
-                            );
-                        NativeProviderConfig {
-                            provider,
-                            base_url: config.base_url,
-                            model: model.clone(),
-                            reasoning_effort: profile.reasoning_effort.clone(),
-                            credential_handle_id: credential_ref.to_owned(),
-                            owner_user_id: owner_user_id.to_owned(),
-                            provider_account_id,
-                            context_tokens,
-                            max_input_tokens,
-                            max_output_tokens,
-                        }
-                    },
-                    system_prompt: compose_system_prompt(
-                        profile.prompt_template.as_deref(),
-                        operating_instruction.as_deref(),
-                    ),
-                    history: runtime_history(&history),
-                    input: input.content,
-                    server_state_card: Some(state_card),
-                    command_allowlist: Some(command_allowlist),
-                    environment,
-                    cancellation,
-                },
-                turn_log,
-            )
+            .run_native_turn(&mut native_request, turn_log)
             .await
         {
             Ok(output) => output,
@@ -2966,6 +2963,16 @@ impl FederatedAgentChatTurnRunner {
                     )),
                 });
             }
+        };
+        let session = if native_request.forge_session_id == session.id {
+            session
+        } else {
+            self.db
+                .get_agent_session(&native_request.forge_session_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_session", &native_request.forge_session_id)
+                })?
         };
         let mut usage_reports = output
             .usage_reports

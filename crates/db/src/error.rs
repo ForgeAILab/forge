@@ -37,6 +37,9 @@ pub enum DbError {
     #[error("dead letter is not a whole event and cannot be replayed")]
     DeadLetterNotReplayable,
 
+    #[error("session history has been retired; start a new session")]
+    SessionRetired,
+
     #[error("version conflict")]
     VersionConflict,
     #[error("task_busy: {pending_steps} pending steps; retry after {retry_after_ms} ms")]

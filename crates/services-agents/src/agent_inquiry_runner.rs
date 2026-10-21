@@ -24,8 +24,7 @@ use db::{
     SqliteDb,
 };
 use forge_agent_host::{
-    AgentSessionBackend, AgentTurnRequest, CanonicalScope, CanonicalScopeType,
-    NativeProviderConfig, WorkspaceAccess,
+    AgentTurnRequest, CanonicalScope, CanonicalScopeType, NativeProviderConfig, WorkspaceAccess,
 };
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -294,7 +293,7 @@ Your inquiry id is {inquiry_id}."
         let turn_cancellation = cancellation.child_token();
         let provider_id = provider.clone();
         let model_id = model.clone();
-        let turn = AgentTurnRequest {
+        let mut turn = AgentTurnRequest {
             forge_session_id: session.id.clone(),
             runtime_session_id,
             scope: CanonicalScope {
@@ -343,12 +342,11 @@ Your inquiry id is {inquiry_id}."
             cancellation: turn_cancellation.clone(),
         };
 
-        let backend = embedded_agents.native_backend();
         let observed_usage = Arc::clone(&self.observed_usage);
         let inquiry_id_for_reports = inquiry_id.to_owned();
         let output = await_inquiry_turn(
             async move {
-                match backend.run_turn(turn, sink).await {
+                match embedded_agents.run_native_turn(&mut turn, sink).await {
                     Ok(output) => Ok(output),
                     Err(forge_agent_host::AgentHostError::RuntimeWithUsage {
                         message,

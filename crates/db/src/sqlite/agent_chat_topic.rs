@@ -122,6 +122,7 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
         };
         let now = crate::now_rfc3339();
         if input.hand_over {
+            super::session_journal_probe::require_unretired_session(&mut tx, &successor).await?;
             // The fork superseded the source: the successor takes over.
             sqlx::query(
                 "DELETE FROM agent_topic_read_digest WHERE runtime_session_id =
@@ -332,6 +333,8 @@ impl AgentChatTopicTransactionRepo for SqliteDb {
             .bind(runtime_id)
             .fetch_one(&mut *transaction)
             .await?;
+            super::session_journal_probe::require_unretired_session(&mut transaction, &successor.0)
+                .await?;
             if let Some(parent) = &successor.1 {
                 // The predecessor's unchanged-read digests refer to calls the
                 // new topic cannot see.

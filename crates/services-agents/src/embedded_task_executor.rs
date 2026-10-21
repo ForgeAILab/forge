@@ -381,10 +381,17 @@ impl EmbeddedTaskExecutor {
             environment: executors::environment::task_environment(&ctx.agent_config),
             cancellation: cancellation.clone(),
         };
+        let mut native_request = turn_request(ctx.description.clone());
         let output = self
-            .backend
-            .run_turn(turn_request(ctx.description.clone()), log_sink.clone())
+            .embedded_agents
+            .run_native_turn(&mut native_request, log_sink.clone())
             .await;
+        let runtime_session_id = native_request.runtime_session_id.clone();
+        let turn_request = |input: String| {
+            let mut request = native_request.clone();
+            request.input = input;
+            request
+        };
         self.active.write().await.remove(&ctx.execution_id);
         if let Some(outcome) =
             native_provider_health_outcome(&output).filter(|_| !cancellation.is_cancelled())
@@ -623,7 +630,7 @@ impl EmbeddedTaskExecutor {
             output,
             |text| ::review::contract::parse_assessment(text).err(),
             |problem, report| {
-                let request = turn_request(review_correction::correction_prompt(&problem));
+                let mut request = turn_request(review_correction::correction_prompt(&problem));
                 let log_sink = Arc::clone(log_sink);
                 async move {
                     let _ = log_sink
@@ -640,7 +647,7 @@ impl EmbeddedTaskExecutor {
                             }),
                         )
                         .await;
-                    let result = self.backend.run_turn(request, log_sink).await;
+                    let result = self.embedded_agents.run_native_turn(&mut request, log_sink).await;
                     if let Some(outcome) = native_provider_health_outcome(&result)
                         .filter(|_| !cancellation.is_cancelled())
                     {
@@ -1048,10 +1055,10 @@ impl TaskExecutor for EmbeddedTaskExecutor {
             return Ok(());
         };
         active.cancellation.cancel();
-        self.backend
-            .cancel(&active.runtime_session_id)
-            .await
-            .map_err(|error| ExecutorError::Other(error.to_string()))
+        match self.backend.cancel(&active.runtime_session_id).await {
+            Ok(()) | Err(AgentHostError::SessionNotFound) => Ok(()),
+            Err(error) => Err(ExecutorError::Other(error.to_string())),
+        }
     }
 }
 
