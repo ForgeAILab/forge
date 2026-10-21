@@ -184,6 +184,14 @@ impl NativeAgentRuntimeBackend {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn failed_topic_read_count_for_test(&self) -> usize {
+        self.failed_topic_reads
+            .lock()
+            .expect("topic read lock")
+            .len()
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn set_failure_barrier_for_test(&self, barrier: Arc<tokio::sync::Barrier>) {
         *self.failure_barrier.lock().expect("failure barrier lock") = Some(barrier);
     }
@@ -1218,11 +1226,6 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             }
             Err(error) => return Err(error),
         };
-        let mut topic_reads_guard = TopicReadTurnGuard {
-            failed: Arc::clone(&self.failed_topic_reads),
-            runtime_session_id: request.runtime_session_id.clone(),
-            completed: false,
-        };
         let start = if !context_mode.persistent_session {
             let mut start = StartSession::ephemeral(Vec::new());
             start.session_id = Some(id);
@@ -1254,6 +1257,11 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             }
             Err(error) => return Err(host_runtime_error(error)),
         };
+        let mut topic_reads_guard = topic_reads.as_ref().map(|_| TopicReadTurnGuard {
+            failed: Arc::clone(&self.failed_topic_reads),
+            runtime_session_id: request.runtime_session_id.clone(),
+            completed: false,
+        });
         // A persistent session restores its accumulated usage ledger, so
         // everything already in it was reported by the turn that made the
         // call. Only records appended from here on belong to this turn.
@@ -1427,7 +1435,9 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             if let Some(reads) = &topic_reads {
                 reads.commit(&history).await?;
             }
-            topic_reads_guard.complete();
+            if let Some(guard) = topic_reads_guard.as_mut() {
+                guard.complete();
+            }
         }
         let text = history
             .iter()

@@ -280,6 +280,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Native Task context manifests use the host session matching the final runtime
+  output after retirement rotation, including reviewer corrections. Retired-open
+  races no longer retain obsolete runtime ids in unchanged-read failure tracking.
+
 - Unreadable-journal warning tracking retains at most 4,096 ids per process,
   without eviction, and emits one overflow warning before suppressing further
   session warnings. Aggregate counters continue; worker preservation counts now

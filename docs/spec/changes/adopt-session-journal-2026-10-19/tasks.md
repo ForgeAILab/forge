@@ -533,6 +533,15 @@ No runtime bench crate becomes a production dependency.
   dormant/newer replaced profile scenario, a selection/open race and non-chat
   resume. Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix/report.md`.
 
+  Re-review follow-up: Task manifest hashing and `agent_session_id` use the host
+  row matching the final successful runtime output, including reviewer-correction
+  rotation. Corrections carry successful request ids into later turns. Native
+  unchanged-read guards begin only after a Chat open succeeds; repeated retired
+  opens cannot accumulate obsolete runtime markers. Real Task executor and
+  correction regressions check B's runtime, B's host manifest link and B's manifest
+  hash; eight repeated Chat open races check an empty failure-marker set.
+  Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix2/report.md`.
+
 - [x] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
   other than the scope's dormant session, where dormant is decided by calling

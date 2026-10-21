@@ -17,7 +17,8 @@ use std::{
 
 use async_trait::async_trait;
 use db::{
-    AgentProfileRepo, AgentRepo, ExecutionRepo, ExecutionStatus, SqliteDb, TaskRepo, WorkspaceRepo,
+    AgentProfileRepo, AgentRepo, AgentSessionRepo, ExecutionRepo, ExecutionStatus, SqliteDb,
+    TaskRepo, WorkspaceRepo,
 };
 use executors::{
     ExecutionContext, ExecutionFailureClass, ExecutionOutcome, ExecutionResult, ExecutorError,
@@ -41,6 +42,8 @@ use services::{
     Result, ServiceError,
 };
 
+#[cfg(test)]
+mod retirement_tests;
 mod review_correction;
 
 const EMBEDDED_EXECUTOR_TYPE: &str = "embedded";
@@ -387,11 +390,6 @@ impl EmbeddedTaskExecutor {
             .run_native_turn(&mut native_request, log_sink.clone())
             .await;
         let runtime_session_id = native_request.runtime_session_id.clone();
-        let turn_request = |input: String| {
-            let mut request = native_request.clone();
-            request.input = input;
-            request
-        };
         self.active.write().await.remove(&ctx.execution_id);
         if let Some(outcome) =
             native_provider_health_outcome(&output).filter(|_| !cancellation.is_cancelled())
@@ -500,7 +498,7 @@ impl EmbeddedTaskExecutor {
             self.correct_review_report(
                 ctx,
                 output,
-                &turn_request,
+                &mut native_request,
                 &log_sink,
                 ReviewCorrectionProvider {
                     runtime_session_id: &runtime_session_id,
@@ -511,6 +509,16 @@ impl EmbeddedTaskExecutor {
             .await
         } else {
             output
+        };
+        let session = if native_request.forge_session_id == session.id {
+            session
+        } else {
+            self.db
+                .get_agent_session(&native_request.forge_session_id)
+                .await?
+                .ok_or_else(|| {
+                    ServiceError::not_found("agent_session", &native_request.forge_session_id)
+                })?
         };
         if cancellation.is_cancelled() {
             let usage_reports = native_usage_reports(
@@ -606,7 +614,7 @@ impl EmbeddedTaskExecutor {
         &self,
         ctx: &ExecutionContext,
         output: forge_agent_host::AgentTurnOutput,
-        turn_request: &impl Fn(String) -> AgentTurnRequest,
+        native_request: &mut AgentTurnRequest,
         log_sink: &Arc<TurnLogSink>,
         provider: ReviewCorrectionProvider<'_>,
         cancellation: &CancellationToken,
@@ -626,11 +634,14 @@ impl EmbeddedTaskExecutor {
             },
         );
         let original_text = output.text.clone();
+        let turn_request = StdMutex::new(native_request.clone());
         let corrected = review_correction::correct_report(
             output,
             |text| ::review::contract::parse_assessment(text).err(),
             |problem, report| {
-                let mut request = turn_request(review_correction::correction_prompt(&problem));
+                let turn_request = &turn_request;
+                let mut request = turn_request.lock().expect("correction request lock").clone();
+                request.input = review_correction::correction_prompt(&problem);
                 let log_sink = Arc::clone(log_sink);
                 async move {
                     let _ = log_sink
@@ -648,6 +659,9 @@ impl EmbeddedTaskExecutor {
                         )
                         .await;
                     let result = self.embedded_agents.run_native_turn(&mut request, log_sink).await;
+                    if result.is_ok() {
+                        *turn_request.lock().expect("correction request lock") = request;
+                    }
                     if let Some(outcome) = native_provider_health_outcome(&result)
                         .filter(|_| !cancellation.is_cancelled())
                     {
@@ -666,6 +680,7 @@ impl EmbeddedTaskExecutor {
             },
         )
         .await;
+        *native_request = turn_request.into_inner().expect("correction request lock");
         self.active.write().await.remove(&ctx.execution_id);
         if corrected.text != original_text {
             // The review cascade reads the last assistant entry. Record the

@@ -2444,6 +2444,10 @@ rotate and retry once, then return any second failure normally. Engine calls run
 outside host transactions. Explicit session resume refuses retired history with
 `409 session_retired` even with a stale version and leaves the row unchanged; the
 client starts a new session. Tombstones and the prohibition on stale legacy fallback remain intact.
+Task execution carries the host session selected by the final successful turn,
+including reviewer corrections, into both the context manifest id hash and its
+`agent_session_id`. Native unchanged-read failure tracking starts only after a
+Chat session opens successfully, so retired-open retries retain no obsolete ids.
 
 The supervisor starts one `session-journal-retention` PeriodicWorker in server
 and Solo. It scans immediately, then on a 60-second Skip interval or a post-commit

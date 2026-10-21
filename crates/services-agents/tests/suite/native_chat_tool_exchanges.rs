@@ -3865,6 +3865,67 @@ async fn retirement_between_selection_and_open_rotates_once_and_retries() {
 }
 
 #[tokio::test]
+async fn repeated_retired_open_races_do_not_retain_topic_read_markers() {
+    use db::AgentSessionRepo;
+    let mut fixture = chat_fixture().await;
+    let store = fixture.service.protected_store();
+    let backend = Arc::new(
+        NativeAgentRuntimeBackend::new(store.clone())
+            .with_provider_override(text_only_provider(17)),
+    );
+    fixture.service = fixture.service.with_native_backend(backend.clone());
+    let mut request = fixture.turn("Publish initial history");
+    fixture
+        .service
+        .run_native_turn(&mut request, Arc::new(NoopSink))
+        .await
+        .unwrap();
+    for race in 0..8 {
+        let retired_runtime = request.runtime_session_id.clone();
+        let retired_host = request.forge_session_id.clone();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        backend.set_open_barrier_for_test(barrier.clone());
+        request.input = format!("Racing turn {race}");
+        let (result, ()) = tokio::join!(
+            fixture
+                .service
+                .run_native_turn(&mut request, Arc::new(NoopSink)),
+            async {
+                barrier.wait().await;
+                assert_eq!(
+                    store
+                        .journals()
+                        .retire_published(&retired_runtime)
+                        .await
+                        .unwrap()
+                        .retired_domains,
+                    2
+                );
+                barrier.wait().await;
+            }
+        );
+        let output = result.unwrap();
+        assert_ne!(output.runtime_session_id, retired_runtime);
+        assert_eq!(output.runtime_session_id, request.runtime_session_id);
+        assert_eq!(
+            fixture
+                .db
+                .get_agent_session(&retired_host)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "replaced"
+        );
+        assert_eq!(
+            backend.failed_topic_read_count_for_test(),
+            0,
+            "retired-open race {race} must not retain an obsolete runtime id"
+        );
+    }
+}
+
+#[tokio::test]
 async fn retired_active_session_rotates_before_reuse() {
     use db::AgentSessionRepo;
     let mut fixture = chat_fixture().await;
