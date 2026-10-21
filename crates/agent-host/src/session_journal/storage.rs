@@ -26,6 +26,10 @@ pub struct ForgeJournalStorage {
     pub(super) cache: Arc<Mutex<Cache>>,
     cpu: Arc<Semaphore>,
     #[cfg(feature = "test-support")]
+    record_loads: Arc<Mutex<std::collections::HashMap<(JournalDomain, SessionId), usize>>>,
+    #[cfg(feature = "test-support")]
+    pub(super) failed_commit_observation: Arc<std::sync::atomic::AtomicU8>,
+    #[cfg(feature = "test-support")]
     pub(super) repack: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-support")]
     pub(super) compact_observations: Arc<Mutex<(u64, usize)>>,
@@ -62,9 +66,19 @@ pub(super) fn flag(row: &SqliteRow, name: &str) -> Result<bool, RuntimeError> {
         _ => Err(corrupt()),
     }
 }
-pub(super) fn database_error(_: impl fmt::Display) -> RuntimeError {
-    // sqlx errors may include bound data; only neutral diagnostics escape.
-    RuntimeError::internal("journal database operation failed")
+pub(super) fn database_error(error: impl Into<db::DbError>) -> RuntimeError {
+    // Inspect sqlx's codes through the DB boundary, never its potentially
+    // sensitive message. Includes extended BUSY/LOCKED codes (low byte 5/6),
+    // IO/CANTOPEN and pool/worker availability errors.
+    let retryable = error.into().is_transient();
+    let error = RuntimeError::internal("journal database operation failed");
+    if retryable { error.retryable() } else { error }
+}
+
+pub(super) fn ambiguous_database_error(error: impl Into<db::DbError>) -> RuntimeError {
+    // A failed COMMIT acknowledgement cannot prove absence. The runtime must
+    // reload/retry, even when the underlying error normally is deterministic.
+    database_error(error).retryable()
 }
 impl ForgeJournalStorage {
     /// This constructor performs no SQL and decodes no pack units.
@@ -79,15 +93,43 @@ impl ForgeJournalStorage {
             cache: Arc::new(Mutex::new(Cache::new(DEFAULT_BUDGET))),
             cpu: Arc::new(Semaphore::new(2)),
             #[cfg(feature = "test-support")]
+            record_loads: Arc::new(Mutex::new(Default::default())),
+            #[cfg(feature = "test-support")]
+            failed_commit_observation: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            #[cfg(feature = "test-support")]
             repack: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "test-support")]
             compact_observations: Arc::new(Mutex::new((0, 0))),
         })
     }
+    /// Make the first protected load after an injected commit failure fail too,
+    /// leaving acceptance unresolved until the next session open.
+    #[cfg(feature = "test-support")]
+    pub fn fail_commit_observation_for_test(&self) {
+        self.failed_commit_observation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(feature = "test-support")]
+    pub fn session_record_loads_for_test(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+    ) -> usize {
+        self.record_loads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(domain.clone(), session.clone()))
+            .copied()
+            .unwrap_or(0)
+    }
+    /// Call only after publication/host commit, with no pooled connection held.
+    pub fn nudge_retention(&self) {
+        self.db.session_journal_cleanup_notify().notify_waiters();
+    }
     pub(super) fn cache_lock(&self) -> Result<MutexGuard<'_, Cache>, RuntimeError> {
         self.cache
             .lock()
-            .map_err(|_| RuntimeError::internal("journal cache unavailable"))
+            .map_err(|_| RuntimeError::internal("journal cache unavailable").retryable())
     }
     pub(super) async fn work<T: Send + 'static>(
         &self,
@@ -98,13 +140,13 @@ impl ForgeJournalStorage {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| corrupt())?;
+            .map_err(|_| RuntimeError::internal("journal codec unavailable").retryable())?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             job()
         })
         .await
-        .map_err(|_| RuntimeError::internal("journal codec worker failed"))?
+        .map_err(|_| RuntimeError::internal("journal codec worker failed").retryable())?
     }
     pub(super) fn revision(&self, row: &SqliteRow) -> Result<(), RuntimeError> {
         if row
@@ -123,6 +165,15 @@ impl ForgeJournalStorage {
         session: &SessionId,
         row: SqliteRow,
     ) -> Result<JournalSessionRecord, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        {
+            *self
+                .record_loads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry((domain.clone(), session.clone()))
+                .or_default() += 1;
+        }
         self.revision(&row)?;
         let keys = self.keys.clone();
         let domain = domain.clone();
@@ -470,81 +521,30 @@ impl JournalStorage for ForgeJournalStorage {
         JournalBodySharing::PerSession
     }
     async fn retained_bytes(&self, domain: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
-        let mut after = 0i64;
-        let mut total = 0u64;
-        loop {
-            // This domain-wide diagnostic authenticates scalar counts against
-            // index units in bounded pages. It never opens body units or builds
-            // a global directory, including for orphan/deferred packs.
-            let rows=sqlx::query("SELECT pack_id,runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND pack_id>? ORDER BY pack_id LIMIT 400")
-                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(after).fetch_all(&mut *tx).await.map_err(database_error)?;
-            if rows.is_empty() {
-                break;
-            }
-            for row in &rows {
-                self.revision(row)?;
-            }
-            let count = rows.len() as u64;
-            let keys = self.keys.clone();
-            let domain = domain.clone();
-            let (last, bytes) = self
-                .work(move || {
-                    let mut last = 0;
-                    let mut bytes = 0u64;
-                    for row in rows {
-                        let id: i64 = row.try_get("pack_id").map_err(|_| corrupt())?;
-                        let session = SessionId::new(
-                            row.try_get::<String, _>("runtime_session_id")
-                                .map_err(|_| corrupt())?,
-                        );
-                        let owner: String =
-                            row.try_get("forge_session_id").map_err(|_| corrupt())?;
-                        let generation = counter(&row, "generation")?;
-                        let count = usize::try_from(
-                            row.try_get::<i64, _>("object_count")
-                                .map_err(|_| corrupt())?,
-                        )
-                        .map_err(|_| corrupt())?;
-                        let retained = usize::try_from(
-                            row.try_get::<i64, _>("retained_canonical_bytes")
-                                .map_err(|_| corrupt())?,
-                        )
-                        .map_err(|_| corrupt())?;
-                        let raw = keys.open(
-                            &Binding {
-                                unit: Unit::PackIndex,
-                                domain: &domain,
-                                session: &session,
-                                owner: &owner,
-                                row: &id.to_be_bytes(),
-                                generation,
-                            },
-                            &row.try_get::<Vec<u8>, _>("index_nonce")
-                                .map_err(|_| corrupt())?,
-                            &row.try_get::<Vec<u8>, _>("index_payload")
-                                .map_err(|_| corrupt())?,
-                            codec::MAX_INDEX_BYTES,
-                        )?;
-                        codec::decode_index(&raw, count, retained)?;
-                        bytes = bytes.checked_add(retained as u64).ok_or_else(corrupt)?;
-                        last = id;
-                    }
-                    Ok((last, bytes))
-                })
-                .await?;
-            self.cache_lock()?.index_decodes += count;
-            after = last;
-            total = total.checked_add(bytes).ok_or_else(corrupt)?;
-        }
-        tx.commit().await.map_err(database_error)?;
-        Ok(Some(total))
+        Ok(Some(self.byte_stats(domain).await?.retained_bytes))
     }
+
     async fn load(
         &self,
         domain: &JournalDomain,
         session: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        if domain.role == JournalRole::Protected
+            && self
+                .failed_commit_observation
+                .compare_exchange(
+                    2,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            return Err(
+                RuntimeError::internal("injected acceptance observation failure").retryable(),
+            );
+        }
         let mut tx = self.db.pool().begin().await.map_err(database_error)?;
         let result = self.load_on(&mut tx, domain, session).await?;
         tx.commit().await.map_err(database_error)?;
@@ -739,7 +739,7 @@ impl JournalStorage for ForgeJournalStorage {
             return Ok(vec![]);
         }
         let mut tx = self.db.pool().begin().await.map_err(database_error)?;
-        let rows=sqlx::query("SELECT * FROM agent_session_journal_session WHERE storage_id=? AND role=? AND collection_dirty=1 AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT ?")
+        let rows=sqlx::query("SELECT runtime_session_id FROM agent_session_journal_session WHERE storage_id=? AND role=? AND collection_dirty=1 AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT ?")
             .bind(domain.storage_id.as_str()).bind(role(domain)).bind(after.map(SessionId::as_str)).bind(after.map(SessionId::as_str)).bind(i64::try_from(limit).unwrap_or(i64::MAX)).fetch_all(&mut *tx).await.map_err(database_error)?;
         let mut sessions = Vec::new();
         for row in rows {
@@ -747,7 +747,8 @@ impl JournalStorage for ForgeJournalStorage {
                 row.try_get::<String, _>("runtime_session_id")
                     .map_err(|_| corrupt())?,
             );
-            self.record_row(domain, &s, row).await?;
+            // Discovery uses only the clear dirty index. The engine loads and
+            // authenticates each id once, isolating an unreadable session.
             sessions.push(s);
         }
         tx.commit().await.map_err(database_error)?;
@@ -757,6 +758,123 @@ impl JournalStorage for ForgeJournalStorage {
         self.apply_write(write).await
     }
     async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
-        self.compact_domain(domain).await
+        // Earlier per-session batches may already have committed. Returned
+        // domain-wide errors must not claim that the whole operation had no
+        // effect; physical maintenance is safe to retry from the beginning.
+        self.compact_domain(domain)
+            .await
+            .map_err(RuntimeError::retryable)
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+    use sqlx::Connection;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn sqlite_busy_is_retryable_and_rolls_back() {
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(temp.path().join("contention.db"))
+                .create_if_missing(true)
+                .shared_cache(false)
+                .busy_timeout(Duration::ZERO);
+            let mut owner = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .unwrap();
+            let mut other = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .unwrap();
+            sqlx::query("CREATE TABLE contention (id INTEGER)")
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO contention VALUES (1)")
+                .execute(&mut owner)
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                sqlx::query("INSERT INTO contention VALUES (2)").execute(&mut other),
+            )
+            .await
+            .expect("busy timeout is disabled")
+            .unwrap_err();
+            let code = error
+                .as_database_error()
+                .unwrap()
+                .code()
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            assert_eq!(code & 0xff, 5);
+            assert!(database_error(error).retryable);
+            sqlx::query("ROLLBACK").execute(&mut owner).await.unwrap();
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM contention")
+                .fetch_one(&mut other)
+                .await
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("private database diagnostic")]
+    struct CodedError(&'static str);
+    impl sqlx::error::DatabaseError for CodedError {
+        fn message(&self) -> &str {
+            "private database diagnostic"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+    #[test]
+    fn sqlite_primary_and_extended_contention_codes_are_retryable() {
+        for code in ["5", "261", "517", "6", "262", "518"] {
+            assert!(
+                database_error(sqlx::Error::Database(Box::new(CodedError(code)))).retryable,
+                "{code}"
+            );
+        }
+        assert!(!database_error(sqlx::Error::Database(Box::new(CodedError("19")))).retryable);
+    }
+
+    #[test]
+    fn ambiguous_acknowledgements_and_availability_are_retryable() {
+        assert!(!database_error(sqlx::Error::RowNotFound).retryable);
+        assert!(!database_error(sqlx::Error::Protocol("private SQL data".into())).retryable);
+        assert!(
+            ambiguous_database_error(sqlx::Error::Protocol("private SQL data".into())).retryable
+        );
+        for error in [
+            sqlx::Error::PoolClosed,
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::WorkerCrashed,
+            sqlx::Error::Io(std::io::Error::other("private IO data")),
+        ] {
+            let mapped = database_error(error);
+            assert!(mapped.retryable);
+            assert_eq!(mapped.message, "journal database operation failed");
+        }
     }
 }

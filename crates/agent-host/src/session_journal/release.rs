@@ -152,3 +152,72 @@ impl ForgeJournalStorage {
         Ok((receipt, survivors))
     }
 }
+
+#[cfg(feature = "test-support")]
+impl ForgeJournalStorage {
+    /// Construct a real, authenticated below-threshold deferred slot without
+    /// changing any engine object, head or existing membership. Lifecycle tests
+    /// use this to prove retired-domain collection purges already-dead bytes.
+    pub async fn add_deferred_slot_for_test(
+        &self,
+        domain: &JournalDomain,
+        session: &agent_runtime::core::ids::SessionId,
+        object: JournalStoredObject,
+    ) -> Result<u64, RuntimeError> {
+        use super::storage::ambiguous_database_error;
+        let scope = (domain.clone(), session.clone());
+        codec::validate(&object)?;
+        let bytes = object.bytes.len();
+        let mut tx = db::begin_immediate(self.db.pool())
+            .await
+            .map_err(database_error)?;
+        let views = self.directory(&mut tx, &scope, false).await?;
+        let view = views
+            .iter()
+            .find(|v| {
+                (0..v.index.key.count).all(|slot| v.held(slot))
+                    && v.index.key.retained > bytes * 4
+                    && v.index.key.retained + bytes <= codec::PACK_CAP
+            })
+            .ok_or_else(corrupt)?;
+        let bodies = self
+            .bodies(&mut tx, &views, &BTreeSet::from([view.index.key.id]), false)
+            .await?;
+        let mut objects = bodies
+            .get(&view.index.key.id)
+            .ok_or_else(corrupt)?
+            .as_ref()
+            .clone();
+        if objects.iter().any(|o| o.id == object.id) {
+            return Err(corrupt());
+        }
+        let dead = object.id.clone();
+        objects.push(object);
+        objects.sort_by(|a, b| a.id.cmp(&b.id));
+        let slot = objects
+            .iter()
+            .position(|o| o.id == dead)
+            .ok_or_else(corrupt)?;
+        let count = objects.len();
+        self.rewrite_live_pack(&mut tx, &scope, view, objects)
+            .await?;
+        let mut bitmap = vec![255; count.div_ceil(8)];
+        if count % 8 != 0 {
+            *bitmap.last_mut().ok_or_else(corrupt)? = (1 << (count % 8)) - 1;
+        }
+        bitmap[slot / 8] &= !(1 << (slot % 8));
+        self.put_bits(
+            &mut tx,
+            &scope,
+            &view.index.key.owner,
+            view.index.key.id,
+            &bitmap,
+        )
+        .await?;
+        tx.commit().await.map_err(ambiguous_database_error)?;
+        self.cache_lock()
+            .map_err(RuntimeError::retryable)?
+            .invalidate(&scope);
+        Ok(bytes as u64)
+    }
+}

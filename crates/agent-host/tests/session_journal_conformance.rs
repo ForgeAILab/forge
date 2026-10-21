@@ -38,6 +38,11 @@ async fn broken_storage_torn_transaction() {
 }
 
 #[tokio::test]
+async fn broken_storage_non_retryable_lost_ack() {
+    broken::rejects(broken::Defect::NonRetryableLostAck, "atomic_apply_cuts").await;
+}
+
+#[tokio::test]
 async fn broken_storage_lost_write() {
     broken::rejects(broken::Defect::LostWrite, "restart_acknowledged_state").await;
 }
@@ -67,7 +72,8 @@ async fn broken_storage_remaining_holder_unlinked() {
 async fn broken_storage_non_member_served() {
     broken::rejects(
         broken::Defect::DeadBodyServed,
-        "membership_isolation_and_receipts",
+        // v0.9.0's new warm-cache authority probe rejects this defect first.
+        "body_cache_membership",
     )
     .await;
 }

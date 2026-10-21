@@ -1316,10 +1316,28 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
         } else {
             turn.completed().await;
         }
-        let persist_result = session.persist().await.map_err(host_runtime_error);
+        let persist_result = session.persist().await;
+        let terminal_published = persist_result.is_ok();
         let finish = finish_result?;
-        persist_result?;
+        // An unresolved acceptance fences persistence until reopen. Preserve
+        // the turn's original failure and usage rather than replacing it with
+        // the cleanup conflict. Every subsequent turn opens a fresh handle.
+        match persist_result {
+            Err(error)
+                if matches!(finish, TurnFinish::Failed)
+                    && error.kind == agent_runtime::core::error::ErrorKind::Conflict =>
+            {
+                tracing::debug!(target: "forge_session_journal", "failed turn persistence remains fenced until reopen");
+            }
+            result => result.map_err(host_runtime_error)?,
+        }
         active_turn.finish();
+        if terminal_published && context_mode.persistent_session {
+            self.protected_store
+                .journals()
+                .post_terminal(&request.runtime_session_id)
+                .await;
+        }
 
         let pending_interaction_id = match finish {
             TurnFinish::Completed => None,
@@ -1711,6 +1729,14 @@ impl NativeAgentRuntimeBackend {
             .await
             .map_err(host_runtime_error)?;
         child.persist().await.map_err(host_runtime_error)?;
+        self.protected_store
+            .journals()
+            .post_terminal(&request.runtime_session_id)
+            .await;
+        self.protected_store
+            .journals()
+            .post_terminal(successor)
+            .await;
         Ok(())
     }
 
@@ -1723,7 +1749,12 @@ impl NativeAgentRuntimeBackend {
             .runtime
             .abort_fork(&SessionId::new(&request.runtime_session_id))
             .await
-            .map_err(host_runtime_error)
+            .map_err(host_runtime_error)?;
+        self.protected_store
+            .journals()
+            .post_terminal(&request.runtime_session_id)
+            .await;
+        Ok(())
     }
 
     fn summary_model(

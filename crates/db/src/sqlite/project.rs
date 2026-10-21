@@ -1109,6 +1109,14 @@ impl ProjectRepo for SqliteDb {
             sqlx::query(statement).bind(id).execute(&mut *tx).await?;
         }
 
+        let chats: Vec<String> = sqlx::query_scalar("SELECT id FROM agent_chat WHERE project_id=?")
+            .bind(id)
+            .fetch_all(&mut *tx)
+            .await?;
+        for chat in chats {
+            self.delete_agent_chat_scopes_in_tx(&mut tx, &chat).await?;
+        }
+
         let result = sqlx::query("DELETE FROM project WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)

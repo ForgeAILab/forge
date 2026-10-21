@@ -2421,23 +2421,59 @@ and its engine clones, sharing gates, lease registries and validated roots. A
 second independent engine over a live storage/domain is unsafe for collection
 and cross-session retirement/dependency checks, even with runtime warm-read
 fences. Engines are never constructed by a turn or collector. The `SessionJournalRetention::retire_page` operation provides a bounded native-only
-selection page for the future retention worker. Replaced sources qualify;
+selection page for the running retention worker. Replaced sources qualify;
 suspended non-Agent-Chat sessions qualify after startup recovery. For Agent Chat,
 it calls `dormant_native_chat_session_id` for the exact identity, context scope
 and profile, preserving each profile's resumable dormant chat. Reusable Task
 sessions stay published; completion alone does not retire them. Legacy-only dead
 rows are never imported to retire them. `SessionJournals::retire_published` loads
-published records, authorizes the current revision, then retires protected before
-ordinary using the same engine clones as runtime turns. A live writer or other
-engine conflict defers retirement; retries skip an already retired domain.
-Retention-worker scheduling, collection and terminal maintenance hooks remain
-task 21, deferred until a runtime release isolates unreadable sessions during
-collection (review D-2). No retention worker is scheduled at the v0.8.0 pin.
+published records in both domains and obtains both revision-bound grants before
+retiring protected then ordinary using the same clones as runtime turns. A live
+writer or conflict defers retirement; retries skip an already retired domain.
+An unreadable own record prevents either domain from retiring. Unknown dependency
+metadata in another session can also defer retirement: Forge preserves partial
+progress and reports a deferral instead of falsely marking the healthy candidate
+unreadable or bypassing the runtime's dependency checks.
+
+The supervisor starts one `session-journal-retention` PeriodicWorker in server
+and Solo. It scans immediately, then on a 60-second Skip interval or a post-commit
+terminal/rotation/recovery/deletion nudge. The shared pool Notify is registered
+before each pass; coalesced or missed wakes are recovered from durable indexes.
+A resumable cursor advances through retirement pages, protected collection,
+ordinary collection and deletion draining. The 10-second scheduling budget is
+checked per retirement candidate and between engine calls/cleanup transactions;
+it does not preempt an awaited SQL or engine call. Each collect supplies
+`max_objects=20_000`, a membership-release bound; physical removals can include
+older deferred bytes too. All engine controls are awaited on task-13 clones.
+Successful native terminal, fork and abort publications await S2 maintenance
+and nudge collection; a maintenance error cannot replace the acknowledged turn.
+Retirement forces collection to purge every dead slot in each retired domain's
+packs, including slots below the normal 25% threshold. Reusable Task sessions,
+current dormant chats and active writers remain protected without a TTL.
+
+Discovery pages only the clear dirty-session index, including corrupt records.
+Runtime v0.9.0 reports per-session non-retryable failures in `unreadable_sessions`,
+keeps their state and dirty hints, and continues healthy collection. A second
+collect reports the bad session again with at most one record load in that call.
+Conflicts skip silently; retryable/domain-wide errors abort. The worker and
+storage share a process-wide once-per-session neutral warning, without ids,
+contents or keys. Diagnostics and compact skip unreadable sessions.
+`forge_session_journal` events separate retirements, conflicts, dependency
+refusals, collection receipts, readable retained/live/deferred bytes, omitted
+session counts and deletion counts. Collect-call duration is a conservative
+gate-hold upper bound including gate wait; the 10-second budget bounds scheduling,
+not the engine's individual gate hold.
 
 Session deletion immediately cascades journal records, pins, catalog,
 operation packs and memberships. Project/Task scopes and physical Agent deletion
-use existing FKs; the journal deletion migration also removes Agent Chat's
-polymorphic scopes on chat deletion and saved sessions on Agent archive.
+use existing FKs. Repository code removes Agent Chat's polymorphic scopes in
+`delete_agent_chat_scopes_in_tx`, called by direct chat deletion and User/Project
+parent deletion before their FK cascades. Both Agent archive entry points call
+`delete_saved_agent_sessions_in_tx`; machine removal's bulk archive calls the
+same helper in its transaction. Archive is the irreversible user-facing Delete
+operation, with no unarchive API/service/UI path. It deletes native and CLI saved
+sessions; it does not itself signal an already spawned CLI process, and a late
+session-row update gets NotFound instead of recreating the resume handle.
 Ciphertext packs retain their owner labels for bounded physical cleanup. A clear
 orphan marker and partial pack-id index, maintained by membership/session triggers,
 provide a durable cleanup nudge. Committed session deletions also wake the existing
@@ -2452,8 +2488,10 @@ new sweeps and restart begin at zero. No pack is decrypted and cleanup counts ar
 separate from engine apply receipts. Other sessions' independent copies remain
 readable. Reusing a deleted session's runtime id fails with the pack-owner mapping
 error until its old-owner packs drain; afterward the new owner works on the same
-shared engines. Task 21 will schedule these drain batches; automatic physical
-reclamation is not active at the v0.8.0 pin.
+shared engines. The retention worker schedules repeated drain batches until the
+index is drained or its scheduling budget expires, resuming the cursor next pass.
+A drain COMMIT error is transient DbError::AmbiguousCommit; the next pass retries
+from durable state without fabricating an apply receipt.
 
 Both domains enable explicit engine collection and set 128 MiB of estimated
 validated-root memo charge independently (256 MiB combined), separate from the
@@ -2470,7 +2508,12 @@ Cache/manifests may contain content; broader free-text redaction has no approved
 recovery-equivalence evidence. Both domains remain encrypted. Credentials stay in
 their existing protected tables and leases, outside journal state.
 
-The pin is agent-runtime v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`).
+The pin is agent-runtime v0.9.0 (`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`).
+The release rolls back proven unaccepted turn input and fences unresolved
+acceptance until reopen. Forge keeps the original turn failure when post-turn
+persist returns that fencing conflict; the next request opens a fresh handle.
+Both seven-cut/both-domain wedge regressions and the unresolved-acceptance case
+cover recovery without manual repair.
 Native-first open uses the runtime importer for eligible legacy snapshot-only or
 checkpoint-bearing state, publishing protected exact first when a checkpoint
 exists. It reads Forge's authenticated zstd envelope or pre-envelope encrypted
@@ -2648,14 +2691,14 @@ the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction
 Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
 are removed.
 
-The pinned agent-runtime v0.8.0 uses `agent-runtime-lcm-4`: normal condensation
+The pinned agent-runtime v0.9.0 uses `agent-runtime-lcm-4`: normal condensation
 carries the newest full covered-entry size tier rather than triggering on active
 node count. Depth stays logarithmic; without token pressure, the frontier can
 retain about `fanout - 1` summaries per tier and use more context. Existing
 soft/hard pressure thresholds still bound context and can trigger smaller merges
 after leaf compaction. Persisted nodes and pending operations remain resumable.
 This dependency upgrade retains Forge's encrypted snapshot/checkpoint persistence;
-native session journals and collection are introduced by later adoption tasks.
+native session journals and collection use the shared engines and retention worker described above.
 
 The runtime measures fixed overhead only after a successful plan, so a cold
 session (new, adopted, or with no successful plan yet) would budget history
@@ -3008,6 +3051,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
+| `session-journal-retention` | Immediate pass, 60-second Skip interval and post-commit terminal/rotation/recovery/deletion Notify | 10-second scheduling budget / warn and await; 20,000 releases per engine collect, bounded retirement and cleanup batches, resumable cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
@@ -8319,9 +8363,12 @@ reads batch by pack, verify full ids and enforce current membership even on
 cache hits. A shared 64 MiB charged LRU in `cache.rs` bounds directories and
 plaintext bodies together; generation keys prevent stale slots after a rewrite.
 `sharing()` declares PerSession with independent domain copies. The retained
-canonical-byte diagnostic authenticates counts against index units in bounded
-pages and includes deferred and orphan pack bodies per domain without opening
-body units.
+canonical-byte diagnostic authenticates session records and index counts in
+bounded per-session pages and includes deferred and orphan copies without opening
+body units. `byte_stats` also reports held-membership and deferred bytes, plus
+skipped-session counts. When a session cannot authenticate, its entire diagnostic
+contribution is omitted and logged: totals cover readable sessions, not the whole
+domain. This diagnostic never controls liveness or stands for file size.
 
 `apply.rs` uses one `db::begin_immediate` transaction and a full SQL revision/
 writer-epoch/generation guard, with checked all-zero absence and successor
@@ -8339,6 +8386,15 @@ publication follows commit; errors and cancellation invalidate the affected
 scope. Tracing target `forge_session_journal` reports apply kind, elapsed/lock
 hold durations, success/commit flags and physical receipt counts without ids or
 contents.
+
+An apply error that is non-retryable guarantees no durable effect. Ambiguous
+COMMIT/rollback acknowledgements, lost acks and post-COMMIT cache failures are
+retryable. SQLx BUSY/LOCKED uses numeric primary/extended codes through DbError's
+low-byte classification; IO/CANTOPEN, pool/worker and cache/codec availability
+failures are retryable too. Pre-commit validation/constraint/authentication
+failures roll back. Physical compact returns retryable domain errors because
+previous bounded batches may have committed; corrupt-session batches roll back
+and the rest of the domain continues.
 
 Pin/catalog Put/Remove persist the supplied records verbatim, including unknown
 engine versions and bytes. Async engine retained-root, staged-leaf and pin-release
@@ -8364,8 +8420,8 @@ Mandatory purges run with optional S2 merging disabled. Independent domain/sessi
 copies never delay each other's reclamation. Retained bytes include dead slots
 until their removal and reconcile with the physical receipts.
 
-`maintenance.rs` provides async `post_terminal(domain, session)` for later runtime
-hooks. It merges fully live equal logical-byte tiers from a 4 KiB minimum,
+`maintenance.rs` provides async `post_terminal(domain, session)` for the native
+terminal/fork/abort hooks. It authenticates the record before rewriting and merges fully live equal logical-byte tiers from a 4 KiB minimum,
 carrying geometrically only when a pair fits 1 MiB. Collection's base repack uses
 only fully live packs below 64 KiB or fully live survivors purged by that apply.
 Collection leaves stable large packs sealed; both maintenance paths leave
@@ -8383,19 +8439,21 @@ Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings
 on the first apply for arbitrary runtime ids. Read-test seeding and generation
 resealing helpers exist only under that feature. Engine conformance factories
-now use the production sqlx adapter with real AEAD. The unedited v0.8.0 testkit
-storage suite passes all 22 named cases in each of three configurations:
+now use the production sqlx adapter with real AEAD. The unedited v0.9.0 testkit
+storage suite passes all 26 named cases in each of three configurations:
 `storage_conformance_no_repack`, `storage_conformance_repack`, and
 `storage_conformance_reopen` (a fresh independent pool and empty storage caches
 on every hydration load). All declare PerSession with independent domain copies;
 S2 off keeps mandatory purges enabled. The testkit supplies the engine collection
 host implementation; Forge adds no collector semantics.
 
-Seven test-target-only broken-storage decorators are each rejected at their
+Eight test-target-only broken-storage decorators are each rejected at their
 named conformance case: torn transactions, lost acknowledged writes, reordered
 n+1 publication, ignored writer epoch, ignored control generation, premature
-unlinking of a remaining holder's copy, and serving released bytes to a
-non-member. Valid independent-copy releases preserve other holders and reclaim
+unlinking of a remaining holder's copy, serving released bytes to a non-member,
+and a non-retryable lost acknowledgement. The non-member defect is now rejected
+first by v0.9.0's body_cache_membership case; NonRetryableLostAck is rejected by
+atomic_apply_cuts. Valid independent-copy releases preserve other holders and reclaim
 only their own bytes. The focused `session_journal_storage` target retains the
 codec/storage/maintenance regressions. Legacy decoder tests use the real
 envelope, checkpoint decoder and runtime schema/transition validation. This
@@ -8437,10 +8495,13 @@ New database logic triggers are not allowed. Constraint/validation guards stay
 in SQLite. The remaining logic-trigger families are intentional projections or
 invalidations that must observe every writer: G02 memory FTS; G07 Task
 notification outbox; G08 board/list revisions; G09 status epoch; G10–G13
-scheduler dirty generations and wait-age; and G14 usage-read watermarks.
+scheduler dirty generations and wait-age; G14 usage-read watermarks; and the
+session-journal orphan markers, which must observe session/membership FK cascades.
+The unreleased journal deletion migration contains only these projection triggers;
+chat and archive logic lives in the repository writers below.
 
-Five former logic triggers (dropped by V202610180752–V202610180820) are now
-repository code that runs in the source writer's transaction. A trigger saw
+Former logic triggers (dropped by V202610180752–V202610180820, or removed from
+the unreleased journal deletion migration) are now repository code that runs in the source writer's transaction. A trigger saw
 every writer; this code sees only the writers that call it, so any new
 statement that writes one of these source rows must go through the named
 writer or call its helper:
@@ -8453,6 +8514,8 @@ writer or call its helper:
 | Attention reopen wake rearm | `attention_projection.status` from `resolved` to anything else, including upserts | `attention.rs` `rearm_attention_wake_on_reopen_in_tx` |
 | Main Chat topic rotation and its origin turn | insert `product_genesis_session`, Genesis `lifecycle` to `handed_off`, insert `agent_handoff`, user `agent_chat_message`, insert `agent_chat_topic_rotation` | `agent_chat_topic.rs` `enqueue_native_topic_rotation_in_tx`, `enqueue_idle_topic_rotation_in_tx`, `assign_topic_rotation_origin_in_tx` |
 | Task media projection and GC state | insert `task_media`, soft delete of `task_media`, insert `project_media_attachment` or `project_release_media_pin` | `task_media.rs` `project_task_media_in_tx` and `soft_delete_media`; `shared_media.rs` `reconcile_media_asset_in_tx` |
+| Chat saved-session deletion | direct delete `agent_chat`, or User/Project deletion cascading chats | `agent_chat.rs` `delete_agent_chat` / `delete_agent_chat_scopes_in_tx`; User/Project writers call the same scope helper before cascade |
+| Agent saved-session deletion | archive `agent_identity`, including machine removal | `agent.rs` `archive` / `archive_agent_identity_in_tx` → `delete_saved_agent_sessions_in_tx`; `daemon.rs` bulk archive calls that helper in its transaction |
 
 Out-of-tree writers follow the same rule: `scripts/perf_fixture.py` writes the
 Project Chat and setup binding for the Projects it inserts with raw SQL.

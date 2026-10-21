@@ -10,7 +10,7 @@ use forge_agent_host::AGENT_RUNTIME_REVISION;
 
 #[tokio::test]
 async fn engine_release_contract() {
-    const RELEASE_SHA: &str = "fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7";
+    const RELEASE_SHA: &str = "8c19be5b226c2fdaeb6708ec5d39e91c235857a5";
     assert_eq!(AGENT_RUNTIME_REVISION, RELEASE_SHA);
     let mut packages = 0;
     let mut testkit = false;
@@ -23,7 +23,7 @@ async fn engine_release_contract() {
         else {
             continue;
         };
-        assert!(package.contains("\nversion = \"0.8.0\"\n"), "{name}");
+        assert!(package.contains("\nversion = \"0.9.0\"\n"), "{name}");
         let source = package
             .lines()
             .find_map(|line| line.strip_prefix("source = \""))
@@ -44,7 +44,7 @@ async fn engine_release_contract() {
         "runtime and testkit must be locked"
     );
 
-    // Exercise the public boundary without enabling native journals in Forge.
+    // Exercise the released boundary independently of production wiring.
     let storage = Arc::new(VolatileJournalStorage::new(JournalBodySharing::PerSession));
     assert_eq!(
         JournalStorage::sharing(&*storage),

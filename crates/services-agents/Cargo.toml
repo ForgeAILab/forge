@@ -22,6 +22,7 @@ name = "main_project_create_command"
 test-support = ["services/test-support"]
 
 [dependencies]
+agent-runtime.workspace = true
 services = { path = "../services" }
 cli-adapters = { path = "../cli-adapters" }
 git = { path = "../git" }
@@ -54,7 +55,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 forge-agent-host = { path = "../agent-host", features = ["test-support"] }
-agent-runtime.workspace = true
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = "../services", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }

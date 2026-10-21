@@ -2958,6 +2958,68 @@ async fn one_failed_journal_commit_after_provider_io_never_wedges_the_chat() {
     assert_one_failed_commit_never_wedges_the_chat(CutPhase::ProviderCall).await;
 }
 
+/// A failed commit whose recovery read also fails fences the handle. Forge
+/// reports the original turn failure, then reopens on the next request.
+#[tokio::test]
+async fn unresolved_acceptance_preserves_turn_failure_and_reopens() {
+    for point in [CutPoint::AfterObjects, CutPoint::AfterCommit] {
+        let fixture = chat_fixture().await;
+        let store = fixture.service.protected_store();
+        let provider = text_only_provider(6);
+        let backend =
+            NativeAgentRuntimeBackend::new(store.clone()).with_provider_override(provider.clone());
+        backend
+            .run_turn(fixture.turn("First turn"), Arc::new(NoopSink))
+            .await
+            .unwrap();
+        let requests = provider.requests().len();
+        store
+            .journals()
+            .storage()
+            .fail_commit_observation_for_test();
+        store
+            .journals()
+            .protected()
+            .fail_next_commit_at(point)
+            .unwrap();
+        let error = backend
+            .run_turn(fixture.turn("Unresolved input"), Arc::new(NoopSink))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                forge_agent_host::AgentHostError::RuntimeWithUsage { .. }
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("turn failed"), "{error:?}");
+        assert!(
+            !error.to_string().contains("fenced"),
+            "cleanup must not replace the turn failure: {error:?}"
+        );
+        assert_eq!(
+            provider.requests().len(),
+            requests,
+            "no provider call before acceptance"
+        );
+        backend
+            .run_turn(fixture.turn("Next turn"), Arc::new(NoopSink))
+            .await
+            .expect("fresh handle recovers");
+        let texts = user_texts(provider.requests().last().unwrap());
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|text| *text == "Unresolved input")
+                .count(),
+            usize::from(point.is_after_commit()),
+            "{point:?}: reopened history follows the durable outcome"
+        );
+        assert_eq!(texts.last().map(String::as_str), Some("Next turn"));
+    }
+}
+
 /// Rotation-summary usage is charged once (an outbox row settled by id), not
 /// on every turn of the successor topic.
 #[cfg(feature = "test-support")]

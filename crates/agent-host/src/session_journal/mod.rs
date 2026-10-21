@@ -1,10 +1,12 @@
 //! Forge's encrypted persistence boundary for the runtime-owned journal engine.
-//! This module is not yet connected to the native runtime stores.
+//! JournalEngine owns semantic validation and collection for the native stores.
 mod apply;
 #[cfg(feature = "test-support")]
 mod audit;
 mod cache;
 mod codec;
+mod diagnostics;
+pub use diagnostics::JournalByteStats;
 mod maintenance;
 mod operations;
 mod release;

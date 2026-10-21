@@ -35,18 +35,5 @@ BEGIN
     UPDATE agent_session_journal_pack SET orphaned = 1 WHERE forge_session_id = OLD.id;
 END;
 
--- Project/Task scopes already have cascading owner FKs. Agent Chat uses a
--- polymorphic scope id, so its delete needs this explicit edge.
-CREATE TRIGGER session_journal_chat_deleted
-AFTER DELETE ON agent_chat
-BEGIN
-    DELETE FROM agent_context_scope WHERE scope_type = 'agent_chat' AND scope_id = OLD.id;
-END;
--- The user-facing Agent delete archives its identity; retain the identity and
--- transcript, but discard its unusable native/CLI sessions through the same FKs.
-CREATE TRIGGER session_journal_agent_archived
-AFTER UPDATE OF archived_at ON agent_identity
-WHEN OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
-BEGIN
-    DELETE FROM agent_session WHERE identity_id = NEW.id;
-END;
+-- Chat-scope deletion and Agent archival are repository logic, in their source
+-- writer transactions. Only orphan projection triggers live in this migration.

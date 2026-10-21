@@ -192,6 +192,8 @@ impl<S: JournalStorage> Drop for ExtensionLease<S> {
 pub struct RetirementProgress {
     pub retired_domains: usize,
     pub conflicts: usize,
+    pub unreadable_session: bool,
+    pub deferred_domains: usize,
 }
 
 impl<S: JournalStorage> SessionJournals<S> {
@@ -209,11 +211,15 @@ impl<S: JournalStorage> SessionJournals<S> {
         };
         let session = SessionId::new(runtime_session_id);
         let mut progress = RetirementProgress::default();
+        // Authenticate BOTH domains and obtain both revision-bound grants
+        // before retiring either. A bad ordinary record must not leave a
+        // healthy protected domain retired merely because it was visited first.
+        let mut prepared = Vec::new();
         for (engine, role) in [
             (&self.protected, JournalRole::Protected),
             (&self.ordinary, JournalRole::Ordinary),
         ] {
-            let Some(record) = self
+            let loaded = self
                 .storage
                 .load(
                     &JournalDomain {
@@ -222,33 +228,97 @@ impl<S: JournalStorage> SessionJournals<S> {
                     },
                     &session,
                 )
-                .await?
-            else {
-                continue;
+                .await;
+            let record = match loaded {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(error) if error.kind == ErrorKind::Serialization && !error.retryable => {
+                    progress.unreadable_session = true;
+                    return Ok(progress);
+                }
+                Err(error) => return Err(error),
             };
-            if record.head.is_none() || record.retirement.is_some() {
-                continue;
+            if record.head.is_some() && record.retirement.is_none() {
+                prepared.push((engine, record.revision));
             }
-            let result = async {
-                engine
-                    .authorize_retirement(&session, record.revision, SystemClock.now())
-                    .await?;
-                engine.retire(&session, record.revision).await?;
-                Ok::<_, RuntimeError>(())
-            }
-            .await;
-            match result {
-                Ok(()) => progress.retired_domains += 1,
+        }
+        for (engine, revision) in &prepared {
+            match engine
+                .authorize_retirement(&session, *revision, SystemClock.now())
+                .await
+            {
+                Ok(()) => {}
                 Err(error) if error.kind == ErrorKind::Conflict => {
-                    // Protected must retire before ordinary; retry the whole
-                    // session later when its writer/pin/dependency is resolved.
                     progress.conflicts += 1;
+                    return Ok(progress);
+                }
+                Err(error) if !error.retryable && !journal_lock_poisoned(&error) => {
+                    progress.deferred_domains += 1;
+                    return Ok(progress);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Domain order is durable; restart skips an already retired domain.
+        for (engine, revision) in prepared {
+            match engine.retire(&session, revision).await {
+                Ok(_) => progress.retired_domains += 1,
+                Err(error) if error.kind == ErrorKind::Conflict => {
+                    progress.conflicts += 1;
+                    break;
+                }
+                // Retirement scans authoritative dependency candidates. A bad
+                // OTHER session may protect this one: defer, never misidentify
+                // this candidate as unreadable, and preserve partial progress.
+                Err(error) if !error.retryable && !journal_lock_poisoned(&error) => {
+                    progress.deferred_domains += 1;
                     break;
                 }
                 Err(error) => return Err(error),
             }
         }
-        tracing::debug!(target: "forge_session_journal", retired_domains=progress.retired_domains, conflicts=progress.conflicts, "retirement attempt");
+        tracing::debug!(target: "forge_session_journal", retired_domains=progress.retired_domains, conflicts=progress.conflicts, deferred_domains=progress.deferred_domains, "retirement attempt");
         Ok(progress)
     }
+}
+
+impl SessionJournals {
+    /// Physical S2 follows an acknowledged terminal publication. It must never
+    /// replace that turn's outcome. A durable dirty marker also survives a
+    /// lost nudge; the worker uses these same engine owners for collection.
+    pub async fn post_terminal(&self, runtime_session_id: &str) {
+        use agent_runtime::core::{
+            ids::SessionId,
+            journal::{JournalDomain, JournalRole, SessionJournal},
+        };
+        let session = SessionId::new(runtime_session_id);
+        for (engine, role) in [
+            (&self.protected, JournalRole::Protected),
+            (&self.ordinary, JournalRole::Ordinary),
+        ] {
+            if let Err(error) = self
+                .storage
+                .post_terminal(
+                    &JournalDomain {
+                        storage_id: engine.storage_id(),
+                        role,
+                    },
+                    &session,
+                )
+                .await
+            {
+                if error.kind == agent_runtime::core::error::ErrorKind::Serialization {
+                    ForgeJournalStorage::note_unreadable_session(&session);
+                } else {
+                    tracing::warn!(target: "forge_session_journal", "terminal journal maintenance deferred");
+                }
+            }
+        }
+        self.storage.nudge_retention();
+    }
+}
+
+fn journal_lock_poisoned(error: &RuntimeError) -> bool {
+    error.metadata.get("journal_lock_poisoned")
+        == Some(&agent_runtime::core::metadata::MetaValue::Bool(true))
 }

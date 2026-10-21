@@ -1,13 +1,13 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T11:30:20Z
+updated_at: 2026-10-20T19:29:31Z
 ---
 
 ## Why
 
 Forge rewrites, compresses and encrypts complete native session snapshots and
 checkpoints at every persistence barrier. The runtime now has a storage-generic
-`JournalEngine<S>` in release `v0.8.0`; Forge should consume that engine rather
+`JournalEngine<S>` in release `v0.9.0`; Forge should consume that engine rather
 than implement journal semantics. The reference packed SQLite adapter measured
 fixture B/N=4000 at **1.60542× L2 plain and 1.79118× L2 tool**, both with
 collect-at-end and per-turn collection.
@@ -27,8 +27,11 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   extension reads, engine-owned 64-revision replay pruning, D-1's reader-operation
   authority check and the reviewer's futures-mutex gate correction. No invented
   version, branch-only production pin or Forge semantic workaround. The rebased
-  baseline pinned `1de6d7d` (0.7.0 + U9 groups C/D); task 1 moves it to `v0.8.0`
-  at `fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`.
+  baseline pinned `1de6d7d` (0.7.0 + U9 groups C/D); task 1 adopted the first
+  engine release. The retention follow-up now pins all eight runtime/testkit
+  packages to `v0.9.0` at `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, including
+  per-session collection isolation, retryable ambiguous acknowledgements and
+  failed-acceptance rollback/fencing.
 - **Forge implements only `JournalStorage`.** Two long-lived
   `JournalEngine<ForgeJournalStorage>` instances share one sqlx-backed storage.
   Create exactly one engine per storage/domain and hand clones to every runtime
@@ -92,9 +95,11 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   metadata; read LCM overhead through `JournalReader::extension`. Retire replaced
   and unresumable suspended sessions, keep resumable dormant chats and reusable
   Task sessions. Schedule bounded dirty-session collection, terminal repacking and
-  deletion cleanup without a TTL.
+  deletion cleanup without a TTL. An unreadable session is preserved and logged
+  once, with healthy collection continuing. Unknown dependency metadata can
+  conservatively defer other retirements; Forge never overrides that refusal.
 - **Acceptance.** Run `assert_journal_storage_conformance` unedited with repacking
-  off/on and reopened storage, all seven Forge-backed broken-storage cases, real
+  off/on and reopened storage, all eight Forge-backed broken-storage cases, real
   import/equivalence/crash cuts and named integration checks. Forge's own bench
   runs B/N=4000 through production storage against L2 from the real legacy row;
   both plain/tool ratios must be ≤2.0× after per-turn collection (aim 1.5×).

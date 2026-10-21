@@ -648,6 +648,7 @@ impl AgentSessionRepo for SqliteDb {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.session_journal_cleanup_notify().notify_waiters();
         self.get_agent_session(&input.replacement.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -669,7 +670,11 @@ impl AgentSessionRepo for SqliteDb {
         .bind(updated_at)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        let suspended = result.rows_affected();
+        if suspended != 0 {
+            self.session_journal_cleanup_notify().notify_waiters();
+        }
+        Ok(suspended)
     }
 }
 

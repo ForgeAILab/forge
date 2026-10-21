@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T13:13:53Z
+updated_at: 2026-10-20T19:30:47Z
 completed_at:
 ---
 
@@ -16,11 +16,6 @@ they need production test constructors. Declare required-features accordingly;
 enable it on the command line, never with a self dev-dependency. DB and
 services(-agents) integration commands below include their required test feature.
 No runtime bench crate becomes a production dependency.
-
-Scheduling override approved on 2026-10-20: task 19 runs in a separate job;
-tasks 20, 22 and 23 proceed independently in that order. Task 21 and review D-2
-wait for a runtime release with per-session collection-failure isolation. No
-Forge workaround for that runtime limitation is part of these tasks.
 
 ## Release gate and foundations
 
@@ -56,6 +51,14 @@ Forge workaround for that runtime limitation is part of these tasks.
   call-site adaptation was needed; native persistence remains materialized.
   Upstream LCM planning changes are documented in CHANGELOG and architecture.
   Tagged source checklist and command receipts: `/Volumes/Data/tmp/refactor/c3-t1/report.md`.
+
+  Follow-up on 2026-10-20: all eight runtime/testkit packages now use
+  **v0.9.0**, commit `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`.
+  Cargo.lock changes only those runtime packages; AGENT_RUNTIME_REVISION and
+  engine_release_contract follow the same pin. The two seven-cut/both-domain
+  Forge wedge regressions pass. A new unresolved-acceptance regression verifies
+  that post-turn persist fencing preserves the original failure and the next
+  turn reopens successfully; Forge introduces no new turn-failure class.
 
 - [x] **2. File-backed test support and engine harness (≤2 h).**
   Use the testkit pinned in task 1; add file DB/temp-dir ownership, the test-only mapping
@@ -265,14 +268,17 @@ Forge workaround for that runtime limitation is part of these tasks.
   file-backed sqlx. S2 off retains mandatory purges; S2 on uses the production
   maintenance path. Reopen discards storage caches and opens an independent
   pool on every load over the same retained file. Testkit supplies engine
-  collection semantics. No production storage fix or runtime wiring was needed.
+  collection semantics. No production storage fix or runtime wiring was needed
+  at that gate. The v0.9.0 follow-up passes all 26 named cases in all three
+  configurations (78 case executions), including the four new authority/isolation
+  probes and the retryable lost-acknowledgement rule.
 
-- [x] **12. Seven broken-storage negative controls (≤2 h).**
+- [x] **12. Broken-storage negative controls (≤2 h).**
   Adapt upstream test-only fault shapes over real Forge storage: torn transaction,
   lost write, reordered n+1, ignored epoch, a remaining holder's copy unlinked
   early, released/deferred bytes served to a non-member, and ignored control
   generation (released v0.8.0's private StaleGeneration shape). Assert
-  the seven named failures in D6; do not flag a valid independent-copy release as
+  the named failures in D6; do not flag a valid independent-copy release as
   early shared deletion. Upstream private test adapters are not
   exported APIs. No defects ship in production.
   Focused test: `cargo test -p forge-agent-host --features test-support --test session_journal_conformance broken_storage_`.
@@ -286,6 +292,10 @@ Forge workaround for that runtime limitation is part of these tasks.
   released control (StaleGeneration), correcting the original six-control list.
   No fault adapter is part of a production module or runtime path. Evidence:
   `/Volumes/Data/tmp/refactor/c3-t11-12/report.md`.
+  The v0.9.0 follow-up adds NonRetryableLostAck (atomic_apply_cuts), for eight
+  negative controls. DeadBodyServed is rejected earlier by the new
+  body_cache_membership case; its exact expected named rejection follows the
+  released suite's order. All eight controls pass.
 
 ## Cut-over and recovery
 
@@ -436,12 +446,15 @@ Forge workaround for that runtime limitation is part of these tasks.
   case runs a native turn (its lead uses `CodingExecutorAdapter` without a
   provider), so none was run.
 
-  Open finding, not fixed here: on a native chat turn, one cut at the protected
+  Original v0.8.0 finding (resolved by the v0.9.0 follow-up): on a native chat turn, one cut at the protected
   engine's next commit fails the turn before provider I/O. The ordinary domain
   still publishes once more, and protected stays at its prior head. Every later
   turn then fails with "canonical session history and terminal checkpoint are
   from different boundaries", on a fresh backend and a restarted store too.
   Reproducer: `/Volumes/Data/tmp/refactor/c3-t19/diag-protected-cut-plain.rs`.
+  Runtime v0.9.0 now rolls back proven unaccepted input and fences unresolved
+  acceptance until reopen. Both wedge regressions and Forge's new
+  unresolved_acceptance_preserves_turn_failure_and_reopens case cover the fix.
 
 - [x] **20. Credential exclusion with real packs (≤2 h).**
   Seed API key/OAuth credentials, run a tool turn and refresh; decrypt all pack,
@@ -464,7 +477,7 @@ Forge workaround for that runtime limitation is part of these tasks.
 
 ## Lifecycle and measurement
 
-- [ ] **21. Retention worker and terminal scheduling (≤3 h).**
+- [x] **21. Retention worker and terminal scheduling (≤3 h).**
   Wire the worker and rotation/recovery nudges: 60 s tick, revision grant then
   protected/ordinary retire, bounded dirty collection (20,000 membership releases
   per call, 10 s scheduling budget), S2 terminal hook. Cover replaced sources, active-writer
@@ -475,6 +488,34 @@ Forge workaround for that runtime limitation is part of these tasks.
   tracing; an undecryptable session is logged once and skipped, never retired or
   released.
   Focused test: `cargo test -p services-agents --features test-support --test main session_journal_retention::rotation_and_retry`.
+
+  Completed with runtime v0.9.0: the shared runtime supervisor starts one
+  `session-journal-retention` periodic worker in server and Solo. It scans
+  immediately, then on a 60-second Skip interval and post-commit
+  terminal/rotation/recovery/deletion nudges. A resumable phase cursor checks the
+  10-second scheduling budget per retirement candidate and between engine calls
+  and cleanup batches; it never cancels an in-flight control. Retirement calls
+  task 22's selection function, authenticates both domains and obtains both
+  revision-bound grants before protected/ordinary retirement. Own unreadable
+  records prevent retirement; unknown dependency metadata can defer another
+  candidate without falsely labelling it unreadable. Partial domain progress is
+  durable and retries after restart. Every engine control awaits task-13 clones.
+  Each collect uses 20,000 membership releases; retired domains force all dead
+  slots out of their packs, including earlier deferred bytes below threshold.
+  Successful native terminal/fork/abort publication awaits S2 and nudges the
+  worker; maintenance cannot undo the turn. Task 23's indexed drain runs bounded
+  5,000-candidate / 32-pack / 8-MiB batches until drained or the scheduling budget
+  expires. D8 tracing separates physical receipts, membership bounds, cleanup,
+  readable retained/live/deferred bytes and collect-call duration (a gate-hold
+  upper bound including wait). Unreadable session warnings are process-wide,
+  once per runtime session, with no ids, contents or keys.
+  `rotation_and_retry` passes for a real runtime fork, successor and completed
+  Task preservation, live-writer retry, cold partial-retirement recovery,
+  below-threshold deferred-byte purges with retained roots in both domains,
+  unreadable isolation/dependency deferral, worker registry/nudge/shutdown,
+  deletion drain and zero scheduling budget. The existing selection and deletion
+  regressions, plus the new chat-delete and native/CLI archive tests, pass.
+  Evidence: `/Volumes/Data/tmp/refactor/c3-t21/report.md`.
 
 - [x] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
@@ -494,7 +535,9 @@ Forge workaround for that runtime limitation is part of these tasks.
   row is imported. `unresumable_and_dormant_restart` passes for two profiles in
   one scope, startup-suspended account/Task rows, reusable completed-Task state,
   replaced sources, shared live writers, partial retirement and cold retry.
-  Native tombstones suppress stale legacy fallback. Scheduling remains task 21.
+  Native tombstones suppress stale legacy fallback. Completed task 21 now
+  schedules these pages; it distinguishes own-record corruption from a safe
+  engine refusal caused by another session's unknown dependency metadata.
 
 - [x] **23. Cascades and bounded orphan-pack maintenance (≤2 h).**
   Project/Agent/chat deletion cascades session metadata/memberships; nudge cleanup
@@ -508,9 +551,11 @@ Forge workaround for that runtime limitation is part of these tasks.
   Focused test: same retention module filtered to `deletion_drains_owned_packs_preserves_other_copies`.
 
   Completed: the additive deletion migration preserves sealed/legacy bytes,
-  maintains an indexed orphan marker, and wires Project/Task/physical-Agent FKs,
-  Agent archive and polymorphic chat deletion to session metadata/membership
-  cascades. Committed session deletions nudge the existing pool activity signal;
+  maintains an indexed orphan marker, and uses Project/Task/physical-Agent FKs.
+  Repository code now handles the two logic edges in source transactions:
+  Agent archive (including machine removal) deletes native/CLI sessions, and
+  direct/User/Project chat deletion removes polymorphic scopes. Only the orphan
+  projection triggers remain in the unreleased deletion migration. Committed session deletions nudge the existing pool activity signal;
   rollback does not. `drain_deleted_packs` calls a DB-only bounded drain: one page
   of at most 5,000 indexed ids, owner/membership rechecks under BEGIN IMMEDIATE,
   at most 32 packs and 8 MiB retained canonical bytes per transaction, cursor
@@ -522,7 +567,8 @@ Forge workaround for that runtime limitation is part of these tasks.
   reuse fails with the old-owner mapping error before drain and works afterward
   on the same shared engines. The migration-preservation regression passes.
   No global tracing collector or synthetic apply receipt was added. Task 21
-  will schedule repeated drain batches; this task tests the function directly.
+  schedules repeated drain batches; the direct function and automatic worker
+  paths are both covered.
 
 - [ ] **24. Forge measurement harness and smoke (≤3 h).**
   Implement production sqlx/real-AEAD engine fixtures A/B/C and actual legacy L2

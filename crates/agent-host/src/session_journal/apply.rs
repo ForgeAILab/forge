@@ -3,7 +3,7 @@ use super::{
     cache::{Scope, ScopeDirectory},
     codec, conflict,
     seal::role,
-    storage::{ForgeJournalStorage, PackView, database_error},
+    storage::{ForgeJournalStorage, PackView, ambiguous_database_error, database_error},
     wire,
 };
 use agent_runtime::core::{
@@ -114,9 +114,11 @@ impl ForgeJournalStorage {
                             self.cache_lock()
                                 .map(|mut cache| cache.put_directory(scope.clone(), next))
                                 .and_then(|_| fail(&write, JournalCommitFailurePoint::AfterCommit))
+                                // Nothing after COMMIT may claim no durable effect.
+                                .map_err(RuntimeError::retryable)
                                 .map(|_| receipt)
                         }
-                        Err(e) => Err(database_error(e)),
+                        Err(e) => Err(ambiguous_database_error(e)),
                     }
                 }
                 Err(e) => {
@@ -124,12 +126,22 @@ impl ForgeJournalStorage {
                     hold_us = locked.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     match rollback {
                         Ok(()) => Err(e),
-                        Err(e) => Err(database_error(e)),
+                        Err(e) => Err(ambiguous_database_error(e)),
                     }
                 }
             }
         }
         .await;
+        #[cfg(feature = "test-support")]
+        if result.is_err() && write.inject.is_some() && write.domain.role == JournalRole::Protected
+        {
+            let _ = self.failed_commit_observation.compare_exchange(
+                1,
+                2,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         invalidation.armed = result.is_err();
         drop(invalidation);
         tracing::debug!(target:"forge_session_journal",kind=?write.kind,

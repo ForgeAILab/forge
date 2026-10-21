@@ -110,8 +110,23 @@ impl SqliteDb {
         report.has_more = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_session_journal_pack WHERE orphaned=1 AND pack_id>?)",
         ).bind(report.after_pack_id).fetch_one(&mut *tx).await?;
-        tx.commit().await?;
+        tx.commit().await.map_err(crate::DbError::AmbiguousCommit)?;
         tracing::debug!(target: "forge_session_journal", candidates=report.candidates, deleted_packs=report.deleted_packs, deleted_objects=report.deleted_objects, deleted_canonical_bytes=report.deleted_canonical_bytes, duration_us=started.elapsed().as_micros() as u64, lock_hold_us=locked.elapsed().as_micros() as u64, "deletion cleanup");
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ambiguous_cleanup_commit_is_transient_without_exposing_sql() {
+        let error =
+            crate::DbError::AmbiguousCommit(sqlx::Error::Protocol("private SQL diagnostic".into()));
+        assert!(error.is_transient());
+        assert_eq!(error.to_string(), "database commit outcome is unknown");
+        assert!(
+            !crate::DbError::Sqlx(sqlx::Error::Protocol("proven no-effect error".into()))
+                .is_transient()
+        );
     }
 }

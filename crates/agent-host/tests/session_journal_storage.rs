@@ -468,9 +468,14 @@ async fn retained_bytes_include_deferred_bodies() {
         .execute(f.database().pool())
         .await
         .unwrap();
+    let partial = storage.byte_stats(&d).await.unwrap();
     assert_eq!(
-        storage.retained_bytes(&d).await.unwrap_err().kind,
-        ErrorKind::Serialization
+        partial.skipped_sessions, 1,
+        "bad scalar/index agreement is detected"
+    );
+    assert_eq!(
+        partial.retained_bytes, total,
+        "only the healthy session is counted"
     );
     assert_eq!(
         storage.retained_bytes(&ordinary).await.unwrap(),
@@ -2466,7 +2471,10 @@ async fn resealed_unit_corruption_fails_closed() {
                     "round {round}: {unit:?} members accepted a changed unit"
                 );
                 if let TestSealedUnit::PackIndex(_) = unit {
-                    assert!(retained.is_err() || retained.unwrap() == expected_retained);
+                    // D-2 diagnostics omit a corrupt scope, with an explicit
+                    // skipped count; reads and membership still fail closed.
+                    let stats = fresh().byte_stats(&d).await.unwrap();
+                    assert!(stats.skipped_sessions == 1 || retained.unwrap() == expected_retained);
                 }
                 if matches!(unit, TestSealedUnit::PackBodyCanonical(_)) {
                     assert!(
@@ -2570,7 +2578,9 @@ async fn relabelled_rows_fail_closed() {
             .is_err()
     );
     assert!(fresh().members(&d, &b).await.is_err());
-    assert!(fresh().retained_bytes(&d).await.is_err());
+    let stats = fresh().byte_stats(&d).await.unwrap();
+    assert_eq!(stats.skipped_sessions, 1);
+    assert_eq!(stats.retained_bytes, 0);
     // The same pack relabelled to the other role of B's session.
     sqlx::query("DELETE FROM agent_session_journal_membership WHERE pack_id=?")
         .bind(a_pack)
@@ -2583,7 +2593,9 @@ async fn relabelled_rows_fail_closed() {
         .await
         .unwrap();
     let ordinary = domain(JournalRole::Ordinary);
-    assert!(fresh().retained_bytes(&ordinary).await.is_err());
+    let stats = fresh().byte_stats(&ordinary).await.unwrap();
+    assert_eq!(stats.skipped_sessions, 1);
+    assert_eq!(stats.retained_bytes, 0);
     assert!(fresh().retained_bytes(&d).await.is_ok());
 }
 

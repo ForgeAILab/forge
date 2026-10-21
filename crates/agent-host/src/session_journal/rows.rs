@@ -1,4 +1,6 @@
 //! Row encoders shared by atomic apply and explicit test fixtures.
+#[cfg(feature = "test-support")]
+use super::storage::ambiguous_database_error;
 use super::{
     cache::Scope,
     codec, conflict, corrupt,
@@ -335,8 +337,10 @@ impl ForgeJournalStorage {
         if let Some(op) = &write.operation {
             self.append_operation(&mut tx, &scope, &owner, op).await?;
         }
-        tx.commit().await.map_err(database_error)?;
-        self.cache_lock()?.invalidate(&scope);
+        tx.commit().await.map_err(ambiguous_database_error)?;
+        self.cache_lock()
+            .map_err(RuntimeError::retryable)?
+            .invalidate(&scope);
         Ok(())
     }
     /// Test-only: open one sealed unit with its real binding, let `mutate`
@@ -418,8 +422,10 @@ impl ForgeJournalStorage {
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
-        tx.commit().await.map_err(database_error)?;
-        self.cache_lock()?.invalidate(&scope);
+        tx.commit().await.map_err(ambiguous_database_error)?;
+        self.cache_lock()
+            .map_err(RuntimeError::retryable)?
+            .invalidate(&scope);
         Ok(())
     }
     /// Test-only generation rewrite, without changing bodies or membership.
@@ -450,13 +456,15 @@ impl ForgeJournalStorage {
             Ok::<_,RuntimeError>(())
         }.await;
         match result {
-            Ok(()) => tx.commit().await.map_err(database_error)?,
+            Ok(()) => tx.commit().await.map_err(ambiguous_database_error)?,
             Err(e) => {
-                tx.rollback().await.map_err(database_error)?;
+                tx.rollback().await.map_err(ambiguous_database_error)?;
                 return Err(e);
             }
         }
-        self.cache_lock()?.invalidate(&scope);
+        self.cache_lock()
+            .map_err(RuntimeError::retryable)?
+            .invalidate(&scope);
         Ok(())
     }
 }

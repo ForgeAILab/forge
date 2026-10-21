@@ -185,16 +185,29 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
-- Deleting a Project or Agent Chat, or archiving an Agent, now removes its saved
-  native session metadata and journal memberships. Physical pack cleanup has a
-  bounded maintenance operation; automatic scheduling awaits the retention worker.
+- Native session disk reclamation now runs automatically after terminal
+  publication and on a 60-second maintenance tick. It retires replaced and
+  unresumable sessions, preserves resumable chats and reusable Task sessions,
+  and drains deleted-owner packs in bounded batches. Unreadable sessions remain
+  untouched while healthy collection continues; unknown dependencies can safely
+  defer retirement.
+- Deleting a Project or Agent Chat, or archiving an Agent, removes saved native
+  session metadata and journal memberships. Agent deletion also removes CLI
+  resume handles; it does not itself signal an already running CLI process.
+  Chat deletion and Agent archival use repository transactions; only the journal
+  orphan-marker projection triggers remain in the unreleased migration.
 
 - Sessions now persist through the native session journal, using agent-runtime
-  v0.8.0 (`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`) and encrypted delta packs.
+  v0.9.0 (`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, previously v0.8.0)
+  and encrypted delta packs. All runtime packages and the testkit use that pin;
+  ambiguous storage acknowledgements and SQLite contention are retryable.
   Chat and Task continuity work as before; the disk layout of newly saved state
   changes. Legacy rows are still read for automatic import and remain stored.
   Protected recovery is exact; ordinary state omits optional sensitive host
   diagnostics while preserving conversation and restore-critical state.
+- A failed native turn acceptance no longer leaves unaccepted input in later
+  saved history. Unresolved acceptance fences persistence until reopen; Forge
+  preserves the original turn failure and the next turn recovers automatically.
 - Native Agent Chat now uses the runtime's `agent-runtime-lcm-4` planning:
   condensation carries a full covered-entry size tier instead of merging on
   active-node count. Without token pressure, summaries can occupy more context;

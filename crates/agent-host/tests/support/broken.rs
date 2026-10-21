@@ -1,4 +1,4 @@
-//! Test-target-only adaptations of v0.8.0's private journal_storage_broken
+//! Test-target-only adaptations of v0.9.0's private journal_storage_broken
 //! fault shapes. Every non-faulted operation reaches real Forge SQL/AEAD storage.
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -17,6 +17,7 @@ use super::support::{self, Storage};
 pub enum Defect {
     TornTransaction,
     LostWrite,
+    NonRetryableLostAck,
     ReorderedCommit,
     StaleEpoch,
     StaleGeneration,
@@ -252,7 +253,15 @@ impl JournalStorage for Broken {
                     .filter_map(|(id, body)| body.map(|body| (id, body))),
             );
         }
-        let receipt = self.storage().apply(write).await?;
+        let lost_ack = self.defect == Defect::NonRetryableLostAck
+            && write.inject == Some(JournalCommitFailurePoint::AfterCommit);
+        let result = self.storage().apply(write).await;
+        if lost_ack {
+            let mut error = result.unwrap_err();
+            error.retryable = false;
+            return Err(error);
+        }
+        let receipt = result?;
         if self.defect == Defect::SharedBodyDeleted {
             self.unlinked.lock().unwrap().extend(release);
         }

@@ -999,3 +999,142 @@ async fn writer_fence_and_drop() {
         "no writer hand-over needed provider I/O"
     );
 }
+
+/// Clear-index discovery must hand every id to the shared engine, including a
+/// corrupt middle record and local dirty hints. Never mutate the bad scope.
+#[tokio::test]
+async fn dirty_corruption_does_not_block_shared_collector() {
+    use sqlx::Row;
+    async fn scope_image(
+        f: &FileDb,
+        domain: &JournalDomain,
+        id: &SessionId,
+    ) -> Vec<Vec<Vec<String>>> {
+        let mut image = Vec::new();
+        for suffix in [
+            "session",
+            "pin",
+            "catalog",
+            "pack",
+            "membership",
+            "operation_pack",
+        ] {
+            let table = format!("agent_session_journal_{suffix}");
+            let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+                .fetch_all(f.database().pool())
+                .await
+                .unwrap();
+            let fields: Vec<_> = columns
+                .iter()
+                .map(|c| format!("quote(\"{}\")", c.get::<String, _>("name")))
+                .collect();
+            let rows = sqlx::query(&format!(
+                "SELECT {} FROM {table} WHERE storage_id=? AND runtime_session_id=? ORDER BY 1,2,3",
+                fields.join(",")
+            ))
+            .bind(domain.storage_id.as_str())
+            .bind(id.as_str())
+            .fetch_all(f.database().pool())
+            .await
+            .unwrap();
+            image.push(
+                rows.iter()
+                    .map(|r| (0..fields.len()).map(|i| r.get(i)).collect())
+                    .collect(),
+            );
+        }
+        image
+    }
+    let f = FileDb::new().await.unwrap();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1));
+    let ids = ["d2-a", "d2-b", "d2-c"].map(SessionId::new);
+    for id in &ids {
+        f.ensure_session(id).await.unwrap();
+        let rt = runtime(store.clone(), provider());
+        let session = rt
+            .start_session(StartSession::create(
+                id.clone(),
+                vec![Message::user("initial history".repeat(30))],
+            ))
+            .await
+            .unwrap();
+        session.persist().await.unwrap();
+        for input in ["first turn", "second turn"] {
+            session
+                .run(UserInput::text(input))
+                .await
+                .unwrap()
+                .completed()
+                .await;
+            session.persist().await.unwrap();
+        }
+        drop(session);
+        drop(rt);
+    }
+    let journal = store.journals().ordinary();
+    let storage = store.journals().storage();
+    let domain = JournalDomain {
+        storage_id: journal.storage_id(),
+        role: JournalRole::Ordinary,
+    };
+    let before: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack WHERE storage_id=? GROUP BY runtime_session_id ORDER BY runtime_session_id")
+        .bind(domain.storage_id.as_str()).fetch_all(f.database().pool()).await.unwrap();
+    sqlx::query("UPDATE agent_session_journal_session SET payload=zeroblob(length(payload)) WHERE storage_id=? AND runtime_session_id=?")
+        .bind(domain.storage_id.as_str()).bind(ids[1].as_str()).execute(f.database().pool()).await.unwrap();
+    let corrupt_image = scope_image(&f, &domain, &ids[1]).await;
+    let loads = storage.session_record_loads_for_test(&domain, &ids[1]);
+    assert_eq!(
+        storage.dirty_sessions(&domain, None, 128).await.unwrap(),
+        ids
+    );
+    assert_eq!(
+        storage.session_record_loads_for_test(&domain, &ids[1]),
+        loads,
+        "discovery never authenticates session rows"
+    );
+    for run in 0..2 {
+        let loads = storage.session_record_loads_for_test(&domain, &ids[1]);
+        let report = journal
+            .collect(JournalGcRequest {
+                storage_id: journal.storage_id(),
+                expected_root_epoch: journal.root_epoch().unwrap(),
+                max_objects: 20_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.unreadable_sessions, vec![ids[1].clone()]);
+        assert_eq!(
+            storage.session_record_loads_for_test(&domain, &ids[1]) - loads,
+            1,
+            "one bad load per collection, including local hints"
+        );
+        assert_eq!(scope_image(&f, &domain, &ids[1]).await, corrupt_image);
+        if run == 0 {
+            assert!(report.reclaimed_bytes > 0);
+        }
+    }
+    let after: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack WHERE storage_id=? GROUP BY runtime_session_id ORDER BY runtime_session_id")
+        .bind(domain.storage_id.as_str()).fetch_all(f.database().pool()).await.unwrap();
+    assert_eq!(before[1], after[1]);
+    assert!(after[0].1 < before[0].1 && after[2].1 < before[2].1);
+    let stats = storage.byte_stats(&domain).await.unwrap();
+    assert_eq!(stats.skipped_sessions, 1);
+    assert_eq!(stats.retained_bytes, (after[0].1 + after[2].1) as u64);
+    assert_eq!(
+        stats.live_bytes + stats.deferred_bytes,
+        stats.retained_bytes
+    );
+    assert_eq!(
+        storage.retained_bytes(&domain).await.unwrap(),
+        Some(stats.retained_bytes)
+    );
+    journal.compact().await.unwrap();
+    assert_eq!(scope_image(&f, &domain, &ids[1]).await, corrupt_image);
+    assert!(
+        storage.load(&domain, &ids[1]).await.is_err(),
+        "corruption never becomes an absent session"
+    );
+    for id in [&ids[0], &ids[2]] {
+        assert!(snapshot(&journal, id).await.history.len() >= 5);
+    }
+}

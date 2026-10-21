@@ -73,6 +73,7 @@ pub enum RuntimeWorker {
     TaskSteps,
     CheckRuns,
     IntegrationQueue,
+    SessionJournalRetention,
 }
 
 /// Names of the durable consumers owned by the upper agent runtime.
@@ -105,7 +106,7 @@ impl RuntimeWorker {
     }
 }
 
-pub const COMMON_WORKERS: [RuntimeWorker; 19] = [
+pub const COMMON_WORKERS: [RuntimeWorker; 20] = [
     RuntimeWorker::CrashRecovery,
     RuntimeWorker::NotificationProjection,
     RuntimeWorker::OperatorStatusProjection,
@@ -125,4 +126,5 @@ pub const COMMON_WORKERS: [RuntimeWorker; 19] = [
     RuntimeWorker::ConflictHotspots,
     RuntimeWorker::CheckRuns,
     RuntimeWorker::IntegrationQueue,
+    RuntimeWorker::SessionJournalRetention,
 ];

@@ -2,8 +2,9 @@
 use super::{
     cache::Scope,
     codec, corrupt,
+    diagnostics::unreadable,
     seal::role,
-    storage::{ForgeJournalStorage, PackView, database_error},
+    storage::{ForgeJournalStorage, PackView, ambiguous_database_error, database_error},
 };
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use sqlx::SqliteConnection;
@@ -128,6 +129,8 @@ impl ForgeJournalStorage {
         let mut rewritten_packs = 0usize;
         let mut rewritten_bytes = 0usize;
         let result = async {
+            // Maintenance may not rewrite an unreadable session's packs.
+            self.load_on(&mut tx, domain, session).await?;
             let mut views = self.directory(&mut tx, &scope, false).await?;
             loop {
                 let mut tiers = BTreeMap::<u32, Vec<PackView>>::new();
@@ -160,13 +163,15 @@ impl ForgeJournalStorage {
         .await;
         // No transient directory/body is ever published by physical work.
         let result = match result {
-            Ok(()) => tx.commit().await.map_err(database_error),
+            Ok(()) => tx.commit().await.map_err(ambiguous_database_error),
             Err(e) => {
-                tx.rollback().await.map_err(database_error)?;
+                tx.rollback().await.map_err(ambiguous_database_error)?;
                 Err(e)
             }
         };
-        self.cache_lock()?.invalidate(&scope);
+        self.cache_lock()
+            .map_err(RuntimeError::retryable)?
+            .invalidate(&scope);
         tracing::debug!(target:"forge_session_journal",kind="post_terminal",duration_us=started.elapsed().as_micros() as u64,lock_hold_us=locked.elapsed().as_micros() as u64,rewritten_packs,rewritten_bytes,success=result.is_ok(),"journal maintenance");
         result
     }
@@ -180,6 +185,15 @@ impl ForgeJournalStorage {
                 break;
             };
             let scope = (domain.clone(), SessionId::new(&session));
+            match self.load(domain, &scope.1).await {
+                Err(error) if unreadable(&error) => {
+                    Self::note_unreadable_session(&scope.1);
+                    after = Some(session);
+                    continue;
+                }
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
             let upper: i64 = sqlx::query_scalar("SELECT coalesce(max(pack_id),0) FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=?")
                 .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&session).fetch_one(self.db.pool()).await.map_err(database_error)?;
             let mut cursor = 0;
@@ -218,15 +232,24 @@ impl ForgeJournalStorage {
                 }
                 .await;
                 let result = match result {
-                    Ok(()) => tx.commit().await.map_err(database_error),
+                    Ok(()) => tx.commit().await.map_err(ambiguous_database_error),
                     Err(e) => {
-                        tx.rollback().await.map_err(database_error)?;
+                        tx.rollback().await.map_err(ambiguous_database_error)?;
                         Err(e)
                     }
                 };
-                self.cache_lock()?.invalidate(&scope);
+                self.cache_lock()
+                    .map_err(RuntimeError::retryable)?
+                    .invalidate(&scope);
                 tracing::debug!(target:"forge_session_journal",kind="compact",duration_us=started.elapsed().as_micros() as u64,lock_hold_us=locked.elapsed().as_micros() as u64,rewritten_packs=count,rewritten_bytes=bytes,success=result.is_ok(),"journal maintenance");
-                result?;
+                match result {
+                    Err(error) if unreadable(&error) => {
+                        Self::note_unreadable_session(&scope.1);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                    Ok(()) => {}
+                }
                 #[cfg(feature = "test-support")]
                 {
                     let mut stats = self.compact_observations.lock().map_err(|_| corrupt())?;
@@ -243,6 +266,7 @@ impl ForgeJournalStorage {
         }
         db::incremental_vacuum(self.db.pool())
             .await
-            .map_err(database_error)
+            // Vacuum can have completed work before losing its acknowledgement.
+            .map_err(ambiguous_database_error)
     }
 }

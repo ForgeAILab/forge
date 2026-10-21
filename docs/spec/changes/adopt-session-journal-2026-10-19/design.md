@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T13:01:05Z
+updated_at: 2026-10-20T19:29:31Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -13,11 +13,11 @@ implementation.
 ## Context and evidence
 
 The runtime contract is authoritative in
-[extract-journal-storage-engine](https://github.com/ForgeAILab/agent-runtime/blob/fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
+[extract-journal-storage-engine](https://github.com/ForgeAILab/agent-runtime/blob/8c19be5b226c2fdaeb6708ec5d39e91c235857a5/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
 especially amended D2 rule 4, D5's per-engine memo and D8.4's measurements.
 Implementation references below use `runtime:` for source paths in the
-`v0.8.0` tag at immutable commit
-`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7`. The local clone at
+`v0.9.0` tag at immutable commit
+`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`. The local clone at
 `/Volumes/Data/codes/ai/agent-runtime-u9b-review/` is read-only; its moving HEAD
 is not release evidence. Runtime Owner Decision Q4 accepts independent
 per-session copies; the earlier Forge review's global-index requirement is withdrawn.
@@ -75,14 +75,14 @@ storage/domain during the process lifetime. Clones share the validated-root memo
 and the lease registry; a new engine loses both. Writer changes therefore reuse
 warm roots and collection sees the leases used by all runtime instances.
 
-Released runtime v0.8.0 implements D-1: warm reads finish each reader
+Released runtime v0.9.0 preserves D-1: warm reads finish each reader
 operation by checking stored current-head authority or the selected historical
 root's durable pin; a stale view retries through membership-scoped storage.
 `JournalEngine::read`, reader materialization and extension reads use that path
 (`engine/mod.rs`, `engine/memo.rs::ReadOperation`, `reader.rs`). This supersedes
 rt-e6-review F2. Released runtime D5 records the resolved decision and requires
 a head-bound memo certificate for a historical pin. Task 1 verifies this in the
-published `v0.8.0` tag; it is release-source evidence, not a Forge storage test result.
+published runtime release; it is release-source evidence, not a Forge storage test result.
 That check does not make independent engines safe: collection sees only its
 engine's leases, and cross-session dependency/retirement checks are not protected
 by a same-session fence. Exactly one engine and its clones per storage/domain
@@ -103,16 +103,15 @@ development guide. The release gate verifies the warm-read check too.
 
 ### D2. What Forge consumes from the runtime
 
-**Release/pin gate.** Task 1 pins every agent-runtime package and testkit to
-**agent-runtime v0.8.0**, the first release containing
-extract-journal-storage-engine, at immutable commit
-`fd5b14ca12f4a8dbc4d52030f3c095292f4eb4a7` (annotated tag object
-`d4dfe1952eeac542d9ec0d5c88ecce07f0c9e86b`). Verify the receipt amendment, R1–R7,
+**Release/pin gate.** Every runtime package and the testkit now consume
+**agent-runtime v0.9.0** at immutable tag commit `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`.
+The original task-1 gate adopted the first engine release; this follow-up adds
+per-session collection isolation, the retryable lost-acknowledgement contract,
+and failed-acceptance rollback/fencing. Verify the receipt amendment, R1–R7,
 N1/N2 fixes, native-first open, bounded extension reads, S5, the amended
-PerSession/deferred-removal contract and reviewer gate fix in that release.
-Verify D-1's reader-operation authority check; Forge uses shared engine clones
-regardless.
-Missing pieces block adoption; they are not Forge engine jobs.
+PerSession/deferred-removal contract, reviewer gate fix and D-1 authority checks.
+Forge uses shared engine clones regardless. Missing pieces block adoption;
+they are not Forge engine jobs.
 
 The public boundary is `JournalStorage: Send + Sync + Debug + 'static`.
 `sharing()` is synchronous and Forge explicitly returns
@@ -384,7 +383,14 @@ The additive `V202610201253__session_journal_deletion.sql` adds a clear
 and session-deletion triggers maintain it; existing packs are backfilled from
 owner/membership existence without rewriting sealed units. Chat deletion removes
 its polymorphic context scopes; Agent archival (the user-facing Agent deletion)
-removes its sessions. Project/Task and physical Agent deletion use existing FKs.
+removes its native and CLI sessions. These two logic edges live in repository
+code in the same source transaction: `delete_agent_chat` and the User/Project
+parent deletions call `delete_agent_chat_scopes_in_tx`; both Agent archive entry
+points and machine-removal archival call `delete_saved_agent_sessions_in_tx`.
+The unreleased deletion migration contains only orphan projection triggers,
+which must observe FK cascades. Project/Task and physical Agent deletion use
+existing FKs. Archive has no unarchive path; it removes saved CLI resume handles
+without signalling an already running CLI process. Late row updates fail NotFound.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
 (no row if all bodies exist already), or several rows cut at the S2 logical-size
@@ -612,6 +618,20 @@ Production journal mutations go through one storage coordinator per process
 cache invalidation because membership is read from SQL on every request. No
 full-closure prefetch on every commit.
 
+**Storage failure contract (runtime v0.9.0, review D3).** A non-retryable
+apply error guarantees no durable effect. Every ambiguous COMMIT, lost ack,
+failed rollback acknowledgement or post-COMMIT cache failure is retryable.
+SQLx BUSY/LOCKED classification uses numeric SQLite codes (including extended
+codes through their low byte), alongside IO/CANTOPEN and pool/worker availability.
+Validation, authentication and constraint errors before a successful commit stay
+non-retryable and roll back. Cache/codec infrastructure failures are retryable
+so collection aborts a domain instead of misidentifying a session. S2 commit
+failures are retryable; compact errors are retryable because earlier bounded
+batches may have committed. The DB-only deletion drain maps any COMMIT error to
+transient `DbError::AmbiguousCommit`, then through ServiceError; no new public
+HTTP or turn-failure class is introduced. Physical maintenance failures never
+undo an acknowledged turn.
+
 **No journal call inside a Forge DB transaction.** Never call the engine or
 storage while holding a Forge `begin_immediate` transaction or a pooled
 connection. The pool has five connections and storage needs its own write lock,
@@ -656,23 +676,27 @@ collection, ordinary shared suffix and projected intent; and unsupported
 collection. Forge does not reimplement `JournalCollectionHost` semantics: testkit
 already implements it for `JournalEngine<S>`.
 
-Run all seven deliberately broken-storage cases using Forge-backed test-only
+Run all eight deliberately broken-storage cases using Forge-backed test-only
 fault decorators, preserving the upstream named expected failures:
 
 | Defect | Required named rejection |
 | --- | --- |
 | Torn transaction | `journal_storage::atomic_apply_cuts` |
+| Non-retryable lost acknowledgement | `journal_storage::atomic_apply_cuts` |
 | Lost acknowledged write | `journal_storage::restart_acknowledged_state` |
 | Reordered n+1 publication | `journal_storage::restart_commit_sequence` |
 | Ignored writer epoch | `journal_storage::writer_epoch_fence` |
 | Ignored control generation | `journal_storage::control_generation_fence` |
 | Shared body deleted with another holder | `journal_storage::shared_body_last_membership` |
-| Released/deferred body served to a non-member | `journal_storage::membership_isolation_and_receipts` or `journal_storage::bounded_deferred_deletion`, matching the injected path |
+| Released/deferred body served to a non-member | `journal_storage::body_cache_membership` (the new warm-cache probe rejects the decorator first) |
 
 Task 12 corrects the original six-control inventory: released v0.8.0 also
 contains the private `StaleGeneration` fault and the named
 `control_generation_fence` case. This seventh control is required alongside
 the writer-epoch control; revision and epoch may stay unchanged across controls.
+The v0.9.0 follow-up adds the eighth control, NonRetryableLostAck. Its suite has
+26 named cases per configuration, adding unreadable-session isolation,
+body-cache membership, full-id lookup and exact membership enumeration.
 
 For the premature-deletion decorator, deliberately damage the surviving scope's
 independent copy; a correct PerSession release in A must never be labeled faulty
@@ -753,16 +777,19 @@ journal, for example after the newer dormant row was replaced, Forge starts a
 fresh session as it does for any unresumable scope. It never loops on the
 conflict or falls back to stale legacy state.
 
-Implementation status at v0.8.0: task 22 provides the directly callable
-selection/retirement page and task 23 the directly callable deletion drain and
-durable/post-commit nudges. Worker scheduling, collection and terminal hooks
-remain task 21, deferred with review D-2 until the runtime releases per-session
-collection failure isolation. The worker contract below is not yet scheduled.
+Task 21 now schedules the task-22 selection function and task-23 deletion drain
+through the existing PeriodicWorkers framework in both server and Solo. The
+supervisor owns exactly one worker and its shared-engine clones. Successful
+native terminal, fork and abort publications await S2; a maintenance error does
+not replace the turn outcome. Post-terminal, rotation, recovery and committed
+session-deletion nudges share the pool activity signal. Wakes can coalesce; the
+60-second tick and durable indexes recover missed wakes.
 
 A `session-journal-retention` worker uses the existing workers framework, a 60 s
 tick and post-commit rotation/recovery nudges. Retire protected then ordinary only
-after the engine accepts the revision-bound grant, no-live-writer and
-resolved-transfer/dependency conditions. A race/conflict retries later. A crash
+after authenticating both records and obtaining both revision-bound grants;
+the engine still enforces no-live-writer and resolved-transfer/dependency
+conditions. A race/conflict retries later. A crash
 between domains resumes on the next tick. Tombstones persist after collection;
 latest-root opens continue to conflict. Operate on published native domains;
 legacy-only dead sessions are not eagerly imported merely to retire them. Their
@@ -773,7 +800,11 @@ Each tick also collects dirty sessions in both domains, initially
 `max_objects = 20_000` per call and a 10 s scheduling budget. The worker checks its
 budget between calls/batches rather than claiming to preempt synchronous CPU
 inside one engine call. The engine holds its write gate for the whole `collect`
-call (runtime `collect_inner`), so every commit and open in that domain waits. The
+call (runtime `collect_inner`), so every commit and open in that domain waits.
+The implemented cursor resumes retirement pages, protected collect, ordinary
+collect and cleanup batches after the scheduling budget expires. The worker
+records collect duration as a conservative gate-hold upper bound including gate
+wait; the scheduling deadline never cancels an in-flight engine control. The
 call visits every dirty session; max_objects bounds membership releases, not
 previously deferred physical copy/byte removals, sessions or time. The 10 s
 budget therefore bounds the worker loop, not the gate hold.
@@ -786,6 +817,23 @@ release/receipt accounting and S2 pack work. Live sessions are collected too;
 superseded checkpoint/cache/manifest paths otherwise accumulate. Post-terminal
 hooks nudge collection and perform geometric S2 maintenance; collection performs
 the base repack. No TTL, object age rule or new runtime schema is introduced.
+
+**D-2 isolation.** Discovery pages the clear dirty index and returns every id,
+including an unreadable record; it never authenticates an entire discovery page.
+The released engine loads the session, reports non-retryable per-session failures
+in `unreadable_sessions`, preserves its state and dirty hint, and continues.
+Conflicts skip silently; retryable and domain-wide failures still abort. The
+same shared engine reports a bad session again on the next call, reading its
+record at most once per collect call. Storage diagnostics and compact skip and
+log a bad session; `byte_stats` exposes omitted-session counts and readable-only
+retained/live/deferred bytes. The trait's scalar retained_bytes is therefore a
+partial diagnostic in that case, never a liveness or total-file-size authority.
+A process-wide warning set logs once per runtime session, with no ids or contents.
+An unreadable candidate's record prevents either retirement domain from changing.
+An unreadable OTHER session may still protect a retirement candidate through
+unknown dependency metadata: the engine refuses that retirement, and Forge
+records a deferral while continuing collection, preserving partial domain progress.
+It must not label that healthy candidate unreadable or bypass dependency safety.
 
 Project/Agent/chat deletion cascades per-session metadata and memberships. After
 commit, nudge bounded physical cleanup to remove **all** packs owned by the
@@ -990,7 +1038,7 @@ not claim Forge has run or passed it.
 
 ## Risks / Trade-offs
 
-- The prerequisite is released as `v0.8.0`. Task 1 verifies the tagged contract,
+- The consumed prerequisite is `v0.9.0`. The release gate verifies the tagged contract,
   including upstream N1/N2, gate and S5 fixes; Forge must not work around them by
   owning engine semantics.
 - Validation/policy CPU can still be O(N); R4 avoids repeated cold closure reads
