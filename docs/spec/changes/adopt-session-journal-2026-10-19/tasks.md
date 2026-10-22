@@ -671,6 +671,10 @@ No runtime bench crate becomes a production dependency.
   Full results and verification: /Volumes/Data/tmp/refactor/c3-t24-25/report.md.
   Task 26 and the overall change completion stamp remain untouched.
 
+  Re-measured after within-session sharing (task 29, 2026-10-21): the B/4000
+  disk gate now passes at 1.60843× / 1.79118×. The turn, import and C/4000
+  collection-hold checks remain NOT MET.
+
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
   Breaking/Changed entries per D9, with actual pins/results. State next-release
@@ -688,7 +692,7 @@ No runtime bench crate becomes a production dependency.
 
 ## Within-session body sharing (2026-10-21 amendment)
 
-- [ ] **27. Share identical bodies between a session's domains (≤5 h with 28–29).**
+- [x] **27. Share identical bodies between a session's domains (≤5 h with 28–29).**
   Amend D2 rule 4, D3 ("Within-session body sharing"), D4 and the D10 risk per
   the task-25 profiling evidence (`/Volumes/Data/tmp/refactor/c3-profile/report.md`,
   section 4 and ranked option 1). In the unreleased session-journal migration,
@@ -706,7 +710,15 @@ No runtime bench crate becomes a production dependency.
   purged and merged), two-domain release crash cuts, deletion drain with shared
   bodies and a corrupt shared body isolating its session.
 
-- [ ] **28. Storage-only speed fixes (profile option 3).**
+  Completed (2026-10-21): conformance (no-repack/repack/reopen) and all eight
+  broken-storage controls pass with the shared layout. New storage tests
+  `shared_domain_copy_and_independent_session_receipts`,
+  `ordinary_never_reads_protected_only_bodies`, `two_domain_release_crash_cuts`,
+  `deletion_drain_removes_shared_session_packs_once` and
+  `corrupt_shared_body_isolates_its_session` pass, and each fails on the
+  pre-sharing commit. Evidence: `/Volumes/Data/tmp/refactor/c3-share/report.md`.
+
+- [x] **28. Storage-only speed fixes (profile option 3).**
   Keep unchanged immutable body-cache entries across S2/compact instead of
   invalidating the session; publish merged pack bodies after COMMIT; precompute
   lookup prefixes once per requested id; batch catalog/pin removals; validate an
@@ -714,8 +726,20 @@ No runtime bench crate becomes a production dependency.
   authentication, full-id verification and atomic fences are unchanged; released
   bodies are never served.
 
-- [ ] **29. Re-measure the Forge gate.**
+  Completed (2026-10-21) together with task 27. Turn/import times stay within
+  noise of task 25 (the runtime's snapshot/proof work dominates); the longest
+  collection call and write transactions fall (B/4000 359/424 → 331/326 ms collect,
+  146/157 → 24/56 ms write transaction).
+
+- [x] **29. Re-measure the Forge gate.**
   Rerun only the named ignored release report and record B/4000 plain/tool disk
   ratios against L2 (hard gate ≤2.0×) and turn/import/collect before vs after.
   Update task 25's notes and `docs/performance-testing.md`; fixtures, seeds,
   projection, baseline and thresholds are unchanged.
+
+  Completed (2026-10-21): B/N=4000 after collection is 2,187,264 / 1,359,872 L2
+  (**1.60843×**, plain) and 2,494,464 / 1,392,640 L2 (**1.79118×**, tool): the
+  2.0× hard disk gate passes; the 1.5× aim is missed. C/4000 is 1.13992×. Turn
+  and import checks still fail; C/4000's longest collect call is 2,106.75 ms,
+  above D8's 1-second bound. Table in `docs/performance-testing.md`; raw output
+  in `/Volumes/Data/tmp/refactor/c3-share/gate/`.

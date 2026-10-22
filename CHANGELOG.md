@@ -174,8 +174,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 ### Added
 
 - Data-preserving session-journal foundation migration: six new tables for
-  session records, pins, catalogs, owned packs, bitmap memberships and operation
-  packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
+  session records, pins, catalogs, session-owned packs, per-domain bitmap
+  memberships and operation packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
   unchanged; new native session state uses the journal tables.
 
 - HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
@@ -209,6 +209,18 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   changes. Legacy rows are still read for automatic import and remain stored.
   Protected recovery is exact; ordinary state omits optional sensitive host
   diagnostics while preserving conversation and restore-critical state.
+- A session's protected and ordinary journal state now store each identical
+  body once: packs belong to the runtime session and each domain reads only
+  through its own membership. Bodies are never shared across sessions, and the
+  ordinary state still never reads content its projection excludes. Pack units
+  are sealed under a session-scoped binding. This changes the unreleased
+  journal layout in place; there is no separate migration.
+  Measured B/N=4000 retained size after collection falls from 2.84×/3.23× to
+  1.61×/1.79× of the legacy row (plain/tool), meeting the 2.0× disk gate;
+  turn and import times are unchanged and still slower than legacy.
+- Session-journal storage keeps unchanged decoded pack bodies cached across
+  terminal maintenance, compaction and collection rewrites, batches pin/catalog
+  removals and validates admitted bodies once.
 - A failed native turn acceptance no longer leaves unaccepted input in later
   saved history. Unresolved acceptance fences persistence until reopen; Forge
   preserves the original turn failure and the next turn recovers automatically.

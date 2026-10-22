@@ -721,9 +721,57 @@ Final outputs: `/Volumes/Data/tmp/usage-merge/bench-reported1.json` and `bench-r
 <!-- session-journal-d10:start -->
 ## Session journal D10 measurements (2026-10-21)
 
-**Adoption gate: NOT MET.** These are actual Forge measurements at agent-runtime
-v0.9.0 / `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, from the production
-SQLx storage and real AEAD. They do not qualify this change for release.
+**Disk gate: MET after within-session sharing (task 29); turn/import/collect
+checks: NOT MET.** These are actual Forge measurements at agent-runtime v0.9.0 /
+`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, from the production SQLx storage and
+real AEAD. The tables after the task-29 section are the original task-25 run,
+with independent domain copies, kept for comparison.
+
+### Task 29: within-session body sharing re-measurement
+
+Same ignored release report, fixtures, seeds, projection, L2 baseline, cadence
+and thresholds. The only changes are session-owned shared packs and the
+storage-only fixes (task 28). Raw output: `/Volumes/Data/tmp/refactor/c3-share/gate/`.
+
+| Fixture | Actual L2 | After collection, task 25 → 29 | Forge/L2, task 25 → 29 | ≤2.0× |
+| --- | ---: | ---: | ---: | --- |
+| A/100 plain | 8,192 | 106,496 → 73,728 | 13.00000× → 9.00000× | n/a |
+| A/100 tool | 8,192 | 110,592 → 77,824 | 13.50000× → 9.50000× | n/a |
+| A/1000 plain | 53,248 | 507,904 → 323,584 | 9.53846× → 6.07692× | n/a |
+| A/1000 tool | 53,248 | 503,808 → 315,392 | 9.46154× → 5.92308× | n/a |
+| A/4000 plain | 204,800 | 1,859,584 → 1,179,648 | 9.08000× → 5.76000× | n/a |
+| A/4000 tool | 208,896 | 1,859,584 → 1,183,744 | 8.90196× → 5.66667× | n/a |
+| B/100 plain | 40,960 | 172,032 → 110,592 | 4.20000× → 2.70000× | n/a |
+| B/100 tool | 45,056 | 180,224 → 122,880 | 4.00000× → 2.72727× | n/a |
+| B/1000 plain | 335,872 | 995,328 → 581,632 | 2.96341× → 1.73171× | n/a |
+| B/1000 tool | 339,968 | 1,118,208 → 634,880 | 3.28916× → 1.86747× | n/a |
+| **B/4000 plain** | 1,359,872 | 3,862,528 → **2,187,264** | 2.84036× → **1.60843×** | **PASS** (aim 1.5×: miss) |
+| **B/4000 tool** | 1,392,640 | 4,501,504 → **2,494,464** | 3.23235× → **1.79118×** | **PASS** (aim 1.5×: miss) |
+| C/1000 tool | 942,080 | 2,293,760 → 1,191,936 | 2.43478× → 1.26522× | n/a |
+| C/4000 tool | 3,981,312 | 8,908,800 → 4,538,368 | 2.23765× → 1.13992× | n/a |
+
+The B/4000 results match the profiling estimate (1.615×/1.797×) and the runtime
+reference (1.605×/1.791×). Timings, ms, task 25 → 29 (last turn including
+synchronous S2/collection; legacy in the same run for context):
+
+| Fixture | Native turn | Legacy turn | Import | Legacy resume | Max collect call | Max write transaction | Delta writes / legacy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| B/1000 plain | 428.82 → 400.60 | 59.60 | 824.67 → 825.34 | 7.43 | 90.49 → 73.78 | 36.68 → 14.87 | 10.675% → 35.94% |
+| B/1000 tool | 673.55 → 680.24 | 115.51 | 971.16 → 1008.98 | 8.49 | 100.55 → 83.58 | 40.91 → 18.83 | 10.492% → 25.32% |
+| B/4000 plain | 1585.06 → 1685.62 | 229.38 | 3361.03 → 3349.73 | 29.37 | 358.55 → 330.56 | 145.90 → 24.15 | 7.658% → 7.753% (PASS) |
+| B/4000 tool | 2635.42 → 2547.75 | 427.33 | 3917.32 → 3925.23 | 34.16 | 423.68 → 326.24 | 157.21 → 56.46 | 5.440% → 5.514% (PASS) |
+| C/1000 tool | 930.11 → 845.89 | 264.89 | 2941.98 → 2910.84 | 34.36 | 682.06 → 256.60 | 630.06 → 57.14 | 11.035% → 10.771% |
+| C/4000 tool | 3937.09 → 3309.28 | 3938.27 | 12294.36 → 12235.53 | 185.84 | 2992.81 → 2106.75 | 2526.39 → 1580.27 | 3.214% → 3.100% (PASS) |
+
+Turn and import times are within run-to-run noise of task 25 and still fail
+their D10 checks: the cost is runtime snapshot/proof and collection tracing,
+not storage. Sharing shrinks the longest collection call and write
+transactions, but C/4000's 2,106.75 ms collect call still exceeds D8's 1-second
+review bound. The A rows ran while the machine was heavily loaded (their
+legacy timings also rose 5–10×), so A timings in this run are not comparable;
+their byte counts are unaffected. B/1000 delta ratios rise because the much
+smaller retained layout makes S2/collection rewrites a larger share; the ≤10%
+check applies to the B/N≥1000 rows and passes only at N=4000, as before.
 
 The fixed upstream seeds are history `0xbadc0ffee1234567`, provider scripts
 `0x12349876abcd5678`, and turn inputs `0x987612345678abcd`. A/B use two turns over

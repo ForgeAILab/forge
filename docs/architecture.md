@@ -8336,16 +8336,17 @@ native session journals, now used by persistent native runtimes:
 | `session` | Sealed engine record, publication/checkpoint/retirement flags and control-generation/revision/writer-epoch fence; keyed by `(storage_id, role, runtime_session_id)`. |
 | `pin` | Sealed pin record, keyed by scope plus a 32-byte keyed lookup value. |
 | `catalog` | Sealed catalog entry, keyed by scope plus a 32-byte keyed head lookup value. |
-| `pack` | Exclusive domain/runtime-session owner, Forge owner label, generation, object count and retained canonical byte count; separately sealed index and body units. `AUTOINCREMENT` pack ids are never reused. |
-| `membership` | One nonzero bitmap per scope/pack; composite FKs enforce matching runtime scope and Forge owner. Slot-count/bitmap-length agreement belongs to storage. |
+| `pack` | Owned by one runtime session (no domain columns) and shared by its protected and ordinary domains; Forge owner label, generation, object count and retained canonical byte count; separately sealed index and body units. `AUTOINCREMENT` pack ids are never reused. |
+| `membership` | One nonzero bitmap per domain/session/pack; composite FKs enforce the pack's runtime session and Forge owner. Each domain reads only through its own bitmap. Slot-count/bitmap-length agreement belongs to storage. |
 | `operation_pack` | Sealed original operation results in nonnegative binary-carry/overflow tiers. |
 
 Session, pin, catalog, membership and operation-pack rows have indexed
 `forge_session_id` foreign keys cascading from `agent_session`. Child metadata
 also cascades from its journal session. Packs have an indexed Forge owner label
 with **no owner FK**: they survive session deletion for later bounded physical
-cleanup. Pack lookup uses `(storage_id, role, runtime_session_id, pack_id)`;
-membership has a reverse `pack_id` index; dirty-session paging uses a partial
+cleanup. Pack lookup uses `(runtime_session_id, pack_id)`; membership has a
+reverse `pack_id` index and a `(runtime_session_id, pack_id)` index for loading
+every domain's bitmaps of one session; dirty-session paging uses a partial
 domain/runtime-session index. A plain non-unique index on
 `agent_session(runtime_session_id)` preserves existing duplicate and NULL values.
 
@@ -8373,24 +8374,35 @@ existing protected key material/server JWT secret). The labels are
 `forge/session-journal/aead/v1` and `forge/session-journal/lookup/v1`;
 `key_revision` remains 1. Every unit uses XChaCha20-Poly1305 with a fresh 24-byte
 nonce and the `FORGE-JOURNAL\0` version-1 envelope. Length-delimited associated
-data binds the table/unit kind, full storage-id/role/runtime-session scope,
-Forge owner, row key, generation, format and key revision. Pin and catalog keys
+data binds the table/unit kind, scope, Forge owner, row key, generation, format
+and key revision. Session, pin, catalog and operation units bind the full
+storage-id/role/runtime-session scope. Pack index and body units are shared by a
+session's domains and bind a session scope instead (`session_pack` table label,
+unit codes 7/8, no domain fields); a domain-bound binding can never open a pack
+unit or the reverse. Pin and catalog keys
 are separately contextualized HMAC-SHA256 values; real ids, operation results
 and opaque engine metadata remain sealed. Authentication failures fail closed.
 
 `storage.rs` serves lossless records, objects, memberships, operations, pins,
 catalogs and runtime-id-sorted dirty pages through one WAL read transaction per
 call. Loading a record and constructing storage decode no packs. Indexes hydrate
-lazily within the requested domain/session; scoped pack headers and membership
-are reread on each call, and only new or changed index units are decoded. Body
-reads batch by pack, verify full ids and enforce current membership even on
-cache hits. A shared 64 MiB charged LRU in `cache.rs` bounds directories and
-plaintext bodies together; generation keys prevent stale slots after a rewrite.
-`sharing()` declares PerSession with independent domain copies. The retained
-canonical-byte diagnostic authenticates session records and index counts in
-bounded per-session pages and includes deferred and orphan copies without opening
-body units. `byte_stats` also reports held-membership and deferred bytes, plus
-skipped-session counts. When a session cannot authenticate, its entire diagnostic
+lazily within the requested runtime session; its pack headers and every
+domain's membership bitmaps are reread on each call, and only new or changed
+index units are decoded. Body reads batch by pack, verify full ids and enforce
+the requesting domain's current membership even on cache hits. Lookup prefixes
+are computed once per requested id. A shared 64 MiB charged LRU in `cache.rs`
+bounds per-session directories and plaintext bodies together; keys carry pack id
+and generation, so a rewrite never serves stale slots. Committed physical
+rewrites (apply purges/merges, S2, compact) forget only removed or rewritten
+pack ids and publish the bodies they sealed; other immutable bodies stay cached.
+`sharing()` declares PerSession: identical bodies are stored once per runtime
+session and shared by its domains, never across sessions. The retained
+canonical-byte diagnostic covers every pack of the sessions a domain
+participates in (record or membership), plus orphaned packs until drained, so
+the protected and ordinary values overlap. It authenticates session records and
+index counts in bounded per-session pages without opening body units.
+`byte_stats` also reports live bytes (held by any domain) and deferred bytes
+(held by none), plus skipped-session counts. When a session cannot authenticate, its entire diagnostic
 contribution is omitted and logged: totals cover readable sessions, not the whole
 domain. This diagnostic never controls liveness or stands for file size.
 
@@ -8401,7 +8413,11 @@ pins/catalog, admits the head, then writes the record and original operation
 result in the runtime's cut order. Six pre-commit cuts roll back the whole
 transaction, so the apply's genuinely new bodies are encoded, sealed and
 inserted once, as one final pack (capped segments when larger) written before
-the record; no intermediate per-cut pack rows exist. AfterCommit commits then
+the record; no intermediate per-cut pack rows exist. Admission searches every
+pack of the session: an identical body already stored, including one only the
+other domain holds or a deferred slot, gains the writing domain's bit after a
+full byte comparison instead of a new copy. Admitted bodies are validated once,
+before the write lock; packing re-checks only order and the cap. AfterCommit commits then
 returns an ambiguous error. A warm one-turn commit reads only the scope's pack
 headers/bitmaps, the new pack's index and the operation tiers, and writes one
 pack row. Only the written
@@ -8432,16 +8448,19 @@ floor and the highest-revision operation of the replacement record's writer
 epoch. Changed partial tiers become capped overflow segments; unchanged packs
 retain their ciphertext. The engine alone chooses the floor and handles replay.
 
-`release.rs` deduplicates release ids and clears only the owning membership bits.
-Read authority ends immediately, including on warm cache hits. Dead canonical
-body bytes below 25% remain sealed. Reaching 25%, emptying the scope, or collecting
-a retired session purges dead copies, including previously deferred slots absent
-from the new release list. A purge keeps the pack id, advances its generation,
-and atomically remaps surviving memberships, or deletes an empty pack. Receipts
-count each physical copy and its original canonical length only when removed;
-clearing bits, restoring a retained slot and moving live bodies count zero.
-Mandatory purges run with optional S2 merging disabled. Independent domain/session
-copies never delay each other's reclamation. Retained bytes include dead slots
+`release.rs` deduplicates release ids and clears only the writing domain's
+membership bits. Read authority ends immediately, including on warm cache hits.
+A slot is dead only when no domain of the session holds it. Dead canonical body
+bytes below 25% remain sealed. Reaching 25%, the writing domain holding nothing
+left in the session, or collecting a retired session purges dead copies,
+including previously deferred slots absent from the new release list. A purge
+keeps the pack id, advances its generation, and atomically remaps every holder
+domain's bitmap from its own previous bits, or deletes an empty pack. Receipts
+count each physical copy and its original canonical length only when removed; a
+release while the other domain still holds the slot, clearing bits, restoring a
+retained slot and moving live bodies count zero. Mandatory purges run with
+optional S2 merging disabled. Separate sessions' copies never delay each other's
+reclamation. Retained bytes include dead slots
 until their removal and reconcile with the physical receipts.
 
 `maintenance.rs` provides async `post_terminal(domain, session)` for the native
@@ -8450,7 +8469,9 @@ carrying geometrically only when a pair fits 1 MiB. Collection's base repack use
 only fully live packs below 64 KiB or fully live survivors purged by that apply.
 Collection leaves stable large packs sealed; both maintenance paths leave
 deferred-dead packs sealed. Repack output is partitioned by kind before cutting
-at 1 MiB; each move remaps only the owning bitmap. Explicit `compact(domain)` keysets original pack ids and
+at 1 MiB; "fully live" means every slot is held by some domain, and each move
+remaps every holder domain's bitmap of that session from its own bits, so no
+domain gains a body it did not admit. Explicit `compact(domain)` keysets original pack ids and
 processes one session and at most 8 MiB of rewritten logical bodies per transaction,
 without advancing the session generation or purging deferred bytes. It then calls
 `db::incremental_vacuum`, which is bounded and a no-op without incremental
@@ -8467,7 +8488,7 @@ now use the production sqlx adapter with real AEAD. The unedited v0.9.0 testkit
 storage suite passes all 26 named cases in each of three configurations:
 `storage_conformance_no_repack`, `storage_conformance_repack`, and
 `storage_conformance_reopen` (a fresh independent pool and empty storage caches
-on every hydration load). All declare PerSession with independent domain copies;
+on every hydration load). All declare PerSession with within-session domain sharing;
 S2 off keeps mandatory purges enabled. The testkit supplies the engine collection
 host implementation; Forge adds no collector semantics.
 
@@ -8477,8 +8498,8 @@ n+1 publication, ignored writer epoch, ignored control generation, premature
 unlinking of a remaining holder's copy, serving released bytes to a non-member,
 and a non-retryable lost acknowledgement. The non-member defect is now rejected
 first by v0.9.0's body_cache_membership case; NonRetryableLostAck is rejected by
-atomic_apply_cuts. Valid independent-copy releases preserve other holders and reclaim
-only their own bytes. The focused `session_journal_storage` target retains the
+atomic_apply_cuts. Valid releases preserve other holders and reclaim only bytes
+no domain of the session still holds. The focused `session_journal_storage` target retains the
 codec/storage/maintenance regressions. Legacy decoder tests use the real
 envelope, checkpoint decoder and runtime schema/transition validation. This
 conformance gate is complemented by the focused session_journal_runtime tests
