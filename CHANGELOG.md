@@ -10,6 +10,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Security
 
+- TLS certificate verification no longer trusts the distrusted emSign
+  intermediates: `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.10 (RUSTSEC-2026-0381).
 - Provider, fetch and public search now share one hostname policy, refusing
   `localhost`, `localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS)
   and all subdomains of those names, ignoring ASCII case and trailing dots.
