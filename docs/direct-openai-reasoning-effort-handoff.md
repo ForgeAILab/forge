@@ -19,7 +19,7 @@ The worktree was already substantially dirty before this task. Do not reset,
 checkout, or broadly reformat it. In particular, the current uncommitted
 changes already include the ChatGPT OAuth effort work in:
 
-- `crates/services/src/embedded_agent_service.rs`
+- `crates/services-agents/src/embedded_agent_service.rs`
 - `crates/agent-host/src/native.rs`
 - `crates/forge-client/src/embedded.rs`
 - `crates/api-types/` and `web/src/types/generated/`
@@ -47,7 +47,7 @@ The following path is present:
 
 ### Server validation rejects API-key entries
 
-`crates/services/src/embedded_agent_service.rs` currently has
+`crates/services-agents/src/embedded_agent_service.rs` currently has
 `validate_native_reasoning_effort`. It only accepts:
 
 - provider `openai`;
@@ -118,7 +118,7 @@ does not render two reasoning selectors.
 ## Recommended implementation sequence
 
 1. Update `validate_native_reasoning_effort` and its tests in
-   `crates/services/src/embedded_agent_service.rs`.
+   `crates/services-agents/src/embedded_agent_service.rs`.
 2. Update the OpenAI provider capability setup in
    `crates/agent-host/src/native.rs`.
 3. Add/adjust a host-level test proving an OpenAI direct provider reports

@@ -1,8 +1,6 @@
 use super::super::*;
 use crate::task_service::tests::helpers::{seed_execution, seed_role_assignment};
 use db::{PageRequest, SortBy, SortOrder};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn review_details_accept_forge_metadata_and_refuse_unknown_fields() {
@@ -986,7 +984,7 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
     let worktree = workspace_path.as_path();
     let marker = repo_dir.path().join("fsmonitor-ran");
     let monitor = worktree.join("fsmonitor.sh");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &monitor,
         format!(
             "#!/bin/sh\nprintf ran > \"{}\"\nprintf 'token\\n'\n",
@@ -994,11 +992,6 @@ async fn finalized_completion_does_not_run_repository_fsmonitor_diagnostic() {
         ),
     )
     .expect("fsmonitor script writes");
-    let mut permissions = std::fs::metadata(&monitor)
-        .expect("fsmonitor metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&monitor, permissions).expect("fsmonitor becomes executable");
     let config = std::process::Command::new("git")
         .arg("-C")
         .arg(worktree)
@@ -2231,10 +2224,9 @@ async fn approval_gated_planner_completion_waits_for_human() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let embedded = Arc::new(crate::EmbeddedAgentService::new(
-        Arc::clone(&db),
-        b"approval-gated-planner-test-key",
-    ));
+    let embedded = Arc::new(crate::test_support::TestExecutionSupport::new(Arc::clone(
+        &db,
+    )));
     let service = TaskService::new(Arc::clone(&db), event_bus)
         .with_task_executor(Arc::new(OutboxPlanExecutor {
             plan: "- [ ] approved implementation\n",
@@ -9098,10 +9090,9 @@ async fn planner_completion_advances_default_planning_gate() {
     let db = Arc::new(sqlite_db().await);
     let event_bus = Arc::new(EventBus::new(16));
     let workspace_root = TempDir::new().expect("workspace temp dir creates");
-    let embedded = Arc::new(crate::EmbeddedAgentService::new(
-        Arc::clone(&db),
-        b"planner-outbox-test-key",
-    ));
+    let embedded = Arc::new(crate::test_support::TestExecutionSupport::new(Arc::clone(
+        &db,
+    )));
     let service = TaskService::new(Arc::clone(&db), Arc::clone(&event_bus))
         .with_task_executor(Arc::new(OutboxPlanExecutor {
             plan: "- [ ] implement the plan\n",
@@ -9729,7 +9720,10 @@ async fn pre_upgrade_hooks_step_replays(checkpoint: Option<&str>) -> db::Transit
         Some(api_types::TransitionBridgeKind::ReviewRefresh)
     );
     assert_eq!(
-        crate::workflow::review_carry_entry_kind(&entries),
+        crate::workflow::review_carry_entry_kind(
+            &entries,
+            &crate::workflow::default_workflow::default_workflow()
+        ),
         Some(db::ReviewCarryKind::CleanRebase)
     );
     refresh.clone()

@@ -5,6 +5,7 @@
 //! translation, label defaulting) on top of the DB-layer contract already
 //! proven directly in `crates/db/tests/suite/main_chat_topics.rs`.
 
+use crate::test_services as services;
 use std::sync::Arc;
 
 use db::{

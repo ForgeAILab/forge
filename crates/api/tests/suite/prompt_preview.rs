@@ -62,7 +62,7 @@ async fn chat_prompt_loader_places_server_state_after_escaped_user_input_without
         .await
         .unwrap()
         .unwrap();
-    let preview = services::FederatedAgentChatTurnRunner::new(
+    let preview = services_agents::FederatedAgentChatTurnRunner::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.state.embedded_agent_service),
         Arc::clone(&harness.state.task_executor),

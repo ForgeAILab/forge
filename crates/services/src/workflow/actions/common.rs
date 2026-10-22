@@ -281,7 +281,7 @@ pub(super) fn follow_up_trigger(ctx: &HookContext) -> &'static str {
         || ctx.from_state == default_states::MERGE_FAILED
     {
         "merge_failed"
-    } else if ctx.from_state == default_states::REVIEW {
+    } else if crate::workflow::is_review_state(&ctx.workflow, &ctx.from_state) {
         "review_failed"
     } else {
         "role_follow_up"
@@ -707,7 +707,7 @@ pub(super) async fn ensure_review_record_for_dispatch(
     ctx: &HookContext,
     _execution_id: &str,
 ) -> Result<(), String> {
-    if ctx.to_state != default_states::REVIEW {
+    if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state) {
         return Ok(());
     }
 
@@ -750,7 +750,9 @@ pub(super) async fn ensure_review_attempt_for_current_candidate(
     ctx: &HookContext,
     task: &db::Task,
 ) -> Result<(), String> {
-    if ctx.to_state != default_states::REVIEW || task.review_passed_at.is_some() {
+    if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state)
+        || task.review_passed_at.is_some()
+    {
         return Ok(());
     }
 
@@ -777,7 +779,7 @@ pub(super) async fn ensure_review_attempt_for_current_candidate(
 }
 
 pub(super) async fn ensure_review_awaiting_human(ctx: &HookContext) -> Result<(), String> {
-    if ctx.to_state != default_states::REVIEW {
+    if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state) {
         return Ok(());
     }
 

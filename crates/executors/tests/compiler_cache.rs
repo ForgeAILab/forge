@@ -10,7 +10,6 @@ use executors::{
 use std::{
     collections::BTreeMap,
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -133,7 +132,7 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
     fs::create_dir_all(&bin).unwrap();
     let wrapper = bin.join("sccache");
     let calls = dir.path().join("calls");
-    fs::write(
+    process_supervisor::executable::write_executable(
         &wrapper,
         format!(
             "#!/bin/sh\n[ \"$1\" = --start-server ] && exit 0\nprintf '%s|%s|%s\\n' \"$1\" \"$SCCACHE_DIR\" \"${{CARGO_TARGET_DIR:-unset}}\" >> '{}'\nexec \"$@\"\n",
@@ -141,7 +140,6 @@ fn two_task_worktrees_of_one_repository_call_the_wrapper_with_one_store() {
         ),
     )
     .unwrap();
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
     compiler_cache::install(
         &root,
         Some(CompilerCache {

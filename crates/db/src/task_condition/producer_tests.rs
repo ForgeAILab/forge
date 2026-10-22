@@ -1104,3 +1104,84 @@ async fn discarding_an_unstarted_review_restates_the_review_facts() {
     // Only a running attempt is discarded.
     assert!(!db.discard_unstarted_review(&running.id).await.unwrap());
 }
+
+/// A renamed review gate waits for a person on the same Review facts as the
+/// built-in `review`: an awaiting-human verdict, and a failed one that no run
+/// is still answering.
+#[tokio::test]
+async fn a_renamed_review_gate_waits_for_a_person_like_review() {
+    use crate::{CreateReview, ReviewRepo, ReviewStatus};
+    let db = db().await;
+    let state = |name: &str, kind, role: Option<&str>, phase| api_types::StateDefinition {
+        name: name.into(),
+        kind,
+        column: name.into(),
+        display_name: name.into(),
+        role: role.map(str::to_owned),
+        hooks: Default::default(),
+        cleanup: None,
+        canonical_phase: Some(phase),
+        gate_config: None,
+        dispatch: None,
+        triggers: Default::default(),
+        config: json!({}),
+    };
+    use api_types::{CanonicalPhase as Phase, StateKind as Kind};
+    let workflow = api_types::WorkflowDefinition {
+        states: vec![
+            state("todo", Kind::Initial, None, Phase::Ready),
+            state("in_progress", Kind::Active, Some("coder"), Phase::Working),
+            state("review", Kind::Gate, Some("reviewer"), Phase::Review),
+            state("qa_review", Kind::Gate, Some("reviewer"), Phase::Review),
+            state("done", Kind::Terminal, None, Phase::Done),
+        ],
+        ..Default::default()
+    };
+    let project = ProjectRepo::get_by_id(&db, "p").await.unwrap().unwrap();
+    ProjectRepo::update_workflow(
+        &db,
+        "p",
+        &serde_json::to_string(&workflow).unwrap(),
+        None,
+        project.version,
+        &crate::now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    for gate in ["review", "qa_review"] {
+        let t = task(&db, gate).await;
+        let now = crate::now_rfc3339();
+        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("UPDATE task SET status=? WHERE id=?")
+            .bind(gate)
+            .bind(&t.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO execution(id,task_id,role,status,created_at,updated_at) VALUES(?,?,'coder','completed',?,?)")
+            .bind(format!("run-{gate}")).bind(&t.id).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+        db.sync_condition_in_tx(&mut tx, &t.id).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(!stored_read(&db, &t.id).await.human_wait, "{gate}");
+        let review = |attempt_number, status| CreateReview {
+            id: crate::new_uuid_v4(),
+            task_id: t.id.clone(),
+            execution_id: format!("run-{gate}"),
+            attempt_number,
+            status,
+            step_results_json: "{}".into(),
+            started_at: crate::now_rfc3339(),
+            created_at: crate::now_rfc3339(),
+            updated_at: crate::now_rfc3339(),
+        };
+        ReviewRepo::create(&db, review(1, ReviewStatus::AwaitingHuman))
+            .await
+            .unwrap();
+        assert!(stored_read(&db, &t.id).await.human_wait, "{gate} awaiting");
+        ReviewRepo::create(&db, review(2, ReviewStatus::Failed))
+            .await
+            .unwrap();
+        assert!(stored_read(&db, &t.id).await.human_wait, "{gate} failed");
+        no_violations(&db, gate).await;
+    }
+}

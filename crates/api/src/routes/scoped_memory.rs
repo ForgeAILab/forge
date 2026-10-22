@@ -18,9 +18,8 @@ use db::{
     AgentContextScopeRepo, AgentRepo, MemoryGetQuery, MemoryItem, MemoryLifecycleAssertion,
     MemoryScopeGrant, ProjectRepo, ScopedMemoryRepository, TaskRepo,
 };
-use services::{
-    ContextManifestService, MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput,
-};
+use services::{MemoryAccessContext, MemoryLifecycleInput, MemoryPublicationInput};
+use services_agents::ContextManifestService;
 use sqlx::Row;
 use uuid::Uuid;
 

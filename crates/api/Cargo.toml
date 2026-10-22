@@ -43,8 +43,10 @@ uuid = { version = "1", features = ["v4"] }
 workspace = { path = "../workspace" }
 
 [dev-dependencies]
+process-supervisor = { path = "../process-supervisor" }
 tracing-subscriber = { workspace = true }
 services = { path = "../services", features = ["test-support"] }
+services-agents = { path = "../services-agents", features = ["test-support"] }
 async-trait = "0.1"
 api-types = { path = "../api-types" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

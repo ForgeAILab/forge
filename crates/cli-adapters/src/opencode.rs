@@ -142,7 +142,7 @@ impl CodingExecutorAdapter for OpencodeAdapter {
 
         executors::server_commands::ensure_allowed()
             .map_err(|e| ExecutorError::Other(e.to_string()))?;
-        let mut child = cmd.spawn()?;
+        let mut child = process_supervisor::executable::spawn(&mut cmd).await?;
 
         let stdout = child
             .stdout
@@ -971,7 +971,7 @@ mod tests {
     async fn execute_drives_opencode_run_json_without_permission_env() {
         let dir = tempfile::tempdir().unwrap();
         let fake_opencode = dir.path().join("fake-opencode");
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &fake_opencode,
             r#"#!/bin/sh
 if [ "${OPENCODE_PERMISSION+x}" = "x" ]; then
@@ -984,13 +984,6 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
 "#,
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_opencode, permissions).unwrap();
-        }
 
         let logs_path = dir.path().join("opencode.jsonl");
         let adapter = OpencodeAdapter::new();
@@ -1028,7 +1021,7 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_test","part":{"type":"step
         let dir = tempfile::tempdir().unwrap();
         let fake_opencode = dir.path().join("fake-opencode-long");
         let body = "x".repeat(2_000);
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &fake_opencode,
             format!(
                 r#"#!/bin/sh
@@ -1037,13 +1030,6 @@ printf '%s\n' '{{"type":"text","sessionID":"ses_test","part":{{"type":"text","te
             ),
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_opencode, permissions).unwrap();
-        }
 
         let logs_path = dir.path().join("opencode-long.jsonl");
         let adapter = OpencodeAdapter::new();
@@ -1099,20 +1085,13 @@ printf '%s\n' '{{"type":"text","sessionID":"ses_test","part":{{"type":"text","te
     async fn execute_fails_when_opencode_emits_error_event() {
         let dir = tempfile::tempdir().unwrap();
         let fake_opencode = dir.path().join("fake-opencode-error");
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &fake_opencode,
             r#"#!/bin/sh
 printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message":"Model not found: bad-model"}}}'
 "#,
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_opencode, permissions).unwrap();
-        }
 
         let logs_path = dir.path().join("opencode-error.jsonl");
         let adapter = OpencodeAdapter::new();
@@ -1142,20 +1121,13 @@ printf '%s\n' '{"type":"error","sessionID":"ses_test","error":{"data":{"message"
     async fn execute_fails_when_opencode_exits_without_text() {
         let dir = tempfile::tempdir().unwrap();
         let fake_opencode = dir.path().join("fake-opencode-empty");
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &fake_opencode,
             r#"#!/bin/sh
 printf '%s\n' '{"type":"step_start","sessionID":"ses_test","part":{"type":"step-start","sessionID":"ses_test"}}'
 "#,
         )
         .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_opencode).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_opencode, permissions).unwrap();
-        }
 
         let logs_path = dir.path().join("opencode-empty.jsonl");
         let adapter = OpencodeAdapter::new();

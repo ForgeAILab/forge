@@ -1,9 +1,13 @@
 //! Provider-entry endpoints and their shared URL-shape validation.
 
 use crate::{Result, ServiceError};
+use config::{is_restricted_public_address, is_restricted_public_hostname};
 use db::CredentialHandle;
+use forge_agent_host::outbound_http::{
+    resolve_public_url, PublicAddressPolicy, PublicHttpError, UNUSABLE_PROXY_MESSAGE,
+};
 use serde_json::Value;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Default API endpoint for API-key entries. `openai_compatible` has no
 /// default and requires an explicit base URL.
@@ -64,9 +68,7 @@ pub fn entry_base_url(entry: &CredentialHandle) -> Result<String> {
 /// shared by metadata/profile persistence and the full async provider probe,
 /// so a legacy or tampered metadata value cannot bypass the endpoint policy
 /// simply because it was read from storage instead of submitted by a caller.
-pub(crate) fn validate_provider_url_shape(
-    base_url: &str,
-) -> std::result::Result<url::Url, &'static str> {
+pub fn validate_provider_url_shape(base_url: &str) -> std::result::Result<url::Url, &'static str> {
     let parsed = url::Url::parse(base_url).map_err(|_| "base_url must be an absolute URL")?;
     if parsed.username() != ""
         || parsed.password().is_some()
@@ -83,13 +85,13 @@ pub(crate) fn validate_provider_url_shape(
         .port_or_known_default()
         .ok_or("base_url has no known port")?;
     match host {
-        url::Host::Ipv4(address) if restricted_provider_ip(IpAddr::V4(address)) => {
+        url::Host::Ipv4(address) if is_restricted_public_address(IpAddr::V4(address)) => {
             return Err("base_url must not target a private or local address");
         }
-        url::Host::Ipv6(address) if restricted_provider_ip(IpAddr::V6(address)) => {
+        url::Host::Ipv6(address) if is_restricted_public_address(IpAddr::V6(address)) => {
             return Err("base_url must not target a private or local address");
         }
-        url::Host::Domain(domain) if restricted_provider_hostname(domain) => {
+        url::Host::Domain(domain) if is_restricted_public_hostname(domain) => {
             return Err("base_url must not target a local or private hostname");
         }
         _ => {}
@@ -97,43 +99,30 @@ pub(crate) fn validate_provider_url_shape(
     Ok(parsed)
 }
 
-fn restricted_provider_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
+/// Resolve a provider endpoint only after applying the shared public-egress
+/// policy. Configuration validation and the agent adapter share this boundary.
+pub async fn provider_url_addresses(
+    base_url: &str,
+) -> std::result::Result<(url::Url, Vec<SocketAddr>), &'static str> {
+    let parsed = validate_provider_url_shape(base_url)?;
+    let addresses = resolve_public_url(&parsed, PublicAddressPolicy::Provider)
+        .await
+        .map_err(provider_egress_refusal)?;
+    Ok((parsed, addresses))
 }
 
-pub(crate) fn restricted_provider_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
+/// Return the stable caller-facing reason for a refused provider endpoint.
+/// Resolution and address-policy failures remain distinct so callers can
+/// correct the relevant endpoint or environment configuration.
+pub fn provider_egress_refusal(error: PublicHttpError) -> &'static str {
+    match error {
+        PublicHttpError::InvalidUrl => "base_url must be an https URL without credentials",
+        PublicHttpError::RestrictedHostname => {
+            "base_url must not target a local or private hostname"
         }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] & 0xfe00) == 0xfc00
-                || segments[0] >= 0xff00
-                || address
-                    .to_ipv4()
-                    .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
-        }
+        PublicHttpError::ResolutionFailed => "base_url hostname could not be resolved",
+        PublicHttpError::RestrictedAddress => "base_url must not target a private or local address",
+        PublicHttpError::ClientUnavailable => "provider client unavailable",
+        PublicHttpError::UnusableProxy => UNUSABLE_PROXY_MESSAGE,
     }
 }

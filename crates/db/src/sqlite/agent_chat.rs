@@ -1036,6 +1036,7 @@ impl AgentHandoffRepo for SqliteDb {
     }
 
     async fn create_agent_handoff(&self, input: CreateAgentHandoff) -> Result<AgentHandoff> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO agent_handoff (
                 id, source_chat_id, target_chat_id, source_message_id,
@@ -1058,12 +1059,25 @@ impl AgentHandoffRepo for SqliteDb {
         .bind(&input.dedupe_key)
         .bind(&input.created_at)
         .bind(&input.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(map_chat_write_error)?;
-        self.get_agent_handoff(&input.id)
-            .await?
-            .ok_or(DbError::NotFound)
+        super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
+            &mut transaction,
+            Some(&input.source_chat_id),
+            "After handoff",
+            "handoff",
+            &input.created_at,
+        )
+        .await?;
+        let handoff = sqlx::query("SELECT * FROM agent_handoff WHERE id = ?")
+            .bind(&input.id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(DbError::from)
+            .and_then(map_agent_handoff)?;
+        transaction.commit().await?;
+        Ok(handoff)
     }
 }
 
@@ -1986,6 +2000,14 @@ impl AgentChatTransactionRepo for SqliteDb {
         if handoff.rows_affected() == 0 {
             return Err(DbError::NotFound);
         }
+        super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
+            &mut transaction,
+            Some(&input.handoff.source_chat_id),
+            "After handoff",
+            "handoff",
+            &input.handoff.created_at,
+        )
+        .await?;
         let message = insert_chat_message(&mut transaction, &target_message_input).await?;
         sqlx::query(
             "INSERT INTO agent_chat_turn_job (
@@ -2273,6 +2295,14 @@ pub(super) async fn insert_chat_message(
     .execute(&mut **transaction)
     .await
     .map_err(map_chat_write_error)?;
+    super::agent_chat_topic::enqueue_idle_topic_rotation_in_tx(
+        transaction,
+        &input.id,
+        &input.chat_id,
+        &input.author_type.to_string(),
+        &input.created_at,
+    )
+    .await?;
     sqlx::query("SELECT * FROM agent_chat_message WHERE id = ?")
         .bind(&input.id)
         .fetch_one(&mut **transaction)

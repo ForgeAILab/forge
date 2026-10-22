@@ -2588,7 +2588,7 @@ fn validate_pin_replay(
 }
 
 async fn media_asset_is_referenced(
-    transaction: &mut Transaction<'_, Sqlite>,
+    connection: &mut sqlx::SqliteConnection,
     asset_id: &str,
 ) -> Result<bool> {
     Ok(sqlx::query_scalar::<_, i64>(
@@ -2606,13 +2606,13 @@ async fn media_asset_is_referenced(
     .bind(asset_id)
     .bind(asset_id)
     .bind(asset_id)
-    .fetch_one(&mut **transaction)
+    .fetch_one(connection)
     .await?
         != 0)
 }
 
-async fn reconcile_media_asset_in_tx(
-    transaction: &mut Transaction<'_, Sqlite>,
+pub(super) async fn reconcile_media_asset_in_tx(
+    connection: &mut sqlx::SqliteConnection,
     asset_id: &str,
     now: &str,
 ) -> Result<MediaAsset> {
@@ -2620,12 +2620,12 @@ async fn reconcile_media_asset_in_tx(
         "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset WHERE id = ?"
     ))
     .bind(asset_id)
-    .fetch_optional(&mut **transaction)
+    .fetch_optional(&mut *connection)
     .await?
     .ok_or(DbError::NotFound)?;
     let asset = map_media_asset(&row)?;
 
-    let referenced = media_asset_is_referenced(transaction, asset_id).await?;
+    let referenced = media_asset_is_referenced(connection, asset_id).await?;
 
     // A live scheduler lease is authoritative while the worker is between
     // the guarded claim and its physical delete.  Reconciliation must not
@@ -2688,7 +2688,7 @@ async fn reconcile_media_asset_in_tx(
     .bind(now)
     .bind(asset_id)
     .bind(asset.version)
-    .execute(&mut **transaction)
+    .execute(&mut *connection)
     .await?;
     if result.rows_affected() != 1 {
         return Err(DbError::VersionConflict);
@@ -2698,9 +2698,51 @@ async fn reconcile_media_asset_in_tx(
         "SELECT {MEDIA_ASSET_COLUMNS} FROM media_asset WHERE id = ?"
     ))
     .bind(asset_id)
-    .fetch_one(&mut **transaction)
+    .fetch_one(connection)
     .await?;
     map_media_asset(&row)
+}
+
+pub(super) async fn reconcile_legacy_task_media_delete_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    asset_id: &str,
+    deleted_at: &str,
+) -> Result<()> {
+    let (availability, version): (String, i64) =
+        sqlx::query_as("SELECT availability, version FROM media_asset WHERE id = ?")
+            .bind(asset_id)
+            .fetch_optional(&mut *connection)
+            .await?
+            .ok_or(DbError::NotFound)?;
+    let referenced = media_asset_is_referenced(connection, asset_id).await?;
+    let state = if availability == "purged" {
+        "deleted"
+    } else if referenced {
+        "referenced"
+    } else {
+        "gc_candidate"
+    };
+    let candidate_at = (state == "gc_candidate").then_some(deleted_at);
+    let asset_deleted_at = (state != "referenced").then_some(deleted_at);
+    let result = sqlx::query(
+        "UPDATE media_asset
+         SET gc_state = ?, gc_candidate_at = ?, deleted_at = ?,
+             gc_lease_owner = NULL, gc_lease_expires_at = NULL,
+             version = version + 1, updated_at = ?
+         WHERE id = ? AND version = ?",
+    )
+    .bind(state)
+    .bind(candidate_at)
+    .bind(asset_deleted_at)
+    .bind(deleted_at)
+    .bind(asset_id)
+    .bind(version)
+    .execute(connection)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DbError::VersionConflict);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2742,8 +2784,11 @@ impl SqliteDb {
         .bind(input.availability)
         .bind(input.pin_digest)
         .bind(input.created_at)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
+        if result.rows_affected() > 0 {
+            reconcile_media_asset_in_tx(connection, input.asset_id, input.created_at).await?;
+        }
         Ok(result.rows_affected())
     }
 }

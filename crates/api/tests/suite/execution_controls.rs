@@ -927,8 +927,13 @@ async fn setup(
     let repo_path = common::setup_git_repo(workspace_root);
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Execution Controls", &repo_path).await;
-    let (agent_id, reviewer_id) =
-        common::create_shell_agents(&harness.app, workspace_root, "execution-controls").await;
+    let (agent_id, reviewer_id) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root,
+        "execution-controls",
+    )
+    .await;
     common::configure_execution_test_setup(
         &harness.state.db,
         &project_id,

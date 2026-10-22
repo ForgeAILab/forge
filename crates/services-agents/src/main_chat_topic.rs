@@ -28,10 +28,8 @@ use db::{
     RotateAgentChatTopic,
 };
 
-use services::{
-    agent_chat_service::AgentChatService, agent_turn_admission::AgentResponderStore,
-    product_genesis::ProductGenesisService, Result, ServiceError,
-};
+use crate::{agent_chat_service::AgentChatService, agent_turn_admission::AgentResponderStore};
+use services::{product_genesis::ProductGenesisService, Result, ServiceError};
 
 const MAIN_CHAT_KIND: &str = "account_main";
 const USER_PRINCIPAL: &str = "user";
@@ -61,7 +59,7 @@ pub struct MainChatTopicService<D> {
     db: Arc<D>,
     chat_service: Arc<AgentChatService<D>>,
     genesis: ProductGenesisService,
-    rotator: Option<Arc<dyn services::TopicRotator>>,
+    rotator: Option<Arc<dyn crate::TopicRotator>>,
 }
 
 impl<D> std::fmt::Debug for MainChatTopicService<D> {
@@ -102,7 +100,7 @@ where
 
     /// Native chats rotate their runtime topic through this coordinator.
     /// Without one, every chat takes the direct (CLI) rotation path.
-    pub fn with_rotator(mut self, rotator: Arc<dyn services::TopicRotator>) -> Self {
+    pub fn with_rotator(mut self, rotator: Arc<dyn crate::TopicRotator>) -> Self {
         self.rotator = Some(rotator);
         self
     }

@@ -439,7 +439,10 @@ impl ProjectEscalationService {
         // intervention state under the escalation transaction's writer lock.
         if details.get("source_event_type").and_then(Value::as_str)
             == Some("task.interruption_changed")
-            && current.attention_type == "execution_failed"
+            && matches!(
+                current.attention_type.as_str(),
+                "execution_failed" | "review_needs_owner"
+            )
         {
             let task_id = details
                 .get("entity_id")
@@ -495,7 +498,12 @@ impl ProjectEscalationService {
             let Some(a) = self.db.get_attention_in_tx(&mut tx, &id).await? else {
                 continue;
             };
-            if a.status != "open" || wake_attention_incident_digest(&a) != admitted_digest {
+            // Review parks already carry the owner's decision request. Old
+            // admitted turns may still link them alongside ordinary blockers.
+            if a.attention_type == "review_needs_owner"
+                || a.status != "open"
+                || wake_attention_incident_digest(&a) != admitted_digest
+            {
                 continue;
             }
             let recovered = outcome.is_some()

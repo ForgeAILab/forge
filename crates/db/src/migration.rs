@@ -3,7 +3,7 @@ use include_dir::{include_dir, Dir};
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -14,7 +14,7 @@ use std::{
 // directory dependency is intentionally compile-time and older Cargo versions
 // do not always notice a newly-created file under the directory (or a changed
 // migration after the initial build).
-// Embedded migration bundle revision: V202610161644 (check consumer purpose `review_verify`; data-preserving check_consumer rebuild, every row, index and trigger kept); previous V202610140530 (typed durable Task command errors; retained string-only replies normalized without dropping rows); previous V202610130038 (comment kinds `handoff` and `request_input` of a coordination root's lead; data-preserving task_comment rebuild, every row and its three indexes kept); previous V202610122352 (index on `integration_attempt.predecessor_attempt_id`, so deleting an attempt row no longer scans the attempt table for its successors; index only, no row changed); previous V202610121119 (the undelivered-result index of check consumers leaves out a consumer created already answered; index only, no row changed); previous V202610120637 (durable owner environment attestations, salted revisions only; additive, no user data changed); previous V202610120418 (immutable Genesis @8 and Project @22 registry doctrine including revision-bound overrides and Task-record provenance); previous V202610111630 (integration read index: `integration_attempt_project_live` for the Task list's merge-queue summary; additive, no row changed); previous V202610111217 (integration cutover: the removed workflow hook `auto_cascade_on_merge_result` is dropped from stored Project workflow definitions and from both definitions of every retained step workflow snapshot; data-preserving); previous V202610110650 (run-slot wait ages: `task_slot_wait_age` with its wait and execution-start triggers and release triggers on execution and check_run, and nullable `check_run.yielded_since`; additive); previous V202610110112 (queued `ReviewCreateAttemptWithExecution` Task mutations of the retired inline review re-run are closed as superseded; rows kept); previous V202610101906 (check run and check consumer changes that free a machine slot mark the run-slot waiters; existing run-slot wait rows are made due once); previous V202610101235 (nullable daemon disk_json: the disk facts of a daemon's workspace root from its report); previous V202610100820 (step status `suspended` with wake deadline and awaited check consumer; data-preserving task_step rebuild); previous V202610100719 (nullable workspace disk_bytes and disk_measured_at written by the garbage-collection sweep); previous V202610100137 (step kind `integration` for the queue's Task-step consumer; data-preserving task_step rebuild); previous V202610091612 (passive integration activation: cancel request, head timings, sweep and retention indexes); previous V202610091347 (durable check worker intent, receipt and delivery checkpoints); previous V202610082320 (check run identity: applied timeout, consumer purpose, no-cleanup pass; data-preserving check_result rebuild); previous V202610082317 (integration owner fences and attempt receipts); previous V202610080851 (passive canonical check runs/results/consumers); previous V202610080123 (passive integration queues and attempts); previous V202610070507 (condition public readers, projection revisions and retry index); previous V202610060838 (internal Task scheduler dirty generations, parks and sweep cursor, running-Task execution index); previous V202610060030 (Task condition shadow column with a Rust-mapped preserving backfill; no view or trigger); previous V202610052305 (data-preserving machine registration tombstones and guarded cleanup receipt abandonment); previous V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
+// Embedded migration bundle revision: V202610180820 (five small logic-trigger families move into repository writers, triggers dropped and no rows rewritten: V202610180820 media projection and GC, V202610180812 Main Chat topic rotation, V202610180804 Attention reopen wake rearm, V202610180758 pricing account-deletion sentinel, V202610180752 owner chat bootstrap); previous V202610161644 (check consumer purpose `review_verify`; data-preserving check_consumer rebuild, every row, index and trigger kept); previous V202610140530 (typed durable Task command errors; retained string-only replies normalized without dropping rows); previous V202610130038 (comment kinds `handoff` and `request_input` of a coordination root's lead; data-preserving task_comment rebuild, every row and its three indexes kept); previous V202610122352 (index on `integration_attempt.predecessor_attempt_id`, so deleting an attempt row no longer scans the attempt table for its successors; index only, no row changed); previous V202610121119 (the undelivered-result index of check consumers leaves out a consumer created already answered; index only, no row changed); previous V202610120637 (durable owner environment attestations, salted revisions only; additive, no user data changed); previous V202610120418 (immutable Genesis @8 and Project @22 registry doctrine including revision-bound overrides and Task-record provenance); previous V202610111630 (integration read index: `integration_attempt_project_live` for the Task list's merge-queue summary; additive, no row changed); previous V202610111217 (integration cutover: the removed workflow hook `auto_cascade_on_merge_result` is dropped from stored Project workflow definitions and from both definitions of every retained step workflow snapshot; data-preserving); previous V202610110650 (run-slot wait ages: `task_slot_wait_age` with its wait and execution-start triggers and release triggers on execution and check_run, and nullable `check_run.yielded_since`; additive); previous V202610110112 (queued `ReviewCreateAttemptWithExecution` Task mutations of the retired inline review re-run are closed as superseded; rows kept); previous V202610101906 (check run and check consumer changes that free a machine slot mark the run-slot waiters; existing run-slot wait rows are made due once); previous V202610101235 (nullable daemon disk_json: the disk facts of a daemon's workspace root from its report); previous V202610100820 (step status `suspended` with wake deadline and awaited check consumer; data-preserving task_step rebuild); previous V202610100719 (nullable workspace disk_bytes and disk_measured_at written by the garbage-collection sweep); previous V202610100137 (step kind `integration` for the queue's Task-step consumer; data-preserving task_step rebuild); previous V202610091612 (passive integration activation: cancel request, head timings, sweep and retention indexes); previous V202610091347 (durable check worker intent, receipt and delivery checkpoints); previous V202610082320 (check run identity: applied timeout, consumer purpose, no-cleanup pass; data-preserving check_result rebuild); previous V202610082317 (integration owner fences and attempt receipts); previous V202610080851 (passive canonical check runs/results/consumers); previous V202610080123 (passive integration queues and attempts); previous V202610070507 (condition public readers, projection revisions and retry index); previous V202610060838 (internal Task scheduler dirty generations, parks and sweep cursor, running-Task execution index); previous V202610060030 (Task condition shadow column with a Rust-mapped preserving backfill; no view or trigger); previous V202610052305 (data-preserving machine registration tombstones and guarded cleanup receipt abandonment); previous V202610051649 (per-kind Task budget ledger and retained-allowance backfill); previous V202610051343 (typed workflow bridges and execution purpose, data-preserving history/queue/checkpoint backfill; open kind/purpose columns and base gate-decision rules); previous V202610051045 (data-preserving single Task writer commands, replies, preemption and remote cancellation fences); previous V202610050233 (topic working sets, protected fork seeds, timeline claims, bounded native-only rotation intents and a summary-usage outbox); previous V202610042145 (level-triggered wakes, category budgets, owner escalation, per-Attention wake decisions, capped lease refunds and Project doctrine @21); previous V202610040225 (durable post-commit hook steps and hook/script checkpoints); previous V202610032100 (conflict hot-spot episodes, indexed transition-log windows and UTC installation time); previous V202610031934 (Task status epochs and step epoch fences, fast/long step lanes, retained workflow references and prune indexes; V202610031431 merge-friendly layout guidance; V202610030400 Task cascade outbox; dead-letter resolution, resolution-time pagination and action audit; audited notification parity and started hook recovery; durable notifications and Project hooks; also V202610020420 incremental usage reads, V202610020600 Project machine readiness, V202610020800 execution plan transport, V202610020859 worker error kinds and isolated retries, V202610020900 machine run caps, V202610021051 stable dead-letter identity and transient retry backoff, V202610021500 fenced, bounded daemon provisioning retries, and V202610030100 Task action doctrine @19).
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 /// Last migration numbered with the old sequential scheme. Every later
@@ -69,7 +69,7 @@ async fn run_migrations_replay(pool: &SqlitePool) -> Result<()> {
 
     migrations.sort_by_key(|(migration, _)| migration.version);
 
-    for (migration, sql) in pending_migrations(pool, migrations).await? {
+    for (migration, sql) in pending_migrations(pool, migrations, true).await? {
         apply_migration_sql(pool, &migration, &sql).await?;
     }
 
@@ -345,7 +345,10 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
         .into_iter()
         .map(|migration| (migration, ()))
         .collect();
-    for (migration, ()) in pending_migrations(pool, migrations).await? {
+    // Custom directories are migration-test fixtures, not the embedded bundle
+    // that identifies this Forge build. They intentionally support replaying a
+    // historical subset against a newer fixture database.
+    for (migration, ()) in pending_migrations(pool, migrations, false).await? {
         apply_migration(pool, &migration).await?;
     }
 
@@ -359,13 +362,15 @@ pub async fn run_migrations_from(pool: &SqlitePool, migration_dir: impl AsRef<Pa
 /// Return the migrations the database has not applied, in version order.
 ///
 /// The `_migration` table records applied versions by number. Two files with
-/// the same number, or a database that applied a different migration under a
-/// number this build uses, would otherwise make the runner skip a migration
-/// without any error and leave its schema missing. Both are refused before
+/// the same number, a database that applied a different migration under a
+/// number this build uses, or (for the embedded production bundle) a database
+/// carrying a version this build does not ship would otherwise make the runner
+/// operate against a schema it does not understand. All are refused before
 /// anything runs. `migrations` must be sorted by version.
 async fn pending_migrations<T>(
     pool: &SqlitePool,
     migrations: Vec<(Migration, T)>,
+    refuse_unknown_applied: bool,
 ) -> Result<Vec<(Migration, T)>> {
     if let Some(pair) = migrations
         .windows(2)
@@ -384,6 +389,21 @@ async fn pending_migrations<T>(
             .await?
             .into_iter()
             .collect();
+    if refuse_unknown_applied {
+        let bundled_versions: HashSet<i64> = migrations
+            .iter()
+            .map(|(migration, _)| migration.version)
+            .collect();
+        let mut unknown: Vec<(i64, String)> = applied
+            .iter()
+            .filter(|(version, _)| !bundled_versions.contains(version))
+            .map(|(version, name)| (*version, name.clone()))
+            .collect();
+        unknown.sort();
+        if !unknown.is_empty() {
+            return Err(DbError::DatabaseNewerThanBuild { unknown });
+        }
+    }
     let mut pending = Vec::new();
     for (migration, payload) in migrations {
         match applied.get(&migration.version) {
@@ -533,6 +553,59 @@ fn migration_requires_direct_connection(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn migration_runner_refuses_newer_database_before_applying_pending_migration() {
+        let pool = crate::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        run_migrations_replay(&pool).await.unwrap();
+        let newest_bundled: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migration")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _migration WHERE version = ?")
+            .bind(newest_bundled)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let expected: Vec<(i64, String)> = (1..=5)
+            .map(|offset| (newest_bundled + offset, format!("future_{offset}")))
+            .collect();
+        for index in [4, 0, 2, 1, 3] {
+            let (version, name) = &expected[index];
+            sqlx::query(
+                "INSERT INTO _migration (version, name, applied_at) VALUES (?, ?, 'future')",
+            )
+            .bind(version)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let error = run_migrations_replay(&pool).await.unwrap_err();
+        match &error {
+            DbError::DatabaseNewerThanBuild { unknown } => assert_eq!(unknown, &expected),
+            other => panic!("unexpected error: {other}"),
+        }
+        let pending_still_missing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _migration WHERE version = ?")
+                .bind(newest_bundled)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            pending_still_missing, 0,
+            "the pending bundled migration must not run"
+        );
+        let message = error.to_string();
+        assert!(message.contains("data directory was upgraded by a newer Forge"));
+        assert!(message.contains("future_5"), "{message}");
+        assert!(message.contains("5 total"), "{message}");
+        assert!(message.contains("plus 2 more"), "{message}");
+        assert!(!message.contains("future_1"), "display must stay bounded");
+        assert!(message.contains("make clean-test"), "{message}");
+    }
 
     #[tokio::test]
     async fn single_writer_upgrade_preserves_claims_causation_and_hook_script_checkpoints() {

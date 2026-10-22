@@ -40,6 +40,9 @@ pub(super) async fn prepare_review_entry(
     else {
         return Ok(None);
     };
+    // Every review-phase gate, also one held by another role or by nobody (an
+    // owner-approval gate): wider than the review lifecycle's
+    // `db::budget::is_review_state`, which needs the reviewer role.
     if state.kind != api_types::StateKind::Gate
         || state.canonical_phase != Some(api_types::CanonicalPhase::Review)
     {
@@ -1710,7 +1713,9 @@ fn gate_requires_user_approval(ctx: &HookContext) -> bool {
 }
 
 fn human_review_requested(ctx: &HookContext, reviewer_assigned: bool) -> bool {
-    ctx.triggered_by.is_user() && ctx.to_state == default_states::REVIEW && !reviewer_assigned
+    ctx.triggered_by.is_user()
+        && crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state)
+        && !reviewer_assigned
 }
 
 /// One line naming what failed, for the transition log and Task history. The

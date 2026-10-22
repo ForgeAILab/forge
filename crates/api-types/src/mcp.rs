@@ -25,6 +25,19 @@ pub enum McpAction {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct McpEndpointQuery {
+    pub scope: Option<String>,
+    pub project_id: Option<String>,
+}
+
+/// Public connection information; never includes server configuration or credentials.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+pub struct McpEndpointResponse {
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfigQuery {
     pub agent: String,
     pub scope: Option<String>,

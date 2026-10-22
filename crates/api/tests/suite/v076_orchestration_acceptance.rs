@@ -62,13 +62,13 @@ async fn chat_preview(
     harness: &common::Harness,
     chat_id: &str,
     turn_id: &str,
-) -> services::agent_chat_turn_worker::AgentChatPromptPreview {
+) -> services_agents::agent_chat_turn_worker::AgentChatPromptPreview {
     let job = db::AgentChatTurnJobRepo::get_agent_chat_turn_job(&*harness.state.db, turn_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(job.chat_id, chat_id);
-    services::FederatedAgentChatTurnRunner::new(
+    services_agents::FederatedAgentChatTurnRunner::new(
         std::sync::Arc::clone(&harness.state.db),
         std::sync::Arc::clone(&harness.state.embedded_agent_service),
         std::sync::Arc::clone(&harness.state.task_executor),
@@ -92,7 +92,7 @@ async fn admit_preview_turn(harness: &common::Harness, chat_id: &str, text: &str
 }
 
 fn assert_preview_state_is_data(
-    preview: &services::agent_chat_turn_worker::AgentChatPromptPreview,
+    preview: &services_agents::agent_chat_turn_worker::AgentChatPromptPreview,
 ) {
     assert_eq!(preview.input_parts.len(), 2);
     let card = &preview.input_parts[1];
@@ -117,10 +117,26 @@ async fn split_prompt_preserves_turn_manifest_sources_revisions_and_digests() {
     let harness = common::test_app(workspace.path(), "split-prompt-manifest").await;
     let project_id = "11111111-1111-4111-8111-111111111111";
     let time = "2026-10-01T00:00:00Z";
-    sqlx::query("INSERT INTO project (id, name, owner_id, version, created_at, updated_at) VALUES (?, 'Manifest Project', 'test-user-id', 4, ?, ?)")
-        .bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
-    sqlx::query("INSERT INTO project_member (id, project_id, user_id, role, created_at, updated_at) VALUES (?, ?, 'test-user-id', 'admin', ?, ?)")
-        .bind(db::new_uuid_v4()).bind(project_id).bind(time).bind(time).execute(harness.state.db.pool()).await.unwrap();
+    db::ProjectRepo::create(
+        &*harness.state.db,
+        db::CreateProject {
+            id: project_id.to_owned(),
+            name: "Manifest Project".to_owned(),
+            settings: "{}".to_owned(),
+            workflow_definition: "{}".to_owned(),
+            primary_repo_id: None,
+            owner_id: Some("test-user-id".to_owned()),
+            created_at: time.to_owned(),
+            updated_at: time.to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE project SET version = 4 WHERE id = ?")
+        .bind(project_id)
+        .execute(harness.state.db.pool())
+        .await
+        .unwrap();
     let agent = connect_agent(
         &harness.app,
         &common::test_jwt(),
@@ -138,7 +154,7 @@ async fn split_prompt_preserves_turn_manifest_sources_revisions_and_digests() {
         .await
         .unwrap()
         .unwrap();
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         std::sync::Arc::clone(&harness.state.db),
         std::sync::Arc::clone(&harness.state.embedded_agent_service),
         std::sync::Arc::clone(&harness.state.task_executor),
@@ -196,7 +212,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
     )
     .await;
     let first = chat_preview(&harness, &fixture.project_chat_id, &first_turn).await;
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.state.embedded_agent_service),
         Arc::clone(&harness.state.task_executor),
@@ -211,7 +227,7 @@ async fn terminal_denial_next_turn_card_keeps_nonclearing_causes_and_rechecks_pa
         "SELECT s.id, s.runtime_session_id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_id = ? AND s.identity_id = ? AND s.status IN ('starting', 'ready', 'running', 'degraded')"
     ).bind(&fixture.project_chat_id).bind(&fixture.project_identity_id)
         .fetch_one(harness.state.db.pool()).await.unwrap();
-    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let provider = services_agents::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
     let scope = CanonicalScope {
         scope_type: CanonicalScopeType::AgentChat,
         scope_id: fixture.project_chat_id.clone(),
@@ -338,7 +354,7 @@ async fn terminal_denial_main_genesis_guards_keep_real_evaluator_causes() {
         scope_id: fixture.main_chat_id.clone(),
         workspace_access: WorkspaceAccess::Deny,
     };
-    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let provider = services_agents::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
     let arguments = json!({"operation":"genesis.start", "payload":{}, "dedupe_key":"genesis-guard-denial", "correlation_id":"genesis-guard-denial"});
     let refusal = provider
         .propose(
@@ -414,7 +430,7 @@ async fn terminal_denial_permission_grant_removes_next_turn_card_entry_and_prese
         .await
         .unwrap()
         .unwrap();
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.state.embedded_agent_service),
         Arc::clone(&harness.state.task_executor),
@@ -423,7 +439,7 @@ async fn terminal_denial_permission_grant_removes_next_turn_card_entry_and_prese
     runner.record_prompt_manifest_for_test(&job).await.unwrap();
     let runtime_id: String = sqlx::query_scalar("SELECT s.runtime_session_id FROM agent_session s JOIN agent_context_scope c ON c.id = s.context_scope_id WHERE c.scope_id = ? AND s.status IN ('starting','ready','running','degraded')")
         .bind(&fixture.project_chat_id).fetch_one(harness.state.db.pool()).await.unwrap();
-    let provider = services::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
+    let provider = services_agents::CoordinationToolProvider::new(Arc::clone(&harness.state.db));
     let scope = CanonicalScope {
         scope_type: CanonicalScopeType::AgentChat,
         scope_id: fixture.project_chat_id.clone(),
@@ -648,7 +664,7 @@ async fn stable_prefix_main_baseline_preview_tracks_portfolio_versions() {
         second.input_parts[1].find("portfolio-20").unwrap()
             < second.input_parts[1].find("portfolio-19").unwrap()
     );
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         std::sync::Arc::clone(&harness.state.db),
         std::sync::Arc::clone(&harness.state.embedded_agent_service),
         std::sync::Arc::clone(&harness.state.task_executor),
@@ -767,7 +783,7 @@ async fn stable_prefix_main_genesis_preview_moves_evolving_instruction_state_to_
 #[tokio::test]
 async fn layout_guidance_upgrade_preserves_frozen_turns_sessions_and_binding() {
     use db::AgentChatTurnJobRepo;
-    use services::AgentChatTurnRunner;
+    use services_agents::AgentChatTurnRunner;
     use std::sync::Arc;
 
     let workspace = common::TestDir::new("layout-guidance-upgrade");
@@ -790,7 +806,7 @@ async fn layout_guidance_upgrade_preserves_frozen_turns_sessions_and_binding() {
             .unwrap();
     }
     let genesis = create_genesis_project(&harness.app, &common::test_jwt(), "layout-upgrade").await;
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.state.embedded_agent_service),
         Arc::clone(&harness.state.task_executor),
@@ -884,7 +900,7 @@ async fn layout_guidance_upgrade_preserves_frozen_turns_sessions_and_binding() {
 #[tokio::test]
 async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions() {
     use db::AgentChatTurnJobRepo;
-    use services::AgentChatTurnRunner;
+    use services_agents::AgentChatTurnRunner;
     use std::sync::Arc;
 
     let workspace = common::TestDir::new("merge-friendly-doctrine-upgrade");
@@ -972,7 +988,7 @@ async fn merge_friendly_doctrine_preserves_old_admissions_and_genesis_sessions()
     .unwrap();
     assert_eq!(session_before, session_after);
 
-    let runner = services::FederatedAgentChatTurnRunner::new(
+    let runner = services_agents::FederatedAgentChatTurnRunner::new(
         Arc::clone(&harness.state.db),
         Arc::clone(&harness.state.embedded_agent_service),
         Arc::clone(&harness.state.task_executor),
@@ -2113,7 +2129,7 @@ async fn v076_typed_project_proposals_are_scoped_and_task_materializes() {
     )
     .await;
     let document_id = required_string(&document, &["id"]);
-    let provider = services::CoordinationToolProvider::new(harness.state.db.clone());
+    let provider = services_agents::CoordinationToolProvider::new(harness.state.db.clone());
     let scope = CanonicalScope {
         scope_type: CanonicalScopeType::Project,
         scope_id: fixture.project_id.clone(),

@@ -234,6 +234,9 @@ mod revised_main_project_task_acceptance;
 #[path = "suite/security_adversarial.rs"]
 mod security_adversarial;
 
+#[path = "suite/security_followups.rs"]
+mod security_followups;
+
 #[path = "suite/settings_endpoint.rs"]
 mod settings_endpoint;
 

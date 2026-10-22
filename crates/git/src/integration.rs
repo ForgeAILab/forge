@@ -1507,7 +1507,6 @@ mod transfer_tests {
 
     /// A hook that would fire on any ref write or object arrival.
     fn arm_hooks(repo: &Path, marker: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         let hooks = repo.join(".git/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         for name in [
@@ -1520,12 +1519,11 @@ mod transfer_tests {
             "post-merge",
         ] {
             let path = hooks.join(name);
-            std::fs::write(
+            process_supervisor::executable::write_executable(
                 &path,
                 format!("#!/bin/sh\necho {name} >> '{}'\n", marker.display()),
             )
             .unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
 
@@ -1766,17 +1764,15 @@ mod transfer_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_lost_swap_leaves_the_branch_and_the_work_tree_as_they_were() {
-        use std::os::unix::fs::PermissionsExt;
         let pair = fetched();
         let hooks = pair.target.join(".git/hooks");
         std::fs::create_dir_all(&hooks).unwrap();
         let hook = hooks.join("reference-transaction");
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &hook,
             "#!/bin/sh\n[ \"$1\" = prepared ] && exit 1\nexit 0\n",
         )
         .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let outcome = fast_forward_exact(&pair.target, "main", &pair.tip, &pair.base, limits())
             .await
             .unwrap();

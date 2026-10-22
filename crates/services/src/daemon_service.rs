@@ -129,6 +129,33 @@ impl DaemonService {
         })
     }
 
+    /// Register this server's in-process daemon under its reserved identity.
+    /// Before remote registrations refused `embedded:` ids, one could claim
+    /// this identity for an account; the server owns it, so a claim is
+    /// released first instead of leaving the embedded daemon unable to
+    /// register (`machine_owned`) on every report.
+    pub async fn register_embedded(
+        &self,
+        input: DaemonRegisterInput,
+    ) -> Result<DaemonRegistration> {
+        if !input.machine_id.starts_with("embedded:") || input.owner_id.is_some() {
+            return Err(ServiceError::invalid_operation(
+                "embedded daemon registration requires its reserved, unowned identity",
+            ));
+        }
+        if self
+            .db
+            .release_embedded_daemon_claim(&input.machine_id, &now_rfc3339())
+            .await?
+        {
+            tracing::warn!(
+                machine_id = %input.machine_id,
+                "released an account claim on the embedded daemon identity"
+            );
+        }
+        self.register(input).await
+    }
+
     #[tracing::instrument(skip(self, token), fields(daemon_id = %daemon_id))]
     pub async fn authenticate(&self, daemon_id: &str, token: &str) -> Result<Daemon> {
         validate_required("daemon_id", daemon_id)?;

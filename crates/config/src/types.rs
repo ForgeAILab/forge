@@ -1,17 +1,14 @@
 use crate::{
-    default_data_dir, default_workspace_root, error::ConfigError,
-    DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS, DEFAULT_AGENT_MAX_CONCURRENT_TASKS,
-    DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST, DEFAULT_CORS_ORIGIN,
-    DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS, DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES,
-    DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT, DEFAULT_MIN_FREE_PERCENT,
-    DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND, DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
+    default_data_dir, default_workspace_root, error::ConfigError, is_blocked_public_search_address,
+    is_restricted_public_hostname, DEFAULT_AGENT_HEARTBEAT_INTERVAL_SECONDS,
+    DEFAULT_AGENT_MAX_CONCURRENT_TASKS, DEFAULT_AGENT_MAX_MISSED_HEARTBEATS, DEFAULT_BCRYPT_COST,
+    DEFAULT_CORS_ORIGIN, DEFAULT_LOG_RETENTION_DAYS, DEFAULT_MAX_DISCONNECT_SECONDS,
+    DEFAULT_MEDIA_UPLOAD_LIMIT_BYTES, DEFAULT_MIN_FREE_BYTES, DEFAULT_MIN_FREE_INODE_PERCENT,
+    DEFAULT_MIN_FREE_PERCENT, DEFAULT_SCAFFOLD_COMMAND, DEFAULT_SERVER_BIND,
+    DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv6Addr},
-    path::PathBuf,
-};
+use std::{collections::BTreeMap, net::IpAddr, path::PathBuf};
 use url::Url;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,63 +596,13 @@ fn is_private_or_local_host(host: &str) -> bool {
     if normalized.contains('%') {
         return true;
     }
-    if matches!(normalized.as_str(), "localhost" | "localhost.localdomain")
-        || normalized.ends_with(".localhost")
-        || normalized.ends_with(".local")
-    {
+    if is_restricted_public_hostname(&normalized) {
         return true;
     }
     let Ok(address) = normalized.parse::<IpAddr>() else {
         return false;
     };
-    match address {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || octets[0] == 0
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0)
-                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
-        }
-        IpAddr::V6(address) => is_blocked_public_ipv6(address),
-    }
-}
-
-fn is_blocked_public_ipv6(address: Ipv6Addr) -> bool {
-    let segments = address.segments();
-    let first = segments[0];
-    address.is_loopback()
-        || address.is_unspecified()
-        || address.is_unique_local()
-        || address.is_unicast_link_local()
-        // Reject every IPv4-compatible/mapped representation, including a
-        // mapped public address.  Allowing one would make endpoint policy
-        // differ depending on the resolver's address-family choice.
-        || address.to_ipv4().is_some()
-        || (first & 0xffc0 == 0xfec0)
-        || (first & 0xff00 == 0xff00)
-        || (first == 0x2001 && segments[1] == 0x0db8)
-        || (first == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
-        || (first == 0x2001 && (0..=5).contains(&segments[1]))
-        || (0x3ff0..=0x3fff).contains(&first)
-        || (first == 0x2001 && segments[1] == 0)
-        || (first == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
-        || (first == 0x2001 && (0x0020..=0x002f).contains(&segments[1]))
-        || first == 0x2002
-        || (first == 0x0100
-            && segments[1] == 0
-            && segments[2] == 0
-            && segments[3] == 0)
-        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 0)
-        || (first == 0x0064 && segments[1] == 0xff9b && segments[2] == 1)
+    is_blocked_public_search_address(address)
 }
 
 impl Default for TerminalConfig {

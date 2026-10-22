@@ -1,7 +1,10 @@
-use std::{
-    fmt,
-    net::{IpAddr, SocketAddr},
+mod rejection;
+
+use crate::outbound_http::{
+    ProxyEnvironment, PublicAddressPolicy, PublicHttpError, public_http_client_builder,
 };
+
+use std::fmt;
 
 use agent_runtime::{
     core::provider::{ProviderError, ProviderErrorKind},
@@ -19,12 +22,14 @@ impl ReqwestTransport {
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ProviderError> {
-        let (client, url) = provider_client_for_url(&request.url).await?;
+        let (client, url) =
+            provider_client_for_url(&request.url, &ProxyEnvironment::from_env()).await?;
+        let diagnostics = rejection::RequestDiagnostics::new(&request);
         let mut builder = client.post(url).body(request.body);
         for (name, value) in request.headers {
             builder = builder.header(name, value);
         }
-        let response = builder.send().await.map_err(|error| {
+        let mut response = builder.send().await.map_err(|error| {
             let kind = if error.is_timeout() {
                 ProviderErrorKind::Timeout
             } else {
@@ -46,15 +51,18 @@ impl ReqwestTransport {
             // provider's credential-refresh path can never trigger; anything
             // else would otherwise be parsed as an SSE stream and fail with
             // an empty-stream error that hides the real cause.
-            let body = response
-                .bytes()
-                .await
-                .ok()
-                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .unwrap_or_default();
-            let body_excerpt: String = body.chars().take(300).collect();
-            tracing::warn!(status, body = %body_excerpt, "provider request rejected");
-            return Err(http_rejection(status, &body, retry_after_ms));
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = response.chunk().await {
+                let remaining = rejection::MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == rejection::MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            let error = http_rejection(status, &String::from_utf8_lossy(&body), retry_after_ms);
+            let error = diagnostics.attach(error, status, &body);
+            tracing::warn!(status, "provider request rejected");
+            return Err(error);
         }
         let headers = response
             .headers()
@@ -163,7 +171,10 @@ fn coarse_duration(seconds: u64) -> String {
     format!("{}d {}h", hours / 24, hours % 24)
 }
 
-async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String), ProviderError> {
+async fn provider_client_for_url(
+    url: &str,
+    proxies: &ProxyEnvironment,
+) -> Result<(reqwest::Client, String), ProviderError> {
     let parsed = url::Url::parse(url)
         .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
     if parsed.scheme() != "https"
@@ -176,93 +187,17 @@ async fn provider_client_for_url(url: &str) -> Result<(reqwest::Client, String),
             "provider URL rejected",
         ));
     }
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
-    let port = parsed
-        .port_or_known_default()
-        .ok_or_else(|| ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"))?;
-    let addresses = match parsed.host() {
-        Some(url::Host::Domain(domain)) => {
-            if restricted_provider_hostname(domain) {
-                return Err(ProviderError::new(
-                    ProviderErrorKind::Network,
-                    "provider URL rejected",
-                ));
+    let client = public_http_client_builder(&parsed, PublicAddressPolicy::Provider, proxies)
+        .await
+        .map_err(|error| match error {
+            PublicHttpError::UnusableProxy => {
+                ProviderError::new(ProviderErrorKind::Network, error.to_string())
             }
-            tokio::net::lookup_host((domain, port))
-                .await
-                .map_err(|_| {
-                    ProviderError::new(ProviderErrorKind::Network, "provider URL rejected")
-                })?
-                .collect::<Vec<_>>()
-        }
-        Some(url::Host::Ipv4(address)) => vec![SocketAddr::new(IpAddr::V4(address), port)],
-        Some(url::Host::Ipv6(address)) => vec![SocketAddr::new(IpAddr::V6(address), port)],
-        None => Vec::new(),
-    };
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| restricted_provider_ip(address.ip()))
-    {
-        return Err(ProviderError::new(
-            ProviderErrorKind::Network,
-            "provider URL rejected",
-        ));
-    }
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, &addresses)
+            _ => ProviderError::new(ProviderErrorKind::Network, "provider URL rejected"),
+        })?
         .build()
         .map_err(|_| ProviderError::new(ProviderErrorKind::Network, "HTTP client setup failed"))?;
     Ok((client, url.to_owned()))
-}
-
-/// Hostnames that never belong to a public endpoint. Shared with the web
-/// fetch transport so both outbound paths refuse the same names.
-pub(crate) fn restricted_provider_hostname(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".home.arpa")
-}
-
-/// Addresses that never belong to a public endpoint: RFC 1918, loopback,
-/// link-local, CGNAT, documentation ranges, and multicast. Shared with the
-/// web fetch transport.
-pub(crate) fn restricted_provider_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(address) => {
-            let octets = address.octets();
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-                || (octets[0] == 198 && (18..=19).contains(&octets[1]))
-                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-                || octets[0] >= 224
-        }
-        IpAddr::V6(address) => {
-            let segments = address.segments();
-            address.is_loopback()
-                || address.is_unspecified()
-                || (segments[0] & 0xffc0) == 0xfe80
-                || (segments[0] & 0xffc0) == 0xfec0
-                || (segments[0] & 0xfe00) == 0xfc00
-                || segments[0] >= 0xff00
-                || address
-                    .to_ipv4()
-                    .is_some_and(|mapped| restricted_provider_ip(IpAddr::V4(mapped)))
-        }
-    }
 }
 
 impl fmt::Debug for ReqwestTransport {
@@ -289,6 +224,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn native_provider_rejects_transition_and_zero_network_urls_before_io() {
+        for url in [
+            "https://0.1.2.3/v1",
+            "https://[2001:db8::1]/v1",
+            "https://[2001:2::1]/v1",
+            "https://[2001:10::1]/v1",
+            "https://[2001:20::1]/v1",
+            "https://[100::1]/v1",
+            "https://[3fff::1]/v1",
+            "https://[::ffff:0:10.0.0.1]/v1",
+            "https://[::ffff:0:127.0.0.1]/v1",
+            "https://[::ffff:0:169.254.169.254]/v1",
+            "https://192.88.99.1/v1",
+            "https://[64:ff9b::192.88.99.1]/v1",
+            "https://[2002:c058:6301::]/v1",
+            "https://[::ffff:192.88.99.1]/v1",
+            "https://[64:ff9b::7f00:1]/v1",
+            "https://[64:ff9b:1::1]/v1",
+            "https://[2002:7f00:1::]/v1",
+            "https://[2001::1]/v1",
+            "https://[::ffff:0.1.2.3]/v1",
+            "https://[::0.1.2.3]/v1",
+        ] {
+            assert!(
+                provider_client_for_url(url, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
+                "{url}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn provider_transport_rejects_private_urls_before_network_io() {
         for url in [
             "http://127.0.0.1/v1/chat/completions",
@@ -298,7 +266,12 @@ mod tests {
             "https://user:pass@example.com/v1/chat/completions",
             "https://example.com/v1/chat/completions#fragment",
         ] {
-            assert!(provider_client_for_url(url).await.is_err(), "{url}");
+            assert!(
+                provider_client_for_url(url, &ProxyEnvironment::default())
+                    .await
+                    .is_err(),
+                "{url}"
+            );
         }
     }
 }
@@ -380,5 +353,37 @@ mod usage_limit_tests {
         let body = r#"{"error":{"type":"rate_limit_exceeded","resets_in_seconds":7200}}"#;
         let message = usage_limit_rejection(body).expect("long reset is a spent window");
         assert!(message.message.contains("2h"), "{message:?}");
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    #[tokio::test]
+    async fn native_provider_uses_environment_proxy() {
+        let (proxies, proxy) = crate::outbound_http::proxy_tests::listener(502).await;
+        let client = provider_client_for_url("https://93.184.215.14/x", &proxies)
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            client
+                .get("https://93.184.215.14/x")
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .is_err()
+        );
+        assert_eq!(proxy.await.unwrap(), "CONNECT 93.184.215.14:443 HTTP/1.1");
+    }
+
+    #[tokio::test]
+    async fn native_provider_refuses_an_unusable_environment_proxy() {
+        let proxies =
+            ProxyEnvironment::from_vars(|key| (key == "HTTPS_PROXY").then(|| "ftp://x:1".into()));
+        let error = provider_client_for_url("https://93.184.215.14/x", &proxies)
+            .await
+            .expect_err("an unusable proxy must not fall back to a direct connection");
+        assert!(error.message.contains("HTTPS_PROXY"), "{error:?}");
     }
 }

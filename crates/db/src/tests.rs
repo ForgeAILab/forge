@@ -170,6 +170,93 @@ async fn sqlite_db() -> SqliteDb {
 }
 
 #[tokio::test]
+async fn task_soft_delete_refuses_builtin_and_renamed_review_gates() {
+    let db = sqlite_db().await;
+    let (project_id, _, _) = seed_project_repo_agent(&db).await;
+    let review = serde_json::json!({
+        "name": "qa_review", "kind": "gate", "column": "Review",
+        "display_name": "QA Review", "role": "reviewer", "canonical_phase": "review",
+        "hooks": {}, "config": {}
+    });
+    for change in [
+        None,
+        Some(("kind", "active")),
+        Some(("role", "planner")),
+        Some(("canonical_phase", "working")),
+    ] {
+        let mut state = review.clone();
+        if let Some((key, value)) = change {
+            state[key] = value.into();
+        }
+        let refuses = change.is_none();
+        let workflow = WorkflowDefinition {
+            states: vec![serde_json::from_value(state).unwrap()],
+            roles: Vec::new(),
+            configuration: Vec::new(),
+            cancellation_state: None,
+        };
+        sqlx::query("UPDATE project SET workflow_definition = ? WHERE id = ?")
+            .bind(serde_json::to_string(&workflow).unwrap())
+            .bind(&project_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let id = seed_task(
+            &db,
+            &project_id,
+            None,
+            "qa_review".into(),
+            "review deletion",
+        )
+        .await;
+        let task = TaskRepo::get_by_id(&db, &id, false).await.unwrap().unwrap();
+        let now = now_rfc3339();
+        let result = TaskRepo::soft_delete(
+            &db,
+            crate::SoftDeleteTask {
+                id: id.clone(),
+                expected_version: task.version,
+                deleted_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await;
+        if refuses {
+            assert!(matches!(result, Err(DbError::InvalidSoftDelete)));
+            let unchanged = TaskRepo::get_by_id(&db, &id, true).await.unwrap().unwrap();
+            assert!(unchanged.deleted_at.is_none());
+            assert_eq!(unchanged.version, task.version);
+        } else {
+            assert!(result.unwrap().deleted_at.is_some());
+        }
+    }
+    sqlx::query("UPDATE project SET workflow_definition = '{}' WHERE id = ?")
+        .bind(&project_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    for status in ["review", "in_progress", "merging"] {
+        let id = seed_task(&db, &project_id, None, status.into(), "active deletion").await;
+        let task = TaskRepo::get_by_id(&db, &id, false).await.unwrap().unwrap();
+        let now = now_rfc3339();
+        let result = TaskRepo::soft_delete(
+            &db,
+            crate::SoftDeleteTask {
+                id,
+                expected_version: task.version,
+                deleted_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DbError::InvalidSoftDelete)),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn latest_non_running_finds_terminal_after_100_newer_running_rows() {
     let db = sqlite_db().await;
     let (project_id, _repo_id, _agent_id) = seed_project_repo_agent(&db).await;
@@ -11316,18 +11403,23 @@ async fn append_agent_chat_message_allocates_sequences_and_replays_by_id() {
 async fn project_delete_tears_down_genesis_chat_and_handoff_rows() {
     let db = sqlite_db().await;
     let now = now_rfc3339();
-    sqlx::query(
-        "INSERT INTO user (id, email, password_hash, created_at, updated_at)
-         VALUES ('genesis-user', 'genesis@example.test', 'test', ?, ?)",
+    UserRepo::create_user(
+        &db,
+        &User {
+            id: "genesis-user".to_owned(),
+            email: "genesis@example.test".to_owned(),
+            password_hash: "test".to_owned(),
+            display_name: None,
+            is_admin: false,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        },
     )
-    .bind(&now)
-    .bind(&now)
-    .execute(db.pool())
     .await
     .expect("user fixture");
     let project_id = seed_project(&db, "Genesis teardown", Some("genesis-user".to_owned())).await;
 
-    // The account's Main Chat is created by trigger when the user row lands.
+    // Account creation materializes the account's Main Chat atomically.
     let main_chat_id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM agent_chat WHERE account_id = 'genesis-user' AND kind = 'account_main'",
     )

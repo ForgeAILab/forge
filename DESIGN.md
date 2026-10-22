@@ -127,6 +127,14 @@ All new spacing is based on 4px. Existing 2px and 6px compact gaps are accepted 
 
 ## 5. Components
 
+### MCP connection URL
+
+Reuse the existing bordered muted URL row, mono text, copy button and Skeleton.
+For non-administrators, read only the scoped server endpoint; show the Skeleton
+while loading and an inline muted error with `role="alert"` if the read fails.
+Withhold the URL and copy action until it succeeds. Server install controls remain
+administrator-only. Preserve existing spacing, focus, responsive and motion rules.
+
 ### Button and icon button
 
 - **Structure:** semantic `button`, optional Phosphor icon, label or accessible name.
@@ -322,6 +330,16 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 ### Mission Control and Agent detail
 
+- Review parks use the existing warning card treatment and name the owner's
+  decision and park reason. Render the server's owner offers with the shared
+  Task action buttons and parameter dialogs; link to the Task's Review tab.
+  Show owner offers and Resolve only after the signed-in user's Project owner
+  permission is confirmed from Project and membership data. Other viewers,
+  including while permission data loads or fails, retain the reason and Review
+  link with muted `Owner action needed` text and no buttons. Filter refreshed
+  Task offers by owner authority too. Preserve legacy ownerless Project rights.
+  Resolved cards retain their reason and link without active Task controls.
+  Long reasons wrap and actions use the existing responsive button layout.
 - **Hierarchy:** primary views lead with the singular Main binding, one Project binding per authorized Project, relevant Task Worker/reviewer activity, Attention, and outcomes. Connected profiles without a binding or active Task scope stay in secondary configuration inventory.
 - **Coordination activity:** render one titled, durable activity section with two explicit groups: `Durable direct-command receipts` for commands committed through the shared command boundary, and `Pending and approved approval actions` for frozen approval-required records. The groups remain visually and semantically distinct even when one group is empty; never imply that an approval action has applied its domain effect until a committed command receipt exists.
 - **Activity provenance:** each row exposes the operation, status, policy result, actor type/ID, scope type/ID, input digest, correlation ID, and occurred-at time in a wrapped metadata grid. Render IDs and digests as inspectable metadata with `break-all`/`title` support; never render raw input or outcome JSON. A recorded outcome may be acknowledged as metadata only (for example, `Outcome recorded`).
@@ -709,6 +727,13 @@ Task action buttons render server labels and meaningful parameters. Use the exis
 ### Task action forms
 
 Use existing outline buttons, Dialog, Label and Textarea primitives. Offers supply labels and fields; required text is labelled and blocks Apply while blank. Boolean selects show only offered choices. Cancellation copy states subtask propagation. Changed-action notices use a polite status region. Dialog content scrolls within the viewport, keeping all inputs reachable.
+
+Mission Control review parks use these same forms. Project owners, admins and
+members see permitted human offers and Resolve; approval with an override requires
+owner rights. While Project or membership data loads, withhold both controls and
+the muted “Owner action needed” message. Show that message after permission reads
+settle only when the viewer can perform none of the actions. Keep the park reason
+and Open review link visible in every permission state.
 
 ### Pending remote workspace cleanup
 

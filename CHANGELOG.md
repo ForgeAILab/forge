@@ -6,45 +6,54 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
-### Breaking
-
-- `forge --demo` no longer executes configured server commands, including review
-  `verify` (app start, readiness and scripted checks), or starts the embedded
-  daemon. It refuses provider credentials and Chat/agent turns, and
-  accepts only public `https://` repositories (no server paths, environment
-  assets, integrations or MCP config file writes). Git operations performed by
-  Forge remain available, but in demo mode Git follows no HTTP redirect and
-  speaks no network protocol but `https`: a repository whose host answers
-  with a redirect no longer clones.
-- Session cookie names are now `__Host-forge_session` and
-  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
-  unprefixed cookies are no longer read. Registration, login and refresh no
-  longer set cookies on plain HTTP; localStorage token authentication remains
-  available.
-
-### Added
-
-- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
-  registration, login and refresh, with matching logout cleanup.
-  REST, web startup and SSE support cookie-only sessions while password-login
-  JSON tokens and existing localStorage behavior remain available. TestSprite
-  can capture a session credential after username/password sign-in.
-- Web startup revives a cookie-only session after an expired access cookie:
-  one empty-body refresh request, then one `/auth/me` retry. Failed revival
-  returns to `/login` without a loop or storing the returned tokens.
-
-### Fixed
-
-- Task-detail title saves now reconcile unrelated concurrent Task writes instead
-  of silently leaving the old title, and show the current title for same-field conflicts.
-- Clearing a Task description now persists an empty value, restores the
-  empty-description prompt, and preserves the blank draft with the current value visible on conflict.
-- Non-default Task types are visible on Kanban cards and Task detail headers.
-- The header brand is a consistently labelled Forge home link to `/`, using the
-  existing home routing for accounts with and without Projects.
+## [0.14.1] - 2026-10-21
 
 ### Security
 
+- TLS certificate verification no longer trusts the distrusted emSign
+  intermediates: `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.10 (RUSTSEC-2026-0381).
+- Provider, fetch and public search now share one hostname policy, refusing
+  `localhost`, `localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS)
+  and all subdomains of those names, ignoring ASCII case and trailing dots.
+  Checks match complete DNS labels, so public names such as
+  `example.internal.com` and `local.example.com` remain allowed.
+- Provider and fetch now also refuse IPv6 documentation `2001:db8::/32` and
+  `3fff::/20`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2
+  `2001:20::/28`, and discard-only `100::/64`. Both policies judge
+  IPv4-translated `::ffff:0:0:0/96` addresses by their embedded IPv4 destination.
+  Public search rejects `internal`, `home.arpa` and names under them as
+  endpoint/result hostnames, and refuses the whole endpoint if any DNS answer
+  is blocked, including mixed public/private answers, instead of connecting to
+  the public subset.
+- Public search and provider/fetch checks share one restricted-address policy.
+  Public search now judges well-known NAT64 `64:ff9b::/96` by its embedded IPv4
+  destination instead of refusing it outright; the rest of `64:ff9b::/48` and
+  local-use NAT64 `64:ff9b:1::/48` remain refused. Provider and fetch now
+  refuse `192.88.99.0/24` (former 6to4 relay anycast), as search already did,
+  including IPv6 forms carrying those IPv4 addresses. Public search retains its
+  documented additional IPv6 exclusions.
+- Provider connection tests and health probes share one HTTP client policy:
+  resolve and validate the endpoint before connecting, disable automatic
+  redirects, and honour environment proxies. Direct requests pin the approved
+  addresses; proxy tunnels preserve the target name for the proxy to resolve.
+  `NO_PROXY=*` disables proxies for every target, including literal IPs, as in curl.
+- Provider endpoint checks now reject `0.0.0.0/8`, local-use NAT64 and Teredo prefixes,
+  and 6to4, IPv4-mapped and IPv4-compatible addresses carrying restricted IPv4
+  destinations, including when reading stored provider metadata. The same
+  predicate protects native provider requests and the web fetch tool (its
+  authorization gate and transport). Public search keeps its own, stricter
+  IPv6 exclusions over the shared address policy.
+- Remote daemon registration, reports and WebSocket connections reject every
+  reserved `embedded:` identity, including this server's own identity. Internal
+  embedded daemon registration and reporting continue through their service path.
+  If an account registration claimed this server's embedded identity before
+  this release, the embedded daemon releases the claim (owner cleared,
+  visibility global, credential rotated) on its next registration instead of
+  failing with `machine_owned` on every report.
+- MCP configuration reads and writes require an instance administrator before
+  accessing server files or returning their paths. Project/local scope with a
+  Project id also enforces Project visibility and owner/admin roles for writes.
 - Demo mode refuses every command the server would run from user configuration.
   Command-bearing Project, Task and workflow writes return `422 server_commands_disabled`;
   stored hooks, checks, environment setup, scaffolds, executors, native Chat
@@ -85,6 +94,206 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   An explicit credential (any `Authorization` header, or `?token=`) always
   decides the request: the session cookie never overrides it or stands in for
   an invalid one.
+
+### Breaking
+
+- Review parks with a `review_needs_owner` condition now use Attention category
+  `review_needs_owner` instead of `execution_failed`. Clients matching category
+  values must handle this owner-decision category.
+- Provider and fetch now reject bare `internal`, `home.arpa` and `local`, plus
+  `localhost.localdomain` and its subdomains. Public search now also rejects
+  bare `local` and subdomains of `localhost.localdomain`. Case and trailing-dot
+  variants are refused too; stored provider endpoints using these names must
+  be changed to public destinations.
+- Provider/fetch destinations in the IPv6 documentation, benchmarking, ORCHID
+  and discard-only ranges listed above are newly refused. Providers, fetch and
+  public search also refuse IPv4-translated destinations carrying restricted
+  IPv4 addresses. Public search no longer accepts `internal`, `home.arpa` or
+  names under them as endpoint/result hostnames, or endpoints with any blocked
+  DNS answer, even when other answers are public.
+- Provider and fetch destinations in `192.88.99.0/24`, including IPv6 forms
+  embedding those addresses, are now rejected as former 6to4 relay anycast.
+- A set but unusable `HTTPS_PROXY`/`ALL_PROXY` value (unparseable, or a
+  non-HTTP scheme such as `socks5h://`) now refuses native provider requests
+  and fetch. v0.14.0 ignored an unparseable value and connected directly (or
+  used `ALL_PROXY` when only `HTTPS_PROXY` was unusable), and failed a SOCKS
+  value only at connect time. Fix or unset the variable.
+- Remote daemon clients using any `embedded:` machine id now receive HTTP 409
+  `machine_id_reserved`, including re-registration and authenticated report or
+  reconnect attempts. These ids are reserved for the in-process server daemon.
+- `GET` and `POST /api/v1/config/mcp` now reject non-administrators with HTTP
+  403 `admin_required`. For Project/local scope with a Project id, inaccessible
+  Projects return scoped HTTP 404; writes by an administrator who is only a
+  Project viewer/member return HTTP 403 `insufficient_role`. The web MCP
+  controls show other users only the MCP URL for their own client, with no
+  install buttons and no server config reads.
+- `forge --demo` no longer executes configured server commands, including review
+  `verify` (app start, readiness and scripted checks), or starts the embedded
+  daemon. It refuses provider credentials and Chat/agent turns, and
+  accepts only public `https://` repositories (no server paths, environment
+  assets, integrations or MCP config file writes). Git operations performed by
+  Forge remain available, but in demo mode Git follows no HTTP redirect and
+  speaks no network protocol but `https`: a repository whose host answers
+  with a redirect no longer clones.
+- Session cookie names are now `__Host-forge_session` and
+  `__Host-forge_refresh`; the refresh cookie moves to `Path=/`. Existing
+  unprefixed cookies are no longer read. Registration, login and refresh no
+  longer set cookies on plain HTTP; localStorage token authentication remains
+  available.
+- Upgrading to this release is one-way for native agent sessions that use
+  lossless context memory: Main and Project chats and every other non-Task
+  native agent session. Agent Runtime v0.5.0 records the producing provider
+  and model on each reasoning part it stores, and the stored LCM entry
+  fingerprints cover that field. v0.14.0 drops the field on read, cannot
+  re-verify the entries, and refuses every later turn of a session that ran a
+  turn with reasoning on this release (`LCM canonical history no longer matches
+  its protected checkpoint`, or `LCM store backend failed` once that turn has
+  been summarized). Sessions without lossless context memory, such as Task
+  sessions, have no such entries and are unaffected, as are sessions that never
+  received reasoning; upgrading again resumes a refused session unchanged.
+  Releases after v0.14.0, beginning with this one, refuse to start on a data
+  directory migrated by a still newer Forge. v0.14.0 and earlier cannot detect
+  that condition, so back up the data directory before upgrading if you may
+  need to run one of them on it again.
+- Upgrading is also one-way for five database triggers that this release
+  replaces with repository code (migrations `V202610180752`–`V202610180820`).
+  Releases after v0.14.0, beginning with this one, refuse unknown migration
+  versions before applying anything. v0.14.0 and earlier cannot detect them:
+  v0.14.0 starts on an upgraded data directory but has neither the triggers nor
+  their replacement, so new accounts and Projects get no Main or Project Chat
+  and no setup binding, Main Chat topic rotations are not marked, reopening a
+  resolved Attention item does not re-arm its wakes, Task media uploads are not
+  projected into Project media, and the pricing guards can refuse deleting an
+  account with pricing history. Restore a backup taken before upgrading instead
+  of running v0.14.0 on the upgraded directory.
+
+### Added
+
+- HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
+  registration, login and refresh, with matching logout cleanup.
+  REST, web startup and SSE support cookie-only sessions while password-login
+  JSON tokens and existing localStorage behavior remain available. TestSprite
+  can capture a session credential after username/password sign-in.
+- Web startup revives a cookie-only session after an expired access cookie:
+  one empty-body refresh request, then one `/auth/me` retry. Failed revival
+  returns to `/login` without a loop or storing the returned tokens.
+
+### Changed
+
+- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D
+  (`1de6d7d`), retaining materialized session/checkpoint stores without
+  journal adoption.
+- A native turn failed by a provider rejection now reads
+  `Provider: provider rejected the request…` instead of `Config: …` in Task
+  execution errors and Agent Chat failure text, and may end with the
+  provider's own reason (at most 300 characters). A reason that echoes a
+  credential sent on that request is withheld, and raw HTTP bodies are never
+  logged. Message text is not a contract: REST/MCP error codes, `TurnFailure`
+  values and retry/recovery decisions are unchanged.
+- Forge refuses to start on a data directory migrated by a newer Forge.
+- **The remaining agent/chat implementation moved from `services` to
+  `services-agents` (internal).** Agent Chat policy, admission, workers and
+  memory projection; inquiries; context manifests and usage; embedded agents;
+  default-agent setup; Main/Project orchestration adapters; native tools;
+  topic rotation; and wake delivery now sit above the Task/workflow core.
+  Core reaches agent-owned behavior only through narrow injected contracts;
+  there is no `services → services-agents` dependency and no REST, MCP, CLI,
+  event, storage, or user-visible behavior change.
+- Five small internal SQLite logic-trigger families now run in the owning
+  repository transactions; database guards and the intentionally global
+  projection/invalidation trigger families are unchanged.
+- Agent Runtime moves from revision `5ee41e4` to the v0.5.0 release commit
+  `82f5aac`. Existing Forge encrypted session snapshots, schema-3 checkpoints
+  and SQLite LCM timelines resume without a database migration; persisted
+  `agent-runtime-lcm-2` derived state rebuilds once for the `-3` algorithm while
+  old nodes and their text stay as stored (downgrading is covered under
+  Breaking). What changes for users: a deterministic LCM fallback summary now
+  renders earlier tool activity as `[earlier tool call: …]` and
+  `[earlier tool result: …]` lines instead of `call name(args)` text a model
+  could copy as its reply; a turn interrupted or failed in the middle of a tool
+  step has each unanswered call closed with an explicit error result when the
+  session next takes a turn, instead of failing every later turn with
+  `invalid_pairing` (the call is never replayed); and new reasoning is replayed
+  only to the provider and model that produced it, so after a session changes
+  model its earlier reasoning is left out of requests. Reasoning stored before
+  this release keeps the previous replay rule. Schema-invalid tool calls and
+  Forge's `parameters` envelope normalizer behave as before. Native journals,
+  external agents and the flat semantic-summary alternative stay disabled.
+- Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
+  lowercase variants, provider probes and connection tests, public search,
+  native provider requests, fetch, and network-capable child processes. Target
+  validation runs before proxy connections; direct connections retain DNS
+  pinning. `NO_PROXY=*` (including a wildcard entry in a list) disables proxies
+  for all targets, including literal IPv4/IPv6 addresses, matching curl.
+  A proxy's own DNS resolution remains under the operator's control.
+  A set but unusable proxy value (unparseable, or a non-HTTP scheme such as
+  `socks5h://`) refuses the request unless `NO_PROXY=*` disables proxies; health
+  probes report it as `outbound_proxy_unusable`. Review/verify check output
+  redacts operator proxy URLs that carry credentials, their percent-decoded
+  Basic authentication tokens, and every `Proxy-Authorization:` header value.
+  Public search shares one timeout budget between DNS resolution and HTTP.
+- Owner-only review parks no longer wake the Project Agent or create a redundant
+  owner escalation. Mission Control shows each Task action and Resolve according
+  to server authority and Project role, including ordinary actions for members
+  and admins; approval with an override remains owner-only. Permission loading
+  shows neither controls nor `Owner action needed`; that message appears only
+  when the viewer can perform none of the actions.
+- Review parks name the owner decision and park reason in Attention and show
+  the owner's finding deferral and guided retry offers when eligible.
+- Workflow snapshots now commit with their queued step and transition,
+  including board moves; failed entries and unused payloads leave no orphan.
+
+### Fixed
+
+- Native Task and reviewer-correction turns now feed provider entry health.
+  They were classified from error text, and the runtime's fixed provider
+  messages carry no HTTP status, so only usage limits were recognised. Health
+  now comes from typed evidence: a credential rejection marks the entry
+  `error` until a connection test passes (as Agent Chat already did), and a
+  usage limit or exhausted transient retries start the usual cooldown.
+  Provider wording cannot set it.
+- New native agent profiles record the Agent Runtime revision Forge actually
+  pins in `config_json.runtime_revision`; it had stayed at `5ee41e4` since the
+  move to `82f5aac`. Existing profiles keep the value they were created with.
+- Re-running Review now cancels its previous attempt and records the new entry
+  atomically, so an entry write failure leaves the previous attempt recoverable.
+  A completed reviewer waiting for human approval no longer adds command steps
+  on unchanged dispatcher ticks. A re-run whose reviewer dispatch failed after
+  its entry committed now starts the next reviewer on its own instead of
+  re-settling the cancelled attempt on every dispatcher tick.
+- Recheck Review now re-dispatches the assigned reviewer when a Task has no
+  review checks, for both the built-in and renamed review gates. Checks still
+  finish before reviewer dispatch. Renamed review gates also refuse Task soft
+  deletion during review. Coordination-root runs in the web UI now resolve the
+  state's review phase and effective role as execution admission does, including
+  implicit phases and custom review roles; implementation roles remain held.
+- Custom review gates named differently from `review` now use the same review
+  lifecycle as the default gate when they have the `reviewer` role and
+  `canonical_phase: review`. Agent verdicts advance Tasks through integration;
+  cancelled and failed entries retain the normal retry/park behavior. Human
+  review actions, recovery, review carry, checks, review-ready projections and
+  the Task's `awaiting_human` flag also resolve the gate from its workflow
+  definition. A Task's `review_config` (its checks, setup steps, verify and
+  conformance settings) now configures a renamed review gate too; before, the
+  gate ran only the workflow's own review config.
+- Well-known NAT64 (`64:ff9b::/96`) provider and fetch destinations now apply
+  the IPv4 policy to the embedded address, allowing public IPv4 services on
+  DNS64 networks while refusing private, loopback and metadata targets.
+- Public search limits the IETF protocol-assignments block to `192.0.0.0/24`,
+  allowing public addresses such as `192.0.1.1` while retaining TEST-NET blocks.
+- Non-administrator MCP controls read only the server-derived endpoint URL
+  through authenticated `GET /api/v1/config/mcp/endpoint`, with Project
+  visibility checks and no filesystem paths, credentials or install state.
+- Fake executable fixtures and generated compiler-cache launchers publish
+  fully closed scripts atomically. Process spawns retry transient Linux
+  `ETXTBSY` errors within a bounded delay.
+- Task-detail title saves now reconcile unrelated concurrent Task writes instead
+  of silently leaving the old title, and show the current title for same-field conflicts.
+- Clearing a Task description now persists an empty value, restores the
+  empty-description prompt, and preserves the blank draft with the current value visible on conflict.
+- Non-default Task types are visible on Kanban cards and Task detail headers.
+- The header brand is a consistently labelled Forge home link to `/`, using the
+  existing home routing for accounts with and without Projects.
 
 ## [0.14.0] - 2026-10-16
 

@@ -224,6 +224,140 @@ fn public_search_defaults_to_disabled_and_bounded_limits() {
 }
 
 #[test]
+fn public_search_nat64_applies_embedded_ipv4_policy() {
+    for (host, blocked) in [
+        ("64:ff9b::8.8.8.8", false),
+        ("64:ff9b::1.1.1.1", false),
+        ("64:ff9b::10.0.0.1", true),
+        ("64:ff9b::127.0.0.1", true),
+        ("64:ff9b::169.254.169.254", true),
+        ("64:ff9b::192.88.99.1", true),
+        ("64:ff9b:1::8.8.8.8", true),
+        ("64:ff9b:1:1234:5678:9abc:808:808", true),
+        // The rest of 64:ff9b::/48 outside the well-known /96 stays refused.
+        ("64:ff9b:0:1::", true),
+        ("64:ff9b::1:0:0", true),
+        ("64:ff9b:0:ffff:ffff:ffff:ffff:ffff", true),
+        // Outside both 64:ff9b::/48 and local-use 64:ff9b:1::/48.
+        ("64:ff9b:2::", false),
+    ] {
+        assert_eq!(
+            crate::is_blocked_public_search_address(host.parse().unwrap()),
+            blocked,
+            "{host}"
+        );
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://[{host}]/search")),
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_err(), blocked, "{host}");
+    }
+}
+
+#[test]
+fn public_search_ietf_protocol_assignments_are_only_a_slash24() {
+    for (host, allowed) in [
+        ("192.0.1.1", true),
+        ("192.0.3.1", true),
+        ("192.0.255.1", true),
+        ("192.0.0.8", false),
+        ("192.0.2.1", false),
+        ("192.88.99.1", false),
+        ("198.51.100.1", false),
+        ("203.0.113.1", false),
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert_eq!(config.validate().is_ok(), allowed, "{host}");
+    }
+}
+
+#[test]
+fn address_tightening_public_search_refuses_local_dns_suffixes() {
+    for host in [
+        "search.internal",
+        "nested.search.internal",
+        "SEARCH.INTERNAL.",
+        "search.home.arpa",
+        "nested.search.home.arpa",
+        "SEARCH.HOME.ARPA.",
+        // The reserved names themselves, not only their subdomains.
+        "internal",
+        "INTERNAL.",
+        "home.arpa",
+        "HOME.ARPA.",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_err(), "{host}");
+    }
+    for host in [
+        "search.internal.example",
+        "search.home.arpa.example",
+        "searchinternal",
+        "example.internal.com",
+        "internal.example.com",
+        "home.arpa.example.com",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{host}");
+    }
+}
+
+#[test]
+fn hostname_refusal_public_search_config() {
+    for reserved in [
+        "localhost",
+        "localhost.localdomain",
+        "internal",
+        "home.arpa",
+        "local",
+    ] {
+        for host in [
+            reserved.to_owned(),
+            format!("search.{reserved}"),
+            format!("nested.search.{reserved}"),
+        ] {
+            for host in [
+                host.clone(),
+                host.to_ascii_uppercase(),
+                format!("{host}."),
+                format!("{}.", host.to_ascii_uppercase()),
+            ] {
+                let config = PublicSearchConfig {
+                    endpoint: Some(format!("https://{host}/search")),
+                    ..Default::default()
+                };
+                assert!(config.validate().is_err(), "{host}");
+            }
+        }
+    }
+    for host in [
+        "example.internal.com",
+        "internal.example.com",
+        "home.arpa.example.com",
+        "local.example.com",
+        "localhost.example.com",
+        "localhost.localdomain.example.com",
+        "notinternal",
+        "notlocal",
+    ] {
+        let config = PublicSearchConfig {
+            endpoint: Some(format!("https://{host}/search")),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "{host}");
+    }
+}
+
+#[test]
 fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
     for endpoint in [
         "http://search.example.test",
@@ -232,6 +366,9 @@ fn public_search_rejects_unsafe_endpoints_and_unbounded_limits() {
         "https://[::ffff:127.0.0.1]/search",
         "https://[::ffff:8.8.8.8]/search",
         "https://[::8.8.8.8]/search",
+        "https://[::ffff:0:10.0.0.1]/search",
+        "https://[::ffff:0:127.0.0.1]/search",
+        "https://[::ffff:0:169.254.169.254]/search",
         "https://[64:ff9b::192.0.2.1]/search",
         "https://[fe80::1%25en0]/search",
         "https://[2001:2::1]/search",

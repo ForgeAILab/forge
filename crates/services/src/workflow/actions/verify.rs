@@ -264,7 +264,7 @@ fn read_file(root: &Path, name: &str, limit: u64) -> Result<Option<Vec<u8>>, Str
     {
         return Err("path escapes verify directory".into());
     }
-    crate::native_tools::read_bounded_regular_file(&root.join(relative), root, limit, true)
+    crate::bounded_file::read_bounded_regular_file(&root.join(relative), root, limit, true)
 }
 
 async fn read_results(

@@ -25,7 +25,7 @@ pub(crate) struct HookPayload {
     pub actor: Actor,
     pub reason: String,
     pub transition_log_id: String,
-    pub workflow_ref: crate::worker_runtime::queue::WorkflowReference,
+    pub workflow_ref: db::WorkflowReference,
     pub authority: Option<i64>,
     pub from_config: serde_json::Value,
     pub to_config: serde_json::Value,
@@ -323,8 +323,7 @@ impl WorkflowExecution<'_> {
         step: &db::TaskStep,
         payload: &HookPayload,
     ) -> crate::Result<HookPhaseResult> {
-        let crate::worker_runtime::queue::WorkflowReference::Snapshot(id) = &payload.workflow_ref
-        else {
+        let db::WorkflowReference::Snapshot(id) = &payload.workflow_ref else {
             return Err(ServiceError::invalid_operation(
                 "hook phase requires its committed workflow",
             ));
@@ -598,7 +597,8 @@ impl WorkflowExecution<'_> {
         }
 
         // This guard precedes every review-entry check and every path that
-        // creates a Review (including a gate without configured CI).
+        // creates a Review (including a gate without configured CI). Like
+        // `prepare_review_entry` it covers every review-phase gate.
         let mut no_change_send_back = false;
         if cascade.is_none()
             && to_state.kind == StateKind::Gate
@@ -767,7 +767,7 @@ impl WorkflowExecution<'_> {
                         }
 
                         if matches!(hook.on_failure, FailurePolicy::Block) {
-                            if target_state == crate::workflow::default_states::REVIEW {
+                            if db::budget::is_review_state(to_state) {
                                 if let Some(reject_target) = to_state
                                     .gate_config
                                     .as_ref()

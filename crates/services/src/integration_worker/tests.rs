@@ -1174,7 +1174,6 @@ async fn cancel_racing_the_permit_on_another_thread_has_exactly_one_winner() {
 /// the cancelled receipt, and only then is the head released.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancel_during_a_running_rebase_stops_git_and_releases_after_the_receipt() {
-    use std::os::unix::fs::PermissionsExt;
     let world = World::new().await;
     let mut pump = Pump::new(world.worker());
     let held = hold_in(&world, &mut pump, S::Rebasing).await;
@@ -1185,7 +1184,7 @@ async fn cancel_during_a_running_rebase_stops_git_and_releases_after_the_receipt
         world.repo("r").join(".git/hooks/pre-rebase"),
     );
     std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &hook,
         format!(
             "#!/bin/sh\ntouch '{}'\nwhile :; do sleep 0.05; done\n",
@@ -1193,7 +1192,6 @@ async fn cancel_during_a_running_rebase_stops_git_and_releases_after_the_receipt
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut driver = pump.drivers.pop().unwrap();
     let pass = tokio::spawn(async move {
         let pass = driver.pass().await;

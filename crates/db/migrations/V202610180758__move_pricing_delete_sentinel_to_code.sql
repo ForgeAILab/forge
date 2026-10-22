@@ -1,0 +1,2 @@
+DROP TRIGGER IF EXISTS pricing_account_deletion_guard_begin;
+DROP TRIGGER IF EXISTS pricing_account_deletion_guard_end;

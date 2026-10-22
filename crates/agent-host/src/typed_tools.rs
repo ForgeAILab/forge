@@ -1675,9 +1675,9 @@ fn public_https_origin(origin: &str) -> bool {
         return false;
     }
     match parsed.host() {
-        Some(url::Host::Domain(domain)) => !crate::transport::restricted_provider_hostname(domain),
-        Some(url::Host::Ipv4(address)) => !crate::transport::restricted_provider_ip(address.into()),
-        Some(url::Host::Ipv6(address)) => !crate::transport::restricted_provider_ip(address.into()),
+        Some(url::Host::Domain(domain)) => !config::is_restricted_public_hostname(domain),
+        Some(url::Host::Ipv4(address)) => !config::is_restricted_public_address(address.into()),
+        Some(url::Host::Ipv6(address)) => !config::is_restricted_public_address(address.into()),
         None => false,
     }
 }
@@ -3629,6 +3629,45 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn native_cleared_commands_receive_operator_proxy_variables() {
+        const MARKER: &str = "FORGE_NATIVE_PROXY_CHILD";
+        let keys = executors::run_process::PROXY_ENV_KEYS;
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "typed_tools::tests::native_cleared_commands_receive_operator_proxy_variables",
+                ])
+                .env(MARKER, "1")
+                .envs(keys.map(|key| (key, format!("sentinel-{key}"))))
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "native proxy child fixture failed");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
+            root: dir.path().to_string_lossy().into_owned(),
+        });
+        let script = keys
+            .map(|key| format!("test \"${key}\" = 'sentinel-{key}'"))
+            .join(" && ");
+        let output = execute_workspace_command(
+            "sh",
+            &["-c".into(), script],
+            None,
+            &Default::default(),
+            &command_invocation_context(workspace),
+        )
+        .await
+        .unwrap();
+        assert!(output.success);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn native_commands_receive_project_and_machine_build_environment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace: Arc<dyn Workspace> = Arc::new(TestWorkspace {
@@ -3683,7 +3722,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn native_command_gets_the_shared_compiler_cache() {
-        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("ws");
         let worktree = root.join("t").join("repo");
@@ -3704,8 +3742,8 @@ mod tests {
         )
         .unwrap();
         let wrapper = temp.path().join("kache");
-        std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        process_supervisor::executable::write_executable(&wrapper, "#!/bin/sh\nexec \"$@\"\n")
+            .unwrap();
         executors::compiler_cache::install(
             &root,
             Some(executors::compiler_cache::CompilerCache {
@@ -4369,6 +4407,44 @@ mod tests {
                 !public_https_origin(refused),
                 "{refused} must not be an authorizable fetch origin"
             );
+        }
+    }
+
+    #[test]
+    fn hostname_refusal_fetch_authorization() {
+        for reserved in [
+            "localhost",
+            "localhost.localdomain",
+            "internal",
+            "home.arpa",
+            "local",
+        ] {
+            for host in [
+                reserved.to_owned(),
+                format!("search.{reserved}"),
+                format!("nested.search.{reserved}"),
+            ] {
+                for host in [
+                    host.clone(),
+                    host.to_ascii_uppercase(),
+                    format!("{host}."),
+                    format!("{}.", host.to_ascii_uppercase()),
+                ] {
+                    assert!(!public_https_origin(&format!("https://{host}")), "{host}");
+                }
+            }
+        }
+        for host in [
+            "example.internal.com",
+            "internal.example.com",
+            "home.arpa.example.com",
+            "local.example.com",
+            "localhost.example.com",
+            "localhost.localdomain.example.com",
+            "notinternal",
+            "notlocal",
+        ] {
+            assert!(public_https_origin(&format!("https://{host}")), "{host}");
         }
     }
 
@@ -6176,3 +6252,36 @@ mod lead_tests;
 
 #[cfg(test)]
 mod proposal_registry_tests;
+
+#[cfg(test)]
+mod public_origin_security_tests {
+    #[test]
+    fn fetch_gate_rejects_transition_and_zero_network_origins() {
+        for origin in [
+            "https://0.1.2.3",
+            "https://[2001:db8::1]",
+            "https://[2001:2::1]",
+            "https://[2001:10::1]",
+            "https://[2001:20::1]",
+            "https://[100::1]",
+            "https://[3fff::1]",
+            "https://[::ffff:0:10.0.0.1]",
+            "https://[::ffff:0:127.0.0.1]",
+            "https://[::ffff:0:169.254.169.254]",
+            "https://192.88.99.1",
+            "https://[64:ff9b::192.88.99.1]",
+            "https://[2002:c058:6301::]",
+            "https://[::ffff:192.88.99.1]",
+            "https://[64:ff9b::7f00:1]",
+            "https://[64:ff9b:1::1]",
+            "https://[2002:7f00:1::]",
+            "https://[2001::1]",
+            "https://[::ffff:0.1.2.3]",
+            "https://[::0.1.2.3]",
+        ] {
+            assert!(!super::public_https_origin(origin), "{origin}");
+        }
+        assert!(super::public_https_origin("https://8.8.8.8"));
+        assert!(super::public_https_origin("https://[::ffff:0:8.8.8.8]"));
+    }
+}

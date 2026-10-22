@@ -77,7 +77,7 @@ pub(crate) fn review_ci_steps_for_task(
     workflow
         .states
         .iter()
-        .find(|state| state.name == crate::workflow::default_states::REVIEW)
+        .find(|state| db::budget::is_review_state(state))
         .map(|state| hooks::merged_state_config(state, project, task_state_config_json))
         .and_then(|config| crate::workflow::actions::review_ci_steps(&config).ok())
         .unwrap_or_default()
@@ -1460,13 +1460,18 @@ impl WorkflowExecution<'_> {
             producing.status = target_state.clone();
             producing.version = version + 1;
             let input = self.cascade_step_input(&producing, workflow, target_state.clone(), reason.clone(), bridge.clone(), false, false, authority.clone(), step.as_ref(), transition_log_id.clone(), None).await?;
-            let frozen = self.db.store_step_workflow(&serde_json::to_string(&durable::HookDefinition { workflow: workflow.clone(), project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()) }).map_err(|e| ServiceError::invalid_operation(e.to_string()))?).await?;
+            let frozen = serde_json::to_string(&durable::HookDefinition { workflow: workflow.clone(), project_workflow_definition: authority.as_ref().map(|a| a.workflow_definition.clone()) }).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
             let cascade_payload: crate::worker_runtime::queue::CascadePayload = serde_json::from_str(&input.payload_json).map_err(|e| ServiceError::invalid_operation(e.to_string()))?;
             let mut dispatch_index = to_state.hooks.on_enter.iter().position(|h| registry::is_dispatch_action(&h.action) && hook_audience_matches(h.applies_to, &actor))
                 .map(|i| (from_state.hooks.on_exit.len() + to_state.hooks.before_enter.len() + i) as i64);
             let mut admission_agent_id=dispatch_index.and(cascade_payload.admission_agent_id);
             let role_unassigned = if let Some(role)=crate::workflow::effective_role(to_state) { crate::task_hierarchy::effective_role_assignment(&self.db,&producing,role).await?.is_none_or(|r| r.assignment.assignee_id.is_none()) } else { false };
-            let action_dispatch = crate::TaskService::task_action_command_active() && !entry_retry;
+            // A review re-run must execute its dispatch hook as part of the
+            // entry. With no checks, that hook opens the replacement Review;
+            // deferring it leaves recovery reconciling the cancelled attempt.
+            let action_dispatch = crate::TaskService::task_action_command_active()
+                && !entry_retry
+                && bridge.review_rerun_requester().is_none();
             let should_defer_dispatch=(defer_dispatch_until.is_some() || action_dispatch) && (to_state.kind!=StateKind::Active || action_dispatch) && dispatch_index.is_some();
             let deferred_marker=should_defer_dispatch.then(||serde_json::json!({"target_state":target_state,"not_before":defer_dispatch_until.clone().unwrap_or_else(now_rfc3339),"reason":if crate::TaskService::task_action_command_active(){"task action dispatch"}else{"board drag dispatch cooldown"}}).to_string());
             // Optional, unassigned planning is an imminent fast role entry:
@@ -1508,7 +1513,7 @@ impl WorkflowExecution<'_> {
             let hook_payload = durable::HookPayload {
                 entry_origin,
                 from: current_status.clone(), to: target_state.clone(), actor: actor.clone(), reason: reason.clone(), bridge: bridge.clone(), transition_log_id: transition_log_id.clone(),
-                workflow_ref: crate::worker_runtime::queue::WorkflowReference::Snapshot(frozen), authority: authority.as_ref().map(|a| a.project_version),
+                workflow_ref: db::WorkflowReference::Definition(frozen), authority: authority.as_ref().map(|a| a.project_version),
                 from_config: exit_ctx.state_config.clone(), to_config: enter_ctx.state_config.clone(), workspace_id: enter_ctx.workspace_id.clone(), execution_id: enter_ctx.execution_id.clone(), agent_id: enter_ctx.agent_id.clone(),
                 skip_before_enter: review_refresh_bridge, skip_on_exit: entry_retry, defer_dispatch_until: defer_dispatch_until.clone(), action_dispatch, pre_results: hook_results.clone(), dispatch_index, admission_agent_id, evidence: cascade_payload.evidence,
             };
@@ -1599,6 +1604,14 @@ impl WorkflowExecution<'_> {
                     let clear_review_passed_at = authority
                         .as_ref()
                         .is_some_and(|authority| authority.clear_review_passed_at_on_commit);
+                    // Superseding the old attempt and durably entering its
+                    // replacement are one write boundary. Entry retries keep
+                    // the attempt that this entry already opened.
+                    if !entry_retry && current_status == target_state
+                        && bridge.review_rerun_requester().is_some()
+                    {
+                        self.db.cancel_review_for_rerun_in_tx(&mut transaction, &task_id, &updated_at).await?;
+                    }
                     // A status change bumps status_epoch through its trigger.
                     // A workflow self-transition (planning -> planning on a
                     // gate reject) is also a new entry: bump it here. A step
@@ -1842,15 +1855,11 @@ impl WorkflowExecution<'_> {
             .await?;
         let evidence = Some(format!("{review_evidence:?}|{rebases}|{head:?}"));
         let workflow_ref = if authority.is_some() {
-            crate::worker_runtime::queue::WorkflowReference::Project
+            db::WorkflowReference::Project
         } else {
-            crate::worker_runtime::queue::WorkflowReference::Snapshot(
-                self.db
-                    .store_step_workflow(
-                        &serde_json::to_string(workflow)
-                            .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
-                    )
-                    .await?,
+            db::WorkflowReference::Definition(
+                serde_json::to_string(workflow)
+                    .map_err(|e| ServiceError::invalid_operation(e.to_string()))?,
             )
         };
         let continuing = parent.filter(|p| {

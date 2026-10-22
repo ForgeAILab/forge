@@ -574,8 +574,8 @@ async fn charter_backed_project(harness: &common::Harness, name: &str) -> Charte
     }
 }
 
-fn native_provider(harness: &common::Harness) -> services::CoordinationToolProvider {
-    let provider = services::CoordinationToolProvider::new(harness.state.db.clone());
+fn native_provider(harness: &common::Harness) -> services_agents::CoordinationToolProvider {
+    let provider = services_agents::CoordinationToolProvider::new(harness.state.db.clone());
     provider.set_task_service(harness.state.task_service.clone());
     provider
 }

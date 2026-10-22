@@ -3,6 +3,7 @@ mod failures;
 pub use failures::strip_ansi;
 
 use api_types::*;
+use base64::Engine;
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -325,9 +326,61 @@ fn redacted(
             }
         }
     }
-    let text = executors::environment::redact_environment_values(&text, env);
+    let text = redact_check_output(&text, env);
     let shortened = text.len() > limit;
     (tail(&text, limit), truncated || shortened)
+}
+/// Curl's verbose output includes this header, including authentication
+/// methods and credentials that need not appear in the proxy URL snapshot.
+fn redact_check_output(text: &str, env: &BTreeMap<String, String>) -> String {
+    static PROXY_AUTHORIZATION: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)(\bproxy-authorization:[\t ]*)[^\r\n]*").unwrap()
+        });
+    let text = PROXY_AUTHORIZATION.replace_all(text, "${1}[REDACTED]");
+    executors::environment::redact_environment_values(&text, env)
+}
+/// Redaction values for a check's output: the Project's values plus every
+/// operator proxy URL that carries credentials, its decoded userinfo, and its
+/// Basic authentication token. Those reach the child too
+/// (cleared policies receive the proxy variables explicitly, the others
+/// inherit them), and a step that prints one must not persist it.
+fn with_operator_proxy_credentials(
+    mut env: BTreeMap<String, String>,
+    operator: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    for key in executors::run_process::PROXY_ENV_KEYS {
+        let Some(value) = operator(key) else {
+            continue;
+        };
+        let rest = value
+            .split_once("://")
+            .map_or(value.as_str(), |(_, rest)| rest);
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let Some((userinfo, _)) = authority.rsplit_once('@') else {
+            continue;
+        };
+        // Keys no Project can declare, so a Project value is never replaced.
+        if !userinfo.is_empty() {
+            env.insert(format!("\0proxy-userinfo:{key}"), userinfo.to_owned());
+            // Curl decodes each URL component before encoding username:password.
+            // Work in bytes so non-UTF-8 percent escapes keep their exact token.
+            let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+            let mut credentials =
+                percent_encoding::percent_decode_str(username).collect::<Vec<_>>();
+            credentials.push(b':');
+            credentials.extend(percent_encoding::percent_decode_str(password));
+            env.insert(
+                format!("\0proxy-basic:{key}"),
+                base64::engine::general_purpose::STANDARD.encode(&credentials),
+            );
+            if let Ok(decoded) = String::from_utf8(credentials) {
+                env.insert(format!("\0proxy-decoded-userinfo:{key}"), decoded);
+            }
+        }
+        env.insert(format!("\0proxy:{key}"), value);
+    }
+    env
 }
 /// The bounded, ANSI-free, redacted tail of output that did not come through
 /// a command pipe (a verify app's own log file), masked exactly like command
@@ -346,7 +399,8 @@ pub fn redacted_tail(
 /// Build a command. The two frozen legacy policies and the canonical CI
 /// policy inherit the owner's environment through a login shell, with the
 /// Project values on top; every other policy clears it and sees only the
-/// spec's declared keys. All use the owner's current budget.
+/// spec's declared keys plus the operator's standard proxy variables. All use
+/// the owner's current budget.
 ///
 /// Legacy policies pass the declared keys and refuse when one is missing. The
 /// canonical policy passes the Project environment in force now, whole: a
@@ -410,7 +464,7 @@ fn sandboxed_command(
         .current_dir(path)
         .envs(&env);
     if cleared {
-        // Nothing of this process's environment reaches the child, so its
+        // Only proxy variables pass through from this process, so its
         // `CARGO_TARGET_DIR` cannot stand in for the Task root's.
         executors::run_process::apply_sandboxed_cleared(&mut command, &env, sandbox);
     } else {
@@ -500,6 +554,7 @@ async fn run_command_group(
         executors::sandbox::RunPurpose::Check,
     );
     let (mut command, env) = sandboxed_command(path, spec, environment, policy, run_scope.env())?;
+    let env = with_operator_proxy_credentials(env, |key| std::env::var(key).ok());
     // An isolated directory prevents one step from inheriting another's reports.
     // Reports are optional evidence: a directory that cannot be made leaves the
     // command without one rather than failing it as infrastructure.
@@ -1099,8 +1154,8 @@ pub fn command_outcome(
     started_at: String,
     finished_at: String,
 ) -> CheckCommandOutcome {
-    let stderr = executors::environment::redact_environment_values(&strip_ansi(output.stderr), env);
-    let stdout = executors::environment::redact_environment_values(&strip_ansi(output.stdout), env);
+    let stderr = redact_check_output(&strip_ansi(output.stderr), env);
+    let stdout = redact_check_output(&strip_ansi(output.stdout), env);
     let combined = if stdout.is_empty() {
         stderr.clone()
     } else if stderr.is_empty() {

@@ -172,10 +172,48 @@ async fn update_status_inner(
     origin: crate::ReviewEventOrigin,
 ) -> Result<(Review, Option<Task>)> {
     let mut transaction = crate::begin_immediate(&db.pool).await?;
-    db.fence_current_step_in_tx(&mut transaction).await?;
+    let result = update_status_in_tx(
+        db,
+        &mut transaction,
+        id,
+        status,
+        step_results_json,
+        finished_at,
+        updated_at,
+        task_authority,
+        expected_project_version,
+        expected_workflow_definition,
+        expected_review_status,
+        expected_review_updated_at,
+        expected_candidate_execution_id,
+        origin,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn update_status_in_tx(
+    db: &SqliteDb,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    status: ReviewStatus,
+    step_results_json: String,
+    finished_at: Option<String>,
+    updated_at: &str,
+    task_authority: Option<TaskAuthorityUpdate>,
+    expected_project_version: Option<i64>,
+    expected_workflow_definition: Option<&str>,
+    expected_review_status: Option<ReviewStatus>,
+    expected_review_updated_at: Option<&str>,
+    expected_candidate_execution_id: Option<&str>,
+    origin: crate::ReviewEventOrigin,
+) -> Result<(Review, Option<Task>)> {
+    db.fence_current_step_in_tx(transaction).await?;
     let review = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?
         .map(map_review)
         .transpose()?
@@ -192,7 +230,7 @@ async fn update_status_inner(
             review_id: review.id.clone(),
             reason: e.to_string(),
         })?;
-    validate_review_details(&mut transaction, &review, &status, &details).await?;
+    validate_review_details(transaction, &review, &status, &details).await?;
     if !review_transition_allowed(&review.status, &status) {
         return Err(DbError::InvalidTransition);
     }
@@ -231,7 +269,7 @@ async fn update_status_inner(
              LIMIT 1",
         )
         .bind(&review.task_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         if latest_review_id.as_deref() != Some(review.id.as_str()) {
             return Err(DbError::VersionConflict);
@@ -239,7 +277,7 @@ async fn update_status_inner(
 
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?;
         let task = map_task(task_row)?;
@@ -256,7 +294,7 @@ async fn update_status_inner(
                      FROM project WHERE id = ?",
                 )
                 .bind(&task.project_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?
                 .ok_or(DbError::NotFound)?;
                 let project_version: i64 = project.try_get("version")?;
@@ -276,12 +314,8 @@ async fn update_status_inner(
             }
         }
         if let Some(expected_candidate_execution_id) = expected_candidate_execution_id {
-            validate_review_candidate_in_tx(
-                &mut transaction,
-                &task.id,
-                expected_candidate_execution_id,
-            )
-            .await?;
+            validate_review_candidate_in_tx(transaction, &task.id, expected_candidate_execution_id)
+                .await?;
         }
         Some((task_authority, task))
     } else {
@@ -289,11 +323,11 @@ async fn update_status_inner(
     };
 
     let budget_task = db
-        .get_task_in_tx(&mut transaction, &review.task_id)
+        .get_task_in_tx(transaction, &review.task_id)
         .await?
         .ok_or(DbError::NotFound)?;
     crate::budget::review_verdict(
-        &mut transaction,
+        transaction,
         &budget_task,
         &review,
         &status,
@@ -309,7 +343,7 @@ async fn update_status_inner(
     .bind(finished_at.as_deref())
     .bind(updated_at)
     .bind(id)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
     if result.rows_affected() == 0 {
         return Err(DbError::NotFound);
@@ -325,7 +359,7 @@ async fn update_status_inner(
         .bind(updated_at)
         .bind(&task.id)
         .bind(task_authority.expected_version)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
@@ -334,7 +368,7 @@ async fn update_status_inner(
     } else {
         sqlx::query_scalar::<_, String>("SELECT project_id FROM task WHERE id = ?")
             .bind(&review.task_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await?
             .ok_or(DbError::NotFound)?
     };
@@ -368,30 +402,81 @@ async fn update_status_inner(
         .to_string(),
         created_at: updated_at.to_owned(),
     };
-    DomainEventRepo::append_event_in_tx(db, &mut transaction, &event).await?;
+    DomainEventRepo::append_event_in_tx(db, transaction, &event).await?;
 
     let updated_row = sqlx::query("SELECT * FROM review WHERE id = ?")
         .bind(id)
-        .fetch_one(&mut *transaction)
+        .fetch_one(&mut **transaction)
         .await?;
     let updated_review = map_review(updated_row)?;
-    crate::task_condition::produce(
-        &mut transaction,
-        &review.task_id,
-        crate::ConditionChange::Human,
-    )
-    .await?;
+    crate::task_condition::produce(transaction, &review.task_id, crate::ConditionChange::Human)
+        .await?;
     let updated_task = if task_authority.is_some() {
         let task_row = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(&review.task_id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
         Some(map_task(task_row)?)
     } else {
         None
     };
-    transaction.commit().await?;
     Ok((updated_review, updated_task))
+}
+
+impl SqliteDb {
+    /// Supersede the current attempt in the transaction that durably enters
+    /// its replacement. A failed entry must leave the old attempt usable.
+    pub async fn cancel_review_for_rerun_in_tx(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        task_id: &str,
+        now: &str,
+    ) -> Result<()> {
+        let review = sqlx::query(
+            "SELECT * FROM review WHERE task_id = ? ORDER BY attempt_number DESC, id DESC LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .map(map_review)
+        .transpose()?;
+        let Some(review) = review.filter(|review| {
+            matches!(
+                review.status,
+                ReviewStatus::Running | ReviewStatus::AwaitingHuman
+            )
+        }) else {
+            return Ok(());
+        };
+        let mut details: serde_json::Value = serde_json::from_str(&review.step_results_json)
+            .unwrap_or_else(|_| serde_json::json!({ "ci_steps": [] }));
+        if !details.is_object() {
+            details = serde_json::json!({ "ci_steps": details });
+        }
+        details["execution_retry"] = serde_json::json!({
+            "status": "superseded_by_rerun",
+            "reason": "a review re-run was requested",
+            "cancelled_at": now,
+        });
+        update_status_in_tx(
+            self,
+            transaction,
+            &review.id,
+            ReviewStatus::Cancelled,
+            details.to_string(),
+            Some(now.to_owned()),
+            now,
+            None,
+            None,
+            None,
+            Some(review.status),
+            Some(&review.updated_at),
+            None,
+            crate::ReviewEventOrigin::Runner,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// The review settlement boundary. Unlike the historical `update_status`

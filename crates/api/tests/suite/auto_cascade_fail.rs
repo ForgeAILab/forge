@@ -11,8 +11,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
-    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
+    AgentResponse, ExecutionResponse, ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -62,7 +62,7 @@ async fn failed_executor_does_not_auto_cascade_to_review() {
     .await;
     assert!(repo.local_path.is_some());
 
-    let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_codex(&harness.state, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -246,7 +246,7 @@ async fn test_app(
     let mut registry = executors::AdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
@@ -296,46 +296,10 @@ async fn setup_git_repo(path: &Path) -> PathBuf {
     repo_path
 }
 
-async fn register_daemon_and_report_codex(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "cascade-fail-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "cascade-fail-test",
-            "labels": { "suite": "auto_cascade_fail" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "codex",
-                "availability": "authenticated",
-                "path": "/bin/codex"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_codex(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "cascade-fail-host", "codex")
+        .await
+        .daemon_id
 }
 
 async fn poll_until_execution_status(

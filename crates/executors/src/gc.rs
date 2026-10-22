@@ -1846,14 +1846,13 @@ mod tests {
     /// sccache server is stopped first.
     #[test]
     fn compiler_cache_stores_of_deleted_repositories_are_removed_after_the_grace() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap().join("root");
         fs::create_dir_all(&root).unwrap();
         let wrapper = dir.path().join("bin").join("sccache");
         fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
         let calls = dir.path().join("calls");
-        fs::write(
+        process_supervisor::executable::write_executable(
             &wrapper,
             format!(
                 "#!/bin/sh\nprintf '%s|%s\\n' \"$1\" \"$SCCACHE_SERVER_UDS\" >> '{}'\n",
@@ -1861,7 +1860,6 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
         let cache_dir = root.join(compiler_cache::CACHE_DIR);
         compiler_cache::install(
             &root,

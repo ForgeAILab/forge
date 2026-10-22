@@ -25,6 +25,65 @@ use tower::ServiceExt;
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
+async fn daemons_embedded_identity_cannot_report_or_reconnect_over_http() {
+    let state = test_state().await;
+    let app = test_app(&state);
+    let registration = state
+        .daemon_service
+        .register(services::DaemonRegisterInput {
+            max_concurrent_runs: None,
+            machine_id: services::embedded_daemon::embedded_machine_id(),
+            hostname: "internal-host".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            agent_version: None,
+            labels: json!({"mode":"embedded"}),
+            runtimes: vec![],
+            owner_id: None,
+            visibility: Some("global".into()),
+        })
+        .await
+        .unwrap();
+    let before = db::DaemonRepo::get_by_id(&*state.db, &registration.daemon_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let error: api_types::ErrorResponse = common::json_request_with_bearer(
+        &app,
+        Method::POST,
+        &format!("/api/v1/daemons/{}/report", registration.daemon_id),
+        &registration.plaintext_token,
+        json!({"detected_clis":[],"labels":{"spoofed":true}}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    assert_eq!(error.code, "machine_id_reserved");
+    let server = TestServer::start(Arc::clone(&state)).await;
+    let error = connect_daemon(
+        &server,
+        &registration.daemon_id,
+        Some(&registration.plaintext_token),
+    )
+    .await
+    .expect_err("internal identity cannot connect remotely");
+    assert_ws_http_status(error, StatusCode::CONFLICT);
+    assert!(!state
+        .daemon_connections
+        .is_connected(&registration.daemon_id));
+    let after = db::DaemonRepo::get_by_id(&*state.db, &registration.daemon_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.labels_json, after.labels_json);
+    assert_eq!(before.last_report_at, after.last_report_at);
+    state
+        .daemon_service
+        .authenticate(&registration.daemon_id, &registration.plaintext_token)
+        .await
+        .expect("internal credential still works");
+}
+
+#[tokio::test]
 async fn daemon_connect_with_bearer_token_upgrades_and_registers_connection() {
     let state = test_state().await;
     let app = test_app(&state);

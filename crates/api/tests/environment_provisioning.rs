@@ -202,7 +202,7 @@ async fn harness(root: &std::path::Path) -> Harness {
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(db::SqliteDb::new(pool));
     common::fake_daemon::seed_test_user(&db).await;
-    services::ensure_default_agents(&db, &cli_adapters::test_support::test_registry())
+    services_agents::ensure_default_agents(&db, &cli_adapters::test_support::test_registry())
         .await
         .unwrap();
     let state = state_for_db(db, &root.join("workspaces")).await;

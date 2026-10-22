@@ -1952,18 +1952,16 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_mid_rebase_kills_git_and_hook_and_retains_recovery_facts() {
-        use std::os::unix::fs::PermissionsExt;
         let mut f = fixture().await;
         std::fs::write(f.repo.join("target"), "target\n").unwrap();
         git::commit_all(&f.repo, "advance target").await.unwrap();
         f.target = git::get_current_sha(&f.repo).await.unwrap();
         let hook = f.repo.join(".git/hooks/pre-rebase");
-        std::fs::write(
+        process_supervisor::executable::write_executable(
             &hook,
             "#!/bin/sh\necho $$ > hook.pid\necho $PPID > git.pid\nexec sleep 60\n",
         )
         .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         let cancel = CancellationToken::new();
         let operation = f.owner.rebase(ServerRebaseRequest {
             fence: &f.fence,

@@ -225,7 +225,7 @@ impl CodingExecutorAdapter for SmithAdapter {
 
         executors::server_commands::ensure_allowed()
             .map_err(|e| ExecutorError::Other(e.to_string()))?;
-        let mut child = cmd.spawn()?;
+        let mut child = process_supervisor::executable::spawn(&mut cmd).await?;
 
         let stdout = child
             .stdout

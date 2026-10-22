@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
+from executable_fixture import write_executable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SPEC = importlib.util.spec_from_file_location("ci_rust_shards", ROOT / "scripts/ci_rust_shards.py")
@@ -86,9 +87,33 @@ class CoverageTests(unittest.TestCase):
                             for error in shards.coverage_errors(self.workspace)))
 
     def test_ci_script_names_the_workspace_features(self):
+        self.workspace["services-agents"] = {"targets": [
+            {"name": "main", "kind": ["test"], "required-features": ["test-support"]}]}
         self.assertEqual(shards.script_errors(self.workspace), [])
         self.assertEqual(shards.workspace_feature_args(self.workspace),
-                         ["--features", "db/test-template,services/test-support"])
+                         ["--features", "db/test-template,services-agents/test-support,"
+                                        "services/test-support"])
+
+    def test_rest_passes_the_qualified_feature_of_its_gated_target(self):
+        # A shard resolves features for its own packages: the catch-all does
+        # not see api's dev-dependency on services-agents/test-support.
+        self.workspace["services-agents"] = {
+            "features": {"test-support": ["services/test-support"]},
+            "targets": [{"name": "services-agents", "kind": ["lib"]},
+                        {"name": "main", "kind": ["test"],
+                         "required-features": ["test-support"]}]}
+        self.assertIn("services-agents/test-support",
+                      shards.passed_features(shards.cargo_args("rest")))
+        self.assertEqual(shards.coverage_errors(self.workspace), [])
+        self.assertEqual(shards.rest_feature_errors(self.workspace), [])
+        with patch.object(shards, "REST_FEATURES", []):
+            self.assertTrue(any("rest selects services-agents target 'main' without --features "
+                                "services-agents/test-support" in error
+                                for error in shards.coverage_errors(self.workspace)))
+        with patch.object(shards, "REST_FEATURES", ["services-agents/fixtures"]):
+            self.assertTrue(shards.rest_feature_errors(self.workspace))
+        with patch.object(shards, "REST_FEATURES", ["services/test-support"]):
+            self.assertTrue(shards.rest_feature_errors(self.workspace))
 
     def test_new_services_target_needs_explicit_coverage(self):
         self.workspace["services"]["targets"].append({"name": "new-bin", "kind": ["bin"]})
@@ -140,13 +165,12 @@ class ShellTests(unittest.TestCase):
             tmp = pathlib.Path(scratch)
             cargo = tmp / "cargo"
             log = tmp / "commands.jsonl"
-            cargo.write_text(
+            write_executable(cargo,
                 "#!/usr/bin/env python3\nimport json, os, sys\n"
                 "with open(os.environ['CI_TEST_COMMAND_LOG'], 'a') as out:\n"
                 "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
                 "sys.exit(1 if sys.argv[1] == os.environ.get('CI_TEST_FAIL') else 0)\n"
             )
-            cargo.chmod(0o755)
             env = dict(os.environ, PATH=str(tmp) + os.pathsep + os.environ["PATH"],
                        CI_TEST_COMMAND_LOG=str(log), CI_RUST_TIMINGS="1" if timings else "",
                        CI_TEST_FAIL=failing or "")
@@ -202,7 +226,8 @@ class ShellTests(unittest.TestCase):
         run, commands = self.commands(failing="fmt")
         self.assertEqual(run.returncode, 1)
         self.assertEqual([cmd[0] for cmd in commands], ["fmt", "clippy", "test"])
-        features = ["--features", "db/test-template,services/test-support"]
+        features = ["--features",
+                    "db/test-template,services-agents/test-support,services/test-support"]
         self.assertEqual(commands[1], ["clippy", "--workspace", "--all-targets", *features,
                                        "--", "-D", "warnings"])
         self.assertEqual(commands[-1], ["test", "--workspace", "--all-targets", *features,

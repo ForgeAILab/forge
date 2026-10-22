@@ -94,11 +94,15 @@ pub(crate) use common::latest_executor_execution_for_task;
 pub use create_subtasks::NewSubtaskInput;
 pub use dependencies::TaskDependencyAction;
 pub use lead::LeadRun;
+pub use project_agent_workspace::ensure_project_agent_workspace;
 pub use proposal::{
     DirectTaskProposalInput, TaskProposalCommandResult, TaskProposalPayload, TASK_PROPOSE_COMMAND,
 };
 pub(crate) use repository_authority::resolve_task_repository_authority;
 pub(crate) use subtask::coordination_review_pending;
+pub use workspace::{
+    ensure_inquiry_workspace, ensure_main_agent_workspace, MAIN_AGENT_INQUIRIES_DIR,
+};
 
 /// Decode persisted review details before any endpoint or workflow mutates the
 /// row. Legacy CI-only arrays are still readable, but every other malformed
@@ -978,6 +982,13 @@ impl TaskService {
         self.credential_env = Some(embedded);
         self.task_step_driver = Arc::default();
         self
+    }
+
+    /// Whether runtime composition supplied the agents-owned execution seam.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn has_provider_credential_env(&self) -> bool {
+        self.credential_env.is_some()
     }
 
     fn publish(&self, event: ForgeEvent) {

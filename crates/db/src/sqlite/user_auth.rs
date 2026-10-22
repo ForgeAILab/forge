@@ -4,6 +4,7 @@ use crate::{RefreshToken, RefreshTokenRepo, User, UserRepo};
 #[async_trait]
 impl UserRepo for SqliteDb {
     async fn create_user(&self, user: &User) -> Result<()> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
         sqlx::query(
             "INSERT INTO user (id, email, password_hash, display_name, is_admin, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -15,8 +16,16 @@ impl UserRepo for SqliteDb {
         .bind(if user.is_admin { 1 } else { 0 })
         .bind(&user.created_at)
         .bind(&user.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        bootstrap_account_main_chat_in_tx(
+            &mut transaction,
+            &user.id,
+            &user.created_at,
+            &user.updated_at,
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -114,11 +123,24 @@ impl UserRepo for SqliteDb {
     }
 
     async fn delete_user(&self, id: &str) -> Result<bool> {
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO pricing_account_deletion_guard (owner_user_id) VALUES (?)",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?;
         let result = sqlx::query("DELETE FROM user WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
-        Ok(result.rows_affected() > 0)
+        let deleted = result.rows_affected() > 0;
+        sqlx::query("DELETE FROM pricing_account_deletion_guard WHERE owner_user_id = ?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(deleted)
     }
 }
 
@@ -235,4 +257,32 @@ pub async fn execution_admission_default_account_in_tx(
     )
     .fetch_optional(connection)
     .await?)
+}
+
+/// Every account gets its canonical Main Chat in the transaction that creates it.
+pub(super) async fn bootstrap_account_main_chat_in_tx(
+    connection: &mut sqlx::SqliteConnection,
+    account_id: &str,
+    created_at: &str,
+    updated_at: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agent_chat (
+            id, kind, account_id, project_id, status,
+            instruction_revision, message_count, version, created_at, updated_at
+         )
+         SELECT ?, 'account_main', ?, NULL, 'agent_setup_required', 0, 0, 1, ?, ?
+         WHERE NOT EXISTS (
+            SELECT 1 FROM agent_chat
+            WHERE kind = 'account_main' AND account_id = ?
+         )",
+    )
+    .bind(crate::new_uuid_v4())
+    .bind(account_id)
+    .bind(created_at)
+    .bind(updated_at)
+    .bind(account_id)
+    .execute(connection)
+    .await?;
+    Ok(())
 }

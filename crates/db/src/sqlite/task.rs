@@ -2512,8 +2512,14 @@ impl TaskRepo for SqliteDb {
 
     async fn soft_delete(&self, input: crate::SoftDeleteTask) -> Result<Task> {
         let mut task = self.get_task_required(&input.id, true).await?;
+        let workflow: String =
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id = ?")
+                .bind(&task.project_id)
+                .fetch_one(&self.pool)
+                .await?;
         if task.deleted_at.is_some()
-            || matches!(task.status.as_str(), "in_progress" | "review" | "merging")
+            || matches!(task.status.as_str(), "in_progress" | "merging")
+            || crate::budget::review_states_from_json(&workflow).contains(&task.status)
         {
             return Err(DbError::InvalidSoftDelete);
         }
@@ -3972,27 +3978,53 @@ pub struct AttentionVisibleWorkItemsRow {
 }
 
 impl SqliteDb {
+    /// Read only visible workflow definitions before deriving review-state filters.
+    pub async fn attention_visible_project_workflows(
+        &self,
+        user_id: &str,
+        project_id: Option<&str>,
+    ) -> crate::Result<Vec<(String, String)>> {
+        let (predicate, values) = Self::attention_project_visibility_predicate(user_id, project_id);
+        let predicate = predicate.replace("t.project_id", "p.id");
+        let sql = format!("SELECT p.id, p.workflow_definition FROM project p WHERE {predicate}");
+        let mut query = sqlx::query_as(&sql);
+        for value in values {
+            query = query.bind(value);
+        }
+        Ok(query.fetch_all(self.pool()).await?)
+    }
+
     pub async fn attention_visible_work_items(
         &self,
         user_id: &str,
         project_id: Option<&str>,
         statuses: &[&str],
+        review_states: &[(String, String)],
         limit: i64,
     ) -> crate::Result<Vec<AttentionVisibleWorkItemsRow>> {
         let status_placeholders = vec!["?"; statuses.len()].join(", ");
-        let status_values = statuses.to_vec();
+        let review_predicate =
+            vec!["(t.project_id = ? AND t.status = ?)"; review_states.len()].join(" OR ");
+        let review_predicate = if review_predicate.is_empty() {
+            "0"
+        } else {
+            &review_predicate
+        };
         let (project_predicate, project_values) =
             Self::attention_project_visibility_predicate(user_id, project_id);
         let sql = format!(
             "SELECT t.id, t.project_id, t.title, t.status, t.priority, t.updated_at
              FROM task t JOIN project p ON p.id = t.project_id
-             WHERE t.deleted_at IS NULL AND t.status IN ({status_placeholders})
+             WHERE t.deleted_at IS NULL AND (t.status IN ({status_placeholders}) OR {review_predicate})
                AND {project_predicate}
              ORDER BY t.priority DESC, t.updated_at ASC, t.id ASC LIMIT ?"
         );
         let mut query = sqlx::query(&sql);
-        for status in status_values {
+        for status in statuses {
             query = query.bind(status);
+        }
+        for (project, state) in review_states {
+            query = query.bind(project).bind(state);
         }
         for value in project_values {
             query = query.bind(value);

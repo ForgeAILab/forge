@@ -14,8 +14,8 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ExecutionResponse, ExecutionStatus,
-    ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse,
+    AgentResponse, ExecutionResponse, ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse,
+    ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -68,7 +68,7 @@ async fn auditor_failure_dispatches_follow_up_executor_with_thread_reuse() {
     .await;
     assert!(repo.local_path.is_some());
 
-    let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_codex(&harness.state, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     let auditor_agent = create_agent(&harness.app, "auditor", &daemon_id).await;
     common::configure_execution_test_setup(
@@ -230,7 +230,7 @@ async fn follow_up_carried_finding_is_fresh_and_model_switch_lasts_one_round() {
         .await;
         let repo: RepoResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/repos", project.id),
             json!({"name":"repo","local_path":repo_path.to_string_lossy(),"remote_url":repo_path.to_string_lossy(),"default_branch":"main"}), StatusCode::OK).await;
-        let daemon = register_daemon_and_report_codex(&harness.app, workspaces.path()).await;
+        let daemon = register_daemon_and_report_codex(&harness.state, workspaces.path()).await;
         let coder: AgentResponse = json_request(&harness.app, Method::POST, "/api/v1/agents",
             json!({"name":"convergence coder","executor_type":"codex","daemon_id":daemon,"model":"primary-model", "config_json":{"fallbacks":[{"executor_type":"codex","config":{"model":"fallback-model"}}]}}), StatusCode::OK).await;
         let reviewer = create_agent(&harness.app, "convergence reviewer", &daemon).await;
@@ -372,7 +372,7 @@ async fn a_reviewer_that_writes_to_the_worktree_fails_and_its_changes_are_discar
         StatusCode::OK,
     )
     .await;
-    let daemon_id = register_daemon_and_report_codex(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_codex(&harness.state, workspaces_root.path()).await;
     let executor_agent = create_agent(&harness.app, "executor", &daemon_id).await;
     let reviewer_agent = create_agent(&harness.app, "reviewer", &daemon_id).await;
     common::configure_execution_test_setup(
@@ -716,7 +716,7 @@ async fn test_app(
     let mut registry = executors::AdapterRegistry::new();
     registry.register(Box::new(adapter));
     let adapter_registry = Arc::new(registry);
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
@@ -767,46 +767,10 @@ async fn setup_git_repo(path: &Path) -> PathBuf {
     repo_path
 }
 
-async fn register_daemon_and_report_codex(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "review-fail-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "review-fail-test",
-            "labels": { "suite": "follow_up_review_fail" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "codex",
-                "availability": "authenticated",
-                "path": "/bin/codex"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_codex(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "review-fail-host", "codex")
+        .await
+        .daemon_id
 }
 
 async fn create_agent(app: &Router, name: &str, daemon_id: &str) -> AgentResponse {

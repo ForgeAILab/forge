@@ -2,6 +2,7 @@ import { getApiErrorCode } from '@/lib/api-error'
 import type {
   Agent,
   RoleDefinition,
+  StateDefinition,
   Task,
   TaskRoleAssignmentResponse,
   WorkflowDefinition,
@@ -149,6 +150,85 @@ export function roleAssignmentErrorMessage(error: unknown): string | undefined {
   return code ? ROLE_ASSIGNMENT_ERRORS[code] : undefined
 }
 
+function effectiveRole(state: StateDefinition | undefined): string | null {
+  return state?.role ?? (state?.kind === 'active' ? 'assignee' : null)
+}
+
+function asciiLowercase(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase())
+}
+
+/** Review result of the server's WorkflowDefinition::canonical_phase_for_state. */
+function hasReviewPhase(state: StateDefinition): boolean {
+  if (state.canonical_phase != null) return state.canonical_phase === 'review'
+  const column = asciiLowercase(state.column?.trim() ?? '')
+  if (column === 'review') return true
+  if (['backlog', 'todo', 'ready', 'in progress', 'working', 'done'].includes(column)) return false
+  const name = asciiLowercase(state.name.trim())
+  if (['review', 'merging', 'merge_failed'].includes(name)) return true
+  if (['backlog', 'todo', 'planning', 'in_progress', 'lead_check', 'done', 'cancelled'].includes(name)) return false
+  const gateName = asciiLowercase(state.name)
+  return state.kind === 'gate' && (gateName.includes('review') || gateName.includes('merge'))
+}
+
+/** The server's WorkflowDefinition::outgoing_trigger_targets without the system-only fail and retry. */
+function manualTargets(states: StateDefinition[], from: string): string[] {
+  const index = states.findIndex((state) => state.name === from)
+  if (index < 0) return []
+  const state = states[index]
+  const triggers = state.triggers ?? {}
+  const targets = (['accept', 'reject'] as const).flatMap((trigger) => {
+    const to = triggers[trigger]?.to
+    return to === undefined ? [] : [to]
+  })
+  const next = states[index + 1]
+  if (!triggers.accept && state.kind !== 'terminal' && next) targets.push(next.name)
+  return targets
+}
+
+/** The server's WorkflowDefinition::coordination_planning_state: the lead's state. */
+function coordinationPlanningState(
+  states: StateDefinition[],
+  implementationRole: string | null,
+): StateDefinition | undefined {
+  for (const initial of states.filter((state) => state.kind === 'initial')) {
+    let cursor = initial.name
+    for (let step = 0; step < states.length; step += 1) {
+      const next = manualTargets(states, cursor)
+        .map((target) =>
+          states.find(
+            (state) => state.name === target && (state.kind === 'active' || state.kind === 'gate'),
+          ),
+        )
+        .find((state) => state !== undefined)
+      if (!next || next.kind === 'active') break
+      if (next.canonical_phase !== 'review' && next.role != null) {
+        return next.role !== 'coder' && next.role !== implementationRole ? next : undefined
+      }
+      cursor = next.name
+    }
+  }
+  return undefined
+}
+
+/**
+ * The review run admitted by the server's RootRolePolicy::allows_execution:
+ * `execution_role_for_state` gives the planning state to the lead first, and
+ * any other state whose phase resolves to review to its effective role.
+ */
+function rootCanRunReview(status: string, workflow?: Pick<WorkflowDefinition, 'states'>): boolean {
+  if (!workflow) return status === 'review'
+  const state = workflow.states.find((candidate) => candidate.name === status)
+  if (!state || !hasReviewPhase(state)) return false
+  const implementation = workflow.states.find((candidate) => candidate.name === 'in_progress')
+  const implementationRole =
+    effectiveRole(implementation) ??
+    effectiveRole(workflow.states.find((candidate) => candidate.kind === 'active'))
+  if (coordinationPlanningState(workflow.states, implementationRole)?.name === status) return false
+  const role = effectiveRole(state)
+  return role !== null && role !== 'coder' && role !== implementationRole
+}
+
 /**
  * Whether a root Task holds its runs for its subtasks, so no run can be
  * launched on it by hand. A coordination root runs its lead in the planning
@@ -160,8 +240,9 @@ export function roleAssignmentErrorMessage(error: unknown): string | undefined {
 export function rootHoldsRuns(
   task: Pick<Task, 'parent_task_id' | 'status' | 'effective_lead' | 'condition'>,
   hasSubtasks: boolean,
+  workflow?: Pick<WorkflowDefinition, 'states'>,
 ): boolean {
-  if (task.parent_task_id != null || task.status === 'review') return false
+  if (task.parent_task_id != null || rootCanRunReview(task.status, workflow)) return false
   const condition = task.condition
   const waitsOnSubtasks =
     condition?.kind === 'parked' &&

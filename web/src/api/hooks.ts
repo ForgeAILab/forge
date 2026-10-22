@@ -98,6 +98,7 @@ import type {
   LogEntry,
   McpConfigActionRequest,
   McpConfigResponse,
+  McpEndpointResponse,
   OAuthApproveRequest,
   OAuthApproveResponse,
   OAuthAuthorizeContext,
@@ -1394,9 +1395,26 @@ function browserPublicBaseUrl(): string | undefined {
   return window.location.origin
 }
 
-export function useMcpConfigQuery(agent: string, scope: string, projectId?: string) {
+export function useMcpEndpointQuery(scope: string, projectId?: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.mcpEndpoint(scope, projectId),
+    enabled,
+    queryFn: () =>
+      apiFetch<McpEndpointResponse>('/config/mcp/endpoint', {
+        search: { scope, ...(projectId ? { project_id: projectId } : {}) },
+      }),
+  })
+}
+
+export function useMcpConfigQuery(
+  agent: string,
+  scope: string,
+  projectId?: string,
+  enabled = true,
+) {
   return useQuery({
     queryKey: qk.mcpConfig(agent, scope, projectId),
+    enabled,
     queryFn: () =>
       apiFetch<McpConfigResponse>('/config/mcp', {
         search: {

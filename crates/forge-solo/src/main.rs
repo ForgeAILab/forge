@@ -196,6 +196,9 @@ fn format_startup_error(error: &StartupError) -> String {
         StartupError::Backend(_) => {
             "Solo backend failed; inspect the local Solo log for details".to_owned()
         }
+        StartupError::Db(error @ db::DbError::DatabaseNewerThanBuild { .. }) => {
+            format!("Solo could not open the database: {}", safe_diagnostic(error))
+        }
         StartupError::Db(_) | StartupError::Services(_) | StartupError::Tracing(_) => {
             "Solo startup failed; inspect the local Solo log for details".to_owned()
         }
@@ -221,5 +224,24 @@ fn safe_diagnostic(detail: impl Display) -> String {
         "unspecified error".to_owned()
     } else {
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newer_database_startup_error_is_actionable() {
+        let error = StartupError::Db(db::DbError::DatabaseNewerThanBuild {
+            unknown: vec![(202_610_190_101, "future_schema".to_owned())],
+        });
+
+        let message = format_startup_error(&error);
+        assert!(message.contains("data directory was upgraded by a newer Forge"));
+        assert!(message.contains("V202610190101__future_schema"));
+        assert!(message.contains("Run the newer Forge"));
+        assert!(message.contains("make clean-test"));
+        assert!(!message.contains("inspect the local Solo log"));
     }
 }

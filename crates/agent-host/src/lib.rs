@@ -8,8 +8,11 @@ mod interaction;
 mod lcm;
 mod manifest;
 mod native;
+#[cfg(test)]
+mod network_policy;
 pub mod operation_catalog;
 pub(crate) mod operation_contract;
+pub mod outbound_http;
 mod protected_store;
 mod tool_preview;
 mod transport;
@@ -143,8 +146,9 @@ impl From<agent_runtime::core::event::LimitKind> for AgentTurnLimit {
     }
 }
 
-/// The immutable revision Forge is built and tested against.
-pub const AGENT_RUNTIME_REVISION: &str = "5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894";
+/// The immutable revision Forge is built and tested against. A test checks it
+/// against the `agent-runtime` pin in `Cargo.lock`.
+pub const AGENT_RUNTIME_REVISION: &str = "1de6d7d34d2cfe4fc35791bca440932602539cf7";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

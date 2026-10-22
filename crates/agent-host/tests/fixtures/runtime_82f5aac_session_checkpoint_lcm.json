@@ -1,0 +1,389 @@
+{
+  "forge_revision": "78702e7c",
+  "inserts": [
+    "INSERT INTO agent_lcm_timeline (id,identity_id,scope_type,scope_id,authorization_revision,revision,created_at,updated_at,runtime_session_id,retired_at,canonical_scope_id,claim_owner,claim_generation) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','state-agent','account','credential-owner#topic:state-runtime','b0487b01a70bbe0a5da50201dc017854',11,'2026-10-19T07:17:17.562139+00:00','2026-10-19T07:17:17.620233+00:00','state-runtime',NULL,'credential-owner','state-runtime',0);",
+    "INSERT INTO agent_runtime_lcm_binding (runtime_session_id,timeline_id) VALUES ('state-runtime','c43994ac-49f7-4778-8189-3495693be26f');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:0:c87bb0c0bd78ec8f037747a8f5d39e3f',0,'{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"historical input 0: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history \"}]}','c87bb0c0bd78ec8f037747a8f5d39e3f','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"user_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.570345+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:1:1092e62699546960ac291ebb35a798c0',1,'{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"text\":\"reasoning 0\",\"redacted\":false,\"signature\":\"signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-\",\"producer\":{\"provider\":\"fake\",\"model\":\"fake\"}},{\"type\":\"text\",\"text\":\"historical reply 0: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context \"}]}','1092e62699546960ac291ebb35a798c0','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.576286+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:2:ccf8f27d330c1e107653d7c32ab906d0',2,'{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"historical input 1: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history \"}]}','ccf8f27d330c1e107653d7c32ab906d0','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"user_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.581804+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:3:eed875ed3f7f8595b8ca5474f07a1a48',3,'{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"text\":\"reasoning 1\",\"redacted\":false,\"signature\":\"signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-\",\"producer\":{\"provider\":\"fake\",\"model\":\"fake\"}},{\"type\":\"text\",\"text\":\"historical reply 1: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context \"}]}','eed875ed3f7f8595b8ca5474f07a1a48','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.586851+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:4:01dae1ce17c564db2b212fb64d601f81',4,'{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"historical input 2: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history \"}]}','01dae1ce17c564db2b212fb64d601f81','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"user_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.591722+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:5:6177e2bdfa9a94b9a4375a0774e8aff0',5,'{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"text\":\"reasoning 2\",\"redacted\":false,\"signature\":\"signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-\",\"producer\":{\"provider\":\"fake\",\"model\":\"fake\"}},{\"type\":\"text\",\"text\":\"historical reply 2: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context \"}]}','6177e2bdfa9a94b9a4375a0774e8aff0','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.602511+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:6:733f191d38c9327f240392c6d64215da',6,'{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"historical input 3: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history \"}]}','733f191d38c9327f240392c6d64215da','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"user_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.608826+00:00');",
+    "INSERT INTO agent_lcm_entry (timeline_id,entry_id,sequence,content_json,content_fingerprint,source_json,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:7:a84346ace303328b7310a236fd47e100',7,'{\"role\":\"assistant\",\"content\":[{\"type\":\"reasoning\",\"text\":\"reasoning 3\",\"redacted\":false,\"signature\":\"signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-\",\"producer\":{\"provider\":\"fake\",\"model\":\"fake\"}},{\"type\":\"text\",\"text\":\"historical reply 3: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context \"}]}','a84346ace303328b7310a236fd47e100','{\"classification\":{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}}','2026-10-19T07:17:17.620230+00:00');",
+    "INSERT INTO agent_lcm_node (timeline_id,node_id,kind,range_start,range_end,edges_json,source_fingerprint,summary_revision,summary,policy_revision,algorithm_revision,sizer_revision,provenance_json,token_count,source_token_count,classification_json,revision,superseded_by,operation_id,operation_fingerprint,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','leaf:c43994ac-49f7-4778-8189-3495693be26f:59750d95ab9cd5d4b7d87629571454c6','leaf',0,1,'[{\"Entry\":\"history:0:c87bb0c0bd78ec8f037747a8f5d39e3f\"},{\"Entry\":\"history:1:1092e62699546960ac291ebb35a798c0\"}]','59750d95ab9cd5d4b7d87629571454c6','e276ab09d0023aacc3bc731df440894e','v0.5 resume summary for entries 0 through 1.','fixture-pressure-1','99837127ed1ea47ef4edf42adfc514a6','c6ac7c823fc4bb3c826d9d3e3460706b','{\"Model\":{\"id\":\"fixture-summary\",\"revision\":\"fixture-summary-1\",\"purpose\":\"context.semantic_summary\",\"level\":\"preserve_details\"}}',15,124,'{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}',7,NULL,'leaf:05e365a5b3ac3fbb9955a30f69a7b58a','f859859c657cea8c69b699c93e607262','2026-10-19T07:17:17.595641+00:00');",
+    "INSERT INTO agent_lcm_node (timeline_id,node_id,kind,range_start,range_end,edges_json,source_fingerprint,summary_revision,summary,policy_revision,algorithm_revision,sizer_revision,provenance_json,token_count,source_token_count,classification_json,revision,superseded_by,operation_id,operation_fingerprint,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','leaf:c43994ac-49f7-4778-8189-3495693be26f:a8a49a4f460c4a3c4a15e1b6a7b3bfb0','leaf',2,3,'[{\"Entry\":\"history:2:ccf8f27d330c1e107653d7c32ab906d0\"},{\"Entry\":\"history:3:eed875ed3f7f8595b8ca5474f07a1a48\"}]','a8a49a4f460c4a3c4a15e1b6a7b3bfb0','c563c45d230379d4c9211f26add3a8ef','v0.5 resume summary for entries 2 through 3.','fixture-pressure-1','99837127ed1ea47ef4edf42adfc514a6','c6ac7c823fc4bb3c826d9d3e3460706b','{\"Model\":{\"id\":\"fixture-summary\",\"revision\":\"fixture-summary-1\",\"purpose\":\"context.semantic_summary\",\"level\":\"preserve_details\"}}',15,124,'{\"sensitivity\":\"sensitive\",\"trust\":\"external_content\",\"guard_revision\":null,\"transformation_revision\":null}',10,NULL,'leaf:5dd0b7ff6b794bbc9ab10256a8a51d2e','6c5fff0c5843e2aebeb46cececfc91c6','2026-10-19T07:17:17.612542+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:0:008762751225b65f1f72bd40be514405','append','44bcae98292b5343f382f63bf760042c',2,1,NULL,'2026-10-19T07:17:17.570358+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:1:dc89204c0d2de8870ff266f98169a20a','append','a4e14be29c3e991b1ca46381c5177680',3,1,NULL,'2026-10-19T07:17:17.576288+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:2:b3320ee1c59651d7128e58dd33dc155c','append','155b203e8b4d122d820172d65e1cff56',4,1,NULL,'2026-10-19T07:17:17.581806+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:3:d5c8bbd389905d0de9bca9814cf8ad02','append','889f884febb8f384220af53822972de4',5,1,NULL,'2026-10-19T07:17:17.586854+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:4:ef5d3acbc96d80cab09b8b6ce564d647','append','6579d424335893f8ffd85fe4417730e2',6,1,NULL,'2026-10-19T07:17:17.591724+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','leaf:05e365a5b3ac3fbb9955a30f69a7b58a','leaf','f859859c657cea8c69b699c93e607262',7,0,'leaf:c43994ac-49f7-4778-8189-3495693be26f:59750d95ab9cd5d4b7d87629571454c6','2026-10-19T07:17:17.595643+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:5:de3d043c393449d538611de50ea42cd2','append','bd4b9a48e60c5342e818b4b34f798704',8,1,NULL,'2026-10-19T07:17:17.602514+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:6:c48e9f691911ffaa6812ec725ddfcbde','append','ba89da8a02869fbb15775988209615c2',9,1,NULL,'2026-10-19T07:17:17.608829+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','leaf:5dd0b7ff6b794bbc9ab10256a8a51d2e','leaf','6c5fff0c5843e2aebeb46cececfc91c6',10,0,'leaf:c43994ac-49f7-4778-8189-3495693be26f:a8a49a4f460c4a3c4a15e1b6a7b3bfb0','2026-10-19T07:17:17.612544+00:00');",
+    "INSERT INTO agent_lcm_operation (timeline_id,operation_id,operation_kind,operation_fingerprint,result_revision,result_entries,result_node_id,created_at) VALUES ('c43994ac-49f7-4778-8189-3495693be26f','history:7:b65a08cbb5da69a4f9c24d86a8463882','append','4a625af2140b1189e63af727d140ab54',11,1,NULL,'2026-10-19T07:17:17.620233+00:00');",
+    "INSERT INTO protected_agent_session_state (session_id,snapshot_ciphertext,snapshot_nonce,checkpoint_ciphertext,checkpoint_nonce,checkpoint_turn_id,checkpoint_revision,checkpoint_fingerprint,key_revision,state_revision,updated_at,lcm_policy_revision,snapshot_digest,checkpoint_lcm_policy_revision) VALUES ('state-session',NULL,NULL,X'DAB50EF44236D8630B32286E245124B8F2D34E5405ED5E108D47646C75C8E4455F73852B2F30371A3D2E03B6448ACA32763F83194FD817C63851C02ACEF03F1BB4F69C85CC7443F00BF2B65B7B4BFE397EEA5E3FFE52A0E3AB66F8E2F8282B955F25FA33A290CBCB5DF70A4E37E4E9DCB3E5ABC33501696BB7A416889B8E85C0285C0FE01863F5E842F057BB06AB3ACA4CF0EE60EC40A559AF56CB25F40A4A1F206FF0023FFA8CE2D9354A3E5E7F3E22B71CE70A9A6405B78EA688C85D52586293593CDC2B5018D4A240E177B59952934E4C6311B841B0500550B3FD6B63AB88C2320992F3878E40460BCBFCC481F28E6B045D2BEEEBFFA5C74AE70A0A8F1C7D47E63D07CED9C4B1FD63F9BB4C63F8A719787523ECD3CE6DB02FDD79D76A0F6BE8A2F9A33764C72E6FE9B201A53EC32660F7E540BE5D947BE29FB792D6DCA32F85989609A4260F96CF6B2B14FE59DED328628E041CCA3F8B7DCDAF0A3FD055FF2B7D21463EA1E7B7CF61482EA4377A12E5879C976E08EABF3DA6CBFC45FCDE7A79D13E45A7DAC05068E36DB3493706D369F50948618499E5D418BF486114BBBFB0A3D8F6BE3D2F4D9261FC35CAB23C28186C6A0E448A6EE67162CFB6E097C06243891A3C8DB36D50A09EEB4FE1E583A091181C080665118068FE85D66D4AA94883359F4E0BB080BC2486B7B8C06A8C4BCC076CE0923C91F893FAA7B72EDFC924F585A200A44E47526C93EAB54EA7942A3129B7CAA66103296CD0E463F43F833B323046CE3316355462830C511CCD93580A4DD23EDF08EF9459C99581C5AA2E1D84DE4DB2FB5247B6FF47718C8B7C6ED04499AB63683E5DFC066ED51E6F7001E6E1DADC1B8006FC0C1AA2E82603E65CD3D71095F32959E817A30BE93518C3E0AECB262C305DBDFDA0D7D58B8235C12B036D5864F50F3833D45FF2C9B9AACA76DF82F0BB136682470A1751EB873CB208886BB494E01974BB0442E72286D508D2C5E7B32208B13574A8FED075DF2ADB5030C2D3C9870F10A65E9783135E364DBBF8E378C7DB67FE70B2BC79FA2B0EA0FC5116F3C1F7F337E7173D85F18087CFA5DF0A8149B6830C10FE4BFD887E9A62BADEFCDADA58A4861E571D6D40A4FA57174D970D6F98B10D4D98DC41CE094011054300C228E5F2023E962C8BE8D7B633E464ACC94DD1538E302885EBEE497CC2B62AE352BC9C4D73BB0DA83321186BBF29FD40DD85D890D76586DF94B35C0EA9251A6BD0A53806CCA5EB14C955FE9B018BC0DC6BB04CD71C947E01AC137194B57D0C0DCE42FC7A4904B6455A5BCA42945458D5012BB099C94119F691F22424D7E36FBA25C6060AA2D9AC411DF568177BDD31D37B8A1B8DC7638F179BEF32A16368683817ACFB14AF41208E38BBCD7AA985D05BC56575967F7C4F51233D23E2F869C4DBAE98AD567B2CAF3FAED1C00DD26509DAADB09CDAE3D6DF78AD0E3E7962BC0CDFABB98AE2A814E0095E63BA8C3DD1AA7F3D39C39E6D001CECB0C5D51247DA729B7E526FAF16A472084BEDA3D6C0C2AF8FC4BF71D6A714F4B49448485F19654858DAF420A9B7827368D0AC0371CF824835EFABE66AC973C0BA69CA6272B927287BCCB5F0C560DBE7F5621B509C2993D853D3F547BF9A2DF6A2685A039558E05E35C4EEDF1D16ACBABB79B54BEF208806D1B4B4838DAD5A5DB030372519F0F13417590D325EBC1CC5F88616F96501AFA67CF61D4A8A117152D40B5F9AF3154D7BDAFB97B57B9E5C4B603BB9540466C3085A73FB7E1470179B6FC7E107E6D7D6AD955A4DF7CCB3AA8A396751B37FE2B7A2B1CF0FFB2AAF20F8BBD6B03285212A68B17786287C9CEF00508823AAA9E8704E774E06349B89CD3DEFF2281983E01C262215E5BF638A84320A8671F98DDD0B399A54AE2CB5BC8DA2324429B16F4A483C4FCAB5C1A75705507443E71DD7F2E17603983BFAD43DE3F414CA46427D8624F6B2389971DB0E60090F3544D0A5C6A4661303BAA7EE246FC733B22EE688603EA1748D9DE840D6856656DA30C6FE0788BCA0AEB90EFDA176D14A619D87244B3297EC200CF84BC9F39F91CFC3379B56D3BB4E627EDC7F6314372AEF73E8BF1871122E31D45B7B231DD88C6FA15C1E270D380BAB15F27FE9FD2A084EFC18933952814426CDC1E1FA8FC4ED9A3AF377B99C9F81BD653D432878181DA28678D8317F5B516C869437F3DEDC31F8FC7972C117C54ECA2067C63B673F36EE3305C603CE3F3FA29D93216293C13B770C087128A1D5D3231387EADCB3A6673B18E5B813D7577ED91014A344805EDF9F0C0C0F69024B572A1DFBE857F01B0E115757391F17F73FADDD728193462640E1520F368AFDE4B00FD759EF54686F305FBFF29E707DD2F28BB7886492613A0610A3C38899ED03F3038E08958A70670703F6543EE8DC7D3F2C6A09443CF719185563FC04CF1128FFD5661AC5BD311D8658555419A5CB6C0AAED1560CE6C2E59BC8F5E7B0CDE6D81EFB6799EF783A0E32F61E78BEEE561081745035CB3BA48D93EC630803F4B9DB337405B99CB5C637586DDBF73A7D3E7ED014B251BB7ACDCAA67B9ABDED183BCC1ADDC4293D2C2462A4F1DF466DFC62310C02190CD6E42F0B35C7CB528A909AC48BCB7BCB70C7058E6F2D060662CD0B1803F38732431E32BF656E07D96E63135E963A3E32C23398205FA10CA6ADFDDAC64D87DBB01AF62DAA2906F48E2BEF593B130BBBA6AD8543444699824314A0284147E5A408CB3488F310CE6257EDC80B78852FB8A807951DB030E09CB3A431783956D55D06E63B79A4E81C7E2D1B6A95BCEDBFFD27B22D6CC9E1CC354A53F292A9828A965D417C6ED9711E631870E95D15804959BDAF24C87C772A02036209F075BDD34800B050DEE32D9ACF6B51D843E0361C40A85CB12396506A89892E07E407AE24CF6481F71038D086A1A7E6EBBAE1B19F9B6B60FD8086B758083F7A468E3EABF253B6049DCF7E4B5C78CEB205975ED27EFF1DD9B65BD0498E61',X'C89CEA41FDDB2B5A7C802184998CB3E691EA4758826873B4','turn-4',7,'9b617f0378a8fd7e0d7217d3ec4937af',1,34,'2026-10-19T07:17:17.624549+00:00','forge-lcm-policy-2','88d99f3d91c8561bc1c13c0023dee22141e7043603f273ea4f6dd9ff91ebbfe9','forge-lcm-policy-2');"
+  ],
+  "producer_revision": "82f5aac57a3b1012b4e96c1903f0ab4a0f00a625",
+  "runtime_version": "0.5.0",
+  "snapshot": {
+    "extension_state": {
+      "agent-runtime.cache-mechanism": {
+        "revision": "cache-mechanism-1",
+        "sensitivity": "sensitive",
+        "value": {
+          "identities": {},
+          "operation_fingerprints": {},
+          "operations": [],
+          "results": {}
+        }
+      },
+      "harness.lcm": {
+        "revision": "df66f2bd9e4f43e07789f33b6943af88",
+        "sensitivity": "sensitive",
+        "value": {
+          "active_nodes": [
+            {
+              "algorithm_revision": "99837127ed1ea47ef4edf42adfc514a6",
+              "classification": {
+                "guard_revision": null,
+                "sensitivity": "sensitive",
+                "transformation_revision": null,
+                "trust": "external_content"
+              },
+              "id": "leaf:c43994ac-49f7-4778-8189-3495693be26f:59750d95ab9cd5d4b7d87629571454c6",
+              "operation_fingerprint": "f859859c657cea8c69b699c93e607262",
+              "operation_id": "leaf:05e365a5b3ac3fbb9955a30f69a7b58a",
+              "policy_revision": "fixture-pressure-1",
+              "provenance": {
+                "Model": {
+                  "id": "fixture-summary",
+                  "level": "preserve_details",
+                  "purpose": "context.semantic_summary",
+                  "revision": "fixture-summary-1"
+                }
+              },
+              "range": {
+                "end": 1,
+                "start": 0
+              },
+              "revision": 7,
+              "sizer_revision": "c6ac7c823fc4bb3c826d9d3e3460706b",
+              "source_fingerprint": "59750d95ab9cd5d4b7d87629571454c6",
+              "source_token_count": 124,
+              "summary_revision": "e276ab09d0023aacc3bc731df440894e",
+              "token_count": 15
+            },
+            {
+              "algorithm_revision": "99837127ed1ea47ef4edf42adfc514a6",
+              "classification": {
+                "guard_revision": null,
+                "sensitivity": "sensitive",
+                "transformation_revision": null,
+                "trust": "external_content"
+              },
+              "id": "leaf:c43994ac-49f7-4778-8189-3495693be26f:a8a49a4f460c4a3c4a15e1b6a7b3bfb0",
+              "operation_fingerprint": "6c5fff0c5843e2aebeb46cececfc91c6",
+              "operation_id": "leaf:5dd0b7ff6b794bbc9ab10256a8a51d2e",
+              "policy_revision": "fixture-pressure-1",
+              "provenance": {
+                "Model": {
+                  "id": "fixture-summary",
+                  "level": "preserve_details",
+                  "purpose": "context.semantic_summary",
+                  "revision": "fixture-summary-1"
+                }
+              },
+              "range": {
+                "end": 3,
+                "start": 2
+              },
+              "revision": 10,
+              "sizer_revision": "c6ac7c823fc4bb3c826d9d3e3460706b",
+              "source_fingerprint": "a8a49a4f460c4a3c4a15e1b6a7b3bfb0",
+              "source_token_count": 124,
+              "summary_revision": "c563c45d230379d4c9211f26add3a8ef",
+              "token_count": 15
+            }
+          ],
+          "algorithm_revision": "99837127ed1ea47ef4edf42adfc514a6",
+          "binding_revision": "b0487b01a70bbe0a5da50201dc017854",
+          "claim_generation": 0,
+          "classifier_revision": "f48d9550425d5621a08c3a48c48e19bd",
+          "content_guard_id": null,
+          "content_guard_revision": null,
+          "dag_revision": 11,
+          "fixed_overhead_tokens": 98,
+          "hard_round_limit": 0,
+          "hard_rounds": 0,
+          "history_fingerprint": "e67d44fa01683e370dfdda02bb241139",
+          "history_len": 8,
+          "immutable_frontier": 7,
+          "model_id": "fixture-summary",
+          "model_purpose": "context.semantic_summary",
+          "model_revision": "fixture-summary-1",
+          "operation_watermarks": [
+            {
+              "operation_fingerprint": "f859859c657cea8c69b699c93e607262",
+              "operation_id": "leaf:05e365a5b3ac3fbb9955a30f69a7b58a",
+              "revision": 7
+            },
+            {
+              "operation_fingerprint": "6c5fff0c5843e2aebeb46cececfc91c6",
+              "operation_id": "leaf:5dd0b7ff6b794bbc9ab10256a8a51d2e",
+              "revision": 10
+            }
+          ],
+          "pending_summary": null,
+          "policy_revision": "fixture-pressure-1",
+          "schema_version": 1,
+          "sizer_revision": "c6ac7c823fc4bb3c826d9d3e3460706b",
+          "source_classification": {
+            "guard_revision": null,
+            "sensitivity": "sensitive",
+            "transformation_revision": null,
+            "trust": "external_content"
+          },
+          "store_revision": "forge-sqlite-lcm-1",
+          "summary_policy_revision": "fixture-pressure-1",
+          "timeline_id": "c43994ac-49f7-4778-8189-3495693be26f"
+        }
+      },
+      "runtime.core.previous_cache": {
+        "revision": "previous-cache-state-1",
+        "sensitivity": "redaction_safe",
+        "value": {
+          "changed_segments": [
+            "lcm-node:c43994ac-49f7-4778-8189-3495693be26f:leaf:c43994ac-49f7-4778-8189-3495693be26f:59750d95ab9cd5d4b7d87629571454c6",
+            "lcm-node:c43994ac-49f7-4778-8189-3495693be26f:leaf:c43994ac-49f7-4778-8189-3495693be26f:a8a49a4f460c4a3c4a15e1b6a7b3bfb0",
+            "history:4",
+            "history:5",
+            "history:6"
+          ],
+          "declared_stable_prefix_len": 0,
+          "has_comparable_predecessor": false,
+          "identity": "fa1d886e2f94b186f07d62a100744f14",
+          "invalidated_tokens": 300,
+          "local_compiled_context_key": "a2570175b43b25e3c0f64d00ac81dc27",
+          "preserved_prefix_len": 0,
+          "preserved_prefix_tokens": 0,
+          "provider_baseline_available": false,
+          "provider_cache": {
+            "capability": {
+              "contract": {
+                "behavior": "unsupported",
+                "evidence": {
+                  "cache_scoped_errors": false,
+                  "resource_operations": false,
+                  "stream": false
+                },
+                "retention": {
+                  "read_refreshes": false,
+                  "write_refreshes": false
+                }
+              },
+              "provider": "unspecified",
+              "revision": "no-provider-cache-1",
+              "supports_ephemeral": false,
+              "supports_stable": false
+            },
+            "unsupported": [
+              "stable",
+              "ephemeral"
+            ]
+          },
+          "segments": [
+            {
+              "cache_class": "ephemeral",
+              "content_hash": "8f985448c7d4dd9ac9cb22f01407ad37",
+              "fragment": "lcm-node:c43994ac-49f7-4778-8189-3495693be26f:leaf:c43994ac-49f7-4778-8189-3495693be26f:59750d95ab9cd5d4b7d87629571454c6",
+              "tokens": 64
+            },
+            {
+              "cache_class": "ephemeral",
+              "content_hash": "35ff3dcc04e5189f1ce14154de744152",
+              "fragment": "lcm-node:c43994ac-49f7-4778-8189-3495693be26f:leaf:c43994ac-49f7-4778-8189-3495693be26f:a8a49a4f460c4a3c4a15e1b6a7b3bfb0",
+              "tokens": 64
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "b9defabfa3e57e0f1d102dc14821cf23",
+              "fragment": "history:4",
+              "tokens": 48
+            },
+            {
+              "cache_class": "stable",
+              "content_hash": "6436680db54df31a6dfa8782ec5f340a",
+              "fragment": "history:5",
+              "tokens": 76
+            },
+            {
+              "cache_class": "ephemeral",
+              "content_hash": "a8a03ce053c800ac990c67e759bb86b3",
+              "fragment": "history:6",
+              "tokens": 48
+            }
+          ]
+        }
+      },
+      "runtime.manifest_boundary": {
+        "revision": "manifest-boundary-1",
+        "sensitivity": "redaction_safe",
+        "value": {
+          "planned_steps": 4,
+          "schema_version": 1
+        }
+      }
+    },
+    "history": [
+      {
+        "content": [
+          {
+            "text": "historical input 0: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history ",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "producer": {
+              "model": "fake",
+              "provider": "fake"
+            },
+            "redacted": false,
+            "signature": "signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-",
+            "text": "reasoning 0",
+            "type": "reasoning"
+          },
+          {
+            "text": "historical reply 0: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context ",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "historical input 1: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history ",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "producer": {
+              "model": "fake",
+              "provider": "fake"
+            },
+            "redacted": false,
+            "signature": "signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-",
+            "text": "reasoning 1",
+            "type": "reasoning"
+          },
+          {
+            "text": "historical reply 1: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context ",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "historical input 2: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history ",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "producer": {
+              "model": "fake",
+              "provider": "fake"
+            },
+            "redacted": false,
+            "signature": "signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-",
+            "text": "reasoning 2",
+            "type": "reasoning"
+          },
+          {
+            "text": "historical reply 2: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context ",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "historical input 3: keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history keep history ",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "producer": {
+              "model": "fake",
+              "provider": "fake"
+            },
+            "redacted": false,
+            "signature": "signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-signed-history-",
+            "text": "reasoning 3",
+            "type": "reasoning"
+          },
+          {
+            "text": "historical reply 3: durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context durable context ",
+            "type": "text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "id": "state-runtime",
+    "identity": {
+      "attempt": 4,
+      "event": 62,
+      "event_seq": 62,
+      "request": 4,
+      "steer": 0,
+      "tool_call": 0,
+      "turn": 4
+    },
+    "updated": 1792394237622,
+    "usage": [
+      {
+        "delta": {
+          "input_uncached": 120,
+          "output": 10
+        },
+        "provenance": {
+          "failed": false,
+          "purpose": "context.semantic_summary"
+        },
+        "source": "semantic_summary"
+      },
+      {
+        "delta": {
+          "input_uncached": 120,
+          "output": 10
+        },
+        "provenance": {
+          "failed": false,
+          "purpose": "context.semantic_summary"
+        },
+        "source": "semantic_summary"
+      }
+    ]
+  }
+}

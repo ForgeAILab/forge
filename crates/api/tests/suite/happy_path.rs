@@ -5,10 +5,10 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, CreateTerminalSessionResponse, DaemonRegisterResponse, DaemonResponse,
-    ExecutionStatus, ExecutionSummaryResponse, PaginatedResponse, ProjectResponse, RepoResponse,
-    TaskResponse, TaskStatus, TerminalAttachTokenResponse, TerminalServerFrame,
-    TerminalSessionResponse, TerminalSessionStatus,
+    AgentResponse, CreateTerminalSessionResponse, ExecutionStatus, ExecutionSummaryResponse,
+    PaginatedResponse, ProjectResponse, RepoResponse, TaskResponse, TaskStatus,
+    TerminalAttachTokenResponse, TerminalServerFrame, TerminalSessionResponse,
+    TerminalSessionStatus,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -20,6 +20,9 @@ use events::{EventBus, EventContext, ForgeEvent, PROJECT_HOOK_RUN_CHANGED_EVENT}
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tower::ServiceExt;
+
+#[path = "happy_path/recheck_review.rs"]
+mod recheck_review;
 
 #[tokio::test]
 async fn open_item_4_durable_task_command_error_keeps_its_rest_status_and_fields() {
@@ -163,7 +166,7 @@ async fn forge_happy_path_end_to_end() {
         Some(repo_path.to_string_lossy().as_ref())
     );
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -473,7 +476,7 @@ async fn autonomous_workflow_requires_human_review_and_resumes_worker_on_reject(
     )
     .await;
 
-    let daemon_id = register_daemon_and_report_shell(&harness.app, workspaces_root.path()).await;
+    let daemon_id = register_daemon_and_report_shell(&harness.state, workspaces_root.path()).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -720,7 +723,7 @@ async fn test_app_with_registry(
     .await
     .expect("seed test user");
     let adapter_registry = Arc::new(registry);
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(EventBus::new(256));
@@ -913,46 +916,10 @@ async fn setup_git_repo(path: &Path) -> std::path::PathBuf {
     repo_path
 }
 
-async fn register_daemon_and_report_shell(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": "happy-path-host",
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "happy-path-test",
-            "labels": { "suite": "happy_path" }
-        }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
-
-    daemon_id
+async fn register_daemon_and_report_shell(state: &AppState, workspace_root: &Path) -> String {
+    common::register_embedded_daemon(state, workspace_root, "happy-path-host", "shell")
+        .await
+        .daemon_id
 }
 
 async fn poll_until_execution_completed(db: &Arc<db::SqliteDb>, execution_id: &str) {
@@ -1296,8 +1263,13 @@ async fn single_machine_environment_recheck_resumes_task_dispatch() {
     let harness = test_app(root.path()).await;
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Environment smoke", &repo).await;
-    let (agent_id, _) =
-        common::create_shell_agents(&harness.app, root.path(), "environment-smoke").await;
+    let (agent_id, _) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        root.path(),
+        "environment-smoke",
+    )
+    .await;
     let agent: AgentResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -1563,7 +1535,7 @@ async fn root_lead_kickoff_returned_step_and_aggregate_review_finish() {
         StatusCode::OK,
     )
     .await;
-    let daemon = register_daemon_and_report_shell(&harness.app, workspaces.path()).await;
+    let daemon = register_daemon_and_report_shell(&harness.state, workspaces.path()).await;
     let worker: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -1771,7 +1743,7 @@ async fn repair_release_project(
     )
     .await;
     let repo: RepoResponse = json_request(&harness.app, Method::POST, &format!("/api/v1/projects/{}/repos", project.id), json!({"name":"repo","local_path":repo_path.to_string_lossy(),"remote_url":repo_path.to_string_lossy(),"default_branch":"main"}), StatusCode::OK).await;
-    let daemon = register_daemon_and_report_shell(&harness.app, workspaces).await;
+    let daemon = register_daemon_and_report_shell(&harness.state, workspaces).await;
     let agent: AgentResponse = json_request(
         &harness.app,
         Method::POST,
@@ -1789,6 +1761,99 @@ async fn repair_release_project(
     )
     .await;
     (project, agent)
+}
+
+#[tokio::test]
+async fn renamed_review_gate_runs_agent_review_and_merges() {
+    let repo_dir = common::TestDir::new("renamed-review-repo");
+    let repo_path = setup_git_repo(repo_dir.path()).await;
+    let workspaces = common::TestDir::new("renamed-review-workspaces");
+    let harness = test_app(workspaces.path()).await;
+    let (project, agent) = repair_release_project(&harness, &repo_path, workspaces.path()).await;
+    let mut workflow = services::workflow::default_workflow::default_workflow();
+    workflow.configuration.clear();
+    for state in &mut workflow.states {
+        for trigger in state.triggers.values_mut() {
+            if trigger.to == "review" {
+                trigger.to = "qa_review".into();
+            }
+        }
+        if state.name == "review" {
+            state.name = "qa_review".into();
+        }
+    }
+    let _: api_types::WorkflowDefinition = json_request(
+        &harness.app,
+        Method::PUT,
+        &format!("/api/v1/projects/{}/workflow", project.id),
+        json!({"definition":workflow}),
+        StatusCode::OK,
+    )
+    .await;
+    let review_prompt = r#"test -f greeting.txt && printf '%s\n' 'Checked greeting.txt and its required CI check.' '{"result":"pass","reason":"The greeting file satisfies the deliverable"}'"#;
+    let task: TaskResponse = json_request(
+        &harness.app, Method::POST,
+        &format!("/api/v1/projects/{}/tasks", project.id),
+        json!({"title":"Deliver through a renamed review gate",
+            "description":"printf 'hello\\n' > greeting.txt && git add greeting.txt && git commit -m greeting",
+            "review_config":{"review_prompt":review_prompt,"ci_steps":["test -f greeting.txt"]}}),
+        StatusCode::OK,
+    ).await;
+    let _: TaskResponse = json_request(
+        &harness.app,
+        Method::POST,
+        &format!("/api/v1/tasks/{}/claim", task.id),
+        json!({"agent_id":agent.id}),
+        StatusCode::OK,
+    )
+    .await;
+    let completed = drain_until_task_status(&harness, &task.id, "done".into()).await;
+    assert_eq!(completed.status, "done");
+    let reviews = ReviewRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].status, db::ReviewStatus::Passed);
+    let reviewer = db::ExecutionRepo::get_by_id(
+        &*harness.state.db,
+        reviews[0]
+            .reviewer_execution_id
+            .as_deref()
+            .expect("agent reviewer ran"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(reviewer.status, db::ExecutionStatus::Completed);
+    assert_eq!(reviewer.role, "reviewer");
+    let details: Value = serde_json::from_str(&reviews[0].step_results_json).unwrap();
+    assert_eq!(details["ci_steps"][0]["exit_code"], 0, "{details}");
+    let entries = db::TransitionLogRepo::list_by_task(&*harness.state.db, &task.id)
+        .await
+        .unwrap();
+    for (from, to) in [
+        ("in_progress", "qa_review"),
+        ("qa_review", "merging"),
+        ("merging", "done"),
+    ] {
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.from_state == from && entry.to_state == to),
+            "{entries:?}"
+        );
+    }
+    assert_eq!(run_git(&repo_path, &["show", "HEAD:greeting.txt"]), "hello");
+    let merged: String = sqlx::query_scalar(
+        "SELECT integrated_sha FROM integration_attempt WHERE task_ref=? AND state='completed'",
+    )
+    .bind(&task.id)
+    .fetch_one(harness.state.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(merged, run_git(&repo_path, &["rev-parse", "HEAD"]));
+    assert_task_conditions_match_legacy(&harness.state.db).await;
+    common::assert_scheduler_clean(&harness.state).await;
 }
 
 #[tokio::test]

@@ -793,6 +793,7 @@ export interface Project {
   id: string
   name: string
   primary_repo_id: string | null
+  owner_id: string | null
   settings: Record<string, unknown>
   project_hooks?: ProjectHookRule[]
   default_review_config?: ReviewConfig | null

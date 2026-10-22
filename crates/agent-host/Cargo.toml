@@ -10,10 +10,12 @@ operation-registry = { path = "../operation-registry" }
 agent-runtime.workspace = true
 async-trait = "0.1"
 chacha20poly1305 = "0.10"
+config = { path = "../config" }
 db = { path = "../db" }
 api-types = { path = "../api-types" }
 executors = { path = "../executors" }
 futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["client-proxy"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
@@ -47,6 +49,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+process-supervisor = { path = "../process-supervisor" }
 db = { path = "../db", features = ["test-template"] }
 jsonschema = { version = "0.28", default-features = false }
 tempfile = "3"

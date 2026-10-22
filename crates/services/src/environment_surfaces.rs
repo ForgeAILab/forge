@@ -784,6 +784,41 @@ mod tests {
             unreachable!()
         }
     }
+
+    async fn shell_agent(db: &SqliteDb) -> db::Agent {
+        let now = db::now_rfc3339();
+        db::AgentRepo::create(
+            db,
+            db::CreateAgent {
+                id: db::new_uuid_v4(),
+                name: "Shell fixture".to_owned(),
+                description: None,
+                executor_type: "shell".to_owned(),
+                model: None,
+                reasoning_effort: None,
+                permission_policy: None,
+                prompt_template: None,
+                capabilities_json: "[]".to_owned(),
+                config_json: "{}".to_owned(),
+                credential_ref: None,
+                daemon_id: None,
+                max_concurrent_tasks: 1,
+                heartbeat_interval_seconds: 30,
+                max_missed_heartbeats: 3,
+                status: db::AgentStatus::Idle,
+                last_heartbeat_at: None,
+                is_default: true,
+                paused: false,
+                owner_id: None,
+                visibility: "global".to_owned(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn paused_agent_pages_skip_unused_cli_probes() {
         use std::sync::{
@@ -793,13 +828,7 @@ mod tests {
         let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
         db::run_migrations(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
-        let fixture_registry = cli_adapters::test_support::test_registry();
-        let mut agent = crate::ensure_default_agents(&db, &fixture_registry)
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|agent| agent.executor_type == "shell")
-            .unwrap();
+        let mut agent = shell_agent(&db).await;
         agent.paused = true;
         agent.daemon_id = None;
         let probes = Arc::new(AtomicUsize::new(0));
@@ -841,11 +870,7 @@ mod tests {
         db::run_migrations(&pool).await.unwrap();
         let db = SqliteDb::new(pool);
         let registry = cli_adapters::test_support::test_registry();
-        let agents = crate::ensure_default_agents(&db, &registry).await.unwrap();
-        let mut shell = agents
-            .into_iter()
-            .find(|agent| agent.executor_type == "shell")
-            .unwrap();
+        let mut shell = shell_agent(&db).await;
         shell.id = "shell".into();
         sqlx::query("INSERT INTO daemon (id,machine_id,hostname,os,arch,status,detected_clis_json,created_at,updated_at) VALUES ('host',?,'Host','linux','x86_64','online','[]','now','now'),('remote','remote-machine','Remote','linux','x86_64','online',?,'now','now')")
             .bind(db.server_run_cap.embedded_machine_id()).bind(serde_json::json!([{"kind":"shell","availability":"authenticated"}]).to_string()).execute(db.pool()).await.unwrap();

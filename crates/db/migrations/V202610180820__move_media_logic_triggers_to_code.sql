@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS project_media_attachment_gc_guard_after_insert;
+DROP TRIGGER IF EXISTS project_release_media_pin_gc_guard_after_insert;
+DROP TRIGGER IF EXISTS task_media_project_asset_after_insert;
+DROP TRIGGER IF EXISTS task_media_project_attachment_after_delete;

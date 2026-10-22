@@ -6,6 +6,30 @@ use db::{
 };
 use sqlx::SqlitePool;
 
+type ProjectedAssetRow = (
+    String,
+    Option<String>,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+);
+type DeletedAssetRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i64,
+    String,
+);
+
 async fn fixture() -> (SqliteDb, String, String) {
     let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
@@ -233,6 +257,264 @@ async fn create_release(db: &SqliteDb, project_id: &str) {
     .execute(db.pool())
     .await
     .expect("release");
+}
+
+#[tokio::test]
+async fn media_projection_rows_versions_and_rollback_match_trigger_contract() {
+    let (db, project_id, task_id) = fixture().await;
+    let created_at = "2026-10-18T08:20:00Z";
+    let deleted_at = "2026-10-18T08:21:00Z";
+    let checksum = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+    sqlx::query(
+        "INSERT INTO media_asset (
+            id, project_id, display_filename, content_type, byte_size, storage_key,
+            checksum, availability, gc_state, gc_candidate_at, gc_lease_owner,
+            gc_lease_expires_at, version, created_at, updated_at
+         ) VALUES (
+            'shared-storage-asset', ?, 'shared-original.png', 'image/png', 4,
+            'shared/storage-key', ?, 'available', 'gc_candidate',
+            '2026-10-18T08:00:00Z', 'stale-worker', '2026-10-18T08:10:00Z',
+            7, '2026-10-18T08:00:00Z', '2026-10-18T08:00:00Z'
+         )",
+    )
+    .bind(&project_id)
+    .bind(checksum)
+    .execute(db.pool())
+    .await
+    .expect("shared storage asset inserts");
+
+    let media = TaskMediaRepo::create_media(
+        &db,
+        CreateTaskMedia {
+            id: "duplicate-storage-task-media".to_owned(),
+            task_id: task_id.clone(),
+            display_filename: "task-proof.png".to_owned(),
+            content_type: "image/png".to_owned(),
+            byte_size: 4,
+            storage_key: "shared/storage-key".to_owned(),
+            author_type: CommentAuthorType::User,
+            author_id: Some("user-media".to_owned()),
+            author_name: "Tester".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("Task media projects onto the existing storage asset");
+    let mapped_asset_id: Option<String> =
+        sqlx::query_scalar("SELECT asset_id FROM task_media WHERE id = ?")
+            .bind(&media.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("Task media asset mapping");
+    assert_eq!(mapped_asset_id.as_deref(), Some("shared-storage-asset"));
+    let projected_asset: ProjectedAssetRow = sqlx::query_as(
+        "SELECT id, legacy_task_media_id, display_filename, content_type, byte_size,
+                gc_state, availability, gc_candidate_at, gc_lease_owner,
+                gc_lease_expires_at, version, updated_at
+         FROM media_asset WHERE id = 'shared-storage-asset'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("projected asset reads");
+    assert_eq!(
+        projected_asset,
+        (
+            "shared-storage-asset".to_owned(),
+            None,
+            "shared-original.png".to_owned(),
+            "image/png".to_owned(),
+            4,
+            "referenced".to_owned(),
+            "available".to_owned(),
+            None,
+            None,
+            None,
+            8,
+            created_at.to_owned(),
+        )
+    );
+    let attachment_identity: (String, String, String, String, String, String, String) =
+        sqlx::query_as(
+            "SELECT id, project_id, asset_id, attachment_kind, task_media_id, task_id,
+                    acceptance_check_ids_json
+             FROM project_media_attachment
+             WHERE task_media_id = 'duplicate-storage-task-media'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("Task attachment identity reads");
+    assert_eq!(
+        attachment_identity,
+        (
+            "task-media-attachment:duplicate-storage-task-media".to_owned(),
+            project_id.clone(),
+            "shared-storage-asset".to_owned(),
+            "task".to_owned(),
+            "duplicate-storage-task-media".to_owned(),
+            task_id.clone(),
+            "[]".to_owned(),
+        )
+    );
+    let attachment_state: (String, Option<String>, String, i64, String, String) = sqlx::query_as(
+        "SELECT evidence_kind, deleted_at, availability, version, created_at, updated_at
+         FROM project_media_attachment
+         WHERE task_media_id = 'duplicate-storage-task-media'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("Task attachment reads");
+    assert_eq!(
+        attachment_state,
+        (
+            "screenshot".to_owned(),
+            None,
+            "available".to_owned(),
+            1,
+            created_at.to_owned(),
+            created_at.to_owned(),
+        )
+    );
+
+    TaskMediaRepo::soft_delete_media(&db, &media.id, deleted_at)
+        .await
+        .expect("Task media soft deletes");
+    let deleted_asset: DeletedAssetRow = sqlx::query_as(
+        "SELECT gc_state, gc_candidate_at, deleted_at, gc_lease_owner,
+                gc_lease_expires_at, version, updated_at
+         FROM media_asset WHERE id = 'shared-storage-asset'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("soft-deleted asset reads");
+    assert_eq!(
+        deleted_asset,
+        (
+            "gc_candidate".to_owned(),
+            Some(deleted_at.to_owned()),
+            Some(deleted_at.to_owned()),
+            None,
+            None,
+            9,
+            deleted_at.to_owned(),
+        )
+    );
+    let deleted_attachment: (String, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT availability, deleted_at, version, updated_at
+         FROM project_media_attachment
+         WHERE task_media_id = 'duplicate-storage-task-media'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("soft-deleted attachment reads");
+    assert_eq!(
+        deleted_attachment,
+        (
+            "purged".to_owned(),
+            Some(deleted_at.to_owned()),
+            2,
+            deleted_at.to_owned(),
+        )
+    );
+
+    create_release(&db, &project_id).await;
+    let pinned_media = upload(&db, &task_id, "single-bump-pinned").await;
+    SharedMediaRepo::create_project_release_media_pin(
+        &db,
+        CreateProjectReleaseMediaPin {
+            id: "single-bump-pin".to_owned(),
+            project_id: project_id.clone(),
+            release_id: "release-media".to_owned(),
+            asset_id: pinned_media.id.clone(),
+            attachment_id: None,
+            legacy_task_media_id: Some(pinned_media.id.clone()),
+            asset_checksum: checksum.to_owned(),
+            attachment_digest: "single-bump-attachment".to_owned(),
+            availability: "available".to_owned(),
+            pin_digest: "single-bump-pin-digest".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await
+    .expect("release pin creates");
+    let version_before_delete: i64 =
+        sqlx::query_scalar("SELECT version FROM media_asset WHERE id = ?")
+            .bind(&pinned_media.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("pinned version before delete");
+    TaskMediaRepo::soft_delete_media(&db, &pinned_media.id, deleted_at)
+        .await
+        .expect("pinned Task media soft deletes");
+    let pinned_state: (String, Option<String>, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT gc_state, gc_candidate_at, deleted_at, version, updated_at
+         FROM media_asset WHERE id = ?",
+    )
+    .bind(&pinned_media.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("pinned asset state");
+    assert_eq!(
+        pinned_state,
+        (
+            "referenced".to_owned(),
+            None,
+            None,
+            version_before_delete + 1,
+            deleted_at.to_owned(),
+        ),
+        "an immutable release pin wins and soft delete bumps the asset once"
+    );
+
+    sqlx::raw_sql(
+        "CREATE TRIGGER fail_task_media_projection
+         BEFORE INSERT ON project_media_attachment
+         WHEN NEW.task_media_id = 'rollback-task-media'
+         BEGIN SELECT RAISE(ABORT, 'injected Task media projection failure'); END;",
+    )
+    .execute(db.pool())
+    .await
+    .expect("projection failpoint installs");
+    let failed = TaskMediaRepo::create_media(
+        &db,
+        CreateTaskMedia {
+            id: "rollback-task-media".to_owned(),
+            task_id,
+            display_filename: "rollback.png".to_owned(),
+            content_type: "image/png".to_owned(),
+            byte_size: 4,
+            storage_key: "rollback/storage-key".to_owned(),
+            author_type: CommentAuthorType::User,
+            author_id: Some("user-media".to_owned()),
+            author_name: "Tester".to_owned(),
+            created_at: created_at.to_owned(),
+        },
+    )
+    .await;
+    assert!(failed.is_err());
+    let rolled_back: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+           (SELECT COUNT(*) FROM task_media WHERE id = 'rollback-task-media'),
+           (SELECT COUNT(*) FROM media_asset WHERE id = 'rollback-task-media'),
+           (SELECT COUNT(*) FROM project_media_attachment
+            WHERE task_media_id = 'rollback-task-media')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("projection rollback counts");
+    assert_eq!(rolled_back, (0, 0, 0));
+
+    let moved_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+            'project_media_attachment_gc_guard_after_insert',
+            'project_release_media_pin_gc_guard_after_insert',
+            'task_media_project_asset_after_insert',
+            'task_media_project_attachment_after_delete'
+         )",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("trigger catalog");
+    assert_eq!(moved_triggers, 0);
 }
 
 #[tokio::test]
@@ -1103,3 +1385,296 @@ async fn queued_gc_is_restartable_and_rejects_new_typed_references() {
 // of a non-migrated connection obvious if the fixture is ever simplified.
 #[allow(dead_code)]
 fn _pool_type(_: &SqlitePool) {}
+
+/// First migration that drops a logic trigger; everything before it still
+/// carries the five legacy trigger families the parity tests use as oracle.
+const LEGACY_TRIGGER_CUTOFF: &str = "V202610180752";
+
+/// A database at the schema just before the logic-trigger drops, so the
+/// legacy media triggers still fire.
+async fn legacy_trigger_database(name: &str) -> SqliteDb {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let target = std::env::temp_dir().join(format!(
+        "forge-media-trigger-parity-{name}-{}",
+        db::new_uuid_v4()
+    ));
+    std::fs::create_dir_all(&target).expect("legacy migration dir");
+    for entry in std::fs::read_dir(&source).expect("migrations read") {
+        let entry = entry.expect("migration entry");
+        let file = entry
+            .file_name()
+            .into_string()
+            .expect("utf-8 migration name");
+        if file.ends_with(".sql") && file.as_str() < LEGACY_TRIGGER_CUTOFF {
+            std::fs::copy(entry.path(), target.join(&file)).expect("migration copies");
+        }
+    }
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    db::run_migrations_from(&pool, &target)
+        .await
+        .expect("legacy migrations");
+    let triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+            'project_media_attachment_gc_guard_after_insert',
+            'project_release_media_pin_gc_guard_after_insert',
+            'task_media_project_asset_after_insert',
+            'task_media_project_attachment_after_delete')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("legacy trigger catalog");
+    assert_eq!(
+        triggers, 4,
+        "the oracle database still has the media triggers"
+    );
+    SqliteDb::new(pool)
+}
+
+/// Every row of `table` as one JSON object, without the excluded columns.
+async fn canonical_rows(db: &SqliteDb, table: &str, exclude: &[&str]) -> Vec<String> {
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info(?) ORDER BY cid")
+            .bind(table)
+            .fetch_all(db.pool())
+            .await
+            .expect("table columns");
+    let pairs = columns
+        .iter()
+        .filter(|column| !exclude.contains(&column.as_str()))
+        .map(|column| format!("'{column}', \"{column}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    sqlx::query_scalar(&format!(
+        "SELECT json_object({pairs}) FROM \"{table}\" ORDER BY 1"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .expect("canonical rows")
+}
+
+const PARITY_CHECKSUM: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+/// The same media history on either database. `legacy` replays what the
+/// pre-drop repository code issued (the source statement, plus the explicit
+/// reconcile the old soft delete ran) and lets the triggers do the rest; the
+/// current database goes through today's repository writers.
+async fn media_history(db: &SqliteDb, legacy: bool) {
+    let created = "2026-10-18T09:00:00Z";
+    sqlx::raw_sql(
+        "INSERT INTO user (id, email, password_hash, display_name, created_at, updated_at)
+         VALUES ('user-media', 'media@example.test', 'test', 'Media Tester',
+                 '2026-10-18T08:00:00Z', '2026-10-18T08:00:00Z');
+         INSERT INTO project (id, name, owner_id, settings, created_at, updated_at)
+         VALUES ('project-media', 'Media Project', 'user-media', '{}',
+                 '2026-10-18T08:00:00Z', '2026-10-18T08:00:00Z');
+         INSERT INTO task (id, project_id, title, task_type, status, created_at, updated_at)
+         VALUES ('task-media', 'project-media', 'Media Task', 'task', 'todo',
+                 '2026-10-18T08:00:00Z', '2026-10-18T08:00:00Z');",
+    )
+    .execute(db.pool())
+    .await
+    .expect("media fixture");
+    create_release(db, "project-media").await;
+
+    for (id, content_type, storage) in [
+        ("parity-free", "image/png", "free"),
+        ("parity-shared", "image/png", "shared"),
+        ("parity-pinned", "video/mp4", "pinned"),
+        ("parity-evidence", "text/plain", "evidence"),
+    ] {
+        let input = CreateTaskMedia {
+            id: id.to_owned(),
+            task_id: "task-media".to_owned(),
+            display_filename: "proof.bin".to_owned(),
+            content_type: content_type.to_owned(),
+            byte_size: 4,
+            storage_key: format!("task-media/{storage}__proof.bin"),
+            author_type: CommentAuthorType::User,
+            author_id: Some("user-media".to_owned()),
+            author_name: "Tester".to_owned(),
+            created_at: created.to_owned(),
+        };
+        if legacy {
+            sqlx::query(
+                "INSERT INTO task_media (id, task_id, display_filename, content_type, byte_size, storage_key, author_type, author_id, author_name, created_at, deleted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            )
+            .bind(&input.id)
+            .bind(&input.task_id)
+            .bind(&input.display_filename)
+            .bind(&input.content_type)
+            .bind(input.byte_size)
+            .bind(&input.storage_key)
+            .bind(input.author_type.to_string())
+            .bind(input.author_id.as_deref())
+            .bind(&input.author_name)
+            .bind(&input.created_at)
+            .execute(db.pool())
+            .await
+            .expect("legacy task media insert");
+        } else {
+            TaskMediaRepo::create_media(db, input)
+                .await
+                .expect("task media create");
+        }
+    }
+    for asset in ["parity-pinned", "parity-evidence"] {
+        SharedMediaRepo::set_media_asset_checksum(
+            db,
+            asset,
+            4,
+            PARITY_CHECKSUM,
+            "2026-10-18T09:05:00Z",
+        )
+        .await
+        .expect("checksum");
+    }
+
+    // Typed pin: one code path on both databases (trigger plus reconcile on
+    // the legacy schema, reconcile alone now).
+    SharedMediaRepo::create_project_release_media_pin(
+        db,
+        CreateProjectReleaseMediaPin {
+            id: "parity-typed-pin".to_owned(),
+            project_id: "project-media".to_owned(),
+            release_id: "release-media".to_owned(),
+            asset_id: "parity-pinned".to_owned(),
+            attachment_id: None,
+            legacy_task_media_id: Some("parity-pinned".to_owned()),
+            asset_checksum: PARITY_CHECKSUM.to_owned(),
+            attachment_digest: "attachment-digest".to_owned(),
+            availability: "available".to_owned(),
+            pin_digest: "pin-digest".to_owned(),
+            created_at: "2026-10-18T09:10:00Z".to_owned(),
+        },
+    )
+    .await
+    .expect("typed pin");
+    // Caller-owned release pin: the old writer was the bare insert.
+    let pin = db::InsertReleaseEvidencePinInput {
+        id: "parity-release-pin",
+        project_id: "project-media",
+        release_id: "release-media",
+        asset_id: "parity-evidence",
+        attachment_id: "task-media-attachment:parity-evidence",
+        task_media_id: Some("parity-evidence"),
+        asset_checksum: PARITY_CHECKSUM,
+        attachment_digest: "attachment-digest",
+        availability: "available",
+        pin_digest: "pin-digest",
+        created_at: "2026-10-18T09:11:00Z",
+    };
+    let mut tx = db::begin_immediate(db.pool()).await.expect("pin tx");
+    if legacy {
+        sqlx::query(
+            "INSERT INTO project_release_media_pin (
+                id, project_id, release_id, asset_id, attachment_id,
+                legacy_task_media_id, asset_checksum, attachment_digest,
+                availability, pin_digest, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(pin.id)
+        .bind(pin.project_id)
+        .bind(pin.release_id)
+        .bind(pin.asset_id)
+        .bind(pin.attachment_id)
+        .bind(pin.task_media_id)
+        .bind(pin.asset_checksum)
+        .bind(pin.attachment_digest)
+        .bind(pin.availability)
+        .bind(pin.pin_digest)
+        .bind(pin.created_at)
+        .execute(&mut *tx)
+        .await
+        .expect("legacy release pin insert");
+    } else {
+        db.insert_release_evidence_pin_in_tx(&mut tx, &pin)
+            .await
+            .expect("release pin insert");
+    }
+    tx.commit().await.expect("pin commit");
+
+    for (index, id) in [
+        "parity-free",
+        "parity-shared",
+        "parity-pinned",
+        "parity-evidence",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let deleted_at = format!("2026-10-18T10:0{index}:00Z");
+        if legacy {
+            sqlx::query("UPDATE task_media SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL")
+                .bind(&deleted_at)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .expect("legacy soft delete");
+            let asset: String = sqlx::query_scalar("SELECT asset_id FROM task_media WHERE id = ?")
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .expect("legacy asset id");
+            SharedMediaRepo::reconcile_media_asset(db, &asset, &deleted_at)
+                .await
+                .expect("legacy reconcile");
+        } else {
+            TaskMediaRepo::soft_delete_media(db, id, &deleted_at)
+                .await
+                .expect("soft delete");
+        }
+    }
+}
+
+#[tokio::test]
+async fn media_writers_match_the_legacy_triggers_row_for_row() {
+    let legacy = legacy_trigger_database("media").await;
+    media_history(&legacy, true).await;
+    let current = current_schema_database().await;
+    media_history(&current, false).await;
+
+    for (table, exclude) in [
+        ("task_media", &[][..]),
+        ("project_media_attachment", &[][..]),
+        ("project_release_media_pin", &[][..]),
+        ("media_asset", &["version"][..]),
+    ] {
+        assert_eq!(
+            canonical_rows(&current, table, exclude).await,
+            canonical_rows(&legacy, table, exclude).await,
+            "{table} matches the legacy trigger result"
+        );
+    }
+    // The only intended difference: a typed pin and a Task-media soft delete
+    // ran a trigger update and a reconcile (two bumps); they now bump once.
+    let legacy_versions = asset_versions(&legacy).await;
+    let current_versions = asset_versions(&current).await;
+    let delta: Vec<(String, i64)> = legacy_versions
+        .iter()
+        .zip(&current_versions)
+        .map(|((id, old), (_, new))| (id.clone(), old - new))
+        .collect();
+    assert_eq!(
+        delta,
+        vec![
+            ("parity-evidence".to_owned(), 1),
+            ("parity-free".to_owned(), 1),
+            ("parity-pinned".to_owned(), 2),
+            ("parity-shared".to_owned(), 1),
+        ]
+    );
+}
+
+/// The current schema with no fixture rows (`media_history` seeds its own).
+async fn current_schema_database() -> SqliteDb {
+    let pool = create_sqlite_pool("sqlite::memory:").await.expect("pool");
+    run_migrations(&pool).await.expect("migrations");
+    SqliteDb::new(pool)
+}
+
+async fn asset_versions(db: &SqliteDb) -> Vec<(String, i64)> {
+    sqlx::query_as("SELECT id, version FROM media_asset ORDER BY id")
+        .fetch_all(db.pool())
+        .await
+        .expect("asset versions")
+}

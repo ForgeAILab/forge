@@ -218,8 +218,8 @@ impl TaskService {
             )
             .await?;
         }
-        if previous_status == crate::workflow::default_states::REVIEW
-            && task.status != crate::workflow::default_states::REVIEW
+        if crate::workflow::is_review_state(&workflow, &previous_status)
+            && !crate::workflow::is_review_state(&workflow, &task.status)
         {
             task = clear_manual_review_awaiting_metadata(&self.db, &task).await?;
         }
@@ -569,7 +569,7 @@ impl TaskService {
         let review_state = workflow
             .states
             .iter()
-            .find(|state| state.name == default_states::REVIEW);
+            .find(|state| db::budget::is_review_state(state));
         let max_retries = db::budget::limit(
             &task,
             db::budget::Kind::Review,

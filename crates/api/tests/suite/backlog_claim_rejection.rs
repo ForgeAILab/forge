@@ -9,8 +9,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse, RepoResponse,
-    TaskResponse, TransitionTaskResponse,
+    AgentResponse, ProjectResponse, RepoResponse, TaskResponse, TransitionTaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -36,7 +35,7 @@ async fn agent_cannot_claim_task_in_backlog_state() {
         StatusCode::OK,
     )
     .await;
-    let agent_id = create_shell_agent(&harness.app, workspace_root.path()).await;
+    let agent_id = create_shell_agent(&harness.app, &harness._state, workspace_root.path()).await;
 
     let task: TaskResponse = json_request(
         &harness.app,
@@ -110,7 +109,7 @@ async fn test_app(workspace_root: &Path) -> Harness {
     db::run_migrations(&pool).await.expect("migrations run");
     let db = Arc::new(db::SqliteDb::new(pool));
     let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));
@@ -171,28 +170,11 @@ async fn create_project_and_repo(app: &Router, repo_path: &Path) -> (String, Str
     (project.id, repo.id)
 }
 
-async fn create_shell_agent(app: &Router, workspace_root: &Path) -> String {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({ "machine_id": services::embedded_daemon::embedded_machine_id(), "hostname": "backlog-host", "os": "linux", "arch": "x86_64", "agent_version": "test" }),
-        StatusCode::OK,
-    )
-    .await;
-    let daemon_id = registration.daemon_id;
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{ "kind": "shell", "availability": "authenticated", "path": "/bin/sh" }],
-            "runtimes": [{ "kind": "local", "workspace_root": workspace_root.to_string_lossy(), "status": "ready" }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
+async fn create_shell_agent(app: &Router, state: &AppState, workspace_root: &Path) -> String {
+    let daemon_id =
+        common::register_embedded_daemon(state, workspace_root, "backlog-host", "shell")
+            .await
+            .daemon_id;
     let agent: AgentResponse = json_request(
         app,
         Method::POST,

@@ -1069,6 +1069,10 @@ pub fn api_router(state: AppState) -> Router {
         )
         .route("/api/v1/events", get(routes::events::stream_events))
         .route(
+            "/api/v1/config/mcp/endpoint",
+            get(routes::mcp_config::get_mcp_endpoint),
+        )
+        .route(
             "/api/v1/config/mcp",
             get(routes::mcp_config::get_mcp_config).post(routes::mcp_config::update_mcp_config),
         )

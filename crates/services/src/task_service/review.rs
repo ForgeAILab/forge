@@ -49,7 +49,7 @@ impl TaskService {
         let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, false).await? else {
             return Ok(());
         };
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Ok(());
         }
         if ExecutionRepo::list_running_by_task(&*self.db, &task.id)
@@ -278,7 +278,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
@@ -338,45 +338,6 @@ impl TaskService {
                 retry_after_ms: 250,
             });
         }
-        // The attempt this re-run replaces is closed first, so the Task never
-        // has two open attempts: neither a human gate nor a reviewer can
-        // settle an attempt the owner asked to run again.
-        let superseded = ReviewRepo::list_by_task(&*self.db, &task_id)
-            .await?
-            .into_iter()
-            .max_by_key(|review| (review.attempt_number, review.id.clone()))
-            .filter(|review| {
-                matches!(
-                    review.status,
-                    ReviewStatus::Running | ReviewStatus::AwaitingHuman
-                )
-            });
-        if let Some(review) = superseded {
-            let now = now_rfc3339();
-            let mut details: Value = serde_json::from_str(&review.step_results_json)
-                .unwrap_or_else(|_| json!({ "ci_steps": [] }));
-            if !details.is_object() {
-                details = json!({ "ci_steps": details });
-            }
-            details["execution_retry"] = json!({
-                "status": "superseded_by_rerun",
-                "reason": "a review re-run was requested",
-                "cancelled_at": now,
-            });
-            ReviewRepo::cancel_if_unchanged(
-                &*self.db,
-                &review.id,
-                review.status.clone(),
-                &review.updated_at,
-                details.to_string(),
-                &now,
-                &now,
-            )
-            .await?;
-        }
-        let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -432,7 +393,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status
@@ -520,7 +481,7 @@ impl TaskService {
         let task = TaskRepo::get_by_id(&*self.db, &task_id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.clone()))?;
-        if task.status != "review" {
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &task.status) {
             return Err(ServiceError::invalid_operation(format!(
                 "task {task_id} is in {} state; expected review",
                 task.status

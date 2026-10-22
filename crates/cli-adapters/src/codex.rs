@@ -1957,8 +1957,6 @@ mod tests {
     use super::*;
     use executors::CommandOverrides;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn sub_agent_resume_target_falls_back_to_a_fresh_thread() {
@@ -2797,7 +2795,6 @@ mod tests {
     fn codex_sandbox_gets_the_compiler_cache_only_when_it_cannot_break_the_run() {
         use executors::compiler_cache::{CACHE_DIR, CompilerCache, WrapperKind};
         use executors::sandbox::{RunPurpose, SandboxEnv, TaskRoot};
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir creates");
         let root = dir.path().join("root");
         let worktree = root.join("t/repo");
@@ -2822,12 +2819,11 @@ mod tests {
         let wrapper = |name: &str| {
             let path = dir.path().join("bin").join(name);
             fs::create_dir_all(path.parent().unwrap()).expect("bin creates");
-            fs::write(
+            process_supervisor::executable::write_executable(
                 &path,
                 "#!/bin/sh\n[ \"$1\" = --start-server ] && exit 0\nexec \"$@\"\n",
             )
             .expect("wrapper writes");
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
             path
         };
         let offered = |name: &str| {
@@ -3604,7 +3600,7 @@ mod tests {
             } else {
                 "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'"
             };
-            fs::write(
+            process_supervisor::executable::write_executable(
                 &script,
                 format!(
                     r#"#!/bin/sh
@@ -3621,12 +3617,6 @@ printf '%s\n' '{}'
                 ),
             )
             .unwrap();
-            #[cfg(unix)]
-            {
-                let mut permissions = fs::metadata(&script).unwrap().permissions();
-                permissions.set_mode(0o755);
-                fs::set_permissions(&script, permissions).unwrap();
-            }
             let primary = json!({"executor_type": "codex", "config": {"base_command_override": script.display().to_string(), "auto_commit": false}});
             let mut candidates = vec![primary.clone()];
             if with_fallback {
@@ -3671,7 +3661,7 @@ printf '%s\n' '{}'
     async fn turn_completed_error_returns_failed_without_commit_or_session() {
         let dir = tempfile::tempdir().expect("tempdir creates");
         let script_path = dir.path().join("fake-codex.sh");
-        fs::write(
+        process_supervisor::executable::write_executable(
             &script_path,
             r#"#!/bin/sh
 read line || exit 1
@@ -3687,12 +3677,6 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"
 "#,
         )
         .expect("script writes");
-        #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(&script_path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).unwrap();
-        }
 
         let adapter = CodexAdapter::new();
         let result = adapter

@@ -959,7 +959,7 @@ impl<'a> WorkspaceManager<'a> {
 /// [`Purpose::Inspect`]: `None` when it is not usable right now (gone, not a
 /// worktree of the recorded repository, or owned by a daemon). Nothing on
 /// disk or in a row changes.
-pub(crate) async fn inspect_path(
+pub async fn inspect_path(
     db: &SqliteDb,
     workspace_root: &Path,
     router: &WorkspaceBackendRouter,

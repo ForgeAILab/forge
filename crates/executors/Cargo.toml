@@ -8,6 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+process-supervisor = { path = "../process-supervisor" }
 config = { path = "../config" }
 tracing.workspace = true
 api-types = { path = "../api-types" }

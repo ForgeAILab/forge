@@ -227,7 +227,7 @@ impl ProjectArtifactCommandService {
     /// back. Everything else about the row -- the governing Charter and
     /// baseline revisions, the definition revision, the check version -- is
     /// derived here rather than accepted from the caller.
-    pub(crate) async fn record_validation_with_context(
+    pub async fn record_validation_with_context(
         &self,
         command: ProjectValidationCommand,
         context: CommandContext,
@@ -273,7 +273,15 @@ impl ProjectArtifactCommandService {
                     "observed_task_id must name a Task in this Project that produced the observation",
                 )
             })?;
-            if !matches!(observed_task_status.as_str(), "done" | "review" | "merging") {
+            let project = ProjectRepo::get_by_id(&*self.db, &command.project_id)
+                .await?
+                .ok_or_else(|| ServiceError::not_found("project", command.project_id.clone()))?;
+            let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow(
+                &project.workflow_definition,
+            );
+            if !matches!(observed_task_status.as_str(), "done" | "merging")
+                && !crate::workflow::is_review_state(&workflow, &observed_task_status)
+            {
                 return Err(ServiceError::invalid_operation(
                     "the observed Task has not produced a delivered result to validate against",
                 ));
@@ -497,7 +505,7 @@ impl ProjectArtifactCommandService {
         Ok(observations)
     }
 
-    pub(crate) async fn attach_evidence_with_context(
+    pub async fn attach_evidence_with_context(
         &self,
         command: ProjectEvidenceCommand,
         context: CommandContext,
@@ -749,7 +757,7 @@ impl ProjectArtifactCommandService {
             .await
     }
 
-    pub(crate) async fn save_document_revision_with_context(
+    pub async fn save_document_revision_with_context(
         &self,
         command: ProjectDocumentRevisionCommand,
         context: CommandContext,
@@ -1043,7 +1051,7 @@ impl ProjectArtifactCommandService {
         self.replay_document_approval(&context).await
     }
 
-    pub(crate) async fn approve_document_with_context(
+    pub async fn approve_document_with_context(
         &self,
         command: ProjectDocumentApprovalCommand,
         context: CommandContext,

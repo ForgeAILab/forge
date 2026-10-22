@@ -11,8 +11,7 @@ use std::{
 
 use api::{build_router, AppState};
 use api_types::{
-    AgentResponse, DaemonRegisterResponse, DaemonResponse, ProjectResponse, RepoResponse,
-    TaskResponse,
+    AgentResponse, DaemonRegisterResponse, ProjectResponse, RepoResponse, TaskResponse,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -149,7 +148,7 @@ pub async fn test_app_on(workspace_root: &Path, prefix: &str, database_url: &str
     .expect("seed test user");
 
     let adapter_registry = Arc::new(cli_adapters::test_support::test_registry());
-    services::ensure_default_agents(db.as_ref(), &adapter_registry)
+    services_agents::ensure_default_agents(db.as_ref(), &adapter_registry)
         .await
         .expect("default agents upsert");
     let event_bus = Arc::new(events::EventBus::new(64));
@@ -452,47 +451,73 @@ pub async fn configure_execution_test_setup(
     }
 }
 
+/// Local workflow fixtures use the same service path as the in-process daemon.
+/// Reserved embedded identities cannot register or report over HTTP.
+pub async fn register_embedded_daemon(
+    state: &AppState,
+    workspace_root: &Path,
+    hostname: &str,
+    cli_kind: &str,
+) -> DaemonRegisterResponse {
+    let registration = state
+        .daemon_service
+        .register(services::DaemonRegisterInput {
+            max_concurrent_runs: None,
+            machine_id: services::embedded_daemon::embedded_machine_id(),
+            hostname: hostname.to_owned(),
+            os: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            agent_version: Some("test".to_owned()),
+            labels: json!({"mode":"embedded"}),
+            runtimes: vec![],
+            owner_id: None,
+            visibility: Some("global".to_owned()),
+        })
+        .await
+        .expect("internal daemon registers");
+    state
+        .daemon_service
+        .ingest_report(
+            &registration.daemon_id,
+            services::DaemonReportInput {
+                max_concurrent_runs: None,
+                detected_clis: vec![services::daemon_service::DetectedCliInput {
+                    kind: cli_kind.to_owned(),
+                    availability: "authenticated".to_owned(),
+                    config_path: None,
+                    version: None,
+                    path: Some(if cli_kind == "shell" {
+                        "/bin/sh".to_owned()
+                    } else {
+                        format!("/bin/{cli_kind}")
+                    }),
+                }],
+                runtimes: vec![services::daemon_service::RuntimeReportInput {
+                    kind: "local".to_owned(),
+                    workspace_root: workspace_root.to_string_lossy().into_owned(),
+                    status: Some("ready".to_owned()),
+                }],
+                labels: None,
+                active_execution_ids: None,
+            },
+        )
+        .await
+        .expect("internal daemon reports");
+    DaemonRegisterResponse {
+        daemon_id: registration.daemon_id,
+        registration_token: registration.plaintext_token,
+    }
+}
+
 pub async fn create_shell_agents(
     app: &Router,
+    state: &AppState,
     workspace_root: &Path,
     prefix: &str,
 ) -> (String, String) {
-    let registration: DaemonRegisterResponse = json_request(
-        app,
-        Method::POST,
-        "/api/v1/daemons/register",
-        json!({
-            "machine_id": services::embedded_daemon::embedded_machine_id(),
-            "hostname": format!("{prefix}-host"),
-            "os": "linux",
-            "arch": "x86_64",
-            "agent_version": "test"
-        }),
-        StatusCode::OK,
-    )
-    .await;
+    let registration =
+        register_embedded_daemon(state, workspace_root, &format!("{prefix}-host"), "shell").await;
     let daemon_id = registration.daemon_id;
-
-    let _: DaemonResponse = json_request_with_bearer(
-        app,
-        Method::POST,
-        &format!("/api/v1/daemons/{daemon_id}/report"),
-        &registration.registration_token,
-        json!({
-            "detected_clis": [{
-                "kind": "shell",
-                "availability": "authenticated",
-                "path": "/bin/sh"
-            }],
-            "runtimes": [{
-                "kind": "local",
-                "workspace_root": workspace_root.to_string_lossy(),
-                "status": "ready"
-            }]
-        }),
-        StatusCode::OK,
-    )
-    .await;
 
     let admin_token = admin_jwt();
     let agent_a: AgentResponse = json_request_with_bearer(

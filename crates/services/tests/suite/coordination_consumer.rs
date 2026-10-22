@@ -575,10 +575,7 @@ async fn binding_replacement_requires_explicit_transfer_and_keeps_outcomes_with_
 
     // Replacing either binding does not silently transfer obligations or
     // expose the old identity's current focus to the replacement.
-    let attention = AttentionService::new(
-        Arc::clone(&db),
-        Arc::new(services::WakeTurnConsumer::new(Arc::clone(&db))),
-    );
+    let attention = AttentionService::new(Arc::clone(&db), crate::noop_wake_turns());
     let old_before_transfer = attention
         .agent_detail("user-1", old_identity, 10)
         .await

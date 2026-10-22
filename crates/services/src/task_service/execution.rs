@@ -28,8 +28,8 @@ pub struct ExecutionOutboxReport {
     pub evidence_items: usize,
     /// One human-readable reason per entry that was not ingested.
     pub rejected: Vec<String>,
-    pub(crate) plan_candidate: bool,
-    pub(crate) plan_rejected: bool,
+    pub plan_candidate: bool,
+    pub plan_rejected: bool,
 }
 
 /// Provider credentials and owner outboxes used by Task execution.
@@ -259,7 +259,7 @@ pub(crate) use guards::DISK_PRE_DISPATCH_ERROR_PREFIX;
 pub(super) use guards::WORKSPACE_LEASE_PRE_DISPATCH_ERROR_PREFIX;
 mod hooks;
 mod launch;
-pub(crate) mod ledger;
+pub mod ledger;
 mod recovery;
 mod runner;
 mod step_check;

@@ -96,7 +96,7 @@ pub async fn validate_repository_input(
         ));
     }
     if let Some(remote_url) = remote_url.map(str::trim).filter(|url| !url.is_empty()) {
-        crate::embedded_agent_service::provider_url_addresses(remote_url)
+        crate::provider_credentials::provider_url_addresses(remote_url)
             .await
             .map_err(|reason| location_refused(&reason.replace("base_url", "repository URL")))?;
     }

@@ -6,7 +6,7 @@ import { budgetExhaustedNotice } from '@/lib/workflow-utils'
 import { workflowLabelFromKind } from '@/components/workflow-health-badge'
 import { TaskInteractiveLaunch } from './task-interactive-launch'
 import { TaskActionButtons } from './task-action-buttons'
-import type { Task, WorkflowExceptionSummary } from '@/types/generated'
+import type { Task, WorkflowDefinition, WorkflowExceptionSummary } from '@/types/generated'
 import type { ReviewAssessment } from '@/types/generated/bindings/ReviewAssessment'
 
 function FailingStepDetails({
@@ -65,9 +65,11 @@ function FailingStepDetails({
 export function WorkflowExceptionPanel({
   task,
   assessment,
+  workflow,
 }: {
   task: Task
   assessment?: ReviewAssessment | null
+  workflow?: Pick<WorkflowDefinition, 'states'>
 }) {
   const exception = task.workflow_exception
   const relations = useTaskRelationsQuery(
@@ -76,7 +78,11 @@ export function WorkflowExceptionPanel({
     Boolean(exception) && task.parent_task_id == null,
   )
   if (!exception) return null
-  const runsHeldForSubtasks = rootHoldsRuns(task, (relations.data?.subtasks.length ?? 0) > 0)
+  const runsHeldForSubtasks = rootHoldsRuns(
+    task,
+    (relations.data?.subtasks.length ?? 0) > 0,
+    workflow,
+  )
   const failure = task.condition.details.failed
   const budgetNotice = budgetExhaustedNotice(task)
   return (

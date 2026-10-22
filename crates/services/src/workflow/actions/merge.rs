@@ -823,7 +823,9 @@ impl HookAction for RequireConflictMarkersResolved {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
         // The review state by its role: a workflow may call it anything.
         let review = crate::workflow::review_refresh_target(&ctx.workflow, &ctx.from_state);
-        if ctx.to_state != default_states::REVIEW && review.as_deref() != Some(&ctx.to_state) {
+        if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state)
+            && review.as_deref() != Some(&ctx.to_state)
+        {
             return HookResult::Skipped {
                 reason: "only the repair-to-review exit is checked".to_string(),
             };

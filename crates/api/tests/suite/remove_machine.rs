@@ -163,7 +163,23 @@ async fn connected_machine_returns_typed_conflict_without_revoking_token() {
 async fn embedded_machine_returns_typed_conflict_even_while_offline() {
     let dir = tempfile::tempdir().unwrap();
     let harness = common::test_app(dir.path(), "remove-local").await;
-    let registration = register(&harness, &services::embedded_daemon::embedded_machine_id()).await;
+    let registration = harness
+        .state
+        .daemon_service
+        .register(services::DaemonRegisterInput {
+            max_concurrent_runs: None,
+            machine_id: services::embedded_daemon::embedded_machine_id(),
+            hostname: "embedded-test-host".to_owned(),
+            os: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            agent_version: None,
+            labels: json!({"mode":"embedded"}),
+            runtimes: vec![],
+            owner_id: Some("test-user-id".to_owned()),
+            visibility: Some("account".to_owned()),
+        })
+        .await
+        .unwrap();
     harness
         .state
         .daemon_service

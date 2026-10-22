@@ -50,6 +50,8 @@ export const qk = {
   repos: (projectId: string) => ['projects', projectId, 'repos'] as const,
   mcpConfig: (agent: string, scope: string, projectId?: string) =>
     ['config', 'mcp', agent, scope, projectId ?? 'global'] as const,
+  mcpEndpoint: (scope: string, projectId?: string) =>
+    ['mcp-endpoint', scope, projectId ?? 'account'] as const,
   fsEntries: (path: string, daemonId: string) => ['fs', 'entries', daemonId, path] as const,
   branches: (path: string, daemonId: string) => ['fs', 'branches', daemonId, path] as const,
   executions: (taskId: string) => ['tasks', taskId, 'executions'] as const,

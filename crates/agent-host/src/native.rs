@@ -514,6 +514,9 @@ impl Provider for ServerStateCardProvider {
     fn capabilities(&self, model: &ModelId) -> Option<agent_runtime::core::provider::Capabilities> {
         self.inner.capabilities(model)
     }
+    fn requires_nonempty_assistant_content(&self) -> bool {
+        self.inner.requires_nonempty_assistant_content()
+    }
     fn cache_resource_provider(
         &self,
     ) -> Option<&dyn agent_runtime::core::provider::CacheResourceProvider> {
@@ -2238,6 +2241,120 @@ mod workspace_tests {
 }
 
 #[cfg(test)]
+mod state_card_provider_tests {
+    use super::*;
+    use agent_runtime::{
+        core::provider::{
+            Capabilities, FinishReason, ModelDescriptor, ProviderCallContext, ProviderError,
+            ProviderRequest, ProviderStream, ProviderStreamEvent,
+        },
+        provider::fake::{FakeProvider, ScriptedStream},
+    };
+
+    /// A recording provider whose wire, like Anthropic's, cannot carry an
+    /// assistant message emptied by reasoning projection.
+    #[derive(Debug)]
+    struct StrictWire(Arc<FakeProvider>);
+
+    #[async_trait]
+    impl Provider for StrictWire {
+        fn requires_nonempty_assistant_content(&self) -> bool {
+            true
+        }
+        fn describe(&self) -> Vec<ModelDescriptor> {
+            self.0.describe()
+        }
+        fn capabilities(&self, model: &ModelId) -> Option<Capabilities> {
+            self.0.capabilities(model)
+        }
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            ctx: ProviderCallContext,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.0.stream(request, ctx).await
+        }
+    }
+
+    /// The state-card adapter wraps every chat provider. When the runtime
+    /// drops another model's reasoning from a reasoning-only assistant
+    /// message, the wrapped wire's requirement must reach the planner so the
+    /// emptied message is left out of the request instead of being planned
+    /// (and cache-marked) as an empty message the wire then discards.
+    #[tokio::test]
+    async fn state_card_adapter_keeps_the_wire_nonempty_assistant_requirement() {
+        let marker = "[forge-state-card:test]\n".to_owned();
+        let recorder = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "answer".into(),
+                },
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])],
+        ));
+        let provider = ServerStateCardProvider {
+            inner: Arc::new(StrictWire(recorder.clone())),
+            marker: marker.clone(),
+        };
+        assert!(provider.requires_nonempty_assistant_content());
+        let runtime = RuntimeBuilder::new(ModelId::new("fake"))
+            .provider_name("fake")
+            .provider(Arc::new(provider))
+            .model_profile(ResolvedModelProfile::explicit(
+                "fake",
+                ModelId::new("fake"),
+                ModelLimits::new(8_000, 8_000, 1_000),
+            ))
+            .context_contributor(Arc::new(ServerStateCard {
+                card: format!("{marker}## SERVER-PROVIDED STATE CARD\n- v1\n"),
+            }))
+            .build()
+            .expect("runtime builds");
+        let foreign_only = Message::assistant(vec![ContentPart::Reasoning {
+            text: "another model's thought".into(),
+            redacted: false,
+            signature: Some("foreign-signature".into()),
+            producer: Some(agent_runtime::core::content::ReasoningProducer {
+                provider: "other".into(),
+                model: ModelId::new("other-model"),
+            }),
+        }]);
+        let session = runtime
+            .start_session(StartSession::new().with_history(vec![
+                Message::user("earlier question"),
+                foreign_only,
+                Message::user("follow-up"),
+                Message::assistant(vec![ContentPart::text("earlier answer")]),
+            ]))
+            .await
+            .expect("session starts");
+        session
+            .run(UserInput::text("next"))
+            .await
+            .expect("turn runs");
+
+        let requests = recorder.requests();
+        assert_eq!(requests.len(), 1);
+        let messages = &requests[0].messages;
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.role != Role::Assistant || !message.content.is_empty()),
+            "an emptied assistant message reached the provider: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.joined_text() == "earlier answer")
+        );
+    }
+}
+
+#[cfg(test)]
 mod retry_input_tests {
     use super::*;
     use agent_runtime::core::content::{ToolCall, ToolResultBlock};
@@ -2630,6 +2747,53 @@ mod turn_failure_tests {
     use super::*;
     use agent_runtime::core::provider::{ProviderError, ProviderErrorKind};
     use api_types::TurnFailure;
+
+    #[test]
+    fn provider_rejections_keep_forge_classification_after_coarse_kind_change() {
+        use agent_runtime::core::{
+            error::{ErrorKind, FailureClass, FailureStage},
+            metadata::MetaValue,
+        };
+        for (provider_kind, runtime_kind) in [
+            (ProviderErrorKind::BadRequest, ErrorKind::Provider),
+            (ProviderErrorKind::Unsupported, ErrorKind::Config),
+        ] {
+            for retryable in [false, true] {
+                let mut original = ProviderError::new(provider_kind, "checked rejection");
+                original
+                    .metadata
+                    .insert("provider.detail", "invalid_request: bad argument");
+                original.metadata.insert("http.status", 400_i64);
+                if retryable {
+                    original = original.retry_after(1200);
+                }
+                let expected = if retryable {
+                    TurnFailure::ProviderRejected {
+                        retryable: true,
+                        retry_after: Some(1200),
+                    }
+                } else {
+                    TurnFailure::ProviderSchema
+                };
+                assert_eq!(provider_turn_failure(&original), expected);
+                let converted =
+                    RuntimeError::from(original).with_class(FailureClass::RequestRejected {
+                        stage: FailureStage::Provider,
+                    });
+                assert_eq!(converted.kind, runtime_kind);
+                assert_eq!(
+                    converted.metadata.get("http.status"),
+                    Some(&MetaValue::Int(400))
+                );
+                assert_eq!(runtime_turn_failure(&converted), expected);
+                assert!(
+                    !serde_json::to_string(&expected)
+                        .unwrap()
+                        .contains("bad argument")
+                );
+            }
+        }
+    }
 
     #[test]
     fn lifecycle_and_runtime_failures_keep_only_typed_evidence() {

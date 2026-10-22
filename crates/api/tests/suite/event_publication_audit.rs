@@ -254,14 +254,14 @@ async fn domain_event_broadcast_audit() {
 
     let cases = [
         Case {
-            // crates/db/src/sqlite/orchestration.rs — Project creation from
-            // a Charter approval.
+            // crates/db/src/sqlite/orchestration/project_creation.rs — Project
+            // creation from a Charter approval.
             event_type: "project.created_from_charter_approval",
             entity_type: "project",
             entity_id: "audit-project-1",
             scope_type: "project",
             scope_id: "audit-project-1",
-            source: "crates/db/src/sqlite/orchestration.rs",
+            source: "crates/db/src/sqlite/orchestration/project_creation.rs",
         },
         Case {
             // crates/db/src/sqlite/agent_chat.rs — Main Genesis control

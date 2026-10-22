@@ -1429,9 +1429,9 @@ mod tests {
     };
     use forge_agent_host::TASK_ACTION_OPERATION;
     use forge_agent_host::{
-        MAIN_PROJECT_CREATE_OPERATION, MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION,
-        PROJECT_DOCUMENT_OPERATION, PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION,
-        PROJECT_READINESS_OPERATION, PROJECT_VALIDATION_OPERATION,
+        MIGRATED_OPERATION_CONTRACTS, PROJECT_DECISION_OPERATION, PROJECT_DOCUMENT_OPERATION,
+        PROJECT_EVIDENCE_OPERATION, PROJECT_MILESTONE_OPERATION, PROJECT_READINESS_OPERATION,
+        PROJECT_VALIDATION_OPERATION,
     };
 
     #[test]
@@ -1740,91 +1740,6 @@ mod tests {
             PROJECT_DECISION_OPERATION,
             &cross_scope_override.to_string()
         ));
-    }
-
-    #[tokio::test]
-    async fn main_orchestration_project_create_is_user_only_and_draft_is_direct() {
-        let db = db().await;
-        let actions = AgentActionService::new(Arc::clone(&db));
-        let draft = actions
-            .propose(ProposeActionInput {
-                id: None,
-                actor_identity_id: "agent-a".to_owned(),
-                scope_type: "account".to_owned(),
-                scope_id: "user-1".to_owned(),
-                operation: MAIN_CHARTER_DRAFT_OPERATION.to_owned(),
-                payload_json: r#"{"action":"save_revision"}"#.to_owned(),
-                dedupe_key: "main-draft-1".to_owned(),
-                correlation_id: "main-draft-correlation".to_owned(),
-                causation_id: None,
-                causation_depth: 0,
-                requested_permission: "propose_discovery".to_owned(),
-                policy_reason: None,
-                target_type: Some("account".to_owned()),
-                target_id: Some("user-1".to_owned()),
-            })
-            .await;
-        assert!(
-            draft.is_err(),
-            "Main Charter drafts do not enter AgentAction"
-        );
-        let draft_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM agent_action WHERE operation = ?")
-                .bind(MAIN_CHARTER_DRAFT_OPERATION)
-                .fetch_one(db.pool())
-                .await
-                .expect("draft action count");
-        assert_eq!(draft_count, 0);
-
-        let create = actions
-            .propose(ProposeActionInput {
-                id: None,
-                actor_identity_id: "agent-a".to_owned(),
-                scope_type: "account".to_owned(),
-                scope_id: "user-1".to_owned(),
-                operation: MAIN_PROJECT_CREATE_OPERATION.to_owned(),
-                payload_json: r#"{"action":"create_from_approval","approval_id":"approval-1"}"#
-                    .to_owned(),
-                dedupe_key: "main-create-1".to_owned(),
-                correlation_id: "main-create-correlation".to_owned(),
-                causation_id: None,
-                causation_depth: 0,
-                requested_permission: "propose_project".to_owned(),
-                policy_reason: None,
-                target_type: Some("account".to_owned()),
-                target_id: Some("user-1".to_owned()),
-            })
-            .await
-            .expect("Main Project create proposal");
-        assert_eq!(
-            create.policy_result,
-            AgentActionPolicyResult::ApprovalRequired
-        );
-        assert_eq!(create.status, AgentActionStatus::PendingApproval);
-        assert!(actions
-            .approve(ApproveActionInput {
-                action_id: create.id.clone(),
-                expected_version: create.version,
-                approver_identity_id: "agent-a".to_owned(),
-                decision: AgentActionApprovalDecision::Approved,
-                reason: None,
-            })
-            .await
-            .is_err());
-
-        let typed_create = crate::MainOrchestrationActionService::new(Arc::clone(&db))
-            .execute(crate::ExecuteMainOrchestrationActionInput {
-                action_id: create.id,
-                expected_version: create.version,
-                executed_by_type: "agent".to_owned(),
-                executed_by_id: "agent-a".to_owned(),
-                idempotency_key: "main-create-execution".to_owned(),
-            })
-            .await;
-        assert!(
-            typed_create.is_err(),
-            "Project creation must remain user-only"
-        );
     }
 
     #[tokio::test]

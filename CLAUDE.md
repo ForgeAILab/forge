@@ -35,10 +35,11 @@ cargo test                           # Full test suite (CI only)
 cargo test -p db --features test-template --test main <module>::<test-filter> # Focused integration test
 cargo test -p db --lib <test-filter> # Focused unit test
 cargo test -p services --features test-support --test main <module>::<test-filter>
+cargo test -p services-agents --features test-support --test main <module>::<test-filter>
 cargo test -p api --test main happy_path::<test-name>  # Run one relevant end-to-end case
 cargo run -p forge-client -- --help  # forge-ctl CLI client
 cargo build -p forge-client          # Build forge-ctl binary
-cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings
+cargo clippy --workspace --all-targets --features db/test-template,services-agents/test-support,services/test-support -- -D warnings
 cargo fmt --all
 FORGE_SKIP_WEB_BUILD=1 cargo check -p forge-cli  # Skip pnpm web build during Rust-only work
 ```
@@ -47,16 +48,16 @@ During local agent work, run only the focused tests directly related to the file
 
 DB, services and most API integration tests are modules under `tests/suite/`, selected
 with `cargo test -p <crate> --test main <original-file-stem>::<test-name>`.
-The `services` and `db` integration targets need their test feature
-(`--features test-support` / `--features test-template`): a named target
-without it is a Cargo error, and a plain `cargo test -p services` or
+The `services`, `services-agents` and `db` integration targets need their test
+feature (`--features test-support` / `--features test-template`): a named
+target without it is a Cargo error, and a plain `cargo test -p services` or
 `cargo test -p db` runs the unit tests only and skips them without a message.
 The clippy command names the same features so that linting those targets does
 not depend on another crate's dev-dependencies.
-Neither crate may dev-depend on itself (it compiles the lib twice in series);
+No crate may dev-depend on itself (it compiles the lib twice in series);
 see [docs/ci.md](docs/ci.md#test-features-and-required-features).
-Services keeps `project_provisioning_characterization` and
-`main_project_create_command` as separate targets for process isolation.
+Services keeps `project_provisioning_characterization` separate; services-agents
+keeps `main_project_create_command` separate for process isolation.
 API keeps seven process-isolated targets; see
 [docs/ci.md](docs/ci.md#api-binary-split-and-isolation) for the list.
 See [docs/ci.md](docs/ci.md#services-unit-split-and-integration-inventory) for
@@ -123,6 +124,7 @@ forge-solo owns its Solo bootstrap and session services
 
 - **Repository pattern** — `db` defines async traits in `repository.rs`; `SqliteDb` in `sqlite.rs` implements all of them.
 - **AppState** — `forge-cli/main.rs` constructs `Arc<SqliteDb>` and `Arc<EventBus>`, builds the shared graph through `services_agents::ForgeRuntimeBuilder`, and hands it to `AppState::from_runtime_arc()`. `AppState` is `Clone` (shared services use `Arc`) and used as Axum state.
+- **Agent boundary** — `services-agents` owns Agent Chat, embedded-agent, native-tool, wake-delivery, and Main/Project orchestration implementations. It depends on `services`; core never depends back. Core uses the narrow `WakeTurns`, task `ExecutionSupport`, and `AgentEventConsumerNames` contracts, wired by `ForgeRuntimeBuilder`.
 - **Event bus** — `events` crate wraps `tokio::sync::broadcast`; SSE at `GET /api/v1/events` subscribes.
 - **Workflow engine** — `TaskService.transition()` resolves the applicable workflow once and delegates to `crates/services/src/workflow/engine/mod.rs`. The wrapper, engine, and hooks share that definition. Default workflow lives in `default_workflow.rs`.
 - **Claim auto-dispatches** — `api::routes::tasks::claim_task` spawns the executor via `tokio::spawn`. There is no separate "dispatch" endpoint.

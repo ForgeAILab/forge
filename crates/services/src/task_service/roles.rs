@@ -701,7 +701,10 @@ impl TaskService {
         Ok(task)
     }
 
-    async fn workflow_for_task(&self, task: &Task) -> Result<api_types::WorkflowDefinition> {
+    pub(super) async fn workflow_for_task(
+        &self,
+        task: &Task,
+    ) -> Result<api_types::WorkflowDefinition> {
         Ok(self.workflow_and_authority_for_task(task).await?.0)
     }
 

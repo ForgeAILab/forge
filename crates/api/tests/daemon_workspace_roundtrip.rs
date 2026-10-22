@@ -3512,7 +3512,7 @@ async fn disconnected_remote_ci_waits_on_the_typed_check_and_resumes_on_reconnec
 #[tokio::test]
 async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done() {
     use db::TaskStepRepo;
-    use std::os::unix::fs::PermissionsExt;
+
     let fixture = Fixture::new("forge-merge-push-cancel").await;
     let candidate = fixture.candidate().await;
     fixture.approve_candidate().await;
@@ -3528,7 +3528,7 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
         .unwrap();
     assert!(output.status.success());
     let hook = remote.join("hooks/pre-receive");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &hook,
         format!(
             "#!/bin/sh\ntouch {}\nwhile [ ! -f {} ]; do sleep 0.02; done\n",
@@ -3537,9 +3537,8 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let post_merge = fixture.checkout.join(".git/hooks/post-merge");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &post_merge,
         format!(
             "#!/bin/sh\ngit push {} HEAD:refs/heads/main\n",
@@ -3547,7 +3546,6 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&post_merge, std::fs::Permissions::from_mode(0o755)).unwrap();
     let db = fixture.harness.state.db.clone();
     let service = fixture.harness.state.task_service.clone();
     let task_id = fixture.resolved.placement.task_id.clone();
@@ -3649,7 +3647,7 @@ async fn cancel_during_remote_merge_push_finishes_integration_and_reports_done()
 #[tokio::test]
 async fn cancel_during_slow_remote_merge_push_reports_done() {
     use db::TaskStepRepo;
-    use std::os::unix::fs::PermissionsExt;
+
     let fixture = Fixture::new("forge-merge-push-cancel-slow").await;
     let candidate = fixture.candidate().await;
     fixture.approve_candidate().await;
@@ -3665,7 +3663,7 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
         .unwrap();
     assert!(output.status.success());
     let hook = remote.join("hooks/pre-receive");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &hook,
         format!(
             "#!/bin/sh\ntouch {}\nwhile [ ! -f {} ]; do sleep 0.02; done\n",
@@ -3674,9 +3672,8 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
     let post_merge = fixture.checkout.join(".git/hooks/post-merge");
-    std::fs::write(
+    process_supervisor::executable::write_executable(
         &post_merge,
         format!(
             "#!/bin/sh\ngit push {} HEAD:refs/heads/main\n",
@@ -3684,7 +3681,6 @@ async fn cancel_during_slow_remote_merge_push_reports_done() {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&post_merge, std::fs::Permissions::from_mode(0o755)).unwrap();
     let db = fixture.harness.state.db.clone();
     let service = fixture.harness.state.task_service.clone();
     let task_id = fixture.resolved.placement.task_id.clone();

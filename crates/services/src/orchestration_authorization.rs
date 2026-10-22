@@ -98,7 +98,7 @@ impl OrchestrationAuthorizationService {
 
     /// Derive the account target after the shared evaluator admits the caller.
     /// This method loads no identity, Profile or binding policy.
-    pub(crate) async fn main_account_target(&self, scope: &CanonicalScope) -> Result<String> {
+    pub async fn main_account_target(&self, scope: &CanonicalScope) -> Result<String> {
         match scope.scope_type {
             CanonicalScopeType::Account => Ok(scope.scope_id.clone()),
             CanonicalScopeType::AgentChat => self

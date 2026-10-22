@@ -36,8 +36,8 @@ use operation_registry::mcp::{
 use serde_json::{json, Value};
 use services::{
     workflow::engine::WorkflowEngine, DiffService, MemoryAccessContext, MemorySearchResult,
-    SetProjectAgentBindingInput,
 };
+use services_agents::SetProjectAgentBindingInput;
 use uuid::Uuid;
 
 use crate::{
@@ -1409,7 +1409,7 @@ pub(super) async fn forge_send_agent_chat_message(
     }
     let admitted = state
         .agent_chat_service
-        .send_message(services::SendAgentChatMessageInput {
+        .send_message(services_agents::SendAgentChatMessageInput {
             actor_user_id: user_id.to_owned(),
             chat_id: params.chat_id,
             content: params.content,
@@ -1472,7 +1472,7 @@ pub(super) async fn forge_create_agent_handoff(
     let source = state.agent_chat_service.ensure_main_chat(user_id).await?;
     let outcome = state
         .agent_chat_service
-        .create_handoff(services::CreateAgentHandoffInput {
+        .create_handoff(services_agents::CreateAgentHandoffInput {
             actor_user_id: user_id.to_owned(),
             source_chat_id: source.id,
             source_message_id: params.source_message_id,

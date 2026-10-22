@@ -143,6 +143,130 @@ async fn hooks_enqueue_failure_rolls_back_status_cas() {
 }
 
 #[tokio::test]
+async fn failed_transition_leaves_no_workflow_snapshot_for_board_or_ordinary_entry() {
+    for board_move in [false, true] {
+        let db = Arc::new(sqlite_db().await);
+        seed_project_repo_and_task(&db, "snapshot-rollback", "start").await;
+        let task = TaskRepo::get_by_id(&*db, "snapshot-rollback", false)
+            .await
+            .unwrap()
+            .unwrap();
+        // Fail after enqueue, so rollback must include the frozen definition,
+        // the hooks step and the transition itself.
+        sqlx::query("CREATE TRIGGER reject_transition_event BEFORE INSERT ON domain_event WHEN NEW.event_type='task.transitioned' BEGIN SELECT RAISE(ABORT,'transition event failed'); END")
+            .execute(db.pool()).await.unwrap();
+        let service = engine(db.clone(), Arc::new(EventBus::new(8)));
+        let workflow = cascade_chain_workflow(1);
+        let actor = api_types::Actor::user(api_types::UserActionSource::Api);
+        let execution = service.workflow_execution();
+        let result = if board_move {
+            execution
+                .move_task(
+                    &task.id,
+                    "step_0",
+                    task.version,
+                    &workflow,
+                    &actor,
+                    "snapshot rollback",
+                    super::super::BoardMoveRequest {
+                        operation_id: new_uuid_v4(),
+                        project_id: task.project_id.clone(),
+                        board_revision: db::TaskBoardRepo::board_revision(&*db, &task.project_id)
+                            .await
+                            .unwrap(),
+                        target_column_statuses: vec!["step_0".into()],
+                        before_id: None,
+                        after_id: None,
+                    },
+                )
+                .await
+        } else {
+            execution
+                .transition(
+                    &task.id,
+                    "step_0",
+                    task.version,
+                    &workflow,
+                    &actor,
+                    "snapshot rollback",
+                    false,
+                    Default::default(),
+                )
+                .await
+        };
+        let Err(error) = result else {
+            panic!("the injected event write must fail")
+        };
+        assert!(
+            error.to_string().contains("transition event failed"),
+            "{error}"
+        );
+        assert_eq!(
+            TaskRepo::get_by_id(&*db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "start"
+        );
+        // The outer command retains its durable failure reply. The rolled
+        // back transition must leave no hooks or cascade step behind.
+        assert!(db
+            .task_steps(&task.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|step| step.kind == "command"));
+        assert!(TransitionLogRepo::list_by_task(&*db, &task.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0,
+            "board_move={board_move}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transition_without_hooks_creates_no_workflow_snapshot() {
+    let db = Arc::new(sqlite_db().await);
+    seed_project_repo_and_task(&db, "snapshot-unused", "start").await;
+    let mut workflow = cascade_chain_workflow(1);
+    for state in &mut workflow.states {
+        state.hooks = StateHooks::default();
+    }
+    let service = engine(db.clone(), Arc::new(EventBus::new(8)));
+    let result = service
+        .workflow_execution()
+        .transition(
+            "snapshot-unused",
+            "step_0",
+            1,
+            &workflow,
+            &api_types::Actor::user(api_types::UserActionSource::Api),
+            "entry without hooks",
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.task.status, "step_0");
+    assert_eq!(result.pending_steps, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM task_step_workflow")
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn workflow_writer_waits_for_hook_lease_and_old_owner_stays_fenced() {
     let db = Arc::new(sqlite_db().await);
     let bus = Arc::new(EventBus::new(8));

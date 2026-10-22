@@ -27,14 +27,14 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.14.0"
+version = "0.14.1"
 license = "MIT"
 description = "AI coding agent workflow engine — orchestrate agents through structured task lifecycles"
 homepage = "https://github.com/ForgeAILab/forge"
 repository = "https://github.com/ForgeAILab/forge"
 
 [workspace.dependencies]
-agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "5ee41e4", features = ["provider-summary"], version = "0.1.0" }
+agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "1de6d7d", features = ["provider-summary"], version = "0.7.0" }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

@@ -63,6 +63,28 @@ impl Host {
         self.forge(&self.path("home"), &all)
     }
 
+    fn seed_newer_database(&self) {
+        let database = self.path("data").join("forge.db");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime builds")
+            .block_on(async move {
+                let pool = db::create_sqlite_pool(&format!("sqlite:{}", database.display()))
+                    .await
+                    .expect("database opens");
+                db::run_migrations(&pool).await.expect("migrations run");
+                sqlx::query(
+                    "INSERT INTO _migration (version, name, applied_at)
+                     VALUES (9999999999999, 'future_schema', 'future')",
+                )
+                .execute(&pool)
+                .await
+                .expect("future migration records");
+                pool.close().await;
+            });
+    }
+
     /// What an older release left behind for this data directory: a
     /// database that recorded the temp-directory root, and files in it.
     fn seed_legacy_root(&self) -> PathBuf {
@@ -178,6 +200,25 @@ fn a_fresh_data_directory_has_nothing_to_move() {
     assert_eq!(output.status.code(), Some(0), "{}", text(&output.stderr));
     assert!(text(&output.stdout).contains("Nothing to move"));
     assert!(!host.path("data").join("worktrees").exists());
+}
+
+#[test]
+fn newer_database_refusal_is_actionable_for_the_migrate_command() {
+    let host = Host::new();
+    host.seed_newer_database();
+
+    let output = host.migrate(&[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("data directory was upgraded by a newer Forge"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("V9999999999999__future_schema"), "{stderr}");
+    assert!(stderr.contains("Run the newer Forge"), "{stderr}");
+    assert!(stderr.contains("make clean-test"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(!stderr.contains("backtrace"), "{stderr}");
 }
 
 #[test]

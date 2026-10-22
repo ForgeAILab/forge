@@ -400,8 +400,7 @@ fn repair_budget_source<'a>(
                 if merge_repair {
                     is_merge(state)
                 } else {
-                    state.name == crate::workflow::default_states::REVIEW
-                        || state.role.as_deref() == Some(crate::workflow::default_roles::REVIEWER)
+                    db::budget::is_review_state(state)
                 }
             })
         });

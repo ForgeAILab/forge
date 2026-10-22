@@ -4698,7 +4698,7 @@ async fn other_review_entries_never_carry() {
         .await
         .expect("entries load");
     assert_eq!(
-        crate::workflow::review_carry_entry_kind(&entries[..entries.len() - 1]),
+        crate::workflow::review_carry_entry_kind(&entries[..entries.len() - 1], &ctx.workflow),
         None,
         "a bridge alone is not an entry into review"
     );

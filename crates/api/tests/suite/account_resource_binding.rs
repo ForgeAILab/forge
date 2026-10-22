@@ -471,7 +471,8 @@ async fn agent_account_visibility_hidden_from_other_user() {
     let app = &harness.app;
 
     // Create a shell agent as User A (test-user-id) — gets visibility=account by default
-    let (agent_id, _) = common::create_shell_agents(app, ws.path(), "agent-vis").await;
+    let (agent_id, _) =
+        common::create_shell_agents(app, &harness.state, ws.path(), "agent-vis").await;
 
     // User A lists agents → sees their account-scoped agent
     let agents_a: PaginatedResponse<AgentResponse> =
@@ -519,7 +520,8 @@ async fn non_owner_cannot_mutate_account_scoped_agent() {
     let harness = common::test_app(ws.path(), "agent-owner-mutate").await;
     let app = &harness.app;
 
-    let (agent_id, _) = common::create_shell_agents(app, ws.path(), "agent-owner-mutate").await;
+    let (agent_id, _) =
+        common::create_shell_agents(app, &harness.state, ws.path(), "agent-owner-mutate").await;
     let agent: AgentResponse = common::empty_request(
         app,
         Method::GET,

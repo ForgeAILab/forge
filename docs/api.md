@@ -270,7 +270,7 @@ database for historical provenance.
 | GET    | `/api/v1/tasks/{id}/findings` | Current review-window findings (same Project read authority as Task reviews) |
 | GET    | `/api/v1/tasks/{id}/prompt-preview?role=&trigger=` | Preview effective prompt without dispatching |
 | PATCH  | `/api/v1/tasks/{id}` | Update a task at the required `version`; send `description: ""` to store an empty description and clear it in the UI (omitted or `null` leaves it unchanged). A stale version returns `409 version_conflict`; clients must refetch before retrying. |
-| DELETE | `/api/v1/tasks/{id}` | Soft-delete task |
+| DELETE | `/api/v1/tasks/{id}` | Soft-delete task; refused in `in_progress`, `merging`, or a review gate (including renamed `reviewer` gates in canonical phase `review`) |
 | POST   | `/api/v1/tasks/{id}/claim` | Claim a standalone Task or the first eligible ordered child (auto-dispatches); a root with children is a non-executing coordinator and cannot be claimed |
 | GET    | `/api/v1/tasks/{id}/actions` | Read caller-filtered offers and the Task version |
 | POST   | `/api/v1/tasks/{id}/actions` | Apply one offered closed verb and parameters at an exact Task version |
@@ -360,6 +360,8 @@ credential health), so it may be `active` below the concurrency cap while
 capacity is a placement wait, independent of Agent availability.
 
 | GET / PUT | `/api/v1/settings` | Read/update administrator Forge settings; the server run cap and usage index budget apply live |
+| GET / POST | `/api/v1/config/mcp` | Administrator-only read/install/uninstall of MCP configuration on the server; Project/local scope with a Project id also requires Project visibility (read) or owner/admin role (write) |
+| GET | `/api/v1/config/mcp/endpoint` | Signed-in connection URL only; Project/local scope with a Project id requires Project visibility |
 | PATCH | `/api/v1/daemons/{id}` | Set or clear a version-checked administrator run limit |
 | DELETE | `/api/v1/daemons/{id}` | Remove a disconnected machine as its registration owner or an administrator |
 | GET    | `/api/v1/daemons/{id}/removal` | Preview a removal for its owner or an administrator: Tasks to re-place and Agents to retire |
@@ -387,6 +389,32 @@ capacity is a placement wait, independent of Agent availability.
 | GET    | `/api/v1/provider-authorizations/{id}` | Poll an account-owned provider authorization operation |
 | POST   | `/api/v1/provider-authorizations/{id}/cancel` | Cancel a non-terminal provider authorization using `expected_version` |
 
+Provider connection tests and health probes resolve each HTTPS endpoint once,
+reject any restricted address in the result, and connect only to those pinned
+addresses. They do not follow redirects or use proxies. Endpoint checks also
+apply when loading stored metadata. Restricted destinations include `0.0.0.0/8`,
+former 6to4 relay anycast `192.88.99.0/24`, local-use NAT64 `64:ff9b:1::/48`,
+Teredo `2001::/32`, IPv6 documentation `2001:db8::/32` and `3fff::/20`,
+benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`,
+discard-only `100::/64`, and well-known NAT64 (`64:ff9b::/96`),
+IPv4-translated (`::ffff:0:0:0/96`), 6to4 (`2002::/16`), IPv4-mapped and
+IPv4-compatible IPv6 addresses whose embedded IPv4 address is restricted.
+Native provider transport, the web fetch tool
+(authorization gate and transport) and public search use the same address
+predicate. Public search adds stricter IPv6 exclusions for its endpoint,
+resolver and result URLs: it refuses every IPv4-mapped/compatible and 6to4
+address outright, the rest of `64:ff9b::/48` outside the well-known `/96`,
+and broader conservative guards listed in [architecture](architecture.md).
+
+Native turn failure messages may contain a provider's checked rejection reason
+(up to 300 characters). Reasons reflecting credentials sent on that request are
+omitted; raw HTTP bodies are never logged. Rejected requests use the runtime
+`Provider` error kind, so their message reads `Provider: …` instead of
+`Config: …`. Existing REST/MCP error codes and
+structured turn failure/retry/recovery fields are unchanged; clients should use
+those fields rather than parse message text. Generic embedded-runtime REST/MCP
+failures continue to redact internal provider details.
+
 Each configured entry in `GET /api/v1/providers` includes `health`, or `null`
 when no provider outcome has been recorded. Health contains `status`
 (`healthy`, `backoff`, or `error`), `consecutive_failures`,
@@ -394,7 +422,10 @@ when no provider outcome has been recorded. Health contains `status`
 `backoff_until`. A timed backoff stops new Task dispatch and leaves queued
 Agent Chat turns waiting without consuming attempts. Auth failures have a
 `null` backoff time and remain unavailable until `POST /providers/{id}/test`
-succeeds. The connection test itself updates the health row.
+succeeds. The connection test itself updates the health row. Native Agent
+Chat, Task and reviewer-correction turns record health from typed turn
+evidence only (credential rejection, usage limit, exhausted transient
+retries), never from provider message text.
 | GET    | `/api/v1/provider-authorizations/{provider}/callback` | Complete a browser callback after validating the protected state and trusted redirect origin |
 | GET    | `/api/v1/agents/{id}/profiles` | List immutable profiles for an owned identity |
 | POST   | `/api/v1/agents/{id}/profiles/connect` | Create/select a new native profile revision referencing an existing provider entry (`credential_id`) |
@@ -970,8 +1001,36 @@ direct stream so one approved execution cannot appear twice.
 
 `AttentionCategory` includes `human_input_required`, `validation_failed`,
 `run_stalled`, `progress_warning`, `retry_exhausted`, `review_ready`, `review_risk`,
-`execution_failed`, `delivery_followup`, `decision_recorded`, `runtime_offline`,
+`review_needs_owner`, `execution_failed`, `delivery_followup`, `decision_recorded`, `runtime_offline`,
 `budget_threshold`, `commitment_overdue`, and `conflict_hotspot`.
+
+Tasks parked with the typed `review_needs_owner` condition project as
+`review_needs_owner`, priority 85, recommended action `inspect_review`. Their
+summary is `Review needs the owner: <park reason>`; `details.interruption`
+retains that reason (for example a repeated finding, only non-blocking findings
+remaining, or no change after repair). `details.recovery.actions` contains the
+owner's standard Task offers, including finding deferral and guided retry when
+eligible. These are versioned context snapshots: commands still use the Task
+action API and its current authorization. Mission Control uses the same shared
+Task action forms as the Task Review tab and filters each offer by its `authority`
+and the viewer's Project role. Human offers (`owner` authority) and Attention
+Resolve require Project member, admin or owner access; approval with an override
+requires owner access. Non-owners retain ordinary approval when an offer permits
+both choices, with the override choice removed. An explicit membership takes
+precedence over `owner_id`; instance administration alone grants no additional
+Project rights. Legacy ownerless Projects retain their existing signed-in-user
+owner rights. While Project or membership data loads, neither buttons nor
+`Owner action needed` appear. Once those reads settle, viewers who can perform
+none of the actions (including signed-out users and failed permission reads) see
+`Owner action needed` without buttons. The park reason and Review link remain
+visible throughout. Refreshed offers use the same per-action permission filter.
+Other interruption causes retain
+`execution_failed`. Clearing the condition, replacing its cause, or reaching a
+terminal state resolves the old park incident. Owner parks do not prepare or
+admit a Project Agent wake, request Agent setup, or consume a blocker wake
+budget. Startup sweeps skip them, and previously admitted blocker turns do not
+escalate them into a second `human_input_required` incident. Other categories
+retain their existing wake behavior.
 
 `project.conflict_hotspot.detected` is a durable Project-scoped event with
 `project_id`, `path`, `task_ids` (distinct, most recent first, at most 10),
@@ -2374,6 +2433,43 @@ is not sent over the protocol. `build_jobs_per_run: 0` denotes a disabled budget
 while `run_nice` reports the configured increment, including on Windows.
 
 
+### MCP client configuration
+
+`GET /api/v1/config/mcp` and `POST /api/v1/config/mcp` use the same instance
+administrator requirement as Settings. A signed-in non-administrator receives HTTP 403
+`admin_required` before any server configuration file is accessed or its path
+is returned. In demo mode (`--demo`), `POST` is refused for every caller with
+HTTP 422 `server_location_refused` before this administrator check (see
+[Errors](#errors)). These routes inspect or modify the server's filesystem: `scope=user`
+uses the server's HOME, and `scope=project` (the default) or `scope=local`
+without a Project id uses the server's current directory.
+
+With a non-empty `project_id` in Project/local scope, reads also require Project
+visibility and writes require its owner/admin role. Instance administrator status
+does not bypass Project visibility: an inaccessible Project has the same HTTP
+404 `not_found` response as an unknown Project, before repository/path lookup;
+an insufficient Project write role returns HTTP 403 `insufficient_role`.
+Authorized responses retain `config_path`, `url`, `expected_url`, `installed`
+and `agents`. Requests accept `agent` (`claude`, `cursor`, `codex`), `scope`
+(`project`, `local`, `user`), optional `project_id` and `public_base_url`;
+POST additionally accepts `action` (`install`, `uninstall`). The web MCP controls
+call these routes only for administrators.
+
+`GET /api/v1/config/mcp/endpoint` is a separate, signed-in read for configuring
+the caller's own MCP client. It accepts only `scope` (`project`, the default;
+`local`; or `user`) and optional `project_id`. Project scope requires a non-empty
+Project id; Project/local scope with an id requires Project visibility, including
+for instance administrators. Hidden and unknown Projects both return HTTP 404
+`not_found`; missing authentication returns HTTP 401. Account (`user`) scope
+requires only a signed-in account. The response is exactly `{"url":"https://forge.example/mcp"}`
+(with `?project_id=` and the encoded id in Project scope). The URL uses the origin
+of configured `server.public_base_url`, falling back to `http://<server.bind>`
+when unset. Caller-supplied base URLs are not accepted. This route never reads
+client configuration files and returns no paths, credentials, or install state.
+Non-administrator web controls use this read and withhold the copy action until
+it succeeds.
+
+
 ### Daemon run limits
 
 Daemon registration and periodic report accept optional typed
@@ -3719,7 +3815,15 @@ Agent is at its run limit, for example a Task sent back by review while the
 coder runs other Tasks. It is the same kind of wait and clears when one of the
 Agent's runs ends; a Task still waiting for its first run shows no reason.
 
-A parent Task (one with subtasks) parked in `review` on an exhausted review
+Review actions, re-runs, and review-ready projections resolve review states from
+the workflow: the state named `review`, or a gate with role `reviewer` and
+`canonical_phase: review`. A custom name such as `qa_review` has the same review
+behavior and appears under its actual state name in responses and events. A
+Task's `review_config` is stored under `review` in its `task_state_config` and
+configures whichever review gate the workflow has: a renamed gate reads it there
+unless the Task configures that gate by its own name.
+
+A parent Task (one with subtasks) parked in a review state on an exhausted review
 budget offers three exits besides `cancel`: `retry` (reset the budget and
 re-run the aggregate review in place), `approve` with `override_checks: true`
 (the owner passes the failed review; see below) and `send_back` (offer reason
@@ -4774,9 +4878,18 @@ The endpoint contract is `{"results":[{"url","title","snippet"}]}`. Forge
 adds its retrieval timestamp, validates public HTTP(S) source URLs, caps the
 query at 512 characters and results at 10, and labels all returned text as
 untrusted data. Forge disables redirects and ambient proxy/cookie/auth state,
-resolves the configured host at connect time, and rejects private, special-use,
-and IPv4-mapped IPv6 addresses. An unset endpoint omits the tool; invalid
-configuration is rejected before a runtime can expose it.
+resolves the configured host at connect time, and rejects the entire hostname
+if any resolved address is private or otherwise blocked (including mixed
+public/private IPv4/IPv6 answers). Empty resolution is also refused; accepted
+answers are passed directly to the connection. Endpoint and result URL checks
+share the provider/fetch hostname policy: reject `localhost`,
+`localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS), and subdomains
+of each, ignoring ASCII case and trailing dots. Names such as
+`example.internal.com`, `internal.example.com`, `home.arpa.example.com` and
+`local.example.com` remain allowed. IPv4-translated addresses apply the embedded
+IPv4 policy; IPv4-mapped/compatible and 6to4 addresses remain refused outright.
+An unset endpoint omits the tool; invalid configuration is rejected before a
+runtime can expose it.
 
 ### Access model
 
@@ -6582,7 +6695,9 @@ overrides take precedence over Review state config and Project defaults. Once
 that allowance is spent, an inconclusive result parks `review_blocked`, source
 `verify`, without charging the Review failure budget. Offers are Retry Verify (`retry`), Mark
 Reviewed (`approve`, reason required), and Cancel (`cancel`). Retry re-enters
-the ordinary review entry. Runner infrastructure retains the existing review
+the ordinary review entry and retires the inconclusive block, so the new
+attempt offers the ordinary review decisions; an inconclusive result in the
+new entry parks again. Runner infrastructure retains the existing review
 CI infrastructure handling.
 
 Evidence paths are relative to `FORGE_VERIFY_DIR` and confined to that directory;
@@ -6914,8 +7029,18 @@ without authentication when it has an owner, returns HTTP 409 with
 `code: machine_owned` and leaves the owner, credential and hostname untouched.
 The same owner re-registering rotates the credential as before, and an unclaimed
 registration can still be claimed by the first authenticated user. A
-`machine_id` starting with `removed:`, or starting with `embedded:` and not this
-server's own embedded identity, returns HTTP 409 with `code: machine_id_reserved`.
+`machine_id` starting with `removed:` or `embedded:` (after trimming whitespace)
+returns HTTP 409 with `code: machine_id_reserved` and message
+`This machine_id is reserved for the Forge server`. This includes this server's
+own embedded identity, for both fresh registration and re-registration, with or
+without user authentication. Authenticated remote reports and WebSocket reconnects
+for reserved identities return the same error and do not modify daemon state.
+Errors use the standard `{code, message, details, request_id}` response shape.
+The server's embedded daemon registers and reports directly through its internal
+service path; it does not use these HTTP routes. Its identity is never
+account-owned: if an earlier remote registration claimed it, the embedded
+daemon's next registration clears the owner, restores `global` visibility and
+rotates the credential, so the claimant's token stops working.
 
 ### Task budget projections
 

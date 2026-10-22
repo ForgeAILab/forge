@@ -1,0 +1,1 @@
+DROP TRIGGER IF EXISTS agent_wake_blocker_rearm_on_reopen;

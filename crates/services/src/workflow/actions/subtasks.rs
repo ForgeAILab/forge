@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use db::TaskDependencyRepo;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
-use crate::workflow::{default_states, HookAction, HookContext, HookResult};
+#[cfg(test)]
+use crate::workflow::default_states;
+use crate::workflow::{HookAction, HookContext, HookResult};
 
 use super::common::cancel_subtask_with_effective_workflow;
 
@@ -67,7 +69,7 @@ pub struct SubtaskSequenceComplete;
 #[async_trait]
 impl HookAction for SubtaskSequenceComplete {
     async fn execute(&self, ctx: &HookContext) -> HookResult {
-        if ctx.to_state != default_states::REVIEW {
+        if !crate::workflow::is_review_state(&ctx.workflow, &ctx.to_state) {
             return HookResult::Skipped {
                 reason: "not entering review".to_owned(),
             };

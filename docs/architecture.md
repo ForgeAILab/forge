@@ -23,8 +23,8 @@ crates/
 ├── agent-host/    # Forge-owned direct Agent Runtime composition and protected stores
 ├── operation-registry/ # Typed native operation specs and generated projections
 ├── db/            # SQLite schema, migrations, repository implementations
-├── services/      # Task core, workflow engine, shared domain services
-├── services-agents/ # Shared composition root, inquiry/topic services, provider authorization, embedded executor
+├── services/      # Task/workflow core and transport-neutral domain contracts
+├── services-agents/ # Agent Chat, native tools, orchestration adapters, embedded agents, and runtime composition
 ├── pricing/       # models.dev catalog, price resolution at admission, cost estimation
 ├── executors/     # TaskExecutor trait, Shell executor, JSONL logging
 ├── cli-adapters/  # Codex, Claude, Cursor, Gemini, opencode, shell, null adapters
@@ -46,7 +46,7 @@ api → mcp-server
 api / mcp-server / forge-solo → services-agents → services → db
 api / mcp-server / forge-solo → services
 services-agents / services → events / agent-host / executors / workspace → git
-agent-host → agent-runtime
+agent-host → agent-runtime / config
 forge-cli / forge-solo → config
 forge-solo → api-types / review / cli-adapters / operation-registry
 api / review → db (finding ledger and round-policy projection)
@@ -59,12 +59,94 @@ services / review / forge-client → check-executor → process-supervisor
                                                   → executors / api-types
 ```
 
-`process-supervisor` is a leaf (tokio only): `git` cannot depend on `executors`
+`services-agents` is strictly above `services`: core never depends on the
+agent crate. Core callers reach upper-layer behavior through narrow contracts
+owned by `services`, including `WakeTurns`, task `ExecutionSupport`, and
+`AgentEventConsumerNames`; `ForgeRuntimeBuilder` supplies their concrete agent
+implementations. Agent Chat policy/turn workers, inquiries, context manifests,
+default agents, Genesis and Project orchestration adapters, native tools,
+topic rotation, wake delivery, and the embedded agent service all live in
+`services-agents`.
+
+`process-supervisor` is a leaf (tokio and tempfile): `git` cannot depend on `executors`
 or `review`, and `forge-client` must not pull in `services`, so the one
 process-group implementation that Git, CI steps and daemon helpers share lives
 below all of them. `check-executor` sits between: it needs `git` (managed
 checkout), `executors` (run budget, redaction) and `api-types`, and is called by
 `services`, `review` and `forge-client`; it depends on neither `services` nor `db`.
+
+`executors` and `cli-adapters` also use `process-supervisor`'s executable helpers.
+Script publication stages in a private sibling directory, writes from a separate
+Unix process, waits for that writer to exit, fsyncs through a read-only descriptor,
+and renames into place. The multithreaded parent never opens the executable inode
+for writing, so another fork cannot inherit a writable descriptor and make even
+an indirectly invoked Git hook fail with Linux `ETXTBSY`. The staging directory
+can sit in a run-writable compiler-cache store, so the writer creates the file
+exclusively (`set -C`), the parent opens it with `O_NOFOLLOW | O_NONBLOCK` and
+requires a regular file with one link, and a writer still running after 10 s is
+stopped: an entry a run plants there fails the publication instead of being
+written through or chmodded. All fake executable
+fixtures and the generated compiler-cache launcher use this publisher.
+The writer program lives in the crate, since release images build from
+`crates/` alone (`scripts/test_crate_includes.py` keeps non-test includes
+inside it); Python CI fixtures run the same program through
+`scripts/executable_fixture.py`. The shared
+sync/async spawn helpers retry only `ExecutableFileBusy`, five retries with
+10/20/40/80/160 ms delays; other spawn errors and process exit failures retain
+their original behavior. Compiler-cache probes, supervised processes, and direct
+opencode/Gemini/Smith launches use these bounded retries.
+
+Provider probes, native requests, web fetch and public search share
+`config::is_restricted_public_address`. `config` has no internal crate
+dependencies, so `agent-host` can use this implementation without a cycle.
+Well-known NAT64 `64:ff9b::/96` and IPv4-translated `::ffff:0:0:0/96`
+(RFC 2765) addresses apply the IPv4 policy to the final 32 bits in every
+consumer, as provider/fetch 6to4 and mapped/compatible addresses do to their
+embedded IPv4 destination. Local-use NAT64
+`64:ff9b:1::/48` and Teredo remain refused. Every consumer rejects IPv4 IETF
+protocol assignments at `192.0.0.0/24`, TEST-NET-1 at `192.0.2.0/24`, and
+former 6to4 relay anycast at `192.88.99.0/24`, including IPv6 forms embedding
+those destinations. All consumers also refuse IPv6 documentation
+`2001:db8::/32` and `3fff::/20`, benchmarking `2001:2::/48`,
+ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28`, and discard-only `100::/64`.
+
+`config::is_blocked_public_search_address` adds public search's existing
+conservative IPv6 exclusions to that common policy for endpoint validation,
+request validation and result URLs. These are deliberate differences:
+public search refuses all IPv4-mapped/compatible and 6to4 addresses even when
+their embedded IPv4 is public, while explicitly configured providers and
+fetch can reach public IPv4 destinations through these transition forms.
+Search also retains its broader guards over `2001:1::/32` through
+`2001:5::/32`, `3ff0::/12`, and the rest of `64:ff9b::/48` outside the
+well-known `/96` (unassigned). These conservative search-only guards cover
+more than the precise benchmarking/documentation prefixes: search accepts
+an endpoint and untrusted result metadata, while provider/fetch deliberately
+admits otherwise public destinations outside the shared special-use ranges.
+Keeping these broader guards search-only preserves that provider/fetch
+boundary without relaxing search's existing restrictions. The shared address table in
+`services_agents::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
+checks agreement and each documented exclusion.
+`config::network_policy::tests::shared_policy_changes_only_intended_address_verdicts`
+compares both predicates with verbatim copies of their pre-sharing versions
+over a generated address set: the only verdict changes allowed are
+provider/fetch refusing `192.88.99.0/24` (and IPv6 forms carrying it),
+provider/fetch refusing the six IPv6 special-use ranges above, both policies
+refusing IPv4-translated addresses carrying restricted IPv4, and public
+search admitting well-known NAT64 addresses whose embedded IPv4 is public.
+
+`config::is_restricted_public_hostname` owns the common hostname policy for
+provider-entry validation and probes, native provider requests, fetch
+authorization and transport, and public-search endpoint validation, request
+resolution and result URLs. All refuse `localhost`, `localhost.localdomain`,
+`internal`, `home.arpa`, `local` (mDNS), and subdomains of each, ignoring ASCII
+case and trailing dots. Matching uses whole DNS labels: `example.internal.com`,
+`internal.example.com`, `home.arpa.example.com` and `local.example.com` remain
+allowed. At request time, search rejects the entire
+hostname if resolution is empty or any answer is blocked, matching providers
+and fetch; it never filters a mixed answer down to its public members.
+Direct clients receive only an all-public pinned answer set. Deterministic
+regressions cover hostname suffixes and mixed IPv4/IPv6 DNS answers without
+contacting DNS or an external endpoint.
 
 `pricing` owns the provider pricing catalog, the SQLite pricing repository and
 the admission-time price resolution (`pricing::auto`). It sits below `services`
@@ -200,6 +282,33 @@ starts as a worker, and Mission Control routes pass one built on the same
 database. Shared shutdown and worker identity contracts live in core
 `worker_runtime::assembly`; graph-dependent dead-letter registration lives in
 `ForgeRuntime::dead_letter_service` in `services-agents`.
+
+`config::is_restricted_public_address` owns the shared IP policy used by
+provider-entry validation, service probes, native provider transport, the web
+fetch tool's authorization gate and transport, and public search.
+`config::is_restricted_public_hostname` owns the shared hostname checks. Public
+search (`services_agents::native_tools` request validation and result filter, and
+`config` endpoint validation) adds the deliberate IPv6 exclusions listed
+above. `forge_agent_host::outbound_http::public_http_client_builder` owns the
+shared client policy for provider connection tests/health probes, native
+provider requests, fetch and public search. It resolves and validates the target
+before any connection, pins direct requests, disables automatic redirects, and
+uses a per-build proxy environment snapshot with reqwest's own proxy matcher.
+Unless `NO_PROXY=*` disables proxies, a set but unusable applicable value
+(`HTTPS_PROXY`, else `ALL_PROXY`) refuses the request
+(`PublicHttpError::UnusableProxy`) instead of falling through to
+the other variable or a direct connection.
+`NO_PROXY` matches use the direct pinned path. A `*` entry anywhere in its
+comma-separated list, with optional surrounding whitespace, disables proxies
+for every target, including literal IPv4/IPv6 addresses, matching curl.
+Other exclusion forms retain reqwest's semantics. An operator-configured proxy's
+address is not target-validated; CONNECT retains target SNI/Host, but the proxy
+resolves the name itself, so pinning cannot hold through that proxy. Proxy
+userinfo is removed from URLs and carried only in sensitive authentication
+headers. Public search shares one timeout budget between local resolution and
+the HTTP request. Check receipts redact credentialed operator proxy URLs,
+their percent-decoded Basic authentication tokens, and all
+`Proxy-Authorization:` header values. See [outbound proxies](getting-started.md#outbound-proxies).
 
 The upper crate also owns `agent_inquiry_service`, `main_chat_topic`,
 `prompt_preview`, `provider_authorization`, and `embedded_task_executor`, with
@@ -1356,7 +1465,7 @@ message provenance and earlier topics remain inspectable.
 For a chat whose responder (the active Main or Project binding's identity and
 its selected Profile) is native, Genesis start, Project creation/handoff and the
 first user message after eight hours idle mark `rotation_pending` in
-`agent_chat_topic_rotation`, in the trigger's transaction. A CLI chat raises no
+`agent_chat_topic_rotation`, in the source writer's transaction. A CLI chat raises no
 automatic intent and keeps its pre-topic-working-set behaviour: its REST topic
 request rotates directly and is denied while a turn is live. A native REST request
 uses the same intent: it is denied while a Genesis session needs a decision
@@ -2280,8 +2389,9 @@ at all, as the owner's decision rather than whatever `PATH` offers.
 Both chat scopes and a Task worker may also fetch a public page through the
 runtime's built-in `fetch` tool, gated on the same permission as the search
 tool (a Task worker on its read permission) and on the host supplying a
-transport. Forge's transport pins each request to addresses it resolved and
-accepted, refuses anything but `https` without credentials, follows redirects
+transport. Forge's transport validates each request locally and pins direct
+requests to the accepted addresses (environment proxies resolve independently),
+refuses anything but `https` without credentials, follows redirects
 only inside the origin the runtime authorized, and caps the body — so a public
 hostname that resolves into this machine's network is refused before a socket
 opens, and a cross-origin redirect costs another authorized tool call instead
@@ -2326,6 +2436,62 @@ of the snapshot digest. Loading the checkpoint-backed snapshot or saving the
 live diagnostic window therefore preserves the same canonical state identity.
 Forge links context provenance from the latest manifest in the live session
 after the turn; it does not reconstruct historical replay from a checkpoint.
+
+The runtime pin is v0.7.0 plus U9 groups C/D (`1de6d7d`). Its materialized session snapshots stay
+unversioned and its checkpoints remain schema 3 / transition revision 4, so
+Forge keeps the same encrypted store and database schema. Runtime schema-4
+SessionJournal support is only a capability contract in this release; Forge's
+stores do not advertise it, and continue writing materialized snapshots and
+checkpoints. The opt-in flat semantic summary and external-agent features are
+also not configured. Forge retains its per-tool argument normalizers: the
+runtime turns a representable schema-invalid call into a correctable tool error
+(as the previous pin already did), but does not apply Forge's historical
+`parameters`-envelope transformation.
+
+v0.5.0 records the provider and model that produced each reasoning part
+(`producer`) in canonical history, so it reaches the encrypted snapshot and
+the SQLite LCM entry, whose content fingerprint covers it. The previous pin
+(5ee41e4, Forge v0.14.0) drops the unknown field on read and then fails the
+fingerprint check, so it cannot resume an LCM session that ran a reasoning turn
+on v0.5.0. Downgrading is therefore unsupported for those sessions; sessions
+without LCM, or without stored reasoning, still resume on the older pin.
+
+The v0.7.0 default request sizer counts reasoning signatures and advertises
+`char-ratio-2`. Forge uses that default for planning and LCM (there is no host
+`ForgeLcmSizer`). Its revision changes the LCM component fingerprint, while
+resume validates the saved identity, ownership and immutable DAG before
+rebuilding derived accounting. `FORGE_LCM_POLICY_REVISION` stays
+`forge-lcm-policy-2`; no migration or LCM namespace reset is needed. The frozen
+`runtime_82f5aac_session_checkpoint_lcm.json` fixture was produced by the prior
+Forge/runtime pin and proves encrypted snapshot/checkpoint resume, compaction,
+another turn and a second resume with historical sources and nodes intact.
+
+Both Forge stores keep the default unsupported `journal()` capability. The
+runtime's native import, writer fencing, retirement and collection paths are
+not enabled; materialized snapshots remain unversioned and checkpoints remain
+schema 3 / transition revision 4. The turn backend waits for
+`TurnHandle::completed()` before persisting and releasing its active registry;
+completion now also guarantees that runtime admission and execution gates have
+been released.
+
+Forge's custom provider transport caps HTTP error bodies at 8 KiB, extracts only
+JSON/SSE error status/code and message fields, and drops a reason that reflects
+any non-public header value, header token or URL query value sent on that
+request. The check is stricter than the runtime's verbatim match: it also
+catches the value percent-encoded, split by whitespace or joined by invisible
+characters, ASCII case-changed, or any 16 consecutive characters of it (a
+gateway echoing a truncated key); a masked key such as `sk-proj-****…abcd`
+still passes. Checked reasons are capped at 300 characters in
+`provider.detail`, with numeric `http.status`; the provider adapters recheck
+them before adding them to error messages. Reasons a provider sends inside a
+successful (HTTP 200) stream never pass through this transport; the runtime
+adapters extract and check those with their own verbatim rule. Logs
+record only the HTTP status, never a raw body. Provider `BadRequest` now has the
+coarse runtime kind `Provider`; typed provider rejection/auth/quota evidence
+continues to govern Forge retry and recovery rather than error prose.
+Native Task execution and reviewer correction likewise record provider health
+from typed auth/quota/transient evidence using fixed diagnostics, so a checked
+provider reason cannot masquerade as an HTTP status or cooldown instruction.
 
 Native turn failures project runtime failure classes into Forge's existing
 typed categories: policy denial, context overflow, authentication, quota,
@@ -2421,6 +2587,20 @@ seeds are sealed in the protected store.
 U6 rebuilds tuning-derived state without deleting its LCM namespace or requiring
 a Forge policy-revision bump. Strict binding and authorization mismatches still
 fail closed.
+
+Runtime v0.5.0 changes the deterministic fallback algorithm revision from
+`agent-runtime-lcm-2` to `agent-runtime-lcm-3`. Resume rebuilds only derived
+metadata from the authorized active DAG; existing entries, nodes and fallback
+text remain immutable. The release's crash-safe hard admission and
+uncheckpointed-tail recovery (through `truncate_from`) target hosts with a
+SessionStore and no CheckpointStore. Forge's LCM sessions configure both, so
+hard admission is unchanged for them, and tail recovery is only a last
+fallback: a store left more than one append ahead of the saved checkpoint is
+truncated back to it instead of failing every resume. The previous pin
+already finalized an abandoned non-terminal checkpoint as failed, without
+replay, before admitting new work; v0.5.0 also closes each tool call that turn
+left unanswered with an explicit error result, so the next turn is not
+rejected as `invalid_pairing`.
 
 Within a topic, a full `project.current_state` or `project.charter` result carries
 a unique `read_ref`, and an unchanged repeat returns
@@ -3256,6 +3436,15 @@ validation/review state, stalls, health, budget thresholds, and overdue
 commitments. Any model wake occurs only after deterministic admission with
 budget, cooldown, batching, dedupe, incident lease, self-event suppression,
 and reaction-depth limits.
+
+`review_needs_owner` is an owner-only incident: projection retains its reason
+and owner Task offers without preparing a wake or an Agent setup decision.
+The blocker sweep skips it, consuming no wake budget, and completion of a
+previously admitted turn excludes it from owner escalation. Other Attention
+categories keep their wake behavior. Mission Control checks the signed-in
+user's Project and membership data before rendering owner offers or Resolve;
+other viewers retain the reason and Review link with `Owner action needed`
+and no buttons. Pending or failed permission reads withhold those controls.
 
 Attention consumer health uses live subscribed backlog and checkpoint progress.
 A caught-up or newly initialized consumer is not stale; both the oldest pending
@@ -6011,6 +6200,11 @@ outside the write transaction; the transaction rechecks attempt and Task entry.
 
 ### Deletion, recovery and operational limits
 
+Task soft deletion refuses implementation (`in_progress`), integration
+(`merging`), and review states. Review states use the shared
+`db::budget::is_review_state` rule: the built-in `review` state or a gate
+with role `reviewer` and canonical phase `review`, including renamed gates.
+
 The unresolved-integration guard refuses repository/location/Project deletion
 and default-location change with `409 integration_unresolved` while an effect
 is outstanding or its result is unknown. Other resource guards can refuse
@@ -6239,6 +6433,11 @@ root `coder` never executes there. The review role is whatever the workflow's
 review gate declares, not the built-in `reviewer` name.
 `services::task_hierarchy::RootRolePolicy` owns these assignment and execution
 decisions.
+
+The web's coordination-root launch guard reads the Task's workflow states.
+Its review exception uses the shared review-gate rule (built-in `review`, or
+a `reviewer` gate with canonical phase `review`), so renamed review gates
+offer the same launch controls.
 
 **Root lifecycle (kickoff and the lead).** One rule for every coordination
 root: its subtasks run only while it is in an implementation (`Active`) state
@@ -6515,7 +6714,8 @@ Resolving the item without an answer is refused; an answer on any other item
 is refused.
 
 Project Agent wakes. Project-scope blocker wakes are admitted in one place,
-the blocker sweep (the event path defers them to it), and the sweep has one
+the blocker sweep (the event path defers them to it). Owner-only
+`review_needs_owner` incidents are excluded. For other blockers, the sweep has one
 rule (`task_hierarchy::subtask_park_is_the_leads`): an open blocker of a subtask
 wakes nobody while its root's lead handles it, that is while the root is about
 to re-plan for that park or its lead is planning. It is level state, not a
@@ -6524,7 +6724,7 @@ parked (its `replan` budget included) or lost its lead, the next sweep admits
 the wake. The rule never guesses: a subtask whose root is gone is the
 Project Agent's, and a read that fails for any other reason holds the wake
 for that sweep instead of waking the Project Agent beside a lead that may be
-handling the park. Blockers of the root itself always wake the Project Agent.
+handling the park. Eligible blockers of the root itself wake the Project Agent.
 The Attention item of the subtask is raised either way; only the wake is
 filtered.
 
@@ -6575,6 +6775,17 @@ database form): the action offers, the release continuation, the dispatcher
 snapshot, the dispatch hook, execution admission and the active recovery, so a
 planning root without a lead offers, launches and admits no planner. The plan-candidate exemption applies to exactly the lead's run (the
 planning role, on a root with subtasks, in the planning state).
+
+The web's coordination-root run control follows the review execution rule:
+resolve the state's phase from its explicit phase, recognized column, legacy
+name, then kind/name fallback, and require an effective role other than `coder`
+or the workflow's implementation role. This admits custom review roles and
+implicit review phases. As in `RootRolePolicy::execution_role_for_state`, the
+coordination planning state belongs to the lead first, even when its phase
+resolves to review (a planning gate named `plan_review`), so it is never a
+review run. It does not use the Task's projected `canonical_phase`:
+`merge_failed` can project `review` while its implementation role cannot run on
+the root.
 
 **Step check (`lead_check`).** The inherited subtask workflow is
 `todo → in_progress → lead_check → done` (`cancelled` from any of them).
@@ -7024,6 +7235,15 @@ or Task reparenting; current workflow state cannot supply missing history.
 Historical events without a snapshot remain unchanged and have unknown
 workflow semantics. Live authorization and recovery checks still use current
 state.
+
+Queued hooks and cascades prepare their workflow definition without a database
+write. `TaskStepRepo::enqueue_step_in_tx` freezes it to the deduplicated
+`task_step_workflow` snapshot and stores its reference in the same transaction
+as the step and producing transition (including board moves). Rollback leaves
+no snapshot behind; a transition with no hooks creates none, and an idempotent
+enqueue never freezes a replacement payload. Persisted step references remain
+`project` or `snapshot`; the preparation-only `definition` reference never
+reaches a worker. Existing snapshot retention and garbage collection apply.
 
 `StateKind` classifies states:
 
@@ -7647,12 +7867,19 @@ including when that Review passes without a rerun. Replaying initialization
 never refunds an existing charge. Task-wide overrides win
 over supplied Review state config, which includes Project defaults for both
 `review_progress` and `review_verify_rerun`.
-Review budgets resolve the Task's current review gate by its workflow definition:
-the state named `review`, or a gate with the `reviewer` role whose
-`canonical_phase` is `review` (a renamed review gate). Such a gate shares the
+Review lifecycle and budgets share `db::budget::is_review_state`: the state named
+`review`, or a gate with the `reviewer` role whose `canonical_phase` is `review`
+(a renamed review gate). Reviewer completion, failed/cancelled entry handling,
+human decisions and re-runs, recovery, review carry, integration checks, and
+review-ready projections all resolve that meaning from the workflow rather than
+requiring the built-in state name. Such a gate shares the
 Task's `review` and `gate:review` budgets with every other review gate. A
 reviewer-role gate in another phase runs no Review and keeps its own
-`gate:<state>` budget and entry cap. Verification
+`gate:<state>` budget and entry cap. The review-entry candidate check
+(`prepare_review_entry`) and the no-change repair guard are wider: they apply
+to every gate whose `canonical_phase` is `review`, whatever its role, so an
+owner-approval or other-role gate keeps refusing a run without a candidate.
+Verification
 initialization and rerun charges require that review state and fence the Task's
 actual status and version; renamed review gates receive the same Project defaults
 and remaining-budget projections.
@@ -7966,6 +8193,30 @@ missing, then update that row's `name` to the build's file name.
 
 Connection pool sets `PRAGMA foreign_keys=ON`, `journal_mode=WAL`,
 `busy_timeout=30000` per connection.
+
+New database logic triggers are not allowed. Constraint/validation guards stay
+in SQLite. The remaining logic-trigger families are intentional projections or
+invalidations that must observe every writer: G02 memory FTS; G07 Task
+notification outbox; G08 board/list revisions; G09 status epoch; G10–G13
+scheduler dirty generations and wait-age; and G14 usage-read watermarks.
+
+Five former logic triggers (dropped by V202610180752–V202610180820) are now
+repository code that runs in the source writer's transaction. A trigger saw
+every writer; this code sees only the writers that call it, so any new
+statement that writes one of these source rows must go through the named
+writer or call its helper:
+
+| Behaviour | Source write | Where it lives (`crates/db/src/sqlite/`) |
+|---|---|---|
+| Account Main Chat bootstrap | insert `user` | `user_auth.rs` `create_user` → `bootstrap_account_main_chat_in_tx` |
+| Project Chat and setup binding | insert `project` | `project.rs` `bootstrap_project_chat_and_binding_in_tx`, called by `ProjectRepo` creation and Charter-approval Project creation |
+| Pricing account-deletion sentinel | delete `user` | `user_auth.rs` `delete_user` |
+| Attention reopen wake rearm | `attention_projection.status` from `resolved` to anything else, including upserts | `attention.rs` `rearm_attention_wake_on_reopen_in_tx` |
+| Main Chat topic rotation and its origin turn | insert `product_genesis_session`, Genesis `lifecycle` to `handed_off`, insert `agent_handoff`, user `agent_chat_message`, insert `agent_chat_topic_rotation` | `agent_chat_topic.rs` `enqueue_native_topic_rotation_in_tx`, `enqueue_idle_topic_rotation_in_tx`, `assign_topic_rotation_origin_in_tx` |
+| Task media projection and GC state | insert `task_media`, soft delete of `task_media`, insert `project_media_attachment` or `project_release_media_pin` | `task_media.rs` `project_task_media_in_tx` and `soft_delete_media`; `shared_media.rs` `reconcile_media_asset_in_tx` |
+
+Out-of-tree writers follow the same rule: `scripts/perf_fixture.py` writes the
+Project Chat and setup binding for the Projects it inserts with raw SQL.
 
 SQLite has one writer. Every transaction that writes begins with
 `db::begin_immediate`, which records where it began until it commits or rolls
@@ -8907,6 +9158,9 @@ gets a ledger-charged rerun (default one, configurable with
 `retry_budgets.review_verify_rerun`), then a `review_blocked` park with source
 `verify` without charging the Review failure budget; owner offers
 are Retry Verify, Mark Reviewed (manual approval with reason), and Cancel.
+Retry Verify is a review re-run: its entry dispatches the reviewer itself, so
+the action retires the inconclusive annotation it was offered on (compared,
+not version-fenced; a new park writes its own).
 Infrastructure failures retain review-CI interruption handling. A daemon
 placement records `not_run` / `placement_unsupported` without launching
 verify. The integration queue head never requests verify.
@@ -10346,17 +10600,19 @@ There is one review path. The owner's review `retry` (offer reason
 internal `rerun_review` command call `TaskService::rerun_review`, which does
 not run anything itself:
 
-1. It refuses unless the Task is in `review` and has a completed
+1. It refuses unless the Task is in a review state (resolved with
+   `db::budget::is_review_state`, including renamed review gates) and has a completed
    implementation candidate. It refuses `task_busy` when a review entry of the
    Task is still running (a hooks step is pending, claimed or suspended on its
    check) or a `reviewer`/`auditor` execution is running. The action system
    refuses earlier for the same states: it offers no `retry`, so the public
    request gets `action_unavailable`.
-2. It closes the attempt it replaces. The newest Review, when still `running`
+2. In the same transaction that records the new entry (step 3), it closes the
+   attempt it replaces. The newest Review, when still `running`
    or `awaiting_human`, is cancelled with
    `execution_retry.status = "superseded_by_rerun"`, so a human gate or a late
    reviewer cannot settle an attempt the owner asked to run again.
-3. It re-enters `review` with a same-state transition
+3. It re-enters that same review state with a same-state transition
    (`review_rerun_entry_with_authority`, exit hooks skipped) under
    `Actor::system(Workflow)` and the current Project workflow snapshot. This is
    a new status entry: a new hooks step, so a new review attempt and a new
@@ -10365,6 +10621,18 @@ not run anything itself:
    (`bridge_kind = recovery`, `bridge_payload = {"verb": "review_rerun",
    "requested_by": <Actor>}`): the workflow routes the entry, the bridge says
    who asked.
+
+Cancellation, its event and condition update, the new status epoch, transition
+receipt and hooks step commit together. If any entry write fails, the previous
+attempt stays usable and the dispatcher can recover its completed reviewer;
+there is no committed cancellation without a replacement entry. Retrying that
+entry's barrier keeps its already-opened attempt. Once an exact bound Review
+is `awaiting_human`, the dispatcher parks on the human decision without queuing
+another settlement command for its completed reviewer. An entry can commit and
+still not open its replacement (its `dispatch_role_agent` hook only logs a
+failure). The completed reviewer is then bound to the cancelled newest Review,
+which has nothing left to settle: the dispatcher does not settle it again, and
+its role dispatch opens the next attempt and starts a reviewer.
 
 A Task whose `task_state_config` still names an auditor
 (`review.auditor_agent_id`, read only by the retired pipeline) and has no
@@ -10445,7 +10713,12 @@ an unchanged commit, worktree and environment; never of a red one; the
 3,600-second wall limit and per-command timeouts; machine run-cap admission),
 `carry_review_authority` (always skipped: a same-state entry is not a
 merge-contention bridge), `dispatch_role_agent` for an assigned reviewer, and
-the `after_enter` cascades. Because the entry runs under the workflow's
+the `after_enter` cascades. A re-run keeps reviewer dispatch in this durable
+entry, including when requested through an owner action. It does not defer
+that hook to the dispatcher: without checks, the hook opens the replacement
+Review before launching its reviewer, so recovery cannot keep reconciling
+the cancelled attempt's completed execution. With checks, those finish before
+the dispatch hook runs. Because the entry runs under the workflow's
 authority and not the user's, it is routed as an automatic entry: failed CI
 settles through `review_failure_target` (remediation, or the exhausted-budget
 blocker when the budget was already spent) instead of parking a user-managed

@@ -1,32 +1,236 @@
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use db::{now_rfc3339, SqliteDb};
 use serde_json::json;
 
-static AFTER_DOMAIN_COMMIT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+pub(crate) struct TestAgentEventConsumerNames;
 
-fn armed() -> &'static Mutex<HashSet<String>> {
-    AFTER_DOMAIN_COMMIT.get_or_init(|| Mutex::new(HashSet::new()))
+impl crate::worker_runtime::assembly::AgentEventConsumerNames for TestAgentEventConsumerNames {
+    fn memory_consumer_name(&self) -> &'static str {
+        "scoped-memory-agent-chat-indexer"
+    }
+
+    fn wake_turn_consumer_name(&self) -> &'static str {
+        "agent-wake-turns"
+    }
 }
 
-/// Arm a one-shot failpoint for the action's post-domain/pre-receipt seam.
-///
-/// This module is only compiled for the services crate's unit-test build.  A
-/// one-shot action id keeps tests independent while still allowing the normal
-/// service execution path to be exercised end to end.
-pub(crate) fn arm_after_domain_commit(action_id: &str) {
-    armed()
-        .lock()
-        .expect("characterization failpoint lock")
-        .insert(action_id.to_owned());
+pub(crate) fn memory_consumer_name() -> &'static str {
+    crate::worker_runtime::assembly::AgentEventConsumerNames::memory_consumer_name(
+        &TestAgentEventConsumerNames,
+    )
 }
 
-pub(crate) fn take_after_domain_commit(action_id: &str) -> bool {
-    armed()
-        .lock()
-        .expect("characterization failpoint lock")
-        .remove(action_id)
+pub(crate) async fn initialize_agent_event_consumer(db: &Arc<SqliteDb>, name: &str) {
+    let health = db::WorkerHealth::new(Arc::clone(db), name);
+    let mut transaction = db::begin_immediate(db.pool())
+        .await
+        .expect("test worker transaction begins");
+    db.initialize_event_worker_in_tx(
+        &mut transaction,
+        &health,
+        &db::EventSubscription::Exact(vec![
+            "agent_chat.message.admitted".to_owned(),
+            "agent_chat.response.completed".to_owned(),
+            "agent_chat.message.completed".to_owned(),
+        ]),
+    )
+    .await
+    .expect("test event worker initializes");
+    transaction
+        .commit()
+        .await
+        .expect("test worker initialization commits");
+}
+
+pub(crate) struct NoopWakeTurns;
+
+#[async_trait]
+impl crate::wake_turns::WakeTurns for NoopWakeTurns {
+    async fn prepare_attention(
+        &self,
+        _attention: &db::AttentionProjection,
+        _dedupe_key: &str,
+        _causation_id: Option<&str>,
+        _depth: i64,
+        _batch: &[db::AttentionProjection],
+    ) -> crate::Result<Option<crate::wake_turns::PreparedWakeTurn>> {
+        Ok(None)
+    }
+
+    fn build_prepared_turn(
+        &self,
+        _event: &db::DomainEvent,
+        _input: &crate::wake_turns::PreparedWakeTurn,
+        _attention: &db::AttentionProjection,
+    ) -> crate::Result<db::AdmitAgentChatTurn> {
+        Err(crate::ServiceError::invalid_operation(
+            "the core test wake adapter never prepares a turn",
+        ))
+    }
+
+    fn consumer_name(&self) -> &'static str {
+        "core-test-noop-wake-turns"
+    }
+}
+
+pub(crate) fn noop_wake_turns() -> Arc<dyn crate::wake_turns::WakeTurns> {
+    Arc::new(NoopWakeTurns)
+}
+
+/// Core-only adapter used where an agent execution provider is merely a
+/// fixture for Task/daemon ordering. It implements the two effects those
+/// tests exercise: staged plans and idempotent owner worklog entries.
+pub(crate) struct TestExecutionSupport {
+    db: Arc<SqliteDb>,
+}
+
+impl TestExecutionSupport {
+    pub(crate) fn new(db: Arc<SqliteDb>) -> Self {
+        Self { db }
+    }
+
+    async fn append_worklog(
+        &self,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+        position: &str,
+        kind: &str,
+        summary: &str,
+    ) -> std::result::Result<(), String> {
+        let idempotency_key = format!("outbox:{}:worklog:{position}", input.execution_id);
+        if self
+            .db
+            .native_task_worklog_exists(input.task_id, &idempotency_key)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+        let now = db::now_rfc3339();
+        let result = db::TaskCommentRepo::create_comment(
+            &*self.db,
+            db::CreateTaskComment {
+                id: db::new_uuid_v4(),
+                task_id: input.task_id.to_owned(),
+                author_type: db::CommentAuthorType::Agent,
+                author_id: Some(input.agent_id.to_owned()),
+                author_name: input.role.unwrap_or("agent").to_owned(),
+                content: summary.to_owned(),
+                execution_id: Some(input.execution_id.to_owned()),
+                role: input.role.map(str::to_owned),
+                worklog_kind: Some(kind.to_owned()),
+                idempotency_key: Some(idempotency_key.clone()),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(_error)
+                if self
+                    .db
+                    .native_task_worklog_exists(input.task_id, &idempotency_key)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::task_service::execution::ExecutionSupport for TestExecutionSupport {
+    async fn inject_provider_env(
+        &self,
+        _agent_config: &mut serde_json::Value,
+    ) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn ingest_execution_outbox(
+        &self,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
+        let mut report = crate::task_service::execution::ExecutionOutboxReport::default();
+        let worktree = std::path::Path::new(input.worktree_path);
+        let outbox = match executors::existing_execution_outbox(worktree, input.execution_id) {
+            Ok(Some(outbox)) => outbox,
+            Ok(None) => return report,
+            Err(error) => {
+                report
+                    .rejected
+                    .push(format!("execution outbox is unsafe: {error}"));
+                return report;
+            }
+        };
+        if executors::task_role_can_write_plan(input.role) {
+            match crate::plan_artifact::stage_execution_outbox_plan(
+                &outbox,
+                worktree,
+                input.execution_id,
+            ) {
+                Ok(true) => report.plan_candidate = true,
+                Ok(false) => {}
+                Err(error) => {
+                    report.plan_rejected = true;
+                    report.rejected.push(format!("plan.md: {error}"));
+                }
+            }
+        }
+        if !report.plan_rejected {
+            if let Err(error) = executors::remove_execution_outbox(worktree, input.execution_id) {
+                report.rejected.push(format!(
+                    "outbox could not be removed after ingestion: {error}"
+                ));
+            }
+        }
+        report
+    }
+
+    async fn ingest_execution_outbox_entries(
+        &self,
+        input: &crate::task_service::execution::ExecutionOutboxInput<'_>,
+        entries: Vec<api_types::ExecutionOutboxEntry>,
+    ) -> crate::task_service::execution::ExecutionOutboxReport {
+        use api_types::{ExecutionOutboxEntry, ExecutionOutboxWorklogKind};
+
+        let mut report = crate::task_service::execution::ExecutionOutboxReport::default();
+        for entry in entries {
+            match entry {
+                ExecutionOutboxEntry::Worklog {
+                    position,
+                    kind,
+                    summary,
+                } => {
+                    let kind = match kind {
+                        ExecutionOutboxWorklogKind::Progress => "progress",
+                        ExecutionOutboxWorklogKind::Decision => "decision",
+                        ExecutionOutboxWorklogKind::Validation => "validation",
+                        ExecutionOutboxWorklogKind::Blocker => "blocker",
+                    };
+                    match self
+                        .append_worklog(input, &position, kind, summary.trim())
+                        .await
+                    {
+                        Ok(()) => report.worklog_entries += 1,
+                        Err(error) => report.rejected.push(format!(
+                            "{}:{position}: {error}",
+                            executors::OUTBOX_WORKLOG_FILE
+                        )),
+                    }
+                }
+                ExecutionOutboxEntry::Evidence { position, .. } => report.rejected.push(format!(
+                    "{}:{position}: core test adapter does not store evidence",
+                    executors::OUTBOX_EVIDENCE_FILE
+                )),
+            }
+        }
+        report
+    }
 }
 
 /// Make a legacy Project fixture explicit about the repository execution

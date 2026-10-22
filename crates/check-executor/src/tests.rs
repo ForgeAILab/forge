@@ -943,7 +943,6 @@ fn assert_saw_compiler_cache(seen: &str, wrapper: &std::path::Path, store: &std:
 #[cfg(unix)]
 #[tokio::test]
 async fn check_in_a_task_worktree_gets_the_shared_compiler_cache() {
-    use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("ws");
     let worktree = root.join("t").join("repo");
@@ -964,8 +963,7 @@ async fn check_in_a_task_worktree_gets_the_shared_compiler_cache() {
     )
     .unwrap();
     let wrapper = temp.path().join("kache");
-    std::fs::write(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    process_supervisor::executable::write_executable(&wrapper, "#!/bin/sh\nexec \"$@\"\n").unwrap();
     executors::compiler_cache::install(
         &root,
         Some(executors::compiler_cache::CompilerCache {
@@ -1315,4 +1313,186 @@ async fn review_verify_runtime_values_are_public_but_project_values_are_redacted
         redacted_tail(b"project-secret", true, true, &env, 4096),
         "[REDACTED]"
     );
+}
+
+#[tokio::test]
+async fn cleared_checks_receive_operator_proxy_variables() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_CHILD";
+    let keys = executors::run_process::PROXY_ENV_KEYS;
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::cleared_checks_receive_operator_proxy_variables",
+            ])
+            .env(MARKER, "1")
+            .envs(keys.map(|key| (key, format!("sentinel-{key}"))))
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "check proxy child fixture failed");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let text = keys
+        .map(|key| format!("test \"${key}\" = 'sentinel-{key}'"))
+        .join(" && ");
+    let (mut child, _) =
+        command(temp.path(), &step(&text), &BTreeMap::new(), "owner-check/1").unwrap();
+    assert!(child.output().await.unwrap().status.success());
+}
+
+#[tokio::test]
+async fn operator_proxy_credentials_are_redacted_from_check_output() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_REDACTION_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::operator_proxy_credentials_are_redacted_from_check_output",
+            ])
+            .env(MARKER, "1")
+            .env("HTTPS_PROXY", "http://proxy-user:leaked-secret@127.0.0.1:9")
+            .env("NO_PROXY", "localhost")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "proxy redaction child fixture failed"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    for policy in ["owner-check/1", CANONICAL_CI_POLICY] {
+        let receipt = run_command(
+            temp.path(),
+            &step(
+                "printf '%s|localhost' \"$HTTPS_PROXY\"; \
+                 printf 'proxy-user:leaked-secret@' >&2; exit 1",
+            ),
+            &BTreeMap::new(),
+            policy,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &CancellationToken::new(),
+            512,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.outcome, CheckExecutionOutcome::Failed, "{policy}");
+        for tail in [&receipt.stdout_tail, &receipt.stderr_tail] {
+            assert!(!tail.contains("leaked-secret"), "{policy}: {tail}");
+            assert!(tail.contains("[REDACTED]"), "{policy}: {tail}");
+        }
+        // Credential-free proxy values are not redaction values.
+        assert!(receipt.stdout_tail.ends_with("|localhost"), "{policy}");
+        let text = format!("{:?}", receipt.failures);
+        assert!(!text.contains("leaked-secret"), "{policy}");
+    }
+}
+
+#[tokio::test]
+async fn proxy_basic_tokens_and_authorization_headers_are_redacted_from_receipts() {
+    const MARKER: &str = "FORGE_CHECK_PROXY_BASIC_REDACTION_CHILD";
+    if std::env::var_os(MARKER).is_none() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::proxy_basic_tokens_and_authorization_headers_are_redacted_from_receipts",
+            ])
+            .env(MARKER, "1")
+            .env(
+                "HTTPS_PROXY",
+                "http://%70roxy-user:p%40ss%3Asecret@127.0.0.1:9",
+            )
+            .env("all_proxy", "http://other-user:other-secret@127.0.0.1:9")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "proxy Basic redaction child fixture failed"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    // Generate the tokens inside the step, so the receipt's command text does
+    // not itself contain a token. Decode the URL escapes curl would decode.
+    let script = r#"
+        credentials=${HTTPS_PROXY#*://}; credentials=${credentials%@*}
+        credentials=${credentials//%70/p}
+        credentials=${credentials//%40/@}
+        credentials=${credentials//%3A/:}
+        token=$(printf '%s' "$credentials" | base64 | tr -d '\n')
+        credentials=${all_proxy#*://}; credentials=${credentials%@*}
+        other=$(printf '%s' "$credentials" | base64 | tr -d '\n')
+        unknown=$(printf 'unlisted:header-secret' | base64 | tr -d '\n')
+        printf '%s\n%s\n' "$token" "$other"
+        printf '> Proxy-Authorization: Basic %s\r\n' "$unknown" >&2
+        printf 'proxy-AUTHORIZATION:\tDigest header-only-secret\n' >&2
+        printf 'test %s ... FAILED\n' "$token"
+        printf 'test Proxy-Authorization: Basic %s ... FAILED\n' "$unknown"
+        printf 'ordinary-output\n'
+        exit 1
+    "#;
+    for policy in ["owner-check/1", CANONICAL_CI_POLICY] {
+        let receipt = run_command(
+            temp.path(),
+            &step(script),
+            &BTreeMap::new(),
+            policy,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &CancellationToken::new(),
+            4096,
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.outcome, CheckExecutionOutcome::Failed, "{policy}");
+        let text = serde_json::to_string(&receipt).unwrap();
+        for credentials in [
+            "proxy-user:p@ss:secret",
+            "other-user:other-secret",
+            "unlisted:header-secret",
+        ] {
+            let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+            assert!(!text.contains(&token), "{policy}: token leaked");
+        }
+        assert!(!receipt.stderr_tail.contains("header-only-secret"));
+        assert!(receipt
+            .stderr_tail
+            .contains("> Proxy-Authorization: [REDACTED]"));
+        assert!(receipt
+            .stderr_tail
+            .contains("proxy-AUTHORIZATION:\t[REDACTED]"));
+        assert!(receipt.stdout_tail.contains("ordinary-output"));
+        assert!(!receipt.failures.is_empty());
+    }
+}
+
+#[test]
+fn operator_proxy_basic_tokens_decode_userinfo_for_all_proxy_variables() {
+    for key in executors::run_process::PROXY_ENV_KEYS {
+        for (userinfo, credentials) in [
+            (
+                "%70roxy-user:p%40ss%3Asecret",
+                b"proxy-user:p@ss:secret".as_slice(),
+            ),
+            ("username", b"username:".as_slice()),
+            (":password", b":password".as_slice()),
+            ("user:%FF", b"user:\xff".as_slice()),
+        ] {
+            let env = with_operator_proxy_credentials(BTreeMap::new(), |name| {
+                (name == key).then(|| format!("http://{userinfo}@127.0.0.1:9"))
+            });
+            let token = base64::engine::general_purpose::STANDARD.encode(credentials);
+            assert_eq!(
+                redacted(token.as_bytes(), false, false, &env, 512).0,
+                "[REDACTED]",
+                "{key}"
+            );
+        }
+    }
 }

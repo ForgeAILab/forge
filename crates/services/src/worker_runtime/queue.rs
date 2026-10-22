@@ -8,7 +8,7 @@ use crate::{
     Result, ServiceError,
 };
 use api_types::{Actor, SystemComponent};
-use db::{TaskRepo, TaskStep, TaskStepRepo};
+use db::{TaskRepo, TaskStep, TaskStepRepo, WorkflowReference};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::{
@@ -135,13 +135,6 @@ pub(crate) struct CascadePayload {
     pub admission_agent_id: Option<String>,
     /// A new completed CI/review result is an execution-result chain boundary.
     pub evidence: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
-pub(crate) enum WorkflowReference {
-    Project,
-    Snapshot(String),
 }
 
 /// A step is long only when its target state runs a merge or CI review
@@ -1549,6 +1542,11 @@ impl TaskStepWorker {
                     .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
                 None,
             ),
+            WorkflowReference::Definition(_) => {
+                return Err(ServiceError::invalid_operation(
+                    "queued workflow definition was not frozen at enqueue",
+                ))
+            }
         };
         let current_lane = cascade_lane(&workflow, &payload.to);
         if current_lane != step.lane {

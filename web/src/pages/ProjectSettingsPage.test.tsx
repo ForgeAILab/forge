@@ -11,6 +11,7 @@ const project: Project = {
   id: 'project-1',
   name: 'NovelKit',
   primary_repo_id: 'repo-1',
+  owner_id: 'user-1',
   project_hooks: [],
   settings: {
     max_active_tasks: 5,

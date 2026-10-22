@@ -8,7 +8,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ChatEntryContainer } from '@/components/chat'
 import { WorkflowExceptionPanel } from '@/components/task-detail/workflow-exception-panel'
 import { cn } from '@/lib/cn'
-import type { Review, Task } from '@/types/generated'
+import type { Review, Task, WorkflowDefinition } from '@/types/generated'
 import { formatDate } from './utils'
 import { ReviewConformancePanel } from './ReviewConformancePanel'
 import { ReviewFindingsLedger } from './ReviewFindingsLedger'
@@ -51,6 +51,7 @@ function stepOutput(step: Review['step_results'][number]) {
 
 type TaskReviewTabProps = {
   task: Task
+  workflow?: Pick<WorkflowDefinition, 'states'>
   reviews: Review[]
   latestReview?: Review
   reviewsLoading: boolean
@@ -63,6 +64,7 @@ type TaskReviewTabProps = {
 
 export function TaskReviewTab({
   task,
+  workflow,
   reviews,
   latestReview,
   reviewsLoading,
@@ -86,6 +88,7 @@ export function TaskReviewTab({
       ) : null}
       <WorkflowExceptionPanel
         task={task}
+        workflow={workflow}
         assessment={latestReview?.details.conformance.assessment}
       />
       {!task.workflow_exception ? (

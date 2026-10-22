@@ -59,7 +59,7 @@ pub async fn get_project_overview(
     let (active_milestones, milestone_stale) = load_active_milestones(&state, &project.id).await?;
     stale |= milestone_stale;
 
-    let task_counts = load_task_counts(&state, &project.id, None).await?;
+    let task_counts = load_task_counts(&state, &project, None).await?;
     let check_summary = load_check_summary(&state, &project.id, None).await?;
     let (milestone_evidence, evidence_stale) = load_evidence(&state, &project.id).await?;
     stale |= evidence_stale;
@@ -125,7 +125,7 @@ pub async fn get_project_overview(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned();
-        let counts = load_task_counts(&state, &project.id, Some(&milestone_id)).await?;
+        let counts = load_task_counts(&state, &project, Some(&milestone_id)).await?;
         let checks = load_check_summary(&state, &project.id, Some(&milestone_id)).await?;
         let definition_revision_id = milestone
             .get("definition_revision_id")
@@ -595,9 +595,12 @@ async fn load_current_acceptance_checks(
 
 async fn load_task_counts(
     state: &AppState,
-    project_id: &str,
+    project: &db::Project,
     milestone_id: Option<&str>,
 ) -> ApiResult<Value> {
+    let project_id = &project.id;
+    let workflow =
+        services::workflow::engine::WorkflowEngine::resolve_workflow(&project.workflow_definition);
     let rows = if let Some(milestone_id) = milestone_id {
         sqlx::query(
             "SELECT t.status, t.condition_json
@@ -643,7 +646,7 @@ async fn load_task_counts(
                 .blocked_json
                 .as_deref()
                 .is_some_and(|value| value.trim().is_empty());
-        match classify_status(&status) {
+        match classify_status(&status, &workflow) {
             TaskBucket::Terminal => counts.terminal += 1,
             _ if blocked => counts.blocked += 1,
             TaskBucket::Backlog => counts.backlog += 1,
@@ -2239,7 +2242,10 @@ enum TaskBucket {
     Blocked,
 }
 
-fn classify_status(status: &str) -> TaskBucket {
+fn classify_status(status: &str, workflow: &api_types::WorkflowDefinition) -> TaskBucket {
+    if services::workflow::is_review_state(workflow, status) {
+        return TaskBucket::Review;
+    }
     let status = status.to_ascii_lowercase();
     if matches!(
         status.as_str(),
@@ -2248,7 +2254,7 @@ fn classify_status(status: &str) -> TaskBucket {
         TaskBucket::Terminal
     } else if status == "blocked" || status.contains("blocked") {
         TaskBucket::Blocked
-    } else if status == "review" || status.contains("review") || status.contains("merge") {
+    } else if status.contains("review") || status.contains("merge") {
         TaskBucket::Review
     } else if matches!(
         status.as_str(),
@@ -2435,6 +2441,33 @@ fn sql_error(error: sqlx::Error) -> ApiError {
 /// this task it named no handler anywhere. `resolve_project_reconciliation`
 /// is referenced by path below so renaming or deleting that handler fails
 /// this module to compile rather than silently reintroducing a dead action.
+#[cfg(test)]
+mod classify_status_tests {
+    use super::*;
+
+    /// A renamed review gate counts as review whatever its name, and a state
+    /// whose name says review or merge stays in the review bucket, as before.
+    #[test]
+    fn review_bucket_adds_renamed_review_gates_and_keeps_review_names() {
+        let mut workflow = services::workflow::default_workflow::default_workflow();
+        for state in &mut workflow.states {
+            if state.name == "review" {
+                state.name = "signoff".into();
+            }
+        }
+        for status in ["signoff", "security_review", "review", "merge_failed"] {
+            assert!(
+                matches!(classify_status(status, &workflow), TaskBucket::Review),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            classify_status("in_progress", &workflow),
+            TaskBucket::Active
+        ));
+    }
+}
+
 #[cfg(test)]
 mod next_action_parity_tests {
     use super::*;

@@ -16,8 +16,8 @@ pub const COMMAND_INPUT_DIGEST_SCHEMA: &str = "forge.command-input/v1";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CommandPrincipal {
-    pub(crate) principal_type: String,
-    pub(crate) principal_id: String,
+    pub principal_type: String,
+    pub principal_id: String,
 }
 
 impl CommandPrincipal {
@@ -63,8 +63,8 @@ impl From<forge_agent_host::CanonicalScopeType> for CommandScopeType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandScope {
-    pub(crate) scope_type: CommandScopeType,
-    pub(crate) scope_id: String,
+    pub scope_type: CommandScopeType,
+    pub scope_id: String,
 }
 
 impl From<&forge_agent_host::CanonicalScope> for CommandScope {
@@ -96,20 +96,20 @@ pub struct ExpectedCommandState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuthorizationProvenance {
-    pub(crate) policy_result: String,
-    pub(crate) policy_revision: Option<String>,
-    pub(crate) policy_digest: Option<String>,
-    pub(crate) requested_permission: Option<String>,
+    pub policy_result: String,
+    pub policy_revision: Option<String>,
+    pub policy_digest: Option<String>,
+    pub requested_permission: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentActionProvenance {
-    pub(crate) action_id: String,
-    pub(crate) expected_action_version: i64,
-    pub(crate) attempt: i64,
-    pub(crate) execution_idempotency_key: String,
-    pub(crate) executed_by_type: String,
-    pub(crate) executed_by_id: String,
+    pub action_id: String,
+    pub expected_action_version: i64,
+    pub attempt: i64,
+    pub execution_idempotency_key: String,
+    pub executed_by_type: String,
+    pub executed_by_id: String,
 }
 
 impl AgentActionProvenance {
@@ -134,6 +134,22 @@ impl AgentActionProvenance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// An authorization-bound command context whose input digest is computed by
+/// [`CommandContext::from_authorized_input`].
+///
+/// Its fields are intentionally not public, so callers outside this crate
+/// cannot bypass the authorized constructor with a struct literal.
+///
+/// ```compile_fail
+/// use services::CommandContext;
+///
+/// fn bypass_authorized_constructor(existing: CommandContext) {
+///     let _ = CommandContext {
+///         principal: existing.principal().clone(),
+///         ..existing
+///     };
+/// }
+/// ```
 pub struct CommandContext {
     pub(crate) principal: CommandPrincipal,
     pub(crate) canonical_scope: CommandScope,
@@ -164,7 +180,7 @@ struct CommandDigestEnvelope<'a, T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NewCommandContext {
+pub struct NewCommandContext {
     pub principal: CommandPrincipal,
     pub canonical_scope: CommandScope,
     pub operation: String,
@@ -178,7 +194,7 @@ pub(crate) struct NewCommandContext {
 }
 
 impl CommandContext {
-    pub(crate) fn from_authorized_input<T: Serialize>(
+    pub fn from_authorized_input<T: Serialize>(
         context: NewCommandContext,
         input: &T,
     ) -> std::result::Result<Self, serde_json::Error> {
@@ -244,8 +260,28 @@ impl CommandContext {
         &self.input_digest
     }
 
+    pub fn expected_state(&self) -> &ExpectedCommandState {
+        &self.expected_state
+    }
+
+    pub fn authorization_provenance(&self) -> Option<&AuthorizationProvenance> {
+        self.authorization_provenance.as_ref()
+    }
+
+    pub fn action_provenance(&self) -> Option<&AgentActionProvenance> {
+        self.action_provenance.as_ref()
+    }
+
     pub fn correlation_id(&self) -> &str {
         &self.correlation_id
+    }
+
+    pub fn causation_id(&self) -> Option<&str> {
+        self.causation_id.as_deref()
+    }
+
+    pub fn causation_depth(&self) -> i64 {
+        self.causation_depth
     }
 }
 

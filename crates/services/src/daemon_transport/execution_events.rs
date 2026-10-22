@@ -1609,10 +1609,7 @@ mod cancellation_tests {
         let service = TaskService::new(db.clone(), bus.clone())
             .with_daemon_connections(registry.clone())
             .with_provider_credential_env(Arc::new(
-                crate::embedded_agent_service::EmbeddedAgentService::new(
-                    db.clone(),
-                    b"cancelled-terminal-test",
-                ),
+                crate::test_support::TestExecutionSupport::new(db.clone()),
             ));
         let router = (*service.workspace_backend_router())
             .clone()

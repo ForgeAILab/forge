@@ -388,7 +388,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                   )
                 ) : null}
 
-                <WorkflowExceptionPanel task={task} />
+                <WorkflowExceptionPanel task={task} workflow={workflow} />
                 {!task.workflow_exception ? <TaskBlockingBanner task={task} /> : null}
 
                 <div>

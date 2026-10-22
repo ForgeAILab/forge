@@ -244,7 +244,7 @@ impl CodingExecutorAdapter for GeminiAdapter {
 
         executors::server_commands::ensure_allowed()
             .map_err(|e| ExecutorError::Other(e.to_string()))?;
-        let mut child = cmd.spawn()?;
+        let mut child = process_supervisor::executable::spawn(&mut cmd).await?;
 
         let stdin = child
             .stdin
@@ -632,8 +632,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn gemini_capacity_preserves_exit_status_success_semantics() {
-        use std::os::unix::fs::PermissionsExt;
-
         for (message, exit_code) in [
             ("model rejected", 0),
             ("HTTP 429; retry in 90s", 0),
@@ -643,12 +641,11 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let script = dir.path().join("gemini.sh");
             let document = serde_json::json!({"error": {"message": message}});
-            std::fs::write(
+            process_supervisor::executable::write_executable(
                 &script,
                 format!("#!/bin/sh\nprintf '%s\\n' '{document}'\nexit {exit_code}\n"),
             )
             .unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
             let result = GeminiAdapter::new()
                 .execute(ExecutionContext {
                     task_id: "task-1".to_owned(),

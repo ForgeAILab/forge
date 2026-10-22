@@ -325,6 +325,25 @@ export function isInitialKind(kind: StateKind | null | undefined): boolean {
   return kind === 'initial'
 }
 
+/** The review-gate rule shared with `db::budget::is_review_state`. */
+export function isReviewState(
+  status: string,
+  workflow?: Pick<WorkflowDefinition, 'states'>,
+): boolean {
+  return (
+    status === 'review' ||
+    Boolean(
+      workflow?.states.some(
+        (state) =>
+          state.name === status &&
+          state.kind === 'gate' &&
+          state.role === 'reviewer' &&
+          state.canonical_phase === 'review',
+      ),
+    )
+  )
+}
+
 const KIND_COLORS: Record<StateKind, { dot: string; accent: string }> = {
   backlog: { dot: 'bg-stone-400', accent: 'border-l-stone-400' },
   initial: { dot: 'bg-stone-500', accent: 'border-l-stone-500' },

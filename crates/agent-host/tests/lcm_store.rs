@@ -104,10 +104,18 @@ async fn sqlite_lcm_is_acl_first_idempotent_and_restart_safe() {
     .await;
     let view = store.view();
     assert_eq!(store.store_revision().as_str(), "forge-sqlite-lcm-1");
-    assert_eq!(
-        AGENT_RUNTIME_REVISION,
-        "5ee41e4e2e830aaf17dd6b1baa4f50f58b1a1894"
-    );
+    let pinned = include_str!("../../../Cargo.lock")
+        .split("[[package]]")
+        .find(|package| package.contains("\nname = \"agent-runtime\"\n"))
+        .and_then(|package| {
+            package
+                .lines()
+                .find_map(|line| line.strip_prefix("source = \""))
+        })
+        .and_then(|source| source.trim_end_matches('"').rsplit_once('#'))
+        .map(|(_, revision)| revision)
+        .expect("Cargo.lock pins agent-runtime to a git revision");
+    assert_eq!(AGENT_RUNTIME_REVISION, pinned);
 
     let entry = LcmEntry::new(
         LcmTimelineId::new(store.timeline_id()),

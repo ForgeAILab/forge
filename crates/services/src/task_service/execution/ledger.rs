@@ -927,7 +927,7 @@ fn persisted_catalog_freshness(selection: &PricingSelection) -> Result<pricing::
     }
 }
 
-pub(crate) fn frozen_selection(
+pub fn frozen_selection(
     selection: &PricingSelection,
     rate: Option<&db::PricingRateRevision>,
     reason: Option<CostCoverageReasonCode>,
@@ -1007,7 +1007,7 @@ pub(crate) fn frozen_selection(
     Ok(selection)
 }
 
-pub(crate) async fn usage_event_for_report(
+pub async fn usage_event_for_report(
     db: &SqliteDb,
     invocation: &UsageInvocation,
     selection: &PricingSelection,
@@ -1368,7 +1368,7 @@ async fn usage_event_for_report_with_rate(
 /// check deliberately runs even for an unmetered/no-event report: a mutated
 /// provenance row must not be silently settled as if its accounting identity
 /// were still trustworthy.
-pub(crate) async fn validate_persisted_selection_digest(
+pub async fn validate_persisted_selection_digest(
     db: &SqliteDb,
     selection: &PricingSelection,
 ) -> Result<()> {

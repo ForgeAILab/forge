@@ -166,6 +166,43 @@ pub enum DbError {
         applied: String,
         bundled: String,
     },
+
+    #[error("{}", database_newer_than_build_message(.unknown))]
+    DatabaseNewerThanBuild { unknown: Vec<(i64, String)> },
+}
+
+fn database_newer_than_build_message(unknown: &[(i64, String)]) -> String {
+    const DISPLAY_LIMIT: usize = 3;
+
+    let Some((newest_version, newest_name)) = unknown.last() else {
+        return "the data directory records migrations this Forge build does not ship; run the newer Forge that upgraded it. For disposable development data in `./test`, run `make clean-test`".to_owned();
+    };
+    let shown = unknown
+        .iter()
+        .rev()
+        .take(DISPLAY_LIMIT)
+        .map(|(version, name)| format!("`V{version}__{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = unknown.len().saturating_sub(DISPLAY_LIMIT);
+    let remainder = if remaining == 0 {
+        String::new()
+    } else {
+        format!(", plus {remaining} more")
+    };
+    let migration_word = if unknown.len() == 1 {
+        "migration"
+    } else {
+        "migrations"
+    };
+
+    format!(
+        "the data directory was upgraded by a newer Forge and cannot be opened by this build; \
+         newest unknown migration: `V{newest_version}__{newest_name}`; unknown {migration_word} \
+         ({} total): {shown}{remainder}. Run the newer Forge that upgraded this data directory. \
+         For disposable development data in `./test`, run `make clean-test`",
+        unknown.len()
+    )
 }
 
 impl From<sqlx::Error> for DbError {

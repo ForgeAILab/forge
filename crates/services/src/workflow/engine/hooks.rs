@@ -20,7 +20,7 @@ pub(crate) fn merged_state_config(
     else {
         return merged;
     };
-    let Some(Value::Object(overrides)) = task_config.get(&state.name) else {
+    let Some(overrides) = crate::workflow::task_state_overrides(&task_config, state) else {
         return merged;
     };
 
@@ -322,6 +322,30 @@ mod tests {
 
         assert_eq!(config["ci_steps"], json!([]));
         assert_eq!(config["review_prompt"], json!("task review only"));
+    }
+
+    /// The Task's `review_config` (stored under `review`) configures a renamed
+    /// review gate as it does `review`; a Task entry naming the gate wins, and
+    /// a reviewer-role gate outside the review phase is not the review gate.
+    #[test]
+    fn renamed_review_gate_reads_the_task_review_config() {
+        let mut state = review_state();
+        state.name = "qa_review".to_owned();
+        state.config = json!({ "ci_steps": ["state check"] });
+        let project = project(json!({}));
+        let task_config = json!({ "review": { "ci_steps": ["task check"] } }).to_string();
+        let config = merged_state_config(&state, Some(&project), Some(&task_config));
+        assert_eq!(config["ci_steps"], json!(["task check"]));
+        let named = json!({
+            "review": { "ci_steps": ["task check"] },
+            "qa_review": { "ci_steps": ["named check"] }
+        })
+        .to_string();
+        let config = merged_state_config(&state, Some(&project), Some(&named));
+        assert_eq!(config["ci_steps"], json!(["named check"]));
+        state.canonical_phase = Some(CanonicalPhase::Working);
+        let config = merged_state_config(&state, Some(&project), Some(&task_config));
+        assert_eq!(config["ci_steps"], json!(["state check"]));
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod file;
 mod jwt_secret;
 mod loader;
 mod machine_capacity;
+mod network_policy;
 mod run_budget;
 pub use machine_capacity::{automatic_run_cap_for_cores, embedded_machine_id, resolved_run_cap};
 pub use run_budget::{default_run_nice, logical_cores, resolved_build_jobs_for_cores, RunBudget};
@@ -27,6 +28,9 @@ pub use defaults::{
     DEFAULT_WORKSPACE_CLEANUP_DELAY_SECONDS,
 };
 pub use error::ConfigError;
+pub use network_policy::{
+    is_blocked_public_search_address, is_restricted_public_address, is_restricted_public_hostname,
+};
 pub use path::{data_dir_from_env, default_config_path, default_data_dir, default_workspace_root};
 pub use runtime::{
     read_server_state, server_state_path, write_server_state, ServerState, SERVER_STATE_FILE,

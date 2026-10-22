@@ -276,16 +276,26 @@ pub fn gate_budget_key(state: &StateDefinition) -> String {
 }
 
 fn review_state_from_json(raw: &str, status: &str) -> bool {
+    review_states_from_json(raw)
+        .iter()
+        .any(|name| name == status)
+}
+
+/// The review states of a Project `workflow_definition` text. An empty or
+/// unreadable text is the built-in workflow, whose review state is `review`.
+pub(crate) fn review_states_from_json(raw: &str) -> Vec<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw == "{}" {
-        return status == "review";
+        return vec!["review".into()];
     }
     match serde_json::from_str::<WorkflowDefinition>(raw) {
         Ok(workflow) => workflow
             .states
             .iter()
-            .any(|state| state.name == status && is_review_state(state)),
-        Err(_) => status == "review",
+            .filter(|state| is_review_state(state))
+            .map(|state| state.name.clone())
+            .collect(),
+        Err(_) => vec!["review".into()],
     }
 }
 

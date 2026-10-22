@@ -264,6 +264,30 @@ def normalize_bootstrap(db: sqlite3.Connection, user_id: str) -> list[dict]:
     return agents
 
 
+def materialize_project_setup(db: sqlite3.Connection, project_id: str, chat_kind: str,
+                              binding_kind: str, at: str) -> None:
+    """The Project Chat and setup binding that Project creation writes, with fixture ids.
+
+    Baselines before V202610180752 create both rows from an AFTER INSERT trigger on
+    `project`; later servers write them in the Project-create transaction, so a raw
+    fixture insert must add them itself. Either way the rows match column for column.
+    """
+    if db.execute('SELECT 1 FROM agent_chat WHERE project_id=?', (project_id,)).fetchone() is None:
+        db.execute("INSERT INTO agent_chat (id, kind, account_id, project_id, status, instruction_revision, "
+                   "message_count, version, created_at, updated_at) "
+                   "VALUES (?, 'project', NULL, ?, 'agent_setup_required', 0, 0, 1, ?, ?)",
+                   (fixture_id(chat_kind), project_id, at, at))
+    if db.execute('SELECT 1 FROM project_agent_binding WHERE project_id=?', (project_id,)).fetchone() is None:
+        db.execute("INSERT INTO project_agent_binding (id, project_id, identity_id, profile_id, state, "
+                   "autonomy_policy_json, permission_ceiling_json, subscriptions_json, wake_budget, "
+                   "version, created_at, updated_at) "
+                   "VALUES (?, ?, NULL, NULL, 'agent_setup_required', '{}', '{}', '[]', 10, 1, ?, ?)",
+                   (fixture_id(binding_kind), project_id, at, at))
+    # Normalize trigger-generated identities too.
+    db.execute('UPDATE agent_chat SET id=? WHERE project_id=?', (fixture_id(chat_kind), project_id))
+    db.execute('UPDATE project_agent_binding SET id=? WHERE project_id=?', (fixture_id(binding_kind), project_id))
+
+
 def seed_deferred_project(db: sqlite3.Connection, sql: SqlBuilder, workflow: dict,
                           user_id: str) -> None:
     """A small paused Project whose Tasks carry real deferred-dispatch metadata."""
@@ -272,9 +296,7 @@ def seed_deferred_project(db: sqlite3.Connection, sql: SqlBuilder, workflow: dic
     sql.insert('project', id=project_id, name='Synthetic deferred-dispatch Project',
                owner_id=user_id, workflow_definition=encode(workflow), workflow_template_name='default',
                paused_at=timestamp(), system_pause_reason=None, created_at=timestamp(), updated_at=timestamp())
-    db.execute('UPDATE agent_chat SET id=? WHERE project_id=?', (fixture_id('deferred-project-chat'), project_id))
-    db.execute('UPDATE project_agent_binding SET id=? WHERE project_id=?',
-               (fixture_id('deferred-project-binding'), project_id))
+    materialize_project_setup(db, project_id, 'deferred-project-chat', 'deferred-project-binding', timestamp())
     sql.insert('repo', id=repo_id, project_id=project_id, name='synthetic-deferred',
                local_path='/nonexistent/forge-perf-fixture-deferred', created_at=timestamp(), updated_at=timestamp())
     db.execute('UPDATE project SET primary_repo_id=? WHERE id=?', (repo_id, project_id))
@@ -305,10 +327,7 @@ def seed(db: sqlite3.Connection, workflow: dict, user_id: str, estimated: bool =
     sql.insert('project', id=project_id, name='Synthetic heavy performance Project',
                owner_id=user_id, workflow_definition=encode(workflow), workflow_template_name='default',
                paused_at=timestamp(), system_pause_reason=None, created_at=timestamp(), updated_at=timestamp())
-    # Project insertion creates its setup chat/binding via baseline SQL triggers.
-    # Normalize those generated identities too; do not bypass the triggers.
-    db.execute('UPDATE agent_chat SET id=? WHERE project_id=?', (fixture_id('project-chat'), project_id))
-    db.execute('UPDATE project_agent_binding SET id=? WHERE project_id=?', (fixture_id('project-binding'), project_id))
+    materialize_project_setup(db, project_id, 'project-chat', 'project-binding', timestamp())
     sql.insert('repo', id=repo_id, project_id=project_id, name='synthetic',
                local_path='/nonexistent/forge-perf-fixture', created_at=timestamp(), updated_at=timestamp())
     db.execute('UPDATE project SET primary_repo_id=? WHERE id=?', (repo_id, project_id))

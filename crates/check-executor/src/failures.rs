@@ -150,9 +150,7 @@ impl Failures {
     ) {
         // Redact the text as printed: separator and duration normalisation
         // would otherwise rewrite a secret (or cut its suffix) past redaction.
-        let signature =
-            executors::environment::redact_environment_values(&strip_ansi(signature), env)
-                .replace('\\', "/");
+        let signature = crate::redact_check_output(&strip_ansi(signature), env).replace('\\', "/");
         let signature = roots.iter().fold(signature, |signature, root| {
             let prefix = root.to_string_lossy().replace('\\', "/");
             signature.replace(&format!("{}/", prefix.trim_end_matches('/')), "")

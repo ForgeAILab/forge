@@ -5,13 +5,14 @@ use db::SqliteDb;
 use events::EventBus;
 use executors::{AdapterRegistry, TaskExecutor};
 use services::{
-    AgentActionService, AgentChatTurnLogRoot, AgentChatTurnWorker, AgentInboxService, AgentService,
-    AuthService, CommitmentService, DaemonService, EmbeddedAgentService, MemoryService,
-    MergeService, NotificationService, OperatorStatusEmitter, OperatorStatusService,
-    ProjectHookService, TaskService, TerminalService, WorkspaceCleanupScheduler,
-    WorkspaceExecutionLockManager,
+    AgentActionService, AgentInboxService, AgentService, AuthService, CommitmentService,
+    DaemonService, MemoryService, MergeService, NotificationService, OperatorStatusEmitter,
+    OperatorStatusService, ProjectHookService, TaskService, TerminalService,
+    WorkspaceCleanupScheduler, WorkspaceExecutionLockManager,
 };
-use services_agents::ProviderAuthorizationService;
+use services_agents::{
+    AgentChatTurnLogRoot, AgentChatTurnWorker, EmbeddedAgentService, ProviderAuthorizationService,
+};
 use uuid::Uuid;
 use workspace::RepoCacheLockManager;
 
@@ -38,7 +39,7 @@ pub struct AppState {
     pub task_service: Arc<TaskService>,
     pub agent_service: Arc<AgentService>,
     pub embedded_agent_service: Arc<EmbeddedAgentService>,
-    pub agent_chat_service: Arc<services::AgentChatService<SqliteDb>>,
+    pub agent_chat_service: Arc<services_agents::AgentChatService<SqliteDb>>,
     pub main_chat_topic_service: Arc<services_agents::MainChatTopicService<SqliteDb>>,
     pub agent_inquiry_service:
         Arc<services_agents::agent_inquiry_service::AgentInquiryService<SqliteDb>>,

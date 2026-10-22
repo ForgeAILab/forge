@@ -4,7 +4,8 @@ use std::{
 };
 
 use api_types::{
-    McpAction, McpAgent, McpConfigActionRequest, McpConfigQuery, McpConfigResponse, McpScope,
+    McpAction, McpAgent, McpConfigActionRequest, McpConfigQuery, McpConfigResponse,
+    McpEndpointQuery, McpEndpointResponse, McpScope,
 };
 use axum::{
     extract::{Query, State},
@@ -16,18 +17,48 @@ use tokio::fs;
 
 use crate::{
     errors::{ApiError, ApiResult},
-    routes::auth::AuthenticatedUser,
+    routes::{
+        auth::{AuthenticatedUser, RequireAdmin},
+        authorization::{require_project_access, ProjectAccess},
+    },
     state::AppState,
 };
 use db::{now_rfc3339, PersonalAccessTokenRepo, ProjectRepo, RepoRepo};
 
+pub async fn get_mcp_endpoint(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Query(params): Query<McpEndpointQuery>,
+) -> ApiResult<Json<McpEndpointResponse>> {
+    let scope = parse_scope(params.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        params.project_id.as_deref(),
+        ProjectAccess::Read,
+    )
+    .await?;
+    Ok(Json(McpEndpointResponse {
+        url: mcp_url_for_scope_from_request(&state, None, &scope, params.project_id.as_deref())?,
+    }))
+}
+
 pub async fn get_mcp_config(
     Query(params): Query<McpConfigQuery>,
     State(state): State<AppState>,
-    user: AuthenticatedUser,
+    RequireAdmin(user): RequireAdmin,
 ) -> ApiResult<Json<McpConfigResponse>> {
     let agent = parse_agent(&params.agent)?;
     let scope = parse_scope(params.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        params.project_id.as_deref(),
+        ProjectAccess::Read,
+    )
+    .await?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, params.project_id.as_deref()).await?;
     let expected_url = mcp_url_for_scope_from_request(
@@ -61,8 +92,17 @@ pub async fn update_mcp_config(
     services::server_commands::ensure_server_files_allowed(
         "agent configuration files on the server are not written",
     )?;
+    let user = require_admin(user)?;
     let agent = parse_agent(&body.agent)?;
     let scope = parse_scope(body.scope.as_deref())?;
+    authorize_config_project(
+        &state,
+        &user,
+        &scope,
+        body.project_id.as_deref(),
+        ProjectAccess::Admin,
+    )
+    .await?;
     let action = parse_action(&body.action)?;
     let config_path =
         resolve_config_path(&state, &agent, &scope, body.project_id.as_deref()).await?;
@@ -117,6 +157,31 @@ pub async fn update_mcp_config(
         config_path: config_path.to_string_lossy().into_owned(),
         agents: supported_agents(),
     }))
+}
+
+fn require_admin(user: AuthenticatedUser) -> ApiResult<AuthenticatedUser> {
+    if !user.is_admin {
+        return Err(ApiError::forbidden_with_code(
+            "admin_required",
+            "Admin access required",
+        ));
+    }
+    Ok(user)
+}
+
+async fn authorize_config_project(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    scope: &McpScope,
+    project_id: Option<&str>,
+    access: ProjectAccess,
+) -> ApiResult<()> {
+    if matches!(scope, McpScope::Project | McpScope::Local) {
+        if let Some(project_id) = project_id.map(str::trim).filter(|id| !id.is_empty()) {
+            require_project_access(state, project_id, &user.user_id, access).await?;
+        }
+    }
+    Ok(())
 }
 
 fn mcp_url_for_scope_from_request(
@@ -1015,7 +1080,7 @@ command = "other"
                 public_base_url: None,
             }),
             State(state.clone()),
-            test_authenticated_user(),
+            RequireAdmin(test_authenticated_user()),
         )
         .await
         .expect("get config succeeds")
@@ -1085,7 +1150,7 @@ command = "other"
         AuthenticatedUser {
             user_id: "test-user-id".to_owned(),
             email: "test@example.com".to_owned(),
-            is_admin: false,
+            is_admin: true,
         }
     }
 

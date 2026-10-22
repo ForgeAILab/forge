@@ -22,10 +22,10 @@ frontend:
 types:
 	FORGE_SKIP_WEB_BUILD=1 cargo test -p api-types --lib export_ -- --include-ignored
 
-# Run all Rust tests. The features build the services and db integration
-# targets, which declare `required-features` (see docs/ci.md).
+# Run all Rust tests. The features build the services, services-agents and db
+# integration targets, which declare `required-features` (see docs/ci.md).
 test:
-	FORGE_SKIP_WEB_BUILD=1 cargo test --workspace --all-targets --features db/test-template,services/test-support
+	FORGE_SKIP_WEB_BUILD=1 cargo test --workspace --all-targets --features db/test-template,services-agents/test-support,services/test-support
 
 # Build everything
 build:

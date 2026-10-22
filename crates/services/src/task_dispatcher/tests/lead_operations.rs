@@ -1,7 +1,6 @@
 //! Stage 4 of the root lead: the lead's operations. Every call here goes
-//! through the native tool boundary (`ForgeToolProvider::propose`), so the
-//! registry's principal rule, the database's lead fact and the one command
-//! boundary are all in the path. In the end-to-end tests the lead's run is
+//! through the lead-operation seam, so the database's lead fact and the one
+//! command boundary are both in the path. In the end-to-end tests the lead's run is
 //! scripted in the test executor: the run issues its operations and
 //! completes, and the dispatcher does the rest.
 use super::root_lead::{
@@ -9,7 +8,7 @@ use super::root_lead::{
 };
 use super::root_replan::{log, root_with_failed_review, root_with_parked_child, spent};
 use super::*;
-use forge_agent_host::{CanonicalScope, CanonicalScopeType, ForgeToolProvider, WorkspaceAccess};
+use forge_agent_host::AgentHostError;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -182,16 +181,15 @@ async fn session(db: &db::SqliteDb, agent: &str, task_id: &str) -> String {
     runtime
 }
 
-fn task_scope(task_id: &str) -> CanonicalScope {
-    CanonicalScope {
-        scope_type: CanonicalScopeType::Task,
-        scope_id: task_id.to_owned(),
-        workspace_access: WorkspaceAccess::TaskRead,
-    }
-}
-
 /// One lead operation, as the native host issues it for the run of `agent`
 /// on `task_id`.
+fn decode_lead_input<T: serde::de::DeserializeOwned>(
+    payload: Value,
+) -> std::result::Result<T, AgentHostError> {
+    serde_json::from_value(payload)
+        .map_err(|error| AgentHostError::Runtime(format!("invalid lead operation: {error}")))
+}
+
 async fn lead_call(
     db: &Arc<db::SqliteDb>,
     service: &Arc<TaskService>,
@@ -202,21 +200,115 @@ async fn lead_call(
     key: &str,
 ) -> std::result::Result<Value, forge_agent_host::AgentHostError> {
     let runtime = session(db, agent, task_id).await;
-    let provider = crate::CoordinationToolProvider::new(Arc::clone(db));
-    provider.set_task_service(Arc::clone(service));
-    ForgeToolProvider::propose(
-        &provider,
-        agent,
-        &task_scope(task_id),
-        &runtime,
-        operation,
-        json!({"operation": operation, "payload": payload, "dedupe_key": key, "correlation_id": key}),
-    )
-    .await
-    // The host wraps a command's value in its outcome envelope.
-    .map(|value| match value.get("result") {
-        Some(result) if result.is_object() => result.clone(),
-        _ => value,
+    let authority = db
+        .resolve_task_effective_authority(agent, None, task_id, "task_read", &runtime)
+        .await
+        .map_err(|_| AgentHostError::ProtectedPersistence)?;
+    let operation_registry::authority::Principal::TaskAgent {
+        execution_id,
+        lead_root_id: Some(root_id),
+        ..
+    } = authority.principal
+    else {
+        return Err(AgentHostError::Authority(
+            "OperationNotInScope: this run does not lead a coordination root".to_owned(),
+        ));
+    };
+    let run = crate::LeadRun {
+        identity_id: agent.to_owned(),
+        execution_id,
+        task_id: task_id.to_owned(),
+        root_id,
+    };
+    let result = match operation {
+        "lead.read" => {
+            let input: operation_registry::task_lead::Read = decode_lead_input(payload)?;
+            service.lead_read(&run, input.task_id.as_deref()).await
+        }
+        "lead.subtask" => {
+            let input: operation_registry::task_lead::Subtask = decode_lead_input(payload)?;
+            match input {
+                operation_registry::task_lead::Subtask::Create {
+                    title,
+                    description,
+                    assignee_id,
+                } => {
+                    service
+                        .lead_create_subtask(&run, title, description, assignee_id, key)
+                        .await
+                }
+                operation_registry::task_lead::Subtask::Update {
+                    task_id,
+                    version,
+                    title,
+                    description,
+                } => {
+                    service
+                        .lead_update_subtask(&run, &task_id, version, title, description, key)
+                        .await
+                }
+                operation_registry::task_lead::Subtask::Cancel {
+                    task_id,
+                    version,
+                    reason,
+                } => {
+                    service
+                        .lead_cancel_subtask(&run, &task_id, version, reason)
+                        .await
+                }
+                operation_registry::task_lead::Subtask::Reorder { ordered_task_ids } => {
+                    service
+                        .lead_reorder_subtasks(&run, ordered_task_ids, key)
+                        .await
+                }
+                operation_registry::task_lead::Subtask::Assign { task_id, agent_id } => {
+                    service
+                        .lead_assign_worker(&run, task_id.as_deref(), &agent_id)
+                        .await
+                }
+            }
+        }
+        "lead.recover" => {
+            let input: operation_registry::task_lead::Recover = decode_lead_input(payload)?;
+            service
+                .lead_recover_subtask(&run, &input.task_id, input.action, input.version, key)
+                .await
+        }
+        "lead.handoff" => {
+            let input: operation_registry::task_lead::Handoff = decode_lead_input(payload)?;
+            service
+                .lead_handoff(&run, &input.task_id, &input.note, key)
+                .await
+        }
+        "lead.request_input" => {
+            let input: operation_registry::task_lead::RequestInput = decode_lead_input(payload)?;
+            service.lead_request_input(&run, &input.question, key).await
+        }
+        _ => {
+            return Err(AgentHostError::Unsupported(operation.to_owned()));
+        }
+    };
+    result.map_err(|error| match error {
+        crate::ServiceError::LeadOperationRefused { refusal, message } => {
+            let mut outcome = api_types::OrchestrationOutcome::failed(
+                api_types::OutcomeCode::ValidationError,
+                operation,
+                api_types::CanonicalScopeRef::new(api_types::OutcomeScopeType::Account, ""),
+                "",
+                message,
+            );
+            outcome.details = Some(json!({ "refusal": refusal.code() }));
+            AgentHostError::StructuredOutcome(Box::new(outcome))
+        }
+        _error => {
+            AgentHostError::StructuredOutcome(Box::new(api_types::OrchestrationOutcome::failed(
+                api_types::OutcomeCode::InternalFailure,
+                operation,
+                api_types::CanonicalScopeRef::new(api_types::OutcomeScopeType::Account, ""),
+                "",
+                "the Forge operation could not complete",
+            )))
+        }
     })
 }
 
@@ -1314,7 +1406,7 @@ async fn a_lead_question_parks_the_root_until_the_owner_answers() {
     // The item is a question: it is resolved with an answer and not without.
     let attention = crate::attention_service::AttentionService::new(
         Arc::clone(&lead.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+        crate::test_support::noop_wake_turns(),
     );
     assert!(attention.resolve("owner", &item, version).await.is_err());
     assert_eq!(reload(&lead.db, &root.id).await.status, "planning");
@@ -1731,7 +1823,7 @@ async fn a_question_of_a_deleted_root_is_resolved_without_an_answer_target() {
         .unwrap();
     let attention = crate::attention_service::AttentionService::new(
         Arc::clone(&lead.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+        crate::test_support::noop_wake_turns(),
     );
     let resolved = attention
         .resolve_with_answer(&owner, &item, version, Some("B"))
@@ -1936,7 +2028,7 @@ async fn a_lead_removed_during_the_wait_leaves_an_answerable_question() {
     assert_eq!(waiting.status, "planning");
     crate::attention_service::AttentionService::new(
         Arc::clone(&lead.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&lead.db))),
+        crate::test_support::noop_wake_turns(),
     )
     .resolve_with_answer("owner", &item, version, Some("B"))
     .await
@@ -1972,7 +2064,7 @@ async fn assert_answer_runs_once(ops: &Ops, root: &str, child: &str, item: &str,
     let before = executions(&ops.lead.db, root).await.len();
     crate::attention_service::AttentionService::new(
         Arc::clone(&ops.lead.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&ops.lead.db))),
+        crate::test_support::noop_wake_turns(),
     )
     .resolve_with_answer("owner", item, version, Some("B"))
     .await
@@ -2297,7 +2389,7 @@ async fn holding_a_live_asking_run_then_releasing_keeps_the_question_and_runs_on
     assert!(executions(&ops.lead.db, &child.id).await.is_empty());
     crate::attention_service::AttentionService::new(
         Arc::clone(&ops.lead.db),
-        std::sync::Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&ops.lead.db))),
+        crate::test_support::noop_wake_turns(),
     )
     .resolve_with_answer("owner", &item, version, Some("B"))
     .await

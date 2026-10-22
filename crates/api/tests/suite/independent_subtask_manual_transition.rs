@@ -14,8 +14,13 @@ async fn independently_claimed_subtask_allows_manual_status_transition() {
     let _ = &harness.state;
     let (project_id, repo_id) =
         common::create_project_and_repo(&harness.app, "Subtask Managed", &repo_path).await;
-    let (agent_id, reviewer_id) =
-        common::create_shell_agents(&harness.app, workspace_root.path(), "subtask-managed").await;
+    let (agent_id, reviewer_id) = common::create_shell_agents(
+        &harness.app,
+        &harness.state,
+        workspace_root.path(),
+        "subtask-managed",
+    )
+    .await;
     common::configure_execution_test_setup(
         &harness.state.db,
         &project_id,

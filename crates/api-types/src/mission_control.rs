@@ -27,6 +27,9 @@ pub enum AttentionCategory {
     RetryExhausted,
     ReviewReady,
     ReviewRisk,
+    /// Review has parked for an owner decision; details retain the park reason
+    /// and the owner's Task action offers.
+    ReviewNeedsOwner,
     ExecutionFailed,
     /// A terminal Task outcome requires the owning Project Agent to reconcile
     /// authoritative validation, evidence, and milestone readiness. It is not

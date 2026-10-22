@@ -9,6 +9,50 @@ use std::{
 };
 use tokio::process::Command;
 
+/// Standard proxy variables passed through even to otherwise cleared children,
+/// as (uppercase, lowercase) pairs.
+pub const PROXY_ENV_KEYS: [&str; 8] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
+fn inherit_proxy_environment(
+    command: &mut Command,
+    project: &BTreeMap<String, String>,
+    operator: impl Fn(&str) -> Option<OsString>,
+) {
+    let preset = command
+        .as_std()
+        .get_envs()
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
+    let is_preset = |key: &str| preset.iter().any(|name| name == key);
+    // Each variable comes in two cases, and tools disagree on which one wins.
+    // A command or Project value in either case therefore keeps the operator's
+    // value out of both, or it could silently outrank the override.
+    for pair in PROXY_ENV_KEYS.chunks(2) {
+        let overridden = pair
+            .iter()
+            .any(|key| is_preset(key) || project.contains_key(*key));
+        for key in pair {
+            if is_preset(key) {
+                continue;
+            }
+            if let Some(value) = project.get(*key) {
+                command.env(key, value);
+            } else if let Some(value) = (!overridden).then(|| operator(key)).flatten() {
+                command.env(key, value);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MachineRunPolicy(RwLock<RunBudget>);
 impl MachineRunPolicy {
@@ -99,8 +143,8 @@ pub fn apply_sandboxed(
 }
 
 /// [`apply_sandboxed`] for a command whose environment was cleared
-/// (`env_clear`): the child inherits nothing of the operator's process
-/// environment, so nothing there can outrank what the Task root gives it.
+/// (`env_clear`): only standard proxy variables pass through from the operator.
+/// No other inherited value can outrank what the Task root gives it.
 ///
 /// The precedence rule lets the operator's `CARGO_TARGET_DIR` (and a
 /// compiler wrapper or cache variable of the operator's) win over Forge's
@@ -114,6 +158,7 @@ pub fn apply_sandboxed_cleared(
     project: &BTreeMap<String, String>,
     sandbox: &SandboxEnv,
 ) {
+    inherit_proxy_environment(command, project, |key| std::env::var_os(key));
     apply_budget(command, machine_policy().get(), project);
     // Every key Forge sets when the Project says nothing about it.
     let forge_keys = sandbox.variables(&BTreeMap::new(), |_| false, |_| None);
@@ -358,5 +403,111 @@ mod tests {
             (baseline + 5).min(19)
         );
         assert_eq!(nice(off).await, baseline);
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cleared_children_receive_operator_proxy_variables() {
+        const MARKER: &str = "FORGE_PROXY_ENV_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run_process::proxy_tests::cleared_children_receive_operator_proxy_variables",
+                ])
+                .env(MARKER, "1")
+                .envs(PROXY_ENV_KEYS.map(|key| (key, format!("sentinel-{key}"))))
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success(), "proxy child fixture failed");
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        let mut child = Command::new("sh");
+        child.env_clear().arg("-c").arg(
+            PROXY_ENV_KEYS
+                .map(|key| format!("test \"${key}\" = 'sentinel-{key}'"))
+                .join(" && "),
+        );
+        apply_sandboxed_cleared(&mut child, &BTreeMap::new(), &SandboxEnv::none());
+        assert!(child.output().await.unwrap().status.success());
+    }
+
+    #[test]
+    fn proxy_passthrough_keeps_command_and_project_precedence() {
+        let mut child = Command::new("sh");
+        child.env_clear().env("HTTPS_PROXY", "command");
+        let project = BTreeMap::from([
+            ("HTTPS_PROXY".into(), "project".into()),
+            ("ALL_PROXY".into(), "project".into()),
+        ]);
+        inherit_proxy_environment(&mut child, &project, |_| None);
+        let values = child.as_std().get_envs().collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            values[std::ffi::OsStr::new("HTTPS_PROXY")],
+            Some(std::ffi::OsStr::new("command"))
+        );
+        assert_eq!(
+            values[std::ffi::OsStr::new("ALL_PROXY")],
+            Some(std::ffi::OsStr::new("project"))
+        );
+        // A cleared Command discards env_remove entries. Check explicit
+        // removals on an inheriting Command, where Rust retains that intent.
+        let mut inheriting = Command::new("sh");
+        inheriting.env_remove("http_proxy");
+        inherit_proxy_environment(&mut inheriting, &BTreeMap::new(), |_| None);
+        assert!(inheriting
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "http_proxy" && value.is_none()));
+    }
+
+    #[test]
+    fn a_command_or_project_proxy_value_overrides_both_cases_of_its_variable() {
+        // Tools disagree on which case wins (curl reads https_proxy first,
+        // reqwest and Go read HTTPS_PROXY first), so an operator value in the
+        // other case would silently outrank the override for some of them.
+        let mut child = Command::new("sh");
+        child.env_clear().env("HTTPS_PROXY", "command");
+        let project = BTreeMap::from([("no_proxy".into(), "project".into())]);
+        inherit_proxy_environment(&mut child, &project, |key| {
+            Some(OsString::from(format!("operator-{key}")))
+        });
+        let values = child
+            .as_std()
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expected = BTreeMap::from([
+            ("HTTPS_PROXY".to_owned(), Some("command".to_owned())),
+            ("no_proxy".to_owned(), Some("project".to_owned())),
+            (
+                "HTTP_PROXY".to_owned(),
+                Some("operator-HTTP_PROXY".to_owned()),
+            ),
+            (
+                "http_proxy".to_owned(),
+                Some("operator-http_proxy".to_owned()),
+            ),
+            (
+                "ALL_PROXY".to_owned(),
+                Some("operator-ALL_PROXY".to_owned()),
+            ),
+            (
+                "all_proxy".to_owned(),
+                Some("operator-all_proxy".to_owned()),
+            ),
+        ]);
+        assert_eq!(values, expected);
     }
 }

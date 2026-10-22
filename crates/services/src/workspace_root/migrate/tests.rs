@@ -104,15 +104,14 @@ impl Install {
         std::fs::write(second.join("README.md"), "# Test\nuncommitted edit\n").unwrap();
         std::fs::create_dir_all(second.join("notes")).unwrap();
         std::fs::write(second.join("notes/untracked.txt"), "never committed\n").unwrap();
-        std::fs::write(second.join("run.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        process_supervisor::executable::write_executable(
+            &second.join("run.sh"),
+            "#!/bin/sh\necho ok\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                second.join("run.sh"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
             std::os::unix::fs::symlink("notes/untracked.txt", second.join("link")).unwrap();
             // What a toolchain leaves behind: a directory nobody may write.
             let frozen = second.join("notes/frozen");

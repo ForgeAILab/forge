@@ -108,7 +108,8 @@ async fn agent_runnable_on_identities_are_admin_only_and_pin_can_be_cleared() {
         StatusCode::FORBIDDEN,
     )
     .await;
-    let (pinned_id, _) = common::create_shell_agents(&harness.app, root.path(), "pin-clear").await;
+    let (pinned_id, _) =
+        common::create_shell_agents(&harness.app, &harness.state, root.path(), "pin-clear").await;
     let row = db::AgentRepo::get_by_id(&*harness.state.db, &pinned_id)
         .await
         .unwrap()

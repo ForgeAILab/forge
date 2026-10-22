@@ -10751,7 +10751,7 @@ async fn permanent_merge_failure_annotates_and_owner_retry_recovers() {
 
     let attention_service = crate::AttentionService::new(
         Arc::clone(&fixture.db),
-        Arc::new(crate::WakeTurnConsumer::new(Arc::clone(&fixture.db))),
+        crate::test_support::noop_wake_turns(),
     );
     while attention_service
         .project_once(100)
@@ -10956,6 +10956,8 @@ mod lead_operations;
 #[cfg(test)]
 #[path = "tests/refresh_recovery.rs"]
 mod refresh_recovery;
+#[path = "tests/rerun_hardening.rs"]
+mod rerun_hardening;
 #[path = "tests/review_candidate.rs"]
 mod review_candidate;
 #[path = "tests/root_lead.rs"]

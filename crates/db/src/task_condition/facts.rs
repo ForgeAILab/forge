@@ -141,6 +141,8 @@ pub(super) struct Terminals {
     initial: Vec<String>,
     cancellation_state: String,
     human_states: BTreeMap<String, HumanState>,
+    /// The review states (`crate::budget::is_review_state`), renamed ones too.
+    review_states: Vec<String>,
 }
 #[derive(Clone)]
 struct HumanState {
@@ -191,6 +193,7 @@ impl Terminals {
             states,
             initial,
             human_states,
+            review_states: crate::budget::review_states_from_json(definition),
             cancellation_state: workflow["cancellation_state"]
                 .as_str()
                 .unwrap_or("cancelled")
@@ -1080,7 +1083,19 @@ impl Snapshot {
         if hooks {
             return Ok(false);
         }
-        if self.state == "review" {
+        if self.parent.is_some() && crate::inherited_subtask::is_state(self.state.as_str()) {
+            return Ok(false);
+        }
+        let workflow: String = if self.families.entry {
+            self.row.try_get("workflow")?
+        } else {
+            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id=?")
+                .bind(&self.project)
+                .fetch_one(&mut *c)
+                .await?
+        };
+        let classes = Terminals::of(&workflow);
+        if classes.review_states.contains(&self.state) {
             if latest_review_status == Some("awaiting_human") {
                 return Ok(true);
             }
@@ -1096,18 +1111,6 @@ impl Snapshot {
                 }
             }
         }
-        if self.parent.is_some() && crate::inherited_subtask::is_state(self.state.as_str()) {
-            return Ok(false);
-        }
-        let workflow: String = if self.families.entry {
-            self.row.try_get("workflow")?
-        } else {
-            sqlx::query_scalar("SELECT workflow_definition FROM project WHERE id=?")
-                .bind(&self.project)
-                .fetch_one(&mut *c)
-                .await?
-        };
-        let classes = Terminals::of(&workflow);
         let state = if classes.has_states {
             classes.human_states.get(&self.state).cloned()
         } else {

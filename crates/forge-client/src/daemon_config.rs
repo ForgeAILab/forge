@@ -175,7 +175,6 @@ mod budget_tests {
     #[cfg(unix)]
     #[test]
     fn daemon_compiler_cache_is_its_own_file_key_and_flags_and_off_by_default() {
-        use std::os::unix::fs::PermissionsExt;
         // The shared cache is off for a process whose own environment names
         // a wrapper (it wins for every run), which this test cannot undo.
         if executors::compiler_cache::WRAPPER_CONFIG_KEYS
@@ -192,12 +191,11 @@ mod budget_tests {
         fs::create_dir_all(&root).unwrap();
         let wrapper = base.join("kache");
         // Answers `--version`, as the real one does when it is resolved.
-        fs::write(
+        process_supervisor::executable::write_executable(
             &wrapper,
             "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nexec \"$@\"\n",
         )
         .unwrap();
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
 
         DaemonConfig::load(&creds)
             .unwrap()

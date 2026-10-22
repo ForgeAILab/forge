@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '@/api/client'
+import type { StateDefinition } from '@/types/generated'
 import {
   effectiveLead,
   isLeadCandidate,
@@ -171,6 +172,96 @@ describe('launching a run on a coordination root', () => {
         false,
       ),
     ).toBe(true)
+  })
+
+  it('allows a renamed reviewer gate in the review phase', () => {
+    const review = {
+      name: 'qa_review',
+      kind: 'gate',
+      role: 'reviewer',
+      canonical_phase: 'review',
+      column: 'Quality',
+    } as StateDefinition
+    const task = { ...root, status: 'qa_review' }
+    expect(rootHoldsRuns(task, true, { states: [review] })).toBe(false)
+    expect(rootHoldsRuns(task, false, { states: [review] })).toBe(false)
+    for (const state of [
+      { ...review, role: 'coder' },
+      { ...review, canonical_phase: 'working' as const },
+      { ...review, name: 'other_gate' },
+    ]) {
+      expect(rootHoldsRuns(task, true, { states: [state] })).toBe(true)
+    }
+    expect(rootHoldsRuns(task, true)).toBe(true)
+  })
+
+  it('allows a review-phase state held by another non-implementation role', () => {
+    const state = { name: 'quality', kind: 'gate', role: 'auditor', canonical_phase: 'review', column: 'Quality' } as StateDefinition
+    const implementation = { name: 'in_progress', kind: 'active', role: 'builder' } as StateDefinition
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, { states: [implementation, state] })).toBe(false)
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+      states: [implementation, { ...state, kind: 'active' }],
+    })).toBe(false)
+    for (const role of ['coder', 'builder', null]) {
+      expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+        states: [implementation, { ...state, kind: 'gate', role }],
+      }), String(role)).toBe(true)
+    }
+  })
+
+  it.each([
+    { name: 'quality', kind: 'gate', column: ' ReViEw ' },
+    { name: 'review', kind: 'gate', column: 'Quality' },
+    { name: 'qa_review', kind: 'gate', column: 'Quality' },
+    { name: 'merge_check', kind: 'gate', column: 'Quality' },
+  ] as const)('resolves an implicit review phase for $name in $column', (implicit) => {
+    const state = { ...implicit, role: 'auditor', canonical_phase: null } as StateDefinition
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, { states: [state] })).toBe(false)
+    // An explicit phase wins over the column, legacy name and kind fallback.
+    expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+      states: [{ ...state, canonical_phase: 'working' }],
+    })).toBe(true)
+  })
+
+  it('uses column and legacy phase precedence before the gate-name fallback', () => {
+    for (const state of [
+      { name: 'qa_review', column: 'Working' },
+      { name: 'planning', column: 'Quality' },
+      { name: 'quality', column: 'Quality' },
+    ]) {
+      expect(rootHoldsRuns({ ...root, status: state.name }, true, {
+        states: [{ ...state, kind: 'gate', role: 'reviewer', canonical_phase: null } as StateDefinition],
+      })).toBe(true)
+    }
+  })
+
+  it('holds the planning gate, which runs the lead, even when its phase resolves to review', () => {
+    // RootRolePolicy::execution_role_for_state answers the planning state
+    // with the lead before it looks at the phase.
+    const states = [
+      { name: 'todo', kind: 'initial', role: null, canonical_phase: null, column: 'Todo' },
+      { name: 'plan_review', kind: 'gate', role: 'planner', canonical_phase: null, column: 'Planning' },
+      { name: 'in_progress', kind: 'active', role: 'coder', canonical_phase: null, column: 'In Progress' },
+      { name: 'qa_review', kind: 'gate', role: 'reviewer', canonical_phase: null, column: 'Quality' },
+    ] as StateDefinition[]
+    expect(rootHoldsRuns({ ...root, status: 'plan_review' }, true, { states })).toBe(true)
+    // The review-named gate after implementation is the aggregate review.
+    expect(rootHoldsRuns({ ...root, status: 'qa_review' }, true, { states })).toBe(false)
+    // An explicit reject is followed before the implicit accept to the next
+    // state, and the system-only fail never is: qa_review plans here.
+    const routed = [
+      { ...states[0], triggers: { fail: { to: 'plan_review' }, reject: { to: 'qa_review' } } },
+      ...states.slice(1),
+    ] as StateDefinition[]
+    expect(rootHoldsRuns({ ...root, status: 'plan_review' }, true, { states: routed })).toBe(false)
+    expect(rootHoldsRuns({ ...root, status: 'qa_review' }, true, { states: routed })).toBe(true)
+  })
+
+  it('keeps merge_failed roots held even when the Task projects the review phase', () => {
+    const task = { ...root, status: 'merge_failed', canonical_phase: 'review' as const }
+    const state = { name: 'merge_failed', kind: 'active', role: 'coder', column: 'Review', canonical_phase: 'review' } as StateDefinition
+    expect(rootHoldsRuns(task, true, { states: [state] })).toBe(true)
+    expect(rootHoldsRuns(task, true)).toBe(true)
   })
 
   it('leaves a plain Task and a subtask launchable', () => {

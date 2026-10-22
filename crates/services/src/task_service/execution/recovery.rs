@@ -123,7 +123,9 @@ impl TaskService {
                 reason: saved_reason.clone(),
                 override_checks: Some(false),
             }),
-            "resume_process" if snapshot.task.status == "review" => {
+            "resume_process"
+                if crate::workflow::is_review_state(&snapshot.workflow, &snapshot.task.status) =>
+            {
                 Some(api_types::TaskAction::SendBack {
                     guidance: guidance
                         .clone()
@@ -1224,13 +1226,8 @@ impl TaskService {
                     }
                 }
                 "review_checks_retry" => {
-                    self.apply_review_check_retry(
-                        &task,
-                        request.offer.clone(),
-                        request.action.clone(),
-                        request.actor.clone(),
-                    )
-                    .await
+                    self.apply_review_check_retry(&task, request.actor.clone())
+                        .await
                 }
                 "review_failed" => self.retry_review_entry(task, guidance).await,
                 "review_owner_retry" => self.retry_review_entry(task, guidance).await,
@@ -1569,12 +1566,15 @@ impl TaskService {
         // state where no role may run for it.
         let review_only = task.parent_task_id.is_none()
             && task.status == gate_state
-            && gate_state == crate::workflow::default_states::REVIEW
+            && crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &gate_state)
             && crate::task_hierarchy::coordination_root_has_subtasks(&self.db, &task).await?;
         let resume_after_reset = if review_only {
             None
         } else if task.status == gate_state {
-            let failed_review = if gate_state == crate::workflow::default_states::REVIEW {
+            let failed_review = if crate::workflow::is_review_state(
+                &self.workflow_for_task(&task).await?,
+                &gate_state,
+            ) {
                 ReviewRepo::list_latest_reviews_for_tasks(&*self.db, &[task.id.as_str()])
                     .await?
                     .first()
@@ -1729,7 +1729,7 @@ impl TaskService {
             .as_ref()
             .is_some_and(crate::task_diagnostics::is_retry_budget_exhausted);
         let (gate_state, budget, count) = self.current_gate_retry_budget(&task).await?;
-        if gate_state != crate::workflow::default_states::REVIEW
+        if !crate::workflow::is_review_state(&self.workflow_for_task(&task).await?, &gate_state)
             || (db::budget::allows_retry(i64::from(budget), count) && !has_exhausted_annotation)
         {
             return Err(ServiceError::invalid_operation(format!(
@@ -1869,7 +1869,10 @@ impl TaskService {
 
         let has_interruption =
             task.condition.read().diagnostic_present || task.condition.read().interruption_present;
-        let has_failed_review = if task.status == crate::workflow::default_states::REVIEW {
+        let has_failed_review = if crate::workflow::is_review_state(
+            &self.workflow_for_task(&task).await?,
+            &task.status,
+        ) {
             matches!(
                 self.latest_review_for_task(&task.id).await,
                 Ok(review) if review.status == ReviewStatus::Failed
@@ -2313,12 +2316,6 @@ impl TaskService {
         finding: Option<&api_types::TaskBlockingAnnotation>,
         action: api_types::TaskAction,
     ) -> Result<Task> {
-        if task.status != crate::workflow::default_states::REVIEW {
-            return Err(ServiceError::invalid_operation(format!(
-                "{action} is only supported from review state, got {}",
-                task.status
-            )));
-        }
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;
@@ -2329,6 +2326,12 @@ impl TaskService {
                 api_types::UserActionSource::Action(action.clone()),
             )),
         );
+        if !crate::workflow::is_review_state(&workflow, &task.status) {
+            return Err(ServiceError::invalid_operation(format!(
+                "{action} is only supported from review state, got {}",
+                task.status
+            )));
+        }
         let pass_target = workflow
             .auto_transition_target(&task.status)
             .unwrap_or(crate::workflow::default_states::MERGING)
