@@ -6,6 +6,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-21
+
 ### Security
 
 - Provider, fetch and public search now share one hostname policy, refusing
