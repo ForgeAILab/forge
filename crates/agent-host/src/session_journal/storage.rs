@@ -83,6 +83,10 @@ impl PackView {
     pub fn fully_live(&self) -> bool {
         (0..self.index.key.count).all(|s| self.live(s))
     }
+    /// The viewing domain holds every slot (so the pack is also fully live).
+    pub fn fully_held(&self) -> bool {
+        (0..self.index.key.count).all(|s| self.held(s))
+    }
 }
 /// Final surviving bodies keyed by pack id, plus ids invalidated by the transaction.
 /// In-place rewrites invalidate the old generation and retain the final output.

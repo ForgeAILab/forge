@@ -162,8 +162,9 @@ impl ForgeJournalStorage {
         let views = self.directory(conn, scope, false).await?;
         let selected: Vec<_> = views
             .into_iter()
+            // Like S2, only packs the collecting domain holds entirely.
             .filter(|v| {
-                v.fully_live()
+                v.fully_held()
                     && (v.index.key.retained < SMALL_PACK || purged.contains(&v.index.key.id))
             })
             .collect();
@@ -205,7 +206,12 @@ impl ForgeJournalStorage {
             let mut views = self.directory(&mut tx, &scope, false).await?;
             loop {
                 let mut tiers = BTreeMap::<u32, Vec<PackView>>::new();
-                for view in views.iter().filter(|v| v.fully_live()) {
+                // A domain's hook moves only bodies that domain holds: a pack
+                // with a slot only another domain holds is that domain's to
+                // merge. Otherwise one hook pairs the other domain's stable
+                // history with its own short-lived bodies, and the next purge
+                // must rewrite the whole merged pack.
+                for view in views.iter().filter(|v| v.fully_held()) {
                     tiers
                         .entry(view.index.key.retained.max(4096).ilog2())
                         .or_default()

@@ -3338,14 +3338,22 @@ async fn ordinary_never_reads_protected_only_bodies() {
     }
     let mut protected_live: Vec<_> = shared.iter().chain(&secrets[3..]).cloned().collect();
     check(raw.clone(), "after purge rewrite", protected_live.clone()).await;
-    // Merge: the base repack folds the small shared and ordinary-only packs.
+    // Base repack: the shared pack still holds protected-only slots, so
+    // ordinary's collection leaves it and the ordinary-only pack in place
+    // (merges carrying both domains' bits:
+    // `maintenance_moves_only_packs_the_domain_fully_holds`).
+    let unmerged: Vec<i64> = pack_rows(&f, &o, &s).await.iter().map(|r| r.0).collect();
+    assert_eq!(unmerged.len(), 2);
     let mut collect = edit(&raw, &o, &s).await;
     collect.kind = JournalWriteKind::Collect;
     raw.apply(collect).await.unwrap();
     let merged: Vec<i64> = pack_rows(&f, &o, &s).await.iter().map(|r| r.0).collect();
-    assert_eq!(merged.len(), 1, "small fully live packs were merged");
-    assert!(!before.contains(&merged[0]));
-    check(raw.clone(), "after merge", protected_live.clone()).await;
+    assert_eq!(
+        merged, unmerged,
+        "ordinary's repack never moves protected-only slots"
+    );
+    assert!(before.contains(&merged[0]));
+    check(raw.clone(), "after collection", protected_live.clone()).await;
     // A second, protected-only pack shares the mixed pack's eligible S2 tier.
     add_objects(&raw, &p, &s, terminal_only.clone()).await;
     protected_live.extend(terminal_only.clone());
@@ -3369,7 +3377,12 @@ async fn ordinary_never_reads_protected_only_bodies() {
     .fetch_all(f.database().pool())
     .await
     .unwrap();
-    assert_eq!(bitmaps.len(), 3);
+    // The ordinary-only pack (merged[1]) keeps its own single row.
+    assert_eq!(bitmaps.len(), 4);
+    assert_eq!(
+        (bitmaps[2].0, bitmaps[2].1.as_str()),
+        (merged[1], "ordinary")
+    );
     assert_eq!(
         (bitmaps[0].0, bitmaps[0].1.as_str()),
         (merged[0], "ordinary")
@@ -3383,7 +3396,7 @@ async fn ordinary_never_reads_protected_only_bodies() {
         "the mixed pack has different domain bitmaps"
     );
     assert_eq!(
-        bitmaps[2],
+        bitmaps[3],
         (terminal_before[1].0, "protected".to_owned(), vec![1])
     );
     check(
@@ -3405,6 +3418,16 @@ async fn ordinary_never_reads_protected_only_bodies() {
         terminal_after, terminal_before,
         "S2 must change the physical layout"
     );
+    assert_eq!(
+        pack_rows(&f, &o, &s)
+            .await
+            .iter()
+            .map(|r| r.0)
+            .filter(|id| *id == merged[1])
+            .count(),
+        1,
+        "protected's S2 leaves the ordinary-only pack"
+    );
     check(
         raw.clone(),
         "after terminal maintenance",
@@ -3415,6 +3438,171 @@ async fn ordinary_never_reads_protected_only_bodies() {
     check(reopened.clone(), "after reopen", protected_live).await;
     assert!(reopened.objects(&o, &s, &ids(&secrets[3..])).await.unwrap()[0].is_none());
     assert!(reopened.objects(&p, &s, &ids(&secrets[3..])).await.unwrap()[0].is_some());
+}
+
+async fn session_pack_ids(f: &FileDb, s: &SessionId) -> Vec<i64> {
+    sqlx::query_scalar(
+        "SELECT pack_id FROM agent_session_journal_pack WHERE runtime_session_id=? ORDER BY pack_id",
+    )
+    .bind(s.as_str())
+    .fetch_all(f.database().pool())
+    .await
+    .unwrap()
+}
+
+/// A domain's terminal hook and base repack move only packs that domain holds
+/// entirely. A pack with a slot only the other domain holds is left to that
+/// domain, so one domain never pairs the other's stable bodies with its own
+/// short-lived ones (the B/N=1000 delta-write regression after sharing).
+#[tokio::test]
+async fn maintenance_moves_only_packs_the_domain_fully_holds() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let (p, o) = (
+        domain(JournalRole::Protected),
+        domain(JournalRole::Ordinary),
+    );
+    let s = SessionId::new("fully-held");
+    let shared = equal_objects("shared", 8);
+    let secrets = equal_objects("secret", 4);
+    let protected_only = equal_objects("protected-only", 1);
+    let ordinary_only = equal_objects("ordinary-only", 1);
+    let extra = equal_objects("protected-extra", 1);
+    // X: protected holds every slot, ordinary only the shared ones.
+    mapped
+        .apply(write(
+            &p,
+            s.as_str(),
+            shared.iter().chain(&secrets).cloned().collect(),
+        ))
+        .await
+        .unwrap();
+    mapped
+        .apply(write(&o, s.as_str(), shared.clone()))
+        .await
+        .unwrap();
+    let [x] = session_pack_ids(&f, &s).await[..] else {
+        panic!("ordinary admitted only shared bodies")
+    };
+    // Y: protected-only. Z: ordinary-only. All three share one S2 tier.
+    add_objects(&raw, &p, &s, protected_only.clone()).await;
+    add_objects(&raw, &o, &s, ordinary_only.clone()).await;
+    let [_, y, z] = session_pack_ids(&f, &s).await[..] else {
+        panic!("one new pack per domain")
+    };
+    let tiers: std::collections::BTreeSet<_> = sqlx::query_scalar::<_, i64>(
+        "SELECT retained_canonical_bytes FROM agent_session_journal_pack WHERE runtime_session_id=?",
+    )
+    .bind(s.as_str())
+    .fetch_all(f.database().pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|b| (b as u64).max(4096).ilog2())
+    .collect();
+    assert_eq!(tiers.len(), 1, "X, Y and Z must occupy one geometric tier");
+    let protected_all: Vec<_> = shared
+        .iter()
+        .chain(&secrets)
+        .chain(&protected_only)
+        .cloned()
+        .collect();
+    let ordinary_all: Vec<_> = shared.iter().chain(&ordinary_only).cloned().collect();
+    let check = |stage: &'static str, protected_all: Vec<JournalStoredObject>| {
+        let (raw, p, o, s) = (raw.clone(), p.clone(), o.clone(), s.clone());
+        let (secrets, ordinary_only, ordinary_all) =
+            (secrets.clone(), ordinary_only.clone(), ordinary_all.clone());
+        async move {
+            for (domain, expected) in [(&p, &protected_all), (&o, &ordinary_all)] {
+                assert_eq!(
+                    raw.members(domain, &s).await.unwrap(),
+                    sorted_ids(expected),
+                    "{stage}: {:?} membership",
+                    domain.role
+                );
+                assert_eq!(
+                    raw.objects(domain, &s, &ids(expected)).await.unwrap(),
+                    expected
+                        .iter()
+                        .map(|o| Some(o.bytes.clone()))
+                        .collect::<Vec<_>>(),
+                    "{stage}: {:?} bytes",
+                    domain.role
+                );
+            }
+            assert!(
+                raw.objects(&o, &s, &ids(&secrets))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none),
+                "{stage}: ordinary read a protected-only body"
+            );
+            assert!(
+                raw.objects(&p, &s, &ids(&ordinary_only))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none),
+                "{stage}: protected read an ordinary-only body"
+            );
+        }
+    };
+    check("before maintenance", protected_all.clone()).await;
+    // Ordinary holds all of Z only: nothing to pair.
+    raw.post_terminal(&o, &s).await.unwrap();
+    assert_eq!(session_pack_ids(&f, &s).await, vec![x, y, z]);
+    // Protected merges X and Y (carrying ordinary's X bits); Z is untouched.
+    raw.post_terminal(&p, &s).await.unwrap();
+    let after = session_pack_ids(&f, &s).await;
+    assert_eq!(after.len(), 2, "S2 merged exactly the fully held pair");
+    assert_eq!(after[0], z, "S2 never moves an ordinary-only pack");
+    let xy = after[1];
+    assert!(xy > z);
+    check("after S2", protected_all.clone()).await;
+    // Base repack: neither collection merges Z with the protected pack.
+    for d in [&p, &o] {
+        let mut collect = edit(&raw, d, &s).await;
+        collect.kind = JournalWriteKind::Collect;
+        raw.apply(collect).await.unwrap();
+        assert_eq!(session_pack_ids(&f, &s).await, vec![z, xy], "{:?}", d.role);
+    }
+    // A second small protected pack is still merged by protected's repack.
+    add_objects(&raw, &p, &s, extra.clone()).await;
+    let mut collect = edit(&raw, &p, &s).await;
+    collect.kind = JournalWriteKind::Collect;
+    raw.apply(collect).await.unwrap();
+    let repacked = session_pack_ids(&f, &s).await;
+    assert_eq!(repacked.len(), 2);
+    assert_eq!(repacked[0], z, "the base repack never moves Z");
+    let mut protected_all = protected_all;
+    protected_all.extend(extra);
+    check("after base repack", protected_all.clone()).await;
+    check_reopened(&f, &p, &o, &s, &protected_all, &ordinary_all).await;
+}
+async fn check_reopened(
+    f: &FileDb,
+    p: &JournalDomain,
+    o: &JournalDomain,
+    s: &SessionId,
+    protected_all: &[JournalStoredObject],
+    ordinary_all: &[JournalStoredObject],
+) {
+    let reopened = reopen(f).await;
+    for (domain, expected) in [(p, protected_all), (o, ordinary_all)] {
+        assert_eq!(
+            reopened.members(domain, s).await.unwrap(),
+            sorted_ids(expected)
+        );
+        assert_eq!(
+            reopened.objects(domain, s, &ids(expected)).await.unwrap(),
+            expected
+                .iter()
+                .map(|o| Some(o.bytes.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[tokio::test]
