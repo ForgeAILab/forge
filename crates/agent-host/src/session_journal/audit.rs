@@ -9,6 +9,14 @@ use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use sqlx::Row;
 use std::io::Read;
 
+fn role_of(role: &str) -> Result<JournalRole, RuntimeError> {
+    match role {
+        "ordinary" => Ok(JournalRole::Ordinary),
+        "protected" => Ok(JournalRole::Protected),
+        _ => Err(corrupt()),
+    }
+}
+
 impl ForgeJournalStorage {
     /// Includes unheld/deferred bodies, not merely objects reachable by a reader.
     /// Uses one SQL snapshot and the production AEAD binding for every unit.
@@ -31,20 +39,34 @@ impl ForgeJournalStorage {
                 .map_err(database_error)?;
             for row in rows {
                 self.revision(&row)?;
-                let domain = JournalDomain {
-                    storage_id: JournalStorageId::new(
-                        row.try_get::<String, _>("storage_id")
-                            .map_err(|_| corrupt())?,
-                    ),
-                    role: match row
-                        .try_get::<String, _>("role")
-                        .map_err(|_| corrupt())?
-                        .as_str()
-                    {
-                        "ordinary" => JournalRole::Ordinary,
-                        "protected" => JournalRole::Protected,
-                        _ => return Err(corrupt()),
-                    },
+                // Session packs are shared: report their units under every
+                // holder domain's role (both roles for an unheld pack).
+                let (domain, roles) = if table == "pack" {
+                    let held: Vec<String> = sqlx::query_scalar(
+                        "SELECT DISTINCT role FROM agent_session_journal_membership WHERE pack_id=? ORDER BY role",
+                    )
+                    .bind(row.try_get::<i64, _>("pack_id").map_err(|_| corrupt())?)
+                    .fetch_all(&mut *tx)
+                    .await
+                    .map_err(database_error)?;
+                    let mut roles = Vec::new();
+                    for role in held {
+                        roles.push(role_of(&role)?);
+                    }
+                    if roles.is_empty() {
+                        roles = vec![JournalRole::Ordinary, JournalRole::Protected];
+                    }
+                    (None, roles)
+                } else {
+                    let domain = JournalDomain {
+                        storage_id: JournalStorageId::new(
+                            row.try_get::<String, _>("storage_id")
+                                .map_err(|_| corrupt())?,
+                        ),
+                        role: role_of(&row.try_get::<String, _>("role").map_err(|_| corrupt())?)?,
+                    };
+                    let role = domain.role;
+                    (Some(domain), vec![role])
                 };
                 let session = SessionId::new(
                     row.try_get::<String, _>("runtime_session_id")
@@ -90,7 +112,7 @@ impl ForgeJournalStorage {
                     let bytes = self.keys.open(
                         &Binding {
                             unit,
-                            domain: &domain,
+                            domain: domain.as_ref(),
                             session: &session,
                             owner: &owner,
                             row: &row_key,
@@ -136,12 +158,18 @@ impl ForgeJournalStorage {
                             for slot in &directory.as_ref().ok_or_else(corrupt)?.slots {
                                 let end = slot.offset.checked_add(slot.len).ok_or_else(corrupt)?;
                                 let object = raw.get(slot.offset..end).ok_or_else(corrupt)?;
-                                out.push((domain.role, "object", object.to_vec()));
+                                for role in &roles {
+                                    out.push((*role, "object", object.to_vec()));
+                                }
                             }
                         }
-                        out.push((domain.role, label, raw));
+                        for role in &roles {
+                            out.push((*role, label, raw.clone()));
+                        }
                     }
-                    out.push((domain.role, label, bytes));
+                    for role in &roles {
+                        out.push((*role, label, bytes.clone()));
+                    }
                 }
             }
         }

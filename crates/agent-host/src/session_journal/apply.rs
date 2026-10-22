@@ -3,7 +3,7 @@ use super::{
     cache::{Scope, ScopeDirectory},
     codec, conflict,
     seal::role,
-    storage::{ForgeJournalStorage, PackView, ambiguous_database_error, database_error},
+    storage::{ForgeJournalStorage, PackView, Staged, ambiguous_database_error, database_error},
     wire,
 };
 use agent_runtime::core::{
@@ -48,7 +48,7 @@ impl Drop for InvalidateOnDrop {
     fn drop(&mut self) {
         if self.armed {
             if let Ok(mut cache) = self.cache.lock() {
-                cache.invalidate(&self.scope);
+                cache.invalidate(&self.scope.1);
             }
         }
     }
@@ -77,6 +77,8 @@ impl ForgeJournalStorage {
             }
             // Validate candidates outside the write lock; no runtime-private
             // engine metadata or closure calculation belongs in this adapter.
+            // The only digest/kind validation of admitted bodies: packing and
+            // sealing later trust this result and re-check only order and caps.
             let objects = write.objects.objects.clone();
             let record = write.record.clone();
             self.work(move || {
@@ -107,7 +109,7 @@ impl ForgeJournalStorage {
             let locked = Instant::now();
             let staged = self.apply_on(&mut tx, &scope, &write).await;
             match staged {
-                Ok((next, applied_receipt)) => {
+                Ok((next, applied_receipt, staged)) => {
                     let commit = {
                         #[cfg(feature = "test-support")]
                         let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
@@ -121,7 +123,14 @@ impl ForgeJournalStorage {
                             // remain useful; new directories replace the old scope.
                             receipt = applied_receipt;
                             self.cache_lock()
-                                .map(|mut cache| cache.put_directory(scope.clone(), next))
+                                .map(|mut cache| {
+                                    cache.committed_rewrite(
+                                        &scope.1,
+                                        &staged.removed,
+                                        staged.written,
+                                    );
+                                    cache.put_directory(scope.1.clone(), next)
+                                })
                                 .and_then(|_| fail(&write, JournalCommitFailurePoint::AfterCommit))
                                 // Nothing after COMMIT may claim no durable effect.
                                 .map_err(RuntimeError::retryable)
@@ -173,7 +182,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         write: &JournalWrite,
-    ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt), RuntimeError> {
+    ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt, Staged), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("apply.apply_on", 0);
         // Full fence comparison is SQL, including the all-zero absent-record
@@ -256,10 +265,12 @@ impl ForgeJournalStorage {
         // Every pre-commit cut rolls back the whole transaction, so packing
         // per cut would only rewrite unobservable intermediate rows. Encode,
         // seal and insert the new bodies once (capped segments when large).
+        let mut staged = Staged::default();
         if !pending.is_empty() {
             pending.sort_by(|a, b| a.id.cmp(&b.id));
             for pack in self.work(move || codec::split(pending)).await? {
-                self.insert_pack(conn, scope, &owner, pack).await?;
+                self.insert_pack(conn, scope, &owner, pack, &mut staged)
+                    .await?;
             }
         }
         self.replace_record(conn, scope, &owner, &write.record, write.expect)
@@ -288,21 +299,23 @@ impl ForgeJournalStorage {
                 &write.release,
                 matches!(write.kind, JournalWriteKind::Collect)
                     && write.record.retirement.is_some(),
+                &mut staged,
             )
             .await?;
         let collect = matches!(write.kind, JournalWriteKind::Collect);
         if collect {
-            self.collection_repack(conn, scope, &purged).await?;
+            self.collection_repack(conn, scope, &purged, &mut staged)
+                .await?;
         }
         // Released bits live only in SQL. Without a purge (every removed pack
         // counts at least one reclaimed copy) or a repack, the indexes are
         // exactly the ones already read in this transaction.
         if !collect && receipt.reclaimed_objects == 0 {
-            return Ok((directory(&final_views), receipt));
+            return Ok((directory(&final_views), receipt, staged));
         }
         let final_views = self
             .directory_from(conn, scope, false, Some(directory(&final_views)))
             .await?;
-        Ok((directory(&final_views), receipt))
+        Ok((directory(&final_views), receipt, staged))
     }
 }

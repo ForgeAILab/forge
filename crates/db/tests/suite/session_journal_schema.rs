@@ -55,13 +55,14 @@ async fn session(pool: &SqlitePool, storage: &str, role: &str, runtime: &str, fo
         .execute(pool).await.unwrap();
 }
 
-async fn pack(pool: &SqlitePool, storage: &str, role: &str, runtime: &str, forge: &str) -> i64 {
+/// Packs are owned by a runtime session (shared by its domains).
+async fn pack(pool: &SqlitePool, runtime: &str, forge: &str) -> i64 {
     sqlx::query(
         "INSERT INTO agent_session_journal_pack
-         (storage_id, role, runtime_session_id, forge_session_id, generation, object_count,
+         (runtime_session_id, forge_session_id, generation, object_count,
           retained_canonical_bytes, key_revision, format, index_nonce, index_payload, body_nonce, body_payload)
-         VALUES (?, ?, ?, ?, zeroblob(8), 8, 1024, 1, 1, zeroblob(24), zeroblob(16), zeroblob(24), zeroblob(16))",
-    ).bind(storage).bind(role).bind(runtime).bind(forge)
+         VALUES (?, ?, zeroblob(8), 8, 1024, 1, 1, zeroblob(24), zeroblob(16), zeroblob(24), zeroblob(16))",
+    ).bind(runtime).bind(forge)
         .execute(pool).await.unwrap().last_insert_rowid()
 }
 
@@ -208,8 +209,8 @@ async fn migration_preserves_legacy_and_scoped_packs() {
             )).bind(runtime).bind(forge).execute(&pool).await.unwrap();
         }
     }
-    let pack_a = pack(&pool, "store", "protected", "runtime-a", "owner-a").await;
-    let pack_b = pack(&pool, "store", "protected", "runtime-b", "owner-b").await;
+    let pack_a = pack(&pool, "runtime-a", "owner-a").await;
+    let pack_b = pack(&pool, "runtime-b", "owner-b").await;
     let a = ("store", "protected", "runtime-a", "owner-a");
     for bits in [&[][..], &[0][..], &[0, 0][..]] {
         constraint(
@@ -217,10 +218,10 @@ async fn migration_preserves_legacy_and_scoped_packs() {
             "CHECK",
         );
     }
+    // A pack is shared by its runtime session's domains, never by another
+    // session or Forge owner.
     for scope in [
-        ("store", "ordinary", "runtime-a", "owner-a"),
         ("store", "protected", "runtime-b", "owner-b"),
-        ("other-store", "protected", "runtime-a", "owner-a"),
         ("store", "protected", "runtime-a", "owner-b"),
     ] {
         constraint(
@@ -229,6 +230,12 @@ async fn migration_preserves_legacy_and_scoped_packs() {
         );
     }
     membership(&pool, a, pack_a, &[128]).await.unwrap();
+    for scope in [
+        ("store", "ordinary", "runtime-a", "owner-a"),
+        ("other-store", "protected", "runtime-a", "owner-a"),
+    ] {
+        membership(&pool, scope, pack_a, &[1]).await.unwrap();
+    }
     membership(
         &pool,
         ("store", "protected", "runtime-b", "owner-b"),
@@ -434,7 +441,7 @@ async fn migration_preserves_legacy_and_scoped_packs() {
         .execute(&pool)
         .await
         .unwrap();
-    let next_pack = pack(&pool, "store", "protected", "runtime-b", "owner-b").await;
+    let next_pack = pack(&pool, "runtime-b", "owner-b").await;
     assert!(
         next_pack > pack_b && next_pack > pack_a,
         "AUTOINCREMENT ids never reuse a deleted id"
@@ -444,7 +451,7 @@ async fn migration_preserves_legacy_and_scoped_packs() {
         .execute(&pool)
         .await
         .unwrap();
-    let last_pack = pack(&pool, "store", "protected", "runtime-b", "owner-b").await;
+    let last_pack = pack(&pool, "runtime-b", "owner-b").await;
     assert!(
         last_pack > next_pack,
         "even the highest deleted id is not reused"

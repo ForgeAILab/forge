@@ -38,7 +38,7 @@ impl ForgeJournalStorage {
                     let compressed = keys.open(
                         &Binding {
                             unit: Unit::Operations,
-                            domain: &scope.0,
+                            domain: Some(&scope.0),
                             session: &scope.1,
                             owner: &owner,
                             row: &tier.to_be_bytes(),

@@ -43,17 +43,63 @@ impl fmt::Debug for ForgeJournalStorage {
             .finish_non_exhaustive()
     }
 }
+/// One session pack as seen by one domain. `bitmap` is that domain's own
+/// membership and alone grants reads; `others` are the other domains' bitmaps
+/// of the same session, used only for liveness and atomic remaps.
 #[derive(Clone)]
 pub(super) struct PackView {
     pub index: IndexEntry,
+    pub domain: JournalDomain,
     pub bitmap: Vec<u8>,
+    pub others: Vec<(JournalDomain, Vec<u8>)>,
+}
+pub(super) fn bit(bits: &[u8], slot: usize) -> bool {
+    bits.get(slot / 8)
+        .is_some_and(|b| b & (1 << (slot % 8)) != 0)
+}
+pub(super) fn full_bitmap(count: usize) -> Vec<u8> {
+    let mut bits = vec![255; count.div_ceil(8)];
+    if count % 8 != 0 {
+        if let Some(last) = bits.last_mut() {
+            *last = (1 << (count % 8)) - 1;
+        }
+    }
+    bits
+}
+/// Each requested id's four-byte directory prefix, computed once per call.
+pub(super) fn prefix(id: &JournalObjectId) -> [u8; 4] {
+    let bytes = id.to_bytes();
+    [bytes[0], bytes[1], bytes[2], bytes[3]]
 }
 impl PackView {
+    /// Read authority of the viewing domain only.
     pub fn held(&self, slot: usize) -> bool {
-        self.bitmap
-            .get(slot / 8)
-            .is_some_and(|b| b & (1 << (slot % 8)) != 0)
+        bit(&self.bitmap, slot)
     }
+    /// Physically live: some domain of the session holds the slot.
+    pub fn live(&self, slot: usize) -> bool {
+        self.held(slot) || self.others.iter().any(|(_, bits)| bit(bits, slot))
+    }
+    pub fn fully_live(&self) -> bool {
+        (0..self.index.key.count).all(|s| self.live(s))
+    }
+}
+/// Bodies sealed and pack ids removed or rewritten by one write transaction.
+/// Applied to the shared cache only after COMMIT succeeds.
+#[derive(Default)]
+pub(super) struct Staged {
+    pub written: Vec<(PackKey, Arc<Vec<JournalStoredObject>>)>,
+    pub removed: BTreeSet<i64>,
+}
+pub(super) fn domain_of(storage_id: String, role: &str) -> Result<JournalDomain, RuntimeError> {
+    Ok(JournalDomain {
+        storage_id: JournalStorageId::new(storage_id),
+        role: match role {
+            "protected" => JournalRole::Protected,
+            "ordinary" => JournalRole::Ordinary,
+            _ => return Err(corrupt()),
+        },
+    })
 }
 pub(super) fn counter(row: &SqliteRow, name: &str) -> Result<u64, RuntimeError> {
     let value: Vec<u8> = row.try_get(name).map_err(|_| corrupt())?;
@@ -204,7 +250,7 @@ impl ForgeJournalStorage {
             let raw = keys.open(
                 &Binding {
                     unit: Unit::Session,
-                    domain: &domain,
+                    domain: Some(&domain),
                     session: &session,
                     owner: &owner,
                     row: b"",
@@ -268,11 +314,30 @@ impl ForgeJournalStorage {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("storage.directory_from", 0);
         let (domain, session) = scope;
-        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT p.pack_id,p.generation,p.object_count,p.retained_canonical_bytes,p.forge_session_id,p.key_revision,p.format,m.bitmap FROM agent_session_journal_pack p LEFT JOIN agent_session_journal_membership m ON m.pack_id=p.pack_id AND m.storage_id=p.storage_id AND m.role=p.role AND m.runtime_session_id=p.runtime_session_id AND m.forge_session_id=p.forge_session_id WHERE p.storage_id=? AND p.role=? AND p.runtime_session_id=? ORDER BY p.pack_id")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
+        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,forge_session_id,key_revision,format FROM agent_session_journal_pack WHERE runtime_session_id=? ORDER BY pack_id")
+            .bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
+        // Every domain's bitmap in the same snapshot; the composite FK binds
+        // each row to its pack's session and Forge owner label.
+        let members={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT storage_id,role,pack_id,bitmap FROM agent_session_journal_membership WHERE runtime_session_id=? ORDER BY pack_id,storage_id,role")
+            .bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
+        let mut bitmaps = BTreeMap::<i64, (Option<Vec<u8>>, Vec<(JournalDomain, Vec<u8>)>)>::new();
+        for row in members {
+            let holder = domain_of(
+                row.try_get("storage_id").map_err(|_| corrupt())?,
+                &row.try_get::<String, _>("role").map_err(|_| corrupt())?,
+            )?;
+            let id: i64 = row.try_get("pack_id").map_err(|_| corrupt())?;
+            let bits: Vec<u8> = row.try_get("bitmap").map_err(|_| corrupt())?;
+            let entry = bitmaps.entry(id).or_default();
+            if &holder == domain {
+                entry.0 = Some(bits);
+            } else {
+                entry.1.push((holder, bits));
+            }
+        }
         let cached = match prior {
             Some(p) => p,
-            None => self.cache_lock()?.directory(scope).unwrap_or_default(),
+            None => self.cache_lock()?.directory(session).unwrap_or_default(),
         };
         let mut headers = BTreeMap::new();
         let mut missing = Vec::new();
@@ -292,11 +357,14 @@ impl ForgeJournalStorage {
             if count == 0 || count > retained || retained > codec::PACK_CAP {
                 return Err(corrupt());
             }
-            let bitmap: Option<Vec<u8>> = row.try_get("bitmap").map_err(|_| corrupt())?;
+            let (bitmap, others) = bitmaps.remove(&id).unwrap_or_default();
             let bitmap = bitmap.unwrap_or_else(|| vec![0; count.div_ceil(8)]);
             validate_bitmap(&bitmap, count)?;
+            for (_, bits) in &others {
+                validate_bitmap(bits, count)?;
+            }
             let key = PackKey {
-                scope: scope.clone(),
+                session: session.clone(),
                 id,
                 generation: counter(&row, "generation")?,
                 count,
@@ -306,19 +374,17 @@ impl ForgeJournalStorage {
             if !cached.packs.get(&id).is_some_and(|p| p.key == key) {
                 missing.push(id);
             }
-            headers.insert(id, (key, bitmap));
+            headers.insert(id, (key, bitmap, others));
+        }
+        if !bitmaps.is_empty() {
+            return Err(corrupt());
         }
         let mut indexes = BTreeMap::new();
         for chunk in missing.chunks(400) {
             let mut q = QueryBuilder::<Sqlite>::new(
-                "SELECT pack_id,index_nonce,index_payload FROM agent_session_journal_pack WHERE storage_id=",
+                "SELECT pack_id,index_nonce,index_payload FROM agent_session_journal_pack WHERE runtime_session_id=",
             );
-            q.push_bind(domain.storage_id.as_str())
-                .push(" AND role=")
-                .push_bind(role(domain))
-                .push(" AND runtime_session_id=")
-                .push_bind(session.as_str())
-                .push(" AND pack_id IN (");
+            q.push_bind(session.as_str()).push(" AND pack_id IN (");
             let mut separated = q.separated(",");
             for id in chunk {
                 separated.push_bind(*id);
@@ -352,8 +418,8 @@ impl ForgeJournalStorage {
                             let raw = keys.open(
                                 &Binding {
                                     unit: Unit::PackIndex,
-                                    domain: &key.scope.0,
-                                    session: &key.scope.1,
+                                    domain: None,
+                                    session: &key.session,
                                     owner: &key.owner,
                                     row: &key.id.to_be_bytes(),
                                     generation: key.generation,
@@ -373,7 +439,7 @@ impl ForgeJournalStorage {
         }
         let mut snapshot = Vec::with_capacity(headers.len());
         let mut next = ScopeDirectory::default();
-        for (id, (key, bitmap)) in headers {
+        for (id, (key, bitmap, others)) in headers {
             let directory = if let Some(d) = indexes.remove(&id) {
                 d
             } else {
@@ -387,11 +453,16 @@ impl ForgeJournalStorage {
             };
             let index = IndexEntry { key, directory };
             next.packs.insert(id, index.clone());
-            snapshot.push(PackView { index, bitmap });
+            snapshot.push(PackView {
+                index,
+                domain: domain.clone(),
+                bitmap,
+                others,
+            });
         }
         if publish {
             self.cache_lock()?
-                .put_directory(scope.clone(), Arc::new(next));
+                .put_directory(session.clone(), Arc::new(next));
         }
         Ok(snapshot)
     }
@@ -456,8 +527,8 @@ impl ForgeJournalStorage {
                             let raw = keys.open(
                                 &Binding {
                                     unit: Unit::PackBody,
-                                    domain: &key.scope.0,
-                                    session: &key.scope.1,
+                                    domain: None,
+                                    session: &key.session,
                                     owner: &key.owner,
                                     row: &key.id.to_be_bytes(),
                                     generation: key.generation,
@@ -616,20 +687,30 @@ impl JournalStorage for ForgeJournalStorage {
         let views = self
             .directory(&mut tx, &(domain.clone(), session.clone()), true)
             .await?;
+        let prefixes: Vec<_> = ids.iter().map(prefix).collect();
         let mut wanted = BTreeSet::new();
-        for id in ids {
+        for p in &prefixes {
             for v in &views {
-                if v.index.directory.candidates(id).any(|slot| v.held(slot)) {
+                if v.index
+                    .directory
+                    .prefix_candidates(p)
+                    .any(|slot| v.held(slot))
+                {
                     wanted.insert(v.index.key.id);
                 }
             }
         }
         let bodies = self.bodies(&mut tx, &views, &wanted, true).await?;
         let mut results = Vec::with_capacity(ids.len());
-        for id in ids {
+        for (id, p) in ids.iter().zip(&prefixes) {
             let mut found = None;
             for v in &views {
-                for slot in v.index.directory.candidates(id).filter(|s| v.held(*s)) {
+                for slot in v
+                    .index
+                    .directory
+                    .prefix_candidates(p)
+                    .filter(|s| v.held(*s))
+                {
                     let object = bodies
                         .get(&v.index.key.id)
                         .and_then(|p| p.get(slot))
@@ -745,7 +826,7 @@ impl JournalStorage for ForgeJournalStorage {
                     let raw = keys.open(
                         &Binding {
                             unit: Unit::Pin,
-                            domain: &domain,
+                            domain: Some(&domain),
                             session: &session,
                             owner: &owner,
                             row: &key,
@@ -805,7 +886,7 @@ impl JournalStorage for ForgeJournalStorage {
                     let raw = keys.open(
                         &Binding {
                             unit: Unit::Catalog,
-                            domain: &domain,
+                            domain: Some(&domain),
                             session: &session,
                             owner: &owner,
                             row: &key,

@@ -433,8 +433,8 @@ async fn bulk_orphans(db: &db::SqliteDb, count: i64, bytes: i64) {
     // indexed ownership/counters, never AEAD or an invented apply receipt.
     sqlx::query("WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<?)
         INSERT INTO agent_session_journal_pack
-        (storage_id,role,runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload)
-        SELECT 'bulk','ordinary','deleted-bulk-runtime','deleted-bulk-owner',zeroblob(8),1,?,1,1,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16) FROM n")
+        (runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload)
+        SELECT 'deleted-bulk-runtime','deleted-bulk-owner',zeroblob(8),1,?,1,1,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16) FROM n")
         .bind(count).bind(bytes).execute(db.pool()).await.unwrap();
 }
 
@@ -522,7 +522,7 @@ async fn deletion_drains_owned_packs_preserves_other_copies() {
             writer_epoch: record.writer_epoch,
         };
         record.generation += 1;
-        let before:i64=sqlx::query_scalar("SELECT SUM(retained_canonical_bytes) FROM agent_session_journal_pack WHERE forge_session_id=? AND role=?").bind(host("deferred-deleted")).bind(if role==JournalRole::Protected {"protected"}else{"ordinary"}).fetch_one(db.pool()).await.unwrap();
+        let before:i64=sqlx::query_scalar("SELECT SUM(retained_canonical_bytes) FROM agent_session_journal_pack WHERE forge_session_id=?").bind(host("deferred-deleted")).fetch_one(db.pool()).await.unwrap();
         let receipt = storage
             .apply(JournalWrite {
                 domain: domain.clone(),
@@ -541,7 +541,7 @@ async fn deletion_drains_owned_packs_preserves_other_copies() {
             .await
             .unwrap();
         assert_eq!(receipt, JournalApplyReceipt::default());
-        let after:i64=sqlx::query_scalar("SELECT SUM(retained_canonical_bytes) FROM agent_session_journal_pack WHERE forge_session_id=? AND role=?").bind(host("deferred-deleted")).bind(if role==JournalRole::Protected {"protected"}else{"ordinary"}).fetch_one(db.pool()).await.unwrap();
+        let after:i64=sqlx::query_scalar("SELECT SUM(retained_canonical_bytes) FROM agent_session_journal_pack WHERE forge_session_id=?").bind(host("deferred-deleted")).fetch_one(db.pool()).await.unwrap();
         assert_eq!(before, after, "12.5% dead remains sealed");
         assert!(storage
             .objects(

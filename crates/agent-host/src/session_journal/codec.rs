@@ -20,10 +20,15 @@ pub(super) struct Directory {
     pub body_len: usize,
 }
 impl Directory {
+    #[cfg(test)]
     pub fn candidates(&self, id: &JournalObjectId) -> std::ops::Range<usize> {
         let prefix: [u8; 4] = id.to_bytes()[..4].try_into().expect("four bytes");
-        self.slots.partition_point(|s| s.prefix < prefix)
-            ..self.slots.partition_point(|s| s.prefix <= prefix)
+        self.prefix_candidates(&prefix)
+    }
+    /// Slots whose prefix matches; callers still verify the complete id.
+    pub fn prefix_candidates(&self, prefix: &[u8; 4]) -> std::ops::Range<usize> {
+        self.slots.partition_point(|s| &s.prefix < prefix)
+            ..self.slots.partition_point(|s| &s.prefix <= prefix)
     }
     pub fn charge(&self) -> usize {
         std::mem::size_of::<Self>() + self.slots.capacity() * std::mem::size_of::<Slot>()
@@ -81,14 +86,30 @@ pub(super) fn validate(object: &JournalStoredObject) -> Result<(), RuntimeError>
     Ok(())
 }
 
+/// Validating entry point for bodies of unknown provenance.
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 pub(super) fn encode(objects: &[JournalStoredObject]) -> Result<EncodedPack, RuntimeError> {
+    for object in objects {
+        validate(object)?;
+    }
+    encode_validated(objects)
+}
+
+/// Production packing: every caller passes bodies validated exactly once, on
+/// admission (apply's prevalidation) or on decode (`decode_body` recomputes
+/// the full id and kind). This re-checks order, emptiness and the cap only.
+pub(super) fn encode_validated(
+    objects: &[JournalStoredObject],
+) -> Result<EncodedPack, RuntimeError> {
     #[cfg(feature = "test-support")]
     let _profile = crate::session_journal::profile::timer("codec.encode", 0);
     if objects.is_empty() || objects.windows(2).any(|p| p[0].id >= p[1].id) {
         return Err(conflict());
     }
     let total = objects.iter().try_fold(0usize, |n, o| {
-        validate(o)?;
+        if o.bytes.is_empty() {
+            return Err(conflict());
+        }
         n.checked_add(o.bytes.len())
             .filter(|n| *n <= PACK_CAP)
             .ok_or_else(conflict)
@@ -272,8 +293,11 @@ pub(super) fn split(
     let mut packs = Vec::new();
     let mut pending = Vec::new();
     let mut bytes = 0;
+    // Bodies were validated once on admission or decode; keep the cap check.
     for object in objects {
-        validate(&object)?;
+        if object.bytes.is_empty() || object.bytes.len() > PACK_CAP {
+            return Err(conflict());
+        }
         if bytes + object.bytes.len() > PACK_CAP {
             packs.push(std::mem::take(&mut pending));
             bytes = 0;

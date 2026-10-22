@@ -64,29 +64,35 @@ impl super::ForgeJournalStorage {
         use agent_runtime::core::{ids::SessionId, journal::*};
         use sqlx::Row;
         use std::collections::{BTreeMap, BTreeSet};
-        let rows = sqlx::query("SELECT p.*,m.bitmap FROM agent_session_journal_pack p LEFT JOIN agent_session_journal_membership m USING(pack_id) ORDER BY p.pack_id").fetch_all(self.db.pool()).await.unwrap();
+        // Packs are session-owned and shared; each domain's bitmap is listed.
+        let rows = sqlx::query("SELECT p.*,(SELECT group_concat(m.role||':'||hex(m.bitmap)) FROM agent_session_journal_membership m WHERE m.pack_id=p.pack_id) AS holders FROM agent_session_journal_pack p ORDER BY p.pack_id").fetch_all(self.db.pool()).await.unwrap();
         let mut packs = Vec::new();
         let mut objects_by_role: BTreeMap<String, BTreeMap<JournalObjectId, JournalStoredObject>> =
             BTreeMap::new();
         let mut held_by_role: BTreeMap<String, BTreeSet<JournalObjectId>> = BTreeMap::new();
         let mut roles = BTreeMap::<String, serde_json::Value>::new();
         for row in rows {
-            let role: String = row.get("role");
-            let domain = JournalDomain {
-                storage_id: JournalStorageId::new(row.get::<String, _>("storage_id")),
-                role: if role == "protected" {
-                    JournalRole::Protected
-                } else {
-                    JournalRole::Ordinary
-                },
-            };
+            let holders: Vec<(String, Vec<u8>)> = row
+                .get::<Option<String>, _>("holders")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|h| !h.is_empty())
+                .map(|h| {
+                    let (role, hex) = h.split_once(':').unwrap();
+                    let bits = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect();
+                    (role.to_owned(), bits)
+                })
+                .collect();
             let session = SessionId::new(row.get::<String, _>("runtime_session_id"));
             let owner: String = row.get("forge_session_id");
             let pid: i64 = row.get("pack_id");
             let generation = super::storage::counter(&row, "generation").unwrap();
             let binding = |unit| Binding {
                 unit,
-                domain: &domain,
+                domain: None,
                 session: &session,
                 owner: &owner,
                 row: &[],
@@ -124,24 +130,30 @@ impl super::ForgeJournalStorage {
             )
             .unwrap();
             let objects = codec::decode_body(&directory, &compressed).unwrap();
-            let bits: Vec<u8> = row.get::<Option<Vec<u8>>, _>("bitmap").unwrap_or_default();
             let mut kinds = BTreeMap::<String, Vec<JournalStoredObject>>::new();
             let mut held = 0usize;
             let mut dead = 0usize;
-            for (slot, o) in objects.iter().enumerate() {
-                objects_by_role
-                    .entry(role.clone())
-                    .or_default()
-                    .insert(o.id.clone(), o.clone());
-                if bits
-                    .get(slot / 8)
+            let set = |bits: &[u8], slot: usize| {
+                bits.get(slot / 8)
                     .is_some_and(|b| b & (1 << (slot % 8)) != 0)
-                {
+            };
+            for (slot, o) in objects.iter().enumerate() {
+                let mut live = false;
+                for (role, bits) in &holders {
+                    if set(bits, slot) {
+                        live = true;
+                        objects_by_role
+                            .entry(role.clone())
+                            .or_default()
+                            .insert(o.id.clone(), o.clone());
+                        held_by_role
+                            .entry(role.clone())
+                            .or_default()
+                            .insert(o.id.clone());
+                    }
+                }
+                if live {
                     held += o.bytes.len();
-                    held_by_role
-                        .entry(role.clone())
-                        .or_default()
-                        .insert(o.id.clone());
                 } else {
                     dead += o.bytes.len();
                 }
@@ -164,15 +176,12 @@ impl super::ForgeJournalStorage {
                 let z = zstd::stream::encode_all(raw.as_slice(),3).unwrap().len();
                 (kind,serde_json::json!({"objects":os.len(),"canonical":raw.len(),"compressed_alone":z}))
             }).collect();
-            packs.push(serde_json::json!({"id":pid,"role":role,"objects":objects.len(),"held_canonical":held,"dead_canonical":dead,"index_raw":index.len(),"body_compressed":compressed.len(),"payload_nonce":ip.len()+bp.len()+48,"nonce_tag":80,"envelope":30,"combined_compressed_diagnostic":reference_combined,"kinds":ks}));
+            let role: Vec<_> = holders.iter().map(|(r, _)| r.clone()).collect();
+            packs.push(serde_json::json!({"id":pid,"holders":role,"objects":objects.len(),"held_canonical":held,"dead_canonical":dead,"index_raw":index.len(),"body_compressed":compressed.len(),"payload_nonce":ip.len()+bp.len()+48,"nonce_tag":80,"envelope":30,"combined_compressed_diagnostic":reference_combined,"kinds":ks}));
         }
         for role in ["protected", "ordinary"] {
             let mut tables = BTreeMap::new();
             for (table, expr) in [
-                (
-                    "pack",
-                    "length(index_payload)+length(body_payload)+length(index_nonce)+length(body_nonce)",
-                ),
                 ("operation_pack", "length(payload)+length(nonce)"),
                 ("session", "length(payload)+length(nonce)"),
                 ("catalog", "length(payload)+length(nonce)"),
@@ -184,8 +193,11 @@ impl super::ForgeJournalStorage {
             }
             roles.insert(role.to_owned(), serde_json::json!(tables));
         }
-        let protected = objects_by_role.get("protected").unwrap();
-        let ordinary = objects_by_role.get("ordinary").unwrap();
+        let shared = sqlx::query("SELECT count(*),coalesce(sum(length(index_payload)+length(body_payload)+length(index_nonce)+length(body_nonce)),0) FROM agent_session_journal_pack").fetch_one(self.db.pool()).await.unwrap();
+        roles.insert("session_packs".to_owned(), serde_json::json!({"rows":shared.get::<i64,_>(0),"payload_nonce_bytes":shared.get::<i64,_>(1)}));
+        let empty = BTreeMap::new();
+        let protected = objects_by_role.get("protected").unwrap_or(&empty);
+        let ordinary = objects_by_role.get("ordinary").unwrap_or(&empty);
         let common: BTreeSet<_> = ordinary
             .keys()
             .filter(|id| protected.contains_key(*id))
@@ -195,7 +207,7 @@ impl super::ForgeJournalStorage {
         let mut kind_totals = BTreeMap::new();
         for role in ["protected", "ordinary"] {
             let mut groups = BTreeMap::<String, Vec<&JournalStoredObject>>::new();
-            for o in objects_by_role[role].values() {
+            for o in objects_by_role.get(role).unwrap_or(&empty).values() {
                 groups
                     .entry(o.kind.as_str().to_owned())
                     .or_default()

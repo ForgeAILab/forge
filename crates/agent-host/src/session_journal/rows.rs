@@ -2,17 +2,18 @@
 #[cfg(feature = "test-support")]
 use super::storage::ambiguous_database_error;
 use super::{
-    cache::Scope,
+    cache::{PackKey, Scope},
     codec, conflict, corrupt,
     seal::{Binding, FORMAT, Sealed, Unit, role},
-    storage::{ForgeJournalStorage, PackView, database_error},
+    storage::{ForgeJournalStorage, PackView, Staged, database_error, full_bitmap, prefix},
     wire,
 };
-use agent_runtime::core::{error::RuntimeError, journal::*};
-use sqlx::SqliteConnection;
-use std::collections::BTreeSet;
+use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection};
+use std::{collections::BTreeSet, sync::Arc};
 
 impl ForgeJournalStorage {
+    /// Seal a domain-bound metadata unit of `scope`.
     pub(super) async fn seal_row(
         &self,
         scope: &Scope,
@@ -22,16 +23,32 @@ impl ForgeJournalStorage {
         generation: u64,
         raw: Vec<u8>,
     ) -> Result<Sealed, RuntimeError> {
+        self.seal_unit(Some(&scope.0), &scope.1, owner, unit, row, generation, raw)
+            .await
+    }
+    /// Seal a unit; pack units pass no domain (session-scoped AAD).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn seal_unit(
+        &self,
+        domain: Option<&JournalDomain>,
+        session: &SessionId,
+        owner: &str,
+        unit: Unit,
+        row: &[u8],
+        generation: u64,
+        raw: Vec<u8>,
+    ) -> Result<Sealed, RuntimeError> {
         let keys = self.keys.clone();
-        let scope = scope.clone();
+        let domain = domain.cloned();
+        let session = session.clone();
         let owner = owner.to_owned();
         let row = row.to_vec();
         self.work(move || {
             keys.seal(
                 &Binding {
                     unit,
-                    domain: &scope.0,
-                    session: &scope.1,
+                    domain: domain.as_ref(),
+                    session: &session,
                     owner: &owner,
                     row: &row,
                     generation,
@@ -144,24 +161,50 @@ impl ForgeJournalStorage {
         }
         Ok(())
     }
+    /// A new pack held by exactly the writing domain.
     pub(super) async fn insert_pack(
         &self,
         conn: &mut SqliteConnection,
         scope: &Scope,
         owner: &str,
         objects: Vec<JournalStoredObject>,
+        staged: &mut Staged,
+    ) -> Result<i64, RuntimeError> {
+        let count = objects.len();
+        self.insert_session_pack(
+            conn,
+            &scope.1,
+            owner,
+            Arc::new(objects),
+            vec![(scope.0.clone(), full_bitmap(count))],
+            staged,
+        )
+        .await
+    }
+    /// Insert a session-owned pack with each holder domain's own bitmap. A
+    /// holder whose bitmap is empty gets no membership row.
+    pub(super) async fn insert_session_pack(
+        &self,
+        conn: &mut SqliteConnection,
+        session: &SessionId,
+        owner: &str,
+        objects: Arc<Vec<JournalStoredObject>>,
+        holders: Vec<(JournalDomain, Vec<u8>)>,
+        staged: &mut Staged,
     ) -> Result<i64, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("rows.insert_pack", 0);
-        let encoded = self.work(move || codec::encode(&objects)).await?;
+        let encode = objects.clone();
+        let encoded = self.work(move || codec::encode_validated(&encode)).await?;
         // Reserve the AUTOINCREMENT identity inside this transaction; this
         // placeholder is replaced by authenticated units before any commit.
-        let id:i64={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query_scalar("INSERT INTO agent_session_journal_pack (storage_id,role,runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload) VALUES (?,?,?,?,?, ?,?,?,?,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16)) RETURNING pack_id")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(0u64.to_be_bytes().as_slice())
+        let id:i64={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query_scalar("INSERT INTO agent_session_journal_pack (runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload) VALUES (?,?,?, ?,?,?,?,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16)) RETURNING pack_id")
+            .bind(session.as_str()).bind(owner).bind(0u64.to_be_bytes().as_slice())
             .bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(self.keys.revision).bind(FORMAT).fetch_one(&mut *conn).await }.map_err(database_error)?;
         let index = self
-            .seal_row(
-                scope,
+            .seal_unit(
+                None,
+                session,
                 owner,
                 Unit::PackIndex,
                 &id.to_be_bytes(),
@@ -170,8 +213,9 @@ impl ForgeJournalStorage {
             )
             .await?;
         let body = self
-            .seal_row(
-                scope,
+            .seal_unit(
+                None,
+                session,
                 owner,
                 Unit::PackBody,
                 &id.to_be_bytes(),
@@ -181,15 +225,31 @@ impl ForgeJournalStorage {
             .await?;
         { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
             .bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(id).execute(&mut *conn).await }.map_err(database_error)?;
-        let mut bits = vec![255; encoded.count.div_ceil(8)];
-        if encoded.count % 8 != 0 {
-            *bits.last_mut().ok_or_else(corrupt)? = (1 << (encoded.count % 8)) - 1;
+        if holders.iter().all(|(_, bits)| bits.iter().all(|b| *b == 0)) {
+            return Err(corrupt());
         }
-        self.put_bits(conn, scope, owner, id, &bits).await?;
+        for (domain, bits) in holders {
+            super::storage::validate_bitmap(&bits, encoded.count)?;
+            self.put_bits(conn, &(domain, session.clone()), owner, id, &bits)
+                .await?;
+        }
+        staged.written.push((
+            PackKey {
+                session: session.clone(),
+                id,
+                generation: 0,
+                count: encoded.count,
+                retained: encoded.canonical_bytes,
+                owner: owner.to_owned(),
+            },
+            objects,
+        ));
         Ok(id)
     }
-    /// Compare only prefix candidates, including deferred slots. New bodies are
-    /// returned to the caller's staged pack; existing slots regain membership.
+    /// Compare only prefix candidates in every pack of the session, including
+    /// deferred slots and slots only another domain holds. New bodies are
+    /// returned to the caller's staged pack; an identical stored body gains the
+    /// writing domain's bit after a full byte comparison.
     pub(super) async fn admit(
         &self,
         conn: &mut SqliteConnection,
@@ -200,25 +260,26 @@ impl ForgeJournalStorage {
     ) -> Result<Vec<JournalStoredObject>, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("rows.admit", 0);
-        let wanted = objects
+        if views.iter().any(|v| v.index.key.owner != owner) {
+            return Err(RuntimeError::internal("journal pack owner mapping changed"));
+        }
+        let prefixes: Vec<_> = objects.iter().map(|o| prefix(&o.id)).collect();
+        let wanted = prefixes
             .iter()
-            .flat_map(|o| {
+            .flat_map(|p| {
                 views
                     .iter()
-                    .filter(|v| !v.index.directory.candidates(&o.id).is_empty())
+                    .filter(|v| !v.index.directory.prefix_candidates(p).is_empty())
                     .map(|v| v.index.key.id)
             })
             .collect::<BTreeSet<_>>();
         let bodies = self.bodies(conn, views, &wanted, false).await?;
         let mut changed = BTreeSet::new();
         let mut new = Vec::new();
-        for object in objects {
+        for (object, p) in objects.iter().zip(&prefixes) {
             let mut found = false;
             for view in &mut *views {
-                if view.index.key.owner != owner {
-                    return Err(RuntimeError::internal("journal pack owner mapping changed"));
-                }
-                for slot in view.index.directory.candidates(&object.id) {
+                for slot in view.index.directory.prefix_candidates(p) {
                     let old = bodies
                         .get(&view.index.key.id)
                         .and_then(|p| p.get(slot))
@@ -255,6 +316,7 @@ impl ForgeJournalStorage {
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("rows.pin_changes", 0);
+        let mut removals = Vec::new();
         for change in changes {
             let pin = match change {
                 JournalPinChange::Put(p) => &p.pin,
@@ -265,18 +327,64 @@ impl ForgeJournalStorage {
                 .lookup(Unit::Pin, &scope.0, &scope.1, pin.as_str().as_bytes());
             match change {
                 JournalPinChange::Put(pin) => {
+                    // Removals before this Put keep their order.
+                    self.remove_keyed(
+                        conn,
+                        "agent_session_journal_pin",
+                        "pin_key",
+                        scope,
+                        &mut removals,
+                    )
+                    .await?;
                     let sealed = self
                         .seal_row(scope, owner, Unit::Pin, &key, 0, wire::pin_bytes(pin)?)
                         .await?;
                     { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_pin (storage_id,role,runtime_session_id,forge_session_id,pin_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,pin_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
                         .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
                 }
-                JournalPinChange::Remove(_) => {
-                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
-                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await }.map_err(database_error)?;
-                }
+                JournalPinChange::Remove(_) => removals.push(key),
             }
         }
+        self.remove_keyed(
+            conn,
+            "agent_session_journal_pin",
+            "pin_key",
+            scope,
+            &mut removals,
+        )
+        .await
+    }
+    /// One DELETE per chunk of keyed pin/catalog removals in this scope.
+    async fn remove_keyed(
+        &self,
+        conn: &mut SqliteConnection,
+        table: &'static str,
+        column: &'static str,
+        scope: &Scope,
+        keys: &mut Vec<Vec<u8>>,
+    ) -> Result<(), RuntimeError> {
+        for chunk in keys.chunks(400) {
+            let mut q =
+                QueryBuilder::<Sqlite>::new(format!("DELETE FROM {table} WHERE storage_id="));
+            q.push_bind(scope.0.storage_id.as_str())
+                .push(" AND role=")
+                .push_bind(role(&scope.0))
+                .push(" AND runtime_session_id=")
+                .push_bind(scope.1.as_str())
+                .push(format!(" AND {column} IN ("));
+            let mut separated = q.separated(",");
+            for key in chunk {
+                separated.push_bind(key.as_slice());
+            }
+            separated.push_unseparated(")");
+            {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+                q.build().execute(&mut *conn).await
+            }
+            .map_err(database_error)?;
+        }
+        keys.clear();
         Ok(())
     }
     pub(super) async fn catalog_changes(
@@ -288,6 +396,7 @@ impl ForgeJournalStorage {
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("rows.catalog_changes", 0);
+        let mut removals = Vec::new();
         for change in changes {
             let head = match change {
                 JournalCatalogChange::Put(c) => &c.head,
@@ -298,6 +407,14 @@ impl ForgeJournalStorage {
                 .lookup(Unit::Catalog, &scope.0, &scope.1, &head.to_bytes());
             match change {
                 JournalCatalogChange::Put(entry) => {
+                    self.remove_keyed(
+                        conn,
+                        "agent_session_journal_catalog",
+                        "head_key",
+                        scope,
+                        &mut removals,
+                    )
+                    .await?;
                     let sealed = self
                         .seal_row(
                             scope,
@@ -311,13 +428,17 @@ impl ForgeJournalStorage {
                     { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_catalog (storage_id,role,runtime_session_id,forge_session_id,head_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,head_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
                         .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
                 }
-                JournalCatalogChange::Remove(_) => {
-                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_catalog WHERE storage_id=? AND role=? AND runtime_session_id=? AND head_key=?")
-                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await }.map_err(database_error)?;
-                }
+                JournalCatalogChange::Remove(_) => removals.push(key),
             }
         }
-        Ok(())
+        self.remove_keyed(
+            conn,
+            "agent_session_journal_catalog",
+            "head_key",
+            scope,
+            &mut removals,
+        )
+        .await
     }
     #[cfg(feature = "test-support")]
     pub(crate) async fn seed(&self, write: JournalWrite) -> Result<(), RuntimeError> {
@@ -344,8 +465,10 @@ impl ForgeJournalStorage {
         let new = self
             .admit(&mut tx, &scope, &owner, &mut views, &write.objects.objects)
             .await?;
+        let mut staged = Staged::default();
         for pack in codec::split(new)? {
-            self.insert_pack(&mut tx, &scope, &owner, pack).await?;
+            self.insert_pack(&mut tx, &scope, &owner, pack, &mut staged)
+                .await?;
         }
         self.pin_changes(&mut tx, &scope, &owner, &write.pins)
             .await?;
@@ -362,7 +485,7 @@ impl ForgeJournalStorage {
         .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
-            .invalidate(&scope);
+            .invalidate(&scope.1);
         Ok(())
     }
     /// Test-only: open one sealed unit with its real binding, let `mutate`
@@ -397,15 +520,27 @@ impl ForgeJournalStorage {
             db::begin_immediate(self.db.pool()).await
         }
         .map_err(database_error)?;
-        let row = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query(&format!(
-            "SELECT * FROM {table} WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
-        ))
-        .bind(domain.storage_id.as_str())
-        .bind(role(domain))
-        .bind(session.as_str())
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await }
+        // Pack units are session-owned; `domain` selects only operation packs.
+        let scoped = matches!(kind, Unit::Operations);
+        // Unused bind slots compare the domain with itself.
+        let filter = if scoped {
+            "storage_id=?1 AND role=?2 AND runtime_session_id=?3"
+        } else {
+            "?1=?1 AND ?2=?2 AND runtime_session_id=?3"
+        };
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(&format!(
+                "SELECT * FROM {table} WHERE {filter} AND {key}=?4"
+            ))
+            .bind(domain.storage_id.as_str())
+            .bind(role(domain))
+            .bind(session.as_str())
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+        }
         .map_err(database_error)?;
         let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
         let generation = match kind {
@@ -415,7 +550,7 @@ impl ForgeJournalStorage {
         let row_key = id.to_be_bytes();
         let binding = Binding {
             unit: kind,
-            domain,
+            domain: scoped.then_some(domain),
             session,
             owner: &owner,
             row: &row_key,
@@ -435,17 +570,21 @@ impl ForgeJournalStorage {
             plain = zstd::stream::encode_all(plain.as_slice(), 3).map_err(|_| corrupt())?;
         }
         let sealed = self.keys.seal(&binding, &plain)?;
-        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query(&format!(
-            "UPDATE {table} SET {nonce}=?,{payload}=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
-        ))
-        .bind(sealed.nonce)
-        .bind(sealed.payload)
-        .bind(domain.storage_id.as_str())
-        .bind(role(domain))
-        .bind(session.as_str())
-        .bind(id)
-        .execute(&mut *tx)
-        .await }
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(&format!(
+                "UPDATE {table} SET {nonce}=?5,{payload}=?6 WHERE {filter} AND {key}=?4"
+            ))
+            .bind(domain.storage_id.as_str())
+            .bind(role(domain))
+            .bind(session.as_str())
+            .bind(id)
+            .bind(sealed.nonce)
+            .bind(sealed.payload)
+            .execute(&mut *tx)
+            .await
+        }
         .map_err(database_error)?;
         {
             #[cfg(feature = "test-support")]
@@ -455,7 +594,7 @@ impl ForgeJournalStorage {
         .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
-            .invalidate(&scope);
+            .invalidate(&scope.1);
         Ok(())
     }
     /// Test-only generation rewrite, without changing bodies or membership.
@@ -481,8 +620,8 @@ impl ForgeJournalStorage {
                 let generation=key.generation.checked_add(1).ok_or_else(corrupt)?;
                 let objects=bodies.get(&key.id).ok_or_else(corrupt)?.clone();
                 let encoded=self.work(move||codec::encode(&objects)).await?;
-                let index=self.seal_row(&scope,&key.owner,Unit::PackIndex,&key.id.to_be_bytes(),generation,encoded.index).await?;
-                let body=self.seal_row(&scope,&key.owner,Unit::PackBody,&key.id.to_be_bytes(),generation,encoded.body).await?;
+                let index=self.seal_unit(None,&scope.1,&key.owner,Unit::PackIndex,&key.id.to_be_bytes(),generation,encoded.index).await?;
+                let body=self.seal_unit(None,&scope.1,&key.owner,Unit::PackBody,&key.id.to_be_bytes(),generation,encoded.body).await?;
                 { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
                     .bind(generation.to_be_bytes().as_slice()).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).execute(&mut *tx).await }.map_err(database_error)?;
             }
@@ -507,7 +646,7 @@ impl ForgeJournalStorage {
         }
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
-            .invalidate(&scope);
+            .invalidate(&scope.1);
         Ok(())
     }
 }

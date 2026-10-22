@@ -4,24 +4,38 @@ use super::{
     codec, corrupt,
     diagnostics::unreadable,
     seal::role,
-    storage::{ForgeJournalStorage, PackView, ambiguous_database_error, database_error},
+    storage::{
+        ForgeJournalStorage, PackView, Staged, ambiguous_database_error, bit, database_error,
+    },
 };
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use sqlx::SqliteConnection;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    sync::Arc,
     time::Instant,
 };
 
 const SMALL_PACK: usize = 64 * 1024;
 const COMPACT_BUDGET: usize = 8 * 1024 * 1024;
 
-impl PackView {
-    fn fully_live(&self) -> bool {
-        (0..self.index.key.count).all(|s| self.held(s))
-    }
-}
 impl ForgeJournalStorage {
+    /// Apply a committed physical rewrite to the shared cache; on failure the
+    /// whole session is forgotten because the outcome may be ambiguous.
+    pub(super) fn settle_cache(
+        &self,
+        session: &SessionId,
+        staged: Staged,
+        committed: bool,
+    ) -> Result<(), RuntimeError> {
+        let mut cache = self.cache_lock().map_err(RuntimeError::retryable)?;
+        if committed {
+            cache.committed_rewrite(session, &staged.removed, staged.written);
+        } else {
+            cache.invalidate(session);
+        }
+        Ok(())
+    }
     pub(super) fn repacking(&self) -> bool {
         #[cfg(feature = "test-support")]
         {
@@ -50,6 +64,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         selected: &[PackView],
+        staged: &mut Staged,
     ) -> Result<Vec<i64>, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("maintenance.merge_packs", 0);
@@ -62,6 +77,28 @@ impl ForgeJournalStorage {
         }
         let wanted = selected.iter().map(|v| v.index.key.id).collect();
         let bodies = self.bodies(conn, selected, &wanted, false).await?;
+        // Which domains hold each moved body, from each domain's own bits.
+        let mut domains = Vec::<JournalDomain>::new();
+        let mut holders = HashMap::<JournalObjectId, Vec<usize>>::new();
+        for view in selected {
+            let pack = bodies.get(&view.index.key.id).ok_or_else(corrupt)?;
+            for (domain, bits) in std::iter::once((&view.domain, &view.bitmap))
+                .chain(view.others.iter().map(|(d, b)| (d, b)))
+            {
+                let index = match domains.iter().position(|d| d == domain) {
+                    Some(index) => index,
+                    None => {
+                        domains.push(domain.clone());
+                        domains.len() - 1
+                    }
+                };
+                for (slot, object) in pack.iter().enumerate() {
+                    if bit(bits, slot) {
+                        holders.entry(object.id.clone()).or_default().push(index);
+                    }
+                }
+            }
+        }
         let objects: Vec<_> = bodies
             .into_values()
             .flat_map(|p| p.as_ref().clone())
@@ -79,11 +116,34 @@ impl ForgeJournalStorage {
             })
             .await?;
         for view in selected {
-            self.delete_pack(conn, scope, view.index.key.id).await?;
+            self.delete_pack(conn, &scope.1, view.index.key.id, staged)
+                .await?;
         }
         let mut ids = Vec::new();
         for pack in packs {
-            ids.push(self.insert_pack(conn, scope, owner, pack).await?);
+            let mut bitmaps = vec![vec![0u8; pack.len().div_ceil(8)]; domains.len()];
+            for (slot, object) in pack.iter().enumerate() {
+                for &holder in holders.get(&object.id).ok_or_else(corrupt)? {
+                    bitmaps[holder][slot / 8] |= 1 << (slot % 8);
+                }
+            }
+            let pack_holders = domains
+                .iter()
+                .cloned()
+                .zip(bitmaps)
+                .filter(|(_, bits)| bits.iter().any(|b| *b != 0))
+                .collect();
+            ids.push(
+                self.insert_session_pack(
+                    conn,
+                    &scope.1,
+                    owner,
+                    Arc::new(pack),
+                    pack_holders,
+                    staged,
+                )
+                .await?,
+            );
         }
         Ok(ids)
     }
@@ -92,6 +152,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         purged: &BTreeSet<i64>,
+        staged: &mut Staged,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("maintenance.collection_repack", 0);
@@ -109,7 +170,7 @@ impl ForgeJournalStorage {
         if selected.len() > 1 {
             let bytes: usize = selected.iter().map(|v| v.index.key.retained).sum();
             let packs = selected.len();
-            self.merge_packs(conn, scope, &selected).await?;
+            self.merge_packs(conn, scope, &selected, staged).await?;
             tracing::debug!(target:"forge_session_journal",kind="collection_repack",rewritten_packs=packs,rewritten_bytes=bytes,"journal maintenance");
         }
         Ok(())
@@ -137,6 +198,7 @@ impl ForgeJournalStorage {
         let locked = Instant::now();
         let mut rewritten_packs = 0usize;
         let mut rewritten_bytes = 0usize;
+        let mut staged = Staged::default();
         let result = async {
             // Maintenance may not rewrite an unreadable session's packs.
             self.load_on(&mut tx, domain, session).await?;
@@ -164,7 +226,8 @@ impl ForgeJournalStorage {
                 };
                 rewritten_bytes += pair.iter().map(|v| v.index.key.retained).sum::<usize>();
                 rewritten_packs += 2;
-                self.merge_packs(&mut tx, &scope, &pair).await?;
+                self.merge_packs(&mut tx, &scope, &pair, &mut staged)
+                    .await?;
                 views = self.directory(&mut tx, &scope, false).await?;
             }
             Ok::<_, RuntimeError>(())
@@ -190,9 +253,9 @@ impl ForgeJournalStorage {
         };
         #[cfg(feature = "test-support")]
         self.observe_write_hold(locked.elapsed().as_micros() as u64);
-        self.cache_lock()
-            .map_err(RuntimeError::retryable)?
-            .invalidate(&scope);
+        // Unchanged immutable bodies stay cached across S2; merged output is
+        // published, and removed pack ids are forgotten.
+        self.settle_cache(session, staged, result.is_ok())?;
         tracing::debug!(target:"forge_session_journal",kind="post_terminal",duration_us=started.elapsed().as_micros() as u64,lock_hold_us=locked.elapsed().as_micros() as u64,rewritten_packs,rewritten_bytes,success=result.is_ok(),"journal maintenance");
         result
     }
@@ -200,7 +263,8 @@ impl ForgeJournalStorage {
         // Keyset the original scopes; each write transaction touches only one.
         let mut after: Option<String> = None;
         loop {
-            let session: Option<String> = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT runtime_session_id FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT 1")
+            // Sessions in which this domain holds packs; packs are session-owned.
+            let session: Option<String> = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT runtime_session_id FROM agent_session_journal_membership WHERE storage_id=? AND role=? AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT 1")
                 .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&after).bind(&after).fetch_optional(self.db.pool()).await }.map_err(database_error)?;
             let Some(session) = session else {
                 break;
@@ -215,8 +279,8 @@ impl ForgeJournalStorage {
                 Err(error) => return Err(error),
                 Ok(_) => {}
             }
-            let upper: i64 = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT coalesce(max(pack_id),0) FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=?")
-                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&session).fetch_one(self.db.pool()).await }.map_err(database_error)?;
+            let upper: i64 = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT coalesce(max(pack_id),0) FROM agent_session_journal_pack WHERE runtime_session_id=?")
+                .bind(&session).fetch_one(self.db.pool()).await }.map_err(database_error)?;
             let mut cursor = 0;
             while cursor < upper {
                 let started = Instant::now();
@@ -230,6 +294,7 @@ impl ForgeJournalStorage {
                 let locked = Instant::now();
                 let mut bytes = 0;
                 let mut count = 0;
+                let mut staged = Staged::default();
                 let result = async {
                     let views = self.directory(&mut tx, &scope, false).await?;
                     let mut selected = Vec::new();
@@ -249,7 +314,8 @@ impl ForgeJournalStorage {
                     }
                     if selected.len() > 1 {
                         count = selected.len();
-                        self.merge_packs(&mut tx, &scope, &selected).await?;
+                        self.merge_packs(&mut tx, &scope, &selected, &mut staged)
+                            .await?;
                     } else {
                         bytes = 0;
                     }
@@ -276,9 +342,7 @@ impl ForgeJournalStorage {
                 };
                 #[cfg(feature = "test-support")]
                 self.observe_write_hold(locked.elapsed().as_micros() as u64);
-                self.cache_lock()
-                    .map_err(RuntimeError::retryable)?
-                    .invalidate(&scope);
+                self.settle_cache(&scope.1, staged, result.is_ok())?;
                 tracing::debug!(target:"forge_session_journal",kind="compact",duration_us=started.elapsed().as_micros() as u64,lock_hold_us=locked.elapsed().as_micros() as u64,rewritten_packs=count,rewritten_bytes=bytes,success=result.is_ok(),"journal maintenance");
                 match result {
                     Err(error) if unreadable(&error) => {

@@ -16,12 +16,28 @@ use std::{
 };
 
 /// Counts cover readable sessions only; skipped sessions have unknown sizes.
+/// Packs are shared by a session's domains: retained bytes cover every pack
+/// of each session the domain participates in, live bytes the slots some
+/// domain holds and deferred bytes the slots no domain holds. The protected
+/// and ordinary values of one session therefore overlap and are not additive.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct JournalByteStats {
     pub retained_bytes: u64,
     pub live_bytes: u64,
     pub deferred_bytes: u64,
     pub skipped_sessions: usize,
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>, RuntimeError> {
+    if hex.len() % 2 != 0 {
+        return Err(corrupt());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(hex.get(i..i + 2).ok_or_else(corrupt)?, 16).map_err(|_| corrupt())
+        })
+        .collect()
 }
 
 pub(super) fn unreadable(error: &RuntimeError) -> bool {
@@ -109,14 +125,21 @@ impl ForgeJournalStorage {
         let mut after: Option<String> = None;
         let mut total = JournalByteStats::default();
         loop {
+            // The trait's sharing scopes: sessions with this domain's record
+            // or membership. Orphaned packs (deleted owner or no holder) belong
+            // to no domain any more; they stay visible here until the deletion
+            // drain removes them, so no physical byte silently disappears.
             let sessions: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT runtime_session_id FROM agent_session_journal_pack
-                 WHERE storage_id=? AND role=? AND (? IS NULL OR runtime_session_id>?)
+                "SELECT runtime_session_id FROM agent_session_journal_session
+                 WHERE storage_id=?1 AND role=?2 AND (?3 IS NULL OR runtime_session_id>?3)
+                 UNION SELECT runtime_session_id FROM agent_session_journal_membership
+                 WHERE storage_id=?1 AND role=?2 AND (?3 IS NULL OR runtime_session_id>?3)
+                 UNION SELECT runtime_session_id FROM agent_session_journal_pack
+                 WHERE orphaned=1 AND (?3 IS NULL OR runtime_session_id>?3)
                  ORDER BY runtime_session_id LIMIT 128",
             )
             .bind(domain.storage_id.as_str())
             .bind(role(domain))
-            .bind(&after)
             .bind(&after)
             .fetch_all(&mut *tx)
             .await
@@ -182,16 +205,17 @@ impl ForgeJournalStorage {
         let mut after = 0i64;
         let mut stats = JournalByteStats::default();
         loop {
+            // Union of every domain's bitmap: a slot is live if any domain
+            // of the session holds it.
             let rows = sqlx::query(
                 "SELECT p.pack_id,p.forge_session_id,p.generation,p.object_count,
-                        p.retained_canonical_bytes,p.key_revision,p.format,p.index_nonce,p.index_payload,m.bitmap
+                        p.retained_canonical_bytes,p.key_revision,p.format,p.index_nonce,p.index_payload,
+                        (SELECT group_concat(hex(m.bitmap)) FROM agent_session_journal_membership m
+                         WHERE m.pack_id=p.pack_id) AS bitmaps
                  FROM agent_session_journal_pack p
-                 LEFT JOIN agent_session_journal_membership m ON m.pack_id=p.pack_id
-                 WHERE p.storage_id=? AND p.role=? AND p.runtime_session_id=? AND p.pack_id>?
+                 WHERE p.runtime_session_id=? AND p.pack_id>?
                  ORDER BY p.pack_id LIMIT 400",
             )
-            .bind(domain.storage_id.as_str())
-            .bind(role(domain))
             .bind(session.as_str())
             .bind(after)
             .fetch_all(&mut *conn)
@@ -205,7 +229,6 @@ impl ForgeJournalStorage {
             }
             let decodes = rows.len() as u64;
             let keys = self.keys.clone();
-            let domain = domain.clone();
             let session = session.clone();
             let (last, retained, live) = self
                 .work(move || {
@@ -228,7 +251,7 @@ impl ForgeJournalStorage {
                         let raw = keys.open(
                             &Binding {
                                 unit: Unit::PackIndex,
-                                domain: &domain,
+                                domain: None,
                                 session: &session,
                                 owner: &owner,
                                 row: &id.to_be_bytes(),
@@ -241,16 +264,21 @@ impl ForgeJournalStorage {
                             codec::MAX_INDEX_BYTES,
                         )?;
                         let directory = codec::decode_index(&raw, count, retained)?;
-                        let bitmap: Option<Vec<u8>> =
-                            row.try_get("bitmap").map_err(|_| corrupt())?;
-                        if let Some(bitmap) = bitmap {
+                        let bitmaps: Option<String> =
+                            row.try_get("bitmaps").map_err(|_| corrupt())?;
+                        let mut union = vec![0u8; count.div_ceil(8)];
+                        for hex in bitmaps.iter().flat_map(|b| b.split(',')) {
+                            let bitmap = decode_hex(hex)?;
                             validate_bitmap(&bitmap, count)?;
-                            for (slot, entry) in directory.slots.iter().enumerate() {
-                                if bitmap[slot / 8] & (1 << (slot % 8)) != 0 {
-                                    live_total = live_total
-                                        .checked_add(entry.len as u64)
-                                        .ok_or_else(corrupt)?;
-                                }
+                            for (out, bits) in union.iter_mut().zip(&bitmap) {
+                                *out |= bits;
+                            }
+                        }
+                        for (slot, entry) in directory.slots.iter().enumerate() {
+                            if union[slot / 8] & (1 << (slot % 8)) != 0 {
+                                live_total = live_total
+                                    .checked_add(entry.len as u64)
+                                    .ok_or_else(corrupt)?;
                             }
                         }
                         retained_total = retained_total

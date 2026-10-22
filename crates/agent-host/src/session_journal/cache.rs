@@ -1,17 +1,20 @@
-//! One charged LRU for scoped index directories and decoded body packs.
+//! One charged LRU for session index directories and decoded body packs.
+//! Packs belong to a runtime session and are shared by its domains, so both
+//! cache keys are session-scoped; membership is never cached.
 use super::codec::Directory;
 use agent_runtime::core::{ids::SessionId, journal::*};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
+/// One domain of one runtime session: the unit of membership and metadata.
 pub(super) type Scope = (JournalDomain, SessionId);
 pub(super) const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct PackKey {
-    pub scope: Scope,
+    pub session: SessionId,
     pub id: i64,
     pub generation: u64,
     pub count: usize,
@@ -33,10 +36,7 @@ impl ScopeDirectory {
             .values()
             .map(|p| {
                 // Include retained prefix slots, BTree nodes, keys and scope strings.
-                256 + p.key.owner.capacity()
-                    + p.key.scope.0.storage_id.as_str().len()
-                    + p.key.scope.1.as_str().len()
-                    + p.directory.charge()
+                256 + p.key.owner.capacity() + p.key.session.as_str().len() + p.directory.charge()
             })
             .sum::<usize>()
             + 128
@@ -44,7 +44,7 @@ impl ScopeDirectory {
 }
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Key {
-    Directory(Scope),
+    Directory(SessionId),
     Body(PackKey),
 }
 #[derive(Clone)]
@@ -138,16 +138,15 @@ impl Cache {
             .map(|(_, entry)| entry.charge)
             .sum()
     }
-    pub fn directory(&mut self, scope: &Scope) -> Option<Arc<ScopeDirectory>> {
-        match self.get(&Key::Directory(scope.clone())) {
+    pub fn directory(&mut self, session: &SessionId) -> Option<Arc<ScopeDirectory>> {
+        match self.get(&Key::Directory(session.clone())) {
             Some(Value::Directory(v)) => Some(v),
             _ => None,
         }
     }
-    pub fn put_directory(&mut self, scope: Scope, value: Arc<ScopeDirectory>) {
-        let charge =
-            value.charge() + scope.0.storage_id.as_str().len() + scope.1.as_str().len() + 128;
-        self.put(Key::Directory(scope), Value::Directory(value), charge);
+    pub fn put_directory(&mut self, session: SessionId, value: Arc<ScopeDirectory>) {
+        let charge = value.charge() + session.as_str().len() + 128;
+        self.put(Key::Directory(session), Value::Directory(value), charge);
     }
     pub fn body(&mut self, key: &PackKey) -> Option<Arc<Vec<JournalStoredObject>>> {
         match self.get(&Key::Body(key.clone())) {
@@ -158,17 +157,41 @@ impl Cache {
     pub fn put_body(&mut self, key: PackKey, value: Arc<Vec<JournalStoredObject>>) {
         let charge = 256
             + key.owner.capacity()
-            + key.scope.0.storage_id.as_str().len()
-            + key.scope.1.as_str().len()
+            + key.session.as_str().len()
             + value.capacity() * std::mem::size_of::<JournalStoredObject>()
             + value.iter().map(|o| o.bytes.len() + 128).sum::<usize>();
         self.put(Key::Body(key), Value::Body(value), charge);
     }
-    pub fn invalidate(&mut self, scope: &Scope) {
+    /// After a successful physical rewrite: forget the session directory and
+    /// the bodies of removed packs, publish the bodies written by that
+    /// transaction, and keep every other immutable body. Body keys carry pack
+    /// id and generation, and pack ids are never reused, so a surviving entry
+    /// still describes exactly the sealed units it was decoded from.
+    pub fn committed_rewrite(
+        &mut self,
+        session: &SessionId,
+        removed: &BTreeSet<i64>,
+        written: Vec<(PackKey, Arc<Vec<JournalStoredObject>>)>,
+    ) {
         self.entries.retain(|key, entry| {
             let remove = match key {
-                Key::Directory(s) => s == scope,
-                Key::Body(p) => &p.scope == scope,
+                Key::Directory(s) => s == session,
+                Key::Body(p) => &p.session == session && removed.contains(&p.id),
+            };
+            if remove {
+                self.charge -= entry.charge;
+            }
+            !remove
+        });
+        for (key, body) in written {
+            self.put_body(key, body);
+        }
+    }
+    pub fn invalidate(&mut self, session: &SessionId) {
+        self.entries.retain(|key, entry| {
+            let remove = match key {
+                Key::Directory(s) => s == session,
+                Key::Body(p) => &p.session == session,
             };
             if remove {
                 self.charge -= entry.charge;

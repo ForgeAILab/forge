@@ -1,42 +1,78 @@
 //! Membership release and mandatory physical-copy receipt accounting.
 use super::{
-    cache::Scope,
+    cache::{PackKey, Scope},
     codec, corrupt,
-    seal::{Unit, role},
-    storage::{ForgeJournalStorage, PackView, database_error},
+    seal::Unit,
+    storage::{ForgeJournalStorage, PackView, Staged, bit, database_error, prefix},
 };
-use agent_runtime::core::{error::RuntimeError, journal::*};
+use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use sqlx::SqliteConnection;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
+
+/// Each holder domain's bits for the kept slots, from its own previous bits.
+/// A rewrite never grants a domain a slot it did not hold.
+pub(super) fn remap(view: &PackView, kept: &[usize]) -> Vec<(JournalDomain, Vec<u8>)> {
+    std::iter::once((&view.domain, &view.bitmap))
+        .chain(view.others.iter().map(|(d, bits)| (d, bits)))
+        .map(|(domain, bits)| {
+            let mut next = vec![0; kept.len().div_ceil(8)];
+            for (slot, &old) in kept.iter().enumerate() {
+                if bit(bits, old) {
+                    next[slot / 8] |= 1 << (slot % 8);
+                }
+            }
+            (domain.clone(), next)
+        })
+        .collect()
+}
 
 impl ForgeJournalStorage {
     pub(super) async fn delete_pack(
         &self,
         conn: &mut SqliteConnection,
-        scope: &Scope,
+        session: &SessionId,
         id: i64,
+        staged: &mut Staged,
     ) -> Result<(), RuntimeError> {
-        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_pack WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
+        // Membership rows of every domain cascade with the pack row.
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query(
+                "DELETE FROM agent_session_journal_pack WHERE pack_id=? AND runtime_session_id=?",
+            )
+            .bind(id)
+            .bind(session.as_str())
+            .execute(&mut *conn)
+            .await
+        }
+        .map_err(database_error)?;
+        staged.removed.insert(id);
         Ok(())
     }
     /// A purge keeps its monotonic identity and advances the pack generation.
-    /// All output slots are live; their sorted-id order defines the new bitmap.
+    /// Output slots are the kept (live) slots in sorted-id order; every holder
+    /// domain's bitmap is remapped from its own bits.
     async fn rewrite_live_pack(
         &self,
         conn: &mut SqliteConnection,
-        scope: &Scope,
+        session: &SessionId,
         view: &PackView,
         objects: Vec<JournalStoredObject>,
+        holders: Vec<(JournalDomain, Vec<u8>)>,
+        staged: &mut Staged,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("release.rewrite_live_pack", 0);
-        let encoded = self.work(move || codec::encode(&objects)).await?;
+        let objects = Arc::new(objects);
+        let encode = objects.clone();
+        let encoded = self.work(move || codec::encode_validated(&encode)).await?;
         let key = &view.index.key;
         let generation = key.generation.checked_add(1).ok_or_else(corrupt)?;
         let index = self
-            .seal_row(
-                scope,
+            .seal_unit(
+                None,
+                session,
                 &key.owner,
                 Unit::PackIndex,
                 &key.id.to_be_bytes(),
@@ -45,8 +81,9 @@ impl ForgeJournalStorage {
             )
             .await?;
         let body = self
-            .seal_row(
-                scope,
+            .seal_unit(
+                None,
+                session,
                 &key.owner,
                 Unit::PackBody,
                 &key.id.to_be_bytes(),
@@ -54,14 +91,28 @@ impl ForgeJournalStorage {
                 encoded.body,
             )
             .await?;
-        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,object_count=?,retained_canonical_bytes=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(generation.to_be_bytes().as_slice()).bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
-        let mut bits = vec![255; encoded.count.div_ceil(8)];
-        if encoded.count % 8 != 0 {
-            *bits.last_mut().ok_or_else(corrupt)? = (1 << (encoded.count % 8)) - 1;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,object_count=?,retained_canonical_bytes=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=? AND runtime_session_id=?")
+            .bind(generation.to_be_bytes().as_slice()).bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).bind(session.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
+        for (domain, bits) in holders {
+            super::storage::validate_bitmap(&bits, encoded.count)?;
+            self.put_bits(conn, &(domain, session.clone()), &key.owner, key.id, &bits)
+                .await?;
         }
-        self.put_bits(conn, scope, &key.owner, key.id, &bits).await
+        staged.removed.insert(key.id);
+        staged.written.push((
+            PackKey {
+                session: session.clone(),
+                id: key.id,
+                generation,
+                count: encoded.count,
+                retained: encoded.canonical_bytes,
+                owner: key.owner.clone(),
+            },
+            objects,
+        ));
+        Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn release_objects(
         &self,
         conn: &mut SqliteConnection,
@@ -70,15 +121,18 @@ impl ForgeJournalStorage {
         views: &mut [PackView],
         release: &[JournalObjectId],
         retired_collection: bool,
+        staged: &mut Staged,
     ) -> Result<(JournalApplyReceipt, BTreeSet<i64>), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("release.release_objects", 0);
         let ids: BTreeSet<_> = release.iter().collect();
+        let prefixes: BTreeSet<_> = ids.iter().map(|id| prefix(id)).collect();
         let wanted: BTreeSet<_> = views
             .iter()
             .filter(|v| {
-                ids.iter()
-                    .any(|id| v.index.directory.candidates(id).any(|s| v.held(s)))
+                prefixes
+                    .iter()
+                    .any(|p| v.index.directory.prefix_candidates(p).any(|s| v.held(s)))
             })
             .map(|v| v.index.key.id)
             .collect();
@@ -98,6 +152,8 @@ impl ForgeJournalStorage {
                 }
             }
         }
+        // The writing domain holds nothing left in this session: purge every
+        // slot no domain holds. Slots another domain holds stay untouched.
         let empty = views.iter().all(|v| v.bitmap.iter().all(|b| *b == 0));
         let mut purge = BTreeSet::new();
         for view in &*views {
@@ -110,7 +166,7 @@ impl ForgeJournalStorage {
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(s, _)| !view.held(*s))
+                .filter(|(s, _)| !view.live(*s))
                 .map(|(_, s)| s.len)
                 .sum();
             if dead != 0
@@ -132,9 +188,11 @@ impl ForgeJournalStorage {
         for view in views.iter().filter(|v| purge.contains(&v.index.key.id)) {
             let objects = bodies.get(&view.index.key.id).ok_or_else(corrupt)?;
             let mut live = Vec::new();
+            let mut kept = Vec::new();
             for (slot, object) in objects.iter().enumerate() {
-                if view.held(slot) {
+                if view.live(slot) {
                     live.push(object.clone());
+                    kept.push(slot);
                 } else {
                     receipt.reclaimed_objects = receipt
                         .reclaimed_objects
@@ -147,9 +205,12 @@ impl ForgeJournalStorage {
                 }
             }
             if live.is_empty() {
-                self.delete_pack(conn, scope, view.index.key.id).await?;
+                self.delete_pack(conn, &scope.1, view.index.key.id, staged)
+                    .await?;
             } else {
-                self.rewrite_live_pack(conn, scope, view, live).await?;
+                let holders = remap(view, &kept);
+                self.rewrite_live_pack(conn, &scope.1, view, live, holders, staged)
+                    .await?;
                 survivors.insert(view.index.key.id);
             }
         }
@@ -198,29 +259,26 @@ impl ForgeJournalStorage {
         if objects.iter().any(|o| o.id == object.id) {
             return Err(corrupt());
         }
-        let dead = object.id.clone();
+        let old_ids: Vec<_> = objects.iter().map(|o| o.id.clone()).collect();
         objects.push(object);
         objects.sort_by(|a, b| a.id.cmp(&b.id));
-        let slot = objects
-            .iter()
-            .position(|o| o.id == dead)
-            .ok_or_else(corrupt)?;
-        let count = objects.len();
-        self.rewrite_live_pack(&mut tx, &scope, view, objects)
+        // Every holder keeps exactly its previous slots; the new slot is dead.
+        let holders = std::iter::once((view.domain.clone(), view.bitmap.clone()))
+            .chain(view.others.iter().cloned())
+            .map(|(domain, bits)| {
+                let mut next = vec![0; objects.len().div_ceil(8)];
+                for (old, id) in old_ids.iter().enumerate() {
+                    if super::storage::bit(&bits, old) {
+                        let slot = objects.iter().position(|o| &o.id == id).unwrap_or(0);
+                        next[slot / 8] |= 1 << (slot % 8);
+                    }
+                }
+                (domain, next)
+            })
+            .collect();
+        let mut staged = Staged::default();
+        self.rewrite_live_pack(&mut tx, &scope.1, view, objects, holders, &mut staged)
             .await?;
-        let mut bitmap = vec![255; count.div_ceil(8)];
-        if count % 8 != 0 {
-            *bitmap.last_mut().ok_or_else(corrupt)? = (1 << (count % 8)) - 1;
-        }
-        bitmap[slot / 8] &= !(1 << (slot % 8));
-        self.put_bits(
-            &mut tx,
-            &scope,
-            &view.index.key.owner,
-            view.index.key.id,
-            &bitmap,
-        )
-        .await?;
         {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
@@ -229,7 +287,7 @@ impl ForgeJournalStorage {
         .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
-            .invalidate(&scope);
+            .invalidate(&scope.1);
         Ok(bytes as u64)
     }
 }

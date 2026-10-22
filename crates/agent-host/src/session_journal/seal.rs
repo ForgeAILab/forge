@@ -13,14 +13,16 @@ use super::corrupt;
 pub(super) const FORMAT: i64 = 1;
 const ENVELOPE: &[u8] = b"FORGE-JOURNAL\0\x01";
 
-#[derive(Clone, Copy)]
+/// Codes 4 and 5 belonged to the superseded domain-owned pack units and are
+/// never reused: a session-scoped pack unit cannot alias a domain-bound one.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Unit {
     Session = 1,
     Pin = 2,
     Catalog = 3,
-    PackIndex = 4,
-    PackBody = 5,
     Operations = 6,
+    PackIndex = 7,
+    PackBody = 8,
 }
 impl Unit {
     fn table(self) -> &'static [u8] {
@@ -28,17 +30,22 @@ impl Unit {
             Self::Session => b"session",
             Self::Pin => b"pin",
             Self::Catalog => b"catalog",
-            Self::PackIndex | Self::PackBody => b"pack",
+            Self::PackIndex | Self::PackBody => b"session_pack",
             Self::Operations => b"operation_pack",
         }
+    }
+    /// Body packs belong to a runtime session and are shared by its domains.
+    fn session_scoped(self) -> bool {
+        matches!(self, Self::PackIndex | Self::PackBody)
     }
 }
 
 /// Every field is length-delimited or fixed width. Owner binds the host mapping
-/// too, so a row cannot be relabeled to a different Forge session.
+/// too, so a row cannot be relabeled to a different Forge session. Metadata
+/// units bind their domain; pack units are session-scoped and carry `None`.
 pub(super) struct Binding<'a> {
     pub unit: Unit,
-    pub domain: &'a JournalDomain,
+    pub domain: Option<&'a JournalDomain>,
     pub session: &'a SessionId,
     pub owner: &'a str,
     pub row: &'a [u8],
@@ -90,19 +97,26 @@ impl Keys {
         })
     }
 
-    fn aad(&self, binding: &Binding<'_>) -> Vec<u8> {
+    fn aad(&self, binding: &Binding<'_>) -> Result<Vec<u8>, RuntimeError> {
         let mut out = ENVELOPE.to_vec();
         out.extend_from_slice(&(FORMAT as u32).to_be_bytes());
         out.extend_from_slice(&(self.revision as u64).to_be_bytes());
         field(&mut out, binding.unit.table());
         out.push(binding.unit as u8);
-        field(&mut out, binding.domain.storage_id.as_str().as_bytes());
-        field(&mut out, role(binding.domain).as_bytes());
+        match (binding.unit.session_scoped(), binding.domain) {
+            (false, Some(domain)) => {
+                field(&mut out, domain.storage_id.as_str().as_bytes());
+                field(&mut out, role(domain).as_bytes());
+            }
+            // A fixed scope marker replaces the two domain fields.
+            (true, None) => field(&mut out, b"runtime-session"),
+            _ => return Err(corrupt()),
+        }
         field(&mut out, binding.session.as_str().as_bytes());
         field(&mut out, binding.owner.as_bytes());
         field(&mut out, binding.row);
         out.extend_from_slice(&binding.generation.to_be_bytes());
-        out
+        Ok(out)
     }
 
     pub fn seal(&self, binding: &Binding<'_>, bytes: &[u8]) -> Result<Sealed, RuntimeError> {
@@ -113,7 +127,7 @@ impl Keys {
         );
         let mut nonce = vec![0; 24];
         OsRng.fill_bytes(&mut nonce);
-        let aad = self.aad(binding);
+        let aad = self.aad(binding)?;
         let ciphertext = self
             .cipher
             .encrypt(
@@ -148,7 +162,7 @@ impl Keys {
         {
             return Err(corrupt());
         }
-        let aad = self.aad(binding);
+        let aad = self.aad(binding)?;
         self.cipher
             .decrypt(
                 XNonce::from_slice(nonce),
@@ -195,9 +209,10 @@ mod tests {
         };
         let session = SessionId::from("session");
         let row = 42u64.to_be_bytes();
+        // Metadata units stay domain-bound: every domain field is authenticated.
         let binding = Binding {
-            unit: Unit::PackIndex,
-            domain: &domain,
+            unit: Unit::Session,
+            domain: Some(&domain),
             session: &session,
             owner: "owner",
             row: &row,
@@ -232,15 +247,21 @@ mod tests {
         let other_session = SessionId::from("other");
         for swapped in [
             Binding {
-                unit: Unit::PackBody,
+                unit: Unit::Pin,
                 ..binding
             },
             Binding {
-                domain: &other,
+                domain: Some(&other),
                 ..binding
             },
             Binding {
-                domain: &other_role,
+                domain: Some(&other_role),
+                ..binding
+            },
+            // A domain-bound unit can never be opened as a session-scoped one.
+            Binding {
+                unit: Unit::PackIndex,
+                domain: None,
                 ..binding
             },
             Binding {
@@ -276,6 +297,86 @@ mod tests {
     }
 
     #[test]
+    fn session_pack_units_bind_session_owner_row_and_generation_not_domain() {
+        let keys = Keys::new(&[7; 32], 1).unwrap();
+        let domain = JournalDomain {
+            storage_id: JournalStorageId::new("protected"),
+            role: JournalRole::Protected,
+        };
+        let session = SessionId::from("session");
+        let other_session = SessionId::from("other");
+        let row = 42u64.to_be_bytes();
+        let binding = Binding {
+            unit: Unit::PackIndex,
+            domain: None,
+            session: &session,
+            owner: "owner",
+            row: &row,
+            generation: 1,
+        };
+        let sealed = keys.seal(&binding, b"secret").unwrap();
+        assert_eq!(
+            keys.open(&binding, &sealed.nonce, &sealed.payload, 6)
+                .unwrap(),
+            b"secret"
+        );
+        for swapped in [
+            Binding {
+                unit: Unit::PackBody,
+                ..binding
+            },
+            Binding {
+                session: &other_session,
+                ..binding
+            },
+            Binding {
+                owner: "another",
+                ..binding
+            },
+            Binding {
+                row: &43u64.to_be_bytes(),
+                ..binding
+            },
+            Binding {
+                generation: 2,
+                ..binding
+            },
+            // Domain-bound shapes cannot open, or be sealed as, pack units.
+            Binding {
+                unit: Unit::Session,
+                domain: Some(&domain),
+                ..binding
+            },
+        ] {
+            assert!(
+                keys.open(&swapped, &sealed.nonce, &sealed.payload, 6)
+                    .is_err()
+            );
+        }
+        assert!(
+            keys.seal(
+                &Binding {
+                    domain: Some(&domain),
+                    ..binding
+                },
+                b"secret"
+            )
+            .is_err()
+        );
+        assert!(
+            keys.seal(
+                &Binding {
+                    unit: Unit::Session,
+                    domain: None,
+                    ..binding
+                },
+                b"secret"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn metadata_units_and_keyed_lookups_are_separated_and_opaque() {
         let keys = Keys::new(&[7; 32], 1).unwrap();
         let domain = JournalDomain {
@@ -305,7 +406,7 @@ mod tests {
         ] {
             let b = Binding {
                 unit,
-                domain: &domain,
+                domain: (!unit.session_scoped()).then_some(&domain),
                 session: &session,
                 owner: "o",
                 row: &pin,
@@ -322,10 +423,6 @@ mod tests {
     #[test]
     fn sealed_pack_contains_no_clear_ids_or_prefixes() {
         let keys = Keys::new(&[7; 32], 1).unwrap();
-        let domain = JournalDomain {
-            storage_id: JournalStorageId::new("d"),
-            role: JournalRole::Protected,
-        };
         let session = SessionId::from("s");
         let mut objects: Vec<_> = [42269, 139372]
             .into_iter()
@@ -343,7 +440,7 @@ mod tests {
         for (unit, raw) in [(Unit::PackIndex, &pack.index), (Unit::PackBody, &pack.body)] {
             let b = Binding {
                 unit,
-                domain: &domain,
+                domain: None,
                 session: &session,
                 owner: "o",
                 row: &1u64.to_be_bytes(),

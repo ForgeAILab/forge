@@ -341,13 +341,18 @@ fn receipt_json(native: &Native) -> Value {
     let r = native.meter.receipt.lock().unwrap();
     json!({"reclaimed_objects":r.reclaimed_objects,"reclaimed_bytes":r.reclaimed_bytes})
 }
+/// Physical retained canonical bytes of the measured session. Packs are
+/// session-owned and shared by both domains, and each domain's diagnostic
+/// covers every pack of the sessions it participates in, so the per-domain
+/// values overlap: both domains participate in the one fixture session.
 fn retained(stats: &Value) -> u64 {
     stats
         .as_array()
         .unwrap()
         .iter()
         .map(|s| s["retained"].as_u64().unwrap())
-        .sum()
+        .max()
+        .unwrap_or(0)
 }
 async fn byte_stats(native: &Native) -> Value {
     let mut stats = vec![];
@@ -683,7 +688,7 @@ fn output() -> PathBuf {
 fn markdown(rows: &[Value]) -> String {
     use std::fmt::Write;
     let mut out = String::from(
-        "Forge production sqlx / real AEAD / independent domain copies. All physical bytes subtract the same full-schema/session baseline after checkpoint/VACUUM; file equals dbstat plus verified pointer-map pages. B and C use per-turn S2/collection plus final sweep.\n\n| Fixture | N | Turn | L1 | Actual L2 | Before final collect | After collect | After/L2 | Retired | Actual old+new | Pack writes | Max collect write |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "Forge production sqlx / real AEAD / within-session domain sharing. All physical bytes subtract the same full-schema/session baseline after checkpoint/VACUUM; file equals dbstat plus verified pointer-map pages. B and C use per-turn S2/collection plus final sweep.\n\n| Fixture | N | Turn | L1 | Actual L2 | Before final collect | After collect | After/L2 | Retired | Actual old+new | Pack writes | Max collect write |\n| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     for r in rows {
         writeln!(
@@ -863,7 +868,15 @@ async fn scoped_and_dirty() -> Value {
     assert_eq!(raw.cache_stats().unwrap().index_decodes, 0);
     assert_eq!(raw.cache_stats().unwrap().body_decodes, 0);
     let domain = native.domains()[1].1.clone();
-    let own_packs=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM agent_session_journal_pack WHERE storage_id=? AND runtime_session_id=?").bind(domain.storage_id.as_str()).bind(id.as_str()).fetch_one(file.database().pool()).await.unwrap() as u64;
+    // Packs are session-owned and shared by both domains: hydration decodes
+    // exactly the target session's indexes, never an unrelated session's.
+    let own_packs = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM agent_session_journal_pack WHERE runtime_session_id=?",
+    )
+    .bind(id.as_str())
+    .fetch_one(file.database().pool())
+    .await
+    .unwrap() as u64;
     let all_packs = scalar(
         file.database().pool(),
         "SELECT count(*) FROM agent_session_journal_pack",

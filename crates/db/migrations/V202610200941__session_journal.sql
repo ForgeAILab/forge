@@ -65,10 +65,10 @@ CREATE INDEX idx_session_journal_catalog_forge ON agent_session_journal_catalog(
 
 -- Owner labels deliberately have NO foreign key to agent_session or the
 -- journal session. Cascades unlink memberships; bounded cleanup drains packs.
+-- A pack belongs to one runtime session; each of its domains holds its own
+-- membership bitmap, so identical bodies are stored once per session.
 CREATE TABLE agent_session_journal_pack (
     pack_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    storage_id TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('protected', 'ordinary')),
     runtime_session_id TEXT NOT NULL,
     forge_session_id TEXT NOT NULL,
     generation BLOB NOT NULL CHECK (typeof(generation) = 'blob' AND length(generation) = 8),
@@ -80,10 +80,10 @@ CREATE TABLE agent_session_journal_pack (
     index_payload BLOB NOT NULL CHECK (typeof(index_payload) = 'blob' AND length(index_payload) >= 16),
     body_nonce BLOB NOT NULL CHECK (typeof(body_nonce) = 'blob' AND length(body_nonce) = 24),
     body_payload BLOB NOT NULL CHECK (typeof(body_payload) = 'blob' AND length(body_payload) >= 16),
-    UNIQUE (pack_id, storage_id, role, runtime_session_id, forge_session_id)
+    UNIQUE (pack_id, runtime_session_id, forge_session_id)
 );
 CREATE INDEX idx_session_journal_pack_scope
-    ON agent_session_journal_pack(storage_id, role, runtime_session_id, pack_id);
+    ON agent_session_journal_pack(runtime_session_id, pack_id);
 CREATE INDEX idx_session_journal_pack_forge ON agent_session_journal_pack(forge_session_id, pack_id);
 
 CREATE TABLE agent_session_journal_membership (
@@ -97,12 +97,14 @@ CREATE TABLE agent_session_journal_membership (
     FOREIGN KEY (storage_id, role, runtime_session_id, forge_session_id)
         REFERENCES agent_session_journal_session
             (storage_id, role, runtime_session_id, forge_session_id) ON DELETE CASCADE,
-    FOREIGN KEY (pack_id, storage_id, role, runtime_session_id, forge_session_id)
+    FOREIGN KEY (pack_id, runtime_session_id, forge_session_id)
         REFERENCES agent_session_journal_pack
-            (pack_id, storage_id, role, runtime_session_id, forge_session_id) ON DELETE CASCADE
+            (pack_id, runtime_session_id, forge_session_id) ON DELETE CASCADE
 ) WITHOUT ROWID;
 CREATE INDEX idx_session_journal_membership_forge ON agent_session_journal_membership(forge_session_id);
 CREATE INDEX idx_session_journal_membership_pack ON agent_session_journal_membership(pack_id);
+CREATE INDEX idx_session_journal_membership_session
+    ON agent_session_journal_membership(runtime_session_id, pack_id);
 -- Bitmap length/slot count consistency is checked by storage on every read/write.
 
 CREATE TABLE agent_session_journal_operation_pack (

@@ -1028,8 +1028,15 @@ async fn dirty_corruption_does_not_block_shared_collector() {
                 .iter()
                 .map(|c| format!("quote(\"{}\")", c.get::<String, _>("name")))
                 .collect();
+            // Packs are session-owned (no domain column); the session's image
+            // then also covers packs shared with the other domain.
+            let filter = if suffix == "pack" {
+                "?1=?1 AND runtime_session_id=?2"
+            } else {
+                "storage_id=?1 AND runtime_session_id=?2"
+            };
             let rows = sqlx::query(&format!(
-                "SELECT {} FROM {table} WHERE storage_id=? AND runtime_session_id=? ORDER BY 1,2,3",
+                "SELECT {} FROM {table} WHERE {filter} ORDER BY 1,2,3",
                 fields.join(",")
             ))
             .bind(domain.storage_id.as_str())
@@ -1077,8 +1084,9 @@ async fn dirty_corruption_does_not_block_shared_collector() {
         storage_id: journal.storage_id(),
         role: JournalRole::Ordinary,
     };
-    let before: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack WHERE storage_id=? GROUP BY runtime_session_id ORDER BY runtime_session_id")
-        .bind(domain.storage_id.as_str()).fetch_all(f.database().pool()).await.unwrap();
+    // Packs are session-owned and shared by both domains of a session.
+    let before: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack GROUP BY runtime_session_id ORDER BY runtime_session_id")
+        .fetch_all(f.database().pool()).await.unwrap();
     sqlx::query("UPDATE agent_session_journal_session SET payload=zeroblob(length(payload)) WHERE storage_id=? AND runtime_session_id=?")
         .bind(domain.storage_id.as_str()).bind(ids[1].as_str()).execute(f.database().pool()).await.unwrap();
     let corrupt_image = scope_image(&f, &domain, &ids[1]).await;
@@ -1113,8 +1121,8 @@ async fn dirty_corruption_does_not_block_shared_collector() {
             assert!(report.reclaimed_bytes > 0);
         }
     }
-    let after: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack WHERE storage_id=? GROUP BY runtime_session_id ORDER BY runtime_session_id")
-        .bind(domain.storage_id.as_str()).fetch_all(f.database().pool()).await.unwrap();
+    let after: Vec<(String,i64)> = sqlx::query_as("SELECT runtime_session_id,sum(retained_canonical_bytes) FROM agent_session_journal_pack GROUP BY runtime_session_id ORDER BY runtime_session_id")
+        .fetch_all(f.database().pool()).await.unwrap();
     assert_eq!(before[1], after[1]);
     assert!(after[0].1 < before[0].1 && after[2].1 < before[2].1);
     let stats = storage.byte_stats(&domain).await.unwrap();

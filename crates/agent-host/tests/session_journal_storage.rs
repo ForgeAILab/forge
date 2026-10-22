@@ -459,7 +459,8 @@ async fn retained_bytes_include_deferred_bodies() {
         Some(total)
     );
     // Physical-byte scalar metadata is checked against the sealed index too.
-    let row=sqlx::query("SELECT pack_id,retained_canonical_bytes FROM agent_session_journal_pack WHERE role='protected' AND runtime_session_id='owner'").fetch_one(f.database().pool()).await.unwrap();
+    // Session "owner" stores one pack shared by both domains.
+    let row=sqlx::query("SELECT pack_id,retained_canonical_bytes FROM agent_session_journal_pack WHERE runtime_session_id='owner'").fetch_one(f.database().pool()).await.unwrap();
     let pack_id: i64 = row.get("pack_id");
     let retained: i64 = row.get("retained_canonical_bytes");
     sqlx::query("UPDATE agent_session_journal_pack SET retained_canonical_bytes=? WHERE pack_id=?")
@@ -477,10 +478,11 @@ async fn retained_bytes_include_deferred_bodies() {
         partial.retained_bytes, total,
         "only the healthy session is counted"
     );
-    assert_eq!(
-        storage.retained_bytes(&ordinary).await.unwrap(),
-        Some(total)
-    );
+    // The bad pack is shared, so the ordinary domain's view of that session
+    // is skipped too (it used to be an independent, healthy copy).
+    let ordinary_partial = storage.byte_stats(&ordinary).await.unwrap();
+    assert_eq!(ordinary_partial.skipped_sessions, 1);
+    assert_eq!(ordinary_partial.retained_bytes, 0);
     sqlx::query("UPDATE agent_session_journal_pack SET retained_canonical_bytes=? WHERE pack_id=?")
         .bind(retained)
         .bind(pack_id)
@@ -495,12 +497,14 @@ async fn retained_bytes_include_deferred_bodies() {
     let row=sqlx::query("SELECT pack_id,bitmap FROM agent_session_journal_membership WHERE storage_id=? AND role='protected' AND runtime_session_id='owner'").bind(d.storage_id.as_str()).fetch_one(f.database().pool()).await.unwrap();
     let mut bits: Vec<u8> = row.get("bitmap");
     bits[0] &= !1;
-    sqlx::query("UPDATE agent_session_journal_membership SET bitmap=? WHERE pack_id=?")
-        .bind(bits)
-        .bind(row.get::<i64, _>("pack_id"))
-        .execute(f.database().pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE agent_session_journal_membership SET bitmap=? WHERE pack_id=? AND role='protected'",
+    )
+    .bind(bits)
+    .bind(row.get::<i64, _>("pack_id"))
+    .execute(f.database().pool())
+    .await
+    .unwrap();
     let mut sorted = objects.clone();
     sorted.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(
@@ -1666,7 +1670,9 @@ async fn engine_replay_window_edges() {
 
 type PackRows = Vec<(i64, Vec<u8>, i64, i64, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>;
 async fn pack_rows(f: &FileDb, d: &JournalDomain, s: &SessionId) -> PackRows {
-    sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,index_nonce,index_payload,body_nonce,body_payload FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY pack_id")
+    // Packs are session-owned; a domain's packs are the ones it holds bits in
+    // (plus fully unheld packs of the session, which no domain holds).
+    sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,index_nonce,index_payload,body_nonce,body_payload FROM agent_session_journal_pack p WHERE runtime_session_id=?3 AND (EXISTS(SELECT 1 FROM agent_session_journal_membership m WHERE m.pack_id=p.pack_id AND m.storage_id=?1 AND m.role=?2) OR NOT EXISTS(SELECT 1 FROM agent_session_journal_membership m WHERE m.pack_id=p.pack_id)) ORDER BY pack_id")
         .bind(d.storage_id.as_str()).bind(if d.role == JournalRole::Protected { "protected" } else { "ordinary" }).bind(s.as_str()).fetch_all(f.database().pool()).await.unwrap().into_iter().map(|r| (r.get(0),r.get(1),r.get(2),r.get(3),r.get(4),r.get(5),r.get(6),r.get(7))).collect()
 }
 async fn edit(raw: &ForgeJournalStorage, d: &JournalDomain, s: &SessionId) -> JournalWrite {
@@ -1870,7 +1876,7 @@ async fn retired_and_empty_scope_force_purge() {
 }
 
 #[tokio::test]
-async fn independent_session_domain_copy_receipts() {
+async fn shared_domain_copy_and_independent_session_receipts() {
     let f = FileDb::new().await.unwrap();
     let raw = storage(&f).await;
     let mapped = MappingStorage::new(raw.clone(), f.clone());
@@ -1892,6 +1898,35 @@ async fn independent_session_domain_copy_receipts() {
         mapped.apply(initial).await.unwrap();
         raw.objects(d, s, &[objects[0].id.clone()]).await.unwrap();
     }
+    let physical = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT coalesce(sum(retained_canonical_bytes),0) FROM agent_session_journal_pack",
+        )
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap() as u64
+    };
+    // One physical copy per session, shared by both of its domains; the
+    // sessions never share. The old layout stored four copies here.
+    for s in [&a, &b] {
+        let packs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_session_journal_pack WHERE runtime_session_id=?",
+        )
+        .bind(s.as_str())
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap();
+        assert_eq!(packs, 1, "{s:?} stores one shared copy");
+    }
+    assert_eq!(physical().await, length * 2);
+    assert_eq!(
+        raw.retained_bytes(&protected).await.unwrap(),
+        Some(length * 2)
+    );
+    assert_eq!(
+        raw.retained_bytes(&ordinary).await.unwrap(),
+        Some(length * 2)
+    );
     let mut totals = JournalApplyReceipt::default();
     for (n, (d, s)) in scopes.into_iter().enumerate() {
         let untouched: Vec<_> = scopes[n + 1..].to_vec();
@@ -1902,11 +1937,15 @@ async fn independent_session_domain_copy_receipts() {
             .chain(std::iter::once(objects[0].id.clone()))
             .collect();
         let r = raw.apply(release).await.unwrap();
+        // The first domain's release leaves the other domain holding every
+        // slot: nothing is removed. The second domain's release removes the
+        // session's one copy, counted once.
+        let removed = n % 2 == 1;
         assert_eq!(
             r,
             JournalApplyReceipt {
-                reclaimed_objects: 8,
-                reclaimed_bytes: length
+                reclaimed_objects: if removed { 8 } else { 0 },
+                reclaimed_bytes: if removed { length } else { 0 },
             }
         );
         totals.reclaimed_objects += r.reclaimed_objects;
@@ -1918,11 +1957,21 @@ async fn independent_session_domain_copy_receipts() {
                 Some(&objects[0].bytes)
             );
         }
-        let remaining = raw.retained_bytes(&protected).await.unwrap().unwrap()
-            + raw.retained_bytes(&ordinary).await.unwrap().unwrap();
-        assert_eq!(length * 4 - remaining, totals.reclaimed_bytes);
+        // Receipts equal physical removal; a released-but-held copy remains.
+        assert_eq!(length * 2 - physical().await, totals.reclaimed_bytes);
+        let reopened = reopen(&f).await;
+        for (d, s) in scopes[n + 1..].iter() {
+            assert_eq!(
+                reopened
+                    .objects(d, s, &[objects[7].id.clone()])
+                    .await
+                    .unwrap()[0]
+                    .as_ref(),
+                Some(&objects[7].bytes)
+            );
+        }
     }
-    assert_eq!(totals.reclaimed_objects, 32);
+    assert_eq!(totals.reclaimed_objects, 16);
     // Engine-selected nonempty collection release now uses the physical path.
     let s = SessionId::new("engine-release");
     let engine = JournalEngine::protected(
@@ -2122,7 +2171,7 @@ async fn collection_repack_eligible_scoped_packs() {
         .apply(write(&d, other_s.as_str(), equal_objects("other", 8)))
         .await
         .unwrap();
-    let foreign_d = pack_rows(&f, &other_d, &s).await;
+    let foreign_members = raw.members(&other_d, &s).await.unwrap();
     let foreign_s = pack_rows(&f, &d, &other_s).await;
     let before = raw.retained_bytes(&d).await.unwrap().unwrap();
     let mut collect = edit(&raw, &d, &s).await;
@@ -2139,13 +2188,30 @@ async fn collection_repack_eligible_scoped_packs() {
         assert!(after.contains(row), "stable/deferred large pack changed");
     }
     assert!(!after.iter().any(|r| r.0 == purge_id));
+    // Packs are session-owned: the other domain's small pack may join the
+    // base output, keeping exactly its own memberships and readable bodies.
     assert_eq!(after.len(), 4);
     assert!(after.iter().all(|r| r.3 <= 1024 * 1024));
     assert_eq!(
         before - raw.retained_bytes(&d).await.unwrap().unwrap(),
         receipt.reclaimed_bytes
     );
-    assert_eq!(pack_rows(&f, &other_d, &s).await, foreign_d);
+    assert_eq!(raw.members(&other_d, &s).await.unwrap(), foreign_members);
+    assert!(
+        raw.objects(&other_d, &s, &foreign_members)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
+    assert!(
+        raw.objects(&other_d, &s, &[purge[2].id.clone(), deferred[1].id.clone()])
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_none),
+        "a repack never grants the other domain a body it did not admit"
+    );
     assert_eq!(pack_rows(&f, &d, &other_s).await, foreign_s);
     assert!(
         raw.objects(&d, &s, &[deferred[0].id.clone()])
@@ -2210,7 +2276,7 @@ async fn purge_rewrites_only_capped_pack() {
         .apply(write(&other_d, s.as_str(), equal_objects("foreign", 8)))
         .await
         .unwrap();
-    let foreign = pack_rows(&f, &other_d, &s).await;
+    let foreign = raw.members(&other_d, &s).await.unwrap();
     let before_members = raw.members(&d, &s).await.unwrap();
     let before_record = raw.load(&d, &s).await.unwrap();
     let before_bytes = raw.retained_bytes(&d).await.unwrap();
@@ -2223,7 +2289,16 @@ async fn purge_rewrites_only_capped_pack() {
     assert_eq!(raw.load(&d, &s).await.unwrap(), before_record);
     assert_eq!(raw.retained_bytes(&d).await.unwrap(), before_bytes);
     assert!(pack_rows(&f, &d, &s).await.contains(&deferred_row));
-    assert_eq!(pack_rows(&f, &other_d, &s).await, foreign);
+    // Session-owned packs: compact may move the other domain's live bodies,
+    // never its memberships or what it can read.
+    assert_eq!(raw.members(&other_d, &s).await.unwrap(), foreign);
+    assert!(
+        raw.objects(&other_d, &s, &foreign)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
     let reopened = reopen(&f).await;
     assert_eq!(reopened.members(&d, &s).await.unwrap(), before_members);
     assert!(
@@ -2523,6 +2598,13 @@ async fn relabelled_rows_fail_closed() {
     f.seed_journal(&raw, write(&d, b.as_str(), vec![object("b own")]))
         .await
         .unwrap();
+    let ordinary = domain(JournalRole::Ordinary);
+    f.seed_journal(
+        &raw,
+        write(&ordinary, b.as_str(), vec![object("b ordinary")]),
+    )
+    .await
+    .unwrap();
     let pool = f.database().pool().clone();
     let b_owner: String = sqlx::query_scalar(
         "SELECT forge_session_id FROM agent_session_journal_session WHERE runtime_session_id='relabel-b'",
@@ -2581,18 +2663,16 @@ async fn relabelled_rows_fail_closed() {
     let stats = fresh().byte_stats(&d).await.unwrap();
     assert_eq!(stats.skipped_sessions, 1);
     assert_eq!(stats.retained_bytes, 0);
-    // The same pack relabelled to the other role of B's session.
-    sqlx::query("DELETE FROM agent_session_journal_membership WHERE pack_id=?")
-        .bind(a_pack)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE agent_session_journal_pack SET role='ordinary' WHERE pack_id=?")
-        .bind(a_pack)
-        .execute(&pool)
-        .await
-        .unwrap();
-    let ordinary = domain(JournalRole::Ordinary);
+    // The same moved pack held by the other domain of B's session: packs are
+    // session-sealed, so the foreign session binding still fails closed.
+    sqlx::query("INSERT INTO agent_session_journal_membership (storage_id,role,runtime_session_id,forge_session_id,pack_id,bitmap) VALUES (?, 'ordinary', 'relabel-b', ?, ?, x'01')")
+        .bind(ordinary.storage_id.as_str()).bind(&b_owner).bind(a_pack).execute(&pool).await.unwrap();
+    assert!(
+        fresh()
+            .objects(&ordinary, &b, std::slice::from_ref(&victim.id))
+            .await
+            .is_err()
+    );
     let stats = fresh().byte_stats(&ordinary).await.unwrap();
     assert_eq!(stats.skipped_sessions, 1);
     assert_eq!(stats.retained_bytes, 0);
@@ -3118,4 +3198,325 @@ async fn operation_frames_are_bounded() {
         fresh().operation(&d, &s, &op).await.unwrap(),
         Some(original)
     );
+}
+
+// ---- Within-session body sharing (spec amendment 2026-10-21, task 27) ----
+
+async fn session_object_count(f: &FileDb, s: &SessionId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT coalesce(sum(object_count),0) FROM agent_session_journal_pack WHERE runtime_session_id=?",
+    )
+    .bind(s.as_str())
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap()
+}
+fn ids(objects: &[JournalStoredObject]) -> Vec<JournalObjectId> {
+    objects.iter().map(|o| o.id.clone()).collect()
+}
+fn sorted_ids(objects: &[JournalStoredObject]) -> Vec<JournalObjectId> {
+    let mut ids = ids(objects);
+    ids.sort();
+    ids
+}
+
+#[tokio::test]
+async fn ordinary_never_reads_protected_only_bodies() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let (p, o) = (
+        domain(JournalRole::Protected),
+        domain(JournalRole::Ordinary),
+    );
+    let s = SessionId::new("isolated");
+    let shared = equal_objects("projected", 8);
+    let secrets = equal_objects("exact-only", 4);
+    let ordinary_only = equal_objects("ordinary-only", 1);
+    let protected_all: Vec<_> = shared.iter().chain(&secrets).cloned().collect();
+    let ordinary_all: Vec<_> = shared.iter().chain(&ordinary_only).cloned().collect();
+    mapped
+        .apply(write(&p, s.as_str(), protected_all.clone()))
+        .await
+        .unwrap();
+    mapped
+        .apply(write(&o, s.as_str(), ordinary_all.clone()))
+        .await
+        .unwrap();
+    // Shared bodies are stored once: 12 protected + 1 ordinary-only slots.
+    // Independent domain copies stored 20.
+    assert_eq!(session_object_count(&f, &s).await, 13);
+    let check = |stage: &'static str| {
+        let raw = raw.clone();
+        let (p, o, s) = (p.clone(), o.clone(), s.clone());
+        let (secrets, ordinary_only, shared) =
+            (secrets.clone(), ordinary_only.clone(), shared.clone());
+        let (protected_all, ordinary_all) = (protected_all.clone(), ordinary_all.clone());
+        async move {
+            let live_secrets: Vec<_> = raw
+                .members(&p, &s)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|id| secrets.iter().any(|o| &o.id == id))
+                .collect();
+            assert!(
+                raw.objects(&o, &s, &ids(&secrets))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none),
+                "{stage}: ordinary read a protected-only body"
+            );
+            assert!(
+                raw.objects(&p, &s, &ids(&ordinary_only))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_none),
+                "{stage}: protected read an ordinary-only body"
+            );
+            assert!(
+                raw.objects(&o, &s, &ids(&shared))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_some),
+                "{stage}"
+            );
+            let mut want: Vec<_> = sorted_ids(&ordinary_all);
+            want.sort();
+            assert_eq!(raw.members(&o, &s).await.unwrap(), want, "{stage}");
+            let mut want: Vec<_> = protected_all
+                .iter()
+                .filter(|x| !secrets.iter().any(|y| y.id == x.id) || live_secrets.contains(&x.id))
+                .map(|x| x.id.clone())
+                .collect();
+            want.sort();
+            assert_eq!(raw.members(&p, &s).await.unwrap(), want, "{stage}");
+        }
+    };
+    check("fresh admission").await;
+    // Purge rewrite: three dead secret slots exceed 25% of the shared pack,
+    // which is rewritten with both domains' bitmaps remapped.
+    let before: Vec<i64> = pack_rows(&f, &p, &s).await.iter().map(|r| r.0).collect();
+    let mut release = edit(&raw, &p, &s).await;
+    release.release = ids(&secrets[..3]);
+    let receipt = raw.apply(release).await.unwrap();
+    assert_eq!(receipt.reclaimed_objects, 3);
+    let purged = pack_rows(&f, &p, &s).await;
+    assert!(
+        purged
+            .iter()
+            .any(|r| before.contains(&r.0) && r.1 == 1u64.to_be_bytes()),
+        "the shared pack was rewritten in place"
+    );
+    check("after purge rewrite").await;
+    // Merge: the base repack folds the small shared and ordinary-only packs.
+    let mut collect = edit(&raw, &o, &s).await;
+    collect.kind = JournalWriteKind::Collect;
+    raw.apply(collect).await.unwrap();
+    let merged: Vec<i64> = pack_rows(&f, &o, &s).await.iter().map(|r| r.0).collect();
+    assert_eq!(merged.len(), 1, "small fully live packs were merged");
+    assert!(!before.contains(&merged[0]));
+    check("after merge").await;
+    raw.post_terminal(&p, &s).await.unwrap();
+    check("after terminal maintenance").await;
+    let reopened = reopen(&f).await;
+    assert!(reopened.objects(&o, &s, &ids(&secrets[3..])).await.unwrap()[0].is_none());
+    assert!(reopened.objects(&p, &s, &ids(&secrets[3..])).await.unwrap()[0].is_some());
+}
+
+#[tokio::test]
+async fn two_domain_release_crash_cuts() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let (p, o) = (
+        domain(JournalRole::Protected),
+        domain(JournalRole::Ordinary),
+    );
+    let objects = equal_objects("cut", 8);
+    let length: u64 = objects.iter().map(|o| o.bytes.len() as u64).sum();
+    for (first_cut, &cut) in [true, false].into_iter().flat_map(|first| {
+        JournalCommitFailurePoint::ALL
+            .iter()
+            .map(move |c| (first, c))
+    }) {
+        let s = SessionId::new(format!("cut-{first_cut}-{cut:?}"));
+        for d in [&p, &o] {
+            mapped
+                .apply(write(d, s.as_str(), objects.clone()))
+                .await
+                .unwrap();
+        }
+        let physical = || async { session_object_count(&f, &s).await };
+        assert_eq!(physical().await, 8);
+        let release = |d: &JournalDomain| {
+            let raw = raw.clone();
+            let (d, s, objects) = (d.clone(), s.clone(), objects.clone());
+            async move {
+                let mut w = edit(&raw, &d, &s).await;
+                w.kind = JournalWriteKind::Collect;
+                w.release = ids(&objects);
+                w
+            }
+        };
+        if !first_cut {
+            assert_eq!(
+                raw.apply(release(&p).await).await.unwrap(),
+                JournalApplyReceipt::default(),
+                "the other domain still holds every slot"
+            );
+        }
+        // Cut the first (non-removing) or second (removing) release.
+        let target = if first_cut { &p } else { &o };
+        let mut w = release(target).await;
+        w.inject = Some(cut);
+        let error = raw.apply(w.clone()).await.unwrap_err();
+        assert!(error.retryable);
+        let reopened = reopen(&f).await;
+        let readable = |d: &JournalDomain| {
+            let reopened = reopened.clone();
+            let (d, s, objects) = (d.clone(), s.clone(), objects.clone());
+            async move {
+                reopened
+                    .objects(&d, &s, &ids(&objects))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(Option::is_some)
+            }
+        };
+        if cut.is_after_commit() {
+            assert!(!readable(target).await);
+            assert_eq!(physical().await, if first_cut { 8 } else { 0 });
+        } else {
+            assert!(readable(target).await, "{cut:?} rolled back");
+            assert_eq!(physical().await, 8, "{cut:?} removed nothing");
+            // The rolled-back release retries from the durable fence.
+            let receipt = reopened.apply(release(target).await).await.unwrap();
+            assert_eq!(receipt.reclaimed_objects, if first_cut { 0 } else { 8 });
+        }
+        if first_cut {
+            // The other domain was untouched by the cut release.
+            assert!(readable(&o).await);
+            let receipt = reopened.apply(release(&o).await).await.unwrap();
+            assert_eq!(
+                receipt,
+                JournalApplyReceipt {
+                    reclaimed_objects: 8,
+                    reclaimed_bytes: length,
+                }
+            );
+        }
+        assert_eq!(physical().await, 0, "{first_cut} {cut:?}");
+    }
+}
+
+#[tokio::test]
+async fn deletion_drain_removes_shared_session_packs_once() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let (p, o) = (
+        domain(JournalRole::Protected),
+        domain(JournalRole::Ordinary),
+    );
+    let objects = equal_objects("deleted", 8);
+    let length: u64 = objects.iter().map(|o| o.bytes.len() as u64).sum();
+    let (x, y) = (SessionId::new("deleted-x"), SessionId::new("kept-y"));
+    for s in [&x, &y] {
+        for d in [&p, &o] {
+            mapped
+                .apply(write(d, s.as_str(), objects.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    let host = f.ensure_session(&x).await.unwrap();
+    sqlx::query("DELETE FROM agent_session WHERE id=?")
+        .bind(host)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    // Both domains' memberships cascaded; the one shared pack is orphaned.
+    let db = f.database();
+    let mut deleted = (0, 0, 0);
+    let mut after = 0;
+    loop {
+        let batch = db.drain_session_journal_orphans(after).await.unwrap();
+        deleted.0 += batch.deleted_packs;
+        deleted.1 += batch.deleted_objects;
+        deleted.2 += batch.deleted_canonical_bytes;
+        after = batch.after_pack_id;
+        if !batch.has_more {
+            break;
+        }
+    }
+    assert_eq!(deleted, (1, 8, length), "one shared copy, counted once");
+    assert_eq!(session_object_count(&f, &x).await, 0);
+    let reopened = reopen(&f).await;
+    for d in [&p, &o] {
+        assert!(
+            reopened
+                .objects(d, &y, &ids(&objects))
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_some)
+        );
+        assert!(reopened.members(d, &x).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn corrupt_shared_body_isolates_its_session() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let (p, o) = (
+        domain(JournalRole::Protected),
+        domain(JournalRole::Ordinary),
+    );
+    let objects = equal_objects("corrupt", 8);
+    let length: u64 = objects.iter().map(|o| o.bytes.len() as u64).sum();
+    let (bad, good) = (SessionId::new("bad"), SessionId::new("good"));
+    for s in [&bad, &good] {
+        for d in [&p, &o] {
+            mapped
+                .apply(write(d, s.as_str(), objects.clone()))
+                .await
+                .unwrap();
+        }
+    }
+    sqlx::query("UPDATE agent_session_journal_pack SET body_payload=zeroblob(length(body_payload)) WHERE runtime_session_id='bad'")
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    let reopened = reopen(&f).await;
+    for d in [&p, &o] {
+        let error = reopened.objects(d, &bad, &ids(&objects)).await.unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Serialization);
+        assert!(!error.retryable, "corruption is not a transient failure");
+        assert!(
+            reopened
+                .objects(d, &good, &ids(&objects))
+                .await
+                .unwrap()
+                .iter()
+                .all(Option::is_some)
+        );
+        // Diagnostics authenticate index units only; both sessions' indexes
+        // are intact, so the corrupt body is still counted as retained.
+        let stats = reopened.byte_stats(d).await.unwrap();
+        assert_eq!(stats.skipped_sessions, 0, "{d:?}");
+        assert_eq!(stats.retained_bytes, length * 2, "{d:?}");
+        // No maintenance rewrites or releases the unreadable session.
+        reopened.compact(d).await.unwrap();
+        let mut release = edit(&reopened, d, &bad).await;
+        release.release = ids(&objects[..1]);
+        assert!(reopened.apply(release).await.is_err());
+    }
+    assert_eq!(session_object_count(&f, &bad).await, 8);
 }
