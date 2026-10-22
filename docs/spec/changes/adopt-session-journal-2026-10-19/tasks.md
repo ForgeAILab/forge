@@ -685,3 +685,37 @@ No runtime bench crate becomes a production dependency.
   Owner Decisions entry verbatim.
   Focused checks: strict spec validation and whitespace/link review. No full code
   suite; reuse the recorded named-test receipts, rerunning only for new changes.
+
+## Within-session body sharing (2026-10-21 amendment)
+
+- [ ] **27. Share identical bodies between a session's domains (≤5 h with 28–29).**
+  Amend D2 rule 4, D3 ("Within-session body sharing"), D4 and the D10 risk per
+  the task-25 profiling evidence (`/Volumes/Data/tmp/refactor/c3-profile/report.md`,
+  section 4 and ranked option 1). In the unreleased session-journal migration,
+  packs become runtime-session owned `(runtime_session_id, forge_session_id)`
+  with per-domain membership bitmaps; pack index/body units use the
+  session-scoped AAD. Admission reuses any byte-identical slot of the session and
+  sets only the writing domain's bit. Release, threshold/empty/retired purges,
+  S2/base/compact merges and the deletion drain treat a slot as dead only when no
+  domain holds it, and remap every holder's own bits. `retained_bytes` follows
+  the trait's sharing-scope definition. Keep Q4 (no cross-session sharing), the
+  conservative ordinary projection and per-domain metadata authentication.
+  Focused tests: the three storage conformance wrappers and `broken_storage_`;
+  new storage tests for a shared body surviving one domain's release, removal
+  after both release, ordinary unable to address a protected-only body (fresh,
+  purged and merged), two-domain release crash cuts, deletion drain with shared
+  bodies and a corrupt shared body isolating its session.
+
+- [ ] **28. Storage-only speed fixes (profile option 3).**
+  Keep unchanged immutable body-cache entries across S2/compact instead of
+  invalidating the session; publish merged pack bodies after COMMIT; precompute
+  lookup prefixes once per requested id; batch catalog/pin removals; validate an
+  admitted batch once before packing. Membership reads, generation keys, row
+  authentication, full-id verification and atomic fences are unchanged; released
+  bodies are never served.
+
+- [ ] **29. Re-measure the Forge gate.**
+  Rerun only the named ignored release report and record B/4000 plain/tool disk
+  ratios against L2 (hard gate ≤2.0×) and turn/import/collect before vs after.
+  Update task 25's notes and `docs/performance-testing.md`; fixtures, seeds,
+  projection, baseline and thresholds are unchanged.

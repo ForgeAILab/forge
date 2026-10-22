@@ -52,10 +52,10 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 - **WHEN** roots or pins change before a scheduled collection's expected epoch is accepted
 - **THEN** the engine refuses the stale request without deletion and Forge retries later
 
-#### Scenario: Independent copy remains referenced
-- **WHEN** ordinary collection releases its copy of an id also held by protected or another session
-- **THEN** the other scope's independent copy remains readable
-- **AND** the ordinary receipt counts only its own physically removed copies at removal time; below-threshold deferred bytes remain in retained_bytes and count zero until purged
+#### Scenario: Shared or independent copy remains referenced
+- **WHEN** ordinary collection releases an id also held by protected in the same session or by another session
+- **THEN** the shared slot stays readable to protected and the other session's independent copy stays readable
+- **AND** the ordinary receipt counts only copies physically removed by that apply; a slot protected still holds counts zero, and below-threshold deferred bytes remain in retained_bytes and count zero until purged
 
 #### Scenario: Unreadable session isolation and retirement dependencies
 - **WHEN** one dirty session cannot authenticate or otherwise fails non-retryably during collection
@@ -71,7 +71,7 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 - **AND** the worker keeps no lifetime id set; unreadable/preserved counts describe the current pass after repair, deletion or worker restart
 
 ### Requirement: Physical pack maintenance preserves membership
-Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during per-turn collection. Each pack SHALL belong to one domain/runtime-session scope; maintenance SHALL remap only that scope's bitmap atomically without changing runtime objects, heads, membership or replay policy, and failure SHALL be retryable without undoing an acknowledged turn. Dead bodies SHALL become unreadable on release; sealed packs MAY defer their removal below 25% dead canonical body bytes. The apply reaching 25%, an empty scope and retired-session collection SHALL force purges even when optional merging is disabled. Receipts SHALL count physical copies and canonical encoded bytes only when removed, including earlier deferred bodies. Imports, admissions, purge rewrites and all repacks SHALL obey the 1 MiB canonical body cap; an oversized object SHALL be rejected atomically. Serialized operation packs SHALL also be capped at 1 MiB. Base repacking SHALL select only fully live packs below 64 KiB or fully live survivor packs purged by that apply; terminal equal-tier pairs SHALL fit the 1 MiB cap. Stable large and deferred-dead packs SHALL stay sealed. `compact` SHALL use bounded per-session transactions, move only eligible fully live bodies so no dead removal escapes apply receipts, and SHALL NOT run a full VACUUM.
+Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during per-turn collection. Each pack SHALL belong to one runtime session; maintenance SHALL remap each holder domain's bitmap of that session atomically from its own previous bits, never granting a domain a slot it did not hold, without changing runtime objects, heads, membership or replay policy, and failure SHALL be retryable without undoing an acknowledged turn. Dead bodies SHALL become unreadable on release; sealed packs MAY defer their removal below 25% dead canonical body bytes. The apply reaching 25%, an empty scope and retired-session collection SHALL force purges even when optional merging is disabled. Receipts SHALL count physical copies and canonical encoded bytes only when removed, including earlier deferred bodies. Imports, admissions, purge rewrites and all repacks SHALL obey the 1 MiB canonical body cap; an oversized object SHALL be rejected atomically. Serialized operation packs SHALL also be capped at 1 MiB. Base repacking SHALL select only fully live packs below 64 KiB or fully live survivor packs purged by that apply; terminal equal-tier pairs SHALL fit the 1 MiB cap. Stable large and deferred-dead packs SHALL stay sealed. `compact` SHALL use bounded per-session transactions, move only eligible fully live bodies so no dead removal escapes apply receipts, and SHALL NOT run a full VACUUM.
 
 #### Scenario: Deferred release and bounded threshold purge in a long session
 - **WHEN** collection after a turn releases superseded bodies in a 4000-message session
@@ -87,7 +87,7 @@ Forge SHALL trigger S2 geometric-tier merging after successful terminal publicat
 #### Scenario: Terminal hook and collection base pack
 - **WHEN** terminal publication succeeds and equal-size pack tiers exist
 - **THEN** the async terminal hook merges them geometrically with fresh AEAD nonces
-- **AND** subsequent collection can form capped kind-ordered output from eligible fully live inputs in that same domain/session only
+- **AND** subsequent collection can form capped kind-ordered output from eligible fully live inputs (every slot held by at least one domain) in that same session only
 
 #### Scenario: Physical compaction
 - **WHEN** compact repacks live bodies or reclaims free SQLite pages
@@ -113,7 +113,7 @@ Deleting an agent_session SHALL cascade its journal session, pin, catalog, membe
 - **AND** a fresh process resumes from the durable orphan index without decryption or fabricated apply receipts
 
 ### Requirement: Forge physical disk gate against real legacy L2
-Forge SHALL run fixture B at N=4000, plain and tool, through production ForgeJournalStorage with sqlx, real AEAD, PerSession/independent-domain copies, S1–S5 and collection, and compare each physical retained size with the same fixture's actual Forge legacy idle row containing two sealed blobs (L2). Both post-collection ratios SHALL be at most 2.0×; 1.5× is an aim. Runtime rt-e7's measured PerSession S1–S5 numbers, which share bodies across a session's domains, SHALL NOT substitute for this Forge gate, and runtime schema 5 SHALL remain out of scope.
+Forge SHALL run fixture B at N=4000, plain and tool, through production ForgeJournalStorage with sqlx, real AEAD, PerSession within-session domain sharing, S1–S5 and collection, and compare each physical retained size with the same fixture's actual Forge legacy idle row containing two sealed blobs (L2). Both post-collection ratios SHALL be at most 2.0×; 1.5× is an aim. Runtime rt-e7's measured PerSession S1–S5 numbers, with modeled sealing, SHALL NOT substitute for this Forge gate, and runtime schema 5 SHALL remain out of scope.
 
 The gate ratios SHALL be taken after the production cadence (S2 hook and collection after every turn plus final shutdown sweep). The report SHALL include cumulative committed object/operation pack payload+nonce writes and largest single collection-call write, matching rt-e7's counter units, plus separate WAL write bytes against legacy, largest single-pack rewrite, lazy session hydration time and bounded scoped-directory/body-cache charge with unrelated sessions present, memo charge/resident-memory/hit/miss/eviction/oversize evidence, cold-validation time and the longest collect gate hold. Memo hit/miss counts and cold-validation time SHALL provide evidence for any increase to the 128 MiB per-engine estimated memo budget. Retained/live/deferred canonical bytes and cumulative physical receipts SHALL remain distinct from file savings. For each layout physical bytes SHALL be page_count×page_size after truncated WAL checkpoints and VACUUM, minus its matching empty-schema/session-setup baseline, verified against file/dbstat totals. Reports SHALL include all metadata/index/crypto costs, A/B at N=100/1000/4000, grown C including supplemental N=4000 with cadence labeled, before/after collection/retirement, L1 diagnostics and the temporary footprint of retained lazy-import legacy rows. L1, small-N and A/C SHALL not replace the settled B/N=4000 L2 gate.
 

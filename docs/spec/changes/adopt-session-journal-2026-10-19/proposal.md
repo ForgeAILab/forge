@@ -14,8 +14,8 @@ collect-at-end and per-turn collection.
 L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
 one-blob assumption. These are measured **PerSession S1–S5** results from
 `/Volumes/Data/tmp/refactor/rt-e7/report.md`, with modeled seal lengths and
-within-session domain sharing; Forge chooses independent domain copies and must
-still prove its own real-AEAD/sqlx gate. Per-turn C/N=1000 is **1.27826× L2**;
+within-session domain sharing. Forge now shares bodies between a session's two
+domains too (2026-10-21 amendment) and must still prove its own real-AEAD/sqlx gate. Per-turn C/N=1000 is **1.27826× L2**;
 the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
 
 ## What Changes
@@ -57,8 +57,9 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   and prefix/offset indexes inside
   sealed packs (separate index and body units), with full-id verification.
   Storage declares `JournalBodySharing::PerSession` and deduplicates only within
-  one domain/runtime-session pair; neither sessions nor the two domains share
-  copies. Lazy scoped indexes decode only the requested scope's packs; storage
+  one runtime session: its two domains share identical bodies through separate
+  membership bitmaps, while sessions never share copies. Lazy scoped indexes
+  decode only the requested session's packs; storage
   open decodes no pack units. S4 packs complete original operation
   results; the engine selects S5 pruning (inclusive floor current−64 plus the
   current writer epoch's last operation), which storage executes only on an

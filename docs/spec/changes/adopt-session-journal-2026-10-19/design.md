@@ -21,6 +21,9 @@ Implementation references below use `runtime:` for source paths in the
 `/Volumes/Data/codes/ai/agent-runtime-u9b-review/` is read-only; its moving HEAD
 is not release evidence. Runtime Owner Decision Q4 accepts independent
 per-session copies; the earlier Forge review's global-index requirement is withdrawn.
+The 2026-10-21 amendment (D3 "Within-session body sharing", tasks 27–29) makes
+Forge share identical bodies between the two domains of one runtime session, as
+the reference does; it still never shares across sessions.
 
 | Evidence | Consequence for Forge |
 | --- | --- |
@@ -168,18 +171,24 @@ Forge honors the runtime's seven trait rules:
    advances its generation exactly once, even when revision/epoch are unchanged.
    A non-successor generation or generation overflow conflicts with no effects;
    revision and writer epoch remain exactly as supplied by the engine.
-4. **Membership/sharing and receipts.** Forge declares PerSession and chooses
-   independent copies per domain as permitted by the runtime. Deduplicate only
-   within `(storage_id, role, runtime_session_id)`; add membership on every
-   admission, including re-admission of a deferred body. An immutable id with
-   different bytes in that scope conflicts. Every held member stays readable;
-   released/non-member bodies are never served, even from a sealed pack/cache.
-   Another session or domain holding the same id does not delay reclaiming this
-   copy. Below 25% dead canonical body bytes a sealed pack may defer removal;
-   the apply reaching 25%, an empty scope, or collection of a retired session
+4. **Membership/sharing and receipts.** Forge declares PerSession and shares
+   identical immutable bodies between the domains of one runtime session, as
+   the runtime permits (2026-10-21 amendment, D3). The physical deduplication
+   scope is the runtime session id `S` across its domains; no admission lookup
+   crosses sessions. Membership stays per `(storage_id, role, S)`: a domain gains
+   a bit only by admitting the complete canonical bytes, verified byte-identical
+   to the stored body, including re-admission of a deferred slot or a slot the
+   other domain holds. An immutable id with different bytes in that session
+   conflicts. Every held member stays readable; a body is never served to a
+   domain without its own bit, even when the other domain holds it or it sits in
+   a sealed pack/cache. A slot is dead only when no domain of the session holds
+   it; another session never delays reclaiming. Below 25% dead canonical body
+   bytes a sealed pack may defer removal; the apply reaching 25%, a domain
+   releasing its last member in the session, or collection of a retired session
    purges dead bytes (D4). Deletion cleanup also purges the deleted session's
    bytes (D8). A receipt counts each physical copy at removal, including earlier
-   deferred bytes; clearing bits and moving live bodies count zero.
+   deferred bytes; clearing bits, a release that leaves another domain holding
+   the slot, and moving live bodies count zero.
 5. **Consistent reads.** Each read observes a completed apply, never a mixture of
    pre-repack bitmaps and post-repack bodies. The engine gates reads feeding a
    write; immutable bodies do not require a transaction spanning trait calls.
@@ -256,14 +265,59 @@ there; no restore-critical state may use that namespace family. Unknown
 namespaces, LCM, conversation and runtime cache/manifests remain exact because
 there is no evidence that they can safely be discarded.
 
-Both domains use the same derived encryption-key material but separate packs,
-session records, memberships, pins, catalogs and operation packs. A pack belongs
-to exactly one `(storage_id, role, runtime_session_id)`; equal exact/projected
-bodies have independent physical copies. Forge chooses no cross-domain sharing
-because the domains have different redaction and recovery duties. The runtime's
-PerSession contract permits this choice; its reference shares across domains
-within a session, so its disk numbers are evidence, not a Forge prediction.
-Different sessions never share bodies, indexes or admission lookup candidates.
+Both domains use the same derived encryption-key material and separate session
+records, memberships, pins, catalogs and operation packs. Since the 2026-10-21
+amendment, body packs belong to the runtime session rather than to one domain:
+a pack is owned by exactly one `(runtime_session_id, forge_session_id)` and each
+domain holds its own membership bitmap over it. Different sessions never share
+bodies, indexes or admission lookup candidates (Q4 unchanged).
+
+**Within-session body sharing (2026-10-21 amendment).** Task-25 profiling found
+that 99.2% / 99.6% of Forge's B/4000 disk gap to the runtime reference was the
+ordinary domain re-storing about 20,000 bodies the protected domain already held.
+Forge therefore stores an identical immutable body once per session and lets both
+domains reference it. The rules that keep this safe:
+
+1. *Conservative projection is unchanged.* The ordinary engine still projects
+   before encoding/hashing and storage still receives only the admitted ordinary
+   batch. A domain gets a membership bit only by admitting the complete bytes;
+   storage verifies the full id and byte equality against the stored body before
+   setting the bit. Object ids are content digests, so a shared body is exactly
+   one the ordinary projection produced. A body only the protected domain admitted
+   (exact checkpoint state, redacted diagnostics) never gains an ordinary bit,
+   and reads, members, purge remaps and merges carry each domain's bits
+   separately: no rewrite grants a domain a slot it did not hold.
+2. *Independent memberships, roots, pins and collection.* Each domain keeps its
+   own session record, fence, pins, catalog, operation packs, dirty flag and
+   membership bitmap. Its engine decides liveness alone. Releasing a slot clears
+   only the writing domain's bit; the body is physically removed only when no
+   domain of the session holds it (D4 purge rules, receipts once per copy).
+3. *Session-scoped sealing.* Pack index and body units are sealed under a
+   session-scoped AAD, with new unit codes and table label (`session_pack`):
+   format, key revision, unit kind, the runtime session id, Forge owner label,
+   pack id and pack generation. No domain field appears in a pack AAD, and no
+   domain-bound unit uses the new codes, so a domain-bound binding can never
+   open a pack unit or vice versa. Session, pin, catalog and operation units stay
+   bound to their full domain/session key exactly as before. The AEAD key is
+   unchanged: one HKDF-derived XChaCha20-Poly1305 key used only for
+   XChaCha20-Poly1305, with the HMAC lookup key still derived under its own label.
+   No key is used by two algorithms, and a random 24-byte nonce per seal keeps the
+   existing nonce analysis.
+4. *Rollback and swap analysis.* Moving pack ciphertext to another session,
+   owner label, pack id or generation still fails authentication, as does moving
+   a metadata unit across domains. A pack unit is no longer bound to a domain,
+   but packs no longer have a domain to swap: domain authority over a slot is the
+   clear membership bitmap, exactly as read authority was already the bitmap
+   inside a domain-owned pack. Editing bitmaps or rows requires write access to
+   the SQLite file, which stays out of scope (below). A file writer could set an
+   ordinary bit on a protected-only slot of the same session; before the change
+   the same writer could already resurrect released slots, roll back records and
+   relabel membership. Bitmap overlap now also shows how much of a session's
+   protected content also appears in ordinary. Both are accepted under the
+   existing local-attacker scope; neither reveals plaintext or a digest.
+5. *Isolation of failures.* A corrupt shared pack fails closed for every domain
+   of that session (D-2 isolation is per session already); other sessions are
+   untouched.
 
 **Real sealing.** Keep **XChaCha20-Poly1305**, Forge's existing master-key path and
 `key_revision`; do not copy the reference's zero-tag/nonce simulation. Compress a
@@ -276,8 +330,9 @@ revision as associated data. Pack ids are never reused (SQLite `AUTOINCREMENT`);
 a purge rewrite keeps the id and increments `generation`, a merge writes a new
 id. Binding the generation guards against bugs, stale caches and ciphertext
 swaps under the current generation that could misalign the membership bitmap. Bind each pack
-unit's AAD to its full owning domain/runtime-session key as well; singleton
-metadata also binds its full domain/session key. Every rewrite/repack uses a
+unit's AAD to its owning runtime session and Forge owner label (session-scoped
+since the 2026-10-21 amendment); singleton metadata binds its full domain/session
+key. Every rewrite/repack uses a
 fresh nonce. Seal session, pin, catalog and operation payloads too.
 Decode/authentication errors fail closed; never treat corruption as
 an absent or fresh session. Diagnostics never print decrypted contents or keys.
@@ -285,7 +340,7 @@ an absent or fresh session. Diagnostics never print decrypted contents or keys.
 **Id decision.** Runtime object ids remain content digests and are never rewritten.
 Four-byte prefixes and offsets live in each pack's **sealed index unit**; full ids
 are recomputed from verified bodies. Rebuildable RAM lookup directories (D4)
-are scoped to one domain/session and populated lazily on its first object access
+are scoped to one runtime session and populated lazily on its first object access
 or admission; storage open decrypts no pack index or body. The old per-object
 `HMAC(id)` key and SQL id index are unnecessary: there is no clear digest/prefix
 in the database against which to confirm a guessed message. Encryption alone
@@ -357,15 +412,15 @@ example `atomic-{point:?}`) that change upstream.
 | `agent_session_journal_session` | PK `(storage_id, role, runtime_session_id)`; indexed `forge_session_id` FK; generation, revision, writer_epoch, collection_dirty, published, has_checkpoint, retired; key_revision, format, nonce | Lossless `JournalSessionRecord` including head, retirement and opaque engine state. Revision 0 + no head is a reservation. Partial dirty index ordered by domain/runtime session id. |
 | `agent_session_journal_pin` | PK `(D, S, pin_key)`; session FK; key/format/nonce | Complete `JournalPinRecord`, including roots and opaque state; Put/Remove only through apply. |
 | `agent_session_journal_catalog` | PK `(D, S, head_key)`; session FK; key/format/nonce | Complete `JournalCatalogEntry`; `head_key` is keyed as in D3, not the raw digest. |
-| `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); strict owner `(D, S)` plus indexed `forge_session_id` label; generation, key/format, object/retained-canonical-byte counts; index on `(D, S, pack_id)` | Two sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit. One domain/session owns all slots; no cross-domain/session holder is valid. Pack owner labels have no cascading FK so deletion cleanup can be bounded. Retained bytes include deferred dead slots. |
-| `agent_session_journal_membership` | PK `(D, S, pack_id)`; session FK and pack FK; bitmap; secondary index on pack_id | One bit per prefix-directory slot. No object id, per-object row or offset index in SQL. Remove empty bitmap rows. |
+| `agent_session_journal_pack` | `INTEGER PRIMARY KEY AUTOINCREMENT` pack id (never reused); strict session owner `S` plus indexed `forge_session_id` label (no domain columns since the 2026-10-21 amendment); generation, key/format, object/retained-canonical-byte counts; index on `(S, pack_id)` | Two session-sealed units with their own nonces: the index unit (prefix/offset directory) and the zstd body unit. One runtime session owns all slots; each of its domains holds its own bitmap; no cross-session holder is valid. Pack owner labels have no cascading FK so deletion cleanup can be bounded. Retained bytes include deferred dead slots. |
+| `agent_session_journal_membership` | PK `(D, S, pack_id)`; session FK and pack FK on `(pack_id, S, forge_session_id)`; bitmap; secondary indexes on pack_id and `(S, pack_id)` | One bit per prefix-directory slot, per domain. No object id, per-object row or offset index in SQL. Remove empty bitmap rows. |
 | `agent_session_journal_operation_pack` | PK `(D, S, tier)`; session FK; key/format/nonce | S4 lossless original operation records in binary-carry tiers, including private digest, revision and complete result head. |
 
 Session, pin, catalog, membership and operation-pack rows cascade from
 `agent_session`; pack rows do not. Packs are exclusively owned, but intentionally
 outlive the row deletion until bounded post-deletion cleanup removes them (D8).
 Their runtime id and Forge owner labels remain available after the cascade;
-membership rows cannot refer to a pack owned by a different domain/session.
+membership rows cannot refer to a pack owned by a different session.
 An apply checks that owner and mapping inside its transaction. In-row invariants
 have CHECKs:
 `has_checkpoint` is false without a published head and on retirement, and a
@@ -376,7 +431,7 @@ read and write. Scalar query columns must agree with the authenticated record on
 The task-3 schema uses eight-byte big-endian BLOBs for generation, revision and
 writer epoch (and pack generation), preserving every runtime `u64` value in SQL
 fences without narrowing to signed SQLite integers. Composite membership FKs
-also enforce the pack's complete domain/runtime-session/Forge owner key. The
+also enforce the pack's complete runtime-session/Forge owner key. The
 allocated migration is `V202610200941__session_journal.sql`.
 The additive `V202610201253__session_journal_deletion.sql` adds a clear
 `orphaned` pack marker and partial pack-id index. Membership insert/delete/move
@@ -409,23 +464,25 @@ not trusted from the batch's clustering hint. No canonical object, reference or
 `JOURNAL_SCHEMA_VERSION` changes.
 
 **Session-local admission and lazy lookup.** `sharing()` explicitly declares
-`JournalBodySharing::PerSession`. Forge further keeps the two domains separate:
-deduplication, prefix candidates, new packs and maintenance are scoped to `(D, S)`.
-No cross-session or cross-domain admission lookup occurs. Testkit branches
-`membership_isolation_and_receipts` on that declaration and accepts independent
-domain copies; the old zero-until-fourth-holder global requirement no longer
-applies to Forge.
+`JournalBodySharing::PerSession`. Deduplication, prefix candidates, new packs and
+maintenance are scoped to the runtime session `S`, shared by its domains;
+memberships, reads and releases stay scoped to `(D, S)`. No cross-session
+admission lookup occurs. Testkit branches `membership_isolation_and_receipts` on
+that declaration and accepts either shared or separate domain copies within a
+session; the old zero-until-fourth-holder global requirement does not apply.
 
 Opening storage and loading scalar/session metadata decode no pack units.
 The first object lookup, membership inventory or admission lazily reads only the
-requested domain/session's pack directory, using its indexed owner key. Rebuild
-that scope's bounded RAM prefix/offset directory from its sealed index units;
-load candidate body units through the bounded LRU and verify full ids/bytes.
-An identical admitted body already in that scope, including an unserved deferred
-slot, reuses its slot and sets membership; a verified miss adds one new copy.
-Different bytes for an existing id conflict, and `JournalObject::kind()` verifies
-the id digest and kind on admission. Other sessions and the other domain keep
-independent copies even for identical ids. Per-scope directory caches are
+requested session's pack directory, using its indexed owner key, plus that
+session's membership rows. Rebuild the session's bounded RAM prefix/offset
+directory from its sealed index units; load candidate body units through the
+bounded LRU and verify full ids/bytes. An identical admitted body already in the
+session, including an unserved deferred slot or a slot only the other domain
+holds, reuses that slot and sets the writing domain's bit; a verified miss adds
+one new copy. Different bytes for an existing id conflict, and
+`JournalObject::kind()` verifies the id digest and kind on admission. Other
+sessions keep independent copies even for identical ids. Per-session directory
+caches are
 evictable and generation-checked; no database-wide body map is built. Update
 caches only after COMMIT (D5). No clear id, prefix or keyed per-object tag is
 stored in SQL. As in the reference's lazy `pack.owner` lookup, opening one
@@ -454,31 +511,39 @@ SQL fence is required even with an in-process gate and `runtime.lock`.
 
 **Membership deletion, deferred purge and receipt.** Clear only the written
 domain/session's bits, deduplicating repeated release ids. Read authority ends
-immediately, including on cache hits. For each touched sealed pack, compute
-`dead_bytes / retained_body_bytes` from canonical encoded lengths of unheld slots
+immediately, including on cache hits. A slot is dead when no domain of the
+session holds it. For each touched sealed pack, compute
+`dead_bytes / retained_body_bytes` from canonical encoded lengths of dead slots
 and all physically retained slots, before compression/sealing. Below **25%**,
 leave the ciphertext sealed and return zero for the deferred copies. The apply
 that reaches **25% or more** rewrites/reseals that pack without all dead slots,
-increments its generation and atomically remaps its membership bitmap; delete
-empty packs. An empty `(D, S)` scope purges all its dead bytes. Collection of a
-retired session scans all its domain-owned packs and forces the same purge even
-below 25%, including dead slots from prior applies with no newly released id.
-Held slots remain readable. These purges are mandatory with S2 off or on.
+increments its generation and atomically remaps every holder domain's bitmap
+from its own previous bits; delete empty packs and empty bitmap rows. When the
+written domain holds nothing left in the session, the apply purges all dead
+bytes of the session's packs. Collection of a retired session scans all the
+session's packs and forces the same purge even below 25%, including dead slots
+from prior applies with no newly released id. Slots held by any domain remain
+readable to that domain. These purges are mandatory with S2 off or on.
 
 Return the exact physical copy count and sum of original canonical encoded
 lengths removed in this acknowledged apply, including previously deferred slots,
-once per copy. Independent session/domain copies are counted independently.
+once per copy. A shared copy counts once, in the apply that removes it; a
+release while another domain still holds the slot counts zero. Separate session
+copies are counted independently.
 Merely clearing bits, re-admitting a retained slot, moving live bodies and
 reclaiming SQLite pages count zero. Optional maintenance does not silently remove
 deferred bodies outside this receipt path; deletion cleanup is separately
 accounted because it is outside apply (D8).
 
 **Retained-byte evidence.** Implement `retained_bytes(domain) -> Some(bytes)` as
-the sum of canonical body lengths still physically stored in that domain's
-owned session packs, including deferred dead slots, each copy once. Maintain
-the per-pack retained-byte count atomically and verify it on pack decode; use a
-consistent read snapshot. Since Forge does not share across domains, the other
-domain's copies are excluded. This diagnostic does not include metadata,
+the trait defines it for a sharing scope: the sum of canonical body lengths still
+physically stored in the packs of every session in which that domain has a
+session record or membership, including deferred dead slots, each copy once.
+Shared copies therefore appear in both domains' diagnostics; the two values are
+not additive. Maintain the per-pack retained-byte count atomically and verify it
+on pack decode; use a consistent read snapshot. `byte_stats` reports live bytes
+as slots held by any domain of those sessions and deferred bytes as slots held by
+none, so live + deferred = retained. This diagnostic does not include metadata,
 operation records, ciphertext overhead or SQLite pages, never grants read
 authority and never decides liveness. GC evidence compares its before/after
 difference with physical apply receipts, so deferred bytes cannot disappear from
@@ -499,8 +564,10 @@ packs below 64 KiB**, or fully live survivor packs already purged by that apply.
 Stable large packs and packs containing deferred dead slots stay sealed; merging
 the latter could concentrate dead bytes above 25% in an output pack. Terminal
 equal-tier merges likewise select fully live inputs and only merge a pair whose
-combined logical bytes fit the 1 MiB cap. Every move remaps the owning `(D, S)`
-bitmap atomically, without touching another scope.
+combined logical bytes fit the 1 MiB cap. "Fully live" means every slot is held
+by at least one domain. Every move remaps each holder domain's bitmap of the
+owning session atomically from that domain's own previous bits, without touching
+another session.
 
 The rt-e7 measurements exercise collection per turn and show bounded pack writes
 instead of the earlier whole-history rewrite behavior (D8). Retain the per-turn
@@ -662,14 +729,14 @@ self dev-dependencies, or a test-local support module.
 Run all reference configurations: (1) S2 repacking disabled, (2) enabled,
 (3) storage reopened on every engine hydration over the same file, plus fresh
 engine recovery. Every production-storage configuration declares PerSession with
-independent domain copies; disabling S2 never disables threshold/retirement
+within-session domain sharing; disabling S2 never disables threshold/retirement
 purges. Collection disabled/enabled and arbitrary ordinary policies are
 covered by the suite; exercise cold/evicted/warm R4 budgets in Forge tests. Do not
 replace file-backed restart evidence with only `sqlite::memory:` tests.
 
 The suite includes primitive apply cuts, revision/epoch/control-generation fences,
 opaque metadata/body conflicts, ordered dirty paging, membership isolation and scope-dependent
-receipts, independently reclaimable session/domain copies, bounded deferred
+receipts, independently reclaimable session copies, bounded deferred
 deletion and exact cumulative receipts on scope emptying; protected/ordinary
 journal suites;
 collection, ordinary shared suffix and projected intent; and unsupported
@@ -699,10 +766,11 @@ The v0.9.0 follow-up adds the eighth control, NonRetryableLostAck. Its suite has
 body-cache membership, full-id lookup and exact membership enumeration.
 
 For the premature-deletion decorator, deliberately damage the surviving scope's
-independent copy; a correct PerSession release in A must never be labeled faulty
-just because B holds the same id. Add Forge-specific assertions that two domains
-and two sessions retain separate copies and can each reclaim them, while every
-remaining holder opens successfully. GC byte evidence uses Forge's
+copy; a correct PerSession release in A must never be labeled faulty just because
+B holds the same id. Add Forge-specific assertions that two sessions retain
+separate copies and can each reclaim them, that two domains of one session share
+one copy that survives one domain's release and is removed only after both
+release, and that every remaining holder opens successfully. GC byte evidence uses Forge's
 `retained_bytes`, including unserved deferred bytes. Do not force Global receipt
 expectations on this adapter or add a Global product mode.
 
@@ -859,7 +927,8 @@ It must not label that healthy candidate unreadable or bypass dependency safety.
 Project/Agent/chat deletion cascades per-session metadata and memberships. After
 commit, nudge bounded physical cleanup to remove **all** packs owned by the
 deleted Forge session, including below-threshold deferred bytes; no other
-domain/session can hold those packs. Find owner/orphan candidates without
+session can hold those packs, and both domains' memberships cascade with the
+`agent_session` row. Find owner/orphan candidates without
 decryption in pages of up to 5,000 pack ids. A candidate has a deleted owner or no
 membership row; recheck ownership and absence of membership under the write lock
 before deleting. Delete at most 32 packs or 8 MiB of retained canonical bytes per
@@ -944,8 +1013,9 @@ and VACUUM. Largest collection write is the largest per-domain collect-call
 counter delta. Final physical sizes include all persisted tables after
 checkpoint/VACUUM and empty-schema subtraction. These are measured SQLite/zstd
 S1–S5 results with modeled seal lengths, **not Forge integration or real AEAD**.
-The reference also shares equal bodies between a session's domains while Forge
-does not; do not project its ratio onto Forge. Forge must still pass D10 through
+The reference shares equal bodies between a session's domains; Forge does too
+since the 2026-10-21 amendment, but the reference's numbers still do not
+substitute for Forge's own measurement. Forge must still pass D10 through
 production storage. A's tiny-message overhead stays report-only; schema 5 stays
 out of scope.
 
@@ -993,9 +1063,9 @@ text and 0.5–8 KiB tool JSON, N=100/1000/4000, plain and tool two-turn shapes;
 C grows to 1000 messages over 250 tool turns with a new writer per turn and a
 32-manifest window; report the supplemental N=4000/1000-writer-epoch shape too.
 Do not tune the seed/content to the gate. Record the ordinary projection and
-independent-domain-copy policy; report an identity-policy diagnostic for
+the within-session domain sharing policy; report an identity-policy diagnostic for
 comparison with rt-e7 without making identity the production policy or treating
-the reference's within-session domain sharing as Forge's layout.
+the reference's modeled sealing as Forge's real AEAD.
 
 For each case, create isolated file DBs with the same Forge schema/session setup:
 
@@ -1070,9 +1140,15 @@ not claim Forge has run or passed it.
   unsupported as today; key_revision is recorded on every sealed unit.
 - Lazy import temporarily retains old and new bytes. Disk reports show that peak
   separately; next-release cleanup is required to remove the legacy table.
-- Independent domain/session copies can cost more disk than the reference's
-  within-session domain sharing; D10 measures that cost through Forge's actual
-  storage. No global index is required by the amended runtime conformance.
+- Within-session domain sharing (2026-10-21) removes the ordinary domain's
+  duplicate copies; separate sessions still keep independent copies and D10
+  measures the result through Forge's actual storage. No global index is
+  required by the amended runtime conformance. Shared packs are session-sealed:
+  domain authority over a shared slot is the clear membership bitmap, and bitmap
+  overlap reveals how much protected content also appears in ordinary. A local
+  file writer could grant an ordinary bit on a protected-only slot. All three are
+  accepted under the existing local-attacker scope (D3); admission still requires
+  the ordinary engine to present the exact projected bytes.
 - Deferred dead bytes must remain unreadable and counted in retained-byte
   diagnostics until a threshold/retirement/deletion purge. Atomic remaps, exact
   physical receipts and every conformance configuration gate this behavior.

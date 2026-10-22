@@ -64,26 +64,33 @@ Full object ids SHALL remain inside sealed payloads and rebuildable RAM lookup m
 - **WHEN** a pack prefix collides with another object's prefix or ciphertext is moved to a different authenticated row key
 - **THEN** the reader verifies the complete runtime object id and refuses a missing/mismatched id
 - **AND** a row-binding/authentication failure fails closed rather than opening a fresh session
-- **AND** AAD binds unit kind, pack id, generation and owning domain/runtime-session key, using distinct HKDF-derived AEAD and lookup keys
+- **AND** pack units bind unit kind, pack id, generation, runtime session and Forge owner label; metadata units bind their full domain/runtime-session key; distinct HKDF-derived AEAD and lookup keys are used
 
 #### Scenario: No credential reaches the journal
 - **WHEN** a session runs a tool turn and refreshes an OAuth credential
 - **THEN** no decrypted pack, session, operation, catalog or pin payload contains the API key, access token or refresh token
 
 ### Requirement: Six-table pack layout and lossless storage records
-Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and operation_pack tables as described in design D4, without per-object body/offset rows. Per-session metadata/membership rows SHALL be keyed by the runtime session id the trait receives and SHALL carry an indexed `forge_session_id` foreign key that cascades from `agent_session`; an apply whose runtime id maps to no or several `agent_session` rows SHALL fail with a typed host error and write nothing. Packs SHALL have strict domain/runtime-session ownership and an indexed Forge owner label without a cascading owner FK, permitting bounded deletion cleanup. JournalEngineState SHALL round-trip version and bytes opaquely; Forge SHALL implement every JournalStorage read method, ordered dirty paging and apply/compact. Each pack SHALL hold a separately sealed prefix/varint offset index unit and a sealed zstd body unit of kind-ordered canonical bodies, with full-id verification and no runtime schema-5 change. Storage SHALL declare `JournalBodySharing::PerSession`, deduplicate only within `(storage_id, role, runtime_session_id)`, and keep independent copies across sessions and across the two domains. Storage open SHALL decode no pack units; lookup directories SHALL load lazily for the requested scope only. Pack ids SHALL never be reused.
+Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and operation_pack tables as described in design D4, without per-object body/offset rows. Per-session metadata/membership rows SHALL be keyed by the runtime session id the trait receives and SHALL carry an indexed `forge_session_id` foreign key that cascades from `agent_session`; an apply whose runtime id maps to no or several `agent_session` rows SHALL fail with a typed host error and write nothing. Packs SHALL have strict runtime-session ownership, per-domain membership bitmaps and an indexed Forge owner label without a cascading owner FK, permitting bounded deletion cleanup. JournalEngineState SHALL round-trip version and bytes opaquely; Forge SHALL implement every JournalStorage read method, ordered dirty paging and apply/compact. Each pack SHALL hold a separately sealed prefix/varint offset index unit and a sealed zstd body unit of kind-ordered canonical bodies, with full-id verification and no runtime schema-5 change. Storage SHALL declare `JournalBodySharing::PerSession`, deduplicate only within one runtime session, store an identical immutable body once for both domains of that session with independent memberships, and keep independent copies across sessions. A domain SHALL gain membership of a body only by admitting its complete, byte-identical canonical bytes. Storage open SHALL decode no pack units; lookup directories SHALL load lazily for the requested session only. Pack ids SHALL never be reused.
 
 #### Scenario: Batch admission and lookup after restart
 - **WHEN** an apply admits a batch of new bodies and storage is reopened
 - **THEN** the final new bodies occupy a compressed/sealed pack with bitmap memberships
-- **AND** only the requested domain/session's lookup directory is rebuilt lazily from its sealed index units, with candidate body units opened as needed for full-id verification
-- **AND** unrelated sessions' packs and the other domain's packs are not decoded or searched for admission
+- **AND** only the requested session's lookup directory is rebuilt lazily from its sealed index units, with candidate body units opened as needed for full-id verification
+- **AND** unrelated sessions' packs are not decoded or searched for admission
 - **AND** unknown opaque engine-state versions/bytes are returned unchanged
 
-#### Scenario: Independent session and domain copies
-- **WHEN** a session/domain admits a body stored only in another session or domain, including after cache eviction or storage reopen
-- **THEN** it writes its own physical copy without looking up the other scope's body
-- **AND** reclaiming that copy does not wait for the other scope's membership or affect its readability
+#### Scenario: Independent session copies
+- **WHEN** a session admits a body stored only in another session, including after cache eviction or storage reopen
+- **THEN** it writes its own physical copy without looking up the other session's body
+- **AND** reclaiming that copy does not wait for the other session's membership or affect its readability
+
+#### Scenario: Shared copy between a session's domains
+- **WHEN** the ordinary domain admits a body byte-identical to one the protected domain of the same session already stores
+- **THEN** no second physical copy is written and the ordinary domain gains its own membership bit on the existing slot
+- **AND** releasing it in one domain leaves it readable to the other domain with a zero receipt, and it is removed and counted once only after both domains release it
+- **AND** a body only the protected domain admitted is never readable through the ordinary domain, including after purge rewrites and merges
+- **AND** a corrupt shared pack fails closed for that session only
 
 #### Scenario: Same-scope re-admission
 - **WHEN** an apply admits an identical body already retained in its domain/session pack, including an unserved deferred slot
@@ -104,7 +111,7 @@ Forge SHALL create session-record, pin, catalog, pack, bitmap-membership and ope
 ### Requirement: Atomic fenced apply with deletion receipts
 Every JournalWrite SHALL run in one sqlx BEGIN IMMEDIATE transaction on one connection, preserving the runtime's ordered cut points, all memberships, pin/catalog changes, replacement record and operation packs. SQL SHALL enforce all three `JournalFence` fields (revision, writer_epoch, generation) inside that transaction for every write, including controls preserving revision/epoch; absence SHALL match only the all-zero fence. Every write SHALL carry a required replacement session record with generation exactly expect.generation + 1; overflow or a non-successor generation SHALL conflict atomically. The session generation SHALL be persisted independently of pack generations. A mismatch SHALL be a typed runtime state conflict with no effects; other ambiguous errors SHALL invalidate caches for reload. Every ambiguous COMMIT/lost acknowledgement SHALL be retryable, as SHALL SQLx SQLite BUSY/LOCKED (including extended codes) and infrastructure availability failures. A non-retryable apply error SHALL leave no durable effect.
 
-Releases SHALL end membership read authority immediately. A sealed pack MAY retain dead bodies below 25% of its physically retained canonical body bytes, never serving them; the apply reaching 25% or more SHALL purge all its dead slots transactionally. An empty domain/session scope and collection of a retired session SHALL purge all that scope's dead bytes, including earlier deferred bytes without new release ids. Purges SHALL run even with optional S2 merging disabled. JournalApplyReceipt SHALL count physical body copies and their original canonical encoded lengths before compression/sealing exactly once at removal time, including previously deferred bodies. Clearing bits, moving live bodies or reclaiming SQLite pages SHALL count zero. Forge SHALL return `Some` from `retained_bytes(domain)` with canonical bytes physically retained in that domain's session packs, including deferred dead bodies; this diagnostic SHALL NOT control liveness or stand for file size. When a session is unreadable, diagnostics SHALL skip and log that session; byte_stats SHALL expose the skipped-session count and readable-only byte totals rather than pretending to report a complete domain size.
+Releases SHALL end membership read authority immediately. A sealed pack MAY retain dead bodies below 25% of its physically retained canonical body bytes, never serving them; the apply reaching 25% or more SHALL purge all its dead slots transactionally. A slot SHALL be dead only when no domain of its session holds it. A domain releasing its last member in a session and collection of a retired session SHALL purge all of that session's dead bytes, including earlier deferred bytes without new release ids. Purges SHALL run even with optional S2 merging disabled. JournalApplyReceipt SHALL count physical body copies and their original canonical encoded lengths before compression/sealing exactly once at removal time, including previously deferred bodies. Clearing bits, moving live bodies or reclaiming SQLite pages SHALL count zero. Forge SHALL return `Some` from `retained_bytes(domain)` with canonical bytes physically retained in the packs of the sessions that domain participates in, including deferred dead bodies and copies shared with the other domain; this diagnostic SHALL NOT control liveness or stand for file size. When a session is unreadable, diagnostics SHALL skip and log that session; byte_stats SHALL expose the skipped-session count and readable-only byte totals rather than pretending to report a complete domain size.
 
 #### Scenario: Failure before publication
 - **WHEN** any pre-commit JournalCommitFailurePoint is injected
@@ -143,7 +150,7 @@ Releases SHALL end membership read authority immediately. A sealed pack MAY reta
 #### Scenario: Retired or empty scope forces removal
 - **WHEN** a scope empties or collection runs for a retired session with below-threshold deferred dead bytes
 - **THEN** all dead bytes in its owned packs are purged, including slots not named by a new release
-- **AND** the removing apply returns their physical-copy receipt while independently held copies in other scopes stay readable
+- **AND** the removing apply returns their physical-copy receipt while slots another domain still holds, and other sessions' copies, stay readable
 
 ### Requirement: Engine replay window with packed original results
 Forge SHALL store lossless operation records in binary-carry operation packs capped at 1 MiB of serialized records before compression/sealing, with bounded overflow segments and atomic rejection of an oversized record, and let the engine select pruning only during collection. Import and prune/rebuild output SHALL obey the same cap. When the engine supplies `prune_operations_before = floor` (current revision minus 64, saturating), storage SHALL keep, within that domain and session only, every record whose revision is at or above the floor plus the single record with the highest revision whose result writer epoch equals the session record's writer epoch after the write; it SHALL prune every other record below the floor and SHALL NOT prune without the directive. Identical retained replays SHALL return the original head, different inputs SHALL conflict, and pruned replays SHALL conflict without applying again.
@@ -196,7 +203,7 @@ Host existence, hand-over and checkpoint probes SHALL use scalar native metadata
 - **AND** current-thread and multi-thread workers remain able to make progress
 
 ### Requirement: Real-storage conformance and negative controls
-Forge SHALL run assert_journal_storage_conformance unedited over production ForgeJournalStorage with repacking off, on, and storage reopened per hydration, real sealing and file-backed restart. Every configuration SHALL declare PerSession with independent domain copies and retain mandatory threshold/retirement purges. Scope-aware receipts, remaining-holder readability, non-member isolation and bounded deferred deletion/retained-byte evidence SHALL all pass. Forge SHALL also retain equivalence/import/crash coverage through JournalCommitFailurePoint::ALL and the real legacy decoder schema guard. All seven upstream broken-storage fault shapes SHALL be tested over Forge-backed decorators and rejected at their named cases; private upstream test adapters SHALL NOT be assumed exported.
+Forge SHALL run assert_journal_storage_conformance unedited over production ForgeJournalStorage with repacking off, on, and storage reopened per hydration, real sealing and file-backed restart. Every configuration SHALL declare PerSession with within-session domain sharing and retain mandatory threshold/retirement purges. Scope-aware receipts, remaining-holder readability, non-member isolation and bounded deferred deletion/retained-byte evidence SHALL all pass. Forge SHALL also retain equivalence/import/crash coverage through JournalCommitFailurePoint::ALL and the real legacy decoder schema guard. All seven upstream broken-storage fault shapes SHALL be tested over Forge-backed decorators and rejected at their named cases; private upstream test adapters SHALL NOT be assumed exported.
 
 #### Scenario: All configurations and policies
 - **WHEN** Forge's named storage conformance wrappers run
