@@ -92,10 +92,13 @@ impl<S: JournalStorage> JournalStorage for Metered<S> {
         self.inner.dirty_sessions(d, after, limit).await
     }
     async fn apply(&self, w: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
-        let op = w
-            .operation
-            .clone()
-            .map(|op| (w.domain.clone(), w.session.clone(), op));
+        let op = if crate::profile::clean() {
+            None
+        } else {
+            w.operation
+                .clone()
+                .map(|op| (w.domain.clone(), w.session.clone(), op))
+        };
         let count = w.objects.objects.len() as u64;
         let bytes = w
             .objects
@@ -104,7 +107,7 @@ impl<S: JournalStorage> JournalStorage for Metered<S> {
             .map(|o| o.bytes.len() as u64)
             .sum::<u64>();
         let receipt = self.inner.apply(w).await?;
-        if let Some(op) = op {
+        if let Some(op) = op.filter(|_| !crate::profile::clean()) {
             self.operations.lock().unwrap().push(op);
         }
         self.admitted_objects

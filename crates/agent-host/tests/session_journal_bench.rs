@@ -107,9 +107,27 @@ impl Native {
             // Production max_objects is a membership-release bound. Sweep until
             // the durable dirty index is empty, never cancel an engine call.
             loop {
-                let before = writes(self.file.database().pool()).await.packs();
-                rewrite_phase(self.file.database().pool(), true).await;
+                let before = if profile::clean() {
+                    0
+                } else {
+                    writes(self.file.database().pool()).await.packs()
+                };
+                if !profile::clean() {
+                    rewrite_phase(self.file.database().pool(), true).await;
+                }
+                let collect_before = forge_agent_host::session_journal::profile::snapshot();
                 let start = Instant::now();
+                let collect_profile = forge_agent_host::session_journal::profile::timer(
+                    format!(
+                        "host.collect.{}",
+                        if engine.storage_id() == self.protected.storage_id() {
+                            "protected"
+                        } else {
+                            "ordinary"
+                        }
+                    ),
+                    0,
+                );
                 let report = engine
                     .collect(JournalGcRequest {
                         storage_id: engine.storage_id(),
@@ -119,8 +137,24 @@ impl Native {
                     .await
                     .unwrap();
                 let elapsed = start.elapsed().as_micros() as u64;
-                rewrite_phase(self.file.database().pool(), false).await;
-                let written = writes(self.file.database().pool()).await.packs() - before;
+                drop(collect_profile);
+                profile::collect_sample(
+                    if engine.storage_id() == self.protected.storage_id() {
+                        "protected"
+                    } else {
+                        "ordinary"
+                    },
+                    elapsed,
+                    collect_before,
+                );
+                if !profile::clean() {
+                    rewrite_phase(self.file.database().pool(), false).await;
+                }
+                let written = if profile::clean() {
+                    0
+                } else {
+                    writes(self.file.database().pool()).await.packs()
+                } - before;
                 assert!(report.unreadable_sessions.is_empty());
                 {
                     let mut m = self.maintenance.lock().unwrap();
@@ -186,18 +220,35 @@ impl CheckpointStore for Native {
 #[async_trait]
 impl TerminalMaintenance for Native {
     async fn terminal(&self, id: &SessionId) {
-        let before = writes(self.file.database().pool()).await.packs();
-        rewrite_phase(self.file.database().pool(), true).await;
+        let before = if profile::clean() {
+            0
+        } else {
+            writes(self.file.database().pool()).await.packs()
+        };
+        if !profile::clean() {
+            rewrite_phase(self.file.database().pool(), true).await;
+        }
+        let s2_profile = forge_agent_host::session_journal::profile::timer("host.s2", 0);
         for (_, domain) in self.domains() {
             self.raw.post_terminal(&domain, id).await.unwrap();
         }
-        rewrite_phase(self.file.database().pool(), false).await;
-        self.maintenance.lock().unwrap().s2_pack_bytes +=
-            writes(self.file.database().pool()).await.packs() - before;
+        drop(s2_profile);
+        if !profile::clean() {
+            rewrite_phase(self.file.database().pool(), false).await;
+        }
+        self.maintenance.lock().unwrap().s2_pack_bytes += if profile::clean() {
+            0
+        } else {
+            writes(self.file.database().pool()).await.packs()
+        } - before;
         if self.per_turn.load(Ordering::Relaxed) {
             self.collect().await;
         }
-        let total = writes(self.file.database().pool()).await.packs();
+        let total = if profile::clean() {
+            0
+        } else {
+            writes(self.file.database().pool()).await.packs()
+        };
         self.maintenance
             .lock()
             .unwrap()
@@ -205,7 +256,11 @@ impl TerminalMaintenance for Native {
             .push(total);
     }
     async fn sample_wal(&self) -> u64 {
-        wal(self.file.database().pool()).await
+        if profile::clean() {
+            0
+        } else {
+            wal(self.file.database().pool()).await
+        }
     }
 }
 #[derive(Debug)]
@@ -240,11 +295,19 @@ impl CheckpointStore for Legacy {
 #[async_trait]
 impl TerminalMaintenance for Legacy {
     async fn terminal(&self, _: &SessionId) {
-        let total = writes(self.file.database().pool()).await.legacy_bytes as u64;
+        let total = if profile::clean() {
+            0
+        } else {
+            writes(self.file.database().pool()).await.legacy_bytes as u64
+        };
         self.turn_bytes.lock().unwrap().push(total);
     }
     async fn sample_wal(&self) -> u64 {
-        wal(self.file.database().pool()).await
+        if profile::clean() {
+            0
+        } else {
+            wal(self.file.database().pool()).await
+        }
     }
 }
 fn open(label: &str) -> JournalOpen {
@@ -348,6 +411,7 @@ async fn cold_warm(file: &FileDb, id: &SessionId) -> Value {
         let mut hits = 0;
         let mut misses = 0;
         for phase in ["cold", "warm"] {
+            profile::phase(&format!("{phase}.{role}"), 0);
             meter.take();
             let start = Instant::now();
             let lease = engine.open(id, open(phase)).await.unwrap();
@@ -733,6 +797,7 @@ impl SessionJournal for Observed {
         self.inner.storage_id()
     }
     async fn open(&self, s: &SessionId, r: JournalOpen) -> Result<JournalLease, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.open", 0);
         let before = self.meter.reads();
         let start = Instant::now();
         let result = self.inner.open(s, r).await;
@@ -741,6 +806,7 @@ impl SessionJournal for Observed {
         result
     }
     async fn read(&self, l: &JournalLease, id: &JournalObjectId) -> Result<Vec<u8>, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.read", 0);
         self.inner.read(l, id).await
     }
     fn begin_read<'a>(
@@ -754,12 +820,15 @@ impl SessionJournal for Observed {
         l: &JournalLease,
         c: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.commit", 0);
         self.inner.commit(l, c).await
     }
     async fn renew(&self, l: &JournalLease) -> Result<JournalLease, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.renew", 0);
         self.inner.renew(l).await
     }
     async fn close(&self, l: JournalLease) -> Result<(), RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.close", 0);
         self.inner.close(l).await
     }
     async fn retire(
@@ -767,9 +836,11 @@ impl SessionJournal for Observed {
         s: &SessionId,
         r: JournalRevision,
     ) -> Result<JournalRetirement, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.retire", 0);
         self.inner.retire(s, r).await
     }
     async fn collect(&self, r: JournalGcRequest) -> Result<JournalGcReport, RuntimeError> {
+        let _profile = forge_agent_host::session_journal::profile::timer("engine.collect", 0);
         self.inner.collect(r).await
     }
 }
@@ -847,3 +918,6 @@ async fn scoped_and_dirty() -> Value {
     }
     json!({"unrelated_sessions":100,"storage_construction_us":construction_us,"construction_decodes":0,"target_scope_pack_count":own_packs,"all_pack_count":all_packs,"target_members":members.len(),"lazy_hydration_us":hydration_us,"cache_after_target":cache,"one_byte_cache":oversize,"bounded_cache_after_100_scopes":bounded,"dirty_sessions_per_domain":dirty,"collect_100_dirty":collect,"cold_validation_with_unrelated":cold_warm(&file,&id).await,"peak_process_rss_bytes":rss_bytes()})
 }
+
+#[path = "support/bench_profile.rs"]
+mod profile;

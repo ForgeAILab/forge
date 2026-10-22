@@ -149,6 +149,8 @@ impl ForgeJournalStorage {
         &self,
         job: impl FnOnce() -> Result<T, RuntimeError> + Send + 'static,
     ) -> Result<T, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("work.await", 0);
         let permit = self
             .cpu
             .clone()
@@ -157,6 +159,8 @@ impl ForgeJournalStorage {
             .map_err(|_| RuntimeError::internal("journal codec unavailable").retryable())?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            #[cfg(feature = "test-support")]
+            let _profile = super::profile::timer("work.cpu", 0);
             job()
         })
         .await
@@ -237,8 +241,8 @@ impl ForgeJournalStorage {
         domain: &JournalDomain,
         session: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
-        let row=sqlx::query("SELECT * FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_optional(&mut *conn).await.map_err(database_error)?;
+        let row={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT * FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?")
+            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_optional(&mut *conn).await }.map_err(database_error)?;
         match row {
             Some(row) => Ok(Some(self.record_row(domain, session, row).await?)),
             None => Ok(None),
@@ -261,9 +265,11 @@ impl ForgeJournalStorage {
         publish: bool,
         prior: Option<Arc<ScopeDirectory>>,
     ) -> Result<Vec<PackView>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.directory_from", 0);
         let (domain, session) = scope;
-        let rows=sqlx::query("SELECT p.pack_id,p.generation,p.object_count,p.retained_canonical_bytes,p.forge_session_id,p.key_revision,p.format,m.bitmap FROM agent_session_journal_pack p LEFT JOIN agent_session_journal_membership m ON m.pack_id=p.pack_id AND m.storage_id=p.storage_id AND m.role=p.role AND m.runtime_session_id=p.runtime_session_id AND m.forge_session_id=p.forge_session_id WHERE p.storage_id=? AND p.role=? AND p.runtime_session_id=? ORDER BY p.pack_id")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *conn).await.map_err(database_error)?;
+        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT p.pack_id,p.generation,p.object_count,p.retained_canonical_bytes,p.forge_session_id,p.key_revision,p.format,m.bitmap FROM agent_session_journal_pack p LEFT JOIN agent_session_journal_membership m ON m.pack_id=p.pack_id AND m.storage_id=p.storage_id AND m.role=p.role AND m.runtime_session_id=p.runtime_session_id AND m.forge_session_id=p.forge_session_id WHERE p.storage_id=? AND p.role=? AND p.runtime_session_id=? ORDER BY p.pack_id")
+            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
         let cached = match prior {
             Some(p) => p,
             None => self.cache_lock()?.directory(scope).unwrap_or_default(),
@@ -318,11 +324,12 @@ impl ForgeJournalStorage {
                 separated.push_bind(*id);
             }
             separated.push_unseparated(")");
-            let rows = q
-                .build()
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(database_error)?;
+            let rows = {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+                q.build().fetch_all(&mut *conn).await
+            }
+            .map_err(database_error)?;
             self.cache_lock()?.pack_queries += 1;
             let jobs: Vec<_> = rows
                 .into_iter()
@@ -395,6 +402,8 @@ impl ForgeJournalStorage {
         wanted: &BTreeSet<i64>,
         publish: bool,
     ) -> Result<Bodies, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.bodies", 0);
         let mut bodies = BTreeMap::new();
         let mut missing = Vec::new();
         let view_map: BTreeMap<_, _> = views
@@ -418,11 +427,12 @@ impl ForgeJournalStorage {
                 separated.push_bind(*id);
             }
             separated.push_unseparated(")");
-            let rows = q
-                .build()
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(database_error)?;
+            let rows = {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+                q.build().fetch_all(&mut *conn).await
+            }
+            .map_err(database_error)?;
             self.cache_lock()?.pack_queries += 1;
             let jobs: Vec<_> = rows
                 .into_iter()
@@ -554,6 +564,8 @@ impl JournalStorage for ForgeJournalStorage {
         session: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
         #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.load", 0);
+        #[cfg(feature = "test-support")]
         if domain.role == JournalRole::Protected
             && self
                 .failed_commit_observation
@@ -569,9 +581,19 @@ impl JournalStorage for ForgeJournalStorage {
                 RuntimeError::internal("injected acceptance observation failure").retryable(),
             );
         }
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let result = self.load_on(&mut tx, domain, session).await?;
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(result)
     }
     async fn objects(
@@ -580,10 +602,17 @@ impl JournalStorage for ForgeJournalStorage {
         session: &SessionId,
         ids: &[JournalObjectId],
     ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.objects", 0);
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let views = self
             .directory(&mut tx, &(domain.clone(), session.clone()), true)
             .await?;
@@ -615,7 +644,12 @@ impl JournalStorage for ForgeJournalStorage {
             }
             results.push(found);
         }
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(results)
     }
     async fn members(
@@ -623,7 +657,14 @@ impl JournalStorage for ForgeJournalStorage {
         domain: &JournalDomain,
         session: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.members", 0);
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let views = self
             .directory(&mut tx, &(domain.clone(), session.clone()), true)
             .await?;
@@ -643,7 +684,12 @@ impl JournalStorage for ForgeJournalStorage {
                 }
             }
         }
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(members.into_iter().collect())
     }
     async fn operation(
@@ -652,11 +698,23 @@ impl JournalStorage for ForgeJournalStorage {
         session: &SessionId,
         operation: &JournalOperationId,
     ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.operation", 0);
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let result = self
             .operation_on(&mut tx, domain, session, operation)
             .await?;
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(result)
     }
     async fn pins(
@@ -664,9 +722,16 @@ impl JournalStorage for ForgeJournalStorage {
         domain: &JournalDomain,
         session: &SessionId,
     ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
-        let rows=sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *tx).await.map_err(database_error)?;
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.pins", 0);
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
+        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=?")
+            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *tx).await }.map_err(database_error)?;
         let mut pins = Vec::new();
         for row in rows {
             self.revision(&row)?;
@@ -701,7 +766,12 @@ impl JournalStorage for ForgeJournalStorage {
             );
         }
         pins.sort_by(|a, b| a.pin.cmp(&b.pin));
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(pins)
     }
     async fn catalog(
@@ -710,12 +780,19 @@ impl JournalStorage for ForgeJournalStorage {
         session: &SessionId,
         head: &JournalObjectId,
     ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.catalog", 0);
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let key = self
             .keys
             .lookup(Unit::Catalog, domain, session, &head.to_bytes());
-        let row=sqlx::query("SELECT * FROM agent_session_journal_catalog WHERE storage_id=? AND role=? AND runtime_session_id=? AND head_key=?")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).bind(&key).fetch_optional(&mut *tx).await.map_err(database_error)?;
+        let row={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT * FROM agent_session_journal_catalog WHERE storage_id=? AND role=? AND runtime_session_id=? AND head_key=?")
+            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).bind(&key).fetch_optional(&mut *tx).await }.map_err(database_error)?;
         let result = if let Some(row) = row {
             self.revision(&row)?;
             let keys = self.keys.clone();
@@ -750,7 +827,12 @@ impl JournalStorage for ForgeJournalStorage {
         } else {
             None
         };
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(result)
     }
     async fn dirty_sessions(
@@ -759,12 +841,19 @@ impl JournalStorage for ForgeJournalStorage {
         after: Option<&SessionId>,
         limit: usize,
     ) -> Result<Vec<SessionId>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("storage.dirty_sessions", 0);
         if limit == 0 {
             return Ok(vec![]);
         }
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
-        let rows=sqlx::query("SELECT runtime_session_id FROM agent_session_journal_session WHERE storage_id=? AND role=? AND collection_dirty=1 AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT ?")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(after.map(SessionId::as_str)).bind(after.map(SessionId::as_str)).bind(i64::try_from(limit).unwrap_or(i64::MAX)).fetch_all(&mut *tx).await.map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
+        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT runtime_session_id FROM agent_session_journal_session WHERE storage_id=? AND role=? AND collection_dirty=1 AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT ?")
+            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(after.map(SessionId::as_str)).bind(after.map(SessionId::as_str)).bind(i64::try_from(limit).unwrap_or(i64::MAX)).fetch_all(&mut *tx).await }.map_err(database_error)?;
         let mut sessions = Vec::new();
         for row in rows {
             let s = SessionId::new(
@@ -775,7 +864,12 @@ impl JournalStorage for ForgeJournalStorage {
             // authenticates each id once, isolating an unreadable session.
             sessions.push(s);
         }
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(sessions)
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {

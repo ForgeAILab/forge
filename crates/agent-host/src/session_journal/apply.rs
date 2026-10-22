@@ -59,6 +59,8 @@ impl ForgeJournalStorage {
         &self,
         write: JournalWrite,
     ) -> Result<JournalApplyReceipt, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("apply.apply_write", 0);
         let start = Instant::now();
         let scope = (write.domain.clone(), write.session.clone());
         let mut invalidation = InvalidateOnDrop {
@@ -96,14 +98,21 @@ impl ForgeJournalStorage {
                 Ok(())
             })
             .await?;
-            let mut tx = db::begin_immediate(self.db.pool())
-                .await
-                .map_err(database_error)?;
+            let mut tx = {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+                db::begin_immediate(self.db.pool()).await
+            }
+            .map_err(database_error)?;
             let locked = Instant::now();
             let staged = self.apply_on(&mut tx, &scope, &write).await;
             match staged {
                 Ok((next, applied_receipt)) => {
-                    let commit = tx.commit().await;
+                    let commit = {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+                        tx.commit().await
+                    };
                     hold_us = locked.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     match commit {
                         Ok(()) => {
@@ -122,7 +131,12 @@ impl ForgeJournalStorage {
                     }
                 }
                 Err(e) => {
-                    let rollback = tx.rollback().await;
+                    let rollback = {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile =
+                            crate::session_journal::profile::timer("sql.ROLLBACK", 0);
+                        tx.rollback().await
+                    };
                     hold_us = locked.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     match rollback {
                         Ok(()) => Err(e),
@@ -160,14 +174,16 @@ impl ForgeJournalStorage {
         scope: &Scope,
         write: &JournalWrite,
     ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("apply.apply_on", 0);
         // Full fence comparison is SQL, including the all-zero absent-record
         // case. BEGIN IMMEDIATE prevents a writer racing this absence guard.
-        let matches:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=? AND revision=? AND writer_epoch=? AND generation=?) OR (?=zeroblob(8) AND ?=zeroblob(8) AND ?=zeroblob(8) AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?))")
+        let matches:bool={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=? AND revision=? AND writer_epoch=? AND generation=?) OR (?=zeroblob(8) AND ?=zeroblob(8) AND ?=zeroblob(8) AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?))")
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str())
             .bind(write.expect.revision.0.to_be_bytes().as_slice()).bind(write.expect.writer_epoch.to_be_bytes().as_slice()).bind(write.expect.generation.to_be_bytes().as_slice())
             .bind(write.expect.revision.0.to_be_bytes().as_slice()).bind(write.expect.writer_epoch.to_be_bytes().as_slice()).bind(write.expect.generation.to_be_bytes().as_slice())
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str())
-            .fetch_one(&mut *conn).await.map_err(database_error)?;
+            .fetch_one(&mut *conn).await }.map_err(database_error)?;
         if !matches {
             return Err(conflict());
         }

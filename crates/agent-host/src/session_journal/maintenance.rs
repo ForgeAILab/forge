@@ -51,6 +51,8 @@ impl ForgeJournalStorage {
         scope: &Scope,
         selected: &[PackView],
     ) -> Result<Vec<i64>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("maintenance.merge_packs", 0);
         if selected.iter().any(|v| !v.fully_live()) {
             return Err(corrupt());
         }
@@ -91,6 +93,8 @@ impl ForgeJournalStorage {
         scope: &Scope,
         purged: &BTreeSet<i64>,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("maintenance.collection_repack", 0);
         if !self.repacking() {
             return Ok(());
         }
@@ -117,14 +121,19 @@ impl ForgeJournalStorage {
         domain: &JournalDomain,
         session: &SessionId,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("maintenance.post_terminal", 0);
         if !self.repacking() {
             return Ok(());
         }
         let started = Instant::now();
         let scope = (domain.clone(), session.clone());
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(database_error)?;
         let locked = Instant::now();
         let mut rewritten_packs = 0usize;
         let mut rewritten_bytes = 0usize;
@@ -163,9 +172,19 @@ impl ForgeJournalStorage {
         .await;
         // No transient directory/body is ever published by physical work.
         let result = match result {
-            Ok(()) => tx.commit().await.map_err(ambiguous_database_error),
+            Ok(()) => {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+                tx.commit().await
+            }
+            .map_err(ambiguous_database_error),
             Err(e) => {
-                tx.rollback().await.map_err(ambiguous_database_error)?;
+                {
+                    #[cfg(feature = "test-support")]
+                    let _sql_profile = crate::session_journal::profile::timer("sql.ROLLBACK", 0);
+                    tx.rollback().await
+                }
+                .map_err(ambiguous_database_error)?;
                 Err(e)
             }
         };
@@ -181,8 +200,8 @@ impl ForgeJournalStorage {
         // Keyset the original scopes; each write transaction touches only one.
         let mut after: Option<String> = None;
         loop {
-            let session: Option<String> = sqlx::query_scalar("SELECT runtime_session_id FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT 1")
-                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&after).bind(&after).fetch_optional(self.db.pool()).await.map_err(database_error)?;
+            let session: Option<String> = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT runtime_session_id FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND (? IS NULL OR runtime_session_id>?) ORDER BY runtime_session_id LIMIT 1")
+                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&after).bind(&after).fetch_optional(self.db.pool()).await }.map_err(database_error)?;
             let Some(session) = session else {
                 break;
             };
@@ -196,14 +215,18 @@ impl ForgeJournalStorage {
                 Err(error) => return Err(error),
                 Ok(_) => {}
             }
-            let upper: i64 = sqlx::query_scalar("SELECT coalesce(max(pack_id),0) FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=?")
-                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&session).fetch_one(self.db.pool()).await.map_err(database_error)?;
+            let upper: i64 = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT coalesce(max(pack_id),0) FROM agent_session_journal_pack WHERE storage_id=? AND role=? AND runtime_session_id=?")
+                .bind(domain.storage_id.as_str()).bind(role(domain)).bind(&session).fetch_one(self.db.pool()).await }.map_err(database_error)?;
             let mut cursor = 0;
             while cursor < upper {
                 let started = Instant::now();
-                let mut tx = db::begin_immediate(self.db.pool())
-                    .await
-                    .map_err(database_error)?;
+                let mut tx = {
+                    #[cfg(feature = "test-support")]
+                    let _sql_profile =
+                        crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+                    db::begin_immediate(self.db.pool()).await
+                }
+                .map_err(database_error)?;
                 let locked = Instant::now();
                 let mut bytes = 0;
                 let mut count = 0;
@@ -234,9 +257,20 @@ impl ForgeJournalStorage {
                 }
                 .await;
                 let result = match result {
-                    Ok(()) => tx.commit().await.map_err(ambiguous_database_error),
+                    Ok(()) => {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+                        tx.commit().await
+                    }
+                    .map_err(ambiguous_database_error),
                     Err(e) => {
-                        tx.rollback().await.map_err(ambiguous_database_error)?;
+                        {
+                            #[cfg(feature = "test-support")]
+                            let _sql_profile =
+                                crate::session_journal::profile::timer("sql.ROLLBACK", 0);
+                            tx.rollback().await
+                        }
+                        .map_err(ambiguous_database_error)?;
                         Err(e)
                     }
                 };

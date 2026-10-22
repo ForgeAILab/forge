@@ -8,6 +8,9 @@ impl SqliteProtectedRuntimeStore {
         &self,
         snapshot: &SessionSnapshot,
     ) -> Result<String, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            crate::session_journal::profile::timer("legacy_baseline.legacy_snapshot_digest", 0);
         // Runtime snapshots stamp the clock on every call, even without a state change.
         // Diagnostic manifests are a bounded recent window and are omitted from
         // new protected checkpoints; neither belongs to canonical state identity.
@@ -27,15 +30,24 @@ impl SqliteProtectedRuntimeStore {
         &self,
         snapshot: &SessionSnapshot,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer(
+            "legacy_baseline.save_legacy_snapshot_baseline",
+            0,
+        );
         let forge_session_id = self.forge_session_id(&snapshot.id).await?;
         let digest = self.legacy_snapshot_digest(snapshot)?;
-        let row = sqlx::query(
-            "SELECT state_revision, snapshot_digest, key_revision, lcm_policy_revision
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT state_revision, snapshot_digest, key_revision, lcm_policy_revision
              FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(&forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(&forge_session_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| RuntimeError::internal("protected session load failed"))?;
         let expected_revision = row
             .as_ref()
@@ -64,8 +76,11 @@ impl SqliteProtectedRuntimeStore {
         }
         let bytes = serde_json::to_vec(snapshot)?;
         let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        let result = sqlx::query(
-            "INSERT INTO protected_agent_session_state (
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_agent_session_state (
                 session_id, snapshot_ciphertext, snapshot_nonce, snapshot_digest,
                 key_revision, lcm_policy_revision, state_revision, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
@@ -83,17 +98,18 @@ impl SqliteProtectedRuntimeStore {
                 state_revision = protected_agent_session_state.state_revision + 1,
                 updated_at = excluded.updated_at
              WHERE protected_agent_session_state.state_revision = ?",
-        )
-        .bind(forge_session_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(digest)
-        .bind(self.key_revision)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(db::now_rfc3339())
-        .bind(expected_revision)
-        .execute(self.db.pool())
-        .await
+            )
+            .bind(forge_session_id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(digest)
+            .bind(self.key_revision)
+            .bind(crate::FORGE_LCM_POLICY_REVISION)
+            .bind(db::now_rfc3339())
+            .bind(expected_revision)
+            .execute(self.db.pool())
+            .await
+        }
         .map_err(|_| RuntimeError::internal("protected session save failed"))?;
         if result.rows_affected() == 0 {
             // All SessionStore callers, including runtime lifecycle and turn
@@ -108,6 +124,11 @@ impl SqliteProtectedRuntimeStore {
         &self,
         checkpoint: &TurnCheckpoint,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer(
+            "legacy_baseline.save_legacy_checkpoint_baseline",
+            0,
+        );
         // Runtime callers propagate save errors into the turn. A competing save
         // is ordinary progress: reload once, then keep the winning state.
         for retry in [false, true] {
@@ -150,13 +171,17 @@ impl SqliteProtectedRuntimeStore {
         let forge_session_id = self.forge_session_id(&checkpoint.session).await?;
         let fingerprint = checkpoint.operation_fingerprint.to_string();
         let revision = i64::try_from(checkpoint.state_revision).unwrap_or(i64::MAX);
-        let row = sqlx::query(
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
             "SELECT state_revision, checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint
              FROM protected_agent_session_state WHERE session_id = ?",
         )
         .bind(&forge_session_id)
         .fetch_optional(self.db.pool())
         .await
+        }
         .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
         let expected_revision = row
             .as_ref()
@@ -198,7 +223,7 @@ impl SqliteProtectedRuntimeStore {
         let digest = self.legacy_snapshot_digest(&checkpoint.snapshot)?;
         let bytes = serde_json::to_vec(checkpoint)?;
         let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        let result = sqlx::query(
+        let result = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query(
             "INSERT INTO protected_agent_session_state (
                 session_id, checkpoint_ciphertext, checkpoint_nonce,
                 checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint,
@@ -241,7 +266,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(db::now_rfc3339())
         .bind(expected_revision)
         .execute(self.db.pool())
-        .await
+        .await }
         .map_err(|_| RuntimeError::internal("protected checkpoint save failed"))?;
         if result.rows_affected() == 0 {
             return Err(RuntimeError::conflict(

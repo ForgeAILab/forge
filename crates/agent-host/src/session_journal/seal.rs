@@ -106,6 +106,11 @@ impl Keys {
     }
 
     pub fn seal(&self, binding: &Binding<'_>, bytes: &[u8]) -> Result<Sealed, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer(
+            format!("aead.seal.{}", binding.unit as u8),
+            bytes.len(),
+        );
         let mut nonce = vec![0; 24];
         OsRng.fill_bytes(&mut nonce);
         let aad = self.aad(binding);
@@ -131,6 +136,11 @@ impl Keys {
         payload: &[u8],
         max: usize,
     ) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer(
+            format!("aead.open.{}", binding.unit as u8),
+            payload.len(),
+        );
         if nonce.len() != 24
             || payload.len() < ENVELOPE.len() + 16
             || payload.len() - ENVELOPE.len() - 16 > max
@@ -157,6 +167,8 @@ impl Keys {
         session: &SessionId,
         id: &[u8],
     ) -> Vec<u8> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("aead.lookup", id.len());
         let mut context = b"forge/session-journal/lookup/v1\0".to_vec();
         // pin and catalog contexts cannot alias even for identical input bytes.
         field(&mut context, unit.table());

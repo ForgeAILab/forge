@@ -21,8 +21,10 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
     ) -> Result<Packs, RuntimeError> {
-        let rows = sqlx::query("SELECT * FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY tier")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).fetch_all(&mut *conn).await.map_err(database_error)?;
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("operations.operation_packs", 0);
+        let rows = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT * FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY tier")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
         let mut packs = BTreeMap::new();
         let mut ids = BTreeSet::new();
         for row in rows {
@@ -47,6 +49,8 @@ impl ForgeJournalStorage {
                             .map_err(|_| corrupt())?,
                         codec::MAX_COMPRESSED_BYTES,
                     )?;
+                    #[cfg(feature = "test-support")]
+                    let zstd_profile = super::profile::timer("zstd.decode", compressed.len());
                     let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
                         .map_err(|_| corrupt())?;
                     decoder.window_log_max(21).map_err(|_| corrupt())?;
@@ -55,6 +59,10 @@ impl ForgeJournalStorage {
                         .take((codec::PACK_CAP + 1) as u64)
                         .read_to_end(&mut raw)
                         .map_err(|_| corrupt())?;
+                    #[cfg(feature = "test-support")]
+                    drop(zstd_profile);
+                    #[cfg(feature = "test-support")]
+                    super::profile::event("zstd.decompressed", raw.len());
                     let ops = wire::operations(&raw)?;
                     if tier < 0
                         || ops.is_empty()
@@ -80,7 +88,12 @@ impl ForgeJournalStorage {
         domain: &JournalDomain,
         session: &agent_runtime::core::ids::SessionId,
     ) -> Result<Vec<(i64, usize, usize)>, RuntimeError> {
-        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN", 0);
+            self.db.pool().begin().await
+        }
+        .map_err(database_error)?;
         let packs = self
             .operation_packs(&mut tx, &(domain.clone(), session.clone()))
             .await?;
@@ -88,7 +101,12 @@ impl ForgeJournalStorage {
             .into_iter()
             .map(|(tier, ops)| Ok((tier, ops.len(), wire::operations_bytes(&ops)?.len())))
             .collect::<Result<_, RuntimeError>>()?;
-        tx.commit().await.map_err(database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(database_error)?;
         Ok(layout)
     }
     async fn save_operations(
@@ -99,6 +117,8 @@ impl ForgeJournalStorage {
         tier: i64,
         mut ops: Vec<JournalOperationRecord>,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("operations.save_operations", 0);
         ops.sort_by(|a, b| {
             a.revision
                 .cmp(&b.revision)
@@ -107,14 +127,24 @@ impl ForgeJournalStorage {
         let raw = self
             .work(move || {
                 let raw = wire::operations_bytes(&ops).map_err(|_| conflict())?;
-                zstd::stream::encode_all(raw.as_slice(), 3).map_err(|_| corrupt())
+                {
+                    #[cfg(feature = "test-support")]
+                    let _zstd_profile = super::profile::timer("zstd.encode", raw.len());
+                    let compressed = zstd::stream::encode_all(raw.as_slice(), 3);
+                    #[cfg(feature = "test-support")]
+                    if let Ok(bytes) = &compressed {
+                        super::profile::event("zstd.compressed", bytes.len());
+                    }
+                    compressed
+                }
+                .map_err(|_| corrupt())
             })
             .await?;
         let sealed = self
             .seal_row(scope, owner, Unit::Operations, &tier.to_be_bytes(), 0, raw)
             .await?;
-        sqlx::query("INSERT INTO agent_session_journal_operation_pack (storage_id,role,runtime_session_id,forge_session_id,tier,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?)")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(tier).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await.map_err(database_error)?;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_operation_pack (storage_id,role,runtime_session_id,forge_session_id,tier,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(tier).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
         Ok(())
     }
     async fn delete_operations(
@@ -123,8 +153,8 @@ impl ForgeJournalStorage {
         scope: &Scope,
         tier: i64,
     ) -> Result<(), RuntimeError> {
-        sqlx::query("DELETE FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? AND tier=?")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(tier).execute(&mut *conn).await.map_err(database_error)?;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? AND tier=?")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(tier).execute(&mut *conn).await }.map_err(database_error)?;
         Ok(())
     }
     fn overflow(packs: &Packs) -> Result<i64, RuntimeError> {
@@ -144,6 +174,8 @@ impl ForgeJournalStorage {
         owner: &str,
         operation: &JournalOperationRecord,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("operations.append_operation", 0);
         // Validate one complete serialized record before touching any tier.
         wire::operations_bytes(std::slice::from_ref(operation)).map_err(|_| conflict())?;
         let packs = self.operation_packs(conn, scope).await?;
@@ -186,6 +218,8 @@ impl ForgeJournalStorage {
         floor: JournalRevision,
         epoch: u64,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("operations.prune_operations", 0);
         let mut packs = self.operation_packs(conn, scope).await?;
         let last = packs
             .values()

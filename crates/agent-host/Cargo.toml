@@ -73,6 +73,7 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
 ring = "0.17"
 agent-runtime-testkit.workspace = true

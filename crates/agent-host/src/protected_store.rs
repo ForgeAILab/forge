@@ -183,6 +183,8 @@ impl SqliteProtectedRuntimeStore {
     }
 
     fn seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.seal", plaintext.len());
         let mut nonce = [0_u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let ciphertext = self
@@ -195,6 +197,8 @@ impl SqliteProtectedRuntimeStore {
     }
 
     fn open(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.open", ciphertext.len());
         if nonce.len() != 24 {
             return Err(RuntimeError::new(
                 ErrorKind::Serialization,
@@ -213,6 +217,9 @@ impl SqliteProtectedRuntimeStore {
 
     #[cfg(any(test, feature = "test-support"))]
     async fn seal_session_state(&self, bytes: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            crate::session_journal::profile::timer("legacy.seal_session_state", bytes.len());
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut payload = SESSION_STATE_MAGIC.to_vec();
@@ -230,6 +237,9 @@ impl SqliteProtectedRuntimeStore {
         ciphertext: Vec<u8>,
         nonce: Vec<u8>,
     ) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            crate::session_journal::profile::timer("legacy.open_session_state", ciphertext.len());
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let payload = store.open(&ciphertext, &nonce)?;
@@ -285,12 +295,18 @@ impl SqliteProtectedRuntimeStore {
     }
 
     async fn forge_session_id(&self, runtime_id: &SessionId) -> Result<String, RuntimeError> {
-        sqlx::query_scalar::<_, String>("SELECT id FROM agent_session WHERE runtime_session_id = ?")
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE runtime_session_id = ?",
+            )
             .bind(runtime_id.as_str())
             .fetch_optional(self.db.pool())
             .await
-            .map_err(|_| RuntimeError::internal("protected state lookup failed"))?
-            .ok_or_else(|| RuntimeError::not_found("runtime session mapping not found"))
+        }
+        .map_err(|_| RuntimeError::internal("protected state lookup failed"))?
+        .ok_or_else(|| RuntimeError::not_found("runtime session mapping not found"))
     }
 
     /// Loads the server-issued identity/scope binding for one runtime session.
@@ -354,7 +370,7 @@ impl SqliteProtectedRuntimeStore {
         runtime_session_id: Option<&str>,
         workspace_path: Option<&str>,
     ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
-        let row = sqlx::query(
+        let row = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query(
             "SELECT session.identity_id, session.profile_id,
                     identity.account_permission_ceiling,
                     identity.paused,
@@ -401,7 +417,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(runtime_session_id)
         .bind(runtime_session_id)
         .fetch_optional(self.db.pool())
-        .await
+        .await }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::SessionNotFound)?;
 
@@ -695,20 +711,24 @@ impl SqliteProtectedRuntimeStore {
         scope_id: &str,
         successor: bool,
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
              WHERE session.runtime_session_id = ?
                AND scope.scope_type = ? AND scope.scope_id = ?
              LIMIT 1",
-        )
-        .bind(runtime_id)
-        .bind(scope_type)
-        .bind(scope_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(runtime_id)
+            .bind(scope_type)
+            .bind(scope_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::SessionNotFound)?;
         let identity_id: String = row
@@ -724,12 +744,16 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        let has_binding: bool = sqlx::query_scalar(
+        let has_binding: bool = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
         )
         .bind(runtime_id)
         .fetch_one(self.db.pool())
         .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         // Reading native/legacy extension state happens outside the write transaction.
         let referenced = if successor || has_binding {
@@ -737,15 +761,22 @@ impl SqliteProtectedRuntimeStore {
         } else {
             self.referenced_lcm_timeline(runtime_id).await?
         };
-        let mut tx = db::begin_immediate(self.db.pool())
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let existing: Option<String> = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar(
+                "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+            )
+            .bind(runtime_id)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
-        )
-        .bind(runtime_id)
-        .fetch_optional(&mut *tx)
-        .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let timeline_id = if let Some(id) = existing {
             id
@@ -753,8 +784,11 @@ impl SqliteProtectedRuntimeStore {
             let candidate: Option<String> = if successor {
                 None
             } else {
-                sqlx::query_scalar(
-                    "SELECT id FROM agent_lcm_timeline
+                {
+                    #[cfg(feature = "test-support")]
+                    let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+                    sqlx::query_scalar(
+                        "SELECT id FROM agent_lcm_timeline
                      WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
                        AND (runtime_session_id = ?4
                             OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
@@ -763,14 +797,15 @@ impl SqliteProtectedRuntimeStore {
                                 AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
                                                WHERE e.timeline_id = agent_lcm_timeline.id)))
                      ORDER BY runtime_session_id IS NULL ASC LIMIT 1",
-                )
-                .bind(&identity_id)
-                .bind(&stored_scope_type)
-                .bind(&stored_scope_id)
-                .bind(runtime_id)
-                .bind(referenced.as_deref())
-                .fetch_optional(&mut *tx)
-                .await
+                    )
+                    .bind(&identity_id)
+                    .bind(&stored_scope_type)
+                    .bind(&stored_scope_id)
+                    .bind(runtime_id)
+                    .bind(referenced.as_deref())
+                    .fetch_optional(&mut *tx)
+                    .await
+                }
                 .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
             };
             let id = match candidate {
@@ -778,56 +813,71 @@ impl SqliteProtectedRuntimeStore {
                     // Adopting a legacy owner-less row stamps its owner, so
                     // the lookup above can never hand it to another session
                     // (a rotation successor in particular).
-                    sqlx::query(
-                        "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                    {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+                        sqlx::query(
+                            "UPDATE agent_lcm_timeline SET runtime_session_id = ?
                          WHERE id = ? AND runtime_session_id IS NULL",
-                    )
-                    .bind(runtime_id)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await
+                        )
+                        .bind(runtime_id)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                    }
                     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
                     id
                 }
                 None => {
                     let id = db::new_uuid_v4();
                     let now = db::now_rfc3339();
-                    sqlx::query(
-                        "INSERT INTO agent_lcm_timeline (
+                    {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+                        sqlx::query(
+                            "INSERT INTO agent_lcm_timeline (
                             id, identity_id, scope_type, scope_id, canonical_scope_id,
                             runtime_session_id, authorization_revision, revision,
                             created_at, updated_at
                          ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                    )
-                    .bind(&id)
-                    .bind(&identity_id)
-                    .bind(&stored_scope_type)
-                    .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
-                    .bind(&stored_scope_id)
-                    .bind(runtime_id)
-                    .bind(authorization_revision.as_str())
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(&mut *tx)
-                    .await
+                        )
+                        .bind(&id)
+                        .bind(&identity_id)
+                        .bind(&stored_scope_type)
+                        .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
+                        .bind(&stored_scope_id)
+                        .bind(runtime_id)
+                        .bind(authorization_revision.as_str())
+                        .bind(&now)
+                        .bind(&now)
+                        .execute(&mut *tx)
+                        .await
+                    }
                     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
                     id
                 }
             };
-            sqlx::query(
-                "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+            {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+                sqlx::query(
+                    "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
                  VALUES (?, ?)",
-            )
-            .bind(runtime_id)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
+                )
+                .bind(runtime_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+            }
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
             id
         };
-        tx.commit()
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
             .await
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
@@ -847,37 +897,48 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(secret.expose().as_bytes())
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO credential_handle (
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
                 credential_method, metadata_json, version, created_at, updated_at
              ) VALUES (?, ?, ?, ?, 'configured', 'api_key', '{}', 1, ?, ?)",
-        )
-        .bind(id)
-        .bind(owner_user_id)
-        .bind(provider)
-        .bind(label)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(id)
+            .bind(owner_user_id)
+            .bind(provider)
+            .bind(label)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO protected_credential_secret (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
@@ -903,16 +964,20 @@ impl SqliteProtectedRuntimeStore {
         handle_id: &str,
         owner_user_id: &str,
     ) -> Result<Secret, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT secret.ciphertext, secret.nonce
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT secret.ciphertext, secret.nonce
              FROM protected_credential_secret AS secret
              JOIN credential_handle AS handle ON handle.id = secret.handle_id
              WHERE handle.id = ? AND handle.owner_user_id = ? AND handle.status = 'configured'",
-        )
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::CredentialNotFound)?;
         let ciphertext: Vec<u8> = row
@@ -938,38 +1003,49 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(&plaintext)
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO credential_handle (
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
                 credential_method, metadata_json, version, created_at, updated_at
              ) VALUES (?, ?, ?, ?, 'configured', 'oauth_bundle', ?, 1, ?, ?)",
-        )
-        .bind(input.id)
-        .bind(input.owner_user_id)
-        .bind(input.provider)
-        .bind(input.label)
-        .bind(input.metadata_json)
-        .bind(input.now)
-        .bind(input.now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(input.id)
+            .bind(input.owner_user_id)
+            .bind(input.provider)
+            .bind(input.label)
+            .bind(input.metadata_json)
+            .bind(input.now)
+            .bind(input.now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO protected_credential_secret (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(input.id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(input.now)
-        .bind(input.now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(input.id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(input.now)
+            .bind(input.now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
@@ -1041,22 +1117,26 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(plaintext)
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        sqlx::query(
-            "INSERT INTO protected_provider_authorization_state (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_provider_authorization_state (
                 operation_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(operation_id) DO UPDATE SET
                 ciphertext = excluded.ciphertext, nonce = excluded.nonce,
                 key_revision = excluded.key_revision, updated_at = excluded.updated_at",
-        )
-        .bind(operation_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(now)
-        .bind(now)
-        .execute(self.db.pool())
-        .await
+            )
+            .bind(operation_id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(now)
+            .bind(now)
+            .execute(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         Ok(())
     }
@@ -1065,13 +1145,17 @@ impl SqliteProtectedRuntimeStore {
         &self,
         operation_id: &str,
     ) -> Result<Vec<u8>, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT ciphertext, nonce FROM protected_provider_authorization_state
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT ciphertext, nonce FROM protected_provider_authorization_state
              WHERE operation_id = ?",
-        )
-        .bind(operation_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(operation_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::ProtectedPersistence)?;
         let ciphertext: Vec<u8> = row
@@ -1088,11 +1172,15 @@ impl SqliteProtectedRuntimeStore {
         &self,
         operation_id: &str,
     ) -> Result<(), crate::AgentHostError> {
-        sqlx::query("DELETE FROM protected_provider_authorization_state WHERE operation_id = ?")
-            .bind(operation_id)
-            .execute(self.db.pool())
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_provider_authorization_state WHERE operation_id = ?")
+                .bind(operation_id)
+                .execute(self.db.pool())
+                .await
+        }
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         Ok(())
     }
 
@@ -1101,18 +1189,22 @@ impl SqliteProtectedRuntimeStore {
         handle_id: &str,
         owner_user_id: &str,
     ) -> Result<StoredCredential, ProviderCredentialError> {
-        let row = sqlx::query(
-            "SELECT handle.provider, handle.credential_method, handle.version,
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT handle.provider, handle.credential_method, handle.version,
                     secret.ciphertext, secret.nonce
              FROM protected_credential_secret AS secret
              JOIN credential_handle AS handle ON handle.id = secret.handle_id
              WHERE handle.id = ? AND handle.owner_user_id = ?
                AND handle.status = 'configured'",
-        )
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| ProviderCredentialError::RefreshFailed)?
         .ok_or(ProviderCredentialError::Unavailable)?;
         let ciphertext: Vec<u8> = row
@@ -1157,17 +1249,21 @@ impl SqliteProtectedRuntimeStore {
         owner_user_id: &str,
         expected_version: i64,
     ) {
-        let _ = sqlx::query(
-            "UPDATE credential_handle
+        let _ = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'invalid', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?",
-        )
-        .bind(db::now_rfc3339())
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(self.db.pool())
-        .await;
+            )
+            .bind(db::now_rfc3339())
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(self.db.pool())
+            .await
+        };
     }
 
     async fn rotate_oauth_bundle(
@@ -1183,21 +1279,28 @@ impl SqliteProtectedRuntimeStore {
             .seal(&plaintext)
             .map_err(|_| ProviderCredentialError::RefreshFailed)?;
         let now = db::now_rfc3339();
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET version = version + 1, status = 'configured', updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?
                AND credential_method = 'oauth_bundle' AND status = 'configured'",
-        )
-        .bind(&now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(&now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         if result.rows_affected() == 0 {
             transaction
@@ -1206,18 +1309,22 @@ impl SqliteProtectedRuntimeStore {
                 .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
             return Err(ProviderCredentialError::RefreshFailed);
         }
-        sqlx::query(
-            "UPDATE protected_credential_secret
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE protected_credential_secret
              SET ciphertext = ?, nonce = ?, key_revision = ?, updated_at = ?
              WHERE handle_id = ?",
-        )
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(&now)
-        .bind(handle_id)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(&now)
+            .bind(handle_id)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         transaction
             .commit()
@@ -1235,29 +1342,40 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ?",
-        )
-        .bind(now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::CredentialNotFound);
         }
         retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
-        sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
-            .bind(handle_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
+                .bind(handle_id)
+                .execute(&mut *transaction)
+                .await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
@@ -1276,30 +1394,41 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?",
-        )
-        .bind(now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::VersionConflict);
         }
         retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
-        sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
-            .bind(handle_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
+                .bind(handle_id)
+                .execute(&mut *transaction)
+                .await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
@@ -1356,17 +1485,21 @@ async fn retire_provider_pricing_subject(
     provider_entry_id: &str,
     now: &str,
 ) -> Result<(), crate::AgentHostError> {
-    sqlx::query(
-        "UPDATE pricing_subject
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE pricing_subject
          SET state = 'retired', version = version + 1, updated_at = ?
          WHERE owner_user_id = ? AND subject_kind = 'provider_entry'
            AND provider_entry_id = ? AND state = 'active'",
-    )
-    .bind(now)
-    .bind(owner_user_id)
-    .bind(provider_entry_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(owner_user_id)
+        .bind(provider_entry_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
     Ok(())
 }
@@ -1376,30 +1509,38 @@ async fn mark_credential_dependents_unavailable(
     handle_id: &str,
     now: &str,
 ) -> Result<(), crate::AgentHostError> {
-    sqlx::query(
-        "UPDATE agent_connection_health
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE agent_connection_health
          SET status = 'unavailable', error_code = 'credential_revoked', updated_at = ?
          WHERE profile_id IN (
              SELECT id FROM agent_profile WHERE credential_ref = ?
          )",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(handle_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-    sqlx::query(
-        "UPDATE agent_session
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE agent_session
          SET status = 'degraded', connection_status = 'unavailable',
              version = version + 1, updated_at = ?
          WHERE profile_id IN (
              SELECT id FROM agent_profile WHERE credential_ref = ?
          ) AND status NOT IN ('replaced', 'terminated')",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(handle_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
     Ok(())
 }
@@ -1680,18 +1821,24 @@ impl SessionStore for SqliteProtectedRuntimeStore {
     }
 
     async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.load", 0);
         let forge_session_id = match self.forge_session_id(id).await {
             Ok(value) => value,
             Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let row = sqlx::query(
-            "SELECT snapshot_ciphertext, snapshot_nonce
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT snapshot_ciphertext, snapshot_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(forge_session_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| RuntimeError::internal("protected session load failed"))?;
         let Some(row) = row else {
             return Ok(None);
@@ -1731,18 +1878,24 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         &self,
         session: &SessionId,
     ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.load_latest", 0);
         let forge_session_id = match self.forge_session_id(session).await {
             Ok(value) => value,
             Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let row = sqlx::query(
-            "SELECT checkpoint_ciphertext, checkpoint_nonce
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT checkpoint_ciphertext, checkpoint_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(forge_session_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
         let Some(row) = row else {
             return Ok(None);

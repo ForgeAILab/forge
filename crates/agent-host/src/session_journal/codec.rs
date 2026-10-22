@@ -64,6 +64,8 @@ fn number(bytes: &[u8], pos: &mut usize) -> Result<usize, RuntimeError> {
 }
 
 pub(super) fn validate(object: &JournalStoredObject) -> Result<(), RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("codec.validate", object.bytes.len());
     if object.bytes.is_empty() || object.bytes.len() > PACK_CAP {
         return Err(conflict());
     }
@@ -80,6 +82,8 @@ pub(super) fn validate(object: &JournalStoredObject) -> Result<(), RuntimeError>
 }
 
 pub(super) fn encode(objects: &[JournalStoredObject]) -> Result<EncodedPack, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("codec.encode", 0);
     if objects.is_empty() || objects.windows(2).any(|p| p[0].id >= p[1].id) {
         return Err(conflict());
     }
@@ -111,7 +115,17 @@ pub(super) fn encode(objects: &[JournalStoredObject]) -> Result<EncodedPack, Run
     }
     Ok(EncodedPack {
         index,
-        body: zstd::stream::encode_all(raw.as_slice(), 3).map_err(|_| corrupt())?,
+        body: {
+            #[cfg(feature = "test-support")]
+            let _zstd_profile = super::profile::timer("zstd.encode", raw.len());
+            let compressed = zstd::stream::encode_all(raw.as_slice(), 3);
+            #[cfg(feature = "test-support")]
+            if let Ok(bytes) = &compressed {
+                super::profile::event("zstd.compressed", bytes.len());
+            }
+            compressed
+        }
+        .map_err(|_| corrupt())?,
         count: objects.len(),
         canonical_bytes: total,
     })
@@ -122,6 +136,8 @@ pub(super) fn decode_index(
     count: usize,
     retained: usize,
 ) -> Result<Directory, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("codec.decode_index", bytes.len());
     if bytes.len() > MAX_INDEX_BYTES
         || bytes.get(..8) != Some(MAGIC)
         || retained == 0
@@ -187,10 +203,14 @@ pub(super) fn decode_body(
     directory: &Directory,
     bytes: &[u8],
 ) -> Result<Vec<JournalStoredObject>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("codec.decode_body", bytes.len());
     if bytes.len() > MAX_COMPRESSED_BYTES {
         return Err(corrupt());
     }
     // The take bound applies to decompressed bytes, including hostile frames.
+    #[cfg(feature = "test-support")]
+    let zstd_profile = super::profile::timer("zstd.decode", bytes.len());
     let mut decoder = zstd::stream::read::Decoder::new(bytes).map_err(|_| corrupt())?;
     // zstd level 3 uses a 2 MiB window even for a smaller streaming frame.
     decoder.window_log_max(21).map_err(|_| corrupt())?;
@@ -199,6 +219,10 @@ pub(super) fn decode_body(
         .take((directory.body_len + 1) as u64)
         .read_to_end(&mut raw)
         .map_err(|_| corrupt())?;
+    #[cfg(feature = "test-support")]
+    drop(zstd_profile);
+    #[cfg(feature = "test-support")]
+    super::profile::event("zstd.decompressed", raw.len());
     if raw.len() != directory.body_len {
         return Err(corrupt());
     }
@@ -243,6 +267,8 @@ pub(super) fn decode_body(
 pub(super) fn split(
     objects: Vec<JournalStoredObject>,
 ) -> Result<Vec<Vec<JournalStoredObject>>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("codec.split", 0);
     let mut packs = Vec::new();
     let mut pending = Vec::new();
     let mut bytes = 0;

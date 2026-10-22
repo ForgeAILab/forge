@@ -208,6 +208,7 @@ pub async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'st
         }
         builder.build().unwrap()
     };
+    super::profile::phase("open", 0);
     let opening = Instant::now();
     let mut session = make()
         .start_session(StartSession::create(
@@ -230,6 +231,7 @@ pub async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'st
             eprintln!("C/{n} {} turn {turn}/{turns}", std::any::type_name::<S>());
         }
         if fixture == "C" && turn != 0 {
+            super::profile::phase("open", turn);
             let opening = Instant::now();
             session = make()
                 .start_session(StartSession::resume(id.clone()))
@@ -248,6 +250,7 @@ pub async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'st
         } else {
             text.prose(100, 800)
         };
+        super::profile::phase("run", turn);
         let start = Instant::now();
         session
             .run(UserInput::text(input))
@@ -256,14 +259,17 @@ pub async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'st
             .completed()
             .await;
         turns_us.push(start.elapsed().as_micros() as u64);
+        super::profile::phase("maintenance", turn);
         let start = Instant::now();
         store.terminal(&id).await;
         maintenance_us.push(start.elapsed().as_micros() as u64);
+        super::profile::phase("wal", turn);
         wal_bytes.push(store.sample_wal().await);
         if fixture == "C" && turn + 1 != turns {
             session.shutdown().await.unwrap();
         }
     }
+    super::profile::phase("shutdown", turns);
     session.persist().await.unwrap();
     session.persist().await.unwrap();
     // Shutdown returns after publishing the final idle view and closing all pins.
@@ -280,6 +286,7 @@ pub async fn drive<S: SessionStore + CheckpointStore + TerminalMaintenance + 'st
                 .is_object()
         );
     }
+    super::profile::phase("idle", turns);
     Drive {
         snapshot,
         opens_us,

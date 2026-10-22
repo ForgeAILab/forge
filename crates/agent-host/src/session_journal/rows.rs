@@ -46,20 +46,24 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
     ) -> Result<String, RuntimeError> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT id FROM agent_session WHERE runtime_session_id=? ORDER BY id LIMIT 2",
-        )
-        .bind(scope.1.as_str())
-        .fetch_all(&mut *conn)
-        .await
+        let ids: Vec<String> = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar(
+                "SELECT id FROM agent_session WHERE runtime_session_id=? ORDER BY id LIMIT 2",
+            )
+            .bind(scope.1.as_str())
+            .fetch_all(&mut *conn)
+            .await
+        }
         .map_err(database_error)?;
         let [owner] = ids.as_slice() else {
             return Err(RuntimeError::internal(
                 "journal host session mapping missing or ambiguous",
             ));
         };
-        let stored:Option<String>=sqlx::query_scalar("SELECT forge_session_id FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).fetch_optional(&mut *conn).await.map_err(database_error)?;
+        let stored:Option<String>={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query_scalar("SELECT forge_session_id FROM agent_session_journal_session WHERE storage_id=? AND role=? AND runtime_session_id=?")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).fetch_optional(&mut *conn).await }.map_err(database_error)?;
         if stored.as_ref().is_some_and(|id| id != owner) {
             return Err(RuntimeError::internal(
                 "journal host session mapping changed",
@@ -84,11 +88,11 @@ impl ForgeJournalStorage {
                 wire::record_bytes(record)?,
             )
             .await?;
-        sqlx::query("INSERT INTO agent_session_journal_session (storage_id,role,runtime_session_id,forge_session_id,generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_session (storage_id,role,runtime_session_id,forge_session_id,generation,revision,writer_epoch,collection_dirty,published,has_checkpoint,retired,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner)
             .bind(record.generation.to_be_bytes().as_slice()).bind(record.revision.0.to_be_bytes().as_slice()).bind(record.writer_epoch.to_be_bytes().as_slice())
             .bind(record.collection_dirty).bind(record.head.is_some()).bind(record.has_checkpoint).bind(record.retirement.is_some())
-            .bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await.map_err(database_error)?;
+            .bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
         Ok(())
     }
     pub(super) async fn replace_record(
@@ -99,6 +103,8 @@ impl ForgeJournalStorage {
         record: &JournalSessionRecord,
         expect: JournalFence,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("rows.replace_record", 0);
         let sealed = self
             .seal_row(
                 scope,
@@ -109,13 +115,13 @@ impl ForgeJournalStorage {
                 wire::record_bytes(record)?,
             )
             .await?;
-        let changed=sqlx::query("UPDATE agent_session_journal_session SET generation=?,revision=?,writer_epoch=?,collection_dirty=?,published=?,has_checkpoint=?,retired=?,key_revision=?,format=?,nonce=?,payload=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND forge_session_id=? AND revision=? AND writer_epoch=? AND generation=?")
+        let changed={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_session SET generation=?,revision=?,writer_epoch=?,collection_dirty=?,published=?,has_checkpoint=?,retired=?,key_revision=?,format=?,nonce=?,payload=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND forge_session_id=? AND revision=? AND writer_epoch=? AND generation=?")
             .bind(record.generation.to_be_bytes().as_slice()).bind(record.revision.0.to_be_bytes().as_slice()).bind(record.writer_epoch.to_be_bytes().as_slice())
             .bind(record.collection_dirty).bind(record.head.is_some()).bind(record.has_checkpoint).bind(record.retirement.is_some())
             .bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload)
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner)
             .bind(expect.revision.0.to_be_bytes().as_slice()).bind(expect.writer_epoch.to_be_bytes().as_slice()).bind(expect.generation.to_be_bytes().as_slice())
-            .execute(&mut *conn).await.map_err(database_error)?.rows_affected();
+            .execute(&mut *conn).await }.map_err(database_error)?.rows_affected();
         if changed != 1 {
             return Err(conflict());
         }
@@ -130,11 +136,11 @@ impl ForgeJournalStorage {
         bits: &[u8],
     ) -> Result<(), RuntimeError> {
         if bits.iter().any(|b| *b != 0) {
-            sqlx::query("INSERT INTO agent_session_journal_membership (storage_id,role,runtime_session_id,forge_session_id,pack_id,bitmap) VALUES (?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,pack_id) DO UPDATE SET bitmap=excluded.bitmap")
-                .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(id).bind(bits).execute(&mut *conn).await.map_err(database_error)?;
+            { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_membership (storage_id,role,runtime_session_id,forge_session_id,pack_id,bitmap) VALUES (?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,pack_id) DO UPDATE SET bitmap=excluded.bitmap")
+                .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(id).bind(bits).execute(&mut *conn).await }.map_err(database_error)?;
         } else {
-            sqlx::query("DELETE FROM agent_session_journal_membership WHERE storage_id=? AND role=? AND runtime_session_id=? AND pack_id=?")
-                .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(id).execute(&mut *conn).await.map_err(database_error)?;
+            { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_membership WHERE storage_id=? AND role=? AND runtime_session_id=? AND pack_id=?")
+                .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(id).execute(&mut *conn).await }.map_err(database_error)?;
         }
         Ok(())
     }
@@ -145,12 +151,14 @@ impl ForgeJournalStorage {
         owner: &str,
         objects: Vec<JournalStoredObject>,
     ) -> Result<i64, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("rows.insert_pack", 0);
         let encoded = self.work(move || codec::encode(&objects)).await?;
         // Reserve the AUTOINCREMENT identity inside this transaction; this
         // placeholder is replaced by authenticated units before any commit.
-        let id:i64=sqlx::query_scalar("INSERT INTO agent_session_journal_pack (storage_id,role,runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload) VALUES (?,?,?,?,?, ?,?,?,?,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16)) RETURNING pack_id")
+        let id:i64={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query_scalar("INSERT INTO agent_session_journal_pack (storage_id,role,runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload) VALUES (?,?,?,?,?, ?,?,?,?,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16)) RETURNING pack_id")
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(0u64.to_be_bytes().as_slice())
-            .bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(self.keys.revision).bind(FORMAT).fetch_one(&mut *conn).await.map_err(database_error)?;
+            .bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(self.keys.revision).bind(FORMAT).fetch_one(&mut *conn).await }.map_err(database_error)?;
         let index = self
             .seal_row(
                 scope,
@@ -171,8 +179,8 @@ impl ForgeJournalStorage {
                 encoded.body,
             )
             .await?;
-        sqlx::query("UPDATE agent_session_journal_pack SET index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
-            .bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(id).execute(&mut *conn).await.map_err(database_error)?;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
+            .bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(id).execute(&mut *conn).await }.map_err(database_error)?;
         let mut bits = vec![255; encoded.count.div_ceil(8)];
         if encoded.count % 8 != 0 {
             *bits.last_mut().ok_or_else(corrupt)? = (1 << (encoded.count % 8)) - 1;
@@ -190,6 +198,8 @@ impl ForgeJournalStorage {
         views: &mut [PackView],
         objects: &[JournalStoredObject],
     ) -> Result<Vec<JournalStoredObject>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("rows.admit", 0);
         let wanted = objects
             .iter()
             .flat_map(|o| {
@@ -243,6 +253,8 @@ impl ForgeJournalStorage {
         owner: &str,
         changes: &[JournalPinChange],
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("rows.pin_changes", 0);
         for change in changes {
             let pin = match change {
                 JournalPinChange::Put(p) => &p.pin,
@@ -256,12 +268,12 @@ impl ForgeJournalStorage {
                     let sealed = self
                         .seal_row(scope, owner, Unit::Pin, &key, 0, wire::pin_bytes(pin)?)
                         .await?;
-                    sqlx::query("INSERT INTO agent_session_journal_pin (storage_id,role,runtime_session_id,forge_session_id,pin_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,pin_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
-                        .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await.map_err(database_error)?;
+                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_pin (storage_id,role,runtime_session_id,forge_session_id,pin_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,pin_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
+                        .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
                 }
                 JournalPinChange::Remove(_) => {
-                    sqlx::query("DELETE FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
-                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await.map_err(database_error)?;
+                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
+                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await }.map_err(database_error)?;
                 }
             }
         }
@@ -274,6 +286,8 @@ impl ForgeJournalStorage {
         owner: &str,
         changes: &[JournalCatalogChange],
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("rows.catalog_changes", 0);
         for change in changes {
             let head = match change {
                 JournalCatalogChange::Put(c) => &c.head,
@@ -294,12 +308,12 @@ impl ForgeJournalStorage {
                             wire::catalog_bytes(entry)?,
                         )
                         .await?;
-                    sqlx::query("INSERT INTO agent_session_journal_catalog (storage_id,role,runtime_session_id,forge_session_id,head_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,head_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
-                        .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await.map_err(database_error)?;
+                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query("INSERT INTO agent_session_journal_catalog (storage_id,role,runtime_session_id,forge_session_id,head_key,key_revision,format,nonce,payload) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(storage_id,role,runtime_session_id,head_key) DO UPDATE SET key_revision=excluded.key_revision,format=excluded.format,nonce=excluded.nonce,payload=excluded.payload")
+                        .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(owner).bind(key).bind(self.keys.revision).bind(FORMAT).bind(sealed.nonce).bind(sealed.payload).execute(&mut *conn).await }.map_err(database_error)?;
                 }
                 JournalCatalogChange::Remove(_) => {
-                    sqlx::query("DELETE FROM agent_session_journal_catalog WHERE storage_id=? AND role=? AND runtime_session_id=? AND head_key=?")
-                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await.map_err(database_error)?;
+                    { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_catalog WHERE storage_id=? AND role=? AND runtime_session_id=? AND head_key=?")
+                    .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key).execute(&mut *conn).await }.map_err(database_error)?;
                 }
             }
         }
@@ -308,9 +322,12 @@ impl ForgeJournalStorage {
     #[cfg(feature = "test-support")]
     pub(crate) async fn seed(&self, write: JournalWrite) -> Result<(), RuntimeError> {
         let scope = (write.domain.clone(), write.session.clone());
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(database_error)?;
         let owner = self.mapping(&mut tx, &scope).await?;
         let old = self.load_on(&mut tx, &scope.0, &scope.1).await?;
         if let Some(old) = old {
@@ -337,7 +354,12 @@ impl ForgeJournalStorage {
         if let Some(op) = &write.operation {
             self.append_operation(&mut tx, &scope, &owner, op).await?;
         }
-        tx.commit().await.map_err(ambiguous_database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
             .invalidate(&scope);
@@ -369,10 +391,13 @@ impl ForgeJournalStorage {
             Unit::Operations => ("agent_session_journal_operation_pack", "tier"),
             _ => ("agent_session_journal_pack", "pack_id"),
         };
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(database_error)?;
-        let row = sqlx::query(&format!(
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(database_error)?;
+        let row = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query(&format!(
             "SELECT * FROM {table} WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
         ))
         .bind(domain.storage_id.as_str())
@@ -380,7 +405,7 @@ impl ForgeJournalStorage {
         .bind(session.as_str())
         .bind(id)
         .fetch_one(&mut *tx)
-        .await
+        .await }
         .map_err(database_error)?;
         let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
         let generation = match kind {
@@ -410,7 +435,7 @@ impl ForgeJournalStorage {
             plain = zstd::stream::encode_all(plain.as_slice(), 3).map_err(|_| corrupt())?;
         }
         let sealed = self.keys.seal(&binding, &plain)?;
-        sqlx::query(&format!(
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query(&format!(
             "UPDATE {table} SET {nonce}=?,{payload}=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND {key}=?"
         ))
         .bind(sealed.nonce)
@@ -420,9 +445,14 @@ impl ForgeJournalStorage {
         .bind(session.as_str())
         .bind(id)
         .execute(&mut *tx)
-        .await
+        .await }
         .map_err(database_error)?;
-        tx.commit().await.map_err(ambiguous_database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
             .invalidate(&scope);
@@ -436,9 +466,12 @@ impl ForgeJournalStorage {
         session: &agent_runtime::core::ids::SessionId,
     ) -> Result<(), RuntimeError> {
         let scope = (domain.clone(), session.clone());
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(database_error)?;
         let result=async {
             let views=self.directory(&mut tx,&scope,false).await?;
             let wanted=views.iter().map(|v|v.index.key.id).collect();
@@ -450,15 +483,25 @@ impl ForgeJournalStorage {
                 let encoded=self.work(move||codec::encode(&objects)).await?;
                 let index=self.seal_row(&scope,&key.owner,Unit::PackIndex,&key.id.to_be_bytes(),generation,encoded.index).await?;
                 let body=self.seal_row(&scope,&key.owner,Unit::PackBody,&key.id.to_be_bytes(),generation,encoded.body).await?;
-                sqlx::query("UPDATE agent_session_journal_pack SET generation=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
-                    .bind(generation.to_be_bytes().as_slice()).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).execute(&mut *tx).await.map_err(database_error)?;
+                { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=?")
+                    .bind(generation.to_be_bytes().as_slice()).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).execute(&mut *tx).await }.map_err(database_error)?;
             }
             Ok::<_,RuntimeError>(())
         }.await;
         match result {
-            Ok(()) => tx.commit().await.map_err(ambiguous_database_error)?,
+            Ok(()) => {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+                tx.commit().await
+            }
+            .map_err(ambiguous_database_error)?,
             Err(e) => {
-                tx.rollback().await.map_err(ambiguous_database_error)?;
+                {
+                    #[cfg(feature = "test-support")]
+                    let _sql_profile = crate::session_journal::profile::timer("sql.ROLLBACK", 0);
+                    tx.rollback().await
+                }
+                .map_err(ambiguous_database_error)?;
                 return Err(e);
             }
         }

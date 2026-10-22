@@ -16,8 +16,8 @@ impl ForgeJournalStorage {
         scope: &Scope,
         id: i64,
     ) -> Result<(), RuntimeError> {
-        sqlx::query("DELETE FROM agent_session_journal_pack WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await.map_err(database_error)?;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0); sqlx::query("DELETE FROM agent_session_journal_pack WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
+            .bind(id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
         Ok(())
     }
     /// A purge keeps its monotonic identity and advances the pack generation.
@@ -29,6 +29,8 @@ impl ForgeJournalStorage {
         view: &PackView,
         objects: Vec<JournalStoredObject>,
     ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("release.rewrite_live_pack", 0);
         let encoded = self.work(move || codec::encode(&objects)).await?;
         let key = &view.index.key;
         let generation = key.generation.checked_add(1).ok_or_else(corrupt)?;
@@ -52,8 +54,8 @@ impl ForgeJournalStorage {
                 encoded.body,
             )
             .await?;
-        sqlx::query("UPDATE agent_session_journal_pack SET generation=?,object_count=?,retained_canonical_bytes=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
-            .bind(generation.to_be_bytes().as_slice()).bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await.map_err(database_error)?;
+        { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,object_count=?,retained_canonical_bytes=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=? AND storage_id=? AND role=? AND runtime_session_id=?")
+            .bind(generation.to_be_bytes().as_slice()).bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
         let mut bits = vec![255; encoded.count.div_ceil(8)];
         if encoded.count % 8 != 0 {
             *bits.last_mut().ok_or_else(corrupt)? = (1 << (encoded.count % 8)) - 1;
@@ -69,6 +71,8 @@ impl ForgeJournalStorage {
         release: &[JournalObjectId],
         retired_collection: bool,
     ) -> Result<(JournalApplyReceipt, BTreeSet<i64>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("release.release_objects", 0);
         let ids: BTreeSet<_> = release.iter().collect();
         let wanted: BTreeSet<_> = views
             .iter()
@@ -168,9 +172,12 @@ impl ForgeJournalStorage {
         let scope = (domain.clone(), session.clone());
         codec::validate(&object)?;
         let bytes = object.bytes.len();
-        let mut tx = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(database_error)?;
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(database_error)?;
         let views = self.directory(&mut tx, &scope, false).await?;
         let view = views
             .iter()
@@ -214,7 +221,12 @@ impl ForgeJournalStorage {
             &bitmap,
         )
         .await?;
-        tx.commit().await.map_err(ambiguous_database_error)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(ambiguous_database_error)?;
         self.cache_lock()
             .map_err(RuntimeError::retryable)?
             .invalidate(&scope);

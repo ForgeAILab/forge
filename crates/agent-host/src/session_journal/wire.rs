@@ -51,6 +51,8 @@ struct Operation {
 }
 
 fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("wire.encode", 0);
     let bytes = serde_json::to_vec(value).map_err(|_| corrupt())?;
     if bytes.len() > max {
         return Err(corrupt());
@@ -58,6 +60,8 @@ fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>, RuntimeError> 
     Ok(bytes)
 }
 fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T, RuntimeError> {
+    #[cfg(feature = "test-support")]
+    let _profile = crate::session_journal::profile::timer("wire.decode", bytes.len());
     if bytes.len() > max {
         return Err(corrupt());
     }
