@@ -138,6 +138,19 @@ impl Cache {
             .map(|(_, entry)| entry.charge)
             .sum()
     }
+    #[cfg(feature = "test-support")]
+    pub fn body_packs(&self, session: &SessionId) -> Vec<(i64, u64)> {
+        let mut packs: Vec<_> = self
+            .entries
+            .keys()
+            .filter_map(|key| match key {
+                Key::Body(pack) if &pack.session == session => Some((pack.id, pack.generation)),
+                _ => None,
+            })
+            .collect();
+        packs.sort_unstable();
+        packs
+    }
     pub fn directory(&mut self, session: &SessionId) -> Option<Arc<ScopeDirectory>> {
         match self.get(&Key::Directory(session.clone())) {
             Some(Value::Directory(v)) => Some(v),
@@ -163,15 +176,15 @@ impl Cache {
         self.put(Key::Body(key), Value::Body(value), charge);
     }
     /// After a successful physical rewrite: forget the session directory and
-    /// the bodies of removed packs, publish the bodies written by that
-    /// transaction, and keep every other immutable body. Body keys carry pack
-    /// id and generation, and pack ids are never reused, so a surviving entry
+    /// the bodies of removed or rewritten packs, publish only the final
+    /// surviving bodies written by that transaction, and keep every other
+    /// immutable body. Body keys carry pack id and generation, and pack ids are never reused, so a surviving entry
     /// still describes exactly the sealed units it was decoded from.
     pub fn committed_rewrite(
         &mut self,
         session: &SessionId,
         removed: &BTreeSet<i64>,
-        written: Vec<(PackKey, Arc<Vec<JournalStoredObject>>)>,
+        written: BTreeMap<i64, (PackKey, Arc<Vec<JournalStoredObject>>)>,
     ) {
         self.entries.retain(|key, entry| {
             let remove = match key {
@@ -183,7 +196,7 @@ impl Cache {
             }
             !remove
         });
-        for (key, body) in written {
+        for (key, body) in written.into_values() {
             self.put_body(key, body);
         }
     }

@@ -2055,6 +2055,14 @@ async fn terminal_geometric_repack() {
     raw.post_terminal(&d, &s).await.unwrap();
     let after = pack_rows(&f, &d, &s).await;
     assert!(after.len() <= 2);
+    assert_eq!(
+        raw.cached_body_packs(&s).unwrap(),
+        after
+            .iter()
+            .map(|r| (r.0, u64::from_be_bytes(r.1.as_slice().try_into().unwrap())))
+            .collect::<Vec<_>>(),
+        "only final SQL pack generations may remain cached after multi-merge S2"
+    );
     let mut tiers = std::collections::BTreeSet::new();
     for row in &after {
         assert!(row.3 <= 1024 * 1024);
@@ -3233,6 +3241,7 @@ async fn ordinary_never_reads_protected_only_bodies() {
     let shared = equal_objects("projected", 8);
     let secrets = equal_objects("exact-only", 4);
     let ordinary_only = equal_objects("ordinary-only", 1);
+    let terminal_only = equal_objects("terminal-protected", 1);
     let protected_all: Vec<_> = shared.iter().chain(&secrets).cloned().collect();
     let ordinary_all: Vec<_> = shared.iter().chain(&ordinary_only).cloned().collect();
     mapped
@@ -3246,20 +3255,32 @@ async fn ordinary_never_reads_protected_only_bodies() {
     // Shared bodies are stored once: 12 protected + 1 ordinary-only slots.
     // Independent domain copies stored 20.
     assert_eq!(session_object_count(&f, &s).await, 13);
-    let check = |stage: &'static str| {
-        let raw = raw.clone();
+    let check = |raw: Arc<ForgeJournalStorage>,
+                 stage: &'static str,
+                 protected_all: Vec<JournalStoredObject>| {
         let (p, o, s) = (p.clone(), o.clone(), s.clone());
-        let (secrets, ordinary_only, shared) =
-            (secrets.clone(), ordinary_only.clone(), shared.clone());
-        let (protected_all, ordinary_all) = (protected_all.clone(), ordinary_all.clone());
+        let secrets: Vec<_> = secrets.iter().chain(&terminal_only).cloned().collect();
+        let (ordinary_only, shared, ordinary_all) =
+            (ordinary_only.clone(), shared.clone(), ordinary_all.clone());
         async move {
-            let live_secrets: Vec<_> = raw
-                .members(&p, &s)
-                .await
-                .unwrap()
-                .into_iter()
-                .filter(|id| secrets.iter().any(|o| &o.id == id))
-                .collect();
+            // Warm protected bodies first, including on the reopened storage.
+            for (domain, expected) in [(&p, &protected_all), (&o, &ordinary_all)] {
+                assert_eq!(
+                    raw.members(domain, &s).await.unwrap(),
+                    sorted_ids(expected),
+                    "{stage}: complete {:?} membership",
+                    domain.role
+                );
+                assert_eq!(
+                    raw.objects(domain, &s, &ids(expected)).await.unwrap(),
+                    expected
+                        .iter()
+                        .map(|o| Some(o.bytes.clone()))
+                        .collect::<Vec<_>>(),
+                    "{stage}: exact {:?} bytes",
+                    domain.role
+                );
+            }
             assert!(
                 raw.objects(&o, &s, &ids(&secrets))
                     .await
@@ -3284,19 +3305,9 @@ async fn ordinary_never_reads_protected_only_bodies() {
                     .all(Option::is_some),
                 "{stage}"
             );
-            let mut want: Vec<_> = sorted_ids(&ordinary_all);
-            want.sort();
-            assert_eq!(raw.members(&o, &s).await.unwrap(), want, "{stage}");
-            let mut want: Vec<_> = protected_all
-                .iter()
-                .filter(|x| !secrets.iter().any(|y| y.id == x.id) || live_secrets.contains(&x.id))
-                .map(|x| x.id.clone())
-                .collect();
-            want.sort();
-            assert_eq!(raw.members(&p, &s).await.unwrap(), want, "{stage}");
         }
     };
-    check("fresh admission").await;
+    check(raw.clone(), "fresh admission", protected_all).await;
     // Purge rewrite: three dead secret slots exceed 25% of the shared pack,
     // which is rewritten with both domains' bitmaps remapped.
     let before: Vec<i64> = pack_rows(&f, &p, &s).await.iter().map(|r| r.0).collect();
@@ -3311,7 +3322,22 @@ async fn ordinary_never_reads_protected_only_bodies() {
             .any(|r| before.contains(&r.0) && r.1 == 1u64.to_be_bytes()),
         "the shared pack was rewritten in place"
     );
-    check("after purge rewrite").await;
+    let cached = raw.cached_body_packs(&s).unwrap();
+    for row in &purged {
+        assert!(
+            cached.contains(&(
+                row.0,
+                u64::from_be_bytes(row.1.as_slice().try_into().unwrap())
+            )),
+            "an in-place rewrite must publish its surviving generation"
+        );
+        assert!(
+            !cached.contains(&(row.0, 0)),
+            "the old generation was invalidated"
+        );
+    }
+    let mut protected_live: Vec<_> = shared.iter().chain(&secrets[3..]).cloned().collect();
+    check(raw.clone(), "after purge rewrite", protected_live.clone()).await;
     // Merge: the base repack folds the small shared and ordinary-only packs.
     let mut collect = edit(&raw, &o, &s).await;
     collect.kind = JournalWriteKind::Collect;
@@ -3319,10 +3345,74 @@ async fn ordinary_never_reads_protected_only_bodies() {
     let merged: Vec<i64> = pack_rows(&f, &o, &s).await.iter().map(|r| r.0).collect();
     assert_eq!(merged.len(), 1, "small fully live packs were merged");
     assert!(!before.contains(&merged[0]));
-    check("after merge").await;
+    check(raw.clone(), "after merge", protected_live.clone()).await;
+    // A second, protected-only pack shares the mixed pack's eligible S2 tier.
+    add_objects(&raw, &p, &s, terminal_only.clone()).await;
+    protected_live.extend(terminal_only.clone());
+    let terminal_before = pack_rows(&f, &p, &s).await;
+    assert_eq!(
+        terminal_before.len(),
+        2,
+        "terminal maintenance must start with two eligible packs"
+    );
+    assert_eq!(terminal_before[0].0, merged[0]);
+    assert_eq!(
+        (terminal_before[0].3 as u64).max(4096).ilog2(),
+        (terminal_before[1].3 as u64).max(4096).ilog2(),
+        "both packs must occupy the same geometric tier"
+    );
+    assert!(terminal_before.iter().map(|r| r.3).sum::<i64>() <= 1024 * 1024);
+    let bitmaps: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT pack_id,role,bitmap FROM agent_session_journal_membership WHERE runtime_session_id=? ORDER BY pack_id,role",
+    )
+    .bind(s.as_str())
+    .fetch_all(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(bitmaps.len(), 3);
+    assert_eq!(
+        (bitmaps[0].0, bitmaps[0].1.as_str()),
+        (merged[0], "ordinary")
+    );
+    assert_eq!(
+        (bitmaps[1].0, bitmaps[1].1.as_str()),
+        (merged[0], "protected")
+    );
+    assert_ne!(
+        bitmaps[0].2, bitmaps[1].2,
+        "the mixed pack has different domain bitmaps"
+    );
+    assert_eq!(
+        bitmaps[2],
+        (terminal_before[1].0, "protected".to_owned(), vec![1])
+    );
+    check(
+        raw.clone(),
+        "before terminal maintenance",
+        protected_live.clone(),
+    )
+    .await;
     raw.post_terminal(&p, &s).await.unwrap();
-    check("after terminal maintenance").await;
+    let terminal_after = pack_rows(&f, &p, &s).await;
+    assert_eq!(terminal_after.len(), 1, "S2 must physically merge the pair");
+    assert!(
+        terminal_after
+            .iter()
+            .all(|after| terminal_before.iter().all(|before| before.0 != after.0)),
+        "S2 must replace the input pack ids"
+    );
+    assert_ne!(
+        terminal_after, terminal_before,
+        "S2 must change the physical layout"
+    );
+    check(
+        raw.clone(),
+        "after terminal maintenance",
+        protected_live.clone(),
+    )
+    .await;
     let reopened = reopen(&f).await;
+    check(reopened.clone(), "after reopen", protected_live).await;
     assert!(reopened.objects(&o, &s, &ids(&secrets[3..])).await.unwrap()[0].is_none());
     assert!(reopened.objects(&p, &s, &ids(&secrets[3..])).await.unwrap()[0].is_some());
 }

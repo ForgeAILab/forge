@@ -48,6 +48,7 @@ impl ForgeJournalStorage {
         }
         .map_err(database_error)?;
         staged.removed.insert(id);
+        staged.written.remove(&id);
         Ok(())
     }
     /// A purge keeps its monotonic identity and advances the pack generation.
@@ -99,17 +100,20 @@ impl ForgeJournalStorage {
                 .await?;
         }
         staged.removed.insert(key.id);
-        staged.written.push((
-            PackKey {
-                session: session.clone(),
-                id: key.id,
-                generation,
-                count: encoded.count,
-                retained: encoded.canonical_bytes,
-                owner: key.owner.clone(),
-            },
-            objects,
-        ));
+        staged.written.insert(
+            key.id,
+            (
+                PackKey {
+                    session: session.clone(),
+                    id: key.id,
+                    generation,
+                    count: encoded.count,
+                    retained: encoded.canonical_bytes,
+                    owner: key.owner.clone(),
+                },
+                objects,
+            ),
+        );
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
