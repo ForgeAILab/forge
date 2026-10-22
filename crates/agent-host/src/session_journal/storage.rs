@@ -84,11 +84,12 @@ impl PackView {
         (0..self.index.key.count).all(|s| self.live(s))
     }
 }
-/// Bodies sealed and pack ids removed or rewritten by one write transaction.
+/// Final surviving bodies keyed by pack id, plus ids invalidated by the transaction.
+/// In-place rewrites invalidate the old generation and retain the final output.
 /// Applied to the shared cache only after COMMIT succeeds.
 #[derive(Default)]
 pub(super) struct Staged {
-    pub written: Vec<(PackKey, Arc<Vec<JournalStoredObject>>)>,
+    pub written: BTreeMap<i64, (PackKey, Arc<Vec<JournalStoredObject>>)>,
     pub removed: BTreeSet<i64>,
 }
 pub(super) fn domain_of(storage_id: String, role: &str) -> Result<JournalDomain, RuntimeError> {
@@ -586,6 +587,10 @@ impl ForgeJournalStorage {
             evictions: c.evictions,
             oversize: c.oversize,
         })
+    }
+    #[cfg(feature = "test-support")]
+    pub fn cached_body_packs(&self, session: &SessionId) -> Result<Vec<(i64, u64)>, RuntimeError> {
+        Ok(self.cache_lock()?.body_packs(session))
     }
     #[cfg(feature = "test-support")]
     pub fn set_cache_budget(&self, budget: usize) -> Result<(), RuntimeError> {

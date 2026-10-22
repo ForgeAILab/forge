@@ -233,17 +233,20 @@ impl ForgeJournalStorage {
             self.put_bits(conn, &(domain, session.clone()), owner, id, &bits)
                 .await?;
         }
-        staged.written.push((
-            PackKey {
-                session: session.clone(),
-                id,
-                generation: 0,
-                count: encoded.count,
-                retained: encoded.canonical_bytes,
-                owner: owner.to_owned(),
-            },
-            objects,
-        ));
+        staged.written.insert(
+            id,
+            (
+                PackKey {
+                    session: session.clone(),
+                    id,
+                    generation: 0,
+                    count: encoded.count,
+                    retained: encoded.canonical_bytes,
+                    owner: owner.to_owned(),
+                },
+                objects,
+            ),
+        );
         Ok(id)
     }
     /// Compare only prefix candidates in every pack of the session, including
