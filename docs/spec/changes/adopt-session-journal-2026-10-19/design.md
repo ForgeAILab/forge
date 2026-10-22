@@ -565,7 +565,16 @@ Stable large packs and packs containing deferred dead slots stay sealed; merging
 the latter could concentrate dead bytes above 25% in an output pack. Terminal
 equal-tier merges likewise select fully live inputs and only merge a pair whose
 combined logical bytes fit the 1 MiB cap. "Fully live" means every slot is held
-by at least one domain. Every move remaps each holder domain's bitmap of the
+by at least one domain. Within a shared session both paths further select only
+packs the acting domain (the hook's or the collecting domain) holds entirely; a
+pack with a slot only another domain holds is left to that domain's own
+maintenance; a pack that no domain holds entirely is then moved only by explicit
+`compact`. Otherwise one domain's hook folds the other domain's stable history
+into its own short-lived bodies (request settings, checkpoints), and the next
+purge rewrites the whole merged pack (measured: B/N=1000 delta writes 10.7% →
+35.9% before this rule, 10.3% after). The cost is fragmentation: C/N=1000
+after collection rises from 1.27× to 1.50× L2 (13 → 33 packs) and C/N=4000 from
+1.14× to 1.35× (41 → 127 packs); B/N=4000 is unchanged. Every move remaps each holder domain's bitmap of the
 owning session atomically from that domain's own previous bits, without touching
 another session.
 

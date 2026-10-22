@@ -682,6 +682,16 @@ No runtime bench crate becomes a production dependency.
   B/1000 35.9% / 25.3% fail. Rerun after pinning the runtime speed release
   (`speed-up-journal-hot-path-2026-10-21` P1/P2/P4, P3 optional).
 
+  B/1000 delta-write fix (2026-10-22, commit 79996e80): sharing let one domain's
+  S2 hook merge its short-lived request-settings/checkpoint pack with the other
+  domain's stable history pack, which the final sweep then purged and repacked
+  (128 + 122 + 137 KB plain). S2 and the base repack now move only packs the
+  acting domain holds entirely. Full gate: B/1000 10.311% / 10.156% (still above
+  10%; pre-sharing 10.675% / 10.492%), B/4000 5.348% / 4.006%, C/1000 8.805%,
+  C/4000 2.574%. B/4000 disk 1.61145× / 1.79412× (PASS). Fragmentation cost:
+  C/1000 1.26522× → 1.50000×, C/4000 1.13992× → 1.34568×, C/4000 max collect
+  2,106.75 → 2,955.71 ms. Evidence: `/Volumes/Data/tmp/refactor/c3-writes/report.md`.
+
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
   Breaking/Changed entries per D9, with actual pins/results. State next-release

@@ -749,6 +749,44 @@ Runtime change `speed-up-journal-hot-path-2026-10-21` owns P1/P2/P4 speed work
 fixed budgets, then rerun Forge's gate. This background-conversion change does
 not rerun the expensive release measurement or claim a latency pass.
 
+### B/1000 delta-write fix: maintenance moves only fully held packs (2026-10-22)
+
+Sharing raised the B/N=1000 delta-write ratio from 10.68% / 10.49% to 35.94% /
+25.32%. Per-call traces of both builds showed why: protected's S2 hook paired
+its turn-1/turn-2 request-settings/checkpoint pack (262,691 logical bytes,
+protected-only) with ordinary's stable history pack (430,579 bytes, which
+protected does not hold). Both sit in the 2^18 tier, so they merged (128,152
+bytes sealed). The final sweep then purged the merged pack's dead checkpoints
+(122,004-byte rewrite) and the base repack re-merged the survivor (137,138
+bytes). Tool shows the same chain: 130,366 / 122,102 / 140,765. The metric counts
+each physical pack write once, so this is not double counting.
+
+Commit `79996e80` limits S2 tiers and the collection base repack to packs the
+acting domain holds entirely. Same ignored release report, fixtures, seeds,
+projection, baseline, cadence and thresholds. Raw output:
+`/Volumes/Data/tmp/refactor/c3-writes/gate/`.
+
+| Fixture | Delta writes / legacy, task 29 → fix | Forge/L2, task 29 → fix | Packs after collection | Max collect call, ms |
+| --- | ---: | ---: | ---: | ---: |
+| B/1000 plain | 35.937% → **10.311%** | 1.73171× → 1.73171× | 3 → 6 | 73.78 → 72.67 |
+| B/1000 tool | 25.317% → **10.156%** | 1.86747× → 1.87952× | 3 → 6 | 83.58 → 83.46 |
+| B/4000 plain | 7.753% → 5.348% (PASS) | 1.60843× → **1.61145×** (PASS) | 8 → 11 | 330.56 → 278.42 |
+| B/4000 tool | 5.514% → 4.006% (PASS) | 1.79118× → **1.79412×** (PASS) | 9 → 12 | 326.24 → 318.88 |
+| C/1000 tool | 10.770% → 8.805% (PASS) | 1.26522× → 1.50000× | 13 → 33 | 256.60 → 175.46 |
+| C/4000 tool | 3.100% → 2.574% (PASS) | 1.13992× → 1.34568× | 41 → 127 | 2106.75 → 2955.71 |
+
+B/1000 is now below the pre-sharing 10.68% / 10.49% but still above 10%. The
+remainder is not specific to sharing. The largest single item is S2 merging two
+request-settings/checkpoint admission packs (23,716 / 25,695 bytes) whose bodies
+die at the next collection. The cost of the rule is fragmentation: a pack that no
+domain holds entirely is left for `compact`. C packs triple, C disk ratios rise
+and C/4000's longest collect call worsens (D8 <1 s was already failing). The
+B/4000 hard disk gate moves by one 4 KiB page. Turn and import times are within
+noise of task 29. B/1000 native turn is 377.09 / 654.80 ms versus legacy 51.69 /
+97.84 ms; B/4000 is 1,466.28 / 2,392.78 versus 210.95 / 391.25 ms. Import is
+809.14 / 931.08 and 3,233.74 / 3,820.18 ms. This run's A rows were not under the
+heavy load of task 29's run; see the JSON for them.
+
 ### Task 29: within-session body sharing re-measurement
 
 Same ignored release report, fixtures, seeds, projection, L2 baseline, cadence

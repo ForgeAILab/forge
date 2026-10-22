@@ -8502,11 +8502,15 @@ reclamation. Retained bytes include dead slots
 until their removal and reconcile with the physical receipts.
 
 `maintenance.rs` provides async `post_terminal(domain, session)` for the native
-terminal/fork/abort hooks. It authenticates the record before rewriting and merges fully live equal logical-byte tiers from a 4 KiB minimum,
+terminal/fork/abort hooks. It authenticates the record before rewriting and merges equal logical-byte tiers from a 4 KiB minimum,
 carrying geometrically only when a pair fits 1 MiB. Collection's base repack uses
-only fully live packs below 64 KiB or fully live survivors purged by that apply.
-Collection leaves stable large packs sealed; both maintenance paths leave
-deferred-dead packs sealed. Repack output is partitioned by kind before cutting
+only packs below 64 KiB or survivors purged by that apply. Both paths select only
+packs the acting domain holds entirely (so they are fully live): a pack with a
+slot only the other domain holds is left to that domain's own hook and
+collection, so one domain never folds the other's stable history into its own
+short-lived bodies. A pack no domain holds entirely is moved only by explicit
+`compact`. Collection leaves stable large packs sealed; both
+maintenance paths leave deferred-dead packs sealed. Repack output is partitioned by kind before cutting
 at 1 MiB; "fully live" means every slot is held by some domain, and each move
 remaps every holder domain's bitmap of that session from its own bits, so no
 domain gains a body it did not admit. Explicit `compact(domain)` keysets original pack ids and
