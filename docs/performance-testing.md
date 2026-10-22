@@ -721,11 +721,33 @@ Final outputs: `/Volumes/Data/tmp/usage-merge/bench-reported1.json` and `bench-r
 <!-- session-journal-d10:start -->
 ## Session journal D10 measurements (2026-10-21)
 
-**Disk gate: MET after within-session sharing (task 29); turn/import/collect
-checks: NOT MET.** These are actual Forge measurements at agent-runtime v0.9.0 /
+**Disk gate: MET after within-session sharing (task 29); turn/collect
+checks: NOT MET pending runtime. Import is no longer latency-gated.** These are actual Forge measurements at agent-runtime v0.9.0 /
 `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, from the production SQLx storage and
 real AEAD. The tables after the task-29 section are the original task-25 run,
 with independent domain copies, kept for comparison.
+
+### Owner acceptance revision, 2026-10-21
+
+D10 replaces relative turn/resume checks with fixed native journal overhead:
+≤~250 ms per turn over legacy at B/N=4000 and ≤~50 ms at N=100, plain and tool,
+release builds at per-turn cadence. Every single collect call / engine gate hold
+must be <1 s (target <250 ms). Disk stays ≤2.0× actual L2 (aim 1.5×); delta
+writes ≤10% of legacy for N≥1000 stays tracked. Older tables below retain their
+historical verdict columns; no historical run was recomputed.
+
+Current task-29 evidence gives disk PASS at 1.60843× / 1.79118× and turn FAIL:
+B/4000 native 1,685.62 / 2,547.75 ms versus legacy 229.38 / 427.33 ms exceeds
+the ~250 ms overhead budget by a wide margin. C/4000 collect 2,106.75 ms FAILS
+the <1 s bound. Loaded A/N=100 timings do not establish the ~50 ms budget.
+The B/4000 import measurements 3,349.73 / 3,925.23 ms are full legacy-to-native
+conversion. Forge now schedules that work in the background, retaining lazy
+fallback for an early open; it does not claim conversion got faster.
+
+Runtime change `speed-up-journal-hot-path-2026-10-21` owns P1/P2/P4 speed work
+(P3 optional). Pin that runtime release, update the report's gate fields to the
+fixed budgets, then rerun Forge's gate. This background-conversion change does
+not rerun the expensive release measurement or claim a latency pass.
 
 ### Task 29: within-session body sharing re-measurement
 
@@ -763,9 +785,10 @@ synchronous S2/collection; legacy in the same run for context):
 | C/1000 tool | 930.11 → 845.89 | 264.89 | 2941.98 → 2910.84 | 34.36 | 682.06 → 256.60 | 630.06 → 57.14 | 11.035% → 10.771% |
 | C/4000 tool | 3937.09 → 3309.28 | 3938.27 | 12294.36 → 12235.53 | 185.84 | 2992.81 → 2106.75 | 2526.39 → 1580.27 | 3.214% → 3.100% (PASS) |
 
-Turn and import times are within run-to-run noise of task 25 and still fail
-their D10 checks: the cost is runtime snapshot/proof and collection tracing,
-not storage. Sharing shrinks the longest collection call and write
+Turn and import times are within run-to-run noise of task 25. Turn overhead
+fails the revised D10 budget; import is now a separately reported conversion
+cost. The measured latency is dominated by runtime snapshot/proof and collection
+tracing. Sharing shrinks the longest collection call and write
 transactions, but C/4000's 2,106.75 ms collect call still exceeds D8's 1-second
 review bound. The A rows ran while the machine was heavily loaded (their
 legacy timings also rose 5–10×), so A timings in this run are not comparable;

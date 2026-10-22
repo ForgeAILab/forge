@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-21T20:15:29Z
+updated_at: 2026-10-22T04:13:54Z
 ---
 
 ## Why
@@ -15,7 +15,9 @@ L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
 one-blob assumption. These are measured **PerSession S1–S5** results from
 `/Volumes/Data/tmp/refactor/rt-e7/report.md`, with modeled seal lengths and
 within-session domain sharing. Forge now shares bodies between a session's two
-domains too (2026-10-21 amendment) and must still prove its own real-AEAD/sqlx gate. Per-turn C/N=1000 is **1.27826× L2**;
+domains too (2026-10-21 amendment). Its real-AEAD/sqlx B/4000 disk gate now
+passes at 1.60843× / 1.79118×; turn/collect gates await runtime speed work.
+The reference per-turn C/N=1000 is **1.27826× L2**;
 the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
 
 ## What Changes
@@ -86,12 +88,14 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   canonical bytes at removal time, including earlier deferred bytes; clearing
   bits and moving live bodies count zero. Implement `retained_bytes` including
   deferred bodies. Await durable engine controls; no volatile sync polling on Tokio.
-- **Lazy, exact-first import.** Keep legacy read/decode methods as the runtime's
+- **Background, exact-first conversion with lazy fallback.** Keep legacy read/decode methods as the runtime's
   v3 source, including unfinished and snapshot-only sessions. Publish protected
   first when a checkpoint exists, repair partial imports without provider/tool
   I/O, and refuse legacy saves. Native-first open skips unnecessary legacy loads.
-  Keep the legacy table this release; import remaining resumable rows and drop it
-  next release through a separate data-preserving change.
+  Convert legacy-only sessions now through a bounded supervised background pass;
+  skip active writers and preserve unreadable rows. Lazy import on open remains
+  fallback. Keep legacy rows and remove the table next release. Import is no
+  longer latency-gated.
 - **Probes and lifecycle.** Read scalar native publication/checkpoint/tombstone
   metadata; read LCM overhead through `JournalReader::extension`. Retire replaced
   and unresumable suspended sessions, keep resumable dormant chats and reusable
@@ -116,8 +120,20 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
 
 Out of scope: U10/LCM-table consolidation, warm runtimes, runtime schema 5 and
 legacy-table removal in this release. The existing Owner Decisions entries remain
-verbatim; two new entries record the 2026-10-20 memo-budget and conservative
-ordinary-redaction decisions.
+verbatim; later entries record the 2026-10-20 memo/redaction decisions and
+the 2026-10-21 background-conversion and fixed-budget revision.
+
+## 2026-10-21 acceptance revision
+
+D10 now uses fixed native per-turn overhead budgets: ≤~250 ms over legacy at
+B/N=4000 and ≤~50 ms at N=100, plain/tool, release, per-turn cadence; each
+collect/gate hold <1 s (target <250 ms). Disk stays ≤2.0× L2 (aim 1.5×), and
+N≥1000 delta writes ≤10% remains tracked. Current sharing results pass disk
+(1.60843× / 1.79118×) and fail turn/collect pending runtime work. Import moves
+out of the latency gate into background scheduling. Speed work belongs to
+agent-runtime `speed-up-journal-hot-path-2026-10-21` P1/P2/P4 (P3 optional);
+rerun Forge's gate after pinning that release. The earlier Owner Decisions
+remain an unmodified historical receipt; the new entry supersedes Q3's timing.
 
 ## Impact
 

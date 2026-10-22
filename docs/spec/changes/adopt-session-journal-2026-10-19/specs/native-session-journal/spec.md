@@ -166,8 +166,13 @@ Forge SHALL store lossless operation records in binary-carry operation packs cap
 - **AND** a current-writer-epoch record below the floor survives only if it is that epoch's highest-revision record
 - **AND** a replay of a pruned operation conflicts rather than becoming a new commit
 
-### Requirement: One-time lazy import with exact-first authority
-The additive migration SHALL preserve existing data and leave protected_agent_session_state readable. First native writer open SHALL use the runtime's v3 importer with no provider/tool I/O; where a checkpoint exists, protected exact publication SHALL precede ordinary publication. Native-first open SHALL avoid unnecessary legacy decoding, both legacy saves SHALL refuse writes, and the legacy table SHALL be removed only by a separate next-release cleanup after resumable rows are imported and dead rows handled under the approved retirement rule.
+### Requirement: Background conversion and fallback import with exact-first authority
+The additive migration SHALL preserve existing data and leave protected_agent_session_state readable. Background conversion and fallback native writer open SHALL use the same runtime v3 importer, shared engines and validation with no provider/tool I/O; where a checkpoint exists, protected exact publication SHALL precede ordinary publication. Native-first open SHALL avoid unnecessary legacy decoding, both legacy saves SHALL refuse writes, and the legacy table SHALL be removed only by a separate next-release cleanup after resumable rows are imported and dead rows handled under the approved retirement rule.
+
+#### Scenario: Background conversion precedes first open
+- **WHEN** a dormant native host session still has a legacy row and lacks native publication
+- **THEN** the supervised worker converts it without user open and the next open reads native state without importing
+- **AND** the legacy row remains unchanged until next-release cleanup
 
 #### Scenario: Mid-turn import
 - **WHEN** a legacy checkpoint at CallingModel or a persisted model/tool result is imported

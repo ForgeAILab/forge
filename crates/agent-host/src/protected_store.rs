@@ -139,6 +139,7 @@ pub struct SqliteProtectedRuntimeStore {
     cipher: Arc<XChaCha20Poly1305>,
     key_revision: i64,
     journals: crate::session_journals::SessionJournals,
+    pub(crate) conversion_admission: Arc<crate::session_journal_conversion::ConversionAdmission>,
     #[cfg(any(test, feature = "test-support"))]
     legacy_snapshot_mac: ring::hmac::Context,
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -163,6 +164,7 @@ impl SqliteProtectedRuntimeStore {
         Self {
             db,
             journals,
+            conversion_admission: Arc::default(),
             #[cfg(any(test, feature = "test-support"))]
             legacy_snapshot_mac,
             cipher: Arc::new(XChaCha20Poly1305::new((&master_key).into())),

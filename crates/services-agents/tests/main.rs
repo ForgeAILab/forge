@@ -47,3 +47,6 @@ mod wake_turn_consumer;
 
 #[path = "suite/session_journal_retention.rs"]
 mod session_journal_retention;
+
+#[path = "suite/session_journal_conversion.rs"]
+mod session_journal_conversion;

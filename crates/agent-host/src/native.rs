@@ -1208,6 +1208,7 @@ impl AgentSessionBackend for NativeAgentRuntimeBackend {
             return Err(AgentHostError::Runtime("turn cancelled".to_owned()));
         }
         let id = SessionId::new(&request.runtime_session_id);
+        let _conversion_admission = self.protected_store.foreground_session(&id).await?;
         let PreparedNativeRuntime {
             runtime,
             context_mode,
@@ -1654,6 +1655,10 @@ impl NativeAgentRuntimeBackend {
         executors::server_commands::ensure_agents_allowed()
             .map_err(|error| AgentHostError::Authority(error.to_string()))?;
         use agent_runtime::lcm::LcmSummaryModel;
+        let _conversion_admission = self
+            .protected_store
+            .foreground_session(&SessionId::new(&request.runtime_session_id))
+            .await?;
         let db = self.protected_store.database();
         if self
             .active
@@ -1827,6 +1832,10 @@ impl NativeAgentRuntimeBackend {
     /// source session, so the source keeps taking turns. A no-op when no
     /// fork is pending; refused by the runtime once the successor was saved.
     pub async fn abort_topic_fork(&self, request: AgentTurnRequest) -> Result<(), AgentHostError> {
+        let _conversion_admission = self
+            .protected_store
+            .foreground_session(&SessionId::new(&request.runtime_session_id))
+            .await?;
         let prepared = self.prepare_runtime(&request, None, false).await?;
         prepared
             .runtime

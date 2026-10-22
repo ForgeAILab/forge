@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-20T19:29:31Z
+updated_at: 2026-10-22T04:13:54Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -58,8 +58,8 @@ daemons do not open this database. Existing migration files are immutable.
   `saved`, topic hand-over and `checkpoint_present`.
 - Meet the physical disk gate: fixture B, N=4000, plain and tool, after collection,
   at most 2.0× Forge's measured real legacy L2; aim for 1.5×.
-- Lazy import now; retire replaced and unresumable sessions; clean up the legacy
-  table next release. Collection has no TTL.
+- Background conversion now with lazy import fallback; retire replaced and
+  unresumable sessions; clean up the legacy table next release. Collection has no TTL.
 - Forge builds storage, framing, SQL fences and lifecycle scheduling only.
 - No U10/LCM-table consolidation, warm-runtime redesign, runtime schema 5,
   per-object SQL tables, feature flags, compatibility aliases or multi-process DB
@@ -705,6 +705,21 @@ connection. The pool has five connections and storage needs its own write lock,
 so such a call waits for itself until the 30 s busy or acquire timeout. Nudges
 from deletion, rotation or recovery are sent after the caller's commit.
 
+**Background importer mapping (2026-10-21).** The conversion worker calls
+`SqliteProtectedRuntimeStore::convert_legacy_session`, which tries per-session
+exclusive host admission shared with native turn/fork preparation. A fenced
+engine writer check skips callers outside host admission. It then uses the real
+legacy decoders to decide whether the runtime needs Forge's LCM binding and
+starts `RuntimeBuilder` over the same stores/engine clones with
+`StartSession::resume(...).with_checkpoint_recovery(Defer)`. The runtime's v3
+importer owns validation and exact-first publication. No tools or credentialed
+provider are configured; the conversion provider refuses calls. Drop the handle
+without shutdown/persist so no synthetic boundary is written. Publication is
+checked after start: a live-composition refusal after successful import does not
+undo or misreport conversion. Typed conflicts defer; non-retryable serialization
+failures use the capped unreadable tracker. Forge does not copy import encoding
+or infer publication from a successful activation alone.
+
 **Scalar probes.** Return native publication, tombstone and checkpoint flags
 without decrypting a pack, selecting rows by the indexed `forge_session_id`. A reservation is absent publication; a tombstone is a
 retired conflict, not fresh state. Consult legacy payloads only when native state
@@ -789,14 +804,14 @@ ordinary-only pre-checkpoint sessions, restart/drop and the relevant native-chat
 happy-path case. Locally run only the named targets/filters in tasks.md; CI owns
 full suites. This spec revision runs no code/build tests.
 
-### D7. Lazy import and data-preserving migration
+### D7. Background conversion, fallback import and data-preserving migration
 
 The one `V{YYYYMMDDHHMM}` migration creates D4's tables/indexes only; it neither rewrites
 legacy payloads nor edits historical SQL. Every persistent native session becomes
 a capable pair on cut-over, without a rollout flag; ephemeral scopes stay
 store-less.
 
-On first writer open the runtime's v3 import reads/decrypts/validates the legacy
+The background worker and fallback first writer open use the same runtime v3 import. That import reads/decrypts/validates the legacy
 pair, uses stable import operations and makes no model/tool/provider call.
 Checkpoint-bearing imports publish **protected exact first**, the authority
 point, then ordinary projection. A crash before exact publication leaves v3
@@ -818,11 +833,13 @@ write the legacy row during or after import. Native-first open skips legacy when
 heads suffice, while legitimate import/repair still loads it. Tombstones suppress
 fallback even if an old legacy blob remains.
 
-**Next release**, a separate change adds its own new migration and bounded
-worker: import resumable legacy-only sessions without provider I/O, NULL migrated
-payloads after authority verification, apply the approved retirement rule to dead
-sessions, and drop `protected_agent_session_state` once empty. This release keeps
-that table, including unopened sessions. Do not pre-create the drop migration.
+**This release** converts legacy-only sessions in the background under D8, leaving
+lazy import as the fallback when an open arrives before the pass. The measured
+B/4000 first import (~3.4 s) is full legacy-to-native conversion, not ordinary
+native hydration, and is no longer a latency gate. **Next release**, a separate
+change adds a data-preserving migration to NULL migrated payloads after authority
+verification, handle dead sessions under the approved retirement rule and drop
+`protected_agent_session_state` once empty. This release never deletes legacy rows. Do not pre-create the drop migration.
 Older builds refuse unknown applied migrations; downgrade requires a pre-upgrade
 backup, never resuming stale legacy state from an upgraded database.
 
@@ -891,8 +908,8 @@ wait; the scheduling deadline never cancels an in-flight engine control. The
 call visits every dirty session; max_objects bounds membership releases, not
 previously deferred physical copy/byte removals, sessions or time. The 10 s
 budget therefore bounds the worker loop, not the gate hold.
-D10 measures the longest collect call with many dirty sessions. Above 1 s it
-is a release-review blocker and a runtime follow-up (a per-call session or time
+D10 measures the longest collect call with many dirty sessions. At or above 1 s it
+is a release-review blocker (target below 250 ms) and a runtime follow-up (a per-call session or time
 bound); Forge does not page sessions around the engine. Engine collection owns
 live-closure calculation, pin and
 root-epoch checks, catalog release, dirty clearing and S5. Storage executes
@@ -900,6 +917,31 @@ release/receipt accounting and S2 pack work. Live sessions are collected too;
 superseded checkpoint/cache/manifest paths otherwise accumulate. Post-terminal
 hooks nudge collection and perform geometric S2 maintenance; collection performs
 the base repack. No TTL, object age rule or new runtime schema is introduced.
+
+**Background conversion (2026-10-21).** A sibling supervised
+`session-journal-conversion` worker runs immediately and every 60 seconds (Skip).
+It is separate from retention so a slow import cannot delay retirement/cleanup.
+A keyset cursor pages only native host sessions with legacy rows and no ordinary
+publication or retirement; exact-only partial imports remain repair candidates.
+The durable publication flags are completion markers: restart scans from zero
+without reconverting finished sessions. Each pass examines at most eight
+candidates, holds one decoded session at a time, yields between sessions and
+checks a two-second scheduling deadline before starting the next. Await an
+in-flight import to completion; the deadline is not a cancellation or hard bound
+on a single conversion (~3.4 s for B/4000 in current evidence).
+
+Per-session admission shared with native turns/forks gives foreground work
+priority: conversion uses try-write, skips active sessions, and retries them on
+a later sweep. Foreground opens hold read admission; an open already racing an
+in-flight conversion waits for it to finish rather than surfacing its writer
+conflict. The runtime's own writer fences cover writers outside this host
+admission. Typed conflicts skip/retry, including a lazy importer winning first.
+Both paths use the existing v3 importer, shared engines and exact-first validation
+with checkpoint recovery deferred, with no provider/tool I/O. Conversion never
+persists a synthetic turn or deletes/updates the legacy row. An unreadable row
+uses the existing capped warning tracker and stays present. Tracing reports
+converted, skipped-active, skipped-unreadable, conflicts/deferred, remaining,
+examined and scheduling-budget exhaustion; remaining includes skipped rows.
 
 **D-2 isolation.** Discovery pages the clear dirty index and returns every id,
 including an unreadable record; it never authenticates an entire discovery page.
@@ -1022,9 +1064,9 @@ out of scope.
 ### D9. Rollout and documentation
 
 Ship both journal capabilities directly after the runtime release gate, storage
-conformance and Forge disk gate pass. No old/new adapter layering or selection
+conformance and the D10 disk, turn and collect gates pass. No old/new adapter layering or selection
 flag. Shared engines survive per-turn Runtime replacement. A newly created native
-session writes no legacy row; existing sessions import lazily. Keep the existing
+session writes no legacy row; existing sessions convert in the background with lazy import on open as fallback. Keep the existing
 single-process `runtime.lock`, daemon boundary and credential store.
 
 Implementation updates `docs/architecture.md` (storage/engine split, packs,
@@ -1043,8 +1085,7 @@ Forge table), and `CHANGELOG.md` under `Unreleased`:
 
 This document records proposed code/doc work only. The existing 2026-10-19 Owner
 Decisions entries below are preserved verbatim as the historical receipt,
-including then-candidate levers and older wording; new entries record the two
-2026-10-20 owner decisions. Settled constraints remain L2, storage-only S1–S5,
+including then-candidate levers and older wording; new entries record later owner decisions, including the 2026-10-21 revision below. Settled constraints remain L2, storage-only S1–S5,
 the runtime's 64-revision window (inclusive floor plus the
 current writer epoch's last operation, D4) and no runtime schema 5.
 
@@ -1119,11 +1160,20 @@ versus file savings, memo/cache charge/hit/miss/read/eviction/oversize counts,
 cold-validation time (so the 128 MiB per-engine memo budget can be raised on
 evidence), resident memory (including the observed 1.24× charge headroom), and
 post-retirement metadata/operation bytes. Retain the existing focused
-performance checks: for N≥1000 delta writes ≤10% of legacy writes, measured at
-the production cadence above including S2 and purge rewrites; N=100 native
-turn time ≤legacy+10%, larger N below legacy; import ≤2× one legacy resume.
-Record every pass/fail; unresolved regressions block release review rather than
-being hidden by the disk result. Output JSON plus a Markdown table in
+performance checks under the 2026-10-21 owner decision: native journal overhead
+per turn ≤ approximately 250 ms over legacy at B/N=4000 and ≤ approximately
+50 ms over legacy at N=100, plain and tool, release builds at per-turn cadence.
+Every single `collect` call / engine gate hold must stay below 1 s (target below
+250 ms). N≥1000 delta writes ≤10% of legacy remains a tracked check including S2
+and purge rewrites. Import is no longer latency-gated: move conversion to D8's
+background pass and retain lazy fallback. Record every pass/fail. Speed work
+belongs to agent-runtime change `speed-up-journal-hot-path-2026-10-21`, phases
+P1/P2/P4 (P3 optional); rerun Forge's gate once that runtime release is pinned.
+Current sharing evidence: disk PASS at 1.60843× / 1.79118×; B/4000 native turns
+1,685.62 / 2,547.75 ms versus legacy approximately 229 / 427 ms, so overhead
+approximately 1,457 / 2,121 ms FAIL; C/4000 max collect 2,106.75 ms FAIL pending
+runtime. Turn/collect budget misses remain release-review blockers. No
+import-latency claim is implied by background scheduling. Output JSON plus a Markdown table in
 `docs/performance-testing.md`. This revision adopts the measured method; it does
 not claim Forge has run or passed it.
 
@@ -1231,3 +1281,21 @@ None.
   roughly 159 MiB per engine / 317 MiB for both at full charge, not a heap cap.
   Keep one engine per storage and domain, cloned into every runtime and the
   collector.
+
+## Owner Decisions (2026-10-21)
+
+- **Q6. Fixed latency budgets supersede D10's relative gates.** Native journal
+  overhead per turn is ≤ approximately 250 ms over legacy at B/N=4000 and
+  ≤ approximately 50 ms over legacy at N=100, plain and tool, release builds
+  with per-turn cadence. Every single collect call / engine gate hold is <1 s
+  (target <250 ms). Disk after collection remains ≤2.0× actual L2, aim 1.5×.
+  Delta writes ≤10% of legacy for N≥1000 remains a tracked check.
+- **Q7. Background conversion now; lazy fallback; legacy removal next release.**
+  Import is no longer gated on latency. Forge converts legacy sessions to native
+  in the background so the first open need not perform full conversion. This
+  revises Q3's lazy-import schedule: lazy import remains the fallback when the
+  session opens before the pass reaches it. Keep legacy rows and defer table
+  removal to the next release.
+- **Q8. Runtime owns speed work.** Use agent-runtime change
+  `speed-up-journal-hot-path-2026-10-21`, phases P1/P2/P4; P3 is optional.
+  Rerun Forge's gate after pinning the runtime release containing that work.

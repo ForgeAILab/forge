@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-21T22:04:36Z
+updated_at: 2026-10-22T04:13:54Z
 completed_at:
 ---
 
@@ -672,8 +672,15 @@ No runtime bench crate becomes a production dependency.
   Task 26 and the overall change completion stamp remain untouched.
 
   Re-measured after within-session sharing (task 29, 2026-10-21): the B/4000
-  disk gate now passes at 1.60843× / 1.79118×. The turn, import and C/4000
-  collection-hold checks remain NOT MET.
+  disk gate now passes at 1.60843× / 1.79118×. Against the 2026-10-21 fixed
+  budgets, disk PASS (1.5× aim missed), turn FAIL and collect FAIL pending runtime.
+  B/4000 plain/tool turns are 1,685.62 / 2,547.75 ms versus legacy ~229 / 427 ms:
+  overhead ~1,457 / 2,121 ms exceeds 250 ms. C/4000 max collect is 2,106.75 ms,
+  exceeding 1 s (target <250 ms). Loaded A/N=100 timings do not establish the
+  50 ms budget. Import 3,349.73 / 3,925.23 ms is full conversion and no longer
+  a latency gate. B/4000 delta writes 7.75% / 5.51% pass the tracked 10% check;
+  B/1000 35.9% / 25.3% fail. Rerun after pinning the runtime speed release
+  (`speed-up-journal-hot-path-2026-10-21` P1/P2/P4, P3 optional).
 
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
@@ -740,6 +747,47 @@ No runtime bench crate becomes a production dependency.
   Completed (2026-10-21): B/N=4000 after collection is 2,187,264 / 1,359,872 L2
   (**1.60843×**, plain) and 2,494,464 / 1,392,640 L2 (**1.79118×**, tool): the
   2.0× hard disk gate passes; the 1.5× aim is missed. C/4000 is 1.13992×. Turn
-  and import checks still fail; C/4000's longest collect call is 2,106.75 ms,
+  overhead fails the revised fixed budget; import is no longer latency-gated.
+  C/4000's longest collect call is 2,106.75 ms,
   above D8's 1-second bound. Table in `docs/performance-testing.md`; raw output
   in `/Volumes/Data/tmp/refactor/c3-share/gate/`.
+
+## 2026-10-21 background conversion amendment
+
+- [x] **30. Supervised background legacy conversion.** Add keyset enumeration,
+  shared foreground admission, same runtime v3 importer/validation and engines,
+  active/conflict skips, capped unreadable logging, yield, two-second scheduling
+  budget, eight-candidate cap and restart from durable publication progress.
+  Keep lazy fallback and all legacy rows. Report converted/skipped/remaining.
+  Completed: sibling supervised worker, immediate/60-second Skip cadence;
+  eight scalar candidates, one decoded session, two-second scheduling deadline,
+  weak per-session foreground admission and runtime writer checks. Deferred
+  runtime resume owns v3 validation/publication; handles drop without persist.
+  Native turns, topic forks and fork abort share admission. No storage-layer edits.
+- [x] **31. Background conversion regressions and negative controls.** Verify
+  dormant conversion plus native-only next open, active-turn skip/retry, both
+  lazy race orders, preserved unreadable rows, time/count bounds and restart.
+  Run each exact new test against a disabled conversion pass and record failures.
+  Completed: all six named session_journal_conversion regressions passed, then
+  all six failed individually with only the worker import call bypassed. The
+  worker source was restored byte-for-byte (negative-control.json). Tests assert
+  two native domain publications at revision 1, no legacy load on next open,
+  preserved ciphertext, active host/runtime writer skips, scheduling stop after
+  one in-flight import, eight-candidate cap, and fresh-pool restart progress.
+  Evidence: /Volumes/Data/tmp/refactor/c3-bgconv/report.md.
+- [x] **32. Background docs and focused verification.** Update architecture and
+  Unreleased changelog, strictly validate this change, fmt check, exact new
+  tests, services retention, named agent-host import tests, full
+  session_journal_runtime target and the requested three-package all-target
+  Clippy. Record counts and remaining runtime gates in c3-bgconv/report.md.
+  Completed: six new exact-name regressions pass after byte-exact restoration;
+  retention 6/6; five named agent-host import checks; full session_journal_runtime
+  target 11/11 (including the sharing corruption regression); explicit worker
+  assembly check; fmt, requested Clippy and strict spec validation pass. All
+  Cargo verification uses the offline c.sh wrapper with per-command timeouts.
+  Task 33 and pre-existing incomplete tasks remain open; no overall completion
+  stamp or new runtime pin is claimed.
+- [ ] **33. Pin runtime speed release and rerun Forge gate.** After the runtime
+  P1/P2/P4 release exists, pin it, update the benchmark report gate fields to
+  the fixed budgets, and rerun D10; P3 optional.
+  Deferred: no runtime release/pin change is part of background conversion.

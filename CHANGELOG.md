@@ -189,6 +189,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Convert legacy native sessions in a supervised background pass, one session at
+  a time with active-turn skips, bounded scheduling and restart recovery. Lazy
+  import remains the fallback on early open; legacy rows remain until the next
+  release. Conversion reuses the runtime importer and shared journal engines.
+
 - Native session disk reclamation now runs automatically after terminal
   publication and on a 60-second maintenance tick. It retires replaced and
   unresumable sessions, preserves resumable chats and reusable Task sessions,

@@ -190,6 +190,7 @@ pub struct ForgeRuntime {
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
     session_journal_retention: Arc<crate::session_journal_retention::SessionJournalRetention>,
+    session_journal_conversion: Arc<crate::session_journal_conversion::SessionJournalConversion>,
     pub check_runner: Arc<services::check_runner::CheckRunner>,
     /// Where a consumer family registers and a Task step asks for a check.
     pub check_consumers: Arc<services::check_runner::consumer::TaskCheckConsumers>,
@@ -724,6 +725,12 @@ impl ForgeRuntimeBuilder {
             StorageMaintenanceWorker::new(Arc::clone(&self.db))
                 .with_check_retention_days(effective_config.server.check_retention_days),
         );
+        let session_journal_conversion = Arc::new(
+            crate::session_journal_conversion::SessionJournalConversion::new(
+                Arc::clone(&self.db),
+                embedded_agent_service.protected_store(),
+            ),
+        );
         let session_journal_retention = Arc::new(
             crate::session_journal_retention::SessionJournalRetention::new(
                 Arc::clone(&self.db),
@@ -808,6 +815,7 @@ impl ForgeRuntimeBuilder {
             domain_event_broadcast,
             storage_maintenance,
             session_journal_retention,
+            session_journal_conversion,
             check_runner,
             check_consumers,
             check_worker,
@@ -1138,6 +1146,11 @@ impl RuntimeSupervisor {
             .start(shutdown.clone()),
         ));
         self.handles.push((
+            RuntimeWorker::SessionJournalConversion,
+            Arc::clone(&self.runtime.session_journal_conversion)
+                .start(&periodic_workers, shutdown.clone()),
+        ));
+        self.handles.push((
             RuntimeWorker::SessionJournalRetention,
             Arc::clone(&self.runtime.session_journal_retention)
                 .start(&periodic_workers, shutdown.clone()),
@@ -1284,7 +1297,7 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 20);
+        assert_eq!(COMMON_WORKERS.len(), 21);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
@@ -1296,6 +1309,7 @@ mod tests {
         assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
         assert_eq!(COMMON_WORKERS[18], RuntimeWorker::IntegrationQueue);
         assert_eq!(COMMON_WORKERS[19], RuntimeWorker::SessionJournalRetention);
+        assert_eq!(COMMON_WORKERS[20], RuntimeWorker::SessionJournalConversion);
     }
 
     #[tokio::test]

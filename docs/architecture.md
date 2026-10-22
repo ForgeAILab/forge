@@ -2465,6 +2465,43 @@ Retirement forces collection to purge every dead slot in each retired domain's
 packs, including slots below the normal 25% threshold. Reusable Task sessions,
 current dormant chats and active writers remain protected without a TTL.
 
+A sibling `session-journal-conversion` PeriodicWorker runs immediately in server
+and Solo, then every 60 seconds (Skip). It has its own cursor and two-second
+scheduling budget, so a slow legacy import does not delay retention. Each pass
+keyset-pages at most eight native host rows with a legacy row and no ordinary
+native publication or tombstone; protected-only partial imports remain eligible
+for runtime repair. It converts one session at a time and yields between
+candidates. The deadline is checked before each candidate; an in-flight import
+finishes even if it exceeds two seconds. Memory holds one decoded session at a
+time plus the eight scalar candidates and existing bounded engine/storage caches.
+The cursor wraps for skipped rows; restart begins at zero and durable publication
+flags exclude completed conversions. Legacy rows are never updated or deleted.
+
+Native turns and topic forks hold per-session read admission from preparation
+through completion. Conversion tries exclusive admission without waiting, skipping
+active sessions for a later sweep. Admission entries use weak references and
+remove unused entries on access. An already in-flight conversion completes before
+a racing foreground open proceeds, so its writer reservation cannot surface as
+a user conflict. Engine writer fences also protect callers outside host admission.
+The worker treats typed conflicts as skips. Lazy import remains the fallback if
+an open reaches a session first; native-first open avoids legacy decoding after
+background conversion. This moves the measured full B/4000 conversion (~3.4 s)
+off first open when the background pass has reached that session; it does not
+make conversion itself faster or promise an instantaneous open during a race.
+
+`SqliteProtectedRuntimeStore::convert_legacy_session` uses the real decoders,
+shared stores and engines, and the existing runtime v3 importer through deferred
+resume. It resolves the existing Forge LCM binding when needed. It configures no
+tools or credentialed provider, and its provider refuses calls. The handle is
+dropped without shutdown/persist, avoiding a synthetic boundary. Runtime import
+validation/publication happens before live ability activation; a later activation
+refusal leaves the validated native publication authoritative for the next real
+turn. Non-retryable serialization failures preserve the row and use the same
+capped unreadable tracker. Tracing on `forge_session_journal` reports converted,
+skipped-active, skipped-unreadable, conflicts, examined, remaining and budget
+exhaustion, without ids, contents or keys. Remaining includes unreadable/active
+rows. Legacy-table removal stays in the next release.
+
 Discovery pages only the clear dirty-session index, including corrupt records.
 Runtime v0.9.0 reports per-session non-retryable failures in `unreadable_sessions`,
 keeps their state and dirty hints, and continues healthy collection. A second
@@ -3075,6 +3112,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
+| `session-journal-conversion` | Immediate pass, 60-second Skip interval | 2-second scheduling budget / warn and await; eight candidates, one import at a time, yield, keyset cursor and durable publication progress |
 | `session-journal-retention` | Immediate pass, 60-second Skip interval and post-commit terminal/rotation/recovery/deletion Notify | 10-second scheduling budget / warn and await; 20,000 releases per engine collect, bounded retirement and cleanup batches, resumable cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |

@@ -131,3 +131,29 @@ The gate ratios SHALL be taken after the production cadence (S2 hook and collect
 - **WHEN** grown fixture C is measured after engine-directed pruning
 - **THEN** the report records actual retained operation tiers and replay-boundary/current-epoch behavior
 - **AND** rt-e7's per-turn C/N=1000 1.27826× and collect-at-end C/N=4000 1.22863× L2 numbers remain reference evidence rather than measured Forge outcomes
+
+### Requirement: Lowest-priority supervised legacy conversion
+Forge SHALL supervise a sibling conversion worker in server and Solo, immediately and every 60 seconds with Skip cadence. It SHALL keyset-page native host sessions with legacy rows and missing ordinary publication, including exact-first partial imports, never tombstones. It SHALL convert one session at a time through the existing runtime v3 importer and shared engines with checkpoint recovery deferred, no provider/tool I/O and no legacy deletion or write. Per-session admission SHALL skip active host turns/forks without waiting; runtime writer conflicts SHALL skip/retry. Foreground lazy open racing a conversion SHALL not surface a background writer conflict. Each pass SHALL examine at most eight candidates, check a two-second scheduling budget before each candidate, yield between candidates and retain at most one decoded session. An in-flight import SHALL finish without cancellation; its duration may exceed the scheduling budget. A resumable cursor SHALL wrap for retries, with restart recovering from durable publication flags. Unreadable rows SHALL be preserved and logged through the capped tracker. D8 tracing SHALL expose converted, skipped-active, skipped-unreadable and remaining counts.
+
+#### Scenario: Active turn and lazy import races
+- **WHEN** an active writer holds a candidate or foreground/background import races in either order
+- **THEN** background work skips active candidates for a later sweep, and exactly one logical native journal publishes per domain
+- **AND** lazy open succeeds without a background conflict and completed conversion is idempotent
+
+#### Scenario: Unreadable row and restart
+- **WHEN** a row cannot decode or the worker restarts after a bounded partial pass
+- **THEN** unreadable legacy data remains present with capped warnings and healthy sessions continue
+- **AND** the fresh worker resumes remaining rows from durable publication state without reconverting completed rows
+
+#### Scenario: Scheduling bounds
+- **WHEN** many legacy sessions await conversion
+- **THEN** a pass stops starting conversions at its time budget or eight-candidate cap, yielding between sessions
+- **AND** it never cancels an in-flight import or accumulates decoded session payloads across the page
+
+### Requirement: Fixed latency budgets and runtime follow-up
+Forge SHALL assess native journal turn overhead against legacy at ≤approximately 250 ms for B/N=4000 and ≤approximately 50 ms at N=100, plain and tool, release builds at per-turn cadence. Every single collect call / engine gate hold SHALL be <1 s, targeting <250 ms. Disk SHALL remain ≤2.0× real L2 after collection, aiming for 1.5×. N≥1000 delta writes ≤10% of legacy SHALL remain a tracked check. Import SHALL NOT be latency-gated; background conversion with lazy fallback SHALL move conversion off first open when the pass has reached that session. Speed work SHALL belong to agent-runtime speed-up-journal-hot-path-2026-10-21 P1/P2/P4, with P3 optional; Forge SHALL rerun the gate after that runtime release is pinned.
+
+#### Scenario: Current evidence pending runtime
+- **WHEN** the 2026-10-21 sharing measurements are assessed against fixed budgets
+- **THEN** disk passes at 1.60843× / 1.79118× while B/4000 turn overhead ~1,457 / 2,121 ms and C/4000 collect 2,106.75 ms fail pending runtime
+- **AND** turn/collect misses block release review pending the runtime release and rerun, while import conversion time is reported separately without applying the superseded relative gate
