@@ -223,9 +223,13 @@ export function TaskDetailPage({
     })
   }
 
-  const onUpdatePriority = (priority: number) => {
+  const onUpdatePriority = async (priority: number, expectedTask: NonNullable<typeof task>) => {
     if (!task) return
-    updateTask.mutate({ taskId: task.id, body: { priority, version: task.version } })
+    await updateTask.mutateAsync({
+      taskId: task.id,
+      body: { priority, version: expectedTask.version },
+      expectedTask,
+    })
   }
 
   const onSaveRetryBudgets = (

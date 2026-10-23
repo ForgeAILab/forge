@@ -175,6 +175,24 @@ function setup(view: 'modal' | 'full page', options: { firstPatchConflict?: Conf
   return { ui, Wrapper, patches, stored: () => stored }
 }
 
+describe('Full-page priority editing', () => {
+  it('keeps a priority draft and its edit-start snapshot across a detail refetch', async () => {
+    const test = setup('full page')
+    const task = test.stored()
+    const props = fullPageProps(task)
+    const save = vi.fn().mockResolvedValue(undefined)
+    const view = render(<TaskOverviewPanel {...props} onUpdatePriority={save} />, { wrapper: test.Wrapper })
+    const input = screen.getByLabelText('Priority') as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe(String(task.priority)))
+    fireEvent.change(input, { target: { value: '4' } })
+    view.rerender(<TaskOverviewPanel {...props} task={{ ...task, version: task.version + 1, description: 'Another writer' }} onUpdatePriority={save} />)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)) })
+    expect(input.value).toBe('4')
+    fireEvent.blur(input)
+    await waitFor(() => expect(save).toHaveBeenCalledExactlyOnceWith(4, task))
+  })
+})
+
 describe('Task detail title editing', () => {
   it('shows a successful title save', async () => {
     const test = setup('modal')

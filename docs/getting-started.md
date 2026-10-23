@@ -1282,6 +1282,27 @@ happen only in admitted Task Worker/reviewer Workspaces. A handoff is an
 immutable, bounded, provenance-linked packet with at most one target turn, not
 shared hidden context or a second chat.
 
+## Editing and filtering Tasks in the web app
+
+Open a Kanban card to edit its title, description or priority. Escape in the title
+or description editor discards the draft and refreshes the stored Task and board
+values. Press Escape again to close the detail dialog. Priority saves when you
+leave the field. If another client changed an unrelated field, Forge refreshes
+the Task version and retries the priority save once; a competing priority change
+is reported instead of overwritten.
+
+The Tasks table's Statuses menu can select several statuses. A row must match one
+of those statuses **and** the other active filters, including minimum and maximum
+priority. Changing a filter or sort preserves the other selections. Clear all
+removes the selections and restores the unfiltered list.
+
+Creating a Task from the board dialog puts it in Todo. The Todo badge and Project
+Overview refresh from the server, including changes from other connected clients.
+Overview's Backlog metric groups `backlog`, `todo`, `ready`, `pending` and `queued`;
+it is broader than the Kanban Backlog column. Task events that arrive during a
+list or count read trigger a follow-up read so an older response cannot leave
+the display stale.
+
 ## End-to-end: Main Chat to a traceable Task
 
 This is the supported path for turning a rough idea into repository-backed work.

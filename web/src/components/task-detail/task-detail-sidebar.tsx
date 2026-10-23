@@ -58,6 +58,7 @@ interface TaskDetailSidebarProps {
   availableTransitions: string[]
   transitionPending: boolean
   priorityDraft: string
+  priorityPending?: boolean
   setPriorityDraft: (value: string) => void
   savePriority: () => void
   agentName: (agentId?: string | null) => string | undefined | null
@@ -78,6 +79,7 @@ export function TaskDetailSidebar({
   availableTransitions,
   transitionPending,
   priorityDraft,
+  priorityPending,
   setPriorityDraft,
   savePriority,
   agentName,
@@ -244,6 +246,8 @@ export function TaskDetailSidebar({
 
             <SidebarField label="Priority">
               <Input
+                aria-label="Priority"
+                disabled={priorityPending}
                 type="number"
                 className="h-8"
                 value={priorityDraft}
@@ -251,7 +255,11 @@ export function TaskDetailSidebar({
                 onChange={(e) => setPriorityDraft(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') savePriority()
-                  if (e.key === 'Escape') setPriorityDraft(String(task.priority))
+                  if (e.key === 'Escape') {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    setPriorityDraft(String(task.priority))
+                  }
                 }}
               />
             </SidebarField>

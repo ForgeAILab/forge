@@ -9,6 +9,7 @@ import {
   useRemoveRole,
   useTasksQuery,
   useTransitionTask,
+  useWorkflowQuery,
 } from '@/api/hooks'
 import { BulkCancelTasks, TaskRowActions } from '@/components/task-detail/task-list-actions'
 import { ErrorBanner } from '@/components/error-banner'
@@ -19,7 +20,13 @@ import {
   type AssigneeSelection,
   AgentAssigneeDropdown,
   TaskStatusDropdown,
+  taskStatusColors,
 } from '@/components/task-controls'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Avatar } from '@/components/ui/avatar'
 import { AgentFilterGroup } from '@/components/agent-filter-group'
 import { WorkflowHealthBadge } from '@/components/workflow-health-badge'
@@ -58,6 +65,7 @@ export function TaskListPage({
   sortBy,
   sortOrder,
   agentIds,
+  statuses = [],
   blockedOnly,
   includeCancelled,
   includeArchived,
@@ -70,6 +78,7 @@ export function TaskListPage({
   sortBy: TaskListSortBy
   sortOrder: TaskListSortOrder
   agentIds: string[]
+  statuses?: string[]
   blockedOnly: boolean
   includeCancelled: boolean
   includeArchived: boolean
@@ -78,6 +87,7 @@ export function TaskListPage({
   onSortChange: (sortBy: TaskListSortBy, sortOrder: TaskListSortOrder) => void
   onFilterChange: (patch: {
     agentIds?: string[]
+    statuses?: string[]
     blockedOnly?: boolean
     includeCancelled?: boolean
     includeArchived?: boolean
@@ -86,6 +96,7 @@ export function TaskListPage({
   }) => void
 }) {
   const navigate = useNavigate()
+  const workflowQuery = useWorkflowQuery(projectId)
   const agentsQuery = useAgentsQuery()
   const { data: projectAgentsData } = useProjectAgentsQuery(projectId)
   const { data: membersData } = useMembersQuery(projectId)
@@ -99,9 +110,10 @@ export function TaskListPage({
   const tasksQuery = useTasksQuery(projectId, {
     sort_by: sortBy,
     sort_order: sortOrder,
+    status: statuses.length > 0 ? statuses.join(',') : undefined,
     agent_id: agentUuids.length > 0 ? agentUuids.join(',') : undefined,
     assignee_type: agentIds.includes('user') ? 'user' : undefined,
-    include_cancelled: includeCancelled,
+    include_cancelled: includeCancelled || statuses.includes('cancelled'),
     include_archived: includeArchived,
   })
 
@@ -123,6 +135,16 @@ export function TaskListPage({
     () => new Map((agentsQuery.data?.items ?? []).map((agent) => [agent.id, agent.name])),
     [agentsQuery.data],
   )
+  const statusNames = Array.from(
+    new Set([
+      ...(workflowQuery.data?.states.map((state) => state.name) ?? []),
+      ...Object.keys(taskStatusColors),
+      'backlog',
+      'blocked',
+      ...tasks.map((task) => task.status),
+      ...statuses,
+    ]),
+  ).sort()
   const agents = agentsQuery.data?.items ?? []
   const selectedTasks = useMemo(
     () => visibleTasks.filter((task) => selectedIds.has(task.id)),
@@ -135,6 +157,7 @@ export function TaskListPage({
     visibleTasks.length > 0 && visibleTasks.every((task) => selectedIds.has(task.id))
 
   const hasActiveFilters =
+    statuses.length > 0 ||
     agentIds.length > 0 ||
     blockedOnly ||
     includeCancelled ||
@@ -143,6 +166,7 @@ export function TaskListPage({
     priorityMax !== undefined
 
   const activeFilterCount = [
+    statuses.length > 0,
     agentIds.length > 0,
     priorityMin !== undefined || priorityMax !== undefined,
     blockedOnly,
@@ -313,6 +337,39 @@ export function TaskListPage({
             showMobileFilters ? 'w-full md:w-auto' : 'hidden md:flex',
           )}
         >
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              aria-label="Statuses"
+              className="h-7 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              Statuses{statuses.length > 0 ? ` (${statuses.length})` : ''}
+            </DropdownMenuTrigger>
+            <DropdownMenuContent className="max-h-64 w-52 overflow-y-auto">
+              <fieldset>
+                <legend className="sr-only">Filter by status</legend>
+                {statusNames.map((status) => (
+                  <label
+                    key={status}
+                    className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-accent"
+                  >
+                    <Checkbox
+                      aria-label={status}
+                      checked={statuses.includes(status)}
+                      onChange={() =>
+                        onFilterChange({
+                          statuses: statuses.includes(status)
+                            ? statuses.filter((selected) => selected !== status)
+                            : [...statuses, status],
+                        })
+                      }
+                    />
+                    {workflowQuery.data?.states.find((state) => state.name === status)?.display_name ||
+                      status.replaceAll('_', ' ')}
+                  </label>
+                ))}
+              </fieldset>
+            </DropdownMenuContent>
+          </DropdownMenu>
           {agents.length > 0 && (
             <>
               <AgentFilterGroup
@@ -390,6 +447,7 @@ export function TaskListPage({
               className="cursor-pointer text-xs text-muted-foreground transition-colors hover:text-foreground"
               onClick={() =>
                 onFilterChange({
+                  statuses: [],
                   agentIds: [],
                   blockedOnly: false,
                   includeCancelled: false,

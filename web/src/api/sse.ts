@@ -3,6 +3,7 @@ import type { QueryClient } from '@tanstack/react-query'
 import { invalidateAnalyticsQueries } from '@/api/analytics-query-invalidation'
 import { qk } from '@/api/query-keys'
 import { invalidateProjectTaskDetails } from '@/api/task-detail-invalidation'
+import { invalidateAfterFetch } from '@/api/invalidate-after-fetch'
 import { useAuthStore } from '@/stores/auth'
 import { useChatSelection } from '@/stores/chat'
 import type { TasksResponse } from '@/types/generated'
@@ -160,6 +161,7 @@ function runProjectSummaryInvalidation(
       { queryKey: qk.project(projectId), exact: true },
       { cancelRefetch: false },
     )
+    invalidateAfterFetch(queryClient, { queryKey: qk.projectOverview(projectId) })
   }
   void queryClient.invalidateQueries(
     { queryKey: qk.projects, exact: true },
@@ -225,18 +227,12 @@ function invalidateProjectSummaries(queryClient: QueryClient, projectId: string)
 
 function runProjectTaskListInvalidation(queryClient: QueryClient, projectId?: string): void {
   if (projectId) {
-    void queryClient.invalidateQueries(
-      { queryKey: qk.projectTasks(projectId) },
-      { cancelRefetch: false },
-    )
+    invalidateAfterFetch(queryClient, { queryKey: qk.projectTasks(projectId) })
     return
   }
-  void queryClient.invalidateQueries(
-    {
-      predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
-    },
-    { cancelRefetch: false },
-  )
+  invalidateAfterFetch(queryClient, {
+    predicate: (query) => query.queryKey[0] === 'projects' && query.queryKey[2] === 'tasks',
+  })
 }
 
 function invalidateProjectTaskLists(
