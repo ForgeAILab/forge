@@ -20,7 +20,6 @@ import {
   type AssigneeSelection,
   AgentAssigneeDropdown,
   TaskStatusDropdown,
-  taskStatusColors,
 } from '@/components/task-controls'
 import {
   DropdownMenu,
@@ -113,7 +112,7 @@ export function TaskListPage({
     status: statuses.length > 0 ? statuses.join(',') : undefined,
     agent_id: agentUuids.length > 0 ? agentUuids.join(',') : undefined,
     assignee_type: agentIds.includes('user') ? 'user' : undefined,
-    include_cancelled: includeCancelled || statuses.includes('cancelled'),
+    include_cancelled: includeCancelled,
     include_archived: includeArchived,
   })
 
@@ -138,9 +137,6 @@ export function TaskListPage({
   const statusNames = Array.from(
     new Set([
       ...(workflowQuery.data?.states.map((state) => state.name) ?? []),
-      ...Object.keys(taskStatusColors),
-      'backlog',
-      'blocked',
       ...tasks.map((task) => task.status),
       ...statuses,
     ]),

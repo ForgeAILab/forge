@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { TaskDetailModal } from './task-detail-modal'
 import { useBoardData } from '@/features/board/useBoardData'
 import { taskListItem } from '@/test-utils/task-list-item'
-import type { Task, UpdateTaskRequest } from '@/types/generated'
+import type { Task, TaskDetailResponse, UpdateTaskRequest } from '@/types/generated'
 import { qk } from '@/api/query-keys'
 
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
@@ -55,7 +55,11 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-function setup() {
+function setup(options: { holdPriority?: boolean; priorityError?: boolean } = {}) {
+  let releasePriority!: () => void
+  const priorityHeld = new Promise<void>((resolve) => {
+    releasePriority = resolve
+  })
   let stored: Task = {
     ...taskListItem({ title: 'Set up CI pipeline', priority: 3 }),
     description: 'Original description',
@@ -70,6 +74,10 @@ function setup() {
     if (path.endsWith('/tasks/task-1') && init?.method === 'PATCH') {
       const body: UpdateTaskRequest = JSON.parse(String(init.body))
       patches.push(body)
+      if (body.priority !== undefined && options.priorityError) {
+        await priorityHeld
+        return Response.json({ message: 'Priority unavailable' }, { status: 503 })
+      }
       if (body.version !== stored.version)
         return Response.json(
           { code: 'version_conflict', message: 'resource version conflict' },
@@ -81,7 +89,9 @@ function setup() {
         description: body.description ?? stored.description,
         version: stored.version + 1,
       }
-      return Response.json(stored)
+      const response = Response.json(stored)
+      if (body.priority !== undefined && options.holdPriority) await priorityHeld
+      return response
     }
     if (path.endsWith('/tasks/task-1')) return Response.json(stored)
     if (path.endsWith('/tasks/task-1/detail'))
@@ -120,6 +130,7 @@ function setup() {
   )
   return {
     patches,
+    releasePriority,
     onClose,
     stored: () => stored,
     secondClient: (changes: Partial<Task>) => {
@@ -129,6 +140,76 @@ function setup() {
 }
 
 describe('TestSprite task edits', () => {
+  it('clears the priority edit base when a title mutation overlaps its pending save', async () => {
+    const test = setup({ holdPriority: true })
+    const input = (await screen.findByRole('textbox', { name: 'Priority' })) as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe('3'))
+    fireEvent.change(input, { target: { value: '4' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(test.patches).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: 'Set up CI pipeline' }))
+    const title = screen.getByRole('textbox', { name: '' })
+    fireEvent.change(title, { target: { value: 'Title saved while priority is pending' } })
+    fireEvent.keyDown(title, { key: 'Enter' })
+    await screen.findByRole('button', { name: 'Title saved while priority is pending' })
+    await act(async () => {
+      test.releasePriority()
+    })
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    test.secondClient({ priority: 8, description: 'Latest cached priority' })
+    act(() =>
+      client.setQueryData<TaskDetailResponse>(qk.taskDetail('task-1'), (detail) =>
+        detail ? { ...detail, task: test.stored() } : detail,
+      ),
+    )
+    await waitFor(() => expect(input.value).toBe('8'))
+    fireEvent.change(input, { target: { value: '9' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(test.stored().priority).toBe(9))
+  })
+
+  it('restores the latest cached priority after a pending save fails', async () => {
+    const test = setup({ priorityError: true })
+    const input = (await screen.findByRole('textbox', { name: 'Priority' })) as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe('3'))
+    fireEvent.change(input, { target: { value: '4' } })
+    fireEvent.blur(input)
+    await waitFor(() => expect(test.patches).toHaveLength(1))
+    test.secondClient({ priority: 8, description: 'Latest cached priority' })
+    await act(async () => {
+      client.setQueryData<TaskDetailResponse>(qk.taskDetail('task-1'), (detail) =>
+        detail ? { ...detail, task: test.stored() } : detail,
+      )
+    })
+    await screen.findByText('Latest cached priority')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(input.value).toBe('4')
+    await act(async () => {
+      test.releasePriority()
+    })
+    await waitFor(() => expect(client.isMutating()).toBe(0))
+    await waitFor(() => expect(input.value).toBe('8'))
+  })
+
+  it('Escape refreshes detail and task lists without invalidating other task panels', async () => {
+    setup()
+    const otherKeys = [
+      qk.taskDiff('task-1'),
+      qk.reviews('task-1'),
+      qk.comments('task-1'),
+      qk.taskMedia('task-1'),
+    ]
+    for (const key of otherKeys) client.setQueryData(key, [])
+    fireEvent.click(await screen.findByRole('button', { name: 'Set up CI pipeline' }))
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.keyDown(screen.getByRole('textbox', { name: '' }), { key: 'Escape' })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.taskDetail('task-1'), exact: true })
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.projectTasks('project-1') })
+    for (const key of otherKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(false)
+  })
+
   it('consumes Escape while cancelling an edit so outer dialog handlers cannot close it', async () => {
     setup()
     fireEvent.click(await screen.findByRole('button', { name: 'Set up CI pipeline' }))

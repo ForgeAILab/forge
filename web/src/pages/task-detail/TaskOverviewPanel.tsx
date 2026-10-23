@@ -4,7 +4,7 @@ import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
-import { getApiErrorMessage, isTransientApiError } from '@/lib/api-error'
+import { isTransientApiError, toastApiError } from '@/lib/api-error'
 import { budgetLabel, visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
 import { type AssigneeSelection, TaskStatusDropdown } from '@/components/task-controls'
@@ -78,7 +78,11 @@ interface TaskOverviewPanelProps {
   ) => void
 }
 
-export function TaskOverviewPanel({
+export function TaskOverviewPanel(props: TaskOverviewPanelProps) {
+  return <TaskOverviewEditor key={props.task?.id} {...props} />
+}
+
+function TaskOverviewEditor({
   task,
   isLoading,
   isError,
@@ -120,6 +124,13 @@ export function TaskOverviewPanel({
   const [descriptionSaveError, setDescriptionSaveError] = useState<unknown>()
   const [priorityDraft, setPriorityDraft] = useState('')
   const priorityEditBase = useRef<Task>()
+  const currentTask = useRef(task)
+  useEffect(() => {
+    currentTask.current = task
+    return () => {
+      currentTask.current = undefined
+    }
+  }, [task])
   const [reviewRetryOverride, setReviewRetryOverride] = useState('')
   const [reviewProgressOverride, setReviewProgressOverride] = useState('')
   const [mergeFixRetryOverride, setMergeFixRetryOverride] = useState('')
@@ -241,16 +252,23 @@ export function TaskOverviewPanel({
       setPriorityDraft(String(task.priority))
       return
     }
+    const expectedTask = priorityEditBase.current ?? task
     try {
-      await onUpdatePriority(priority, priorityEditBase.current ?? task)
-      priorityEditBase.current = undefined
+      await onUpdatePriority(priority, expectedTask)
+      if (currentTask.current?.id !== expectedTask.id) return
       setPriorityDraft(String(priority))
     } catch (error) {
-      priorityEditBase.current = undefined
+      if (currentTask.current?.id !== expectedTask.id) return
       setPriorityDraft(
-        String(error instanceof TaskFieldConflictError ? error.currentTask.priority : task.priority),
+        String(
+          error instanceof TaskFieldConflictError
+            ? error.currentTask.priority
+            : currentTask.current.priority,
+        ),
       )
-      toast.error(getApiErrorMessage(error, 'Priority update failed'))
+      toastApiError(error, 'Priority update failed')
+    } finally {
+      priorityEditBase.current = undefined
     }
   }
 

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { taskListItem } from '@/test-utils/task-list-item'
 import { TaskListPage } from './TaskListPage'
@@ -17,7 +17,7 @@ vi.mock('@/api/hooks', () => ({
   useProjectAgentsQuery: () => ({ data: [] }),
   useMembersQuery: () => ({ data: [] }),
   useWorkflowQuery: () => ({
-    data: { states: ['todo', 'review', 'done'].map((name) => ({ name, display_name: name })) },
+    data: { states: ['todo', 'review', 'queued'].map((name) => ({ name, display_name: name })) },
   }),
   useArchiveTask: () => ({}),
   useAssignRole: () => ({}),
@@ -63,6 +63,44 @@ function Filters() {
 }
 
 describe('Task table filters', () => {
+  it('offers only workflow, loaded, and selected statuses', () => {
+    render(
+      <TaskListPage
+        projectId="project-1"
+        sortBy="updated_at"
+        sortOrder="desc"
+        agentIds={[]}
+        statuses={['legacy']}
+        blockedOnly={false}
+        includeCancelled={false}
+        includeArchived={false}
+        onSortChange={vi.fn()}
+        onFilterChange={vi.fn()}
+      />,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Statuses' }))
+    expect(
+      within(screen.getByRole('group', { name: 'Filter by status' }))
+        .getAllByRole('checkbox')
+        .map((checkbox) => checkbox.getAttribute('aria-label')),
+    ).toEqual(['legacy', 'queued', 'review', 'todo'])
+    for (const status of ['todo', 'review', 'queued', 'legacy'])
+      expect(screen.getByRole('checkbox', { name: status })).toBeTruthy()
+    for (const status of ['blocked', 'backlog', 'cancelled', 'in_progress'])
+      expect(screen.queryByRole('checkbox', { name: status })).toBeNull()
+  })
+
+  it('includes statuses from loaded tasks outside the current workflow', () => {
+    render(<Filters />)
+    fireEvent.click(screen.getByRole('button', { name: 'Clear all' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Statuses' }))
+    expect(
+      within(screen.getByRole('group', { name: 'Filter by status' }))
+        .getAllByRole('checkbox')
+        .map((checkbox) => checkbox.getAttribute('aria-label')),
+    ).toEqual(['done', 'queued', 'review', 'todo'])
+  })
+
   it('intersects selected statuses with minimum priority and clears every filter', () => {
     render(<Filters />)
     expect(screen.getByRole('button', { name: 'High todo' })).toBeTruthy()

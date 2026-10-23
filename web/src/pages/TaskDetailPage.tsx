@@ -203,7 +203,7 @@ export function TaskDetailPage({
   // Handlers
 
   const onUpdateTitle = async (title: string, expectedTask: NonNullable<typeof task>) => {
-    if (!task) return
+    if (!task || expectedTask.id !== task.id) return
     await updateTask.mutateAsync({
       taskId: task.id,
       body: { title, version: task.version },
@@ -215,7 +215,7 @@ export function TaskDetailPage({
     description: string,
     expectedTask: NonNullable<typeof task>,
   ) => {
-    if (!task) return
+    if (!task || expectedTask.id !== task.id) return
     await updateTask.mutateAsync({
       taskId: task.id,
       body: { description, version: task.version },
@@ -224,7 +224,7 @@ export function TaskDetailPage({
   }
 
   const onUpdatePriority = async (priority: number, expectedTask: NonNullable<typeof task>) => {
-    if (!task) return
+    if (!task || expectedTask.id !== task.id) return
     await updateTask.mutateAsync({
       taskId: task.id,
       body: { priority, version: expectedTask.version },

@@ -8,8 +8,8 @@ export function invalidateAfterFetch(queryClient: QueryClient, filters: QueryFil
   const fetching = queryClient
     .getQueryCache()
     .findAll(filters)
-    .filter((query) => query.state.fetchStatus === 'fetching')
-  const refreshed = queryClient.invalidateQueries(filters, { cancelRefetch: false })
+    .filter((query) => query.isActive() && query.state.fetchStatus === 'fetching')
+  void queryClient.invalidateQueries(filters, { cancelRefetch: false })
   let pending = pendingRefreshes.get(queryClient)
   if (!pending) {
     pending = new Set()
@@ -18,10 +18,15 @@ export function invalidateAfterFetch(queryClient: QueryClient, filters: QueryFil
   for (const query of fetching) {
     if (pending.has(query.queryHash)) continue
     pending.add(query.queryHash)
-    void refreshed.then(() => {
+    void (async () => {
+      // Invalidation can resolve immediately if an observer disables or unmounts.
+      // Wait for the actual read, including a replacement read, before refreshing.
+      while (query.state.fetchStatus === 'fetching' && query.promise) {
+        await query.promise.catch(() => {})
+      }
       pending.delete(query.queryHash)
-      if (queryClient.getQueryCache().get(query.queryHash) !== query) return
+      if (queryClient.getQueryCache().get(query.queryHash) !== query || !query.isActive()) return
       invalidateAfterFetch(queryClient, { queryKey: query.queryKey, exact: true })
-    })
+    })()
   }
 }

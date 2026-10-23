@@ -1,4 +1,4 @@
-import type { Task } from '@/types/generated'
+import type { Task, TaskDetailResponse } from '@/types/generated'
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
@@ -33,7 +33,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getAvailableTaskTransitions } from '@/components/task-controls'
-import { getApiErrorMessage, isTransientApiError, notifyTaskBusy, toastApiError } from '@/lib/api-error'
+import {
+  getApiErrorMessage,
+  isTransientApiError,
+  notifyTaskBusy,
+  toastApiError,
+} from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
 import type { Review } from '@/types/generated'
@@ -158,7 +163,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   }, [open, onClose, editingTitle, editingDescription])
 
   const refreshStoredTask = () => {
-    void queryClient.invalidateQueries({ queryKey: qk.task(taskId) })
+    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId), exact: true })
     if (task) void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
   }
 
@@ -254,7 +259,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     )
   }
 
-  const savePriority = () => {
+  const savePriority = async () => {
     if (!task || updateTask.isPending) return
     const priority = Number(priorityDraft)
     if (!priorityDraft.trim() || !Number.isFinite(priority) || priority === task.priority) {
@@ -263,22 +268,25 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
       return
     }
     const expectedTask = priorityEditBase.current ?? task
-    updateTask.mutate(
-      { taskId: task.id, body: { priority, version: expectedTask.version }, expectedTask },
-      {
-        onSuccess: (saved) => {
-          priorityEditBase.current = undefined
-          setPriorityDraft(String(saved.priority))
-        },
-        onError: (error) => {
-          priorityEditBase.current = undefined
-          setPriorityDraft(
-            String(error instanceof TaskFieldConflictError ? error.currentTask.priority : task.priority),
-          )
-          toastApiError(error, 'Priority update failed')
-        },
-      },
-    )
+    try {
+      const saved = await updateTask.mutateAsync({
+        taskId: task.id,
+        body: { priority, version: expectedTask.version },
+        expectedTask,
+      })
+      setPriorityDraft(String(saved.priority))
+    } catch (error) {
+      const latest =
+        queryClient.getQueryData<TaskDetailResponse>(qk.taskDetail(task.id))?.task ?? task
+      setPriorityDraft(
+        String(
+          error instanceof TaskFieldConflictError ? error.currentTask.priority : latest.priority,
+        ),
+      )
+      toastApiError(error, 'Priority update failed')
+    } finally {
+      priorityEditBase.current = undefined
+    }
   }
 
   const onTitleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {

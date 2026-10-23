@@ -20,8 +20,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Kanban column counts and Project Overview counts refresh when a Task event
   arrives during an in-flight list or count read, instead of keeping the older
   response.
-- Ordinary Task title, description and priority edits now publish the
-  Project-scoped `task.updated` event, so other connected clients refresh.
+- Ordinary Task title, description and priority edits, from the web app or
+  the MCP `forge_update_task` tool, now publish the Project-scoped
+  `task.updated` event, so other connected clients refresh. The MCP tool now
+  goes through the same Task update validation as `PATCH /api/v1/tasks/{id}`.
 
 ## [0.14.1] - 2026-10-21
 
