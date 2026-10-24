@@ -38,7 +38,7 @@ The following path is present:
 2. The embedded-agent routes pass it to `EmbeddedAgentService`.
 3. The service stores it on the immutable agent profile.
 4. Native turn builders copy the profile value into `NativeProviderConfig`.
-5. `crates/agent-host/src/native.rs` applies it to Agent Runtime through
+5. `crates/agent-host/src/native/runtime_setup.rs` applies it to Agent Runtime through
    `ReasoningConfig`.
 6. The shared Agent Runtime OpenAI-compatible adapter serializes the value as
    the Chat Completions field `reasoning_effort`.
@@ -47,7 +47,7 @@ The following path is present:
 
 ### Server validation rejects API-key entries
 
-`crates/services-agents/src/embedded_agent_service.rs` currently has
+`crates/services-agents/src/embedded_agent_service/providers.rs` currently has
 `validate_native_reasoning_effort`. It only accepts:
 
 - provider `openai`;
@@ -118,7 +118,7 @@ does not render two reasoning selectors.
 ## Recommended implementation sequence
 
 1. Update `validate_native_reasoning_effort` and its tests in
-   `crates/services-agents/src/embedded_agent_service.rs`.
+   `crates/services-agents/src/embedded_agent_service/providers.rs`.
 2. Update the OpenAI provider capability setup in
    `crates/agent-host/src/native.rs`.
 3. Add/adjust a host-level test proving an OpenAI direct provider reports

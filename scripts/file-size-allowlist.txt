@@ -2,9 +2,6 @@
 # Never raise or add entries; split files instead.
 # After shrinking/deleting files: python3 scripts/check-file-sizes.py --update
 # Maintainers only: --init recreates the one-time baseline, never to accept growth.
-3293 crates/agent-host/src/native.rs
-4272 crates/agent-host/src/protected_store.rs
-6288 crates/agent-host/src/typed_tools.rs
 2187 crates/agent-host/tests/session_journal_runtime.rs
 4604 crates/agent-host/tests/session_journal_storage.rs
 2185 crates/api-types/src/daemon_transport.rs
@@ -50,9 +47,6 @@
 5230 crates/pricing/src/lib.rs
 3329 crates/pricing/src/sqlite.rs
 2728 crates/review/src/contract.rs
-8398 crates/services-agents/src/agent_chat_turn_worker.rs
-4147 crates/services-agents/src/embedded_agent_service.rs
-7815 crates/services-agents/src/native_tools.rs
 2108 crates/services-agents/src/provider_authorization.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
