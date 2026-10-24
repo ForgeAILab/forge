@@ -290,14 +290,25 @@ Arbitration SHALL follow Forge's selected-Profile Chat resume choice when that s
 - **AND** partial arbitration effects roll back before adoption, and the full original transcript resumes with zero provider calls
 - **AND** an existing owner can resume through its own binding while receipt work is deferred
 
-#### Scenario: Own canonical timeline while another Profile is selected
-- **WHEN** a session already owns and binds T and the selected Profile uses a topic timeline or has no session in this chat
-- **THEN** background conversion preserves that session's binding and imports normally without routing it through the unrelated selected Profile
+#### Scenario: Conversion defers shared timelines without a selected referencing target
+- **WHEN** shared pre-topic T is unowned, or an existing owner has unreceipted referencing siblings, and no selected-Profile resume target references T
+- **THEN** conversion SHALL leave ownership, bindings, receipts and referencing legacy sessions unchanged and eligible for a later sweep with the same cursor
+- **AND** it SHALL report the retryable outcome under a distinct shared-LCM skipped reason, never parking it or counting it unreadable
+- **AND** a failed or cancelled sibling reached first SHALL NOT adopt T; a later foreground resume of Forge's chosen session can adopt T with sibling receipts
+
+#### Scenario: Refuse a target bound to another timeline
+- **WHEN** the transfer target already has a non-repairable binding different from referenced T
+- **THEN** the resolver SHALL refuse with the precise target-binding mismatch reason before changing T, source bindings, receipts or session labels
 
 #### Scenario: Selected target already owns the timeline
 - **WHEN** the selected target already owns and binds T and its unpublished or published saved state references T
 - **THEN** the same admissions, writer checks and version fences authorize a receipt-only transaction
 - **AND** siblings convert and resume after a Profile switch back without moving T or republishing the target's state
+
+#### Scenario: Completed sibling receipt pass leaves later turns cheap
+- **WHEN** the selected owner has receipted every referencing sibling or none reference T
+- **THEN** subsequent turns SHALL skip sibling admission while the cached durable metadata marker is unchanged
+- **AND** new siblings, changed legacy copies, binding or ownership changes SHALL invalidate the marker and retry the guarded receipt pass
 
 #### Scenario: Resume a Profile that relinquished shared pre-topic LCM
 - **WHEN** a retained session resumes after relinquishing T

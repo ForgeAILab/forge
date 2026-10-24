@@ -46,6 +46,9 @@ impl ConversionAdmission {
     }
 }
 
+pub const SHARED_LCM_CONVERSION_DEFERRED: &str =
+    "LCM shared timeline conversion awaits the selected profile's resume target";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConversionOutcome {
     Converted,

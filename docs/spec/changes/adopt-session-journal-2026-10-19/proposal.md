@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-24T15:41:33Z
+updated_at: 2026-10-24T16:48:22Z
 ---
 
 ## Why
@@ -169,14 +169,24 @@ as a previously assigned owner. Conversion assigns ownership and records
 relinquishment before any non-target sibling publishes, then imports that
 sibling's own transcript and protected state immediately. Both worker cursor
 orders, unchanged legacy data and a zero-provider native Main Chat resume are
-required; Profile-based conversion deferral is removed.
+required. Conversion defers shared timelines if no selected resume target
+references T; foreground resume decides ownership.
 
 
 The review repair preserves Forge's foreground resume choice. Receipts cover all
 referencing sibling statuses and rotation-linked switches; unrelated native,
-topic and rotation rows do not block. Own-bound timelines convert normally under
-another selection, and target-owned timelines support receipt-only arbitration
+topic and rotation rows do not block. Own-bound shared timelines with
+unreceipted siblings defer under unrelated selection; target-owned timelines
+support receipt-only arbitration
 before or after native publication. Transient contention retries within the same
 worker lifetime, corrupt sibling errors stay with that sibling, and a no-LCM
 copy retains its semantic summary. Task 36 covers these fixes and foreground-first
 real-copy resume with zero provider calls.
+
+
+The N1–N3 amendment requires retryable, separately reported shared-LCM deferral
+before unselected conversion can adopt or publish; binding equality before any
+transfer; and a durable-metadata-invalidated cache of completed sibling receipt
+passes. Foreground adoption remains available, and conversion still assigns T
+when the selected Profile's actual resume target references it. Task 37 covers
+fail-without regressions, all round-6 suites and isolated real-copy verification.

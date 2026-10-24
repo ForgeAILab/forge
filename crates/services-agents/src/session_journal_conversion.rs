@@ -5,7 +5,8 @@ use agent_runtime::core::{
 };
 use db::SqliteDb;
 use forge_agent_host::{
-    session_journal::ForgeJournalStorage, session_journal_conversion::ConversionOutcome,
+    session_journal::ForgeJournalStorage,
+    session_journal_conversion::{ConversionOutcome, SHARED_LCM_CONVERSION_DEFERRED},
     SqliteProtectedRuntimeStore,
 };
 use services::Result;
@@ -32,6 +33,7 @@ pub struct ConversionReport {
     pub converted: usize,
     pub skipped_active: usize,
     pub skipped_retired: usize,
+    pub skipped_shared_lcm: usize,
     pub parked_by_reason: BTreeMap<String, usize>,
     pub parked_sessions: Vec<ParkedSession>,
     pub skipped_unreadable: usize,
@@ -182,6 +184,9 @@ impl SessionJournalConversion {
                 Ok(ConversionOutcome::AlreadyNative) => {}
                 Ok(ConversionOutcome::SkippedActive) => report.skipped_active += 1,
                 Err(error) if error.retryable => {
+                    if error.message == SHARED_LCM_CONVERSION_DEFERRED {
+                        report.skipped_shared_lcm += 1;
+                    }
                     tracing::debug!(target: "forge_session_journal", runtime_session_id=runtime,
                         error_kind=?error.kind, "background journal conversion deferred for retry");
                 }
@@ -224,7 +229,7 @@ impl SessionJournalConversion {
             )
             .await?;
         tracing::debug!(target: "forge_session_journal", duration_us=started.elapsed().as_micros() as u64,
-            examined=report.examined, converted=report.converted, skipped_active=report.skipped_active, skipped_retired=report.skipped_retired, parked_by_reason=?report.parked_by_reason,
+            examined=report.examined, converted=report.converted, skipped_active=report.skipped_active, skipped_retired=report.skipped_retired, skipped_shared_lcm=report.skipped_shared_lcm, parked_by_reason=?report.parked_by_reason,
             skipped_unreadable=report.skipped_unreadable, conflicts=report.conflicts, remaining=report.remaining,
             budget_exhausted=report.budget_exhausted, "journal conversion pass");
         Ok(report)

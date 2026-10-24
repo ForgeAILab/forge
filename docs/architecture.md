@@ -2513,16 +2513,23 @@ Both background conversion and lazy resume use this resolver. An earlier failed
 attempt's empty replacement binding can be repaired only before either native
 domain publishes or retires, while the replacement is unclaimed, revision zero,
 and has no entries, nodes or operations. The check and binding replacement share
-one write transaction. A populated replacement binding is a conflict.
+one write transaction. Otherwise an existing target binding must equal the
+referenced timeline before transfer; a mismatch leaves shared ownership,
+bindings, receipts and session labels untouched.
 
 Pre-V149 Agent Chat timelines were shared by successive runtimes of the same
 chat. V149 backfills canonical scope and retirement metadata but leaves runtime
 ownership NULL. Forge chooses an active session first, otherwise the newest
 unreplaced suspended native session for the selected Profile in that chat.
 Arbitration follows that choice only when the selected session's own saved state
-references the shared timeline. A session that already owns and binds its own
-timeline converts normally when another Profile is selected, including when that
-Profile has no session in this chat or uses a topic timeline.
+references the shared timeline. Background conversion defers a shared pre-topic
+timeline when its resolver target is not the selected Profile's resume choice.
+This includes an unowned timeline and an existing own binding with unreceipted
+referencing siblings. An empty selection, no session for that Profile in this
+chat, or a selected session using a topic timeline cannot authorize adoption.
+These sessions stay legacy, retry with the same cursor, and are counted under
+`skipped_shared_lcm`, never parked or counted unreadable. When the selected target
+references T, conversion can still assign it T and receipt siblings before import.
 
 Foreground resume keeps the pre-branch adoption behavior: arbitration guards
 must never turn a previously resumable chat into a Conflict. The resolver retries
@@ -2540,6 +2547,14 @@ Background active-target, sibling-admission and journal-writer conflicts remain
 retryable on subsequent sweeps rather than parked until restart. The public LCM
 resolver retains typed runtime errors; the native host boundary preserves
 transience and missing-session classification.
+
+A successful selected-owner receipt pass caches a process-local clean marker.
+The marker is derived from durable selection and unreceipted sibling metadata,
+including membership, host versions, legacy nonces, bindings, timeline ownership
+and native publication/retirement. An unchanged marker bypasses sibling admission
+and native LCM extension loading on later turns. New siblings or changed legacy
+state invalidate it; restart simply repeats the guarded pass. The marker is
+captured inside the successful arbitration transaction and cached after commit.
 
 Ownership changes still require an unretired shared canonical timeline with
 pre-topic continuity, exclusive sibling admissions, writer leases and version

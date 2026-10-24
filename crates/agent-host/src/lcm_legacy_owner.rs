@@ -16,6 +16,34 @@ impl LegacyLcmOwnerAdmission {
 }
 
 impl SqliteProtectedRuntimeStore {
+    /// Nonces distinguish legacy rewrites even when host version/timestamps stay
+    /// unchanged. Capture this inside arbitration so a racing sibling is never
+    /// included in the cached clean pass without being checked.
+    pub(super) async fn legacy_lcm_receipt_stamp(
+        connection: &mut sqlx::SqliteConnection,
+        runtime: &str,
+        timeline: &str,
+    ) -> Result<String, RuntimeError> {
+        sqlx::query_scalar(
+            "SELECT json_array(?2,target.id,target.profile_id,i.selected_profile_id,
+                (SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?2),
+                (SELECT json_group_array(stamp) FROM (
+                    SELECT json_array(s.id,s.runtime_session_id,s.version,s.profile_id,s.status,
+                        s.created_at,s.predecessor_session_id,s.replaced_by_session_id,
+                        l.key_revision,l.state_revision,hex(l.snapshot_nonce),hex(l.checkpoint_nonce),
+                        (SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=s.runtime_session_id),
+                        EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=?2 AND runtime_session_id=s.runtime_session_id),
+                        EXISTS(SELECT 1 FROM agent_session_journal_session j WHERE j.forge_session_id=s.id AND (j.published=1 OR j.retired=1))) AS stamp
+                    FROM agent_session s LEFT JOIN protected_agent_session_state l ON l.session_id=s.id
+                    WHERE s.identity_id=target.identity_id AND s.context_scope_id=target.context_scope_id
+                      AND s.id<>target.id AND NOT EXISTS(SELECT 1 FROM agent_legacy_lcm_relinquishment r
+                          WHERE r.session_id=s.id AND r.timeline_id=?2)
+                    ORDER BY s.id)))
+             FROM agent_session target JOIN agent_identity i ON i.id=target.identity_id
+             WHERE target.runtime_session_id=?1",
+        ).bind(runtime).bind(timeline).fetch_one(connection).await.map_err(protected_database_error)
+    }
+
     async fn selected_chat_lcm_target(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         identity: &str,
@@ -154,6 +182,9 @@ impl SqliteProtectedRuntimeStore {
         let Some(timeline) = timeline else {
             return Ok(None);
         };
+        #[cfg(test)]
+        self.legacy_lcm_sibling_preparations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let shared: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline t
              JOIN agent_session s ON s.runtime_session_id=?1
@@ -272,7 +303,8 @@ impl SqliteProtectedRuntimeStore {
         runtime: &str,
         timeline: &str,
         admission: Option<&LegacyLcmOwnerAdmission>,
-    ) -> Result<(), RuntimeError> {
+        foreground: bool,
+    ) -> Result<bool, RuntimeError> {
         let row = sqlx::query(
             "SELECT t.runtime_session_id,t.scope_type,t.scope_id,t.canonical_scope_id,
                     t.identity_id,t.retired_at,t.claim_owner,t.claim_generation,t.created_at,t.updated_at
@@ -282,12 +314,12 @@ impl SqliteProtectedRuntimeStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(protected_database_error)?;
-        let Some(t) = row else { return Ok(()) };
+        let Some(t) = row else { return Ok(false) };
         let old_runtime: Option<String> = t
             .try_get("runtime_session_id")
             .map_err(protected_database_error)?;
         if t.get::<String, _>("scope_type") != "agent_chat" {
-            return Ok(());
+            return Ok(false);
         }
         let sessions = sqlx::query(
             "SELECT s.id,s.runtime_session_id,s.identity_id,s.context_scope_id,s.profile_id,
@@ -335,16 +367,33 @@ impl SqliteProtectedRuntimeStore {
         let created: String = target.get("created_at");
         let receipt_only = old_runtime.as_deref() == Some(runtime);
         let selection = Self::selected_chat_lcm_target(tx, &identity, &context).await?;
-        if receipt_only
-            && selection
-                .as_ref()
-                .is_none_or(|(_, selected)| selected != &target_id)
-        {
-            return Ok(());
+        let selected_target = selection
+            .as_ref()
+            .is_some_and(|(_, selected)| selected == &target_id);
+        let has_siblings: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_session WHERE identity_id=? AND context_scope_id=? AND id<>?)",
+        ).bind(&identity).bind(&context).bind(&target_id).fetch_one(&mut **tx).await.map_err(protected_database_error)?;
+        if receipt_only && !selected_target && foreground {
+            return Ok(false);
         }
         let relinquishing = self
             .legacy_lcm_references(tx, &identity, &context, &target_id, timeline)
             .await?;
+        if !foreground
+            && !selected_target
+            && (has_siblings && old_runtime.is_none() || !relinquishing.is_empty())
+            && t.get::<String, _>("scope_id") == scope
+            && t.get::<Option<String>, _>("canonical_scope_id").as_deref() == Some(&scope)
+            && t.get::<Option<String>, _>("retired_at").is_none()
+        {
+            return Err(RuntimeError::conflict(
+                crate::session_journal_conversion::SHARED_LCM_CONVERSION_DEFERRED,
+            )
+            .retryable());
+        }
+        if receipt_only && !selected_target {
+            return Ok(false);
+        }
         if old_runtime.is_none()
             && selection.as_ref().is_none_or(|(_, selected)| {
                 selected != &target_id
@@ -353,16 +402,11 @@ impl SqliteProtectedRuntimeStore {
                         .any(|s| s.get::<String, _>("id") == *selected)
             })
         {
-            // No selected session references T, so keep legacy reference-based adoption.
-            return Ok(());
+            // Foreground follows Forge's resume choice even without a selected reference.
+            return Ok(false);
         }
-        if source.is_none() && relinquishing.is_empty() {
-            let has_siblings: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM agent_session WHERE identity_id=? AND context_scope_id=? AND id<>?)",
-            ).bind(&identity).bind(&context).bind(&target_id).fetch_one(&mut **tx).await.map_err(protected_database_error)?;
-            if !has_siblings {
-                return Ok(());
-            }
+        if source.is_none() && relinquishing.is_empty() && !has_siblings {
+            return Ok(selected_target);
         }
         if source.is_some_and(|s| {
             s.get::<String, _>("identity_id") != identity
@@ -586,7 +630,7 @@ impl SqliteProtectedRuntimeStore {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn legacy_lcm_references(
@@ -1024,28 +1068,42 @@ mod tests {
             let result = store
                 .convert_legacy_session(&f.ensure_session(&older).await.unwrap(), &older)
                 .await;
-            if matches!(
-                case,
-                "no-selected-profile"
-                    | "selected-profile-without-session"
-                    | "rotation"
-                    | "failed-reference"
-                    | "target-other-reference"
-                    | "target-no-reference"
-            ) {
+            if matches!(case, "rotation" | "failed-reference") {
                 assert_eq!(
                     result.unwrap(),
                     crate::session_journal_conversion::ConversionOutcome::Converted,
                     "{case}"
                 );
                 let after = ownership(&f).await;
-                if matches!(case, "rotation" | "failed-reference") {
-                    assert_eq!(after.2, Some(id.to_string()), "{case}");
-                    assert_eq!(after.3.len(), 10, "{case}");
-                } else {
-                    assert_eq!(after.2, Some(older.to_string()), "{case}");
-                    assert!(after.3.is_empty(), "{case}");
-                }
+                assert_eq!(after.2, Some(id.to_string()), "{case}");
+                assert_eq!(after.3.len(), 10, "{case}");
+                continue;
+            }
+            if matches!(
+                case,
+                "no-selected-profile"
+                    | "selected-profile-without-session"
+                    | "target-other-reference"
+                    | "target-no-reference"
+                    | "target-unmapped"
+            ) {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind, ErrorKind::Conflict, "{case}");
+                assert!(error.retryable, "{case}");
+                assert_eq!(
+                    error.message,
+                    "LCM shared timeline conversion awaits the selected profile's resume target",
+                    "{case}"
+                );
+                assert_eq!(
+                    ownership(&f).await,
+                    before,
+                    "{case} changed ownership or receipts"
+                );
+                let published: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_session_journal_session WHERE published=1 OR retired=1",
+                ).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(published, 0, "{case}");
                 continue;
             }
             let error = result.unwrap_err();
@@ -1405,6 +1463,176 @@ mod tests {
             }
             drop(foreground);
         }
+    }
+
+    #[tokio::test]
+    async fn clean_receipt_pass_skips_second_turn_admission_and_detects_new_siblings() {
+        use std::sync::atomic::Ordering;
+        for case in ["receipted", "nonreferencing", "no-siblings"] {
+            let f = FileDb::new().await.unwrap();
+            let db = f.database();
+            let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+            let id = SessionId::new(format!("clean-receipts-{case}"));
+            let (old, older) =
+                LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+            if case == "nonreferencing" {
+                let mut unrelated = old.checkpoint.snapshot.clone();
+                unrelated.id = older.clone();
+                unrelated
+                    .extension_state
+                    .remove(agent_runtime::harness::LCM_COMPONENT_ID);
+                store
+                    .seed_legacy_bytes(
+                        &older,
+                        Some(&serde_json::to_vec(&unrelated).unwrap()),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            } else if case == "no-siblings" {
+                sqlx::query("DELETE FROM protected_agent_session_state WHERE session_id IN (SELECT id FROM agent_session WHERE runtime_session_id<>?)")
+                    .bind(id.as_str()).execute(db.pool()).await.unwrap();
+                sqlx::query("DELETE FROM agent_session WHERE runtime_session_id<>?")
+                    .bind(id.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id=?")
+                    .bind(id.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=NULL WHERE id=?")
+                    .bind(&old.timeline_id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            let owner = f.ensure_session(&id).await.unwrap();
+            assert_eq!(
+                store.convert_legacy_session(&owner, &id).await.unwrap(),
+                crate::session_journal_conversion::ConversionOutcome::Converted
+            );
+            assert!(
+                store
+                    .legacy_lcm_receipt_stamps
+                    .lock()
+                    .unwrap()
+                    .contains_key(id.as_str())
+            );
+            let after_first = store
+                .legacy_lcm_sibling_preparations
+                .load(Ordering::Relaxed);
+            for _ in 0..2 {
+                let lcm = store
+                    .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{id}"))
+                    .await
+                    .unwrap();
+                assert_eq!(lcm.timeline_id(), old.timeline_id);
+                assert_eq!(
+                    store
+                        .legacy_lcm_sibling_preparations
+                        .load(Ordering::Relaxed),
+                    after_first,
+                    "{case}: subsequent turn admitted siblings"
+                );
+            }
+            let new_sibling = SessionId::new(format!("{id}:late"));
+            let new_owner = format!("journal-fixture:{new_sibling}");
+            sqlx::query("INSERT INTO agent_session(id,identity_id,profile_id,context_scope_id,backend_kind,runtime_session_id,status,created_at,updated_at) VALUES (?,'journal-agent','glm-profile','journal-scope','native',?,'suspended','2026-09-21T00:00:00Z','c')")
+                .bind(&new_owner).bind(new_sibling.as_str()).execute(db.pool()).await.unwrap();
+            let mut shared = old.checkpoint.snapshot.clone();
+            shared.id = new_sibling.clone();
+            store
+                .seed_legacy_bytes(
+                    &new_sibling,
+                    Some(&serde_json::to_vec(&shared).unwrap()),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+            store
+                .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{id}"))
+                .await
+                .unwrap();
+            let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE session_id=? AND timeline_id=? AND transferred_to_runtime_session_id=?")
+                .bind(&new_owner).bind(&old.timeline_id).bind(id.as_str()).fetch_one(db.pool()).await.unwrap();
+            assert_eq!(
+                receipts, 1,
+                "{case}: new sibling must invalidate the clean marker"
+            );
+            let after_new = store
+                .legacy_lcm_sibling_preparations
+                .load(Ordering::Relaxed);
+            assert!(after_new > after_first, "{case}");
+            store
+                .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{id}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .legacy_lcm_sibling_preparations
+                    .load(Ordering::Relaxed),
+                after_new,
+                "{case}: new clean pass must be cached"
+            );
+            if case == "nonreferencing" {
+                shared.id = older.clone();
+                store
+                    .seed_legacy_bytes(
+                        &older,
+                        Some(&serde_json::to_vec(&shared).unwrap()),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{id}"))
+                    .await
+                    .unwrap();
+                let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE session_id=? AND timeline_id=?")
+                    .bind(f.ensure_session(&older).await.unwrap()).bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(
+                    receipts, 1,
+                    "changed legacy nonces must invalidate the clean marker"
+                );
+                assert!(
+                    store
+                        .legacy_lcm_sibling_preparations
+                        .load(Ordering::Relaxed)
+                        > after_new
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn target_binding_mismatch_refuses_transfer_without_touching_shared_timeline() {
+        let f = FileDb::new().await.unwrap();
+        let db = f.database();
+        let store = SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1);
+        let id = SessionId::new("target-binding-mismatch");
+        let (old, _) = LegacyLcmFixture::shared_pre_topic_chat(&f, &store, &id).await;
+        let replacement = old.bind_empty_replacement(&f).await;
+        sqlx::query("UPDATE agent_lcm_timeline SET revision=1 WHERE id=?")
+            .bind(replacement.timeline_id())
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let before = ownership(&f).await;
+        let error = store
+            .resolve_lcm_store(id.as_str(), "agent_chat", &format!("chat:{id}"), false)
+            .await
+            .expect_err("mismatched target binding must refuse transfer");
+        assert_eq!(error.kind, ErrorKind::Conflict);
+        assert_eq!(
+            error.message,
+            "LCM selected chat resume target is bound to a different timeline"
+        );
+        assert_eq!(ownership(&f).await, before);
     }
 
     #[tokio::test]

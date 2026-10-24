@@ -259,11 +259,9 @@ async fn review_m1_foreground_accepts_legacy_sibling_shapes() {
 }
 
 #[tokio::test]
-async fn review_m2_owned_timeline_converts_with_another_profile_selected() {
+async fn review_m2_owned_shared_timeline_defers_under_unrelated_selection() {
     use agent_runtime::harness::LCM_COMPONENT_ID;
-    use forge_agent_host::{
-        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
-    };
+    use forge_agent_host::test_support::LegacyLcmFixture;
     for empty_profile in [false, true] {
         let id = SessionId::new(format!("review-m2-{empty_profile}"));
         let (f, store) = fixture(&id).await;
@@ -298,13 +296,24 @@ async fn review_m2_owned_timeline_converts_with_another_profile_selected() {
         }
         let expected = SessionStore::load(&*store, &older).await.unwrap().unwrap();
         let owner = f.ensure_session(&older).await.unwrap();
+        let error = store
+            .convert_legacy_session(&owner, &older)
+            .await
+            .unwrap_err();
+        assert!(error.retryable);
         assert_eq!(
-            store.convert_legacy_session(&owner, &older).await.unwrap(),
-            ConversionOutcome::Converted
+            error.message,
+            forge_agent_host::session_journal_conversion::SHARED_LCM_CONVERSION_DEFERRED
         );
         assert_eq!(
-            snapshot(&store.journals().ordinary(), &older).await,
+            SessionStore::load(&*store, &older).await.unwrap().unwrap(),
             expected
+        );
+        assert!(
+            !db.session_persistence_flags(&owner)
+                .await
+                .unwrap()
+                .ordinary_published
         );
         let facts:(String,i64)=sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment) FROM agent_lcm_timeline WHERE id=?").bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
         assert_eq!(facts, (older.to_string(), 0));

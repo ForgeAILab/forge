@@ -163,6 +163,9 @@ pub struct SqliteProtectedRuntimeStore {
     pub(crate) conversion_admission: Arc<crate::session_journal_conversion::ConversionAdmission>,
     #[cfg(any(test, feature = "test-support"))]
     legacy_snapshot_mac: ring::hmac::Context,
+    legacy_lcm_receipt_stamps: Arc<StdMutex<HashMap<String, String>>>,
+    #[cfg(test)]
+    legacy_lcm_sibling_preparations: Arc<std::sync::atomic::AtomicUsize>,
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     revocation_client: reqwest::Client,
     gemini_revocation_endpoint: Arc<str>,
@@ -190,6 +193,9 @@ impl SqliteProtectedRuntimeStore {
             legacy_snapshot_mac,
             cipher: Arc::new(XChaCha20Poly1305::new((&master_key).into())),
             key_revision,
+            legacy_lcm_receipt_stamps: Arc::default(),
+            #[cfg(test)]
+            legacy_lcm_sibling_preparations: Arc::default(),
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             revocation_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -800,12 +806,12 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        let (has_binding, owns_shared_timeline): (bool, bool) = {
+        let (has_binding, owned_shared_timeline): (bool, Option<String>) = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
             sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id=?1),
-                    EXISTS(SELECT 1 FROM agent_runtime_lcm_binding b JOIN agent_lcm_timeline t ON t.id=b.timeline_id
+                    (SELECT t.id FROM agent_runtime_lcm_binding b JOIN agent_lcm_timeline t ON t.id=b.timeline_id
                         WHERE b.runtime_session_id=?1 AND t.runtime_session_id=?1 AND t.scope_type='agent_chat'
                           AND t.scope_id=t.canonical_scope_id AND t.retired_at IS NULL)",
         )
@@ -814,13 +820,30 @@ impl SqliteProtectedRuntimeStore {
         .await
         }
         .map_err(protected_database_error)?;
+        let owns_shared_timeline = owned_shared_timeline.is_some();
+        let receipts_complete = if let Some(timeline) = owned_shared_timeline.as_deref() {
+            let mut connection = self
+                .db
+                .pool()
+                .acquire()
+                .await
+                .map_err(protected_database_error)?;
+            let stamp =
+                Self::legacy_lcm_receipt_stamp(&mut connection, runtime_id, timeline).await?;
+            self.legacy_lcm_receipt_stamps
+                .lock()
+                .ok()
+                .is_some_and(|cached| cached.get(runtime_id) == Some(&stamp))
+        } else {
+            false
+        };
         // Reading native/legacy extension state happens outside the write transaction.
         let flags = self.persistence_flags(&SessionId::new(runtime_id)).await?;
         let referenced = if successor
             || (has_binding
                 && !flags.legacy_eligible
                 && expected_legacy_timeline.is_none()
-                && !owns_shared_timeline)
+                && (!owns_shared_timeline || receipts_complete))
         {
             None
         } else {
@@ -832,10 +855,11 @@ impl SqliteProtectedRuntimeStore {
             ));
         }
         let mut arbitration_deferred = None;
-        let sibling_admission = if flags.legacy_eligible
-            || expected_legacy_timeline.is_some()
-            || owns_shared_timeline
-        {
+        let needs_arbitration = !receipts_complete
+            && (flags.legacy_eligible
+                || expected_legacy_timeline.is_some()
+                || owns_shared_timeline);
+        let sibling_admission = if needs_arbitration {
             let mut prepared = self
                 .prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref(), admitted_runtime)
                 .await;
@@ -909,15 +933,21 @@ impl SqliteProtectedRuntimeStore {
         } else {
             false
         };
-        if expected_legacy_timeline.is_some_and(|expected| {
-            !repair_empty && existing.as_deref().is_some_and(|id| id != expected)
-        }) {
+        if !repair_empty
+            && referenced
+                .as_deref()
+                .is_some_and(|referenced| existing.as_deref().is_some_and(|id| id != referenced))
+        {
             return Err(RuntimeError::conflict(
                 "LCM selected chat resume target is bound to a different timeline",
             ));
         }
-        if (flags.legacy_eligible || expected_legacy_timeline.is_some() || owns_shared_timeline)
-            && (existing.is_none() || repair_empty || sibling_admission.is_some())
+        let mut receipts_completed = false;
+        if needs_arbitration
+            && (existing.is_none()
+                || repair_empty
+                || (existing.as_ref() == referenced.as_ref()
+                    && (sibling_admission.is_some() || (!foreground && owns_shared_timeline))))
         {
             if let Some(timeline) = referenced.as_deref() {
                 let fallback: bool = foreground && sqlx::query_scalar::<_, bool>(
@@ -939,10 +969,11 @@ impl SqliteProtectedRuntimeStore {
                             runtime_id,
                             timeline,
                             sibling_admission.as_ref(),
+                            foreground,
                         )
                         .await;
                     match transfer {
-                        Ok(()) => {}
+                        Ok(complete) => receipts_completed = complete,
                         Err(_) if fallback => {
                             // Forge already selected this foreground session. Restore the
                             // old adoption path if arbitration cannot prove exclusive receipts.
@@ -1061,6 +1092,11 @@ impl SqliteProtectedRuntimeStore {
             .map_err(protected_database_error)?;
             id
         };
+        let receipt_stamp = if receipts_completed {
+            Some(Self::legacy_lcm_receipt_stamp(&mut tx, runtime_id, &timeline_id).await?)
+        } else {
+            None
+        };
         {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
@@ -1069,6 +1105,14 @@ impl SqliteProtectedRuntimeStore {
         .map_err(|error| protected_database_error(error).retryable())?;
         if let Some(admission) = sibling_admission {
             admission.close().await.map_err(RuntimeError::retryable)?;
+        }
+        if let Some(stamp) = receipt_stamp {
+            if let Ok(mut cached) = self.legacy_lcm_receipt_stamps.lock() {
+                if cached.len() >= 4_096 {
+                    cached.clear();
+                }
+                cached.insert(runtime_id.to_owned(), stamp);
+            }
         }
         let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
             .await

@@ -85,7 +85,7 @@ async fn legacy_chat_lcm_facts(
         };
         facts.push(serde_json::json!({
             "forge_session_id":owner,"runtime_session_id":runtime,"profile_id":profile,
-            "selected_profile_id":selected,"snapshot":snapshot.as_ref().map(&state),
+            "selected_profile_id":selected,"snapshot":snapshot.as_ref().map(state),
             "checkpoint":checkpoint.as_ref().map(|c| state(&c.snapshot))
         }));
     }
@@ -550,6 +550,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let mut cursor = ConversionCursor::default();
     let (mut ticks, mut converted, mut skipped_retired, mut skipped_active, mut unreadable) =
         (0, 0, 0, 0, 0);
+    let mut skipped_shared_lcm = 0;
     let mut parked = BTreeMap::<String, usize>::new();
     let mut parked_sessions = Vec::new();
     let mut parked_sessions_omitted = 0;
@@ -561,6 +562,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
         converted += report.converted;
         skipped_retired += report.skipped_retired;
         skipped_active += report.skipped_active;
+        skipped_shared_lcm += report.skipped_shared_lcm;
         unreadable += report.skipped_unreadable;
         for (reason, count) in report.parked_by_reason {
             *parked.entry(reason).or_default() += count;
@@ -595,7 +597,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let retention_ms = retention_started.elapsed().as_millis();
     let after = physical_bytes(&pool).await?;
     let summary = serde_json::json!({
-        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active},
+        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active,"shared_lcm":skipped_shared_lcm},
         "parked_by_reason":parked, "unreadable":{"conversion":unreadable,"retention":collected.unreadable_sessions},
         "parked_sessions":parked_sessions,"parked_sessions_omitted":parked_sessions_omitted,
         "remaining":0, "conversion_ticks":ticks, "bytes":{"before":before,"after":after},

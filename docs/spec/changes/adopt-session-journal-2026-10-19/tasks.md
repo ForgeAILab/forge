@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-24T15:41:33Z
+updated_at: 2026-10-24T16:48:22Z
 completed_at:
 ---
 
@@ -898,3 +898,32 @@ benchmark receipts predate the tag and no benchmark rerun is claimed.
   and LCM rows are verified; all disposable copies are deleted. L4's decode-under-
   write-transaction performance work remains a follow-up; the read-only probe uses
   a deferred transaction. Earlier unfinished tasks and Owner Decisions remain intact.
+
+
+- [x] **37. Guard background shared LCM adoption and finish receipt hot-path work.**
+  Defer unselected unowned shared timelines and own-bound timelines with
+  unreceipted siblings; report a retryable shared-LCM skip without parking or
+  unreadable counts. Restore four ownership guards and test empty/topic selection,
+  failed/cancelled first sweep candidates, foreground adoption and receipts.
+  Refuse mismatched non-repairable target bindings without touching T. Cache
+  successful selected-owner receipt passes using durable metadata that changes
+  when new siblings or legacy references appear. Prove a second turn admits no
+  siblings and new siblings invalidate the cache. Retain N1/N2 fail-without
+  evidence; run all round-6 suites, strict two-package Clippy, workspace fmt,
+  and isolated converted/foreground-first real-copy checks; delete work copies.
+  Completed (2026-10-24): N1 and N2 each fail once against unchanged production.
+  The four ownership guards are restored; empty/topic selection and failed or
+  cancelled first sweep candidates defer without adoption, parking or unreadable
+  counts, then foreground resume adopts with receipts and zero provider calls.
+  Existing own-bound shared timelines with unreceipted siblings defer too.
+  Non-repairable target-binding mismatches preserve ownership and receipts.
+  A bounded durable-metadata cache skips subsequent sibling preparation and
+  native extension reads, including first adoption with no siblings; new siblings
+  and changed legacy nonces invalidate it. All round-6 suites, conversion units,
+  workspace fmt and strict two-package Clippy pass. The real-copy dry run converts
+  three sessions, with zero parked/unreadable/remaining and no shared-LCM skips;
+  Main Chat keeps 114 entries, zero nodes, 121 operations and ten receipts.
+  Foreground-first and converted resumes use zero provider calls; retained rows
+  compare unchanged and both work copies are deleted. Cold-pass decoding inside
+  the write transaction remains the prior L4 follow-up. Earlier tasks and Owner
+  Decisions remain intact.

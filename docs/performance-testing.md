@@ -1050,7 +1050,11 @@ other Profile's eight sessions remain suspended and unreplaced. The JSON summary
 reports two conversions, nine retirement-policy skips and no parked sessions.
 The non-selected resume target converts with its own history and protected state,
 omitting only its receipted shared LCM namespaces. There is no
-`skipped.profile_selection` category. Both cursor orders and fresh-cursor retries
+`skipped.profile_selection` category. `skipped.shared_lcm` separately counts
+retryable shared-timeline deferrals when no selected resume target references T,
+including the existing-owner path. Persistent deferrals remain legacy and can
+reach the bounded dry-run non-convergence limit; a foreground resume decides
+ownership. Both cursor orders and fresh-cursor retries
 are covered by the worker suite. All legacy ciphertext and original
 LCM rows remain unchanged. This generated fixture uses no installation data.
 

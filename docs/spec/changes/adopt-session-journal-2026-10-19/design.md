@@ -1440,9 +1440,11 @@ Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 8
 This amendment supersedes the same-Profile-only ownership restrictions in D5.
 
 The selected Profile's Forge resume target receives a shared canonical timeline
-only when its own saved state references that timeline. A session already owning
-and binding T converts through that binding even when the selected Profile uses
-a topic timeline or has no session in this chat. Foreground resume preserves the
+only when its own saved state references that timeline. Background conversion
+otherwise defers shared T, including an own binding with unreceipted referencing
+siblings when the selected Profile uses a topic timeline or has no session in
+this chat. The retryable outcome has a distinct `skipped_shared_lcm` count and
+never parks or counts unreadable. Foreground resume preserves the
 old adoption behavior: an arbitration guard cannot reject a resume that worked
 before this branch. After a brief retry for sibling contention, unowned T may be
 adopted by the resuming session without receipts; partial arbitration changes
@@ -1455,7 +1457,10 @@ limited to older, unlinked, suspended native siblings of the target's Profile.
 Chat topics and rotations do not block this process; native state blocks only
 when that sibling owns, binds or references T. Ownership moves still require
 canonical pre-topic continuity, no conflicting claim/binding, admissions, writer
-leases and version fences. When the selected target already owns and binds T,
+leases and version fences. An existing target binding must equal referenced T
+before transfer, except for the existing untouched-empty-replacement repair.
+A mismatch refuses precisely and leaves T, source binding, receipts and labels
+unchanged. When the selected target already owns and binds T,
 the same fences authorize receipts alone, including after publication if its
 native state references T. No transcript, checkpoint or LCM history is rewritten in that path.
 
@@ -1465,6 +1470,15 @@ sibling's own state. Busy targets, sibling admissions and journal writers remain
 retryable on later sweeps. Corrupt sibling copies are attributed to that sibling
 and cannot park the target. The public LCM resolver preserves typed errors;
 Native maps retryability and missing sessions at its boundary.
+
+A successful selected-owner pass captures a clean marker inside its transaction
+and caches it only after commit. The marker reads durable selected-Profile and
+unreceipted sibling metadata: session membership/versions, legacy nonces,
+bindings, ownership and native publication/retirement. Later turns with the same
+marker skip sibling writer admission and native extension loading. New siblings
+and changed legacy copies invalidate it, including non-referencing copies that
+begin referencing T. The bounded process cache is optional; restart repeats the
+normal guarded pass.
 
 Receipts in additive V202610241249 survive deletion of T and cascade only with
 the losing session. A copy referencing receipted T omits its LCM and semantic
