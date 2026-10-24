@@ -33,6 +33,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Large source files are split into modules by responsibility, and a CI
+  file-size ratchet keeps them from growing back. In JSONL logs, the `target`
+  of events from moved code now names the child module (for example
+  `services_agents::agent_chat_turn_worker::worker_turn`); filters on the
+  parent module path still match.
 - Convert legacy native sessions in a supervised background pass, one session at
   a time with active-turn skips, bounded scheduling and restart recovery. Lazy
   import remains the fallback on early open; legacy rows remain until the next

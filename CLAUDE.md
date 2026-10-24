@@ -98,6 +98,8 @@ cd web && pnpm lint && pnpm typecheck && pnpm test
 
 ## When working on this repo
 
+Source files are capped at 2,000 lines for Rust and 1,000 for TS/TSX. Run `python3 scripts/check-file-sizes.py`; existing oversized files are ratcheted in `scripts/file-size-allowlist.txt`. Growth fails, and shrinking or deleting a listed file requires `python3 scripts/check-file-sizes.py --update` to lower or remove its entry. Split by responsibility: keep `foo.rs` as the Rust module root with `foo/<part>.rs` children, and move tests with the code they test into `foo/tests.rs`; use sibling modules for TS/TSX. Never use `_part2`-style files; never raise or add an allowlist entry; split instead. `--init` is for maintainers only to create the one-time baseline.
+
 - **Read `docs/architecture.md` before changing service wiring, the workflow engine, or the task state machine.** That doc is the source of truth for the lifecycle, hook ordering, role assignment, and retry-budget rules.
 - **Public-API changes touch four places**: the route handler in `crates/api/src/routes/`, the request/response type in `crates/api-types/`, the generated TS types under `web/src/types/generated/`, and `docs/api.md`. Run `make types` to regenerate bindings in `web/src/types/generated/bindings/` and commit them with the other updates in the same change.
 - **State-machine changes** must keep `crates/api/tests/suite/happy_path.rs` green and the table in `docs/architecture.md#task-state-machine` accurate.
