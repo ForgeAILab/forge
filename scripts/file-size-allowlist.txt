@@ -21,18 +21,11 @@
 2654 crates/db/src/check_run/tests.rs
 2266 crates/db/src/integration_queue/activation_tests.rs
 2028 crates/db/src/integration_queue/fencing.rs
-5204 crates/db/src/models.rs
-4574 crates/db/src/repository.rs
 2239 crates/db/src/sqlite.rs
 2655 crates/db/src/sqlite/agent.rs
 4427 crates/db/src/sqlite/agent_chat.rs
-3330 crates/db/src/sqlite/analytics.rs
-3433 crates/db/src/sqlite/execution.rs
 2471 crates/db/src/sqlite/orchestration/charters.rs
-4316 crates/db/src/sqlite/pricing.rs
 2193 crates/db/src/sqlite/project.rs
-3178 crates/db/src/sqlite/shared_media.rs
-5890 crates/db/src/sqlite/task.rs
 2303 crates/db/src/task_condition/tests.rs
 2189 crates/db/src/task_step.rs
 12529 crates/db/src/tests.rs
@@ -47,8 +40,6 @@
 2281 crates/forge-solo/src/ui_bridge.rs
 3168 crates/mcp-server/src/tests.rs
 2010 crates/mcp-server/src/tools/handlers.rs
-5230 crates/pricing/src/lib.rs
-3329 crates/pricing/src/sqlite.rs
 2728 crates/review/src/contract.rs
 8398 crates/services-agents/src/agent_chat_turn_worker.rs
 4147 crates/services-agents/src/embedded_agent_service.rs
