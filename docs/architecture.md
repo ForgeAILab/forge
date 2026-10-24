@@ -8749,7 +8749,12 @@ unbounded or stale pages, partial applies, underreported units and dropped pin
 pages. The non-member defect is rejected by `body_cache_membership` (added in v0.9.0); NonRetryableLostAck is rejected by
 atomic_apply_cuts. Valid releases preserve other holders and reclaim only bytes
 no domain of the session still holds. The focused `session_journal_storage` target retains the
-codec/storage/maintenance regressions. Legacy decoder tests use the real
+codec/storage/maintenance regressions. Its root at
+`crates/agent-host/tests/session_journal_storage.rs` holds shared helpers and
+declares topic modules under `tests/session_journal_storage/` for reads,
+atomicity, pins, operations, retention, repacking, corruption, sharing,
+collection and performance. These modules remain part of the same test target.
+Legacy decoder tests use the real
 envelope, checkpoint decoder and runtime schema/transition validation. This
 conformance gate is complemented by the focused session_journal_runtime tests
 for engine ownership, projection, probes and legacy write refusals.

@@ -6,7 +6,6 @@
 4272 crates/agent-host/src/protected_store.rs
 6288 crates/agent-host/src/typed_tools.rs
 2187 crates/agent-host/tests/session_journal_runtime.rs
-4604 crates/agent-host/tests/session_journal_storage.rs
 2185 crates/api-types/src/daemon_transport.rs
 2786 crates/api-types/src/project_orchestration.rs
 2447 crates/api/src/routes/milestones.rs
