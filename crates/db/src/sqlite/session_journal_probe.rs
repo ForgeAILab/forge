@@ -110,38 +110,63 @@ pub(super) async fn require_unretired_session(
 }
 
 impl SqliteDb {
+    /// An open intent owns its reserved successor and protects the predecessor
+    /// even after startup suspends it and the successor becomes newest dormant.
+    pub async fn native_chat_session_pending_predecessor(
+        &self,
+        session_id: &str,
+    ) -> crate::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_chat_topic_rotation r
+             JOIN agent_session successor ON successor.id=r.successor_session_id
+             WHERE successor.predecessor_session_id=?)",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     /// Publication is the durable conversion cursor. Reservations and exact-only
     /// partial imports remain eligible; tombstones never permit legacy fallback.
     pub async fn legacy_journal_conversion_page(
         &self,
         after: &str,
         limit: u32,
+        excluded: &[String],
     ) -> crate::Result<Vec<(String, String)>> {
         Ok(sqlx::query_as(
             "SELECT s.id, s.runtime_session_id FROM agent_session s
              JOIN protected_agent_session_state l ON l.session_id=s.id
              WHERE s.id > ? AND s.backend_kind='native' AND s.runtime_session_id IS NOT NULL
+               AND (l.snapshot_ciphertext IS NOT NULL OR l.checkpoint_ciphertext IS NOT NULL)
+               AND s.id NOT IN (SELECT value FROM json_each(?))
                AND NOT EXISTS (SELECT 1 FROM agent_session_journal_session j
                    WHERE j.forge_session_id=s.id AND j.runtime_session_id=s.runtime_session_id
                      AND (j.retired=1 OR (j.role='ordinary' AND j.storage_id=? AND j.published=1)))
              ORDER BY s.id LIMIT ?",
         )
         .bind(after)
+        .bind(serde_json::json!(excluded).to_string())
         .bind(SESSION_JOURNAL_ORDINARY_STORAGE_ID)
         .bind(limit)
         .fetch_all(self.pool())
         .await?)
     }
 
-    pub async fn legacy_journal_conversion_remaining(&self) -> crate::Result<u64> {
+    pub async fn legacy_journal_conversion_remaining(
+        &self,
+        excluded: &[String],
+    ) -> crate::Result<u64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_session s
              JOIN protected_agent_session_state l ON l.session_id=s.id
              WHERE s.backend_kind='native' AND s.runtime_session_id IS NOT NULL
+               AND (l.snapshot_ciphertext IS NOT NULL OR l.checkpoint_ciphertext IS NOT NULL)
+               AND s.id NOT IN (SELECT value FROM json_each(?))
                AND NOT EXISTS (SELECT 1 FROM agent_session_journal_session j
                    WHERE j.forge_session_id=s.id AND j.runtime_session_id=s.runtime_session_id
                      AND (j.retired=1 OR (j.role='ordinary' AND j.storage_id=? AND j.published=1)))",
-        ).bind(SESSION_JOURNAL_ORDINARY_STORAGE_ID).fetch_one(self.pool()).await?;
+        ).bind(serde_json::json!(excluded).to_string()).bind(SESSION_JOURNAL_ORDINARY_STORAGE_ID).fetch_one(self.pool()).await?;
         Ok(count as u64)
     }
 }

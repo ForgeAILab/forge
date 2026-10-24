@@ -944,8 +944,8 @@ async fn rotation_and_retry() {
     );
     assert_eq!(
         store.journals().storage().diagnostic_calls_for_test().0 - diagnostics_before,
-        2,
-        "byte diagnostics run once per finished domain phase, including yielded calls"
+        0,
+        "debug-disabled retention never runs byte diagnostics, including yielded calls"
     );
     assert_eq!(
         pass.collection_calls - pass.collection_continuations,
@@ -1461,4 +1461,221 @@ async fn over_capacity_sessions_are_reported_and_preserved_per_pass() {
     let report = policy.maintain_once(&mut cursor).await.unwrap();
     assert_eq!(report.over_capacity_sessions, 0);
     assert_eq!(report.preserved_sessions, 0);
+}
+
+#[tokio::test]
+async fn domain_event_burst_is_debounced_without_debug_byte_scans() {
+    use services_agents::session_journal_retention::RETENTION_DEBOUNCE;
+    use std::time::Duration;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    let policy = Arc::new(SessionJournalRetention::new(db.clone(), &store));
+    let registry = services::worker_runtime::PeriodicWorkers::new(db.clone());
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let running = policy.clone().start(&registry, shutdown);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while policy.completed_passes_for_test() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.journals().storage().diagnostic_calls_for_test().0,
+        0,
+        "debug disabled: no encrypted byte diagnostic scan"
+    );
+    for n in 0..10 {
+        sqlx::query("INSERT INTO domain_event (id,event_type,entity_type,entity_id,actor_type,scope_type,scope_id,correlation_id,created_at) VALUES (?,'test','test','test','system','system','system','test','c')")
+            .bind(format!("debounce-{n}")).execute(db.pool()).await.unwrap();
+        db.domain_event_notify().notify_one();
+        tokio::time::sleep(RETENTION_DEBOUNCE / 25).await;
+        assert_eq!(
+            policy.completed_passes_for_test(),
+            1,
+            "no pass inside debounce"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while policy.completed_passes_for_test() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(RETENTION_DEBOUNCE * 2).await;
+    assert_eq!(
+        policy.completed_passes_for_test(),
+        2,
+        "ten domain events cause one pass"
+    );
+    stop.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), running)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pending_topic_rotation_survives_restart_and_retention_then_forks() {
+    use agent_runtime::runtime::{ForkLcm, ForkSeed, ForkSession};
+    use services_agents::session_journal_retention::RetentionCursor;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    publish(&f, store.clone(), "pending-source").await;
+    for sql in [
+        "INSERT INTO user (id,email,password_hash,created_at,updated_at) VALUES ('pending-owner','pending@example.test','hash','c','u')",
+        "INSERT INTO agent_chat (id,kind,account_id,status,created_at,updated_at) VALUES ('pending-chat','account_main','pending-owner','ready','c','u')",
+        "INSERT INTO agent_context_scope (id,identity_id,scope_type,scope_id,created_at,updated_at) VALUES ('pending-scope','journal-agent','agent_chat','pending-chat','c','u')",
+    ] { sqlx::query(sql).execute(db.pool()).await.unwrap(); }
+    update(
+        &f,
+        "pending-source",
+        "pending-scope",
+        "journal-profile",
+        "ready",
+        "a",
+    )
+    .await;
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    db.reserve_topic_rotation_successor_session_in_tx(
+        &mut tx,
+        db::ReserveTopicRotationSuccessorSessionInTxInput {
+            source_id: &host("pending-source"),
+            successor_id: &host("pending-successor"),
+            runtime_id: "pending-successor",
+            created_at: "z",
+            updated_at: "z",
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO agent_chat_topic_rotation (chat_id,id,successor_session_id,successor_runtime_id,label,cause,created_at) VALUES ('pending-chat','pending-intent',?,'pending-successor','Rotate','test','c')")
+        .bind(host("pending-successor")).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    drop(store);
+    let cold_db = f.reopen().await.unwrap();
+    assert_eq!(
+        cold_db
+            .suspend_stale_native_sessions("restart")
+            .await
+            .unwrap(),
+        1
+    );
+    let cold = Arc::new(SqliteProtectedRuntimeStore::new(
+        cold_db.clone(),
+        [7; 32],
+        1,
+    ));
+    let policy = SessionJournalRetention::new(cold_db.clone(), &cold);
+    policy
+        .maintain_once(&mut RetentionCursor::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        retired(&cold, "pending-source").await,
+        [false, false],
+        "a pending rotation keeps its predecessor after the startup sweep"
+    );
+    let rt = runtime(cold.clone());
+    let child = rt
+        .fork_session(ForkSession {
+            from: SessionId::new("pending-source"),
+            new_id: SessionId::new("pending-successor"),
+            seed: ForkSeed::FromIndex(0),
+            lcm: ForkLcm::NewTimeline,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !child.history().is_empty(),
+        "fork retains the native context"
+    );
+    child.shutdown().await.unwrap();
+    drop(child);
+    drop(rt);
+    sqlx::query("DELETE FROM agent_chat_topic_rotation WHERE id='pending-intent'")
+        .execute(cold_db.pool())
+        .await
+        .unwrap();
+    assert!(
+        policy.should_retire(&host("pending-source")).await.unwrap(),
+        "protection lasts only while the rotation intent is open"
+    );
+}
+
+#[tokio::test]
+async fn debug_bytes_are_sampled_only_once_per_pass() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    use tracing::instrument::WithSubscriber;
+    let f = FileDb::new().await.unwrap();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1));
+    let policy = SessionJournalRetention::new(f.database(), &store);
+    let mut cursor = RetentionCursor::default();
+    let events = forge_agent_host::test_support::JournalEvents {
+        debug: true,
+        ..Default::default()
+    };
+    policy
+        .maintain_once(&mut cursor)
+        .with_subscriber(events)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.journals().storage().diagnostic_calls_for_test().0,
+        1,
+        "one ordinary-domain byte sample per debug-enabled pass"
+    );
+}
+
+#[tokio::test]
+async fn retirement_errors_do_not_starve_collection_or_orphans_and_warn_once_per_cause() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    use tracing::instrument::WithSubscriber;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    publish(&f, store.clone(), "healthy-during-retire-error").await;
+    let policy = SessionJournalRetention::new(db.clone(), &store);
+    let events = forge_agent_host::test_support::JournalEvents::default();
+    let mut cursor = RetentionCursor::default();
+    for cause in [
+        "retirement lock unavailable",
+        "retirement lock unavailable",
+        "retirement database unavailable",
+    ] {
+        bulk_orphans(&db, 1, 32).await;
+        policy.fail_retirement_for_test(cause);
+        let report = policy
+            .maintain_once(&mut cursor)
+            .with_subscriber(events.clone())
+            .await
+            .unwrap();
+        assert_eq!(report.retirement_errors, 1);
+        assert_eq!(
+            report.collection_calls, 2,
+            "both domains collect after retirement fails"
+        );
+        assert_eq!(
+            report.deleted_packs, 1,
+            "orphan cleanup still runs in the same pass"
+        );
+    }
+    let rows = events.rows.lock().unwrap();
+    let warnings: Vec<_> = rows
+        .iter()
+        .filter(|(level, fields)| {
+            *level == tracing::Level::WARN
+                && fields
+                    .get("message")
+                    .is_some_and(|message| message.contains("journal retirement failed"))
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "each distinct cause warns once across passes"
+    );
 }

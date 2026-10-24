@@ -14,6 +14,11 @@ Forge SHALL retire replaced topic/profile-rotation sources and suspended native 
 - **AND** it preserves resumable dormant chats and does not retire an active writer
 - **AND** it does not eagerly import legacy-only dead sessions solely for retirement; their payload cleanup stays in the next release
 
+#### Scenario: Pending topic rotation survives restart
+- **WHEN** a restart suspends a source whose reserved successor is referenced by an open topic-rotation intent
+- **THEN** the shared retirement/conversion predicate preserves the predecessor until the intent closes
+- **AND** a retention pass does not prevent the fork from recovering native context
+
 #### Scenario: Dormant chats for two profiles in one scope
 - **WHEN** an Agent Chat scope has suspended native sessions for two profiles after a restart
 - **THEN** the newest unreplaced suspended session of each profile is kept as that profile's dormant session
@@ -61,7 +66,7 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 - **WHEN** one dirty session cannot authenticate or otherwise fails non-retryably during collection
 - **THEN** the released engine reports it in unreadable_sessions, preserves its state and dirty hint, and collects other readable sessions
 - **AND** a later completed pass reports it again, without loading its record more than once in any call that visits it
-- **AND** Forge logs it once per process while the non-evicting 4,096-id warning tracker has capacity, without ids, contents or keys; diagnostics and compact skip the unreadable session
+- **AND** Forge logs it once per process while the non-evicting 4,096-id warning tracker has capacity, including the opaque runtime session id, without contents or keys; diagnostics and compact skip the unreadable session
 - **AND** an unreadable retirement candidate prevents retirement of either domain, while unknown dependency metadata from another session conservatively defers retirement without falsely labelling the candidate unreadable
 
 #### Scenario: Warning capacity and worker restart
@@ -139,7 +144,7 @@ The gate ratios SHALL be taken after the production cadence (S2 hook and collect
 - **AND** rt-e7's per-turn C/N=1000 1.27826× and collect-at-end C/N=4000 1.22863× L2 numbers remain reference evidence rather than measured Forge outcomes
 
 ### Requirement: Lowest-priority supervised legacy conversion
-Forge SHALL supervise a sibling conversion worker in server and Solo, immediately and every 60 seconds with Skip cadence. It SHALL keyset-page native host sessions with legacy rows and missing ordinary publication, including exact-first partial imports, never tombstones. It SHALL convert one session at a time through the existing runtime v3 importer and shared engines with checkpoint recovery deferred, no provider/tool I/O and no legacy deletion or write. Per-session admission SHALL skip active host turns/forks without waiting; runtime writer conflicts SHALL skip/retry. Foreground lazy open racing a conversion SHALL not surface a background writer conflict. Each pass SHALL examine at most eight candidates, check a two-second scheduling budget before each candidate, yield between candidates and retain at most one decoded session. An in-flight import SHALL finish without cancellation; its duration may exceed the scheduling budget. A resumable cursor SHALL wrap for retries, with restart recovering from durable publication flags. Unreadable rows SHALL be preserved and logged through the capped tracker. D8 tracing SHALL expose converted, skipped-active, skipped-unreadable and remaining counts.
+Forge SHALL supervise a sibling conversion worker in server and Solo, immediately and every 60 seconds with Skip cadence. It SHALL keyset-page native host sessions with legacy rows and missing ordinary publication, including exact-first partial imports, never tombstones. It SHALL convert one session at a time through the existing runtime v3 importer and shared engines with checkpoint recovery deferred, no provider/tool I/O and no legacy deletion or write. Per-session admission SHALL skip active host turns/forks without waiting; runtime active-writer conflicts SHALL skip/retry. Foreground lazy open racing a conversion SHALL not surface a background writer conflict. Each pass SHALL examine at most eight candidates, check a two-second scheduling budget before each candidate, yield between candidates and retain at most one decoded session. An in-flight import SHALL finish without cancellation; its duration may exceed the scheduling budget. The worker SHALL use the same retirement predicate as retention to skip unresumable legacy sessions. A resumable cursor SHALL wrap for active-writer retries; every per-session error SHALL advance it and park the owner with an error-kind reason until worker restart, including validation conflicts. Remaining SHALL exclude parked and retirement-policy skips, include active skips, and reach zero when eligible work completes. Restart SHALL recover from durable publication flags and retry parked errors. Unreadable rows SHALL be preserved and logged through the capped tracker. D8 tracing SHALL expose converted, skipped-active, skipped-unreadable and remaining counts.
 
 #### Scenario: Active turn and lazy import races
 - **WHEN** an active writer holds a candidate or foreground/background import races in either order
@@ -176,3 +181,18 @@ Forge SHALL pass an explicit JournalGcBudget and refresh the root epoch between 
 - **WHEN** the runtime proves that a live root lacks membership
 - **THEN** Forge preserves that session and surfaces the unreadable observation through the existing capped diagnostics
 - **AND** healthy sessions continue collection
+
+### Requirement: Debounced retention and optional byte diagnostics
+Forge SHALL run retention immediately, then on its 60-second Skip interval or shared pool activity Notify, including domain-event and terminal/deletion commits. After a wake it SHALL coalesce activity for at least one second before the next pass. It SHALL call byte_stats at most once per pass, sampling the ordinary domain only when debug logging for forge_session_journal is enabled.
+
+#### Scenario: Activity burst with debug logging disabled
+- **WHEN** N domain events arrive within one debounce window
+- **THEN** they cause one retention pass and no byte_stats call
+
+### Requirement: Retirement failure isolation
+A retire-phase error SHALL NOT abort collection or orphan cleanup in the same retention pass. Each distinct cause SHALL warn once per cursor lifetime; a later pass SHALL retry retirement.
+
+#### Scenario: Repeated retirement failure
+- **WHEN** retirement fails with the same cause over multiple passes
+- **THEN** both collection domains and orphan cleanup still run each pass
+- **AND** the repeated cause emits one warning while a distinct cause can emit another

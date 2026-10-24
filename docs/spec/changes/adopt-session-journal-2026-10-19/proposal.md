@@ -12,8 +12,7 @@ than implement journal semantics. The reference packed SQLite adapter measured
 fixture B/N=4000 at **1.60542× L2 plain and 1.79118× L2 tool**, both with
 collect-at-end and per-turn collection.
 L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
-one-blob assumption. These are measured **PerSession S1–S5** results from
-`historical-receipts/rt-e7/report.md`, with modeled seal lengths and
+one-blob assumption. These are measured runtime-reference **PerSession S1–S5** results, with modeled seal lengths and
 within-session domain sharing. Forge now shares bodies between a session's two
 domains too (2026-10-21 amendment). Its real-AEAD/sqlx B/4000 disk gate now
 passes at 1.60843× / 1.79118×; turn/collect gates await runtime speed work.

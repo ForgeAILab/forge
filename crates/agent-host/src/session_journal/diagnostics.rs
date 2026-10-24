@@ -98,7 +98,7 @@ impl ForgeJournalStorage {
             .unwrap_or_else(|e| e.into_inner())
             .observe(session);
         if decision.session {
-            tracing::warn!(target: "forge_session_journal", skipped_sessions=1,
+            tracing::warn!(target: "forge_session_journal", runtime_session_id=session.as_str(), skipped_sessions=1,
                 "unreadable session journal preserved; maintenance skipped");
         }
         if decision.overflow {
@@ -335,6 +335,24 @@ impl ForgeJournalStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn unreadable_warning_identifies_session_once() {
+        let events = crate::test_support::JournalEvents::default();
+        let id = SessionId::new("diagnostic-unreadable-with-id");
+        tracing::subscriber::with_default(events.clone(), || {
+            ForgeJournalStorage::note_unreadable_session(&id);
+            ForgeJournalStorage::note_unreadable_session(&id);
+        });
+        let rows = events.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1["runtime_session_id"],
+            format!("{:?}", id.as_str())
+        );
+        assert_eq!(rows[0].0, tracing::Level::WARN);
+    }
 
     #[test]
     fn unreadable_warning_tracker_caps_ids_without_eviction_and_warns_overflow_once() {

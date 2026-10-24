@@ -341,14 +341,27 @@ impl SessionJournals {
                 )
                 .await
             {
-                if error.kind == agent_runtime::core::error::ErrorKind::Serialization {
-                    ForgeJournalStorage::note_unreadable_session(&session);
-                } else {
-                    tracing::warn!(target: "forge_session_journal", "terminal journal maintenance deferred");
-                }
+                note_terminal_maintenance_error(&session, &error);
             }
         }
         self.storage.nudge_retention();
+    }
+}
+
+fn note_terminal_maintenance_error(
+    session: &agent_runtime::core::ids::SessionId,
+    error: &RuntimeError,
+) {
+    use agent_runtime::core::error::ErrorKind;
+    if error.kind == ErrorKind::Serialization {
+        ForgeJournalStorage::note_unreadable_session(session);
+    } else if error.kind == ErrorKind::Conflict
+        || error.metadata.get("journal_database_contention")
+            == Some(&agent_runtime::core::metadata::MetaValue::Bool(true))
+    {
+        tracing::debug!(target: "forge_session_journal", kind=?error.kind, "terminal journal maintenance deferred");
+    } else {
+        tracing::warn!(target: "forge_session_journal", kind=?error.kind, "terminal journal maintenance deferred");
     }
 }
 
@@ -370,6 +383,44 @@ mod tests {
         },
         registry::RegistryRevision,
     };
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn terminal_conflict_and_busy_are_debug_but_deterministic_errors_warn() {
+        let events = crate::test_support::JournalEvents {
+            debug: true,
+            ..Default::default()
+        };
+        tracing::subscriber::with_default(events.clone(), || {
+            for error in [
+                RuntimeError::conflict("stale fence"),
+                RuntimeError::internal("busy").retryable().with_metadata(
+                    agent_runtime::core::metadata::Metadata::new()
+                        .with("journal_database_contention", true),
+                ),
+                RuntimeError::internal("IO unavailable").retryable(),
+                RuntimeError::internal("deterministic failure"),
+            ] {
+                note_terminal_maintenance_error(&SessionId::new("terminal-log"), &error);
+            }
+        });
+        let levels: Vec<_> = events
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(level, _)| *level)
+            .collect();
+        assert_eq!(
+            levels,
+            vec![
+                tracing::Level::DEBUG,
+                tracing::Level::DEBUG,
+                tracing::Level::WARN,
+                tracing::Level::WARN
+            ]
+        );
+    }
 
     fn state(sensitivity: SessionStateSensitivity) -> VersionedSessionState {
         let mut state = VersionedSessionState::new(

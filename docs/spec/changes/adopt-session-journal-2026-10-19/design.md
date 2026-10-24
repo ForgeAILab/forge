@@ -889,7 +889,9 @@ backup, never resuming stale legacy state from an upgraded database.
 Retire `replaced` topic/profile-rotation sources **and** suspended native sessions
 Forge cannot resume: non-Agent-Chat scopes after restart, and Agent Chat rows
 that are not their scope's dormant session. Keep resumable dormant chats and Task
-sessions that remain reusable; Task completion alone never retires. These are
+sessions that remain reusable; Task completion alone never retires. An open
+topic-rotation intent protects its reserved successor's predecessor, including
+after the startup sweep, until the intent closes. These are
 approved decisions, not conditional tasks or new open questions.
 
 "Dormant" means exactly what `SqliteDb::dormant_native_chat_session_id` would
@@ -923,8 +925,12 @@ through the existing PeriodicWorkers framework in both server and Solo. The
 supervisor owns exactly one worker and its shared-engine clones. Successful
 native terminal, fork and abort publications await S2; a maintenance error does
 not replace the turn outcome. Post-terminal, rotation, recovery and committed
-session-deletion nudges share the pool activity signal. Wakes can coalesce; the
-60-second tick and durable indexes recover missed wakes.
+session-deletion nudges share the pool activity signal with domain-event commits.
+After each wake a fixed one-second debounce drains further hints into one pass;
+the 60-second tick and durable indexes recover missed wakes. Byte diagnostics
+sample the ordinary domain at most once per pass, only with debug logging for
+`forge_session_journal`. A retirement error does not prevent collection/orphan
+cleanup in the same pass; each distinct cause warns once per cursor lifetime.
 
 A `session-journal-retention` worker uses the existing workers framework, a 60 s
 tick and post-commit rotation/recovery nudges. Retire protected then ordinary only
@@ -965,7 +971,9 @@ the base repack. No TTL, object age rule or new runtime schema is introduced.
 `session-journal-conversion` worker runs immediately and every 60 seconds (Skip).
 It is separate from retention so a slow import cannot delay retirement/cleanup.
 A keyset cursor pages only native host sessions with legacy rows and no ordinary
-publication or retirement; exact-only partial imports remain repair candidates.
+publication or retirement and a non-NULL legacy payload; exact-only partial
+imports remain repair candidates. The worker shares the retirement predicate
+and skips sessions it would retire instead of importing dead legacy history.
 The durable publication flags are completion markers: restart scans from zero
 without reconverting finished sessions. Each pass examines at most eight
 candidates, holds one decoded session at a time, yields between sessions and
@@ -978,13 +986,18 @@ priority: conversion uses try-write, skips active sessions, and retries them on
 a later sweep. Foreground opens hold read admission; an open already racing an
 in-flight conversion waits for it to finish rather than surfacing its writer
 conflict. The runtime's own writer fences cover writers outside this host
-admission. Typed conflicts skip/retry, including a lazy importer winning first.
+admission. Active writer conflicts skip/retry, including a lazy importer winning
+first. Every other per-session error advances the cursor and parks that owner
+with its error-kind reason until worker restart, including validation conflicts.
+Foreground lazy import remains available after repair; legacy rows stay intact.
 Both paths use the existing v3 importer, shared engines and exact-first validation
 with checkpoint recovery deferred, with no provider/tool I/O. Conversion never
 persists a synthetic turn or deletes/updates the legacy row. An unreadable row
 uses the existing capped warning tracker and stays present. Tracing reports
 converted, skipped-active, skipped-unreadable, conflicts/deferred, remaining,
-examined and scheduling-budget exhaustion; remaining includes skipped rows.
+examined, parked-by-reason and scheduling-budget exhaustion. Remaining excludes
+parked and retirement-policy skips and includes active skips, reaching zero
+when eligible conversion work finishes.
 
 **D-2 isolation.** Discovery pages the clear dirty index and returns every id,
 including an unreadable record; it never authenticates an entire discovery page.
@@ -999,7 +1012,8 @@ partial diagnostic in that case, never a liveness or total-file-size authority.
 A capped, non-evicting process tracker retains at most 4,096 runtime ids. It
 logs each tracked session once, emits one overflow warning when the cap is
 reached, then suppresses further per-session warnings. Aggregate observations
-continue counting; no ids, contents or keys are logged. The worker retains ids
+continue counting; per-session warnings include the opaque runtime id, never
+contents or keys. The worker retains ids
 only for deduplication within the current pass. Its `preserved_sessions` and
 `unreadable_sessions` counts cover that pass, so repaired/deleted sessions and
 worker restarts cannot grow lifetime cursor state.
@@ -1387,3 +1401,7 @@ None.
 - **Q8. Runtime owns speed work.** Use agent-runtime change
   `speed-up-journal-hot-path-2026-10-21`, phases P1/P2/P4; P3 is optional.
   Rerun Forge's gate after pinning the runtime release containing that work.
+
+## Owner Decisions (2026-10-24)
+
+Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 86 ms vs ~50 ms), B/1000 delta writes 10.3% vs 10%, and the unfinished C/4000 run are accepted for this release and fixed in a follow-up after merge.

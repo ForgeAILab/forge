@@ -10,6 +10,8 @@ use services::{Result, ServiceError};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinHandle, time::Instant};
 
+pub const RETENTION_DEBOUNCE: Duration = Duration::from_secs(1);
+
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 pub const RETENTION_SCHEDULING_BUDGET: Duration = Duration::from_secs(10);
 pub const MEMBERSHIP_RELEASE_LIMIT: u64 = 20_000;
@@ -32,6 +34,7 @@ pub struct RetentionCursor {
     cleanup_after: i64,
     reclaimed_objects: u64,
     reclaimed_bytes: u64,
+    warned_retirement_causes: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -39,6 +42,7 @@ pub struct RetentionReport {
     pub retired_domains: usize,
     pub conflicts: usize,
     pub deferred_domains: usize,
+    pub retirement_errors: usize,
     pub unreadable_sessions: usize,
     pub over_capacity_sessions: usize,
     pub preserved_sessions: usize,
@@ -56,6 +60,10 @@ pub struct SessionJournalRetention {
     db: Arc<SqliteDb>,
     journals: SessionJournals,
     #[cfg(feature = "test-support")]
+    completed_passes: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-support")]
+    retirement_failure: Arc<std::sync::Mutex<Option<String>>>,
+    #[cfg(feature = "test-support")]
     collection_budget: JournalGcBudget,
 }
 
@@ -70,14 +78,67 @@ pub struct RetirementPage {
     pub unreadable_sessions: usize,
 }
 
+/// Shared by retirement and background conversion; legacy-only dead sessions
+/// must not be imported just to be retired by the next pass.
+pub(crate) async fn should_retire_session(db: &SqliteDb, forge_session_id: &str) -> Result<bool> {
+    let Some(session) = db.get_agent_session(forge_session_id).await? else {
+        return Ok(false);
+    };
+    if session.backend_kind != "native" {
+        return Ok(false);
+    }
+    if db
+        .native_chat_session_pending_predecessor(&session.id)
+        .await?
+    {
+        return Ok(false);
+    }
+    if session.status == "replaced" || session.replaced_by_session_id.is_some() {
+        return Ok(true);
+    }
+    if session.status != "suspended" {
+        return Ok(false);
+    }
+    let Some(scope) = db.get_context_scope(&session.context_scope_id).await? else {
+        return Ok(false);
+    };
+    if scope.scope_type != "agent_chat" {
+        return Ok(true);
+    }
+    Ok(db
+        .dormant_native_chat_session_id(
+            &session.identity_id,
+            &session.context_scope_id,
+            &session.profile_id,
+        )
+        .await?
+        .as_deref()
+        != Some(&session.id))
+}
+
 impl SessionJournalRetention {
     pub fn new(db: Arc<SqliteDb>, store: &SqliteProtectedRuntimeStore) -> Self {
         Self {
             db,
             journals: store.journals().clone(),
             #[cfg(feature = "test-support")]
+            completed_passes: Arc::default(),
+            #[cfg(feature = "test-support")]
+            retirement_failure: Arc::default(),
+            #[cfg(feature = "test-support")]
             collection_budget: JournalGcBudget::default(),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn fail_retirement_for_test(&self, cause: &str) {
+        *self.retirement_failure.lock().unwrap() = Some(cause.to_owned());
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn completed_passes_for_test(&self) -> u64 {
+        self.completed_passes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(feature = "test-support")]
@@ -87,37 +148,11 @@ impl SessionJournalRetention {
     }
 
     /// The resume query is authoritative per identity, scope AND profile.
-    /// Replaced sources always qualify; a reusable Task or other ready row does
-    /// not. Suspended non-chat rows are the startup sweep's unresumable sessions.
+    /// Pending rotation predecessors stay live; other replaced sources qualify.
+    /// A reusable Task or other ready row does not. Suspended non-chat rows are
+    /// the startup sweep's unresumable sessions.
     pub async fn should_retire(&self, forge_session_id: &str) -> Result<bool> {
-        let Some(session) = self.db.get_agent_session(forge_session_id).await? else {
-            return Ok(false);
-        };
-        if session.backend_kind != "native" {
-            return Ok(false);
-        }
-        if session.status == "replaced" || session.replaced_by_session_id.is_some() {
-            return Ok(true);
-        }
-        if session.status != "suspended" {
-            return Ok(false);
-        }
-        let Some(scope) = self.db.get_context_scope(&session.context_scope_id).await? else {
-            return Ok(false);
-        };
-        if scope.scope_type != "agent_chat" {
-            return Ok(true);
-        }
-        Ok(self
-            .db
-            .dormant_native_chat_session_id(
-                &session.identity_id,
-                &session.context_scope_id,
-                &session.profile_id,
-            )
-            .await?
-            .as_deref()
-            != Some(&session.id))
+        should_retire_session(&self.db, forge_session_id).await
     }
 
     /// One bounded policy page, also useful for direct recovery operations.
@@ -132,6 +167,10 @@ impl SessionJournalRetention {
         deadline: Option<Instant>,
         unreadable: &mut HashSet<SessionId>,
     ) -> Result<RetirementPage> {
+        #[cfg(feature = "test-support")]
+        if let Some(cause) = self.retirement_failure.lock().unwrap().take() {
+            return Err(ServiceError::Domain(cause));
+        }
         let ids = self.db.native_journal_retirement_page(after, 128).await?;
         let mut report = RetirementPage::default();
         if !ids.is_empty() {
@@ -166,7 +205,16 @@ impl SessionJournalRetention {
                 .journals
                 .retire_published(&runtime)
                 .await
-                .map_err(|_| ServiceError::Domain("session journal retirement deferred".into()))?;
+                .map_err(|error| {
+                    use std::hash::{Hash, Hasher};
+                    let mut cause = std::collections::hash_map::DefaultHasher::new();
+                    error.to_string().hash(&mut cause);
+                    ServiceError::Domain(format!(
+                        "session journal retirement deferred ({:?}, cause {:016x})",
+                        error.kind,
+                        cause.finish()
+                    ))
+                })?;
             report.retired_domains += retired_domains;
             report.conflicts += conflicts;
             report.deferred_domains += deferred_domains;
@@ -223,6 +271,20 @@ impl SessionJournalRetention {
                             _ = tick.tick() => {}
                             _ = &mut wake => {}
                         }
+                        // Drain activity hints throughout a fixed window: a burst
+                        // becomes one pass and hints during a pass cannot spin it.
+                        let debounce = tokio::time::sleep(RETENTION_DEBOUNCE);
+                        tokio::pin!(debounce);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow_and_update() { return Ok(()); }
+                                }
+                                _ = &mut debounce => break,
+                                _ = notify.notified() => {}
+                            }
+                        }
                     }
                 }
             })
@@ -264,7 +326,20 @@ impl SessionJournalRetention {
                 Phase::Retire => {
                     let page = self
                         .retire_page_until(&cursor.retire_after, Some(deadline), &mut unreadable)
-                        .await?;
+                        .await;
+                    let page = match page {
+                        Ok(page) => page,
+                        Err(error) => {
+                            report.retirement_errors += 1;
+                            if cursor.warned_retirement_causes.insert(error.to_string()) {
+                                tracing::warn!(target: "forge_session_journal", %error,
+                                    "journal retirement failed; continuing collection and orphan cleanup");
+                            }
+                            cursor.retire_after.clear();
+                            cursor.phase = Phase::Protected;
+                            continue;
+                        }
+                    };
                     report.retired_domains += page.retired_domains;
                     report.conflicts += page.conflicts;
                     report.deferred_domains += page.deferred_domains;
@@ -320,10 +395,30 @@ impl SessionJournalRetention {
                 }
             }
         }
+        if tracing::enabled!(target: "forge_session_journal", tracing::Level::DEBUG) {
+            let engine = self.journals.ordinary();
+            let stats = self
+                .journals
+                .storage()
+                .byte_stats(&JournalDomain {
+                    storage_id: engine.storage_id(),
+                    role: JournalRole::Ordinary,
+                })
+                .await
+                .map_err(|_| {
+                    ServiceError::Domain("session journal byte diagnostic deferred".into())
+                })?;
+            tracing::debug!(target: "forge_session_journal", role=?JournalRole::Ordinary,
+                retained_bytes=stats.retained_bytes, live_bytes=stats.live_bytes, deferred_bytes=stats.deferred_bytes,
+                diagnostic_skipped_sessions=stats.skipped_sessions, "journal retention byte sample");
+        }
+        #[cfg(feature = "test-support")]
+        self.completed_passes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         report.preserved_sessions = unreadable.union(&over_capacity).count();
         report.over_capacity_sessions = over_capacity.len();
         tracing::debug!(target: "forge_session_journal", duration_us=started.elapsed().as_micros() as u64,
-            retired_domains=report.retired_domains, conflicts=report.conflicts, deferred_domains=report.deferred_domains,
+            retired_domains=report.retired_domains, retirement_errors=report.retirement_errors, conflicts=report.conflicts, deferred_domains=report.deferred_domains,
             unreadable_sessions=report.unreadable_sessions, over_capacity_sessions=report.over_capacity_sessions, preserved_sessions=report.preserved_sessions,
             unreadable_observations_total=ForgeJournalStorage::unreadable_session_observations(),
             collection_calls=report.collection_calls, collection_continuations=report.collection_continuations, membership_release_limit=MEMBERSHIP_RELEASE_LIMIT,
@@ -387,22 +482,6 @@ impl SessionJournalRetention {
                     reclaimed_objects=gc.deleted, reclaimed_bytes=gc.reclaimed_bytes,
                     unreadable_sessions=gc.unreadable_sessions.len(), over_capacity_sessions=gc.over_capacity_sessions.len(),
                     has_more=gc.has_more, work_units=gc.work_units, zero_work_calls=gc.zero_work_calls, "journal collection");
-                if !more {
-                    let stats = self
-                        .journals
-                        .storage()
-                        .byte_stats(&JournalDomain {
-                            storage_id: engine.storage_id(),
-                            role,
-                        })
-                        .await
-                        .map_err(|_| {
-                            ServiceError::Domain("session journal byte diagnostic deferred".into())
-                        })?;
-                    tracing::debug!(target: "forge_session_journal", ?role, retained_bytes=stats.retained_bytes,
-                        live_bytes=stats.live_bytes, deferred_bytes=stats.deferred_bytes,
-                        diagnostic_skipped_sessions=stats.skipped_sessions, "journal collection phase finished");
-                }
             }
             Err(error) if error.kind == ErrorKind::Conflict => {
                 report.conflicts += 1;

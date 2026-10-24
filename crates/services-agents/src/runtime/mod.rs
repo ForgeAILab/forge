@@ -1492,8 +1492,30 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 19);
-        assert_eq!(supervisor.worker_handle_count(), 19);
+        for journal_worker in [
+            RuntimeWorker::SessionJournalRetention,
+            RuntimeWorker::SessionJournalConversion,
+        ] {
+            assert_eq!(
+                supervisor
+                    .handles
+                    .iter()
+                    .filter(|(worker, _)| *worker == journal_worker)
+                    .count(),
+                1,
+                "{journal_worker:?} must be registered exactly once"
+            );
+        }
+        assert_eq!(
+            supervisor.workers().len(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
+        assert_eq!(
+            supervisor.worker_handle_count(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1544,6 +1566,7 @@ mod tests {
             "workspace-cleanup",
             "storage-maintenance",
             "session-journal-retention",
+            "session-journal-conversion",
             "environment-settings-observer",
             "check-runs",
             "integration-queue",
@@ -1573,7 +1596,7 @@ mod tests {
             .compute_status()
             .await
             .unwrap();
-        assert_eq!(status.periodic_workers.len(), expected.len());
+        assert_eq!(status.periodic_workers.len(), expected.len(), "registry includes session-journal-retention and session-journal-conversion exactly once");
         supervisor.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while runtime
@@ -1598,7 +1621,11 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 19);
+        assert_eq!(
+            supervisor.worker_handle_count(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

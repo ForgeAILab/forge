@@ -133,8 +133,12 @@ pub(super) fn database_error(error: impl Into<db::DbError>) -> RuntimeError {
     // Inspect sqlx's codes through the DB boundary, never its potentially
     // sensitive message. Includes extended BUSY/LOCKED codes (low byte 5/6),
     // IO/CANTOPEN and pool/worker availability errors.
-    let retryable = error.into().is_transient();
-    let error = RuntimeError::internal("journal database operation failed");
+    let db_error = error.into();
+    let retryable = db_error.is_transient();
+    let mut error = RuntimeError::internal("journal database operation failed");
+    if db_error.is_busy() {
+        error.metadata.insert("journal_database_contention", true);
+    }
     if retryable { error.retryable() } else { error }
 }
 
@@ -1122,8 +1126,11 @@ mod error_contract_tests {
     #[test]
     fn sqlite_primary_and_extended_contention_codes_are_retryable() {
         for code in ["5", "261", "517", "6", "262", "518"] {
-            assert!(
-                database_error(sqlx::Error::Database(Box::new(CodedError(code)))).retryable,
+            let mapped = database_error(sqlx::Error::Database(Box::new(CodedError(code))));
+            assert!(mapped.retryable, "{code}");
+            assert_eq!(
+                mapped.metadata.get("journal_database_contention"),
+                Some(&agent_runtime::core::metadata::MetaValue::Bool(true)),
                 "{code}"
             );
         }
@@ -1146,6 +1153,10 @@ mod error_contract_tests {
             let mapped = database_error(error);
             assert!(mapped.retryable);
             assert_eq!(mapped.message, "journal database operation failed");
+            assert!(
+                mapped.metadata.get("journal_database_contention").is_none(),
+                "availability failures are not routine contention"
+            );
         }
     }
 }

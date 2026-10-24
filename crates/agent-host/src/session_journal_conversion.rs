@@ -27,6 +27,8 @@ pub(crate) struct ConversionAdmission {
     sessions: Mutex<HashMap<SessionId, Weak<RwLock<()>>>>,
     #[cfg(feature = "test-support")]
     barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(feature = "test-support")]
+    failure: Mutex<Option<RuntimeError>>,
 }
 impl ConversionAdmission {
     fn session(&self, id: &SessionId) -> Result<Arc<RwLock<()>>, RuntimeError> {
@@ -57,6 +59,11 @@ impl SqliteProtectedRuntimeStore {
         *self.conversion_admission.barrier.lock().unwrap() = Some(barrier);
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn fail_conversion_for_test(&self, error: RuntimeError) {
+        *self.conversion_admission.failure.lock().unwrap() = Some(error);
+    }
+
     /// Read admission preserves the runtime's existing foreground writer-conflict
     /// semantics. Only background conversion takes exclusive host admission.
     pub async fn foreground_session(
@@ -76,6 +83,10 @@ impl SqliteProtectedRuntimeStore {
         owner: &str,
         id: &SessionId,
     ) -> Result<ConversionOutcome, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        if let Some(error) = self.conversion_admission.failure.lock().unwrap().take() {
+            return Err(error);
+        }
         let Ok(_admission) = self.conversion_admission.session(id)?.try_write_owned() else {
             return Ok(ConversionOutcome::SkippedActive);
         };
@@ -174,7 +185,10 @@ impl SqliteProtectedRuntimeStore {
                 Arc::new(store),
                 Arc::new(crate::DeterministicLcmSummaryModel::default()),
                 Arc::new(StaticLcmTimelineResolver::new(binding)),
-                LcmCoordinatorPolicy::default(),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: 28_000,
+                    ..Default::default()
+                },
             )?));
         }
         let runtime = builder.build()?;

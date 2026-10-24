@@ -11,6 +11,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Explicit Agent Session resume now returns `409 session_retired` when native
   journal history was retired; clients must start a new session. Automatic native
   selection and open races rotate to a fresh runtime id with one bounded retry.
+  Answering a protected interaction for retired history also returns HTTP 409
+  `session_retired`. MCP exposes JSON-RPC -32602 with `data.code=session_retired`;
+  native orchestration maps that cause to a failed `validation_error` tool outcome
+  directing the caller to start a new session.
 - New native session state uses encrypted journal packs. Older Forge builds
   cannot resume that state and refuse the newer database; downgrading requires
   a backup taken before upgrading. Journal migrations V202610200941,
@@ -31,7 +35,14 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - Convert legacy native sessions in a supervised background pass, one session at
   a time with active-turn skips, bounded scheduling and restart recovery. Lazy
   import remains the fallback on early open; legacy rows remain until the next
-  release. Conversion reuses the runtime importer and shared journal engines.
+  release. Conversion skips sessions selected by the shared retirement policy
+  and parks per-session errors by reason until restart, preserving the legacy row.
+  Conversion reuses the runtime importer and shared journal engines.
+  Legacy and native payloads coexist: measured B/4000 retained overlap is about
+  2.6–2.8× legacy-only disk size, and small sessions can grow more. Older databases
+  without incremental vacuum retain their file high-water mark; stop Forge and
+  use `--convert-db-to-incremental-vacuum` for the one-time rebuild that enables
+  subsequent incremental reclamation.
 - Native session disk reclamation now runs automatically after terminal
   publication and on a 60-second maintenance tick. It retires replaced and
   unresumable sessions, preserves resumable chats and reusable Task sessions,
@@ -39,17 +50,21 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   untouched while healthy collection continues; unknown dependencies can safely
   defer retirement. Collection is bounded and resumable: the worker refreshes
   the root epoch on each continuation, within 10 seconds and 32 calls per pass.
-  Byte diagnostics run once per finished domain phase. Retention logs add
+  Shared domain-event/terminal/deletion wakes are coalesced for at least one
+  second; byte diagnostics sample the ordinary domain at most once per pass,
+  only with `forge_session_journal` debug logging enabled. Retention logs add
   `collection_continuations`, `has_more`, `work_units`, `zero_work_calls` and
   `over_capacity_sessions`; capped per-session warnings identify capacity skips.
-- Deleting a Project or Agent Chat, or archiving an Agent, removes saved native
-  session metadata and journal memberships. Agent deletion also removes CLI
-  resume handles; it does not itself signal an already running CLI process.
-  Chat deletion and Agent archival use repository transactions; only the journal
+- Project or User/account deletion, Agent archival and machine-removal archival
+  remove the affected saved sessions. Agent archival deletes session metadata,
+  journal memberships, legacy encrypted snapshots, pending protected interactions,
+  chat denials and CLI resume handles. An in-flight native turn fails at its next
+  journal write because its mapping is gone; archival does not itself signal an
+  already running CLI process. These deletions use repository transactions; only the journal
   orphan-marker projection triggers remain in the journal migrations. Pack
   layout invalidation runs in indexed repository writers and orphan drain.
 - Sessions now persist through the native session journal, using agent-runtime
-  v0.10.0 (`c036af7b4635cf7d76451aaa666a9df87405ca1a`, previously v0.8.0)
+  v0.10.0 (`c036af7b4635cf7d76451aaa666a9df87405ca1a`, previously v0.7.0 + U9 at `1de6d7d`)
   and encrypted delta packs. All runtime packages and the testkit use that pin;
   ambiguous storage acknowledgements and SQLite contention are retryable.
   Chat and Task continuity work as before; the disk layout of newly saved state
@@ -111,6 +126,15 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   the MCP `forge_update_task` tool, now publish the Project-scoped
   `task.updated` event, so other connected clients refresh. The MCP tool now
   goes through the same Task update validation as `PATCH /api/v1/tasks/{id}`.
+
+### Known limitations
+
+- Session journals ship with owner-accepted performance follow-ups: A/100 tool
+  turn overhead is 72 ms and B/100 tool is 86 ms against ~50 ms; B/1000 delta
+  writes are about 10.3% against 10%; the C/4000 run is unfinished. These misses
+  are accepted for this release and will be fixed after merge. Allocator-level
+  memo/heap telemetry and follow-up documentation/spec sign-off remain open in
+  the change tracker.
 
 ## [0.14.1] - 2026-10-21
 
@@ -286,6 +310,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Changed
 
+- Bump Agent Runtime from v0.5.0 (`82f5aac`) to v0.7.0 plus U9 groups C/D
+  (`1de6d7d`), retaining materialized session/checkpoint stores without
+  journal adoption.
 - A native turn failed by a provider rejection now reads
   `Provider: provider rejected the request…` instead of `Config: …` in Task
   execution errors and Agent Chat failure text, and may end with the
@@ -320,8 +347,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   only to the provider and model that produced it, so after a session changes
   model its earlier reasoning is left out of requests. Reasoning stored before
   this release keeps the previous replay rule. Schema-invalid tool calls and
-  Forge's `parameters` envelope normalizer behave as before. External agents
-  and the flat semantic-summary alternative stay disabled.
+  Forge's `parameters` envelope normalizer behave as before. Native journals,
+  external agents and the flat semantic-summary alternative stay disabled.
 - Forge honours HTTPS_PROXY/ALL_PROXY/NO_PROXY on every outbound path, including
   lowercase variants, provider probes and connection tests, public search,
   native provider requests, fetch, and network-capable child processes. Target
@@ -2173,6 +2200,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   with step-level ids when signatures are unavailable. Review checklists show
   checked findings only when resolved by that review, omitting older resolutions.
 
+
 - Review comments show the finding checklist and drop the full report. Read the
   full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
   findings retain a 2 KiB excerpt. The checklist lists open findings first and
@@ -3535,7 +3563,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 
+
 - Project `review_ci_triage` (`full`, `report`, `off`), a durable rerun and exact-commit base comparison, queue-head CI triage, and Project Attention categories `flaky_check` and `base_check_failing` with Mission Control warnings.
+
 
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with

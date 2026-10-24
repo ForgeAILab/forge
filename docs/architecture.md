@@ -2428,7 +2428,9 @@ suspended non-Agent-Chat sessions qualify after startup recovery. For Agent Chat
 it calls `dormant_native_chat_session_id` for the exact identity, context scope
 and profile, preserving each profile's resumable dormant chat. Reusable Task
 sessions stay published; completion alone does not retire them. Legacy-only dead
-rows are never imported to retire them. `SessionJournals::retire_published` loads
+rows are never imported to retire them. A predecessor referenced by a reserved
+successor of an open topic-rotation intent is preserved until that intent closes,
+including after the startup sweep. `SessionJournals::retire_published` loads
 published records in both domains and obtains both revision-bound grants before
 retiring protected then ordinary using the same clones as runtime turns. A live
 writer or conflict defers retirement; retries skip an already retired domain.
@@ -2453,8 +2455,11 @@ Chat session opens successfully, so retired-open retries retain no obsolete ids.
 
 The supervisor starts one `session-journal-retention` PeriodicWorker in server
 and Solo. It scans immediately, then on a 60-second Skip interval or a post-commit
-terminal/rotation/recovery/deletion nudge. The shared pool Notify is registered
-before each pass; coalesced or missed wakes are recovered from durable indexes.
+shared pool activity Notify (domain-event commits, including Task/check/schedule
+writes, as well as terminal/rotation/recovery/session-deletion nudges). The wake
+is registered before each pass; a fixed one-second debounce drains subsequent
+hints into one pass and prevents immediate back-to-back passes. The 60-second
+tick and durable indexes recover missed wakes.
 A resumable cursor advances through retirement pages, protected collection,
 ordinary collection and deletion draining. The 10-second scheduling budget is
 checked per retirement candidate and between engine calls/cleanup transactions;
@@ -2472,8 +2477,10 @@ and Solo, then every 60 seconds (Skip). It has its own cursor and two-second
 scheduling budget, so a slow legacy import does not delay retention. Each pass
 keyset-pages at most eight native host rows with a legacy row and no ordinary
 native publication or tombstone; protected-only partial imports remain eligible
-for runtime repair. It converts one session at a time and yields between
-candidates. The deadline is checked before each candidate; an in-flight import
+for runtime repair. Before import it calls the same retirement predicate as
+retention, skipping replaced and unresumable suspended sessions. An open topic
+rotation protects its reserved successor's predecessor, including after startup
+suspension. It converts one session at a time and yields between candidates. The deadline is checked before each candidate; an in-flight import
 finishes even if it exceeds two seconds. Memory holds one decoded session at a
 time plus the eight scalar candidates and existing bounded engine/storage caches.
 The cursor wraps for skipped rows; restart begins at zero and durable publication
@@ -2485,7 +2492,11 @@ active sessions for a later sweep. Admission entries use weak references and
 remove unused entries on access. An already in-flight conversion completes before
 a racing foreground open proceeds, so its writer reservation cannot surface as
 a user conflict. Engine writer fences also protect callers outside host admission.
-The worker treats typed conflicts as skips. Lazy import remains the fallback if
+Active-writer conflicts are skips for a later sweep. All per-session import
+errors, including validation conflicts, advance the cursor and park the owner
+with an error-kind reason for this worker lifetime. Restart retries parked errors;
+foreground lazy import stays available after repair. Empty legacy payloads are
+excluded. Retirement-policy skips are also excluded until restart. Lazy import remains the fallback if
 an open reaches a session first; native-first open avoids legacy decoding after
 background conversion. This moves the measured full B/4000 conversion (~3.4 s)
 off first open when the background pass has reached that session; it does not
@@ -2501,8 +2512,10 @@ refusal leaves the validated native publication authoritative for the next real
 turn. Non-retryable serialization failures preserve the row and use the same
 capped unreadable tracker. Tracing on `forge_session_journal` reports converted,
 skipped-active, skipped-unreadable, conflicts, examined, remaining and budget
-exhaustion, without ids, contents or keys. Remaining includes unreadable/active
-rows. Legacy-table removal stays in the next release.
+exhaustion. Parked-error diagnostics include the opaque runtime id and error
+kind, never contents or keys. Remaining excludes parked and retirement-policy
+skips, includes active skips, and reaches zero after eligible work is exhausted.
+Legacy-table removal stays in the next release.
 
 Discovery pages only the clear dirty-session index, including corrupt records.
 Runtime v0.10.0 reports per-session non-retryable failures in `unreadable_sessions`,
@@ -2513,7 +2526,8 @@ Conflicts skip silently; retryable/domain-wide errors abort. The worker and
 storage share a capped, non-evicting process warning tracker. It retains at most
 4,096 ids, warns once per tracked session and emits one overflow warning when
 capacity is reached. Further per-session warnings are suppressed while aggregate
-observations keep counting. Unreadable warnings contain no ids, contents or keys.
+observations keep counting. Unreadable warnings include the opaque runtime
+session id, never contents or keys.
 Over-capacity warnings use a separate tracker with the same 4,096-session cap and include the runtime
 session id. `over_capacity_sessions` counts distinct affected sessions per pass;
 `preserved_sessions` counts the union with unreadable sessions. Diagnostics
@@ -2525,8 +2539,18 @@ refusals, collection receipts, readable retained/live/deferred bytes, omitted
 session counts and deletion counts. Collect-call duration is a conservative
 gate-hold upper bound including gate wait; the 10-second budget bounds scheduling,
 not the engine's individual gate hold. Collection refreshes the root epoch on
-each continuation and makes at most 32 calls per pass. Byte diagnostics run
-once per finished domain phase, rather than on each yielded call.
+each continuation and makes at most 32 calls per pass. Byte diagnostics sample
+the ordinary domain at most once per pass only when `forge_session_journal`
+debug logging is enabled; its domain-scoped values are not whole-database totals.
+A retire-phase error advances to collection and orphan cleanup in that same
+pass; the cursor logs each distinct retirement cause once and retries retirement
+on a later pass.
+
+Operation replay retains an inclusive 64-revision window: collection may prune
+below `max(current_revision - 64, 0)`, preserving every operation at or above
+that floor plus the current writer epoch's last operation, even below the floor.
+The engine selects pruning; storage never prunes without its directive. Replaying
+a pruned operation conflicts instead of applying it again.
 
 Session deletion immediately cascades journal records, pins, catalog,
 operation packs and memberships. Project/Task scopes and physical Agent deletion
@@ -3121,7 +3145,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
 | `session-journal-conversion` | Immediate pass, 60-second Skip interval | 2-second scheduling budget / warn and await; eight candidates, one import at a time, yield, keyset cursor and durable publication progress |
-| `session-journal-retention` | Immediate pass, 60-second Skip interval and post-commit terminal/rotation/recovery/deletion Notify | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 calls per pass, resumable retirement/collection/cleanup cursors |
+| `session-journal-retention` | Immediate pass, 60-second Skip interval and shared pool domain-event/terminal/deletion activity Notify with a fixed one-second debounce | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 calls per pass, resumable retirement/collection/cleanup cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |

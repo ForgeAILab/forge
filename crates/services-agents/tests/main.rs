@@ -50,3 +50,6 @@ mod session_journal_retention;
 
 #[path = "suite/session_journal_conversion.rs"]
 mod session_journal_conversion;
+
+#[path = "suite/session_journal_dryrun.rs"]
+mod session_journal_dryrun;

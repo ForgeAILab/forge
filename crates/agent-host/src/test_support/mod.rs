@@ -1,5 +1,7 @@
 //! File-backed fixtures available only with the explicit `test-support` feature.
 
+mod journal_events;
+pub use journal_events::JournalEvents;
 mod mapping;
 pub use mapping::MappingStorage;
 

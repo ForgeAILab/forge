@@ -30,9 +30,23 @@ async fn fixture() -> (
     let worker = Arc::new(SessionJournalConversion::new(f.database(), store.clone()));
     (f, store, worker)
 }
-async fn seed(f: &FileDb, store: &SqliteProtectedRuntimeStore, name: &str) -> SessionId {
+pub(super) async fn seed(f: &FileDb, store: &SqliteProtectedRuntimeStore, name: &str) -> SessionId {
     let id = SessionId::new(name);
     f.ensure_session(&id).await.unwrap();
+    // Each legacy fixture is a resumable dormant chat, including bulk pages.
+    let db = f.database();
+    sqlx::query("INSERT INTO user (id,email,password_hash,created_at,updated_at) VALUES (?,?,'hash','c','u')")
+        .bind(format!("owner:{name}")).bind(format!("{name}@example.test")).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_chat (id,kind,account_id,status,created_at,updated_at) VALUES (?,'account_main',?,'ready','c','u')")
+        .bind(format!("chat:{name}")).bind(format!("owner:{name}")).execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO agent_context_scope (id,identity_id,scope_type,scope_id,created_at,updated_at) VALUES (?,'journal-agent','agent_chat',?,'c','u')")
+        .bind(format!("scope:{name}")).bind(format!("chat:{name}")).execute(db.pool()).await.unwrap();
+    sqlx::query("UPDATE agent_session SET context_scope_id=? WHERE runtime_session_id=?")
+        .bind(format!("scope:{name}"))
+        .bind(name)
+        .execute(db.pool())
+        .await
+        .unwrap();
     let mut s: SessionSnapshot =
         serde_json::from_value(serde_json::json!({"id":id,"history":[],"updated":1})).unwrap();
     s.history.push(Message::user("accepted legacy input"));
@@ -270,16 +284,34 @@ async fn background_unreadable_legacy_preserved() {
     sqlx::query("UPDATE protected_agent_session_state SET checkpoint_ciphertext=X'000102' WHERE session_id=?")
         .bind(format!("journal-fixture:{}",id.as_str())).execute(f.database().pool()).await.unwrap();
     let before = legacy(&f, &id).await;
-    for _ in 0..2 {
+    use tracing::instrument::WithSubscriber;
+    let events = forge_agent_host::test_support::JournalEvents::default();
+    let mut cursor = ConversionCursor::default();
+    for pass in 0..3 {
         let report = worker
-            .convert_once(&mut ConversionCursor::default())
+            .convert_once(&mut cursor)
+            .with_subscriber(events.clone())
             .await
             .unwrap();
-        assert_eq!((report.skipped_unreadable, report.remaining), (1, 1));
+        assert_eq!(
+            (report.skipped_unreadable, report.remaining),
+            (usize::from(pass == 0), 0),
+            "unreadable rows are parked rather than decoded every cycle"
+        );
         assert_eq!(legacy(&f, &id).await, before);
         assert_eq!(publication_count(&f, &id).await, 0);
     }
     assert_eq!(publication_count(&f, &good).await, 2);
+    let rows = events.rows.lock().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "parking must not bypass the capped unreadable warning tracker"
+    );
+    assert_eq!(
+        rows[0].1["runtime_session_id"],
+        format!("{:?}", id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -354,4 +386,224 @@ async fn background_worker_restart_resumes_durable_progress() {
             2
         );
     }
+}
+
+#[tokio::test]
+async fn background_skips_replaced_and_suspended_task_sessions() {
+    let (f, store, worker) = fixture().await;
+    let replaced = seed(&f, &store, "dead-replaced-task").await;
+    let suspended = seed(&f, &store, "dead-suspended-task").await;
+    let good = seed(&f, &store, "resumable-chat").await;
+    let db = f.database();
+    for sql in [
+        "INSERT INTO project (id,name,settings,workflow_definition,created_at,updated_at) VALUES ('conversion-project','Conversion','{}','{}','c','u')",
+        "INSERT INTO task (id,project_id,title,status,created_at,updated_at) VALUES ('conversion-task','conversion-project','Done task','done','c','u')",
+        "INSERT INTO agent_context_scope (id,identity_id,scope_type,scope_id,project_id,task_id,task_role,workspace_access,created_at,updated_at) VALUES ('conversion-task-scope','journal-agent','task','conversion-task','conversion-project','conversion-task','worker','task_write','c','u')",
+    ] { sqlx::query(sql).execute(db.pool()).await.unwrap(); }
+    for (id, status) in [(&replaced, "replaced"), (&suspended, "suspended")] {
+        sqlx::query("UPDATE agent_session SET context_scope_id='conversion-task-scope',status=? WHERE runtime_session_id=?")
+            .bind(status).bind(id.as_str()).execute(db.pool()).await.unwrap();
+    }
+    let before = [legacy(&f, &replaced).await, legacy(&f, &suspended).await];
+    let mut cursor = ConversionCursor::default();
+    let report = worker.convert_once(&mut cursor).await.unwrap();
+    assert_eq!(report.converted, 1, "only the resumable chat is imported");
+    assert_eq!(
+        report.remaining, 0,
+        "unresumable sessions are excluded from pending work"
+    );
+    assert_eq!(publication_count(&f, &replaced).await, 0);
+    assert_eq!(publication_count(&f, &suspended).await, 0);
+    assert_eq!(publication_count(&f, &good).await, 2);
+    assert_eq!(
+        [legacy(&f, &replaced).await, legacy(&f, &suspended).await],
+        before
+    );
+    assert_eq!(worker.convert_once(&mut cursor).await.unwrap().converted, 0);
+}
+
+#[tokio::test]
+async fn every_conversion_error_kind_parks_and_cursor_finishes() {
+    for error in [
+        RuntimeError::conflict("validation conflict"),
+        RuntimeError::not_found("missing owner"),
+        RuntimeError::config("invalid builder"),
+        RuntimeError::internal("ambiguous host mapping"),
+        RuntimeError::internal("transient database failure").retryable(),
+    ] {
+        let (f, store, worker) = fixture().await;
+        let bad = seed(&f, &store, "a-parked").await;
+        let good = seed(&f, &store, "b-healthy").await;
+        let before = legacy(&f, &bad).await;
+        let reason = format!("{:?}", error.kind);
+        store.fail_conversion_for_test(error);
+        let mut cursor = ConversionCursor::default();
+        let first = worker.convert_once(&mut cursor).await.unwrap();
+        assert_eq!(first.parked_by_reason.get(&reason), Some(&1));
+        assert_eq!(
+            (first.examined, first.converted, first.remaining),
+            (2, 1, 0)
+        );
+        for _ in 0..3 {
+            let next = worker.convert_once(&mut cursor).await.unwrap();
+            assert_eq!(
+                (next.examined, next.converted, next.remaining),
+                (0, 0, 0),
+                "{reason} is not retried every cycle"
+            );
+        }
+        assert_eq!(publication_count(&f, &bad).await, 0);
+        assert_eq!(publication_count(&f, &good).await, 2);
+        assert_eq!(legacy(&f, &bad).await, before);
+    }
+}
+
+#[derive(Debug)]
+struct LegacyState(Arc<SqliteProtectedRuntimeStore>);
+#[async_trait]
+impl SessionStore for LegacyState {
+    async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        SessionStore::load(&*self.0, id).await
+    }
+    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        self.0.save_legacy_snapshot_baseline(snapshot).await
+    }
+}
+#[async_trait]
+impl CheckpointStore for LegacyState {
+    async fn load_latest(&self, id: &SessionId) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        CheckpointStore::load_latest(&*self.0, id).await
+    }
+    async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        self.0.save_legacy_checkpoint_baseline(checkpoint).await
+    }
+}
+
+async fn lcm_runtime(
+    store: Arc<SqliteProtectedRuntimeStore>,
+    sessions: Arc<dyn SessionStore>,
+    checkpoints: Arc<dyn CheckpointStore>,
+    id: &SessionId,
+) -> Runtime {
+    use agent_runtime::{
+        core::provider::{FinishReason, ProviderStreamEvent},
+        harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver},
+        provider::fake::ScriptedStream,
+    };
+    let lcm_store = store
+        .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{}", id.as_str()))
+        .await
+        .unwrap();
+    let binding = lcm_store.runtime_binding(id.clone()).unwrap();
+    let coordinator = LcmCoordinator::new(
+        Arc::new(lcm_store),
+        Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+        Arc::new(StaticLcmTimelineResolver::new(binding)),
+        LcmCoordinatorPolicy {
+            input_budget_tokens: 28_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    RuntimeBuilder::new(ModelId::new("fake"))
+        .provider_name("fake")
+        .provider(Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            vec![ScriptedStream::new(vec![
+                ProviderStreamEvent::TextDelta {
+                    text: "LCM retained reply".into(),
+                },
+                ProviderStreamEvent::Finish {
+                    reason: FinishReason::Stop,
+                },
+            ])],
+        )))
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(32_000, 28_000, 4_000),
+        ))
+        .session_store(sessions)
+        .checkpoint_store(checkpoints)
+        .lcm(Arc::new(coordinator))
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn background_converts_agent_chat_lcm_and_next_turn_is_native_only() {
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    let (f, store, worker) = fixture().await;
+    let id = seed(&f, &store, "lcm-chat").await;
+    sqlx::query("DELETE FROM protected_agent_session_state WHERE session_id=?")
+        .bind(format!("journal-fixture:{}", id.as_str()))
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    let old = Arc::new(LegacyState(store.clone()));
+    let rt = lcm_runtime(store.clone(), old.clone(), old, &id).await;
+    let session = rt
+        .start_session(StartSession::create(
+            id.clone(),
+            vec![Message::user("legacy LCM history")],
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("legacy LCM turn"))
+        .await
+        .unwrap()
+        .completed()
+        .await;
+    session.shutdown().await.unwrap();
+    drop(session);
+    drop(rt);
+    let snapshot = SessionStore::load(&*store, &id).await.unwrap().unwrap();
+    assert!(
+        snapshot.extension_state.contains_key(LCM_COMPONENT_ID),
+        "fixture must exercise needs_lcm"
+    );
+    let before = legacy(&f, &id).await;
+    let report = worker
+        .convert_once(&mut ConversionCursor::default())
+        .await
+        .unwrap();
+    assert_eq!((report.converted, report.remaining), (1, 0));
+    assert_eq!(publication_count(&f, &id).await, 2);
+    assert_eq!(legacy(&f, &id).await, before);
+    drop(worker);
+    drop(store);
+    let cold = Arc::new(SqliteProtectedRuntimeStore::new(
+        f.reopen().await.unwrap(),
+        [7; 32],
+        1,
+    ));
+    let only = Arc::new(NativeOnly(cold.clone()));
+    let rt = lcm_runtime(cold, only.clone(), only, &id).await;
+    let session = rt
+        .start_session(StartSession::resume(id.clone()))
+        .await
+        .unwrap();
+    assert_eq!(session.history(), snapshot.history.as_slice());
+    session
+        .run(UserInput::text("native-only LCM turn"))
+        .await
+        .unwrap()
+        .completed()
+        .await;
+    assert!(session
+        .history()
+        .iter()
+        .any(|message| message.joined_text() == "native-only LCM turn"));
+    assert_eq!(
+        session.history().last().unwrap().joined_text(),
+        "LCM retained reply"
+    );
+    session.shutdown().await.unwrap();
+    assert_eq!(
+        legacy(&f, &id).await,
+        before,
+        "next native turn never rewrites legacy state"
+    );
 }

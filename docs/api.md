@@ -439,7 +439,7 @@ retries), never from provider message text.
 | POST   | `/api/v1/agent-sessions/{id}/cancel` | Explicitly cancel the active native turn when supported |
 | POST   | `/api/v1/agent-sessions/{id}/steer` | Explicitly steer the active native turn when supported |
 | GET    | `/api/v1/agent-sessions/{session_id}/interactions` | List redaction-safe pending protected interactions for an owned session |
-| POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version |
+| POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/answer` | Answer a protected interaction with an optimistic version; retired native history returns `409 session_retired`, directing the client to start a new session |
 | POST   | `/api/v1/agent-sessions/{session_id}/interactions/{interaction_id}/cancel` | Cancel a protected interaction with an optimistic version |
 | GET    | `/api/v1/account/main-agent` | `V071+` — Get the account's single Main Agent binding |
 | PUT    | `/api/v1/account/main-agent` | `V071+` — Create or replace the account's Main Agent binding with optimistic concurrency. The request names only the agent (`identity_id`); the binding follows that agent's current settings |
@@ -5943,6 +5943,12 @@ Reconnect/resync invalidates active queries; global refetch-on-focus is disabled
 
 Forge exposes tools at `POST /mcp` (JSON-RPC 2.0). The MCP server has its own
 `AppState` and does not depend on the `api` crate.
+
+A retired native session returns JSON-RPC error `-32602` with
+`data.code = "session_retired"` and a message directing the caller to start a new
+session. Native orchestration tools map the same `SessionRetired` cause to a
+failed `validation_error` outcome with that recovery message; they do not expose
+a distinct orchestration `session_retired` outcome code.
 
 MCP requests require authentication. Clients can send `Authorization: Bearer
 <token>` or include `token=<token>` in the MCP URL query string; `forge-ctl mcp

@@ -765,8 +765,7 @@ each physical pack write once, so this is not double counting.
 
 Commit `79996e80` limits S2 tiers and the collection base repack to packs the
 acting domain holds entirely. Same ignored release report, fixtures, seeds,
-projection, baseline, cadence and thresholds. Raw output:
-`$TMPDIR/refactor/c3-writes/gate/`.
+projection, baseline, cadence and thresholds; the measurements follow below.
 
 | Fixture | Delta writes / legacy, task 29 → fix | Forge/L2, task 29 → fix | Packs after collection | Max collect call, ms |
 | --- | ---: | ---: | ---: | ---: |
@@ -793,7 +792,7 @@ heavy load of task 29's run; see the JSON for them.
 
 Same ignored release report, fixtures, seeds, projection, L2 baseline, cadence
 and thresholds. The only changes are session-owned shared packs and the
-storage-only fixes (task 28). Raw output: `$TMPDIR/refactor/c3-share/gate/`.
+storage-only fixes (task 28); the measurement table follows.
 
 | Fixture | Actual L2 | After collection, task 25 → 29 | Forge/L2, task 25 → 29 | ≤2.0× |
 | --- | ---: | ---: | ---: | --- |
@@ -938,8 +937,8 @@ The longest collect call overall is C/4000 tool at **2992.81 ms**: **FAIL** agai
 **NOT MET telemetry:** the pinned runtime keeps RootMemo private and exposes no charge/heap or internal hit/miss/eviction/oversize API. Those JSON fields are null with a reason; storage cache charge is an estimate, not measured allocator heap. No unsafe layout inspection, runtime patch, invented counters or production budget increase was used. Task 24 remains unchecked for these missing mandatory metrics despite the working harness; task 25 records completed gate execution and its failed verdict.
 
 
-The complete JSON, candidate patch and verification receipts are retained under
-`$TMPDIR/refactor/c3-t24-25/`. Native-only retirement sizes exclude the
+The measurement harness emits the complete JSON and verification metrics.
+Native-only retirement sizes exclude the
 legacy row only for measurement; production retirement retains legacy payloads.
 Old-plus-new peak is the larger of the two measured overlap layouts, not an
 in-flight WAL/allocator peak. Source and method live in
@@ -991,3 +990,40 @@ Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to
 **NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. All Owner Decisions below remain verbatim.
 
 The v0.10.0 pin, revision constant and dependency contract are aligned; the historical benchmark receipt predates the tag and no benchmark rerun is claimed.
+
+### Known limitations accepted for this release (2026-10-24)
+
+Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 86 ms vs ~50 ms), B/1000 delta writes 10.3% vs 10%, and the unfinished C/4000 run are accepted for this release and fixed in a follow-up after merge.
+
+The measurements above remain failures against their fixed thresholds; this
+owner decision accepts them for shipping and carries the fixes past merge.
+Tasks 24, 26 and 33 remain unchecked for telemetry, final documentation/spec
+acceptance and those performance follow-ups. No new benchmark run is claimed.
+
+### Conversion dry run on an offline database copy
+
+The ignored `services-agents` test `session_journal_dryrun::journal_real_data_dry_run`
+opens only the path supplied in `FORGE_JOURNAL_DRYRUN_DB`, using the production
+SQLite pool and migrations. It runs conversion to completion with the production
+eight-candidate/two-second per-tick budget, followed by one retention pass. It
+starts no executors, provider, daemon or runtime supervisor. The test skips when
+the path is unset and refuses any path containing a `.forge` directory, including
+a symlink's canonical target. Use a disposable, consistent offline copy and a
+copied `jwt_secret.bin` beside it; `FORGE_JOURNAL_DRYRUN_SECRET_FILE` can instead
+name a copied file containing the original JWT secret bytes (including an inline
+configured secret). No secret is generated or printed.
+
+```bash
+FORGE_JOURNAL_DRYRUN_DB=/path/to/disposable-copy/forge.db \
+  cargo test --offline -p services-agents --features test-support --test main \
+  session_journal_dryrun::journal_real_data_dry_run -- --ignored --exact --nocapture
+```
+
+It prints one JSON summary with converted/skipped/parked counts by reason,
+unreadable counts, allocated legacy/journal table-and-index bytes from `dbstat`
+before/after, conversion tick count, retention results and elapsed milliseconds
+for migrations, conversion and retention. `dbstat` allocation is not canonical
+live bytes or a file-shrink promise. Parked errors are excluded from remaining
+work for that worker lifetime and retried after restart; foreground lazy import
+remains available after repair. The generated-database regression invokes this
+same ignored entrypoint; it is not evidence from user data.
