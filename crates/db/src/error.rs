@@ -20,6 +20,11 @@ pub enum DbError {
     #[error("database error: {0}")]
     Sqlx(#[source] sqlx::Error),
 
+    /// The write may have committed; retry/read authoritative state. This is
+    /// an internal availability error, not a new HTTP or turn-failure class.
+    #[error("database commit outcome is unknown")]
+    AmbiguousCommit(#[source] sqlx::Error),
+
     #[error("not found")]
     NotFound,
 
@@ -31,6 +36,9 @@ pub enum DbError {
 
     #[error("dead letter is not a whole event and cannot be replayed")]
     DeadLetterNotReplayable,
+
+    #[error("session history has been retired; start a new session")]
+    SessionRetired,
 
     #[error("version conflict")]
     VersionConflict,
@@ -243,7 +251,8 @@ impl DbError {
     /// Worker retry classification, deliberately narrower than "any DB error".
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::TaskBusy { .. }
+            Self::AmbiguousCommit(_)
+            | Self::TaskBusy { .. }
             | Self::VersionConflict
             | Self::TaskVersionConflict { .. }
             | Self::BoardRevisionConflict { .. } => true,

@@ -357,6 +357,7 @@ pub(super) enum StoredServiceError {
         reason: String,
         wait_cause: Option<api_types::DeniedBy>,
     },
+    SessionRetired,
     Conflict(String),
     ProductGenesisActiveSession {
         session_id: String,
@@ -519,6 +520,7 @@ impl From<StoredServiceError> for ServiceError {
                 reason,
                 wait_cause,
             },
+            StoredServiceError::SessionRetired => Self::SessionRetired,
             StoredServiceError::Conflict(value) => Self::Conflict(value),
             StoredServiceError::ProductGenesisActiveSession { session_id } => {
                 Self::ProductGenesisActiveSession { session_id }

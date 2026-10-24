@@ -130,6 +130,16 @@ impl UserRepo for SqliteDb {
         .bind(id)
         .execute(&mut *transaction)
         .await?;
+        // agent_chat's polymorphic scopes have no FK to the chat. Remove that
+        // edge explicitly before the account's chat FK cascades.
+        let chats: Vec<String> = sqlx::query_scalar("SELECT id FROM agent_chat WHERE account_id=?")
+            .bind(id)
+            .fetch_all(&mut *transaction)
+            .await?;
+        for chat in chats {
+            self.delete_agent_chat_scopes_in_tx(&mut transaction, &chat)
+                .await?;
+        }
         let result = sqlx::query("DELETE FROM user WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)

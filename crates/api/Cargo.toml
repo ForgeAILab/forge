@@ -43,6 +43,7 @@ uuid = { version = "1", features = ["v4"] }
 workspace = { path = "../workspace" }
 
 [dev-dependencies]
+agent-runtime = { workspace = true }
 process-supervisor = { path = "../process-supervisor" }
 tracing-subscriber = { workspace = true }
 services = { path = "../services", features = ["test-support"] }

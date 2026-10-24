@@ -6665,7 +6665,7 @@ async fn logic_trigger_drops_upgrade_a_populated_database() {
     );
     assert_eq!(rows(pool.clone()).await, before, "no row is rewritten");
     let recorded: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _migration WHERE version > ? ORDER BY version")
+        sqlx::query_scalar("SELECT version FROM _migration WHERE version > ? AND version <= 202610180820 ORDER BY version")
             .bind(LAST_WITH_TRIGGERS)
             .fetch_all(&pool)
             .await

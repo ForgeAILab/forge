@@ -297,6 +297,12 @@ impl From<ServiceError> for ApiError {
                 message,
                 json!({ "setup_requirements": requirements }),
             ),
+            ServiceError::SessionRetired => Self {
+                status: StatusCode::CONFLICT,
+                code: "session_retired",
+                message: "session history has been retired; start a new session".to_owned(),
+                details: None,
+            },
             ServiceError::Db(error) => error.into(),
             ServiceError::Git(error) => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -549,6 +555,7 @@ impl From<DbError> for ApiError {
         match error {
             DbError::PermissionDocument(error) => Self::bad_request_with_code(
                 error.code(), error.to_string()),
+            DbError::SessionRetired => ServiceError::SessionRetired.into(),
             DbError::TaskBusy {pending_steps,retry_after_ms} => ServiceError::TaskBusy {pending_steps,retry_after_ms}.into(),
             DbError::TaskConditionQuarantined { task_id } => ServiceError::TaskConditionQuarantined { task_id }.into(),
             DbError::IntegrationUnresolved { task_id, machine } => Self::conflict_with_code_and_details(

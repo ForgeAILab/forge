@@ -5,6 +5,26 @@ edition = "2024"
 rust-version = "1.86"
 license.workspace = true
 
+[features]
+# Explicit integration-test support; never enabled through a self dependency.
+test-support = ["dep:tempfile", "dep:ring", "db/test-template", "agent-runtime/test-support"]
+
+[[test]]
+name = "session_journal_conformance"
+required-features = ["test-support"]
+
+[[test]]
+name = "session_journal_runtime"
+required-features = ["test-support"]
+
+[[test]]
+name = "session_journal_bench"
+required-features = ["test-support"]
+
+[[test]]
+name = "session_journal_storage"
+required-features = ["test-support"]
+
 [dependencies]
 operation-registry = { path = "../operation-registry" }
 agent-runtime.workspace = true
@@ -32,10 +52,14 @@ reqwest = { version = "0.12", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+sha2-journal = { package = "sha2", version = "0.10.9" }
+hkdf = "0.12.4"
+hmac = "0.12.1"
 hex = "0.4"
-ring = "0.17"
+ring = { version = "0.17", optional = true }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 thiserror = "2"
+tempfile = { version = "3", optional = true }
 tokio = { version = "1", features = ["sync", "rt", "time", "process", "net", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
@@ -49,8 +73,15 @@ nix = { version = "0.28", default-features = false, features = ["signal"] }
 workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+base64 = "0.22"
+ring = "0.17"
+agent-runtime-testkit.workspace = true
 process-supervisor = { path = "../process-supervisor" }
 db = { path = "../db", features = ["test-template"] }
 jsonschema = { version = "0.28", default-features = false }
 tempfile = "3"
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.28", features = ["resource"] }

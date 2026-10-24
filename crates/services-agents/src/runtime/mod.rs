@@ -189,6 +189,8 @@ pub struct ForgeRuntime {
         Arc<services::worker_runtime::conflict_hotspot::ConflictHotspotConsumer>,
     pub domain_event_broadcast: Arc<DomainEventBroadcastConsumer>,
     storage_maintenance: Arc<StorageMaintenanceWorker>,
+    session_journal_retention: Arc<crate::session_journal_retention::SessionJournalRetention>,
+    session_journal_conversion: Arc<crate::session_journal_conversion::SessionJournalConversion>,
     pub check_runner: Arc<services::check_runner::CheckRunner>,
     /// Where a consumer family registers and a Task step asks for a check.
     pub check_consumers: Arc<services::check_runner::consumer::TaskCheckConsumers>,
@@ -723,6 +725,18 @@ impl ForgeRuntimeBuilder {
             StorageMaintenanceWorker::new(Arc::clone(&self.db))
                 .with_check_retention_days(effective_config.server.check_retention_days),
         );
+        let session_journal_conversion = Arc::new(
+            crate::session_journal_conversion::SessionJournalConversion::new(
+                Arc::clone(&self.db),
+                embedded_agent_service.protected_store(),
+            ),
+        );
+        let session_journal_retention = Arc::new(
+            crate::session_journal_retention::SessionJournalRetention::new(
+                Arc::clone(&self.db),
+                &embedded_agent_service.protected_store(),
+            ),
+        );
         // One configuration for both sides of the queue's Task-step
         // handshake: the worker and the merge-path check family.
         let integration_config = services::integration_worker::IntegrationWorkerConfig::default();
@@ -800,6 +814,8 @@ impl ForgeRuntimeBuilder {
             conflict_hotspot_consumer,
             domain_event_broadcast,
             storage_maintenance,
+            session_journal_retention,
+            session_journal_conversion,
             check_runner,
             check_consumers,
             check_worker,
@@ -1130,6 +1146,16 @@ impl RuntimeSupervisor {
             .start(shutdown.clone()),
         ));
         self.handles.push((
+            RuntimeWorker::SessionJournalConversion,
+            Arc::clone(&self.runtime.session_journal_conversion)
+                .start(&periodic_workers, shutdown.clone()),
+        ));
+        self.handles.push((
+            RuntimeWorker::SessionJournalRetention,
+            Arc::clone(&self.runtime.session_journal_retention)
+                .start(&periodic_workers, shutdown.clone()),
+        ));
+        self.handles.push((
             RuntimeWorker::StorageMaintenance,
             Arc::clone(&self.runtime.storage_maintenance).start(&periodic_workers, shutdown),
         ));
@@ -1271,7 +1297,7 @@ mod tests {
 
     #[test]
     fn worker_set_is_explicit_and_stable() {
-        assert_eq!(COMMON_WORKERS.len(), 19);
+        assert_eq!(COMMON_WORKERS.len(), 21);
         assert_eq!(COMMON_WORKERS[0], RuntimeWorker::CrashRecovery);
         assert_eq!(COMMON_WORKERS[1], RuntimeWorker::NotificationProjection);
         assert_eq!(COMMON_WORKERS[2], RuntimeWorker::OperatorStatusProjection);
@@ -1282,6 +1308,8 @@ mod tests {
         assert_eq!(COMMON_WORKERS[16], RuntimeWorker::ConflictHotspots);
         assert_eq!(COMMON_WORKERS[17], RuntimeWorker::CheckRuns);
         assert_eq!(COMMON_WORKERS[18], RuntimeWorker::IntegrationQueue);
+        assert_eq!(COMMON_WORKERS[19], RuntimeWorker::SessionJournalRetention);
+        assert_eq!(COMMON_WORKERS[20], RuntimeWorker::SessionJournalConversion);
     }
 
     #[tokio::test]
@@ -1464,8 +1492,30 @@ mod tests {
         assert!(!supervisor.started());
         supervisor.start().await.expect("runtime starts");
         assert!(supervisor.started());
-        assert_eq!(supervisor.workers().len(), 19);
-        assert_eq!(supervisor.worker_handle_count(), 19);
+        for journal_worker in [
+            RuntimeWorker::SessionJournalRetention,
+            RuntimeWorker::SessionJournalConversion,
+        ] {
+            assert_eq!(
+                supervisor
+                    .handles
+                    .iter()
+                    .filter(|(worker, _)| *worker == journal_worker)
+                    .count(),
+                1,
+                "{journal_worker:?} must be registered exactly once"
+            );
+        }
+        assert_eq!(
+            supervisor.workers().len(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
+        assert_eq!(
+            supervisor.worker_handle_count(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
         assert!(supervisor
             .workers()
             .contains(&RuntimeWorker::HeartbeatMonitor));
@@ -1515,6 +1565,8 @@ mod tests {
             "agent-chat-turns",
             "workspace-cleanup",
             "storage-maintenance",
+            "session-journal-retention",
+            "session-journal-conversion",
             "environment-settings-observer",
             "check-runs",
             "integration-queue",
@@ -1544,7 +1596,7 @@ mod tests {
             .compute_status()
             .await
             .unwrap();
-        assert_eq!(status.periodic_workers.len(), expected.len());
+        assert_eq!(status.periodic_workers.len(), expected.len(), "registry includes session-journal-retention and session-journal-conversion exactly once");
         supervisor.shutdown().await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while runtime
@@ -1569,7 +1621,11 @@ mod tests {
         let mut supervisor = RuntimeSupervisor::new(runtime, RuntimeAssemblyMode::Server);
 
         supervisor.start().await.expect("runtime starts");
-        assert_eq!(supervisor.worker_handle_count(), 19);
+        assert_eq!(
+            supervisor.worker_handle_count(),
+            21,
+            "includes session-journal-retention and session-journal-conversion"
+        );
         supervisor.shutdown().await.expect("runtime shuts down");
     }
 }

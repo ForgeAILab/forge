@@ -14,6 +14,11 @@ pub mod operation_catalog;
 pub(crate) mod operation_contract;
 pub mod outbound_http;
 mod protected_store;
+pub mod session_journal;
+pub mod session_journal_conversion;
+pub mod session_journals;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod tool_preview;
 mod transport;
 mod typed_tools;
@@ -148,7 +153,7 @@ impl From<agent_runtime::core::event::LimitKind> for AgentTurnLimit {
 
 /// The immutable revision Forge is built and tested against. A test checks it
 /// against the `agent-runtime` pin in `Cargo.lock`.
-pub const AGENT_RUNTIME_REVISION: &str = "1de6d7d34d2cfe4fc35791bca440932602539cf7";
+pub const AGENT_RUNTIME_REVISION: &str = "c036af7b4635cf7d76451aaa666a9df87405ca1a";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,6 +468,8 @@ pub enum AgentHostError {
     AgentPaused { agent_id: String },
     #[error("Project is paused")]
     ProjectPaused { project_id: String },
+    #[error("session journal is retired")]
+    SessionRetired,
     #[error("runtime session not found")]
     SessionNotFound,
     #[error("credential handle not found")]
@@ -516,6 +523,26 @@ impl AgentHostError {
             },
             Self::RuntimeWithUsage { failure, .. } => failure.clone(),
             _ => TurnFailure::Unclassified,
+        }
+    }
+}
+
+impl From<agent_runtime::core::error::RuntimeError> for AgentHostError {
+    fn from(error: agent_runtime::core::error::RuntimeError) -> Self {
+        if error.kind == agent_runtime::core::error::ErrorKind::NotFound {
+            return Self::SessionNotFound;
+        }
+        Self::RuntimeWithUsage {
+            message: error.to_string(),
+            failure: if error.retryable {
+                api_types::TurnFailure::Transient {
+                    retry_after: error.retry_after_ms,
+                }
+            } else {
+                api_types::TurnFailure::Unclassified
+            },
+            provider_auth_rejected: false,
+            usage_reports: Vec::new(),
         }
     }
 }

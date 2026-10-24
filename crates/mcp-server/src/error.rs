@@ -473,6 +473,8 @@ impl From<ServiceError> for McpToolError {
             })),
             // A generic service conflict does not identify a versioned target;
             // do not infer a version conflict by parsing its prose.
+            ServiceError::SessionRetired => Self::new(-32602, "session history has been retired; start a new session")
+                .with_data(json!({"code": "session_retired"})),
             ServiceError::Conflict(_message) => Self::new(-32602, "operation conflict"),
             ServiceError::ExecutionAlreadyRunning {
                 scope,

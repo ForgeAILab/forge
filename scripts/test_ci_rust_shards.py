@@ -87,14 +87,22 @@ class CoverageTests(unittest.TestCase):
                             for error in shards.coverage_errors(self.workspace)))
 
     def test_ci_script_names_the_workspace_features(self):
+        self.workspace["forge-agent-host"] = {"targets": [
+            {"name": "session_journal_conformance", "kind": ["test"],
+             "required-features": ["test-support"]}]}
         self.workspace["services-agents"] = {"targets": [
             {"name": "main", "kind": ["test"], "required-features": ["test-support"]}]}
         self.assertEqual(shards.script_errors(self.workspace), [])
         self.assertEqual(shards.workspace_feature_args(self.workspace),
-                         ["--features", "db/test-template,services-agents/test-support,"
+                         ["--features", "db/test-template,forge-agent-host/test-support,services-agents/test-support,"
                                         "services/test-support"])
 
     def test_rest_passes_the_qualified_feature_of_its_gated_target(self):
+        self.workspace["forge-agent-host"] = {
+            "features": {"test-support": ["db/test-template"]},
+            "targets": [{"name": "forge-agent-host", "kind": ["lib"]},
+                        {"name": "session_journal_conformance", "kind": ["test"],
+                         "required-features": ["test-support"]}]}
         # A shard resolves features for its own packages: the catch-all does
         # not see api's dev-dependency on services-agents/test-support.
         self.workspace["services-agents"] = {
@@ -103,6 +111,8 @@ class CoverageTests(unittest.TestCase):
                         {"name": "main", "kind": ["test"],
                          "required-features": ["test-support"]}]}
         self.assertIn("services-agents/test-support",
+                      shards.passed_features(shards.cargo_args("rest")))
+        self.assertIn("forge-agent-host/test-support",
                       shards.passed_features(shards.cargo_args("rest")))
         self.assertEqual(shards.coverage_errors(self.workspace), [])
         self.assertEqual(shards.rest_feature_errors(self.workspace), [])
@@ -227,7 +237,7 @@ class ShellTests(unittest.TestCase):
         self.assertEqual(run.returncode, 1)
         self.assertEqual([cmd[0] for cmd in commands], ["fmt", "clippy", "test"])
         features = ["--features",
-                    "db/test-template,services-agents/test-support,services/test-support"]
+                    "db/test-template,forge-agent-host/test-support,services-agents/test-support,services/test-support"]
         self.assertEqual(commands[1], ["clippy", "--workspace", "--all-targets", *features,
                                        "--", "-D", "warnings"])
         self.assertEqual(commands[-1], ["test", "--workspace", "--all-targets", *features,

@@ -20,8 +20,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-ability",
  "agent-runtime-context",
@@ -46,8 +46,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-ability"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -58,8 +58,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-context"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -71,8 +71,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-core"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-registry",
  "async-trait",
@@ -89,8 +89,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-lcm"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-context",
  "agent-runtime-core",
@@ -105,8 +105,8 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-provider"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "agent-runtime-core",
  "agent-runtime-registry",
@@ -122,10 +122,27 @@ dependencies = [
 
 [[package]]
 name = "agent-runtime-registry"
-version = "0.7.0"
-source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=1de6d7d#1de6d7d34d2cfe4fc35791bca440932602539cf7"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "agent-runtime-testkit"
+version = "0.10.0"
+source = "git+https://github.com/ForgeAILab/agent-runtime.git?rev=c036af7b4635cf7d76451aaa666a9df87405ca1a#c036af7b4635cf7d76451aaa666a9df87405ca1a"
+dependencies = [
+ "agent-runtime",
+ "agent-runtime-core",
+ "agent-runtime-lcm",
+ "async-stream",
+ "async-trait",
+ "futures-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -241,6 +258,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "api"
 version = "0.14.1"
 dependencies = [
+ "agent-runtime",
  "api-types",
  "async-trait",
  "axum",
@@ -1093,6 +1111,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer 0.10.4",
  "crypto-common 0.1.7",
+ "subtle",
 ]
 
 [[package]]
@@ -1356,14 +1375,18 @@ name = "forge-agent-host"
 version = "0.14.1"
 dependencies = [
  "agent-runtime",
+ "agent-runtime-testkit",
  "api-types",
  "async-trait",
+ "base64",
  "chacha20poly1305",
  "config",
  "db",
  "executors",
  "futures-util",
  "hex",
+ "hkdf",
+ "hmac",
  "hyper-util",
  "jsonschema",
  "nix 0.28.0",
@@ -1372,8 +1395,10 @@ dependencies = [
  "regex",
  "reqwest",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha2 0.11.0",
  "sqlx",
  "tempfile",
@@ -1758,6 +1783,24 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "http"
@@ -3521,6 +3564,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "workspace",

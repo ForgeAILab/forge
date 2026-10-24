@@ -4391,3 +4391,37 @@ impl SqliteDb {
         Ok(rows.map(|row| MainActionChatAccountRow { row }))
     }
 }
+
+impl SqliteDb {
+    /// Physical chat deletion and its polymorphic scope edge are one write.
+    /// Parent User/Project deletes call the same scope helper before FK cascade.
+    pub async fn delete_agent_chat(&self, chat_id: &str) -> Result<bool> {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        self.delete_agent_chat_scopes_in_tx(&mut tx, chat_id)
+            .await?;
+        let removed = sqlx::query("DELETE FROM agent_chat WHERE id=?")
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(removed != 0)
+    }
+
+    pub(super) async fn delete_agent_chat_scopes_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        chat_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM agent_context_scope
+            WHERE scope_type='agent_chat' AND scope_id=?
+              AND EXISTS(SELECT 1 FROM agent_chat WHERE id=?)",
+        )
+        .bind(chat_id)
+        .bind(chat_id)
+        .execute(&mut *connection)
+        .await?;
+        Ok(())
+    }
+}
