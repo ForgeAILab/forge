@@ -6126,7 +6126,7 @@ overwriting newer settings or hooks; refresh the Project before retrying.
 | `forge_list_tasks` | List tasks with pagination |
 | `forge_get_task` | Get task detail |
 | `forge_preview_prompt` | Preview effective prompt without dispatching |
-| `forge_update_task` | Update mutable task fields |
+| `forge_update_task` | Update mutable task fields through `TaskService`; publish a Project-scoped `task.updated` after commit, and no event for a rejected version |
 | `forge_transition_task` | Transition a task to another status |
 | `forge_memory_search` | Search project memory with an injection-guard wrapper |
 | `forge_memory_get` | Get one memory item with an injection-guard wrapper |

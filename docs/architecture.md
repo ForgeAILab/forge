@@ -1614,8 +1614,10 @@ reconnect, or an unrecognized `event_type`. Every committed durable event
 uses one shared completion identity across consumers: its stored `dedupe_key`
 when present, otherwise the bare event ID. Consumers must not invent a
 transport-specific fallback, because disagreement with the repository contract
-would pin that consumer's cursor at the event forever. Events publish after
-their transaction and invalidate the exact query keys they affect; the client
+would pin that consumer's cursor at the event forever. Ordinary Task title,
+description and priority edits publish the existing Project-scoped `task.updated`
+envelope after the update commits. Rejected version checks publish nothing.
+Events publish after their transaction and invalidate the exact query keys they affect; the client
 invalidates active authoritative queries once per stream
 open, reconnect, or resync, and reconciles a live optimistic turn with a
 bounded foreground watchdog. The watchdog follows both a locally optimistic

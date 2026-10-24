@@ -240,6 +240,7 @@ type TaskListRouteSearch = {
   sort_by: TaskListSortBy
   sort_order: TaskListSortOrder
   agentIds?: string
+  statuses?: string
   blockedOnly?: boolean
   includeCancelled?: boolean
   includeArchived?: boolean
@@ -267,6 +268,7 @@ const taskListRoute = createRoute({
         : 'updated_at',
     sort_order: search.sort_order === 'asc' ? 'asc' : 'desc',
     agentIds: typeof search.agentIds === 'string' ? search.agentIds : undefined,
+    statuses: typeof search.statuses === 'string' ? search.statuses : undefined,
     blockedOnly: parseOptionalBool(search.blockedOnly),
     includeCancelled: parseOptionalBool(search.includeCancelled),
     includeArchived: parseOptionalBool(search.includeArchived),
@@ -285,6 +287,7 @@ function TaskListRouteComponent() {
 
   const setFilter = (patch: {
     agentIds?: string[]
+    statuses?: string[]
     blockedOnly?: boolean
     includeCancelled?: boolean
     includeArchived?: boolean
@@ -294,6 +297,7 @@ function TaskListRouteComponent() {
     void navigate({
       search: (prev) => ({
         ...prev,
+        statuses: 'statuses' in patch ? patch.statuses?.join(',') || undefined : prev.statuses,
         agentIds:
           'agentIds' in patch
             ? patch.agentIds && patch.agentIds.length > 0
@@ -317,6 +321,7 @@ function TaskListRouteComponent() {
       sortBy={search.sort_by}
       sortOrder={search.sort_order}
       agentIds={agentIds}
+      statuses={search.statuses?.split(',').filter(Boolean) ?? []}
       blockedOnly={search.blockedOnly ?? false}
       includeCancelled={search.includeCancelled ?? false}
       includeArchived={search.includeArchived ?? false}

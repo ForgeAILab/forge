@@ -12,7 +12,10 @@ import type { InfiniteData } from '@tanstack/react-query'
 
 function createMocks() {
   const invalidateQueries = vi.fn()
-  const queryClient = { invalidateQueries } as unknown as QueryClient
+  const queryClient = {
+    invalidateQueries,
+    getQueryCache: () => ({ findAll: () => [] }),
+  } as unknown as QueryClient
   const dispatch = vi.fn()
   return { queryClient, invalidateQueries, dispatch }
 }
