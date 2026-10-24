@@ -436,16 +436,25 @@ async fn every_conversion_error_kind_parks_and_cursor_finishes() {
         let good = seed(&f, &store, "b-healthy").await;
         let before = legacy(&f, &bad).await;
         let reason = format!("{:?}", error.kind);
+        let message = error.message.clone();
         store.fail_conversion_for_test(error);
         let mut cursor = ConversionCursor::default();
         let first = worker.convert_once(&mut cursor).await.unwrap();
         assert_eq!(first.parked_by_reason.get(&reason), Some(&1));
+        assert_eq!(first.parked_sessions.len(), 1);
+        let parked = &first.parked_sessions[0];
+        assert_eq!(parked.forge_session_id, "journal-fixture:a-parked");
+        assert_eq!(parked.runtime_session_id, bad.as_str());
+        assert_eq!(parked.owner_kind, "agent_chat");
+        assert_eq!(parked.error_kind, reason);
+        assert_eq!(parked.error_message, message);
         assert_eq!(
             (first.examined, first.converted, first.remaining),
             (2, 1, 0)
         );
         for _ in 0..3 {
             let next = worker.convert_once(&mut cursor).await.unwrap();
+            assert!(next.parked_sessions.is_empty());
             assert_eq!(
                 (next.examined, next.converted, next.remaining),
                 (0, 0, 0),

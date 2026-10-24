@@ -1,5 +1,8 @@
 //! Lowest-priority legacy conversion, isolated from collection scheduling.
-use agent_runtime::core::{error::ErrorKind, ids::SessionId};
+use agent_runtime::core::{
+    error::{ErrorKind, RuntimeError},
+    ids::SessionId,
+};
 use db::SqliteDb;
 use forge_agent_host::{
     session_journal::ForgeJournalStorage, session_journal_conversion::ConversionOutcome,
@@ -12,6 +15,8 @@ use tokio::{sync::watch, task::JoinHandle, time::Instant};
 pub const CONVERSION_INTERVAL: Duration = Duration::from_secs(60);
 pub const CONVERSION_SCHEDULING_BUDGET: Duration = Duration::from_secs(2);
 pub const CONVERSION_CANDIDATE_LIMIT: u32 = 8;
+pub const PARKED_SESSION_REPORT_LIMIT: usize = 32;
+const PARKED_ERROR_MESSAGE_LIMIT: usize = 1_024;
 
 #[derive(Default)]
 pub struct ConversionCursor {
@@ -28,10 +33,49 @@ pub struct ConversionReport {
     pub skipped_active: usize,
     pub skipped_retired: usize,
     pub parked_by_reason: BTreeMap<String, usize>,
+    pub parked_sessions: Vec<ParkedSession>,
     pub skipped_unreadable: usize,
     pub conflicts: usize,
     pub remaining: u64,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct ParkedSession {
+    pub forge_session_id: String,
+    pub runtime_session_id: String,
+    pub owner_kind: String,
+    pub error_kind: String,
+    pub error_message: String,
+}
+
+impl ConversionReport {
+    fn record_parked_session(
+        &mut self,
+        owner: &str,
+        runtime: &str,
+        owner_kind: String,
+        error: &RuntimeError,
+    ) {
+        if self.parked_sessions.len() < PARKED_SESSION_REPORT_LIMIT {
+            self.parked_sessions.push(ParkedSession {
+                forge_session_id: owner.into(),
+                runtime_session_id: runtime.into(),
+                owner_kind,
+                error_kind: format!("{:?}", error.kind),
+                // Serde errors can quote a value from decrypted legacy JSON.
+                // Other runtime messages are redaction-safe by contract.
+                error_message: if error.kind == ErrorKind::Serialization {
+                    "legacy or journal state could not be decoded (message redacted)"
+                } else {
+                    &error.message
+                }
+                .chars()
+                .take(PARKED_ERROR_MESSAGE_LIMIT)
+                .collect(),
+            });
+        }
+    }
 }
 
 pub struct SessionJournalConversion {
@@ -144,6 +188,17 @@ impl SessionJournalConversion {
                     }
                     let reason = format!("{:?}", error.kind);
                     *report.parked_by_reason.entry(reason.clone()).or_default() += 1;
+                    let owner_kind = sqlx::query_scalar::<_, String>(
+                        "SELECT c.scope_type FROM agent_session s
+                         JOIN agent_context_scope c ON c.id=s.context_scope_id WHERE s.id=?",
+                    )
+                    .bind(&owner)
+                    .fetch_optional(self.db.pool())
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "unknown".into());
+                    report.record_parked_session(&owner, &runtime, owner_kind, &error);
                     cursor.excluded.insert(owner.clone(), reason.clone());
                     // Unreadable warnings already went through the capped tracker.
                     if error.kind != ErrorKind::Serialization || error.retryable {
@@ -166,5 +221,43 @@ impl SessionJournalConversion {
             skipped_unreadable=report.skipped_unreadable, conflicts=report.conflicts, remaining=report.remaining,
             budget_exhausted=report.budget_exhausted, "journal conversion pass");
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parked_diagnostics_cap_records_and_message_characters() {
+        let mut report = ConversionReport::default();
+        let error = RuntimeError::conflict("é".repeat(PARKED_ERROR_MESSAGE_LIMIT + 1));
+        for n in 0..PARKED_SESSION_REPORT_LIMIT + 1 {
+            report.record_parked_session("owner", &format!("runtime-{n}"), "task".into(), &error);
+        }
+        assert_eq!(report.parked_sessions.len(), PARKED_SESSION_REPORT_LIMIT);
+        let last = report.parked_sessions.last().unwrap();
+        assert_eq!(last.runtime_session_id, "runtime-31");
+        assert_eq!(last.owner_kind, "task");
+        assert_eq!(last.error_kind, "Conflict");
+        assert_eq!(
+            last.error_message.chars().count(),
+            PARKED_ERROR_MESSAGE_LIMIT
+        );
+    }
+
+    #[test]
+    fn parked_serialization_message_does_not_echo_decrypted_values() {
+        let mut report = ConversionReport::default();
+        report.record_parked_session(
+            "owner",
+            "runtime",
+            "agent_chat".into(),
+            &RuntimeError::new(ErrorKind::Serialization, "unknown variant `private value`"),
+        );
+        assert_eq!(
+            report.parked_sessions[0].error_message,
+            "legacy or journal state could not be decoded (message redacted)"
+        );
     }
 }

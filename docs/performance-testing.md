@@ -1027,3 +1027,20 @@ live bytes or a file-shrink promise. Parked errors are excluded from remaining
 work for that worker lifetime and retried after restart; foreground lazy import
 remains available after repair. The generated-database regression invokes this
 same ignored entrypoint; it is not evidence from user data.
+
+The conversion report also retains at most 32 `parked_sessions` per pass, with
+the Forge/runtime session IDs, owner scope kind, error kind and runtime error
+message (at most 1,024 characters; no error metadata or session content).
+Serialization messages are replaced with a fixed decoding-failure message
+because a JSON decoder error can quote a value from decrypted session state. The
+dry-run summary caps this list at 32 across all ticks and reports excess records
+in `parked_sessions_omitted`; aggregate reason counts still include every park.
+Each retained record includes read-only facts captured before retention: legacy
+host status/version/owner columns and state revisions, native journal existence
+for that runtime ID and publication/retirement flags/counters, predecessor and
+replacement links, and pending topic-rotation IDs/links. These queries select
+only metadata; encrypted payloads, nonces, topic labels/summaries and rotation
+tokens are excluded. A native row with `published=0` is only a reservation, not
+proof of a completed import. The ignored entrypoint installs a stderr tracing
+subscriber with `forge_session_journal=debug`, so capped warnings and pass
+diagnostics remain visible alongside the JSON summary.

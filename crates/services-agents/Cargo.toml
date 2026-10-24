@@ -59,6 +59,7 @@ cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = "../services", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
 tempfile = "3"
+tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
