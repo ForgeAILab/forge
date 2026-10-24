@@ -230,6 +230,7 @@ impl TaskMutationReply {
                 .into();
                 stored
             }
+            DbError::SessionRetired => serde_json::json!({"code":"session_retired"}),
             DbError::VersionConflict => serde_json::json!({"code":"version_conflict"}),
             DbError::NotFound => serde_json::json!({"code":"not_found"}),
             DbError::TaskVersionConflict { expected, actual } => {
@@ -352,6 +353,7 @@ impl TaskMutationReply {
                     }
                     _ => sqlx::Error::Protocol(value("message")),
                 }),
+                Some("session_retired") => DbError::SessionRetired,
                 Some("version_conflict") => DbError::VersionConflict,
                 Some("not_found") => DbError::NotFound,
                 Some("task_version_conflict") => DbError::TaskVersionConflict {

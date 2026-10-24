@@ -450,20 +450,14 @@ impl AgentRepo for SqliteDb {
     }
 
     async fn archive(&self, id: &str, archived_at: &str) -> Result<()> {
-        let result = sqlx::query(
-            "UPDATE agent_identity
-             SET archived_at = ?, paused = 1, is_default = 0, status = 'offline',
-                 version = version + 1, updated_at = ?
-             WHERE id = ? AND archived_at IS NULL",
-        )
-        .bind(archived_at)
-        .bind(archived_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let changed = self
+            .archive_agent_identity_in_tx(&mut tx, archived_at, archived_at, id)
+            .await?;
+        if changed == 0 {
             return Err(DbError::NotFound);
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1046,18 +1040,6 @@ impl SqliteDb {
                 })
             })
             .collect()
-    }
-}
-
-impl SqliteDb {
-    pub async fn attention_session_checkpoint_count(&self, session_id: &str) -> crate::Result<i64> {
-        Ok(sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM protected_agent_session_state
-                 WHERE session_id = ? AND checkpoint_turn_id IS NOT NULL",
-        )
-        .bind(session_id)
-        .fetch_one(self.pool())
-        .await?)
     }
 }
 
@@ -1661,9 +1643,14 @@ impl SqliteDb {
         .bind(archived_at)
         .bind(updated_at)
         .bind(agent_id)
-        .execute(connection)
+        .execute(&mut *connection)
         .await?;
-        Ok(result.rows_affected())
+        let changed = result.rows_affected();
+        if changed != 0 {
+            self.delete_saved_agent_sessions_in_tx(connection, agent_id)
+                .await?;
+        }
+        Ok(changed)
     }
 }
 
@@ -2648,5 +2635,21 @@ impl SqliteDb {
         .fetch_optional(connection)
         .await?;
         Ok(rows.map(|row| WakeBlockerProjectResponderRow { row }))
+    }
+}
+
+impl SqliteDb {
+    /// Archive is permanent deletion from the roster. This includes CLI resume
+    /// handles: deleting their rows does not signal an already spawned process.
+    pub(super) async fn delete_saved_agent_sessions_in_tx(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        agent_id: &str,
+    ) -> crate::Result<()> {
+        sqlx::query("DELETE FROM agent_session WHERE identity_id=?")
+            .bind(agent_id)
+            .execute(&mut *connection)
+            .await?;
+        Ok(())
     }
 }

@@ -22,6 +22,7 @@ name = "main_project_create_command"
 test-support = ["services/test-support"]
 
 [dependencies]
+agent-runtime.workspace = true
 services = { path = "../services" }
 cli-adapters = { path = "../cli-adapters" }
 git = { path = "../git" }
@@ -53,11 +54,12 @@ tokio = { version = "1", features = ["rt", "sync", "time", "fs", "net", "io-util
 tracing.workspace = true
 
 [dev-dependencies]
-agent-runtime.workspace = true
+forge-agent-host = { path = "../agent-host", features = ["test-support"] }
 cli-adapters = { path = "../cli-adapters", features = ["test-support"] }
 services = { path = "../services", features = ["test-support"] }
 db = { path = "../db", features = ["test-template"] }
 tempfile = "3"
+tracing-subscriber.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]

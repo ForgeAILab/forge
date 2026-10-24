@@ -2228,9 +2228,9 @@ impl AttentionService {
         for session in &sessions {
             let has_checkpoint = self
                 .db
-                .attention_session_checkpoint_count(&session.session_id)
+                .session_persistence_flags(&session.session_id)
                 .await?
-                > 0;
+                .checkpoint_present;
             checkpoint_present |= has_checkpoint;
         }
         let continuity_status = if sessions

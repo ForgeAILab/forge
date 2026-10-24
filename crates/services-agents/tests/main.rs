@@ -44,3 +44,12 @@ mod security_adversarial;
 mod task02_agent_prose;
 #[path = "suite/wake_turn_consumer.rs"]
 mod wake_turn_consumer;
+
+#[path = "suite/session_journal_retention.rs"]
+mod session_journal_retention;
+
+#[path = "suite/session_journal_conversion.rs"]
+mod session_journal_conversion;
+
+#[path = "suite/session_journal_dryrun.rs"]
+mod session_journal_dryrun;

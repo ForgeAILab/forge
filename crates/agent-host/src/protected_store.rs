@@ -32,6 +32,39 @@ const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 const SESSION_STATE_MAGIC: &[u8] = b"FORGE-SESSION\0";
 const SESSION_STATE_FORMAT: u8 = 1;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "test_support/legacy_baseline.rs"]
+mod legacy_baseline;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "test_support/legacy.rs"]
+mod legacy_test_support;
+
+#[path = "session_probe.rs"]
+mod session_probe;
+
+#[path = "lcm_legacy_owner.rs"]
+mod lcm_legacy_owner;
+
+pub(crate) enum LcmResolveAdmission<'a> {
+    Foreground,
+    Conversion {
+        runtime: &'a str,
+        timeline: Option<&'a str>,
+    },
+}
+
+fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
+    serde_json::from_slice(bytes).map_err(|_| {
+        RuntimeError::new(
+            ErrorKind::Serialization,
+            format!(
+                "protected checkpoint for session {} contains invalid checkpoint JSON",
+                session.as_str()
+            ),
+        )
+    })
+}
+
 /// Logs a swallowed sqlx error before mapping it to the given fallback.
 /// Mirrors the diagnosability fix in `lcm.rs`: a bare `.map_err(|_| ...)`
 /// discarded the cause, making a SQLite busy/busy-snapshot failure
@@ -39,6 +72,16 @@ const SESSION_STATE_FORMAT: u8 = 1;
 fn log_store_error<E>(error: impl std::fmt::Display, fallback: E) -> E {
     tracing::warn!(error = %error, "protected store operation failed");
     fallback
+}
+
+pub(crate) fn protected_database_error(error: impl Into<db::DbError>) -> RuntimeError {
+    let error = error.into();
+    let failure = RuntimeError::internal("protected persistence database operation failed");
+    if error.is_transient() {
+        failure.retryable()
+    } else {
+        failure
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +159,13 @@ pub struct SqliteProtectedRuntimeStore {
     db: Arc<SqliteDb>,
     cipher: Arc<XChaCha20Poly1305>,
     key_revision: i64,
-    snapshot_mac: ring::hmac::Context,
+    journals: crate::session_journals::SessionJournals,
+    pub(crate) conversion_admission: Arc<crate::session_journal_conversion::ConversionAdmission>,
+    #[cfg(any(test, feature = "test-support"))]
+    legacy_snapshot_mac: ring::hmac::Context,
+    legacy_lcm_receipt_stamps: Arc<StdMutex<HashMap<String, String>>>,
     #[cfg(test)]
-    save_barrier: Option<Arc<tokio::sync::Barrier>>,
+    legacy_lcm_sibling_preparations: Arc<std::sync::atomic::AtomicUsize>,
     refresh_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
     revocation_client: reqwest::Client,
     gemini_revocation_endpoint: Arc<str>,
@@ -126,17 +173,29 @@ pub struct SqliteProtectedRuntimeStore {
 
 impl SqliteProtectedRuntimeStore {
     pub fn new(db: Arc<SqliteDb>, master_key: [u8; 32], key_revision: i64) -> Self {
-        // Separate the digest domain from encryption and any other keyed hashes.
-        let digest_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &master_key);
-        let mut snapshot_mac = ring::hmac::Context::with_key(&digest_key);
-        snapshot_mac.update(b"forge/protected-session/snapshot-digest\0");
+        #[cfg(any(test, feature = "test-support"))]
+        let legacy_snapshot_mac = {
+            let digest_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &master_key);
+            let mut mac = ring::hmac::Context::with_key(&digest_key);
+            mac.update(b"forge/protected-session/snapshot-digest\0");
+            mac
+        };
+        let storage = Arc::new(
+            crate::session_journal::ForgeJournalStorage::new(db.clone(), master_key, key_revision)
+                .expect("protected store key revision must be positive"),
+        );
+        let journals = crate::session_journals::SessionJournals::new(storage);
         Self {
             db,
-            snapshot_mac,
-            #[cfg(test)]
-            save_barrier: None,
+            journals,
+            conversion_admission: Arc::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            legacy_snapshot_mac,
             cipher: Arc::new(XChaCha20Poly1305::new((&master_key).into())),
             key_revision,
+            legacy_lcm_receipt_stamps: Arc::default(),
+            #[cfg(test)]
+            legacy_lcm_sibling_preparations: Arc::default(),
             refresh_locks: Arc::new(StdMutex::new(HashMap::new())),
             revocation_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -147,7 +206,14 @@ impl SqliteProtectedRuntimeStore {
         }
     }
 
+    /// The same engine clones used by every persistent runtime and maintenance.
+    pub fn journals(&self) -> crate::session_journals::SessionJournals {
+        self.journals.clone()
+    }
+
     fn seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.seal", plaintext.len());
         let mut nonce = [0_u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let ciphertext = self
@@ -160,6 +226,8 @@ impl SqliteProtectedRuntimeStore {
     }
 
     fn open(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.open", ciphertext.len());
         if nonce.len() != 24 {
             return Err(RuntimeError::new(
                 ErrorKind::Serialization,
@@ -176,7 +244,11 @@ impl SqliteProtectedRuntimeStore {
             })
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn seal_session_state(&self, bytes: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>), RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            crate::session_journal::profile::timer("legacy.seal_session_state", bytes.len());
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut payload = SESSION_STATE_MAGIC.to_vec();
@@ -194,6 +266,9 @@ impl SqliteProtectedRuntimeStore {
         ciphertext: Vec<u8>,
         nonce: Vec<u8>,
     ) -> Result<Vec<u8>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile =
+            crate::session_journal::profile::timer("legacy.open_session_state", ciphertext.len());
         let store = self.clone();
         tokio::task::spawn_blocking(move || {
             let payload = store.open(&ciphertext, &nonce)?;
@@ -215,22 +290,6 @@ impl SqliteProtectedRuntimeStore {
         })
         .await
         .map_err(|_| RuntimeError::internal("protected session decompression task failed"))?
-    }
-
-    fn snapshot_digest(&self, snapshot: &SessionSnapshot) -> Result<String, RuntimeError> {
-        // Runtime snapshots stamp the clock on every call, even without a state change.
-        // Diagnostic manifests are a bounded recent window and are omitted from
-        // new protected checkpoints; neither belongs to canonical state identity.
-        let bytes = serde_json::to_vec(&(
-            &snapshot.id,
-            &snapshot.history,
-            &snapshot.usage,
-            &snapshot.identity,
-            &snapshot.extension_state,
-        ))?;
-        let mut mac = self.snapshot_mac.clone();
-        mac.update(&bytes);
-        Ok(hex::encode(mac.sign().as_ref()))
     }
 
     /// Internal protected-payload seam used by the interaction broker.  The
@@ -265,12 +324,18 @@ impl SqliteProtectedRuntimeStore {
     }
 
     async fn forge_session_id(&self, runtime_id: &SessionId) -> Result<String, RuntimeError> {
-        sqlx::query_scalar::<_, String>("SELECT id FROM agent_session WHERE runtime_session_id = ?")
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar::<_, String>(
+                "SELECT id FROM agent_session WHERE runtime_session_id = ?",
+            )
             .bind(runtime_id.as_str())
             .fetch_optional(self.db.pool())
             .await
-            .map_err(|_| RuntimeError::internal("protected state lookup failed"))?
-            .ok_or_else(|| RuntimeError::not_found("runtime session mapping not found"))
+        }
+        .map_err(protected_database_error)?
+        .ok_or_else(|| RuntimeError::not_found("runtime session mapping not found"))
     }
 
     /// Loads the server-issued identity/scope binding for one runtime session.
@@ -334,7 +399,7 @@ impl SqliteProtectedRuntimeStore {
         runtime_session_id: Option<&str>,
         workspace_path: Option<&str>,
     ) -> Result<crate::RuntimeScopeBinding, crate::AgentHostError> {
-        let row = sqlx::query(
+        let row = { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query(
             "SELECT session.identity_id, session.profile_id,
                     identity.account_permission_ceiling,
                     identity.paused,
@@ -381,7 +446,7 @@ impl SqliteProtectedRuntimeStore {
         .bind(runtime_session_id)
         .bind(runtime_session_id)
         .fetch_optional(self.db.pool())
-        .await
+        .await }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::SessionNotFound)?;
 
@@ -620,13 +685,18 @@ impl SqliteProtectedRuntimeStore {
     /// or adopt the one pre-V149 owner-less timeline its *own* persisted LCM
     /// state references; that adoption stamps the owner in the same
     /// transaction, so no other runtime session can resolve to it afterwards.
-    /// Anything else gets a fresh timeline.
+    /// An empty, unclaimed non-Chat timeline may continue across runtimes.
+    /// Without a persisted reference, other sessions get a fresh timeline;
+    /// A shared pre-topic Chat timeline may move from an inactive legacy sibling
+    /// to the selected Profile's Chat resume target. Ownership, binding,
+    /// relinquishment and same-Profile replacement commit together; other
+    /// Profiles retain their legacy sessions and rebuild relinquished LCM state.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
             .await
     }
@@ -639,7 +709,7 @@ impl SqliteProtectedRuntimeStore {
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
             .await
     }
@@ -649,172 +719,426 @@ impl SqliteProtectedRuntimeStore {
     async fn referenced_lcm_timeline(
         &self,
         runtime_id: &str,
-    ) -> Result<Option<String>, crate::AgentHostError> {
+        flags: db::SessionPersistenceFlags,
+    ) -> Result<Option<String>, RuntimeError> {
         let id = SessionId::new(runtime_id);
-        let snapshot = match SessionStore::load(self, &id)
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-        {
-            Some(snapshot) => Some(snapshot),
-            None => CheckpointStore::load_latest(self, &id)
-                .await
-                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-                .map(|checkpoint| checkpoint.snapshot),
-        };
-        Ok(snapshot.and_then(|snapshot| {
-            snapshot
-                .extension_state
-                .get(agent_runtime::harness::LCM_COMPONENT_ID)
-                .and_then(|state| state.value.get("timeline_id"))
+        let mut state = self
+            .persisted_extension(&id, flags, agent_runtime::harness::LCM_COMPONENT_ID)
+            .await?;
+        // Pre-topic stores wrote the two copies independently. Resume overlays
+        // checkpoint-only namespaces, so timeline discovery must see them too.
+        if state.is_none() && flags.legacy_eligible && flags.checkpoint_present {
+            state = CheckpointStore::load_latest(self, &id)
+                .await?
+                .and_then(|mut checkpoint| {
+                    checkpoint
+                        .snapshot
+                        .extension_state
+                        .remove(agent_runtime::harness::LCM_COMPONENT_ID)
+                });
+        }
+        Ok(state.and_then(|state| {
+            state
+                .value
+                .get("timeline_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
         }))
     }
 
-    async fn resolve_lcm_store(
+    pub(crate) async fn resolve_lcm_store(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
         successor: bool,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
+        self.resolve_lcm_store_admitted(
+            runtime_id,
+            scope_type,
+            scope_id,
+            successor,
+            LcmResolveAdmission::Foreground,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_lcm_store_admitted(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        successor: bool,
+        admission: LcmResolveAdmission<'_>,
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
+        let (admitted_runtime, expected_legacy_timeline, foreground) = match admission {
+            LcmResolveAdmission::Foreground => (runtime_id, None, true),
+            LcmResolveAdmission::Conversion { runtime, timeline } => (runtime, timeline, false),
+        };
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT session.identity_id, session.profile_id, scope.scope_type, scope.scope_id
              FROM agent_session AS session
              JOIN agent_context_scope AS scope
                ON scope.id = session.context_scope_id
              WHERE session.runtime_session_id = ?
                AND scope.scope_type = ? AND scope.scope_id = ?
              LIMIT 1",
-        )
-        .bind(runtime_id)
-        .bind(scope_type)
-        .bind(scope_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-        .ok_or(crate::AgentHostError::SessionNotFound)?;
+            )
+            .bind(runtime_id)
+            .bind(scope_type)
+            .bind(scope_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
+        .map_err(protected_database_error)?
+        .ok_or_else(|| RuntimeError::not_found("LCM session binding not found"))?;
         let identity_id: String = row
             .try_get("identity_id")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?;
         let stored_scope_type: String = row
             .try_get("scope_type")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let stored_scope_id: String = row
-            .try_get("scope_id")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?;
+        let stored_scope_id: String = row.try_get("scope_id").map_err(protected_database_error)?;
         let authorization_revision =
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        let has_binding: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
+        let (has_binding, owned_shared_timeline): (bool, Option<String>) = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id=?1),
+                    (SELECT t.id FROM agent_runtime_lcm_binding b JOIN agent_lcm_timeline t ON t.id=b.timeline_id
+                        WHERE b.runtime_session_id=?1 AND t.runtime_session_id=?1 AND t.scope_type='agent_chat'
+                          AND t.scope_id=t.canonical_scope_id AND t.retired_at IS NULL)",
         )
         .bind(runtime_id)
         .fetch_one(self.db.pool())
         .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        // Decrypting the snapshot happens outside the write transaction.
-        let referenced = if successor || has_binding {
+        }
+        .map_err(protected_database_error)?;
+        let owns_shared_timeline = owned_shared_timeline.is_some();
+        let receipts_complete = if let Some(timeline) = owned_shared_timeline.as_deref() {
+            let mut connection = self
+                .db
+                .pool()
+                .acquire()
+                .await
+                .map_err(protected_database_error)?;
+            let stamp =
+                Self::legacy_lcm_receipt_stamp(&mut connection, runtime_id, timeline).await?;
+            self.legacy_lcm_receipt_stamps
+                .lock()
+                .ok()
+                .is_some_and(|cached| cached.get(runtime_id) == Some(&stamp))
+        } else {
+            false
+        };
+        // Reading native/legacy extension state happens outside the write transaction.
+        let flags = self.persistence_flags(&SessionId::new(runtime_id)).await?;
+        let referenced = if successor
+            || (has_binding
+                && !flags.legacy_eligible
+                && expected_legacy_timeline.is_none()
+                && (!owns_shared_timeline || receipts_complete))
+        {
             None
         } else {
-            self.referenced_lcm_timeline(runtime_id).await?
+            self.referenced_lcm_timeline(runtime_id, flags).await?
         };
-        let mut tx = db::begin_immediate(self.db.pool())
+        if expected_legacy_timeline.is_some_and(|id| referenced.as_deref() != Some(id)) {
+            return Err(RuntimeError::conflict(
+                "LCM selected chat resume target does not reference the shared timeline",
+            ));
+        }
+        let mut arbitration_deferred = None;
+        let needs_arbitration = !receipts_complete
+            && (flags.legacy_eligible
+                || expected_legacy_timeline.is_some()
+                || owns_shared_timeline);
+        let sibling_admission = if needs_arbitration {
+            let mut prepared = self
+                .prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref(), admitted_runtime)
+                .await;
+            if foreground && prepared.as_ref().is_err_and(|e| e.retryable) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                prepared = self
+                    .prepare_legacy_chat_lcm_owner(
+                        runtime_id,
+                        referenced.as_deref(),
+                        admitted_runtime,
+                    )
+                    .await;
+            }
+            match prepared {
+                Ok(admission) => admission,
+                Err(error) if foreground => {
+                    arbitration_deferred = Some(error);
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let mut tx = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(protected_database_error)?;
+        let existing: Option<String> = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query_scalar(
+                "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
+            )
+            .bind(runtime_id)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?",
-        )
-        .bind(runtime_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let timeline_id = if let Some(id) = existing {
+        }
+        .map_err(protected_database_error)?;
+        // An interrupted old resolver could bind an empty replacement before
+        // import rejected its timeline mismatch. Only unpublished legacy state
+        // may repair that binding, and only while the replacement is untouched.
+        let repair_empty = if flags.legacy_eligible
+            && referenced.is_some()
+            && existing
+                .as_ref()
+                .is_some_and(|id| Some(id) != referenced.as_ref())
+        {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline t
+                 WHERE t.id=? AND t.runtime_session_id=? AND t.retired_at IS NULL
+                   AND t.identity_id=? AND t.scope_type=? AND t.canonical_scope_id=?
+                   AND t.revision=0 AND t.claim_owner IS NULL AND t.claim_generation=0
+                   AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session j
+                                  WHERE j.runtime_session_id=t.runtime_session_id
+                                    AND (j.published=1 OR j.retired=1))
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e WHERE e.timeline_id=t.id)
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_node n WHERE n.timeline_id=t.id)
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_operation o WHERE o.timeline_id=t.id))",
+            )
+            .bind(existing.as_deref())
+            .bind(runtime_id)
+            .bind(&identity_id)
+            .bind(&stored_scope_type)
+            .bind(&stored_scope_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(protected_database_error)?
+        } else {
+            false
+        };
+        if !repair_empty
+            && referenced
+                .as_deref()
+                .is_some_and(|referenced| existing.as_deref().is_some_and(|id| id != referenced))
+        {
+            return Err(RuntimeError::conflict(
+                "LCM selected chat resume target is bound to a different timeline",
+            ));
+        }
+        let mut receipts_completed = false;
+        if needs_arbitration
+            && (existing.is_none()
+                || repair_empty
+                || (existing.as_ref() == referenced.as_ref()
+                    && (sibling_admission.is_some() || (!foreground && owns_shared_timeline))))
+        {
+            if let Some(timeline) = referenced.as_deref() {
+                let fallback: bool = foreground && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=? AND (runtime_session_id IS NULL OR runtime_session_id=?))",
+                ).bind(timeline).bind(runtime_id).fetch_one(&mut *tx).await.map_err(protected_database_error)?;
+                if !fallback {
+                    if let Some(error) = arbitration_deferred.take() {
+                        return Err(error);
+                    }
+                }
+                if arbitration_deferred.is_none() {
+                    sqlx::query("SAVEPOINT legacy_lcm_arbitration")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(protected_database_error)?;
+                    let transfer = self
+                        .transfer_legacy_chat_lcm_owner(
+                            &mut tx,
+                            runtime_id,
+                            timeline,
+                            sibling_admission.as_ref(),
+                            foreground,
+                        )
+                        .await;
+                    match transfer {
+                        Ok(complete) => receipts_completed = complete,
+                        Err(_) if fallback => {
+                            // Forge already selected this foreground session. Restore the
+                            // old adoption path if arbitration cannot prove exclusive receipts.
+                            sqlx::query("ROLLBACK TO legacy_lcm_arbitration")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(protected_database_error)?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    sqlx::query("RELEASE legacy_lcm_arbitration")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(protected_database_error)?;
+                }
+            }
+        }
+        let timeline_id = if let Some(id) = existing.filter(|_| !repair_empty) {
             id
         } else {
             let candidate: Option<String> = if successor {
                 None
             } else {
-                sqlx::query_scalar(
-                    "SELECT id FROM agent_lcm_timeline
+                {
+                    #[cfg(feature = "test-support")]
+                    let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+                    sqlx::query_scalar(
+                        "SELECT id FROM agent_lcm_timeline
                      WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
+                       AND (?5 IS NULL OR id = ?5)
                        AND (runtime_session_id = ?4
-                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
+                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5
+                                AND (claim_owner IS NULL OR claim_owner = ?4))
                             OR (scope_type <> 'agent_chat' AND claim_owner IS NULL
                                 AND retired_at IS NULL
                                 AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
                                                WHERE e.timeline_id = agent_lcm_timeline.id)))
                      ORDER BY runtime_session_id IS NULL ASC LIMIT 1",
-                )
-                .bind(&identity_id)
-                .bind(&stored_scope_type)
-                .bind(&stored_scope_id)
-                .bind(runtime_id)
-                .bind(referenced.as_deref())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                    )
+                    .bind(&identity_id)
+                    .bind(&stored_scope_type)
+                    .bind(&stored_scope_id)
+                    .bind(runtime_id)
+                    .bind(referenced.as_deref())
+                    .fetch_optional(&mut *tx)
+                    .await
+                }
+                .map_err(protected_database_error)?
             };
             let id = match candidate {
                 Some(id) => {
                     // Adopting a legacy owner-less row stamps its owner, so
                     // the lookup above can never hand it to another session
                     // (a rotation successor in particular).
-                    sqlx::query(
-                        "UPDATE agent_lcm_timeline SET runtime_session_id = ?
+                    {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+                        sqlx::query(
+                            "UPDATE agent_lcm_timeline SET runtime_session_id = ?
                          WHERE id = ? AND runtime_session_id IS NULL",
-                    )
-                    .bind(runtime_id)
-                    .bind(&id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                        )
+                        .bind(runtime_id)
+                        .bind(&id)
+                        .execute(&mut *tx)
+                        .await
+                    }
+                    .map_err(protected_database_error)?;
                     id
+                }
+                None if referenced.is_some() => {
+                    return Err(RuntimeError::conflict(
+                        "persisted LCM timeline is unavailable or belongs to another session",
+                    ));
                 }
                 None => {
                     let id = db::new_uuid_v4();
                     let now = db::now_rfc3339();
-                    sqlx::query(
-                        "INSERT INTO agent_lcm_timeline (
+                    {
+                        #[cfg(feature = "test-support")]
+                        let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+                        sqlx::query(
+                            "INSERT INTO agent_lcm_timeline (
                             id, identity_id, scope_type, scope_id, canonical_scope_id,
                             runtime_session_id, authorization_revision, revision,
                             created_at, updated_at
                          ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                    )
-                    .bind(&id)
-                    .bind(&identity_id)
-                    .bind(&stored_scope_type)
-                    .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
-                    .bind(&stored_scope_id)
-                    .bind(runtime_id)
-                    .bind(authorization_revision.as_str())
-                    .bind(&now)
-                    .bind(&now)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                        )
+                        .bind(&id)
+                        .bind(&identity_id)
+                        .bind(&stored_scope_type)
+                        .bind(format!("{stored_scope_id}#topic:{runtime_id}"))
+                        .bind(&stored_scope_id)
+                        .bind(runtime_id)
+                        .bind(authorization_revision.as_str())
+                        .bind(&now)
+                        .bind(&now)
+                        .execute(&mut *tx)
+                        .await
+                    }
+                    .map_err(protected_database_error)?;
                     id
                 }
             };
-            sqlx::query(
-                "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
-                 VALUES (?, ?)",
-            )
-            .bind(runtime_id)
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            {
+                #[cfg(feature = "test-support")]
+                let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+                sqlx::query(
+                    "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
+                 VALUES (?, ?) ON CONFLICT(runtime_session_id) DO UPDATE SET timeline_id=excluded.timeline_id",
+                )
+                .bind(runtime_id)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+            }
+            .map_err(protected_database_error)?;
             id
         };
-        tx.commit()
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        let receipt_stamp = if receipts_completed {
+            Some(Self::legacy_lcm_receipt_stamp(&mut tx, runtime_id, &timeline_id).await?)
+        } else {
+            None
+        };
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
+            tx.commit().await
+        }
+        .map_err(|error| protected_database_error(error).retryable())?;
+        if let Some(admission) = sibling_admission {
+            admission.close().await.map_err(RuntimeError::retryable)?;
+        }
+        if let Some(stamp) = receipt_stamp {
+            if let Ok(mut cached) = self.legacy_lcm_receipt_stamps.lock() {
+                if cached.len() >= 4_096 {
+                    cached.clear();
+                }
+                cached.insert(runtime_id.to_owned(), stamp);
+            }
+        }
         let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-            .ok_or(crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?
+            .ok_or_else(|| RuntimeError::conflict("LCM binding timeline is missing"))?;
+        // V149 retirement frees the canonical scope without revoking the
+        // owning runtime's binding or its fenced claim.
+        let matches_owner: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=?
+             AND identity_id=? AND scope_type=? AND canonical_scope_id=?
+             AND (scope_type <> 'agent_chat' OR runtime_session_id IS NULL OR runtime_session_id=?5)
+             AND (claim_owner IS NULL OR claim_owner=?5))",
+        )
+        .bind(&timeline_id)
+        .bind(&identity_id)
+        .bind(&stored_scope_type)
+        .bind(&stored_scope_id)
+        .bind(runtime_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(protected_database_error)?;
+        if !matches_owner {
+            return Err(RuntimeError::conflict(
+                "LCM timeline does not match its session binding",
+            ));
+        }
         Ok(crate::SqliteLcmStore::new(self.db.clone(), timeline))
     }
 
@@ -830,37 +1154,48 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(secret.expose().as_bytes())
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO credential_handle (
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
                 credential_method, metadata_json, version, created_at, updated_at
              ) VALUES (?, ?, ?, ?, 'configured', 'api_key', '{}', 1, ?, ?)",
-        )
-        .bind(id)
-        .bind(owner_user_id)
-        .bind(provider)
-        .bind(label)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(id)
+            .bind(owner_user_id)
+            .bind(provider)
+            .bind(label)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO protected_credential_secret (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
@@ -886,16 +1221,20 @@ impl SqliteProtectedRuntimeStore {
         handle_id: &str,
         owner_user_id: &str,
     ) -> Result<Secret, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT secret.ciphertext, secret.nonce
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT secret.ciphertext, secret.nonce
              FROM protected_credential_secret AS secret
              JOIN credential_handle AS handle ON handle.id = secret.handle_id
              WHERE handle.id = ? AND handle.owner_user_id = ? AND handle.status = 'configured'",
-        )
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::CredentialNotFound)?;
         let ciphertext: Vec<u8> = row
@@ -921,38 +1260,49 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(&plaintext)
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO credential_handle (
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO credential_handle (
                 id, owner_user_id, provider, label, status,
                 credential_method, metadata_json, version, created_at, updated_at
              ) VALUES (?, ?, ?, ?, 'configured', 'oauth_bundle', ?, 1, ?, ?)",
-        )
-        .bind(input.id)
-        .bind(input.owner_user_id)
-        .bind(input.provider)
-        .bind(input.label)
-        .bind(input.metadata_json)
-        .bind(input.now)
-        .bind(input.now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(input.id)
+            .bind(input.owner_user_id)
+            .bind(input.provider)
+            .bind(input.label)
+            .bind(input.metadata_json)
+            .bind(input.now)
+            .bind(input.now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        sqlx::query(
-            "INSERT INTO protected_credential_secret (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_credential_secret (
                 handle_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(input.id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(input.now)
-        .bind(input.now)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(input.id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(input.now)
+            .bind(input.now)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         transaction
             .commit()
@@ -1024,22 +1374,26 @@ impl SqliteProtectedRuntimeStore {
         let (ciphertext, nonce) = self
             .seal(plaintext)
             .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        sqlx::query(
-            "INSERT INTO protected_provider_authorization_state (
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
+            sqlx::query(
+                "INSERT INTO protected_provider_authorization_state (
                 operation_id, ciphertext, nonce, key_revision, created_at, updated_at
              ) VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(operation_id) DO UPDATE SET
                 ciphertext = excluded.ciphertext, nonce = excluded.nonce,
                 key_revision = excluded.key_revision, updated_at = excluded.updated_at",
-        )
-        .bind(operation_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(now)
-        .bind(now)
-        .execute(self.db.pool())
-        .await
+            )
+            .bind(operation_id)
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(now)
+            .bind(now)
+            .execute(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         Ok(())
     }
@@ -1048,13 +1402,17 @@ impl SqliteProtectedRuntimeStore {
         &self,
         operation_id: &str,
     ) -> Result<Vec<u8>, crate::AgentHostError> {
-        let row = sqlx::query(
-            "SELECT ciphertext, nonce FROM protected_provider_authorization_state
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT ciphertext, nonce FROM protected_provider_authorization_state
              WHERE operation_id = ?",
-        )
-        .bind(operation_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(operation_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
         .ok_or(crate::AgentHostError::ProtectedPersistence)?;
         let ciphertext: Vec<u8> = row
@@ -1071,11 +1429,15 @@ impl SqliteProtectedRuntimeStore {
         &self,
         operation_id: &str,
     ) -> Result<(), crate::AgentHostError> {
-        sqlx::query("DELETE FROM protected_provider_authorization_state WHERE operation_id = ?")
-            .bind(operation_id)
-            .execute(self.db.pool())
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_provider_authorization_state WHERE operation_id = ?")
+                .bind(operation_id)
+                .execute(self.db.pool())
+                .await
+        }
+        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
         Ok(())
     }
 
@@ -1084,18 +1446,22 @@ impl SqliteProtectedRuntimeStore {
         handle_id: &str,
         owner_user_id: &str,
     ) -> Result<StoredCredential, ProviderCredentialError> {
-        let row = sqlx::query(
-            "SELECT handle.provider, handle.credential_method, handle.version,
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT handle.provider, handle.credential_method, handle.version,
                     secret.ciphertext, secret.nonce
              FROM protected_credential_secret AS secret
              JOIN credential_handle AS handle ON handle.id = secret.handle_id
              WHERE handle.id = ? AND handle.owner_user_id = ?
                AND handle.status = 'configured'",
-        )
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .fetch_optional(self.db.pool())
-        .await
+            )
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
         .map_err(|_| ProviderCredentialError::RefreshFailed)?
         .ok_or(ProviderCredentialError::Unavailable)?;
         let ciphertext: Vec<u8> = row
@@ -1140,17 +1506,21 @@ impl SqliteProtectedRuntimeStore {
         owner_user_id: &str,
         expected_version: i64,
     ) {
-        let _ = sqlx::query(
-            "UPDATE credential_handle
+        let _ = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'invalid', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?",
-        )
-        .bind(db::now_rfc3339())
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(self.db.pool())
-        .await;
+            )
+            .bind(db::now_rfc3339())
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(self.db.pool())
+            .await
+        };
     }
 
     async fn rotate_oauth_bundle(
@@ -1166,21 +1536,28 @@ impl SqliteProtectedRuntimeStore {
             .seal(&plaintext)
             .map_err(|_| ProviderCredentialError::RefreshFailed)?;
         let now = db::now_rfc3339();
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET version = version + 1, status = 'configured', updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?
                AND credential_method = 'oauth_bundle' AND status = 'configured'",
-        )
-        .bind(&now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(&now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         if result.rows_affected() == 0 {
             transaction
@@ -1189,18 +1566,22 @@ impl SqliteProtectedRuntimeStore {
                 .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
             return Err(ProviderCredentialError::RefreshFailed);
         }
-        sqlx::query(
-            "UPDATE protected_credential_secret
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE protected_credential_secret
              SET ciphertext = ?, nonce = ?, key_revision = ?, updated_at = ?
              WHERE handle_id = ?",
-        )
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(self.key_revision)
-        .bind(&now)
-        .bind(handle_id)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(ciphertext)
+            .bind(nonce)
+            .bind(self.key_revision)
+            .bind(&now)
+            .bind(handle_id)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, ProviderCredentialError::RefreshFailed))?;
         transaction
             .commit()
@@ -1218,29 +1599,40 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ?",
-        )
-        .bind(now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::CredentialNotFound);
         }
         retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
-        sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
-            .bind(handle_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
+                .bind(handle_id)
+                .execute(&mut *transaction)
+                .await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
@@ -1259,30 +1651,41 @@ impl SqliteProtectedRuntimeStore {
         let remote_bundle = self
             .remote_revocation_bundle(handle_id, owner_user_id)
             .await;
-        let mut transaction = db::begin_immediate(self.db.pool())
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
-        let result = sqlx::query(
-            "UPDATE credential_handle
+        let mut transaction = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
+            db::begin_immediate(self.db.pool()).await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        let result = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+            sqlx::query(
+                "UPDATE credential_handle
              SET status = 'revoked', version = version + 1, updated_at = ?
              WHERE id = ? AND owner_user_id = ? AND version = ?",
-        )
-        .bind(now)
-        .bind(handle_id)
-        .bind(owner_user_id)
-        .bind(expected_version)
-        .execute(&mut *transaction)
-        .await
+            )
+            .bind(now)
+            .bind(handle_id)
+            .bind(owner_user_id)
+            .bind(expected_version)
+            .execute(&mut *transaction)
+            .await
+        }
         .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         if result.rows_affected() == 0 {
             return Err(crate::AgentHostError::VersionConflict);
         }
         retire_provider_pricing_subject(&mut transaction, owner_user_id, handle_id, now).await?;
-        sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
-            .bind(handle_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
+        {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.DELETE", 0);
+            sqlx::query("DELETE FROM protected_credential_secret WHERE handle_id = ?")
+                .bind(handle_id)
+                .execute(&mut *transaction)
+                .await
+        }
+        .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
         mark_credential_dependents_unavailable(&mut transaction, handle_id, now).await?;
         transaction
             .commit()
@@ -1339,17 +1742,21 @@ async fn retire_provider_pricing_subject(
     provider_entry_id: &str,
     now: &str,
 ) -> Result<(), crate::AgentHostError> {
-    sqlx::query(
-        "UPDATE pricing_subject
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE pricing_subject
          SET state = 'retired', version = version + 1, updated_at = ?
          WHERE owner_user_id = ? AND subject_kind = 'provider_entry'
            AND provider_entry_id = ? AND state = 'active'",
-    )
-    .bind(now)
-    .bind(owner_user_id)
-    .bind(provider_entry_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(owner_user_id)
+        .bind(provider_entry_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|error| log_store_error(error, crate::AgentHostError::ProtectedPersistence))?;
     Ok(())
 }
@@ -1359,30 +1766,38 @@ async fn mark_credential_dependents_unavailable(
     handle_id: &str,
     now: &str,
 ) -> Result<(), crate::AgentHostError> {
-    sqlx::query(
-        "UPDATE agent_connection_health
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE agent_connection_health
          SET status = 'unavailable', error_code = 'credential_revoked', updated_at = ?
          WHERE profile_id IN (
              SELECT id FROM agent_profile WHERE credential_ref = ?
          )",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(handle_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-    sqlx::query(
-        "UPDATE agent_session
+    {
+        #[cfg(feature = "test-support")]
+        let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0);
+        sqlx::query(
+            "UPDATE agent_session
          SET status = 'degraded', connection_status = 'unavailable',
              version = version + 1, updated_at = ?
          WHERE profile_id IN (
              SELECT id FROM agent_profile WHERE credential_ref = ?
          ) AND status NOT IN ('replaced', 'terminated')",
-    )
-    .bind(now)
-    .bind(handle_id)
-    .execute(&mut **transaction)
-    .await
+        )
+        .bind(now)
+        .bind(handle_id)
+        .execute(&mut **transaction)
+        .await
+    }
     .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
     Ok(())
 }
@@ -1656,139 +2071,32 @@ impl fmt::Debug for SqliteProtectedRuntimeStore {
     }
 }
 
-impl SqliteProtectedRuntimeStore {
-    async fn save_checkpoint_once(
-        &self,
-        checkpoint: &TurnCheckpoint,
-        retry: bool,
-    ) -> Result<(), RuntimeError> {
-        let forge_session_id = self.forge_session_id(&checkpoint.session).await?;
-        let fingerprint = checkpoint.operation_fingerprint.to_string();
-        let revision = i64::try_from(checkpoint.state_revision).unwrap_or(i64::MAX);
-        let row = sqlx::query(
-            "SELECT state_revision, checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint
-             FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(&forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
-        let expected_revision = row
-            .as_ref()
-            .map(|row| row.get::<i64, _>("state_revision"))
-            .unwrap_or(0);
-        if let Some(row) = &row {
-            if retry
-                && row
-                    .get::<Option<String>, _>("checkpoint_turn_id")
-                    .is_some_and(|turn| turn != checkpoint.turn.as_str())
-            {
-                return Err(RuntimeError::conflict(
-                    "protected checkpoint turn changed during retry",
-                ));
-            }
-            if row
-                .get::<Option<String>, _>("checkpoint_turn_id")
-                .as_deref()
-                == Some(checkpoint.turn.as_str())
-            {
-                if let Some(stored_revision) = row.get::<Option<i64>, _>("checkpoint_revision") {
-                    if revision < stored_revision
-                        || (revision == stored_revision
-                            && row
-                                .get::<Option<String>, _>("checkpoint_fingerprint")
-                                .as_deref()
-                                != Some(fingerprint.as_str()))
-                    {
-                        return Err(RuntimeError::conflict(
-                            "protected checkpoint revision moved backwards or changed fingerprint",
-                        ));
-                    }
-                    if revision == stored_revision {
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        let digest = self.snapshot_digest(&checkpoint.snapshot)?;
-        let bytes = serde_json::to_vec(checkpoint)?;
-        let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        #[cfg(test)]
-        if !retry {
-            if let Some(barrier) = &self.save_barrier {
-                barrier.wait().await;
-            }
-        }
-        let result = sqlx::query(
-            "INSERT INTO protected_agent_session_state (
-                session_id, checkpoint_ciphertext, checkpoint_nonce,
-                checkpoint_turn_id, checkpoint_revision, checkpoint_fingerprint,
-                snapshot_digest,
-                key_revision, lcm_policy_revision, checkpoint_lcm_policy_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(session_id) DO UPDATE SET
-                checkpoint_ciphertext = excluded.checkpoint_ciphertext,
-                checkpoint_nonce = excluded.checkpoint_nonce,
-                checkpoint_turn_id = excluded.checkpoint_turn_id,
-                checkpoint_revision = excluded.checkpoint_revision,
-                checkpoint_fingerprint = excluded.checkpoint_fingerprint,
-                snapshot_ciphertext = NULL,
-                snapshot_nonce = NULL,
-                snapshot_digest = excluded.snapshot_digest,
-                key_revision = excluded.key_revision,
-                lcm_policy_revision = excluded.lcm_policy_revision,
-                checkpoint_lcm_policy_revision = excluded.checkpoint_lcm_policy_revision,
-                state_revision = protected_agent_session_state.state_revision + 1,
-                updated_at = excluded.updated_at
-             WHERE protected_agent_session_state.state_revision = ? AND (
-                protected_agent_session_state.checkpoint_revision IS NULL
-                OR excluded.checkpoint_turn_id != protected_agent_session_state.checkpoint_turn_id
-                OR excluded.checkpoint_revision > protected_agent_session_state.checkpoint_revision
-                OR (
-                    excluded.checkpoint_revision = protected_agent_session_state.checkpoint_revision
-                    AND excluded.checkpoint_fingerprint = protected_agent_session_state.checkpoint_fingerprint
-                ))",
-        )
-        .bind(forge_session_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(checkpoint.turn.as_str())
-        .bind(revision)
-        .bind(fingerprint)
-        .bind(digest)
-        .bind(self.key_revision)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(db::now_rfc3339())
-        .bind(expected_revision)
-        .execute(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected checkpoint save failed"))?;
-        if result.rows_affected() == 0 {
-            return Err(RuntimeError::conflict(
-                "protected checkpoint revision moved backwards or changed fingerprint",
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[async_trait]
 impl SessionStore for SqliteProtectedRuntimeStore {
+    fn journal(&self) -> Option<Arc<dyn agent_runtime::core::journal::SessionJournal>> {
+        Some(Arc::new(self.journals.ordinary()))
+    }
+
     async fn load(&self, id: &SessionId) -> Result<Option<SessionSnapshot>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.load", 0);
         let forge_session_id = match self.forge_session_id(id).await {
             Ok(value) => value,
             Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let row = sqlx::query(
-            "SELECT snapshot_ciphertext, snapshot_nonce, lcm_policy_revision
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT snapshot_ciphertext, snapshot_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected session load failed"))?;
+            )
+            .bind(&forge_session_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
+        .map_err(protected_database_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -1801,7 +2109,9 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open_session_state(ciphertext, nonce).await?;
-                let snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
+                let mut snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
+                self.omit_relinquished_legacy_lcm(&forge_session_id, &mut snapshot)
+                    .await?;
                 Ok(Some(snapshot))
             }
             // A checkpoint already owns the exact canonical snapshot. NULL
@@ -1812,109 +2122,40 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         }
     }
 
-    async fn save(&self, snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
-        let forge_session_id = self.forge_session_id(&snapshot.id).await?;
-        let digest = self.snapshot_digest(snapshot)?;
-        let row = sqlx::query(
-            "SELECT state_revision, snapshot_digest, key_revision, lcm_policy_revision
-             FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(&forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected session load failed"))?;
-        let expected_revision = row
-            .as_ref()
-            .map(|row| row.get::<i64, _>("state_revision"))
-            .unwrap_or(0);
-        if let Some(row) = &row {
-            let stored_digest: Option<String> = row.get("snapshot_digest");
-            let current_format = row.get::<i64, _>("key_revision") == self.key_revision
-                && row
-                    .get::<Option<String>, _>("lcm_policy_revision")
-                    .as_deref()
-                    == Some(crate::FORGE_LCM_POLICY_REVISION);
-            if current_format {
-                let unchanged = match stored_digest {
-                    Some(stored) => stored == digest,
-                    None => SessionStore::load(self, &snapshot.id)
-                        .await?
-                        .map(|stored| self.snapshot_digest(&stored))
-                        .transpose()?
-                        .is_some_and(|stored| stored == digest),
-                };
-                if unchanged {
-                    return Ok(());
-                }
-            }
-        }
-        let bytes = serde_json::to_vec(snapshot)?;
-        let (ciphertext, nonce) = self.seal_session_state(bytes).await?;
-        #[cfg(test)]
-        if let Some(barrier) = &self.save_barrier {
-            barrier.wait().await;
-        }
-        let result = sqlx::query(
-            "INSERT INTO protected_agent_session_state (
-                session_id, snapshot_ciphertext, snapshot_nonce, snapshot_digest,
-                key_revision, lcm_policy_revision, state_revision, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-             ON CONFLICT(session_id) DO UPDATE SET
-                snapshot_ciphertext = excluded.snapshot_ciphertext,
-                snapshot_nonce = excluded.snapshot_nonce,
-                snapshot_digest = excluded.snapshot_digest,
-                key_revision = excluded.key_revision,
-                checkpoint_lcm_policy_revision = CASE
-                    WHEN protected_agent_session_state.checkpoint_ciphertext IS NOT NULL THEN
-                        COALESCE(protected_agent_session_state.checkpoint_lcm_policy_revision,
-                                 protected_agent_session_state.lcm_policy_revision, '')
-                    ELSE protected_agent_session_state.checkpoint_lcm_policy_revision END,
-                lcm_policy_revision = excluded.lcm_policy_revision,
-                state_revision = protected_agent_session_state.state_revision + 1,
-                updated_at = excluded.updated_at
-             WHERE protected_agent_session_state.state_revision = ?",
-        )
-        .bind(forge_session_id)
-        .bind(ciphertext)
-        .bind(nonce)
-        .bind(digest)
-        .bind(self.key_revision)
-        .bind(crate::FORGE_LCM_POLICY_REVISION)
-        .bind(db::now_rfc3339())
-        .bind(expected_revision)
-        .execute(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected session save failed"))?;
-        if result.rows_affected() == 0 {
-            // All SessionStore callers, including runtime lifecycle and turn
-            // saves, treat a lost CAS as superseded. Preserve the winner.
-            tracing::info!(session_id = %snapshot.id.as_str(),
-                "protected session save superseded by competing state");
-        }
-        Ok(())
+    async fn save(&self, _snapshot: &SessionSnapshot) -> Result<(), RuntimeError> {
+        Err(RuntimeError::conflict("legacy session store is read-only"))
     }
 }
 
 #[async_trait]
 impl CheckpointStore for SqliteProtectedRuntimeStore {
+    fn journal(&self) -> Option<Arc<dyn agent_runtime::core::journal::SessionJournal>> {
+        Some(Arc::new(self.journals.protected()))
+    }
+
     async fn load_latest(
         &self,
         session: &SessionId,
     ) -> Result<Option<TurnCheckpoint>, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        let _profile = crate::session_journal::profile::timer("legacy.load_latest", 0);
         let forge_session_id = match self.forge_session_id(session).await {
             Ok(value) => value,
             Err(error) if error.kind == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        let row = sqlx::query(
-            "SELECT checkpoint_ciphertext, checkpoint_nonce,
-                    COALESCE(checkpoint_lcm_policy_revision, lcm_policy_revision) AS lcm_policy_revision
+        let row = {
+            #[cfg(feature = "test-support")]
+            let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
+            sqlx::query(
+                "SELECT checkpoint_ciphertext, checkpoint_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
-        )
-        .bind(forge_session_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
+            )
+            .bind(&forge_session_id)
+            .fetch_optional(self.db.pool())
+            .await
+        }
+        .map_err(protected_database_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -1939,15 +2180,9 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                             ),
                         )
                     })?;
-                let checkpoint: TurnCheckpoint = serde_json::from_slice(&bytes).map_err(|_| {
-                    RuntimeError::new(
-                        ErrorKind::Serialization,
-                        format!(
-                            "protected checkpoint for session {} contains invalid checkpoint JSON",
-                            session.as_str()
-                        ),
-                    )
-                })?;
+                let mut checkpoint = decode_checkpoint(session, &bytes)?;
+                self.omit_relinquished_legacy_lcm(&forge_session_id, &mut checkpoint.snapshot)
+                    .await?;
                 Ok(Some(checkpoint))
             }
             (None, None) => Ok(None),
@@ -1961,39 +2196,8 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
         }
     }
 
-    async fn save(&self, checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
-        // Runtime callers propagate save errors into the turn. A competing save
-        // is ordinary progress: reload once, then keep the winning state.
-        for retry in [false, true] {
-            match self.save_checkpoint_once(checkpoint, retry).await {
-                Err(error) if error.kind == ErrorKind::Conflict => {
-                    if !retry {
-                        // A new turn that won the CAS is authoritative. Do not
-                        // retry an older turn over it just because its turn ID
-                        // differs (which ordinarily permits starting a turn).
-                        let winner =
-                            CheckpointStore::load_latest(self, &checkpoint.session).await?;
-                        if winner.is_some_and(|winner| {
-                            winner.turn != checkpoint.turn
-                                || winner.state_revision > checkpoint.state_revision
-                                || (winner.state_revision == checkpoint.state_revision
-                                    && winner.operation_fingerprint
-                                        != checkpoint.operation_fingerprint)
-                        }) {
-                            tracing::info!(session_id = %checkpoint.session.as_str(),
-                                turn_id = %checkpoint.turn.as_str(),
-                                "protected checkpoint save superseded by competing state");
-                            return Ok(());
-                        }
-                    }
-                    tracing::info!(session_id = %checkpoint.session.as_str(),
-                        turn_id = %checkpoint.turn.as_str(), superseded = retry,
-                        "protected checkpoint save conflicted; retrying once or keeping the winner");
-                }
-                result => return result,
-            }
-        }
-        Ok(())
+    async fn save(&self, _checkpoint: &TurnCheckpoint) -> Result<(), RuntimeError> {
+        Err(RuntimeError::conflict("legacy session store is read-only"))
     }
 }
 
@@ -2063,6 +2267,43 @@ mod tests {
         (store, db, snapshot)
     }
 
+    pub(super) async fn native_snapshot(
+        store: &SqliteProtectedRuntimeStore,
+        id: &SessionId,
+    ) -> SessionSnapshot {
+        use agent_runtime::core::journal::*;
+        let journal = store.journals().ordinary();
+        let lease = journal
+            .open(
+                id,
+                JournalOpen {
+                    root: JournalRootSelection::Latest,
+                    expected_revision: None,
+                    operation: JournalOperationId::new("fixture-read"),
+                    pin: JournalPinId::new("fixture-read"),
+                    intent: JournalOpenIntent::ReadOnly,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = JournalReader::new(
+            &journal,
+            &lease,
+            JournalReadLimits {
+                objects: 100_000,
+                encoded_bytes: 64 * 1024 * 1024,
+                entries: 100_000,
+            },
+        )
+        .unwrap()
+        .snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+        journal.close(lease).await.unwrap();
+        snapshot
+    }
+
     fn session_checkpoint(mut snapshot: SessionSnapshot) -> TurnCheckpoint {
         let active_history_start = snapshot.history.len();
         snapshot
@@ -2094,7 +2335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_preserves_base_lcm_policy_on_upgrade() {
+    async fn legacy_read_policy_revision() {
         use agent_runtime::{core::store::VersionedSessionState, registry::RegistryRevision};
         let (store, db, mut snapshot) = session_store().await;
         snapshot.extension_state.insert(
@@ -2106,7 +2347,10 @@ mod tests {
         );
         let checkpoint = session_checkpoint(snapshot.clone());
         let snapshot = checkpoint.snapshot.clone();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision = 'forge-lcm-policy-2', checkpoint_lcm_policy_revision = 'forge-lcm-policy-2'")
             .execute(db.pool()).await.unwrap();
         assert_eq!(
@@ -2121,12 +2365,253 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-support")]
     #[tokio::test]
-    async fn session_state_digest_is_keyed_and_timestamp_independent() {
+    async fn lcm_binding_busy_is_retryable_and_retry_keeps_the_timeline() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("busy-lcm-binding");
+        f.ensure_session(&id).await.unwrap();
+        let original = SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1);
+        let old = LegacyLcmFixture::seed(&f, &original, &id, false).await;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(f.directory().join("journal.db"))
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let store = SqliteProtectedRuntimeStore::new(Arc::new(SqliteDb::new(pool)), [7; 32], 1);
+        let held = db::begin_immediate(f.database().pool()).await.unwrap();
+        let error = store
+            .resolve_lcm_store(id.as_str(), "account", "journal-owner", false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Internal);
+        assert!(error.retryable);
+        held.rollback().await.unwrap();
+        let resolved = store
+            .resolve_lcm_store(id.as_str(), "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(resolved.timeline_id(), old.timeline_id);
+        assert_eq!(
+            SessionStore::load(&store, &id).await.unwrap().unwrap(),
+            old.snapshot
+        );
+        assert_eq!(
+            CheckpointStore::load_latest(&store, &id)
+                .await
+                .unwrap()
+                .unwrap(),
+            old.checkpoint
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn retired_chat_binding_resumes_without_shared_ownership_transfer() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("retired-chat-binding");
+        let db = f.database();
+        let store = SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1);
+        let (old, _) =
+            LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+        let chat = format!("chat:{}", id.as_str());
+        let retired = "2026-09-25T00:00:00Z";
+        sqlx::query("UPDATE agent_lcm_timeline SET scope_id=canonical_scope_id || '#retired:' || id,retired_at=? WHERE id=?")
+            .bind(retired).bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+        for keep_binding in [true, false] {
+            if !keep_binding {
+                sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id=?")
+                    .bind(id.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                let resolved = store
+                    .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &chat)
+                    .await
+                    .unwrap();
+                assert_eq!(resolved.timeline_id(), old.timeline_id);
+                let state: (String, String, String, Option<String>, i64, String) = sqlx::query_as(
+                    "SELECT runtime_session_id,scope_id,canonical_scope_id,claim_owner,claim_generation,retired_at FROM agent_lcm_timeline WHERE id=?",
+                ).bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(
+                    state,
+                    (
+                        id.as_str().to_owned(),
+                        format!("{chat}#retired:{}", old.timeline_id),
+                        chat.clone(),
+                        None,
+                        0,
+                        retired.to_owned()
+                    )
+                );
+                let receipts: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+                )
+                .bind(&old.timeline_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(receipts, 0, "retired timelines bypass shared arbitration");
+                let replaced: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_session WHERE replaced_by_session_id IS NOT NULL",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(replaced, 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn retired_chat_binding_rejects_foreign_owners_and_scopes() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("retired-chat-authorization");
+        let db = f.database();
+        let store = SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1);
+        let (old, older) =
+            LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+        let chat = format!("chat:{}", id.as_str());
+        for (runtime_owner, claim_owner, scope_type, canonical_scope) in [
+            (older.as_str(), None, "agent_chat", chat.as_str()),
+            (
+                id.as_str(),
+                Some(older.as_str()),
+                "agent_chat",
+                chat.as_str(),
+            ),
+            (id.as_str(), None, "account", chat.as_str()),
+            (id.as_str(), None, "agent_chat", "another-chat"),
+        ] {
+            sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=?,claim_owner=?,scope_type=?,canonical_scope_id=?,scope_id=? || '#retired:' || id,retired_at='2026-09-25T00:00:00Z' WHERE id=?")
+                .bind(runtime_owner).bind(claim_owner).bind(scope_type).bind(canonical_scope).bind(canonical_scope)
+                .bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+            let error = store
+                .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &chat)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Conflict);
+            assert_eq!(
+                error.message,
+                "LCM timeline does not match its session binding"
+            );
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn non_chat_empty_binding_continues_after_it_gains_entries() {
+        use crate::test_support::FileDb;
+        use agent_runtime::lcm::*;
+        let f = FileDb::new().await.unwrap();
+        for id in ["empty-source", "empty-successor"] {
+            f.ensure_session(&SessionId::new(id)).await.unwrap();
+        }
+        let store = SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1);
+        let source = store
+            .resolve_lcm_store("empty-source", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        let successor = store
+            .resolve_lcm_store("empty-successor", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(successor.timeline_id(), source.timeline_id());
+        successor
+            .append(
+                &successor.view(),
+                LcmAppendRequest::new(
+                    LcmOperationId::new("continued-append"),
+                    vec![LcmEntry::new(
+                        LcmTimelineId::new(successor.timeline_id()),
+                        LcmEntryId::new("continued-entry"),
+                        LcmSequence::new(0),
+                        crate::Message::user("continued non-Chat history"),
+                        LcmSourceMetadata::new(LcmClassification::new(
+                            crate::Sensitivity::Sensitive,
+                            crate::TrustClass::UserContent,
+                        )),
+                    )],
+                ),
+            )
+            .await
+            .unwrap();
+        let reopened = store
+            .resolve_lcm_store("empty-successor", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(reopened.timeline_id(), source.timeline_id());
+        assert_eq!(
+            reopened
+                .current_revision(&reopened.view())
+                .await
+                .unwrap()
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn lcm_binding_busy_and_locked_codes_are_retryable() {
+        #[derive(Debug)]
+        struct CodedSqliteError(u32);
+        impl std::fmt::Display for CodedSqliteError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "SQLite code {}", self.0)
+            }
+        }
+        impl std::error::Error for CodedSqliteError {}
+        impl sqlx::error::DatabaseError for CodedSqliteError {
+            fn message(&self) -> &str {
+                "synthetic SQLite error"
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(self.0.to_string().into())
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        for code in [5, 6, 261, 262, 517, 518] {
+            let error =
+                protected_database_error(sqlx::Error::Database(Box::new(CodedSqliteError(code))));
+            assert_eq!(error.kind, ErrorKind::Internal);
+            assert!(error.retryable, "SQLite code {code}");
+        }
+        let constraint =
+            protected_database_error(sqlx::Error::Database(Box::new(CodedSqliteError(19))));
+        assert!(!constraint.retryable);
+    }
+
+    #[tokio::test]
+    async fn legacy_baseline_digest_is_keyed_and_timestamp_independent() {
         let (store, db, mut snapshot) = session_store().await;
-        let digest = store.snapshot_digest(&snapshot).unwrap();
+        let digest = store.legacy_snapshot_digest(&snapshot).unwrap();
         let different_key = SqliteProtectedRuntimeStore::new(db.clone(), [8; 32], 1);
-        assert_ne!(digest, different_key.snapshot_digest(&snapshot).unwrap());
+        assert_ne!(
+            digest,
+            different_key.legacy_snapshot_digest(&snapshot).unwrap()
+        );
         // RFC 2104 HMAC, verified independently using its inner/outer pads.
         use sha2::{Digest, Sha256};
         let mut inner_pad = [0x36; 64];
@@ -2152,8 +2637,11 @@ mod tests {
         outer.update(inner.finalize());
         assert_eq!(digest, hex::encode(outer.finalize()));
         snapshot.updated = Timestamp(123);
-        assert_eq!(digest, store.snapshot_digest(&snapshot).unwrap());
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        assert_eq!(digest, store.legacy_snapshot_digest(&snapshot).unwrap());
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let stored: String =
             sqlx::query_scalar("SELECT snapshot_digest FROM protected_agent_session_state")
                 .fetch_one(db.pool())
@@ -2163,19 +2651,25 @@ mod tests {
         snapshot
             .history
             .push(agent_runtime::core::content::Message::user("changed"));
-        assert_ne!(digest, store.snapshot_digest(&snapshot).unwrap());
+        assert_ne!(digest, store.legacy_snapshot_digest(&snapshot).unwrap());
         let checkpoint = session_checkpoint(snapshot);
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let stored: String =
             sqlx::query_scalar("SELECT snapshot_digest FROM protected_agent_session_state")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-        assert_eq!(stored, store.snapshot_digest(&checkpoint.snapshot).unwrap());
+        assert_eq!(
+            stored,
+            store.legacy_snapshot_digest(&checkpoint.snapshot).unwrap()
+        );
     }
 
     #[tokio::test]
-    async fn session_state_manifest_window_does_not_change_checkpoint_digest() {
+    async fn legacy_baseline_manifest_window_does_not_change_checkpoint_digest() {
         use agent_runtime::{
             core::{
                 ids::TurnId,
@@ -2213,7 +2707,10 @@ mod tests {
             ),
         );
         // The ordinary snapshot retains diagnostics and the protected boundary.
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot.clone())
@@ -2224,15 +2721,18 @@ mod tests {
         // Model Runtime's checkpoint capture, which preserves execution state
         // and its boundary extension but leaves diagnostics in the live window.
         checkpoint.snapshot.manifests.clear();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let loaded = SessionStore::load(&store, &live.id).await.unwrap().unwrap();
         // SessionStore references the checkpoint's execution state, whose
         // serialized snapshot omits the live diagnostic window.
         assert!(loaded.manifests.is_empty());
         assert_eq!(loaded.extension_state, live.extension_state);
         assert_eq!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&loaded).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&loaded).unwrap()
         );
         let mut retained = live.clone();
         retained
@@ -2240,15 +2740,18 @@ mod tests {
             .push(TurnManifest::new(TurnId::new("latest-turn"), manifest));
         retained.manifests.remove(0);
         assert_eq!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&retained).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&retained).unwrap()
         );
         // Neither the restored state nor the live diagnostic window requires
         // a conflicting independent save over the checkpoint-backed row.
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        SessionStore::save(&store, &loaded).await.unwrap();
-        SessionStore::save(&store, &retained).await.unwrap();
+        store.save_legacy_snapshot_baseline(&loaded).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&retained)
+            .await
+            .unwrap();
         // The runtime-owned boundary remains protected even though manifests
         // are diagnostic: changing its frontier must change the digest.
         retained
@@ -2257,169 +2760,13 @@ mod tests {
             .unwrap()
             .value = serde_json::json!({"schema_version": 1, "planned_steps": 2});
         assert_ne!(
-            store.snapshot_digest(&live).unwrap(),
-            store.snapshot_digest(&retained).unwrap()
+            store.legacy_snapshot_digest(&live).unwrap(),
+            store.legacy_snapshot_digest(&retained).unwrap()
         );
     }
 
     #[tokio::test]
-    async fn session_state_concurrent_snapshot_save_is_superseded_without_failing() {
-        let (mut store, db, snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
-        // Synchronize after both reads/encryptions, before either CAS.
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let mut first = snapshot.clone();
-        first
-            .history
-            .push(agent_runtime::core::content::Message::user("first"));
-        let mut second = snapshot.clone();
-        second
-            .history
-            .push(agent_runtime::core::content::Message::user("second"));
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                SessionStore::save(&store, &first),
-                SessionStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        let saved = SessionStore::load(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(saved == first || saved == second);
-        let revision: i64 =
-            sqlx::query_scalar("SELECT state_revision FROM protected_agent_session_state")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(revision, 2); // Exactly one winner; the loser did not overwrite it.
-    }
-
-    #[tokio::test]
-    async fn session_state_concurrent_checkpoint_save_retries_without_failing() {
-        use agent_runtime::core::checkpoint::TurnState;
-        let (mut store, _, snapshot) = session_store().await;
-        let checkpoint = session_checkpoint(snapshot.clone());
-        let snapshot = checkpoint.snapshot.clone();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
-        let first = checkpoint
-            .transition(
-                TurnState::Planning { step: 0 },
-                snapshot.clone(),
-                1,
-                Timestamp(1),
-            )
-            .unwrap();
-        let second = first
-            .transition(
-                TurnState::Completing {
-                    finish: agent_runtime::core::event::TurnFinish::Completed,
-                    visible_output: false,
-                    provider_error_kind: None,
-                },
-                snapshot,
-                2,
-                Timestamp(2),
-            )
-            .unwrap();
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                CheckpointStore::save(&store, &first),
-                CheckpointStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        assert_eq!(
-            CheckpointStore::load_latest(&store, &second.session)
-                .await
-                .unwrap(),
-            Some(second)
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_concurrent_checkpoint_turn_is_not_overwritten_by_retry() {
-        let (mut store, db, snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
-        let first = session_checkpoint(snapshot);
-        let second = TurnCheckpoint::accepted(
-            agent_runtime::core::ids::TurnId::new("competing-turn"),
-            agent_runtime::core::content::UserInput::text("hello"),
-            first.snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        store.save_barrier = Some(Arc::new(tokio::sync::Barrier::new(2)));
-        let competing_store = store.clone();
-        let saves = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(
-                CheckpointStore::save(&store, &first),
-                CheckpointStore::save(&competing_store, &second)
-            )
-        })
-        .await
-        .unwrap();
-        saves.0.unwrap();
-        saves.1.unwrap();
-        let winner = CheckpointStore::load_latest(&store, &first.session)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(winner == first || winner == second);
-        let revision: i64 =
-            sqlx::query_scalar("SELECT state_revision FROM protected_agent_session_state")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(revision, 2);
-    }
-
-    #[tokio::test]
-    async fn session_state_checkpoint_retry_preserves_a_new_turn() {
-        let (store, _, snapshot) = session_store().await;
-        let candidate = session_checkpoint(snapshot);
-        let winner = TurnCheckpoint::accepted(
-            agent_runtime::core::ids::TurnId::new("winning-turn"),
-            agent_runtime::core::content::UserInput::text("hello"),
-            candidate.snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        CheckpointStore::save(&store, &winner).await.unwrap();
-        // Model a new turn landing after the retry's reload, before its CAS read.
-        let error = store
-            .save_checkpoint_once(&candidate, true)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind, ErrorKind::Conflict);
-        assert_eq!(
-            CheckpointStore::load_latest(&store, &winner.session)
-                .await
-                .unwrap(),
-            Some(winner)
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_checkpoint_decode_failure_names_session() {
+    async fn legacy_read_checkpoint_decode_failure_names_session() {
         let (store, db, snapshot) = session_store().await;
         assert!(
             SessionStore::load(&store, &snapshot.id)
@@ -2428,7 +2775,10 @@ mod tests {
                 .is_none()
         );
         let checkpoint = session_checkpoint(snapshot.clone());
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let mut bad_format = SESSION_STATE_MAGIC.to_vec();
         bad_format.push(SESSION_STATE_FORMAT + 1);
         let (mut corrupt_ciphertext, nonce) = store.seal(b"{}").unwrap();
@@ -2458,7 +2808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_compressed_round_trip_and_legacy_read() {
+    async fn legacy_read_compressed_and_pre_envelope() {
         let (store, db, mut snapshot) = session_store().await;
         snapshot
             .history
@@ -2466,7 +2816,10 @@ mod tests {
                 "context ".repeat(100_000),
             ));
         let bytes = serde_json::to_vec(&snapshot).unwrap();
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let row = sqlx::query(
             "SELECT snapshot_ciphertext, snapshot_nonce FROM protected_agent_session_state",
         )
@@ -2496,18 +2849,28 @@ mod tests {
         );
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn session_state_unchanged_saves_do_not_write() {
+    async fn legacy_baseline_unchanged_saves_do_not_write() {
         let (store, db, mut snapshot) = session_store().await;
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
         for updated in 1..4 {
             snapshot.updated = Timestamp(updated);
-            SessionStore::save(&store.clone(), &snapshot).await.unwrap();
+            store
+                .clone()
+                .save_legacy_snapshot_baseline(&snapshot)
+                .await
+                .unwrap();
         }
         sqlx::query("DROP TRIGGER reject_state_write")
             .execute(db.pool())
@@ -2516,7 +2879,10 @@ mod tests {
         snapshot
             .history
             .push(agent_runtime::core::content::Message::user("changed"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot)
@@ -2533,7 +2899,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_checkpoint_is_shared_idempotent_and_revision_checked() {
+    async fn legacy_baseline_checkpoint_is_shared_idempotent_and_revision_checked() {
         use agent_runtime::core::{
             checkpoint::TurnState,
             content::{Message, UserInput},
@@ -2541,7 +2907,10 @@ mod tests {
         };
         let (store, db, mut snapshot) = session_store().await;
         snapshot.history.push(Message::user("hello"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         let checkpoint = TurnCheckpoint::accepted(
             TurnId::new("state-turn"),
             UserInput::text("hello"),
@@ -2565,7 +2934,10 @@ mod tests {
                 .unwrap(),
             Some(checkpoint.clone())
         );
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let row = sqlx::query("SELECT snapshot_ciphertext, snapshot_nonce, checkpoint_ciphertext FROM protected_agent_session_state")
             .fetch_one(db.pool()).await.unwrap();
         assert!(
@@ -2589,9 +2961,15 @@ mod tests {
         );
         sqlx::query("CREATE TRIGGER reject_state_write BEFORE UPDATE ON protected_agent_session_state BEGIN SELECT RAISE(ABORT, 'unexpected write'); END")
             .execute(db.pool()).await.unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         snapshot.updated = Timestamp(1);
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         sqlx::query("DROP TRIGGER reject_state_write")
             .execute(db.pool())
             .await
@@ -2604,11 +2982,17 @@ mod tests {
                 Timestamp(1),
             )
             .unwrap();
-        CheckpointStore::save(&store, &next).await.unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
+        store.save_legacy_checkpoint_baseline(&next).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&checkpoint)
+            .await
+            .unwrap();
         let mut conflicting = next.clone();
         conflicting.operation_fingerprint = checkpoint.operation_fingerprint;
-        CheckpointStore::save(&store, &conflicting).await.unwrap();
+        store
+            .save_legacy_checkpoint_baseline(&conflicting)
+            .await
+            .unwrap();
         assert_eq!(
             CheckpointStore::load_latest(&store, &next.session)
                 .await
@@ -2617,7 +3001,10 @@ mod tests {
         );
         // Independent extension/history progress must not replace the recovery checkpoint.
         snapshot.history.push(Message::user("later"));
-        SessionStore::save(&store, &snapshot).await.unwrap();
+        store
+            .save_legacy_snapshot_baseline(&snapshot)
+            .await
+            .unwrap();
         assert_eq!(
             SessionStore::load(&store, &snapshot.id).await.unwrap(),
             Some(snapshot)
@@ -2631,7 +3018,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_state_rejects_unknown_format_and_corruption() {
+    async fn legacy_read_unknown_format_and_corruption() {
         let (store, _) = test_store().await;
         let mut payload = SESSION_STATE_MAGIC.to_vec();
         payload.push(SESSION_STATE_FORMAT + 1);
@@ -2653,65 +3040,6 @@ mod tests {
                 .unwrap_err()
                 .kind,
             ErrorKind::Serialization
-        );
-    }
-
-    #[tokio::test]
-    async fn session_state_standalone_save_preserves_checkpoint_policy_revision() {
-        use agent_runtime::{
-            core::{
-                content::{Message, UserInput},
-                ids::TurnId,
-                store::VersionedSessionState,
-            },
-            registry::RegistryRevision,
-        };
-        let (store, db, mut snapshot) = session_store().await;
-        snapshot.history.push(Message::user("hello"));
-        snapshot.extension_state.insert(
-            agent_runtime::harness::LCM_COMPONENT_ID.to_owned(),
-            VersionedSessionState::new(
-                RegistryRevision::new("old-lcm"),
-                serde_json::json!({"old": true}),
-            ),
-        );
-        let checkpoint = TurnCheckpoint::accepted(
-            TurnId::new("old-policy-turn"),
-            UserInput::text("hello"),
-            snapshot.clone(),
-            0,
-            Deadline::never(),
-            1,
-            0,
-            Timestamp::ZERO,
-        )
-        .unwrap();
-        CheckpointStore::save(&store, &checkpoint).await.unwrap();
-        sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision = 'old-policy', checkpoint_lcm_policy_revision = NULL")
-            .execute(db.pool()).await.unwrap();
-        let loaded = SessionStore::load(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.extension_state, snapshot.extension_state);
-        SessionStore::save(&store, &loaded).await.unwrap();
-        let checkpoint = CheckpointStore::load_latest(&store, &snapshot.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            checkpoint.snapshot.extension_state,
-            snapshot.extension_state
-        );
-        let row = sqlx::query("SELECT lcm_policy_revision, checkpoint_lcm_policy_revision FROM protected_agent_session_state")
-            .fetch_one(db.pool()).await.unwrap();
-        assert_eq!(
-            row.get::<String, _>("lcm_policy_revision"),
-            crate::FORGE_LCM_POLICY_REVISION
-        );
-        assert_eq!(
-            row.get::<String, _>("checkpoint_lcm_policy_revision"),
-            "old-policy"
         );
     }
 
@@ -3824,10 +4152,7 @@ mod tests {
                 )
             })
         };
-        let saved = SessionStore::load(&store, &session_id)
-            .await
-            .expect("resumed snapshot reloads")
-            .expect("resumed snapshot exists");
+        let saved = native_snapshot(&store, &session_id).await;
         assert!(saved.history.iter().any(has_producer));
         assert_eq!(algorithm(&saved), new_algorithm.as_str());
         let last = u64::try_from(saved.history.len() - 1).expect("history index");

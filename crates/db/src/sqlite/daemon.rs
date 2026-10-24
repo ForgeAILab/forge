@@ -466,10 +466,20 @@ impl SqliteDb {
         // Agents pinned to the machine are archived, the existing retirement:
         // paused, never default, hidden from `agent_current` and so from every
         // assignment and selection path. A fresh registration creates new ones.
+        let retiring_agents: Vec<String> = sqlx::query_scalar(&format!(
+            "SELECT i.id FROM agent_identity i WHERE {PINNED_AGENT}"
+        ))
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
         let agents_retired = sqlx::query(&format!("UPDATE agent_identity AS i SET archived_at=?,paused=1,is_default=0,status='offline',description=COALESCE(description,?),version=version+1,updated_at=? WHERE {PINNED_AGENT}"))
             .bind(&now)
             .bind(format!("Retired: machine {} was removed", daemon.hostname))
             .bind(&now).bind(id).execute(&mut *tx).await?.rows_affected();
+        for agent_id in retiring_agents {
+            self.delete_saved_agent_sessions_in_tx(&mut tx, &agent_id)
+                .await?;
+        }
         for task_id in &tasks {
             let step_id = crate::new_uuid_v4();
             let task = sqlx::query("SELECT status,version FROM task WHERE id=?")
@@ -1045,6 +1055,39 @@ mod tests {
                 ["pending_remote_cancels_cleared"],
             1
         );
+    }
+
+    #[tokio::test]
+    async fn removal_archives_agents_and_deletes_native_and_cli_sessions() {
+        let (db, daemon) = fixture().await;
+        sqlx::query("INSERT INTO agent_identity (id,name,created_at,updated_at) VALUES ('removal-agent','Pinned agent','c','u')").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_profile (id,identity_id,backend_kind,executor_type,daemon_id,created_at,updated_at) VALUES ('removal-cli','removal-agent','cli','codex',?,'c','u')").bind(&daemon.id).execute(db.pool()).await.unwrap();
+        for sql in [
+            "INSERT INTO agent_profile (id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('removal-native','removal-agent','native','embedded','c','u')",
+            "UPDATE agent_identity SET selected_profile_id='removal-cli' WHERE id='removal-agent'",
+            "INSERT INTO agent_context_scope (id,identity_id,scope_type,scope_id,created_at,updated_at) VALUES ('removal-scope','removal-agent','account','removal-owner','c','u')",
+            "INSERT INTO agent_session (id,identity_id,profile_id,context_scope_id,backend_kind,runtime_session_id,status,created_at,updated_at) VALUES ('removal-running-cli','removal-agent','removal-cli','removal-scope','cli','cli-id','running','c','u')",
+            "INSERT INTO agent_session (id,identity_id,profile_id,context_scope_id,backend_kind,runtime_session_id,status,created_at,updated_at) VALUES ('removal-saved-native','removal-agent','removal-native','removal-scope','native','native-id','suspended','c','u')",
+        ] { sqlx::query(sql).execute(db.pool()).await.unwrap(); }
+        // This is the third archive writer, outside AgentRepo/AgentService.
+        let result = db
+            .remove_daemon(&daemon.id, "admin", true, "local", false)
+            .await
+            .unwrap();
+        assert_eq!(result.agents_retired, 1);
+        let sessions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_session WHERE identity_id='removal-agent'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(sessions, 0);
+        let archived: Option<String> =
+            sqlx::query_scalar("SELECT archived_at FROM agent_identity WHERE id='removal-agent'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert!(archived.is_some());
     }
 
     #[tokio::test]

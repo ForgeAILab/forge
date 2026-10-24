@@ -85,6 +85,9 @@ pub use sqlite::{
     TaskOperatorRetryRow, UpdateMilestoneReadinessProjectionInput, WorkerDeadLetterIssue,
     WorkerDiagnostic, WorkspaceCleanupAttentionRow, INTEGRATION_OWNED_SQL,
 };
+pub use sqlite::{
+    JournalCleanupBatch, JOURNAL_CLEANUP_BYTES, JOURNAL_CLEANUP_PACKS, JOURNAL_CLEANUP_PAGE,
+};
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;
@@ -419,3 +422,8 @@ pub use sqlite::RecordReviewCiFailureInTxInput;
 pub use sqlite::ClearDaemonUpgradeDispatchRefusalInput;
 
 pub mod review_findings;
+
+pub use sqlite::{
+    SessionPersistenceFlags, SESSION_JOURNAL_ORDINARY_STORAGE_ID,
+    SESSION_JOURNAL_PROTECTED_STORAGE_ID,
+};

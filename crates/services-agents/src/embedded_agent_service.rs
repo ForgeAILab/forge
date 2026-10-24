@@ -548,6 +548,70 @@ impl EmbeddedAgentService {
         Arc::clone(&self.native_backend)
     }
 
+    async fn native_session_retired(&self, session: &AgentSession) -> Result<bool> {
+        Ok(session.backend_kind == "native"
+            && self
+                .db
+                .session_persistence_flags(&session.id)
+                .await?
+                .retired)
+    }
+
+    async fn rotate_retired_session(&self, previous: &AgentSession) -> Result<AgentSession> {
+        let profile = AgentProfileRepo::get_profile(&*self.db, &previous.profile_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found("agent_profile", &previous.profile_id))?;
+        match self.rotate_authorized_session(previous, &profile).await {
+            Ok(session) => Ok(session),
+            Err(error) => {
+                let winner = self
+                    .activation_winner(error, &previous.identity_id, &previous.context_scope_id)
+                    .await?;
+                if winner.profile_id != previous.profile_id
+                    || self.native_session_retired(&winner).await?
+                {
+                    return Err(ServiceError::Db(db::DbError::VersionConflict));
+                }
+                Ok(winner)
+            }
+        }
+    }
+
+    /// Retirement may win after selection but before native writer open. Rotate
+    /// the host identity once, then let any second retirement fail the turn.
+    pub async fn run_native_turn(
+        &self,
+        request: &mut forge_agent_host::AgentTurnRequest,
+        sink: Arc<dyn forge_agent_host::TurnEventSink>,
+    ) -> std::result::Result<forge_agent_host::AgentTurnOutput, forge_agent_host::AgentHostError>
+    {
+        let first = self
+            .native_backend
+            .run_turn(request.clone(), sink.clone())
+            .await;
+        if !matches!(first, Err(forge_agent_host::AgentHostError::SessionRetired)) {
+            return first;
+        }
+        let previous = self
+            .db
+            .get_agent_session(&request.forge_session_id)
+            .await
+            .map_err(|_| forge_agent_host::AgentHostError::ProtectedPersistence)?
+            .ok_or(forge_agent_host::AgentHostError::SessionNotFound)?;
+        if previous.runtime_session_id.as_deref() != Some(&request.runtime_session_id) {
+            return Err(forge_agent_host::AgentHostError::VersionConflict);
+        }
+        let fresh = self
+            .rotate_retired_session(&previous)
+            .await
+            .map_err(|_| forge_agent_host::AgentHostError::ProtectedPersistence)?;
+        request.forge_session_id = fresh.id;
+        request.runtime_session_id = fresh
+            .runtime_session_id
+            .ok_or(forge_agent_host::AgentHostError::SessionNotFound)?;
+        self.native_backend.run_turn(request.clone(), sink).await
+    }
+
     pub fn protected_store(&self) -> Arc<SqliteProtectedRuntimeStore> {
         Arc::clone(&self.protected_store)
     }
@@ -1584,7 +1648,8 @@ impl EmbeddedAgentService {
         canonical: &CanonicalScope,
     ) -> Result<AgentSession> {
         let capabilities = capabilities_for_profile(profile, canonical);
-        if active.profile_id == profile.id
+        if !self.native_session_retired(&active).await?
+            && active.profile_id == profile.id
             && serde_json::from_str::<BackendCapabilities>(&active.capabilities_json).ok()
                 == Some(capabilities)
         {
@@ -1630,6 +1695,9 @@ impl EmbeddedAgentService {
         dormant: &AgentSession,
         now: &str,
     ) -> Result<AgentSession> {
+        if self.native_session_retired(dormant).await? {
+            return self.rotate_retired_session(dormant).await;
+        }
         let resumed = AgentSessionRepo::update_agent_session(
             &*self.db,
             UpdateAgentSession {
@@ -1645,6 +1713,7 @@ impl EmbeddedAgentService {
         .await;
         match resumed {
             Ok(session) => Ok(session),
+            Err(db::DbError::SessionRetired) => self.rotate_retired_session(dormant).await,
             Err(error) => {
                 self.activation_winner(
                     error.into(),
@@ -2801,6 +2870,7 @@ fn intersect_non_empty_layers(layers: &[BTreeSet<String>]) -> BTreeSet<String> {
 
 fn redacted_host_error(error: forge_agent_host::AgentHostError) -> ServiceError {
     match error {
+        forge_agent_host::AgentHostError::SessionRetired => ServiceError::SessionRetired,
         forge_agent_host::AgentHostError::CredentialNotFound
         | forge_agent_host::AgentHostError::SessionNotFound
         | forge_agent_host::AgentHostError::VersionConflict => {

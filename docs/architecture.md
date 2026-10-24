@@ -2411,44 +2411,353 @@ only while Smith owns that CLI runtime. Forge neither reads nor imports that
 credential store into the native host; native Main/Project typed tools require
 an account-owned Forge provider entry and lease.
 
-Protected session/checkpoint payloads use a versioned zstd envelope inside
-authenticated encryption; earlier encrypted JSON rows remain readable and are
-converted on their next state change. Snapshot digests use domain-separated
-HMAC-SHA256 with the protected store key and exclude the save timestamp and
-diagnostic manifests, so unchanged saves do no encryption or database write. Checkpoints
-are idempotent by session, turn, revision, and operation fingerprint, and retain
-the runtime's provider/tool recovery barriers. A checkpoint's exact snapshot
-also serves as the session snapshot (NULL standalone snapshot columns reference
-it); only independent canonical state changes need a separate snapshot. Writes
-use the protected row's revision CAS. A competing snapshot save supersedes the
-losing save; a checkpoint save reloads and retries once if it can still advance
-the winning turn. Newer turns/revisions, conflicting fingerprints, and any
-remaining CAS conflict supersede the losing save. The store handles these races
-for every runtime caller without failing the turn. Snapshot/checkpoint LCM policy markers are tracked
-separately so a standalone save cannot relabel an older checkpoint. A checkpoint
-decode failure returns an error naming the runtime session; it cannot safely
-fall back to fresh state because that would discard provider/tool recovery
-barriers.
+Persistent native sessions use the runtime's JournalEngine over ForgeJournalStorage.
+`EmbeddedAgentService::new` constructs one `SqliteProtectedRuntimeStore` for the
+server or Solo runtime graph. That store constructs one shared storage and one
+`SessionJournals` owner (`agent-host/src/session_journals.rs`). The owner creates
+exactly one protected and one ordinary engine for the storage's process lifetime.
+`SessionStore::journal()` and `CheckpointStore::journal()` return clones of those
+engines; every per-turn RuntimeBuilder and runtime fork receives them through
+clones of the same store. Maintenance and collection receive `store.journals()`
+and its engine clones, sharing gates, lease registries and validated roots. A
+second independent engine over a live storage/domain is unsafe for collection
+and cross-session retirement/dependency checks, even with runtime warm-read
+fences. Engines are never constructed by a turn or collector. The `SessionJournalRetention::retire_page` operation provides a bounded native-only
+selection page for the running retention worker. Replaced sources qualify;
+suspended non-Agent-Chat sessions qualify after startup recovery. For Agent Chat,
+it calls `dormant_native_chat_session_id` for the exact identity, context scope
+and profile, preserving each profile's resumable dormant chat. Reusable Task
+sessions stay published; completion alone does not retire them. Legacy-only dead
+rows are never imported to retire them. A predecessor referenced by a reserved
+successor of an open topic-rotation intent is preserved until that intent closes,
+including after the startup sweep. `SessionJournals::retire_published` loads
+published records in both domains and obtains both revision-bound grants before
+retiring protected then ordinary using the same clones as runtime turns. A live
+writer or conflict defers retirement; retries skip an already retired domain.
+An unreadable own record prevents either domain from retiring. Unknown dependency
+metadata in another session can also defer retirement: Forge preserves partial
+progress and reports a deferral instead of falsely marking the healthy candidate
+unreadable or bypassing the runtime's dependency checks.
 
-Runtime manifests are an ordered recent window (default 32 planned steps),
-not a lifetime session archive. New protected checkpoints omit this diagnostic
-window, while ordinary snapshots preserve any supplied manifests and the
-runtime-owned `runtime.manifest_boundary` extension. The boundary remains part
-of the snapshot digest. Loading the checkpoint-backed snapshot or saving the
-live diagnostic window therefore preserves the same canonical state identity.
-Forge links context provenance from the latest manifest in the live session
-after the turn; it does not reconstruct historical replay from a checkpoint.
+Host dormant selection and active reuse probe native retirement before use and
+rotate a retired row through the versioned host transaction, preserving identity,
+scope and profile with a fresh runtime id. Ready-status writes, including topic
+handoff, guard tombstones in their host transaction. Native open reports a typed
+retirement outcome when retirement wins after selection; Chat, Task and inquiry callers
+rotate and retry once, then return any second failure normally. Engine calls run
+outside host transactions. Explicit session resume refuses retired history with
+`409 session_retired` even with a stale version and leaves the row unchanged; the
+client starts a new session. Tombstones and the prohibition on stale legacy fallback remain intact.
+Task execution carries the host session selected by the final successful turn,
+including reviewer corrections, into both the context manifest id hash and its
+`agent_session_id`. Native unchanged-read failure tracking starts only after a
+Chat session opens successfully, so retired-open retries retain no obsolete ids.
 
-The runtime pin is v0.7.0 plus U9 groups C/D (`1de6d7d`). Its materialized session snapshots stay
-unversioned and its checkpoints remain schema 3 / transition revision 4, so
-Forge keeps the same encrypted store and database schema. Runtime schema-4
-SessionJournal support is only a capability contract in this release; Forge's
-stores do not advertise it, and continue writing materialized snapshots and
-checkpoints. The opt-in flat semantic summary and external-agent features are
-also not configured. Forge retains its per-tool argument normalizers: the
-runtime turns a representable schema-invalid call into a correctable tool error
-(as the previous pin already did), but does not apply Forge's historical
-`parameters`-envelope transformation.
+The supervisor starts one `session-journal-retention` PeriodicWorker in server
+and Solo. It scans immediately, then on a 60-second Skip interval or a post-commit
+shared pool activity Notify (domain-event commits, including Task/check/schedule
+writes, as well as terminal/rotation/recovery/session-deletion nudges). The wake
+is registered before each pass; a fixed one-second debounce drains subsequent
+hints into one pass and prevents immediate back-to-back passes. The 60-second
+tick and durable indexes recover missed wakes.
+A resumable cursor advances through retirement pages, protected collection,
+ordinary collection and deletion draining. The 10-second scheduling budget is
+checked per retirement candidate and between engine calls/cleanup transactions;
+it does not preempt an awaited SQL or engine call. Each collect supplies
+`max_objects=20_000`, a membership-release bound; physical removals can include
+older deferred bytes too. All engine controls are awaited on task-13 clones.
+Successful native terminal, fork and abort publications await S2 maintenance
+and nudge collection; a maintenance error cannot replace the acknowledged turn.
+Retirement forces collection to purge every dead slot in each retired domain's
+packs, including slots below the normal 25% threshold. Reusable Task sessions,
+current dormant chats and active writers remain protected without a TTL.
+
+A sibling `session-journal-conversion` PeriodicWorker runs immediately in server
+and Solo, then every 60 seconds (Skip). It has its own cursor and two-second
+scheduling budget, so a slow legacy import does not delay retention. Each pass
+keyset-pages at most eight native host rows with a legacy row and no ordinary
+native publication or tombstone; protected-only partial imports remain eligible
+for runtime repair. Before import it calls the same retirement predicate as
+retention, skipping replaced and unresumable suspended sessions. An open topic
+rotation protects its reserved successor's predecessor, including after startup
+suspension. It converts one session at a time and yields between candidates. The deadline is checked before each candidate; an in-flight import
+finishes even if it exceeds two seconds. Memory holds one decoded session at a
+time plus the eight scalar candidates and existing bounded engine/storage caches.
+The cursor wraps for skipped rows; restart begins at zero and durable publication
+flags exclude completed conversions. Legacy rows are never updated or deleted.
+
+Native turns and topic forks hold per-session read admission from preparation
+through completion. Conversion tries exclusive admission without waiting, skipping
+active sessions for a later sweep. Admission entries use weak references and
+remove unused entries on access. An already in-flight conversion completes before
+a racing foreground open proceeds, so its writer reservation cannot surface as
+a user conflict. Engine writer fences also protect callers outside host admission.
+Active-writer conflicts are skips for a later sweep. Retryable persistence
+errors, including SQLite BUSY/LOCKED binding failures, advance the cursor and
+remain eligible for the next sweep. Non-retryable per-session import errors,
+including validation conflicts, advance the cursor and park the owner
+with an error-kind reason for this worker lifetime. Restart retries parked errors;
+foreground lazy import stays available after repair. Empty legacy payloads are
+excluded. Retirement-policy skips are also excluded until restart. Lazy import remains the fallback if
+an open reaches a session first; native-first open avoids legacy decoding after
+background conversion. This moves the measured full B/4000 conversion (~3.4 s)
+off first open when the background pass has reached that session; it does not
+make conversion itself faster or promise an instantaneous open during a race.
+
+`SqliteProtectedRuntimeStore::convert_legacy_session` uses the real decoders,
+shared stores and engines, and the existing runtime v3 importer through deferred
+resume. It resolves the existing Forge LCM binding when needed. Pre-topic
+stores wrote snapshots and checkpoints independently, so a checkpoint-only LCM
+reference can authorize adoption of that session's unretired owner-less timeline.
+Both background conversion and lazy resume use this resolver. An earlier failed
+attempt's empty replacement binding can be repaired only before either native
+domain publishes or retires, while the replacement is unclaimed, revision zero,
+and has no entries, nodes or operations. The check and binding replacement share
+one write transaction. Otherwise an existing target binding must equal the
+referenced timeline before transfer; a mismatch leaves shared ownership,
+bindings, receipts and session labels untouched.
+
+Pre-V149 Agent Chat timelines were shared by successive runtimes of the same
+chat. V149 backfills canonical scope and retirement metadata but leaves runtime
+ownership NULL. Forge chooses an active session first, otherwise the newest
+unreplaced suspended native session for the selected Profile in that chat.
+Arbitration follows that choice only when the selected session's own saved state
+references the shared timeline. Background conversion defers a shared pre-topic
+timeline when its resolver target is not the selected Profile's resume choice.
+This includes an unowned timeline and an existing own binding with unreceipted
+referencing siblings. An empty selection, no session for that Profile in this
+chat, or a selected session using a topic timeline cannot authorize adoption.
+These sessions stay legacy, retry with the same cursor, and are counted under
+`skipped_shared_lcm`, never parked or counted unreadable. When the selected target
+references T, conversion can still assign it T and receipt siblings before import.
+
+Foreground resume keeps the pre-branch adoption behavior: arbitration guards
+must never turn a previously resumable chat into a Conflict. The resolver retries
+briefly when a sibling is converting or has a writer. If receipts cannot be
+proved for an unowned timeline, it rolls back arbitration's partial changes and
+lets the Forge-chosen resuming session adopt its own referenced timeline. A
+session already owning its binding can also resume while receipts are deferred.
+Historical V149 retirement does not revoke a session's existing binding or
+prevent it from resolving its own persisted timeline again. Such a timeline
+still loads and receives its first fenced claim exactly once; its retired scope
+and timestamp remain intact. Identity, canonical scope, runtime ownership and
+claim ownership must still match. Retired timelines never enter shared pre-topic
+ownership arbitration.
+Background active-target, sibling-admission and journal-writer conflicts remain
+retryable on subsequent sweeps rather than parked until restart. The public LCM
+resolver retains typed runtime errors; the native host boundary preserves
+transience and missing-session classification.
+
+A successful selected-owner receipt pass caches a process-local clean marker.
+The marker is derived from durable selection and unreceipted sibling metadata,
+including membership, host versions, legacy nonces, bindings, timeline ownership
+and native publication/retirement. An unchanged marker bypasses sibling admission
+and native LCM extension loading on later turns. New siblings or changed legacy
+state invalidate it; restart simply repeats the guarded pass. The marker is
+captured inside the successful arbitration transaction and cached after commit.
+
+Ownership changes still require an unretired shared canonical timeline with
+pre-topic continuity, exclusive sibling admissions, writer leases and version
+fences. Native publication or retirement blocks transfer only for a sibling that
+owns, binds or references that timeline. Unrelated native siblings and chat topic
+or rotation rows do not block arbitration. A replaced predecessor in the same
+identity/context scope is valid for a rotation-linked Profile switch. Receipts
+cover every referencing sibling regardless of status, age or replacement links.
+Only older, unlinked, suspended native siblings of the same Profile are marked
+replaced; all receipt-only siblings retain their status, links and version.
+
+When the selected target already owns and binds the timeline, arbitration records
+receipts without moving ownership or republishing the target's state. This also
+works after publication when the target's native state references the timeline.
+The same admissions, writer checks and version fences apply. Before publishing
+another sibling, conversion routes through the selected target only if that
+target references the shared timeline, then reloads the sibling through its
+receipt. Both cursor orders preserve the selected target's full LCM history and
+each sibling's own transcript and other protected state. A corrupt sibling's
+legacy copy is reported against that sibling and does not prevent the target's
+conversion or resume; the worker parks the corrupt session on its own turn.
+
+Migration `V202610241249` adds only `agent_legacy_lcm_relinquishment`. Receipts
+survive deletion of the transferred timeline and cascade only with the losing
+session. Legacy decoding omits the recorded timeline's LCM and semantic-summary
+namespaces only in a copy that references that timeline. A semantic summary in a
+copy without LCM state is preserved. Original ciphertext, transcripts and LCM
+entries, nodes and operations remain unchanged. On a later Profile switch,
+receipted sessions bind a fresh timeline and rebuild missing derived state from
+retained history. Unrecorded binding mismatches still fail closed. Failed
+arbitration writes roll back ownership, binding, receipts and replacement together.
+
+Older tuning revisions and NULL/stale Forge policy markers do not discard LCM:
+the runtime validates identity, binding and frontier before exact import, then
+rebuilds tuning metadata on live resume. Legacy payloads and chat transcripts
+remain unchanged; corrupt state keeps failing validation. It configures no
+tools or credentialed provider, and its provider refuses calls. The handle is
+dropped without shutdown/persist, avoiding a synthetic boundary. Runtime import
+validation/publication happens before live ability activation; a later activation
+refusal leaves the validated native publication authoritative for the next real
+turn. Non-retryable serialization failures preserve the row and use the same
+capped unreadable tracker. Tracing on `forge_session_journal` reports converted,
+skipped-active, skipped-unreadable, conflicts, examined, remaining and budget
+exhaustion. Parked-error diagnostics include the opaque runtime id and error
+kind, never contents or keys. Remaining excludes parked and retirement-policy
+skips, includes active skips and retryable errors, and reaches zero after eligible work is exhausted.
+Legacy-table removal stays in the next release.
+
+Discovery pages only the clear dirty-session index, including corrupt records.
+Runtime v0.10.0 reports per-session non-retryable failures in `unreadable_sessions`,
+keeps their state and dirty hints, and continues healthy collection. Bounded
+collect calls resume through continuations; a later pass reports still-unreadable
+sessions again, with at most one record load per session in each call.
+Conflicts skip silently; retryable/domain-wide errors abort. The worker and
+storage share a capped, non-evicting process warning tracker. It retains at most
+4,096 ids, warns once per tracked session and emits one overflow warning when
+capacity is reached. Further per-session warnings are suppressed while aggregate
+observations keep counting. Unreadable warnings include the opaque runtime
+session id, never contents or keys.
+Over-capacity warnings use a separate tracker with the same 4,096-session cap and include the runtime
+session id. `over_capacity_sessions` counts distinct affected sessions per pass;
+`preserved_sessions` counts the union with unreadable sessions. Diagnostics
+and compact skip unreadable sessions. The worker deduplicates unreadable ids only
+within the current pass: `preserved_sessions` and `unreadable_sessions` are
+current-pass counts, with no lifetime id set in the restartable cursor.
+`forge_session_journal` events separate retirements, conflicts, dependency
+refusals, collection receipts, readable retained/live/deferred bytes, omitted
+session counts and deletion counts. Collect-call duration is a conservative
+gate-hold upper bound including gate wait; the 10-second budget bounds scheduling,
+not the engine's individual gate hold. Collection refreshes the root epoch on
+each continuation and makes at most 32 calls per pass. Byte diagnostics sample
+the ordinary domain at most once per pass only when `forge_session_journal`
+debug logging is enabled; its domain-scoped values are not whole-database totals.
+A retire-phase error advances to collection and orphan cleanup in that same
+pass; the cursor logs each distinct retirement cause once and retries retirement
+on a later pass.
+
+Operation replay retains an inclusive 64-revision window: collection may prune
+below `max(current_revision - 64, 0)`, preserving every operation at or above
+that floor plus the current writer epoch's last operation, even below the floor.
+The engine selects pruning; storage never prunes without its directive. Replaying
+a pruned operation conflicts instead of applying it again.
+
+Session deletion immediately cascades journal records, pins, catalog,
+operation packs and memberships. Project/Task scopes and physical Agent deletion
+use existing FKs. Repository code removes Agent Chat's polymorphic scopes in
+`delete_agent_chat_scopes_in_tx`, called by direct chat deletion and User/Project
+parent deletion before their FK cascades. Both Agent archive entry points call
+`delete_saved_agent_sessions_in_tx`; machine removal's bulk archive calls the
+same helper in its transaction. Archive is the irreversible user-facing Delete
+operation, with no unarchive API/service/UI path. It deletes native and CLI saved
+sessions; it does not itself signal an already spawned CLI process, and a late
+session-row update gets NotFound instead of recreating the resume handle.
+Ciphertext packs retain their owner labels for bounded physical cleanup. A clear
+orphan marker and partial pack-id index, maintained by membership/session triggers,
+provide a durable cleanup nudge. Committed session deletions also wake the existing
+pool-scoped activity signal after SQL commit/release; rollback does not wake it.
+
+`SessionJournalRetention::drain_deleted_packs` delegates to the DB-only
+`drain_session_journal_orphans`: discover up to 5,000 indexed candidate ids, then
+recheck owner labels and absence of membership under BEGIN IMMEDIATE. One call
+commits at most 32 packs and 8 MiB retained canonical bytes, including all deferred
+dead bytes irrespective of the 25% threshold. It returns a continuation cursor;
+new sweeps and restart begin at zero. No pack is decrypted and cleanup counts are
+separate from engine apply receipts. Other sessions' independent copies remain
+readable. Reusing a deleted session's runtime id fails with the pack-owner mapping
+error until its old-owner packs drain; afterward the new owner works on the same
+shared engines. The retention worker schedules repeated drain batches until the
+index is drained or its scheduling budget expires, resuming the cursor next pass.
+A drain COMMIT error is transient DbError::AmbiguousCommit; the next pass retries
+from durable state without fabricating an apply receipt.
+
+Both domains enable explicit engine collection and set 128 MiB of estimated
+validated-root memo charge independently (256 MiB combined), separate from the
+storage's 64 MiB cache and live writers. This is not an RSS bound: review observed
+up to 1.24 times the estimated charge, about 159 MiB per engine / 317 MiB combined.
+Clones reuse warm validation across writer changes; restart, eviction and
+oversize entries require cold validation. Zero and tiny budgets preserve results.
+Protected state is exact. The ordinary ForgeJournalProjection removes sensitive
+extensions only in the reserved optional `forge.diagnostics.*` namespace family.
+That family must never carry recovery data. Other extensions, LCM, conversation,
+identity/order/cardinality, counters, timestamps, runtime cache and manifests
+remain exact, including ordinary-only sessions before their first checkpoint.
+Cache/manifests may contain content; broader free-text redaction has no approved
+recovery-equivalence evidence. Both domains remain encrypted. Credentials stay in
+their existing protected tables and leases, outside journal state.
+
+The pin is agent-runtime v0.10.0 (`c036af7b4635cf7d76451aaa666a9df87405ca1a`).
+The release rolls back proven unaccepted turn input and fences unresolved
+acceptance until reopen. Forge separates terminal outcomes and per-turn usage
+from shutdown/persist cleanup. Failed and cancelled turns retain their original
+classification, message and usage envelope when cleanup returns the runtime's
+typed fencing conflict; other secondary cleanup failures cannot replace a primary
+failure either. Shutdown closes leases, and the active-turn registration is
+removed before returning. A successful turn's genuine persistence failure remains
+an error, with the first cleanup failure preserved. The next request opens a fresh
+handle. Both seven-cut/both-domain wedge regressions, unresolved acceptance, and
+deterministic cancellation barriers before/after provider I/O cover recovery.
+Native-first open uses the runtime importer for eligible legacy snapshot-only or
+checkpoint-bearing state, publishing protected exact first when a checkpoint
+exists. It reads Forge's authenticated zstd envelope or pre-envelope encrypted
+JSON without rewriting the legacy row. Already native heads skip legacy loads;
+tombstones suppress fallback. Both production legacy saves return the typed
+conflict `legacy session store is read-only`; their old CAS, digest-skip, retry,
+supersession and policy-marker write paths are gone. The exact legacy
+save-order/digest/encryption baseline exists only under tests/test-support for
+D10 measurements. No legacy payload is cleared and the legacy table remains for
+next-release cleanup. The file-backed `legacy_import_state_matrix` covers Idle,
+snapshot-only, CallingModel, ModelResponseReady, AwaitingApproval,
+AwaitingInteraction, ExecutingTools, ToolOutcomeReady and cache-started imports.
+Deferred recovery performs no provider/tool/interaction I/O, all legacy columns
+remain unchanged, checkpoint-bearing state publishes protected first, and a
+second native open makes no legacy loads. Ordinary snapshots match the host
+projection; protected checkpoints match their exact input independently.
+
+`import_and_commit_crash_cuts` exercises all seven runtime failure points across
+119 import combinations and 161 live plain/tool publication cases. A fresh SQL
+pool, storage and engine pair checks repair/recovery; every live and recovered
+publication equals the legacy oracle, including lost acknowledgements, without
+replaying model/tool operations or overlaying stale legacy state. The async
+control regression holds a real SQLite write lock while controls and writer
+open wait, and proves local close and timer progress on both current-thread and
+multi-thread Tokio runtimes. `journal_credential_exclusion` separately runs real provider-adapter tool turns
+with API-key/OAuth sources and token refresh, audits every decrypted journal
+unit (including framed objects, decompressed and unheld bodies) in both domains
+for raw, normalized, encoded and partial credential echoes. It also inspects JSON
+string escapes and byte vectors, then separately checks cold exact recovery.
+Ordinary diagnostic redaction remains an independent assertion.
+
+`writer_fence_and_drop` holds one native writer while concurrent turn, fork and
+abort-fork writers from other runtimes conflict before provider I/O; concurrent
+ephemeral inquiries on the same id neither take nor free the slot, and dropping
+the holder releases it for the next writer, abort, fork and successor open.
+Native chat and Task integration tests no longer write legacy rows. Their
+fixture state comes from real runtime turns, and failures are injected through
+`fail_next_commit_at`, a storage fault scoped to one session's native journal
+rows, or zeroed sealed pack bodies. A superseded LCM component revision is
+produced by running turns under different Forge working-set/input-budget
+tunables; the next turn under the current tunables rebuilds and republishes both
+domains.
+
+Older builds cannot resume journal-only state and refuse the newer database;
+downgrade requires a pre-upgrade backup.
+
+Host saved-state, topic hand-over and Attention continuity probes use indexed
+scalar native publication/retirement/checkpoint flags plus eligible legacy payload
+presence, never packs. Writer reservations do not count as saved state. Either
+native publication takes authority from legacy data; retirement in either domain
+suppresses stale fallback. `checkpoint_present` keeps its meaning: an unretired
+published protected checkpoint or an unimported legacy checkpoint. Per-turn/fork
+preparation probes after scope authorization; ephemeral inquiries and reviewers
+attach no stores and bypass persistence discovery. LCM overhead and timeline
+adoption use `JournalReader::extension(LCM_COMPONENT_ID)` with ordinary first and
+protected fallback if that value was omitted. The bounded reader operation reads
+only head, batch, map path and the selected opaque value. Cold lease acquisition
+still validates the complete root before that operation, as required by the
+runtime; it is separate from scalar existence and is reused by later writer opens.
+
+Runtime manifests are an ordered recent window (default 32 planned steps), not
+a lifetime archive. Protected checkpoints omit the live diagnostic window while
+ordinary structured deltas preserve manifests and runtime-owned cache/boundary
+extensions exactly. Forge links context provenance from the latest live manifest
+after the turn rather than reconstructing replay from a checkpoint.
 
 v0.5.0 records the provider and model that produced each reasoning part
 (`producer`) in canonical history, so it reaches the encrypted snapshot and
@@ -2468,13 +2777,11 @@ rebuilding derived accounting. `FORGE_LCM_POLICY_REVISION` stays
 Forge/runtime pin and proves encrypted snapshot/checkpoint resume, compaction,
 another turn and a second resume with historical sources and nodes intact.
 
-Both Forge stores keep the default unsupported `journal()` capability. The
-runtime's native import, writer fencing, retirement and collection paths are
-not enabled; materialized snapshots remain unversioned and checkpoints remain
-schema 3 / transition revision 4. The turn backend waits for
-`TurnHandle::completed()` before persisting and releasing its active registry;
-completion now also guarantees that runtime admission and execution gates have
-been released.
+Materialized legacy snapshots remain unversioned and legacy checkpoints remain
+schema 3 / transition revision 4; native journal objects use the runtime's released
+journal schema. The turn backend waits for `TurnHandle::completed()` before
+persisting and releasing its active registry; completion guarantees runtime
+admission and execution gates have been released.
 
 Forge's custom provider transport caps HTTP error bodies at 8 KiB, extracts only
 JSON/SSE error status/code and message fields, and drops a reason that reflects
@@ -2562,6 +2869,15 @@ set each value. Smaller provider windows clamp both values. The planner enforces
 the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction.
 Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
 are removed.
+
+The pinned agent-runtime v0.10.0 uses `agent-runtime-lcm-4`: normal condensation
+carries the newest full covered-entry size tier rather than triggering on active
+node count. Depth stays logarithmic; without token pressure, the frontier can
+retain about `fanout - 1` summaries per tier and use more context. Existing
+soft/hard pressure thresholds still bound context and can trigger smaller merges
+after leaf compaction. Persisted nodes and pending operations remain resumable.
+This dependency upgrade retains Forge's encrypted snapshot/checkpoint persistence;
+native session journals and collection use the shared engines and retention worker described above.
 
 The runtime measures fixed overhead only after a successful plan, so a cold
 session (new, adopted, or with no successful plan yet) would budget history
@@ -2914,6 +3230,8 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `lifecycle-projection` | Existing EventBus receiver; only events the handler acts on count as ticks; other hints bypass health, lag warned | 1 hour / cancel |
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
+| `session-journal-conversion` | Immediate pass, 60-second Skip interval | 2-second scheduling budget / warn and await; eight candidates, one import at a time, yield, keyset cursor and durable publication progress |
+| `session-journal-retention` | Immediate pass, 60-second Skip interval and shared pool domain-event/terminal/deletion activity Notify with a fixed one-second debounce | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 calls per pass, resumable retirement/collection/cleanup cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
@@ -8162,8 +8480,233 @@ require `WHERE version = ?` and increment on success. Version mismatch →
 ## Database
 
 SQLite with WAL mode. Schema in
-`crates/db/migrations/V001__initial_schema.sql`. All primary keys are
-app-generated UUID v4; all timestamps are app-generated RFC3339.
+`crates/db/migrations/V001__initial_schema.sql`. Entity primary keys are
+app-generated UUID v4; all timestamps are app-generated RFC3339. Journal metadata
+uses composite runtime-session keys, and journal packs use monotonic SQLite ids.
+
+`V202610200941__session_journal.sql` adds six tables as the storage foundation for
+native session journals, now used by persistent native runtimes:
+
+| Table (`agent_session_journal_` prefix) | Stored unit and lifetime |
+| --- | --- |
+| `session` | Sealed engine record, publication/checkpoint/retirement flags and control-generation/revision/writer-epoch fence; keyed by `(storage_id, role, runtime_session_id)`. |
+| `pin` | Sealed pin record, keyed by scope plus a 32-byte keyed lookup value. |
+| `catalog` | Sealed catalog entry, keyed by scope plus a 32-byte keyed head lookup value. |
+| `pack` | Owned by one runtime session (no domain columns) and shared by its protected and ordinary domains; Forge owner label, generation, object count and retained canonical byte count; separately sealed index and body units. `AUTOINCREMENT` pack ids are never reused. |
+| `membership` | One nonzero bitmap per domain/session/pack; composite FKs enforce the pack's runtime session and Forge owner. Each domain reads only through its own bitmap. Slot-count/bitmap-length agreement belongs to storage. |
+| `operation_pack` | Sealed original operation results in nonnegative binary-carry/overflow tiers. |
+
+Session, pin, catalog, membership and operation-pack rows have indexed
+`forge_session_id` foreign keys cascading from `agent_session`. Child metadata
+also cascades from its journal session. Packs have an indexed Forge owner label
+with **no owner FK**: they survive session deletion for later bounded physical
+cleanup. Pack lookup uses `(runtime_session_id, pack_id)`; membership has a
+reverse `pack_id` index and a `(runtime_session_id, pack_id)` index for loading
+every domain's bitmaps of one session; dirty-session paging uses a partial
+domain/runtime-session index. A plain non-unique index on
+`agent_session(runtime_session_id)` preserves existing duplicate and NULL values.
+
+Fence counters and pack generation use eight-byte big-endian BLOBs to preserve
+the runtime's full unsigned 64-bit range in SQL comparisons. CHECKs constrain
+roles, flags, counter widths, positive key/format revisions, 24-byte nonces,
+sealed payload lengths, lookup-key widths, positive pack counts and the 1 MiB
+retained canonical body cap. A checkpoint requires a published, unretired head;
+empty/all-zero membership bitmaps are refused. The additive migration leaves
+every legacy `protected_agent_session_state` value unchanged. Older builds
+refuse an unknown applied migration; downgrade requires a pre-upgrade backup.
+
+`crates/agent-host/src/session_journal/` implements the encrypted sqlx storage
+boundary independently of the runtime engine. The long-lived host owner
+connects it to both native persistence capabilities. `codec.rs` encodes JRPACK v1: a separately sealed
+`JRPACK\0`/version/count index with sorted four-byte prefixes and bounded varint
+offsets/lengths, and a zstd level-3 body unit ordered by kind and full id. Each
+pack holds at most 1 MiB of canonical bodies. Reads verify canonical envelopes,
+kinds and complete content ids, including prefix collisions. SQL holds no
+per-object id, prefix or keyed object index.
+
+`ForgeJournalProjection` opts into the runtime's incremental projection protocol
+at policy revision 1. It changes only updated optional diagnostic extensions:
+a Sensitive replacement becomes a removal, so a formerly visible value cannot
+survive. History, usage, manifests, restore-critical extensions and runtime-owned
+structured references stay exact. Bootstrap, unknown policy revisions and opaque
+diagnostic references use complete projection. Pointwise equivalence with the
+existing complete policy is tested across both sensitivity transitions and
+removals; the conservative redaction policy itself is unchanged.
+
+The runtime is pinned to v0.10.0 at `c036af7b4635cf7d76451aaa666a9df87405ca1a`.
+`collection.rs` implements the required bounded storage protocol. Member pages
+keyset by pack id and slot, opening at most one capped pack per page; pin pages
+use an indexed relative rank, while pin ids and lookup HMACs stay unchanged.
+The additive `V202610240425__journal_collection_pages.sql` migration adds pin ranks and a
+per-domain session layout generation and an index on runtime session id.
+Pack rewrite/delete writers and orphan drain bump all domains of the affected
+session through that index, once per transaction; no layout triggers remain.
+Monotonic inserts cannot move an existing position and need no layout bump.
+Continuations bind the full runtime fence; member positions additionally bind
+that layout generation, so S2/compact cannot
+silently skip a moved member. Missing pin ranks backfill in the next writer
+transaction; `load()` remains read-only and independent of pin readability. Sparse ranks make an insertion
+decrypt only its new pin and logarithmically many comparisons, updating existing
+ranks only when a gap is exhausted. Pin pages authenticate ids and verify strict
+id/rank ordering through the lookahead and across continuations; unreadable or
+duplicate ranks fail conservatively. Encrypted pin payloads are preserved.
+
+Preflight is read-only. It counts touched input packs, forced deferred purges,
+bounded base-repack inputs and changed operation segments, at most 32 physical
+units of 1 MiB each. Apply repeats planning under BEGIN IMMEDIATE and commits
+all selected releases and metadata atomically, or changes nothing. Merge outputs
+are the transformation of their charged input packs. Deferred forced purges
+retain the durable dirty hint until a later bounded apply finishes them. Engine
+reports may now name incomplete live membership as unreadable; the existing
+capped warning tracker and per-pass diagnostics preserve those sessions too.
+The retention worker refreshes the root epoch for each continuation and keeps
+its domain phase while `has_more`, within its ten-second deadline and a 32-call
+cap. Background conversion retains its separate eight-candidate/two-second
+budget. Benchmark after-turn and final-shutdown drains have a 10,000-call bound,
+record every individual gate hold and refresh epochs between calls.
+
+`seal.rs` derives distinct AEAD and lookup keys with HKDF-SHA256 from the exact
+master key already passed to `SqliteProtectedRuntimeStore` (SHA-256 of the
+existing protected key material/server JWT secret). The labels are
+`forge/session-journal/aead/v1` and `forge/session-journal/lookup/v1`;
+`key_revision` remains 1. Every unit uses XChaCha20-Poly1305 with a fresh 24-byte
+nonce and the `FORGE-JOURNAL\0` version-1 envelope. Length-delimited associated
+data binds the table/unit kind, scope, Forge owner, row key, generation, format
+and key revision. Session, pin, catalog and operation units bind the full
+storage-id/role/runtime-session scope. Pack index and body units are shared by a
+session's domains and bind a session scope instead (`session_pack` table label,
+unit codes 7/8, no domain fields); a domain-bound binding can never open a pack
+unit or the reverse. Pin and catalog keys
+are separately contextualized HMAC-SHA256 values; real ids, operation results
+and opaque engine metadata remain sealed. Authentication failures fail closed.
+
+`storage.rs` serves lossless records, objects, memberships, operations, pins,
+catalogs and runtime-id-sorted dirty pages through one WAL read transaction per
+call. Loading a record and constructing storage decode no packs. Indexes hydrate
+lazily within the requested runtime session; its pack headers and every
+domain's membership bitmaps are reread on each call, and only new or changed
+index units are decoded. Body reads batch by pack, verify full ids and enforce
+the requesting domain's current membership even on cache hits. Lookup prefixes
+are computed once per requested id. A shared 64 MiB charged LRU in `cache.rs`
+bounds per-session directories and plaintext bodies together; keys carry pack id
+and generation, so a rewrite never serves stale slots. Committed physical
+rewrites (apply purges/merges, S2, compact) forget only removed or rewritten
+pack ids and publish the bodies they sealed; other immutable bodies stay cached.
+`sharing()` declares PerSession: identical bodies are stored once per runtime
+session and shared by its domains, never across sessions. The retained
+canonical-byte diagnostic covers every pack of the sessions a domain
+participates in (record or membership), plus orphaned packs until drained, so
+the protected and ordinary values overlap. It authenticates session records and
+index counts in bounded per-session pages without opening body units.
+`byte_stats` also reports live bytes (held by any domain) and deferred bytes
+(held by none), plus skipped-session counts. When a session cannot authenticate, its entire diagnostic
+contribution is omitted and logged: totals cover readable sessions, not the whole
+domain. This diagnostic never controls liveness or stands for file size.
+
+`apply.rs` uses one `db::begin_immediate` transaction and a full SQL revision/
+writer-epoch/generation guard, with checked all-zero absence and successor
+generation. It admits non-control objects, checkpoint and batch, writes
+pins/catalog, admits the head, then writes the record and original operation
+result in the runtime's cut order. Six pre-commit cuts roll back the whole
+transaction, so the apply's genuinely new bodies are encoded, sealed and
+inserted once, as one final pack (capped segments when larger) written before
+the record; no intermediate per-cut pack rows exist. Admission searches every
+pack of the session: an identical body already stored, including one only the
+other domain holds or a deferred slot, gains the writing domain's bit after a
+full byte comparison instead of a new copy. Admitted bodies are validated once,
+before the write lock; packing re-checks only order and the cap. AfterCommit commits then
+returns an ambiguous error. A warm one-turn commit reads only the scope's pack
+headers/bitmaps, the new pack's index and the operation tiers, and writes one
+pack row. Only the written
+scope's directory refreshes; cache staleness is never a StateConflict. Cache
+publication follows commit; errors and cancellation invalidate the affected
+scope. Tracing target `forge_session_journal` reports apply kind, elapsed/lock
+hold durations, success/commit flags and physical receipt counts without ids or
+contents.
+
+An apply error that is non-retryable guarantees no durable effect. Ambiguous
+COMMIT/rollback acknowledgements, lost acks and post-COMMIT cache failures are
+retryable. SQLx BUSY/LOCKED uses numeric primary/extended codes through DbError's
+low-byte classification; IO/CANTOPEN, pool/worker and cache/codec availability
+failures are retryable too. Pre-commit validation/constraint/authentication
+failures roll back. Physical compact returns retryable domain errors because
+previous bounded batches may have committed; corrupt-session batches roll back
+and the rest of the domain continues.
+
+Pin/catalog Put/Remove persist the supplied records verbatim, including unknown
+engine versions and bytes. Async engine retained-root, staged-leaf and pin-release
+controls survive restart without host closure computation or private metadata
+parsing. `operations.rs` seals zstd packs of complete original operation results.
+Primary tiers contain exactly `2^tier` records; a carry exceeding 1 MiB of
+serialized records leaves the occupied segment sealed and writes a capped overflow
+segment at tier 64 or above. Oversized records fail atomically. Only an explicit
+pruning directive removes operations: keep revisions at or above its inclusive
+floor and the highest-revision operation of the replacement record's writer
+epoch. Changed partial tiers become capped overflow segments; unchanged packs
+retain their ciphertext. The engine alone chooses the floor and handles replay.
+
+`release.rs` deduplicates release ids and clears only the writing domain's
+membership bits. Read authority ends immediately, including on warm cache hits.
+A slot is dead only when no domain of the session holds it. Dead canonical body
+bytes below 25% remain sealed. Reaching 25%, the writing domain holding nothing
+left in the session, or collecting a retired session purges dead copies,
+including previously deferred slots absent from the new release list. A purge
+keeps the pack id, advances its generation, and atomically remaps every holder
+domain's bitmap from its own previous bits, or deletes an empty pack. Receipts
+count each physical copy and its original canonical length only when removed; a
+release while the other domain still holds the slot, clearing bits, restoring a
+retained slot and moving live bodies count zero. Mandatory purges run with
+optional S2 merging disabled. Separate sessions' copies never delay each other's
+reclamation. Retained bytes include dead slots
+until their removal and reconcile with the physical receipts.
+
+`maintenance.rs` provides async `post_terminal(domain, session)` for the native
+terminal/fork/abort hooks. It authenticates the record before rewriting and merges equal logical-byte tiers from a 4 KiB minimum,
+carrying geometrically only when a pair fits 1 MiB. Collection's base repack uses
+only packs below 64 KiB or survivors purged by that apply. Both paths exclude
+a pack fully held by another domain when the acting domain does not hold it
+entirely. Fully live mixed packs with no complete holder remain eligible;
+merging them preserves each holder's own bits. This keeps another domain's
+complete stable history out of the acting domain's short-lived packs while
+reducing mixed-pack fragmentation. Collection leaves stable large packs sealed; both
+maintenance paths leave deferred-dead packs sealed. Repack output is partitioned by kind before cutting
+at 1 MiB; "fully live" means every slot is held by some domain, and each move
+remaps every holder domain's bitmap of that session from its own bits, so no
+domain gains a body it did not admit. Explicit `compact(domain)` keysets original pack ids and
+processes one session and at most 8 MiB of rewritten logical bodies per transaction,
+without advancing the session generation or purging deferred bytes. It then calls
+`db::incremental_vacuum`, which is bounded and a no-op without incremental
+SQL auto-vacuum. There is no full VACUUM. Failed physical work can be retried
+without undoing acknowledged state. The S2 switch and compact diagnostics exist
+only under test-support. No JournalStorage method remains typed Unsupported;
+native runtimes now use the shared engine owner described above.
+
+Agent-host's explicit `test-support` feature provides file-backed fixtures whose
+storage decorators retain their temporary directories and create host mappings
+on the first apply for arbitrary runtime ids. Read-test seeding and generation
+resealing helpers exist only under that feature. Engine conformance factories
+now use the production sqlx adapter with real AEAD. The unedited v0.10.0 testkit
+storage suite exercises all 27 named cases, including
+`bounded_collection_protocol`, in each of three configurations:
+`storage_conformance_no_repack`, `storage_conformance_repack`, and
+`storage_conformance_reopen` (a fresh independent pool and empty storage caches
+on every hydration load). All declare PerSession with within-session domain sharing;
+S2 off keeps mandatory purges enabled. The testkit supplies the engine collection
+host implementation; Forge adds no collector semantics.
+
+Thirteen test-target-only broken-storage decorators are each rejected at their
+named conformance case: torn transactions, lost acknowledged writes, reordered
+n+1 publication, ignored writer epoch, ignored control generation, premature
+unlinking of a remaining holder's copy, serving released bytes to a non-member,
+and a non-retryable lost acknowledgement. Five bounded-protocol controls cover
+unbounded or stale pages, partial applies, underreported units and dropped pin
+pages. The non-member defect is rejected by `body_cache_membership` (added in v0.9.0); NonRetryableLostAck is rejected by
+atomic_apply_cuts. Valid releases preserve other holders and reclaim only bytes
+no domain of the session still holds. The focused `session_journal_storage` target retains the
+codec/storage/maintenance regressions. Legacy decoder tests use the real
+envelope, checkpoint decoder and runtime schema/transition validation. This
+conformance gate is complemented by the focused session_journal_runtime tests
+for engine ownership, projection, probes and legacy write refusals.
 
 Migrations are files named `V{version}__{name}.sql`, embedded in the binary
 and recorded by version and name in the `_migration` table. Versions up to
@@ -8200,10 +8743,13 @@ New database logic triggers are not allowed. Constraint/validation guards stay
 in SQLite. The remaining logic-trigger families are intentional projections or
 invalidations that must observe every writer: G02 memory FTS; G07 Task
 notification outbox; G08 board/list revisions; G09 status epoch; G10–G13
-scheduler dirty generations and wait-age; and G14 usage-read watermarks.
+scheduler dirty generations and wait-age; G14 usage-read watermarks; and the
+session-journal orphan markers, which must observe session/membership FK cascades.
+The unreleased journal deletion migration contains only these projection triggers;
+chat and archive logic lives in the repository writers below.
 
-Five former logic triggers (dropped by V202610180752–V202610180820) are now
-repository code that runs in the source writer's transaction. A trigger saw
+Former logic triggers (dropped by V202610180752–V202610180820, or removed from
+the unreleased journal deletion migration) are now repository code that runs in the source writer's transaction. A trigger saw
 every writer; this code sees only the writers that call it, so any new
 statement that writes one of these source rows must go through the named
 writer or call its helper:
@@ -8216,6 +8762,8 @@ writer or call its helper:
 | Attention reopen wake rearm | `attention_projection.status` from `resolved` to anything else, including upserts | `attention.rs` `rearm_attention_wake_on_reopen_in_tx` |
 | Main Chat topic rotation and its origin turn | insert `product_genesis_session`, Genesis `lifecycle` to `handed_off`, insert `agent_handoff`, user `agent_chat_message`, insert `agent_chat_topic_rotation` | `agent_chat_topic.rs` `enqueue_native_topic_rotation_in_tx`, `enqueue_idle_topic_rotation_in_tx`, `assign_topic_rotation_origin_in_tx` |
 | Task media projection and GC state | insert `task_media`, soft delete of `task_media`, insert `project_media_attachment` or `project_release_media_pin` | `task_media.rs` `project_task_media_in_tx` and `soft_delete_media`; `shared_media.rs` `reconcile_media_asset_in_tx` |
+| Chat saved-session deletion | direct delete `agent_chat`, or User/Project deletion cascading chats | `agent_chat.rs` `delete_agent_chat` / `delete_agent_chat_scopes_in_tx`; User/Project writers call the same scope helper before cascade |
+| Agent saved-session deletion | archive `agent_identity`, including machine removal | `agent.rs` `archive` / `archive_agent_identity_in_tx` → `delete_saved_agent_sessions_in_tx`; `daemon.rs` bulk archive calls that helper in its transaction |
 
 Out-of-tree writers follow the same rule: `scripts/perf_fixture.py` writes the
 Project Chat and setup binding for the Projects it inserts with raw SQL.

@@ -231,6 +231,8 @@ pub struct CreateAgentSessionRequest {
     pub scope: CanonicalScopeRequest,
 }
 
+/// Optimistic session mutation. Resume refuses retired history with HTTP 409
+/// `session_retired`; the client must start a new session.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SessionVersionRequest {

@@ -351,6 +351,12 @@ pub fn outcome_for_service_error_with_correction(
     retry: Option<RetryInstruction>,
 ) -> OrchestrationOutcome {
     let (code, safe_message, default_retry, setup_requirements) = match error {
+        ServiceError::SessionRetired => (
+            OutcomeCode::ValidationError,
+            "session history has been retired; start a new session",
+            None,
+            None,
+        ),
         ServiceError::ServerCommandsDisabled => (OutcomeCode::ServerCommandsDisabled, executors::server_commands::MESSAGE, None, None),
         ServiceError::ServerAgentsDisabled => (OutcomeCode::ServerCommandsDisabled, executors::server_commands::AGENTS_MESSAGE, None, None),
         ServiceError::ServerLocationRefused { .. } => (OutcomeCode::ValidationError, executors::server_commands::LOCATION_MESSAGE, None, None),

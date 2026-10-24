@@ -386,6 +386,9 @@ pub enum ServiceError {
         wait_cause: Option<api_types::DeniedBy>,
     },
 
+    #[error("session history has been retired; start a new session")]
+    SessionRetired,
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -513,6 +516,7 @@ impl From<db::DbError> for ServiceError {
             db::DbError::TaskConditionQuarantined { task_id } => {
                 Self::TaskConditionQuarantined { task_id }
             }
+            db::DbError::SessionRetired => Self::SessionRetired,
             db::DbError::DependencyGate => Self::DependencyGate,
             db::DbError::AgentPaused { agent_id } => Self::AgentPaused { agent_id },
             db::DbError::ProjectPaused { project_id } => Self::ProjectPaused { project_id },

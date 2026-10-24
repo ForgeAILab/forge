@@ -1,4 +1,4 @@
-use super::tests::{runtime_v050_fixture_runtime, session_store};
+use super::tests::{native_snapshot, runtime_v050_fixture_runtime, session_store};
 use super::*;
 
 /// Captured with Forge 78702e7c and runtime 82f5aac (0.5.0), before changing
@@ -33,8 +33,8 @@ async fn runtime_82f5aac_session_resumes_and_compacts_without_policy_reset() {
             .await
             .unwrap();
     }
-    assert!(SessionStore::journal(&store).is_none());
-    assert!(CheckpointStore::journal(&store).is_none());
+    assert!(SessionStore::journal(&store).is_some());
+    assert!(CheckpointStore::journal(&store).is_some());
     let id = SessionId::new("state-runtime");
     let old = SessionStore::load(&store, &id).await.unwrap().unwrap();
     let old_checkpoint = CheckpointStore::load_latest(&store, &id)
@@ -103,17 +103,24 @@ async fn runtime_82f5aac_session_resumes_and_compacts_without_policy_reset() {
         new_lcm.value["sizer_revision"],
         old_lcm.value["sizer_revision"]
     );
-    for field in [
-        "binding_revision",
-        "classifier_revision",
-        "algorithm_revision",
-        "timeline_id",
-    ] {
+    for field in ["binding_revision", "classifier_revision", "timeline_id"] {
         assert_eq!(
             new_lcm.value[field], old_lcm.value[field],
             "identity field {field}"
         );
     }
+    assert_eq!(
+        new_lcm.value["algorithm_revision"],
+        serde_json::to_value(
+            agent_runtime::harness::LcmCoordinatorPolicy::default().algorithm_revision
+        )
+        .unwrap(),
+        "derived algorithm state adopts the pinned runtime policy"
+    );
+    assert_ne!(
+        new_lcm.value["algorithm_revision"],
+        old_lcm.value["algorithm_revision"]
+    );
     let compacted = session.try_idle_compaction().await.unwrap();
     assert!(matches!(
         compacted,
@@ -139,7 +146,7 @@ async fn runtime_82f5aac_session_resumes_and_compacts_without_policy_reset() {
     ));
     session.persist().await.unwrap();
     assert_eq!(provider.requests().len(), 1);
-    let saved = SessionStore::load(&store, &id).await.unwrap().unwrap();
+    let saved = native_snapshot(&store, &id).await;
     assert_eq!(&saved.history[..old.history.len()], old.history.as_slice());
     assert_eq!(saved.history.len(), 10);
     let retained: Vec<(String, String, String)> = sqlx::query_as(

@@ -576,6 +576,11 @@ impl AgentSessionRepo for SqliteDb {
             .get_agent_session(&input.id)
             .await?
             .ok_or(DbError::NotFound)?;
+        let mut transaction = crate::begin_immediate(&self.pool).await?;
+        if input.status.as_deref().unwrap_or(&existing.status) == "ready" {
+            super::session_journal_probe::require_unretired_session(&mut transaction, &input.id)
+                .await?;
+        }
         if existing.version != input.expected_version {
             return Err(DbError::VersionConflict);
         }
@@ -601,11 +606,12 @@ impl AgentSessionRepo for SqliteDb {
         .bind(&input.updated_at)
         .bind(&input.id)
         .bind(input.expected_version)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::VersionConflict);
         }
+        transaction.commit().await?;
         self.get_agent_session(&input.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -648,6 +654,7 @@ impl AgentSessionRepo for SqliteDb {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        self.session_journal_cleanup_notify().notify_waiters();
         self.get_agent_session(&input.replacement.id)
             .await?
             .ok_or(DbError::NotFound)
@@ -669,7 +676,11 @@ impl AgentSessionRepo for SqliteDb {
         .bind(updated_at)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        let suspended = result.rows_affected();
+        if suspended != 0 {
+            self.session_journal_cleanup_notify().notify_waiters();
+        }
+        Ok(suspended)
     }
 }
 
@@ -967,23 +978,6 @@ impl SqliteDb {
         .fetch_one(self.pool())
         .await?;
         Ok(TopicRotationScopeWorkspaceRow { row: rows })
-    }
-}
-
-impl SqliteDb {
-    pub async fn topic_rotation_successor_has_protected_state(
-        &self,
-        session_id: &str,
-    ) -> crate::Result<bool> {
-        Ok(sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM protected_agent_session_state
-                           WHERE session_id = ?
-                             AND (snapshot_ciphertext IS NOT NULL
-                                  OR checkpoint_ciphertext IS NOT NULL))",
-        )
-        .bind(session_id)
-        .fetch_one(self.pool())
-        .await?)
     }
 }
 

@@ -264,7 +264,7 @@ pub async fn create_sqlite_pool(database_url: &str) -> Result<SqlitePool> {
                 hooks.take(key);
                 let updated = Arc::clone(&dirty);
                 handle.set_update_hook(move |update| {
-                    if (update.table == "domain_event" && update.operation == sqlx::sqlite::SqliteOperation::Insert) || ((update.table == "task_schedule_dirty" || update.table == "project_schedule_dirty") && update.operation != sqlx::sqlite::SqliteOperation::Delete) {
+                    if (update.table == "agent_session" && update.operation == sqlx::sqlite::SqliteOperation::Delete) || (update.table == "domain_event" && update.operation == sqlx::sqlite::SqliteOperation::Insert) || ((update.table == "task_schedule_dirty" || update.table == "project_schedule_dirty") && update.operation != sqlx::sqlite::SqliteOperation::Delete) {
                         updated.store(true, Ordering::Relaxed);
                     }
                 });
