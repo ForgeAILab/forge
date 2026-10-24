@@ -38,7 +38,7 @@ The following path is present:
 2. The embedded-agent routes pass it to `EmbeddedAgentService`.
 3. The service stores it on the immutable agent profile.
 4. Native turn builders copy the profile value into `NativeProviderConfig`.
-5. `crates/agent-host/src/native.rs` applies it to Agent Runtime through
+5. `crates/agent-host/src/native/runtime_setup.rs` applies it to Agent Runtime through
    `ReasoningConfig`.
 6. The shared Agent Runtime OpenAI-compatible adapter serializes the value as
    the Chat Completions field `reasoning_effort`.
