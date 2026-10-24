@@ -212,6 +212,13 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 - **States:** default, filtering, ordering-disabled, committing, conflict, loading, and error.
 - **Accessibility:** ordering eligibility is visible text and announced; non-ordering controls remain usable during a move.
 
+### Task table filters
+
+- Reuse the existing DropdownMenu, Checkbox, compact filter controls and semantic tokens.
+- The Statuses menu offers labelled checkboxes for workflow states and task statuses. Multiple statuses match any selected status; priority bounds, assignment and blocked filters intersect with that selection.
+- Keep the selection in route search state when another filter or sort changes. Clear all removes status selections and priority bounds together.
+- The trigger has a stable accessible name, native checkboxes expose selection, and Escape closes the menu. Preserve the existing mobile filter disclosure and focus treatment.
+
 ### Board viewport and column
 
 - **Structure:** one scroll-owning board viewport containing non-scrolling droppable columns.
@@ -235,7 +242,7 @@ inspect controls. No new colors, fonts, motion or layout primitives are needed.
 
 - **Structure:** selecting a Kanban card opens one bounded dialog without leaving the board context. The task header and description lead; workflow exceptions, dependencies, runs, and history follow; editable phase, assignees, priority, timestamps, and observability are supporting details.
 - **Responsive:** at 1024px and above, content and the 288px supporting-detail rail may scroll independently. Below 1024px, the dialog becomes one ordered column and one scroll owner: primary task content first, supporting details second. The content column must never remain beside the rail when doing so would make readable text narrower than the card minimum.
-- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. A stale save refetches current Task truth, reapplies once when the edited field is unchanged, and otherwise keeps the draft open beside a warning that names the current field value. The dialog closes on Escape and restores the board context.
+- **States:** loading preserves header/content/detail geometry; empty description and empty run/history sections name the absence; errors stay inline; editing preserves the user's draft. A stale save refetches current Task truth, reapplies once when the edited field is unchanged, and otherwise reports the conflict. Escape in an editor discards that draft and refreshes stored Task and board values; a subsequent Escape closes the dialog and restores the board context. A rejected priority save reports the error and restores the latest cached priority. Queued saves use the existing informational notice. Priority save settlement is independent of overlapping title saves. Full-page editor drafts belong to one Task id; navigation resets them and ignores the previous Task’s completion. Cancelling refreshes only Task detail and Project task lists.
 - **Accessibility:** the task title labels the dialog, close and full-page actions remain visible, headings preserve a logical order, and all identifiers wrap without horizontal overflow.
 
 ### Drag handle

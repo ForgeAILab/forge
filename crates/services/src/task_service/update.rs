@@ -123,6 +123,14 @@ impl TaskService {
         {
             resolve_retired_auditor_notice(&self.db, &updated.id).await?;
         }
+        self.publish(ForgeEvent {
+            event_type: "task.updated".to_owned(),
+            entity_id: updated.id.clone(),
+            timestamp: event_timestamp(),
+            context: EventContext::TaskUpdated {
+                project_id: updated.project_id.clone(),
+            },
+        });
         Ok(updated)
     }
 }
@@ -267,6 +275,64 @@ pub(super) fn review_requirement_ids_from_config(
 mod tests {
     use super::review_requirement_ids_from_config;
     use super::{names_retired_auditor, reject_retired_auditor_config};
+
+    #[tokio::test]
+    async fn ordinary_edits_publish_one_scoped_update_after_commit_and_none_on_conflict() {
+        use db::TaskRepo;
+        use std::sync::Arc;
+
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        crate::install_demo_data(&db).await.unwrap();
+        let task_id: String =
+            sqlx::query_scalar("SELECT id FROM task WHERE title = 'Set up CI pipeline'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let mut task = TaskRepo::get_by_id(&*db, &task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let bus = Arc::new(events::EventBus::new(16));
+        let service = super::TaskService::new(Arc::clone(&db), Arc::clone(&bus));
+        let mut receiver = bus.subscribe();
+
+        for mut changes in [
+            serde_json::json!({"title": "Updated title"}),
+            serde_json::json!({"description": "Updated description"}),
+            serde_json::json!({"priority": 4}),
+        ] {
+            changes["version"] = serde_json::json!(task.version);
+            let request = serde_json::from_value(changes.clone()).unwrap();
+            let saved = service.update_task(&task_id, request).await.unwrap();
+            let event = receiver
+                .try_recv()
+                .expect("the committed edit notifies other clients");
+            assert_eq!(event.event_type, "task.updated");
+            assert_eq!(event.entity_id, task_id);
+            assert!(
+                matches!(event.context, events::EventContext::TaskUpdated { project_id } if project_id == task.project_id)
+            );
+            let stored = TaskRepo::get_by_id(&*db, &task_id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.version, saved.version);
+            assert_eq!(stored.title, saved.title);
+            assert_eq!(stored.description, saved.description);
+            assert_eq!(stored.priority, saved.priority);
+            assert!(receiver.try_recv().is_err(), "one notification per edit");
+
+            let stale_request = serde_json::from_value(changes).unwrap();
+            assert!(service.update_task(&task_id, stale_request).await.is_err());
+            assert!(
+                receiver.try_recv().is_err(),
+                "a rejected edit publishes nothing"
+            );
+            task = saved;
+        }
+    }
 
     #[test]
     fn a_configuration_that_names_an_auditor_is_refused_and_any_other_is_accepted() {

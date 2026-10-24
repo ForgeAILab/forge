@@ -291,7 +291,10 @@ describe('TaskCommentsPanel', () => {
 
   it('invalidates task media queries when media upload SSE events arrive', () => {
     const invalidateQueries = vi.fn()
-    const queryClient = { invalidateQueries } as unknown as QueryClientType
+    const queryClient = {
+      invalidateQueries,
+      getQueryCache: () => ({ findAll: () => [] }),
+    } as unknown as QueryClientType
     const dispatch = vi.fn()
 
     routeSsePayload(

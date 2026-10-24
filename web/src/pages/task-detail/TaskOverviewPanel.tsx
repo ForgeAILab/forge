@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { TaskActionButtons } from '@/components/task-detail/task-action-buttons'
 import { Link } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { useMembersQuery, useProjectAgentsQuery } from '@/api/hooks'
 import { ErrorBanner } from '@/components/error-banner'
-import { isTransientApiError } from '@/lib/api-error'
+import { isTransientApiError, toastApiError } from '@/lib/api-error'
 import { budgetLabel, visibleRemainingBudgets } from '@/lib/retry-budget-display'
 import { PlanChecklist } from '@/components/plan-checklist'
 import { type AssigneeSelection, TaskStatusDropdown } from '@/components/task-controls'
@@ -65,7 +65,7 @@ interface TaskOverviewPanelProps {
   // handlers
   onUpdateTitle: (title: string, expectedTask: Task) => Promise<unknown> | unknown
   onUpdateDescription: (description: string, expectedTask: Task) => Promise<unknown> | unknown
-  onUpdatePriority: (priority: number) => void
+  onUpdatePriority: (priority: number, expectedTask: Task) => Promise<unknown> | unknown
   onStatusChange: (status: string) => void
   onAssigneeChange: (roleName: string, selection: AssigneeSelection) => void
   onOpenLaunchDialog?: () => void
@@ -78,7 +78,11 @@ interface TaskOverviewPanelProps {
   ) => void
 }
 
-export function TaskOverviewPanel({
+export function TaskOverviewPanel(props: TaskOverviewPanelProps) {
+  return <TaskOverviewEditor key={props.task?.id} {...props} />
+}
+
+function TaskOverviewEditor({
   task,
   isLoading,
   isError,
@@ -119,6 +123,14 @@ export function TaskOverviewPanel({
   const [descriptionEditBase, setDescriptionEditBase] = useState<Task | undefined>()
   const [descriptionSaveError, setDescriptionSaveError] = useState<unknown>()
   const [priorityDraft, setPriorityDraft] = useState('')
+  const priorityEditBase = useRef<Task>()
+  const currentTask = useRef(task)
+  useEffect(() => {
+    currentTask.current = task
+    return () => {
+      currentTask.current = undefined
+    }
+  }, [task])
   const [reviewRetryOverride, setReviewRetryOverride] = useState('')
   const [reviewProgressOverride, setReviewProgressOverride] = useState('')
   const [mergeFixRetryOverride, setMergeFixRetryOverride] = useState('')
@@ -132,7 +144,7 @@ export function TaskOverviewPanel({
     const timeout = window.setTimeout(() => {
       if (!editingTitle) setTitleDraft(task.title)
       if (!editingDescription) setDescriptionDraft(task.description ?? '')
-      setPriorityDraft(String(task.priority))
+      if (!priorityEditBase.current) setPriorityDraft(String(task.priority))
       const taskStateConfig = readTaskStateConfig(task)
       setReviewRetryOverride(retryBudgetFromConfig(taskStateConfig, 'review'))
       setReviewProgressOverride(retryBudgetFromConfig(taskStateConfig, 'review_progress'))
@@ -232,14 +244,32 @@ export function TaskOverviewPanel({
     setDescriptionSaveError(undefined)
   }
 
-  const handleSavePriority = () => {
-    if (!task) return
+  const handleSavePriority = async () => {
+    if (!task || updatePending) return
     const priority = Number(priorityDraft)
-    if (!Number.isFinite(priority) || priority === task.priority) {
+    if (!priorityDraft.trim() || !Number.isFinite(priority) || priority === task.priority) {
+      priorityEditBase.current = undefined
       setPriorityDraft(String(task.priority))
       return
     }
-    onUpdatePriority(priority)
+    const expectedTask = priorityEditBase.current ?? task
+    try {
+      await onUpdatePriority(priority, expectedTask)
+      if (currentTask.current?.id !== expectedTask.id) return
+      setPriorityDraft(String(priority))
+    } catch (error) {
+      if (currentTask.current?.id !== expectedTask.id) return
+      setPriorityDraft(
+        String(
+          error instanceof TaskFieldConflictError
+            ? error.currentTask.priority
+            : currentTask.current.priority,
+        ),
+      )
+      toastApiError(error, 'Priority update failed')
+    } finally {
+      priorityEditBase.current = undefined
+    }
   }
 
   const handleSaveRetryBudgets = () => {
@@ -536,14 +566,22 @@ export function TaskOverviewPanel({
               </Label>
               <Input
                 id="task-priority"
+                disabled={updatePending}
                 type="number"
                 className="h-7 w-20 text-sm"
                 value={priorityDraft}
                 onBlur={handleSavePriority}
-                onChange={(e) => setPriorityDraft(e.target.value)}
+                onChange={(e) => {
+                  if (e.target.value === String(task.priority)) priorityEditBase.current = undefined
+                  else priorityEditBase.current ??= task
+                  setPriorityDraft(e.target.value)
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') handleSavePriority()
-                  if (e.key === 'Escape') setPriorityDraft(String(task.priority))
+                  if (e.key === 'Escape') {
+                    priorityEditBase.current = undefined
+                    setPriorityDraft(String(task.priority))
+                  }
                 }}
               />
             </div>

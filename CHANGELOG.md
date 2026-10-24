@@ -6,8 +6,32 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Fixed
+
+- Task detail: Escape in the title or description editor discards the draft,
+  refreshes the stored Task and board values, and no longer also closes the
+  dialog; a second Escape closes it.
+- Task detail: priority saves now carry the edit-start Task, so a concurrent
+  edit to another field is reconciled once instead of failing with 409 and
+  leaving the board on the old priority; a competing priority edit is reported.
+- Tasks table: new Statuses filter; selected statuses match any of them and
+  intersect with priority, assignee and blocked filters; Clear all removes
+  them.
+- Kanban column counts and Project Overview counts refresh when a Task event
+  arrives during an in-flight list or count read, instead of keeping the older
+  response.
+- Ordinary Task title, description and priority edits, from the web app or
+  the MCP `forge_update_task` tool, now publish the Project-scoped
+  `task.updated` event, so other connected clients refresh. The MCP tool now
+  goes through the same Task update validation as `PATCH /api/v1/tasks/{id}`.
+
+## [0.14.1] - 2026-10-21
+
 ### Security
 
+- TLS certificate verification no longer trusts the distrusted emSign
+  intermediates: `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.10 (RUSTSEC-2026-0381).
 - Provider, fetch and public search now share one hostname policy, refusing
   `localhost`, `localhost.localdomain`, `internal`, `home.arpa`, `local` (mDNS)
   and all subdomains of those names, ignoring ASCII case and trailing dots.

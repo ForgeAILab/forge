@@ -8,6 +8,8 @@ import { TaskOverviewPanel } from '@/pages/task-detail/TaskOverviewPanel'
 import { taskListItem } from '@/test-utils/task-list-item'
 import type { Task, TaskDetailResponse, UpdateTaskRequest } from '@/types/generated'
 import { TaskDetailModal } from './task-detail-modal'
+import { ApiError } from '@/api/client'
+import { toast } from 'sonner'
 
 vi.mock('@tanstack/react-router', () => ({ useNavigate: () => vi.fn() }))
 vi.mock('@/api/hooks', async (importOriginal) => ({
@@ -174,6 +176,124 @@ function setup(view: 'modal' | 'full page', options: { firstPatchConflict?: Conf
     view === 'modal' ? <TaskDetailModal taskId="task-1" open onClose={vi.fn()} /> : <FullPage />
   return { ui, Wrapper, patches, stored: () => stored }
 }
+
+describe('Full-page priority editing', () => {
+  it('resets a draft on task navigation and only saves with the new task snapshot', async () => {
+    const test = setup('full page')
+    const first = test.stored()
+    const second = { ...first, id: 'task-2', priority: 6, version: 11 }
+    const save = vi.fn().mockResolvedValue(undefined)
+    const props = { ...fullPageProps(first), onUpdatePriority: save }
+    const view = render(<TaskOverviewPanel {...props} />, { wrapper: test.Wrapper })
+    await waitFor(() =>
+      expect((screen.getByLabelText('Priority') as HTMLInputElement).value).toBe(
+        String(first.priority),
+      ),
+    )
+    fireEvent.change(screen.getByLabelText('Priority'), { target: { value: '4' } })
+    view.rerender(<TaskOverviewPanel {...props} task={second} />)
+    await waitFor(() =>
+      expect((screen.getByLabelText('Priority') as HTMLInputElement).value).toBe('6'),
+    )
+    fireEvent.blur(screen.getByLabelText('Priority'))
+    expect(save).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('Priority'), { target: { value: '7' } })
+    fireEvent.blur(screen.getByLabelText('Priority'))
+    await waitFor(() => expect(save).toHaveBeenCalledExactlyOnceWith(7, second))
+  })
+
+  it.each(['success', 'failure'] as const)(
+    'ignores a previous task priority save %s after navigation',
+    async (outcome) => {
+      const test = setup('full page')
+      const first = test.stored()
+      const second = { ...first, id: 'task-2', priority: 6, version: 11 }
+      let resolve!: () => void
+      let reject!: (error: Error) => void
+      const save = vi.fn(
+        () =>
+          new Promise<void>((yes, no) => {
+            resolve = yes
+            reject = no
+          }),
+      )
+      const errorToast = vi.spyOn(toast, 'error')
+      const props = { ...fullPageProps(first), onUpdatePriority: save }
+      const view = render(<TaskOverviewPanel {...props} />, { wrapper: test.Wrapper })
+      await waitFor(() =>
+        expect((screen.getByLabelText('Priority') as HTMLInputElement).value).toBe(
+          String(first.priority),
+        ),
+      )
+      fireEvent.change(screen.getByLabelText('Priority'), { target: { value: '4' } })
+      fireEvent.blur(screen.getByLabelText('Priority'))
+      expect(save).toHaveBeenCalledExactlyOnceWith(4, first)
+      view.rerender(<TaskOverviewPanel {...props} task={second} />)
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      })
+      await act(async () => {
+        if (outcome === 'success') resolve()
+        else reject(new Error('Previous task failed'))
+      })
+      await waitFor(() =>
+        expect((screen.getByLabelText('Priority') as HTMLInputElement).value).toBe('6'),
+      )
+      fireEvent.blur(screen.getByLabelText('Priority'))
+      expect(save).toHaveBeenCalledTimes(1)
+      expect(errorToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it('shows the queued notice instead of an error toast for a busy priority save', async () => {
+    const test = setup('full page')
+    const save = vi
+      .fn()
+      .mockRejectedValue(Object.assign(new ApiError('Queued', 409), { code: 'task_busy' }))
+    const info = vi.spyOn(toast, 'info')
+    const error = vi.spyOn(toast, 'error')
+    render(<TaskOverviewPanel {...fullPageProps(test.stored())} onUpdatePriority={save} />, {
+      wrapper: test.Wrapper,
+    })
+    await waitFor(() =>
+      expect((screen.getByLabelText('Priority') as HTMLInputElement).value).toBe(
+        String(test.stored().priority),
+      ),
+    )
+    fireEvent.change(screen.getByLabelText('Priority'), { target: { value: '4' } })
+    fireEvent.blur(screen.getByLabelText('Priority'))
+    await waitFor(() =>
+      expect(info).toHaveBeenCalledWith('Queued; it will apply after the current step'),
+    )
+    expect(error).not.toHaveBeenCalled()
+  })
+
+  it('keeps a priority draft and its edit-start snapshot across a detail refetch', async () => {
+    const test = setup('full page')
+    const task = test.stored()
+    const props = fullPageProps(task)
+    const save = vi.fn().mockResolvedValue(undefined)
+    const view = render(<TaskOverviewPanel {...props} onUpdatePriority={save} />, {
+      wrapper: test.Wrapper,
+    })
+    const input = screen.getByLabelText('Priority') as HTMLInputElement
+    await waitFor(() => expect(input.value).toBe(String(task.priority)))
+    fireEvent.change(input, { target: { value: '4' } })
+    view.rerender(
+      <TaskOverviewPanel
+        {...props}
+        task={{ ...task, version: task.version + 1, description: 'Another writer' }}
+        onUpdatePriority={save}
+      />,
+    )
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    expect(input.value).toBe('4')
+    fireEvent.blur(input)
+    await waitFor(() => expect(save).toHaveBeenCalledExactlyOnceWith(4, task))
+  })
+})
 
 describe('Task detail title editing', () => {
   it('shows a successful title save', async () => {

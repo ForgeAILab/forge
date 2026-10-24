@@ -17,7 +17,7 @@ use db::{
     AgentSessionRepo, CreateAccountMainAgentBinding, CreateProject, ExecutionRepo,
     MemoryScopeGrant, PageRequest, ProjectAgentBinding, ProjectAgentBindingRepo, ProjectRepo,
     ReplaceAccountMainAgentBinding, SortBy, SortOrder, TaskDependencyRepo, TaskListQuery, TaskRepo,
-    TaskRoleAssignmentRepo, UpdateProject, UpdateTask, UserRepo,
+    TaskRoleAssignmentRepo, UpdateProject, UserRepo,
 };
 use executors::ExecutionOverrides;
 use operation_registry::mcp::{
@@ -596,25 +596,23 @@ pub(super) async fn forge_update_task(
     state: &AppState,
     params: UpdateTaskParams,
 ) -> Result<Value, McpToolError> {
-    let task = TaskRepo::update(
-        &*state.db,
-        UpdateTask {
-            id: params.task_id,
-            expected_version: params.version,
-            title: params.title,
-            description: params.description.map(Some),
-            priority: params.priority,
-            merge_config: None,
-            plan: params.plan.map(Some),
-            error_annotation: None,
-            blocked_json: None,
-            failed_json: None,
-            task_state_config: None,
-            parent_task_id: None,
-            updated_at: now_rfc3339(),
-        },
-    )
-    .await?;
+    let task = state
+        .task_service
+        .update_task(
+            params.task_id,
+            api_types::UpdateTaskRequest {
+                version: params.version,
+                title: params.title,
+                description: params.description,
+                priority: params.priority,
+                merge_config: None,
+                plan: params.plan,
+                task_state_config: None,
+                review_requirement_ids: None,
+                parent_task_id: None,
+            },
+        )
+        .await?;
     task_with_offers(state, task).await
 }
 
@@ -1835,6 +1833,56 @@ fn lifecycle_hooks_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn update_task_publishes_one_scoped_event_after_commit_and_none_on_conflict() {
+        let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
+        db::run_migrations(&pool).await.unwrap();
+        let db = Arc::new(db::SqliteDb::new(pool));
+        let state = AppState::new(db.clone(), Arc::new(events::EventBus::new(16)));
+        let now = db::now_rfc3339();
+        sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES ('p','p',?,?)")
+            .bind(&now)
+            .bind(&now)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task(id,project_id,title,status,created_at,updated_at) VALUES ('t','p','task','todo',?,?)")
+            .bind(&now).bind(&now).execute(db.pool()).await.unwrap();
+        let mut events = state.event_bus.subscribe();
+        let params = || {
+            serde_json::from_value(json!({
+                "task_id": "t", "version": 1, "title": "Updated title",
+                "description": "Updated description", "priority": 4, "plan": "Updated plan"
+            }))
+            .unwrap()
+        };
+        let response = forge_update_task(&state, params()).await.unwrap();
+        assert_eq!(response["title"], "Updated title");
+        assert_eq!(response["description"], "Updated description");
+        assert_eq!(response["priority"], 4);
+        assert_eq!(response["plan"], "Updated plan");
+        let event = events
+            .try_recv()
+            .expect("the committed edit notifies clients");
+        assert_eq!(event.event_type, "task.updated");
+        assert_eq!(event.entity_id, "t");
+        assert!(
+            matches!(event.context, events::EventContext::TaskUpdated { project_id } if project_id == "p")
+        );
+        let stored = TaskRepo::get_by_id(&*db, "t", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.title, "Updated title");
+        assert_eq!(stored.version, 2);
+        assert!(events.try_recv().is_err(), "publish exactly once");
+        assert!(forge_update_task(&state, params()).await.is_err());
+        assert!(
+            events.try_recv().is_err(),
+            "a rejected CAS publishes nothing"
+        );
+    }
 
     #[test]
     fn typed_task_commands_match_domain_serde_acceptance_and_convert_without_loss() {

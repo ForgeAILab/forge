@@ -1,8 +1,10 @@
-import type { Task } from '@/types/generated'
-import { useEffect, useMemo, useState, type KeyboardEvent } from 'react'
+import type { Task, TaskDetailResponse } from '@/types/generated'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { toast } from 'sonner'
 import { ApiError } from '@/api/client'
+import { qk } from '@/api/query-keys'
 import { ErrorBanner } from '@/components/error-banner'
 import { cn } from '@/lib/cn'
 import {
@@ -31,7 +33,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { MarkdownEditor, MarkdownView } from '@/components/ui/markdown-editor'
 import { getAvailableTaskTransitions } from '@/components/task-controls'
-import { getApiErrorMessage, isTransientApiError, notifyTaskBusy } from '@/lib/api-error'
+import {
+  getApiErrorMessage,
+  isTransientApiError,
+  notifyTaskBusy,
+  toastApiError,
+} from '@/lib/api-error'
 import { workflowTriggerTargets } from '@/lib/workflow-utils'
 import { productTerm } from '@/lib/i18n'
 import type { Review } from '@/types/generated'
@@ -81,6 +88,7 @@ interface TaskDetailModalProps {
 
 export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps) {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const taskDetailQuery = useTaskDetailQuery(taskId, { enabled: open })
   const [activeModalTab, setActiveModalTab] = useState<'executions' | 'review' | 'history'>(
     'executions',
@@ -99,6 +107,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   const [descriptionEditBase, setDescriptionEditBase] = useState<Task | undefined>()
   const [descriptionSaveError, setDescriptionSaveError] = useState<unknown>()
   const [priorityDraft, setPriorityDraft] = useState('')
+  const priorityEditBase = useRef<Task>()
 
   const task = taskDetailQuery.data?.task
   const errorInfo = useMemo(() => getErrorInfo(task), [task])
@@ -122,7 +131,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     const timeout = window.setTimeout(() => {
       if (!editingTitle) setTitleDraft(task.title)
       if (!editingDescription) setDescriptionDraft(task.description ?? '')
-      setPriorityDraft(String(task.priority))
+      if (!priorityEditBase.current) setPriorityDraft(String(task.priority))
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [editingDescription, editingTitle, task])
@@ -137,6 +146,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
       setDescriptionEditBase(undefined)
       setTitleSaveError(undefined)
       setDescriptionSaveError(undefined)
+      priorityEditBase.current = undefined
     }, 0)
     return () => window.clearTimeout(timeout)
   }, [open])
@@ -144,13 +154,34 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
   useEffect(() => {
     if (!open) return
     const handleKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape' && !editingTitle && !editingDescription) {
+      if (e.key === 'Escape' && !e.defaultPrevented && !editingTitle && !editingDescription) {
         onClose()
       }
     }
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [open, onClose, editingTitle, editingDescription])
+
+  const refreshStoredTask = () => {
+    void queryClient.invalidateQueries({ queryKey: qk.taskDetail(taskId), exact: true })
+    if (task) void queryClient.invalidateQueries({ queryKey: qk.projectTasks(task.project_id) })
+  }
+
+  const discardTitle = () => {
+    setTitleDraft(task?.title ?? '')
+    setEditingTitle(false)
+    setTitleEditBase(undefined)
+    setTitleSaveError(undefined)
+    refreshStoredTask()
+  }
+
+  const discardDescription = () => {
+    setDescriptionDraft(task?.description ?? '')
+    setEditingDescription(false)
+    setDescriptionEditBase(undefined)
+    setDescriptionSaveError(undefined)
+    refreshStoredTask()
+  }
 
   const saveTitle = () => {
     if (!task) return
@@ -228,14 +259,34 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
     )
   }
 
-  const savePriority = () => {
-    if (!task) return
+  const savePriority = async () => {
+    if (!task || updateTask.isPending) return
     const priority = Number(priorityDraft)
-    if (!Number.isFinite(priority) || priority === task.priority) {
+    if (!priorityDraft.trim() || !Number.isFinite(priority) || priority === task.priority) {
+      priorityEditBase.current = undefined
       setPriorityDraft(String(task.priority))
       return
     }
-    updateTask.mutate({ taskId: task.id, body: { priority, version: task.version } })
+    const expectedTask = priorityEditBase.current ?? task
+    try {
+      const saved = await updateTask.mutateAsync({
+        taskId: task.id,
+        body: { priority, version: expectedTask.version },
+        expectedTask,
+      })
+      setPriorityDraft(String(saved.priority))
+    } catch (error) {
+      const latest =
+        queryClient.getQueryData<TaskDetailResponse>(qk.taskDetail(task.id))?.task ?? task
+      setPriorityDraft(
+        String(
+          error instanceof TaskFieldConflictError ? error.currentTask.priority : latest.priority,
+        ),
+      )
+      toastApiError(error, 'Priority update failed')
+    } finally {
+      priorityEditBase.current = undefined
+    }
   }
 
   const onTitleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -244,10 +295,9 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
       saveTitle()
     }
     if (event.key === 'Escape') {
-      setTitleDraft(task?.title ?? '')
-      setEditingTitle(false)
-      setTitleEditBase(undefined)
-      setTitleSaveError(undefined)
+      event.preventDefault()
+      event.stopPropagation()
+      discardTitle()
     }
   }
 
@@ -323,12 +373,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
           titleDraft={titleDraft}
           updatePending={updateTask.isPending}
           updateError={titleSaveError}
-          onCancelTitle={() => {
-            setTitleDraft(task?.title ?? '')
-            setEditingTitle(false)
-            setTitleEditBase(undefined)
-            setTitleSaveError(undefined)
-          }}
+          onCancelTitle={discardTitle}
           onClose={onClose}
           onEditTitle={() => {
             if (!task) return
@@ -404,10 +449,9 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                         onChange={setDescriptionDraft}
                         onKeyDown={(e) => {
                           if (e.key === 'Escape') {
-                            setDescriptionDraft(task.description ?? '')
-                            setEditingDescription(false)
-                            setDescriptionEditBase(undefined)
-                            setDescriptionSaveError(undefined)
+                            e.preventDefault()
+                            e.stopPropagation()
+                            discardDescription()
                           }
                         }}
                       />
@@ -418,12 +462,7 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
                         <Button
                           size="sm"
                           variant="outline"
-                          onClick={() => {
-                            setDescriptionDraft(task.description ?? '')
-                            setEditingDescription(false)
-                            setDescriptionEditBase(undefined)
-                            setDescriptionSaveError(undefined)
-                          }}
+                          onClick={discardDescription}
                         >
                           Cancel
                         </Button>
@@ -548,8 +587,13 @@ export function TaskDetailModal({ taskId, open, onClose }: TaskDetailModalProps)
             formatDate={formatDate}
             isLoading={taskDetailQuery.isLoading}
             priorityDraft={priorityDraft}
+            priorityPending={updateTask.isPending}
             savePriority={savePriority}
-            setPriorityDraft={setPriorityDraft}
+            setPriorityDraft={(value) => {
+              if (value === String(task?.priority)) priorityEditBase.current = undefined
+              else priorityEditBase.current ??= task
+              setPriorityDraft(value)
+            }}
             task={task}
             transitionPending={transitionTask.isPending}
             workflow={workflow}

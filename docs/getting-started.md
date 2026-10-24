@@ -1282,6 +1282,38 @@ happen only in admitted Task Worker/reviewer Workspaces. A handoff is an
 immutable, bounded, provenance-linked packet with at most one target turn, not
 shared hidden context or a second chat.
 
+## Editing and filtering Tasks in the web app
+
+Open a Kanban card to edit its title, description or priority. Escape in the title
+or description editor discards the draft and refreshes the stored Task and board
+values. Press Escape again to close the detail dialog. Priority saves when you
+leave the field. If another client changed an unrelated field, Forge refreshes
+the Task version and retries the priority save once; a competing priority change
+is reported instead of overwritten. A priority save settles independently of overlapping
+title edits. Navigating to another Task discards the previous Task’s drafts and
+ignores its pending save completion.
+
+The Tasks table's Statuses menu can select several statuses. A row must match one
+of those statuses **and** the other active filters, including minimum and maximum
+priority. Changing a filter or sort preserves the other selections. Clear all
+removes the selections and restores the unfiltered list. Status options come from
+the Project workflow, loaded Tasks and the current selection; blocked is a separate
+condition filter.
+
+The Kanban search also searches Task text. Clearing it with select-all and
+Delete/Backspace, or using **Filters → Clear all**, restores the board under the
+remaining filters. Task events from other clients refresh the current search;
+clearing the search must also include their newly created and edited Tasks.
+
+Creating a Task from the board dialog puts it in Todo. The Todo badge and Project
+Overview refresh from the server, including changes from other connected clients.
+Overview's Backlog metric groups `backlog`, `todo`, `ready`, `pending` and `queued`;
+it is broader than the Kanban Backlog column. Task events that arrive during a
+list or count read trigger one follow-up read after the current fetch settles,
+while the query is still active. Inactive or disabled queries are invalidated
+without scheduling reads. Cancelling an edit refreshes Task detail and Project
+task lists without refetching unrelated Task panels.
+
 ## End-to-end: Main Chat to a traceable Task
 
 This is the supported path for turning a rough idea into repository-backed work.
