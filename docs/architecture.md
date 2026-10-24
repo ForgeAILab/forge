@@ -68,6 +68,12 @@ default agents, Genesis and Project orchestration adapters, native tools,
 topic rotation, wake delivery, and the embedded agent service all live in
 `services-agents`.
 
+The Agent Chat turn worker, native tool provider, and embedded agent service
+keep their module roots in `agent_chat_turn_worker.rs`, `native_tools.rs`, and
+`embedded_agent_service.rs`. Their child directories separate admission,
+execution, projections, persistence, provider configuration, and tests. Public
+imports continue through the module roots.
+
 `process-supervisor` is a leaf (tokio and tempfile): `git` cannot depend on `executors`
 or `review`, and `forge-client` must not pull in `services`, so the one
 process-group implementation that Git, CI steps and daemon helpers share lives
@@ -124,7 +130,7 @@ an endpoint and untrusted result metadata, while provider/fetch deliberately
 admits otherwise public destinations outside the shared special-use ranges.
 Keeping these broader guards search-only preserves that provider/fetch
 boundary without relaxing search's existing restrictions. The shared address table in
-`services_agents::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
+`services_agents::native_tools::public_search::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
 checks agreement and each documented exclusion.
 `config::network_policy::tests::shared_policy_changes_only_intended_address_verdicts`
 compares both predicates with verbatim copies of their pre-sharing versions
