@@ -153,3 +153,13 @@ remain an unmodified historical receipt; the new entry supersedes Q3's timing.
   subsequent tasks; the runtime repository remains read-only.
 - Evidence and detailed contract: design D2–D10; reference measurements are inputs,
   not a claim that Forge's release gates already pass.
+
+
+## 2026-10-24 shared LCM Profile-switch amendment
+
+The selected Profile's Chat resume target owns a guarded shared pre-topic
+LCM timeline. Preserve other Profiles' legacy sessions as unreplaced; record
+relinquishment transactionally so future import omits only their shared
+LCM-derived state and rebuilds it from retained history. The appended design
+Owner Decisions record the maintainer's instruction verbatim; task 34 and the
+native-session-journal delta cover implementation and focused verification.

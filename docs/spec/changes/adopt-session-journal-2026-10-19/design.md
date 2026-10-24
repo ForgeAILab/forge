@@ -1433,3 +1433,45 @@ None.
 ## Owner Decisions (2026-10-24)
 
 Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 86 ms vs ~50 ms), B/1000 delta writes 10.3% vs 10%, and the unfinished C/4000 run are accepted for this release and fixed in a follow-up after merge.
+
+
+## Selected-Profile shared LCM amendment (2026-10-24)
+
+This amendment supersedes the same-Profile-only ownership restrictions in D5.
+
+For a shared pre-V149 Chat timeline owned by an older, unlinked suspended
+sibling, conversion and lazy resume transfer ownership to the resume target for
+the identity's currently selected Profile. Active-first/newest-suspended native
+resolution still applies within that Profile; another dormant Profile does not
+compete. The timeline must predate and have been updated after the target's
+creation. Claims, leases (including unpublished writer reservations), topics or
+rotations, competing active/tied/newer selected-Profile sessions, extra bindings
+and any sibling's published/retired native state remain conflicts. An identity
+without a selected Profile, or a selected Profile without a resumable native
+session, parks with a precise reason.
+
+The resolver admits the legacy siblings exclusively and holds both engine
+writer leases before its immediate transaction. Ownership, binding, version-fenced
+relinquishment receipts and same-Profile replacement commit together. Siblings
+under another Profile keep their status, links, version and legacy ciphertext.
+Every referencing legacy sibling and the old owner receives a receipt in the
+additive `agent_legacy_lcm_relinquishment` table (V202610241249); receipts survive
+timeline deletion and cascade only with the losing session. On a later Profile
+switch, legacy decoding omits only the recorded LCM and semantic-summary state
+from the import view. The transcript and other protected state import exactly;
+Forge binds a fresh timeline and the runtime rebuilds its missing derived state.
+Unrecorded binding mismatches still fail closed. Background conversion defers a
+non-selected shared-timeline sibling before it can publish, including when it
+appears before the selected target in a keyset page, and retries it in the same
+worker after the selection changes. Failures roll back receipts and all labels;
+retries reuse the original timeline without duplicating history.
+V149 is unchanged; it backfills scope/retirement metadata, not runtime ownership.
+
+
+## Owner Decisions (2026-10-24; shared LCM across a profile switch)
+
+The session Forge resumes for the identity's **currently selected profile** owns the shared pre-topic timeline. Siblings under a non-selected profile are not a reason to park: transfer to B (same guards as now: writer leases, version fences, not natively used, nothing else references it). For the sibling(s) that lose the timeline (A, and any other session whose checkpoint references it):
+- they stay as-is in legacy storage (no data deleted), are not marked `replaced` if they belong to another profile (they may legitimately resume after a profile switch back), and
+- if one of them is later resumed/converted (user switches back to the GLM profile), it imports its transcript and protected state **without** the shared LCM state (its LCM-derived state is rebuilt the way Forge already handles missing/stale LCM state), instead of failing or parking. Define and test this.
+- Same-profile older siblings keep your current behaviour (marked replaced).
+If the identity has no selected profile, or the selected profile has no resumable session, keep parking with a precise reason.

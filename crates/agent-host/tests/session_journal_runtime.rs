@@ -97,6 +97,226 @@ async fn fixture(id: &SessionId) -> (FileDb, Arc<SqliteProtectedRuntimeStore>) {
     (f, store)
 }
 
+async fn profile_lcm_runtime(
+    store: Arc<SqliteProtectedRuntimeStore>,
+    p: Arc<FakeProvider>,
+    id: &SessionId,
+    chat: &str,
+) -> (Runtime, String) {
+    use agent_runtime::harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver};
+    let lcm = store
+        .lcm_store_for_runtime_session(id.as_str(), "agent_chat", chat)
+        .await
+        .unwrap();
+    let timeline = lcm.timeline_id().to_owned();
+    let binding = lcm.runtime_binding(id.clone()).unwrap();
+    let coordinator = LcmCoordinator::new(
+        Arc::new(lcm),
+        Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+        Arc::new(StaticLcmTimelineResolver::new(binding)),
+        LcmCoordinatorPolicy {
+            input_budget_tokens: 28_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (
+        runtime_builder(store, p)
+            .lcm(Arc::new(coordinator))
+            .build()
+            .unwrap(),
+        timeline,
+    )
+}
+
+#[tokio::test]
+async fn selected_profile_owns_shared_pre_topic_lcm_after_profile_switch() {
+    use agent_runtime::harness::{LCM_COMPONENT_ID, LcmRecoveryPolicy};
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    let id = SessionId::new("profile-switch-conversion");
+    let (f, store) = fixture(&id).await;
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+    let db = f.database();
+    let older_snapshot = SessionStore::load(&*store, &older).await.unwrap().unwrap();
+    let older_checkpoint = CheckpointStore::load_latest(&*store, &older)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        older_checkpoint
+            .snapshot
+            .extension_state
+            .contains_key(LCM_COMPONENT_ID)
+    );
+    let before: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    let shape: Vec<(String, i64)> = sqlx::query_as("SELECT profile_id,COUNT(*) FROM agent_session WHERE status='suspended' AND backend_kind='native' AND predecessor_session_id IS NULL AND replaced_by_session_id IS NULL GROUP BY profile_id ORDER BY profile_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(
+        shape,
+        vec![("gemini-profile".into(), 3), ("glm-profile".into(), 10)]
+    );
+    let owner = f.ensure_session(&id).await.unwrap();
+    assert_eq!(
+        db.dormant_native_chat_session_id("journal-agent", "journal-scope", "gemini-profile")
+            .await
+            .unwrap(),
+        Some(owner.clone())
+    );
+    assert_eq!(
+        store.convert_legacy_session(&owner, &id).await.unwrap(),
+        ConversionOutcome::Converted
+    );
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+    let retained: (String, Option<String>, i64) = sqlx::query_as("SELECT status,replaced_by_session_id,version FROM agent_session WHERE runtime_session_id=?")
+        .bind(older.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(retained, ("suspended".into(), None, 1));
+    let older_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE profile_id='glm-profile' AND status='suspended' AND replaced_by_session_id IS NULL AND predecessor_session_id IS NULL AND version=1")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(older_rows, 10);
+    let replaced: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session WHERE profile_id='gemini-profile' AND status='replaced' AND replaced_by_session_id=? AND version=2")
+        .bind(&owner).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(replaced, 2);
+    let publications: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_journal_session j JOIN agent_session s ON s.id=j.forge_session_id WHERE s.profile_id='glm-profile' AND (j.published=1 OR j.retired=1)")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(publications, 0);
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+    )
+    .bind(&old.timeline_id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(receipts, 12);
+    assert_eq!(
+        store.convert_legacy_session(&owner, &id).await.unwrap(),
+        ConversionOutcome::AlreadyNative
+    );
+    let timeline: (String,i64,i64,i64,i64) = sqlx::query_as("SELECT runtime_session_id,revision,(SELECT COUNT(*) FROM agent_lcm_entry),(SELECT COUNT(*) FROM agent_lcm_operation),(SELECT COUNT(*) FROM agent_lcm_timeline) FROM agent_lcm_timeline WHERE id=?")
+        .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(timeline, (id.to_string(), 131, 114, 121, 1));
+    drop(store);
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(
+        f.reopen().await.unwrap(),
+        [7; 32],
+        1,
+    ));
+    let p = provider();
+    let chat = format!("chat:{id}");
+    let (rt, b_timeline) = profile_lcm_runtime(store.clone(), p.clone(), &id, &chat).await;
+    assert_eq!(b_timeline, old.timeline_id);
+    let b = rt
+        .start_session(StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt))
+        .await
+        .unwrap();
+    assert_eq!(b.history(), old.snapshot.history.as_slice());
+    assert!(p.requests().is_empty());
+    drop(b);
+    drop(rt);
+    sqlx::query("UPDATE agent_identity SET selected_profile_id='glm-profile',version=version+1 WHERE id='journal-agent'")
+        .execute(db.pool()).await.unwrap();
+    let older_owner = f.ensure_session(&older).await.unwrap();
+    assert_eq!(
+        db.dormant_native_chat_session_id("journal-agent", "journal-scope", "glm-profile")
+            .await
+            .unwrap(),
+        Some(older_owner.clone())
+    );
+    assert_eq!(
+        store
+            .convert_legacy_session(&older_owner, &older)
+            .await
+            .unwrap(),
+        ConversionOutcome::Converted
+    );
+    let mut expected = older_snapshot;
+    expected.extension_state.remove(LCM_COMPONENT_ID);
+    assert_eq!(
+        snapshot(&store.journals().ordinary(), &older).await,
+        expected
+    );
+    let mut protected = older_checkpoint.snapshot;
+    protected.extension_state.remove(LCM_COMPONENT_ID);
+    assert_eq!(
+        snapshot(&store.journals().protected(), &older).await,
+        protected
+    );
+    assert!(protected.extension_state.contains_key("fixture.protected"));
+    assert_eq!(
+        store
+            .convert_legacy_session(&older_owner, &older)
+            .await
+            .unwrap(),
+        ConversionOutcome::AlreadyNative
+    );
+    let a_provider = provider();
+    let (a_rt, a_timeline) =
+        profile_lcm_runtime(store.clone(), a_provider.clone(), &older, &chat).await;
+    assert_ne!(a_timeline, old.timeline_id);
+    let a = a_rt
+        .start_session(StartSession::resume(older.clone()))
+        .await
+        .unwrap();
+    assert_eq!(a.history(), protected.history.as_slice());
+    assert!(a_provider.requests().is_empty());
+    a.run(agent_runtime::core::content::UserInput::text(
+        "Resume GLM with rebuilt LCM",
+    ))
+    .await
+    .unwrap()
+    .completed()
+    .await;
+    assert_eq!(a.history().last().unwrap().joined_text(), "reply");
+    assert_eq!(a_provider.requests().len(), 1);
+    a.shutdown().await.unwrap();
+    let after: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(before, after);
+    let shared: (String,i64,i64) = sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_lcm_entry WHERE timeline_id=t.id),(SELECT COUNT(*) FROM agent_lcm_operation WHERE timeline_id=t.id) FROM agent_lcm_timeline t WHERE id=?")
+        .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(shared, (id.to_string(), 114, 121));
+}
+
+#[tokio::test]
+async fn selected_profile_shared_lcm_lazy_resume_without_provider_calls() {
+    use agent_runtime::harness::LcmRecoveryPolicy;
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    let id = SessionId::new("selected-profile-lazy");
+    let (f, store) = fixture(&id).await;
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+    sqlx::query(
+        "UPDATE agent_session SET status='ready',version=version+1 WHERE runtime_session_id=?",
+    )
+    .bind(id.as_str())
+    .execute(f.database().pool())
+    .await
+    .unwrap();
+    let _foreground = store.foreground_session(&id).await.unwrap();
+    let p = provider();
+    let (rt, timeline) =
+        profile_lcm_runtime(store.clone(), p.clone(), &id, &format!("chat:{id}")).await;
+    assert_eq!(timeline, old.timeline_id);
+    let b = rt
+        .start_session(StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt))
+        .await
+        .unwrap();
+    assert_eq!(b.history(), old.snapshot.history.as_slice());
+    assert_eq!(b.history().len(), 114);
+    assert!(p.requests().is_empty());
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+    let a: (String,Option<String>,i64)=sqlx::query_as("SELECT status,replaced_by_session_id,version FROM agent_session WHERE runtime_session_id=?")
+        .bind(older.as_str()).fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(a, ("suspended".into(), None, 1));
+}
+
 #[tokio::test]
 async fn sibling_owned_pre_topic_lcm_converts_and_retries() {
     use forge_agent_host::{

@@ -272,3 +272,26 @@ ForgeJournalProjection SHALL opt into the runtime incremental projection protoco
 - **WHEN** the current projected view and its encoding carry the same policy revision
 - **THEN** Forge projects only changed optional diagnostic updates through project_delta
 - **AND** it does not force the runtime's complete-projection fallback at every boundary
+
+
+### Requirement: Selected-Profile ownership of shared pre-topic LCM
+The session resumed for an identity's currently selected Profile SHALL own a guarded shared pre-topic Chat timeline. This requirement supersedes the same-Profile-only restrictions in the earlier shared-timeline scenario. Other-Profile legacy siblings SHALL remain resumable and unreplaced, and only a durable, transactionally recorded relinquishment SHALL authorize omitting shared LCM-derived namespaces from their otherwise exact protected import.
+
+#### Scenario: Shared pre-topic Chat timeline owned by a superseded sibling
+- **WHEN** the resume target for the identity's currently selected Profile references a shared pre-topic timeline owned by an older, unlinked suspended native sibling of the same identity and context scope
+- **AND** the timeline predates the target and was updated after its creation, neither runtime nor another sibling has published or retired native state, and no claim, lease, topic/rotation, active or tied/newer selected-Profile session, additional binding or reference outside the guarded legacy siblings makes ownership ambiguous
+- **THEN** conversion and lazy resume transfer the original timeline's runtime ownership and binding to the resume target in the same immediate transaction
+- **AND** that transaction records a version-fenced relinquishment for every legacy sibling referencing the timeline and its old owner, marks same-Profile siblings replaced by the target, and preserves other-Profile siblings' status, links, version and legacy payloads
+- **AND** no timeline, entry, node or operation is duplicated or discarded; retries are idempotent and a failed binding write rolls back the whole transfer
+- **AND** another dormant Profile does not cause parking; no selected Profile, no resumable native session for the selected Profile, an active owner, a tied newest session, native publication/retirement, or additional ownership evidence keeps the target parked with a precise Conflict reason
+
+#### Scenario: Resume a Profile that relinquished shared pre-topic LCM
+- **WHEN** the identity switches back to a Profile whose retained legacy session relinquished the shared timeline
+- **THEN** conversion and lazy import preserve its transcript and all other protected state while omitting only the recorded timeline's LCM and semantic-summary namespaces from its import view
+- **AND** the original encrypted legacy payloads remain unchanged and the runtime rebuilds missing LCM-derived state against a fresh session timeline without failure or parking
+- **AND** the relinquishment receipt survives process restart and deletion of the transferred timeline; an unrecorded binding mismatch still fails closed
+
+#### Scenario: Background discovery encounters the non-selected owner first
+- **WHEN** a conversion page reaches a non-selected Profile's legacy shared-timeline owner before the selected Profile's resume target
+- **THEN** the worker defers that owner without native publication, retirement or a parked error, and converts the selected target with the full shared history
+- **AND** a later Profile selection change re-enables the deferred owner in the same worker; retries do not duplicate native publication or relinquishment receipts

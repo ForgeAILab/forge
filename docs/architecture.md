@@ -2520,22 +2520,38 @@ chat. V149 backfills canonical scope and retirement metadata but leaves runtime
 ownership NULL; a subsequent open can assign a shared timeline to an older
 sibling. Chat resolution prefers the active session, otherwise the newest
 unreplaced suspended native session for the same identity, context scope and
-Profile. Conversion and lazy resume can transfer a referenced pre-topic timeline
-to that resume target when its current owner is an older suspended sibling of
-the same Profile. The timeline must predate the target and have been written
-after its creation. Neither runtime may have published or retired a native
-journal; claims, leases, topic/rotation references, other runtime bindings,
-other resumable sessions and additional legacy sibling references prevent
-transfer with a specific Conflict reason. Other siblings' native state also
-prevents transfer when exclusive legacy ownership cannot be established.
+Profile. The resume target for the identity's **currently selected Profile** owns
+the shared pre-topic timeline, even when its older suspended owner belongs to
+another Profile. The timeline must predate the target and have been written
+after its creation. Neither runtime nor another sibling may have published or
+retired a native journal; claims, leases, topic/rotation references, other
+runtime bindings, active siblings and tied/newer selected-Profile sessions
+prevent transfer with a specific Conflict reason. No selected Profile, or no
+resumable native session for that Profile, also parks with a precise reason.
+Unlinked suspended legacy siblings of the same identity/context scope may
+reference the shared timeline; another dormant Profile does not compete.
+
 The resolver holds exclusive admission and both journal writer leases for the
-old owner, including unpublished reservations with no pin row, and checks these
-conditions in its immediate write transaction. That transaction moves the
-timeline's runtime owner and binding and marks the older session replaced by
-the resume target, using its version fence. This makes the older session
-retire-eligible even after the target becomes active. It neither copies the
-timeline nor rewrites either legacy payload; failed binding writes roll back
-all three changes and retries reuse the transferred timeline.
+legacy siblings, including unpublished reservations with no pin row, and checks
+the guards in its immediate write transaction. The transaction moves the
+timeline's runtime owner and binding and records every relinquishing sibling
+in `agent_legacy_lcm_relinquishment`, fenced by its session version. Same-Profile
+siblings are marked replaced by the target. Other-Profile siblings retain their
+status, links and version, so their newest session remains resumable after a
+Profile switch. Background conversion defers these unselected siblings, even if
+it encounters the old owner first; a selection change makes them eligible again
+in the same worker. This deferral is neither retirement nor a parked error.
+
+Migration `V202610241249` adds only the relinquishment table. Its receipts belong
+to the losing session and survive deletion of the transferred timeline, so a
+stale reference cannot resurrect. Legacy snapshot/checkpoint decoding omits
+only the recorded timeline's LCM and semantic-summary namespaces from the import
+view. The legacy ciphertext, transcript and other protected state remain exact.
+When that Profile resumes, Forge binds a fresh timeline and the runtime rebuilds
+missing LCM state from its retained history. Arbitrary binding mismatches still
+fail closed. No original timeline, entry, node or operation is copied or removed;
+failed writes roll back ownership, binding, receipts and same-Profile replacement
+together, and retries reuse the committed transfer.
 
 Older tuning revisions and NULL/stale Forge policy markers do not discard LCM:
 the runtime validates identity, binding and frontier before exact import, then

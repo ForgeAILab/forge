@@ -673,9 +673,10 @@ impl SqliteProtectedRuntimeStore {
     /// transaction, so no other runtime session can resolve to it afterwards.
     /// An empty, unclaimed non-Chat timeline may continue across runtimes.
     /// Without a persisted reference, other sessions get a fresh timeline;
-    /// A shared pre-topic Chat timeline may move from an inactive, superseded
-    /// legacy sibling to the session Chat resume selects. Ownership, binding,
-    /// and supersession change in one transaction; ambiguous references fail closed.
+    /// A shared pre-topic Chat timeline may move from an inactive legacy sibling
+    /// to the selected Profile's Chat resume target. Ownership, binding,
+    /// relinquishment and same-Profile replacement commit together; other
+    /// Profiles retain their legacy sessions and rebuild relinquished LCM state.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
@@ -1942,7 +1943,7 @@ impl SessionStore for SqliteProtectedRuntimeStore {
                 "SELECT snapshot_ciphertext, snapshot_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
             )
-            .bind(forge_session_id)
+            .bind(&forge_session_id)
             .fetch_optional(self.db.pool())
             .await
         }
@@ -1959,7 +1960,9 @@ impl SessionStore for SqliteProtectedRuntimeStore {
         match (ciphertext, nonce) {
             (Some(ciphertext), Some(nonce)) => {
                 let bytes = self.open_session_state(ciphertext, nonce).await?;
-                let snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
+                let mut snapshot: SessionSnapshot = serde_json::from_slice(&bytes)?;
+                self.omit_relinquished_legacy_lcm(&forge_session_id, &mut snapshot)
+                    .await?;
                 Ok(Some(snapshot))
             }
             // A checkpoint already owns the exact canonical snapshot. NULL
@@ -1999,7 +2002,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                 "SELECT checkpoint_ciphertext, checkpoint_nonce
              FROM protected_agent_session_state WHERE session_id = ?",
             )
-            .bind(forge_session_id)
+            .bind(&forge_session_id)
             .fetch_optional(self.db.pool())
             .await
         }
@@ -2028,7 +2031,9 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
                             ),
                         )
                     })?;
-                let checkpoint = decode_checkpoint(session, &bytes)?;
+                let mut checkpoint = decode_checkpoint(session, &bytes)?;
+                self.omit_relinquished_legacy_lcm(&forge_session_id, &mut checkpoint.snapshot)
+                    .await?;
                 Ok(Some(checkpoint))
             }
             (None, None) => Ok(None),

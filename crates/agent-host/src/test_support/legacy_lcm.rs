@@ -73,6 +73,8 @@ impl LegacyLcmFixture {
         let older_runtime = SessionId::new(format!("{}:older", session.as_str()));
         let older = fixture.ensure_session(&older_runtime).await.unwrap();
         let db = fixture.database();
+        sqlx::query("UPDATE agent_identity SET selected_profile_id='journal-profile' WHERE id='journal-agent'")
+            .execute(db.pool()).await.unwrap();
         let chat = format!("chat:{}", session.as_str());
         sqlx::query("INSERT INTO user (id,email,password_hash,created_at,updated_at) VALUES (?1,?1,'hash','c','u')")
             .bind(format!("owner:{}", session.as_str())).execute(db.pool()).await.unwrap();
@@ -117,6 +119,89 @@ impl LegacyLcmFixture {
             .await
             .unwrap();
         (old, older_runtime)
+    }
+
+    /// The reported 10 GLM / 3 Gemini suspended sessions, with no topic or
+    /// predecessor links and one pre-topic timeline still bound to GLM's A.
+    pub async fn shared_pre_topic_profile_switch(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+    ) -> (Self, SessionId) {
+        let (old, older) = Self::shared_pre_topic_chat(fixture, store, session).await;
+        let db = fixture.database();
+        sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,provider,created_at,updated_at) VALUES ('gemini-profile','journal-agent','native','embedded','gemini','2026-09-23T03:58:00Z','2026-09-23T03:58:00Z')")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,provider,created_at,updated_at) VALUES ('glm-profile','journal-agent','native','embedded','glm','2026-09-17T00:00:00Z','2026-09-17T00:00:00Z')")
+            .execute(db.pool()).await.unwrap();
+        let mut siblings = vec![(
+            older.clone(),
+            "glm-profile",
+            "2026-09-23T02:09:00Z".to_owned(),
+        )];
+        for n in 0..9 {
+            siblings.push((
+                SessionId::new(format!("{}:glm:{n}", session.as_str())),
+                "glm-profile",
+                format!("2026-09-{:02}T00:00:00Z", 17 + n / 2),
+            ));
+        }
+        for (n, created) in ["2026-09-23T04:01:00Z", "2026-09-23T18:36:00Z"]
+            .iter()
+            .enumerate()
+        {
+            siblings.push((
+                SessionId::new(format!("{}:gemini:{n}", session.as_str())),
+                "gemini-profile",
+                (*created).to_owned(),
+            ));
+        }
+        for (runtime, profile, created) in siblings {
+            let owner = fixture.ensure_session(&runtime).await.unwrap();
+            sqlx::query(
+                "UPDATE agent_session SET profile_id=?,created_at=?,updated_at=? WHERE id=?",
+            )
+            .bind(profile)
+            .bind(&created)
+            .bind(&created)
+            .bind(owner)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let mut snapshot = old.checkpoint.snapshot.clone();
+            snapshot.id = runtime.clone();
+            snapshot.extension_state.insert(
+                "fixture.protected".into(),
+                VersionedSessionState::new(
+                    RegistryRevision::from_content("protected-fixture"),
+                    json!({"keep": runtime.as_str()}),
+                ),
+            );
+            let checkpoint = TurnCheckpoint::session_boundary(snapshot.clone(), 6).unwrap();
+            store
+                .seed_legacy_bytes(
+                    &runtime,
+                    Some(&serde_json::to_vec(&snapshot).unwrap()),
+                    Some(&serde_json::to_vec(&checkpoint).unwrap()),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE agent_session SET profile_id='gemini-profile' WHERE runtime_session_id=?",
+        )
+        .bind(session.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agent_identity SET selected_profile_id='gemini-profile' WHERE id='journal-agent'")
+            .execute(db.pool()).await.unwrap();
+        sqlx::query("DELETE FROM agent_profile WHERE id='journal-profile'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        (old, older)
     }
 
     async fn seed_history(

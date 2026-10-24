@@ -51,6 +51,7 @@ pub enum ConversionOutcome {
     Converted,
     AlreadyNative,
     SkippedActive,
+    SkippedProfile { selected_profile: String },
 }
 
 impl SqliteProtectedRuntimeStore {
@@ -142,6 +143,22 @@ impl SqliteProtectedRuntimeStore {
         // importer still decodes and validates both stores itself before publish.
         let snapshot = SessionStore::load(&**self, id).await?;
         let checkpoint = CheckpointStore::load_latest(&**self, id).await?;
+        let referenced = snapshot
+            .iter()
+            .chain(checkpoint.iter().map(|c| &c.snapshot))
+            .filter_map(|s| s.extension_state.get(LCM_COMPONENT_ID))
+            .find_map(|state| {
+                state
+                    .value
+                    .get("timeline_id")
+                    .and_then(serde_json::Value::as_str)
+            });
+        if let Some(selected_profile) = self
+            .legacy_lcm_conversion_profile(id.as_str(), referenced)
+            .await?
+        {
+            return Ok(ConversionOutcome::SkippedProfile { selected_profile });
+        }
         let needs_lcm = snapshot
             .iter()
             .chain(checkpoint.iter().map(|c| &c.snapshot))

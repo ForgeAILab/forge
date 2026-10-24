@@ -97,6 +97,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Convert pre-topic Main Chats across profile switches by assigning shared LCM history to the selected profile and rebuilding relinquished LCM state when an older profile resumes.
 - Native Task context manifests use the host session matching the final runtime
   output after retirement rotation, including reviewer corrections. Retired-open
   races no longer retain obsolete runtime ids in unchanged-read failure tracking.

@@ -1039,6 +1039,17 @@ after the newer session was created. It verifies one conversion, one superseded
 legacy owner skipped by retirement policy, no parked sessions, unchanged legacy
 ciphertext and all LCM rows retained in the original timeline.
 
+`session_journal_dryrun::dry_run_entrypoint_converts_selected_profile_shared_main_chat`
+uses the same entrypoint with two Profiles and 10+3 unlinked suspended sessions.
+It verifies that the selected Profile's newest session receives the original
+114-entry timeline, its two older same-Profile siblings are replaced, and the
+other Profile's ten sessions remain suspended and unreplaced. The JSON summary
+reports one conversion, eleven retirement-policy skips, one
+`skipped.profile_selection` deferral and no parked sessions. Profile deferral
+preserves legacy authority and becomes eligible again when selection changes;
+it is separate from retirement and parking. All legacy ciphertext and original
+LCM rows remain unchanged. This generated fixture uses no installation data.
+
 The conversion report also retains at most 32 `parked_sessions` per pass, with
 the Forge/runtime session IDs, owner scope kind, error kind and runtime error
 message (at most 1,024 characters; no error metadata or session content).

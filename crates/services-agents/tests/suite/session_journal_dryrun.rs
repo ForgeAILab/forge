@@ -147,8 +147,14 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let initial = db.legacy_journal_conversion_remaining(&[]).await?;
     let conversion_started = Instant::now();
     let mut cursor = ConversionCursor::default();
-    let (mut ticks, mut converted, mut skipped_retired, mut skipped_active, mut unreadable) =
-        (0, 0, 0, 0, 0);
+    let (
+        mut ticks,
+        mut converted,
+        mut skipped_retired,
+        mut skipped_active,
+        mut skipped_profile,
+        mut unreadable,
+    ) = (0, 0, 0, 0, 0, 0);
     let mut parked = BTreeMap::<String, usize>::new();
     let mut parked_sessions = Vec::new();
     let mut parked_sessions_omitted = 0;
@@ -160,6 +166,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
         converted += report.converted;
         skipped_retired += report.skipped_retired;
         skipped_active += report.skipped_active;
+        skipped_profile += report.skipped_profile;
         unreadable += report.skipped_unreadable;
         for (reason, count) in report.parked_by_reason {
             *parked.entry(reason).or_default() += count;
@@ -194,7 +201,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let retention_ms = retention_started.elapsed().as_millis();
     let after = physical_bytes(&pool).await?;
     let summary = serde_json::json!({
-        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active},
+        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active,"profile_selection":skipped_profile},
         "parked_by_reason":parked, "unreadable":{"conversion":unreadable,"retention":collected.unreadable_sessions},
         "parked_sessions":parked_sessions,"parked_sessions_omitted":parked_sessions_omitted,
         "remaining":0, "conversion_ticks":ticks, "bytes":{"before":before,"after":after},
@@ -462,6 +469,73 @@ async fn dry_run_entrypoint_converts_shared_pre_topic_main_chat() {
     assert!(!stdout.contains(std::str::from_utf8(secret).unwrap()));
     assert!(!stdout.contains("Synthetic historical message"));
     println!("{summary}");
+}
+
+#[tokio::test]
+async fn dry_run_entrypoint_converts_selected_profile_shared_main_chat() {
+    use agent_runtime::core::ids::SessionId;
+    use forge_agent_host::test_support::{FileDb, LegacyLcmFixture};
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let secret = b"synthetic-selected-profile-chat-secret";
+    let store = SqliteProtectedRuntimeStore::new(db.clone(), Sha256::digest(secret).into(), 1);
+    let id = SessionId::new("dryrun-selected-profile-main");
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+    let before:Vec<(String,String,String)>=sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    std::fs::write(f.directory().join("jwt_secret.bin"), secret).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "session_journal_dryrun::journal_real_data_dry_run",
+            "--nocapture",
+        ])
+        .env("FORGE_JOURNAL_DRYRUN_DB", f.directory().join("journal.db"))
+        .env(
+            "FORGE_JOURNAL_DRYRUN_SECRET_FILE",
+            f.directory().join("jwt_secret.bin"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let summary = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .expect(&stdout);
+    assert_eq!(summary["converted"], 1);
+    assert_eq!(summary["skipped"]["retirement_policy"], 11);
+    assert_eq!(summary["skipped"]["profile_selection"], 1);
+    assert_eq!(summary["skipped"]["active"], 0);
+    assert_eq!(summary["parked_by_reason"], serde_json::json!({}));
+    assert_eq!(summary["parked_sessions"], serde_json::json!([]));
+    assert_eq!(summary["remaining"], 0);
+    let after:Vec<(String,String,String)>=sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(before, after);
+    let rows:(String,i64,i64,i64,i64)=sqlx::query_as("SELECT runtime_session_id,revision,(SELECT COUNT(*) FROM agent_lcm_entry),(SELECT COUNT(*) FROM agent_lcm_operation),(SELECT COUNT(*) FROM agent_lcm_timeline) FROM agent_lcm_timeline WHERE id=?")
+        .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(rows, (id.to_string(), 131, 114, 121, 1));
+    let a:(String,Option<String>,i64)=sqlx::query_as("SELECT status,replaced_by_session_id,version FROM agent_session WHERE runtime_session_id=?")
+        .bind(older.as_str()).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(a, ("suspended".into(), None, 1));
+    let old_native:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_journal_session j JOIN agent_session s ON s.id=j.forge_session_id WHERE s.profile_id='glm-profile' AND (j.published=1 OR j.retired=1)")
+        .fetch_one(db.pool()).await.unwrap();
+    assert_eq!(old_native, 0);
+    let relinquishments: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(relinquishments, 12);
+    assert!(!stdout.contains(std::str::from_utf8(secret).unwrap()));
+    assert!(!stdout.contains("Synthetic historical message"));
+    println!("selected-profile-generated-dryrun {summary}");
 }
 
 #[tokio::test]

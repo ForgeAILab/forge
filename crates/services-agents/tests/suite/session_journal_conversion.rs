@@ -179,8 +179,8 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
     for (case, reason) in [
         ("active", "LCM sibling owner is active"),
         (
-            "profile",
-            "LCM sibling owner remains resumable for another profile",
+            "no-selected-profile",
+            "LCM shared chat identity has no selected profile",
         ),
         (
             "tie",
@@ -199,11 +199,13 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
                     .await
                     .unwrap();
             }
-            "profile" => {
-                sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('other-profile','journal-agent','native','embedded','c','u')")
-                    .execute(db.pool()).await.unwrap();
-                sqlx::query("UPDATE agent_session SET profile_id='other-profile' WHERE runtime_session_id=?")
-                    .bind(older.as_str()).execute(db.pool()).await.unwrap();
+            "no-selected-profile" => {
+                sqlx::query(
+                    "UPDATE agent_identity SET selected_profile_id=NULL WHERE id='journal-agent'",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap();
             }
             "tie" => {
                 sqlx::query("UPDATE agent_session SET created_at='2026-09-24T08:34:00Z' WHERE runtime_session_id=?")
@@ -232,6 +234,205 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
                 .await
                 .unwrap();
         assert_eq!(owner, older.as_str(), "{case}");
+    }
+}
+
+#[tokio::test]
+async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection_changes() {
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    use services_agents::session_journal_retention::SessionJournalRetention;
+    let (f, store, worker) = fixture().await;
+    let id = SessionId::new("profile-switch-worker");
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+    let db = f.database();
+    let original_owner = f.ensure_session(&older).await.unwrap();
+    // Put A before B in the worker's keyset page, as opaque production ids can.
+    let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query("PRAGMA defer_foreign_keys=ON")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_session SET id='000-old-profile-owner' WHERE id=?")
+        .bind(&original_owner)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE protected_agent_session_state SET session_id='000-old-profile-owner' WHERE session_id=?")
+        .bind(&original_owner).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let older_owner = f.ensure_session(&older).await.unwrap();
+    assert_eq!(older_owner, "000-old-profile-owner");
+    let protected = CheckpointStore::load_latest(&*store, &older)
+        .await
+        .unwrap()
+        .unwrap();
+    let before: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(
+        store
+            .convert_legacy_session(&older_owner, &older)
+            .await
+            .unwrap(),
+        ConversionOutcome::SkippedProfile {
+            selected_profile: "gemini-profile".into()
+        }
+    );
+    let mut cursor = ConversionCursor::default();
+    let (mut converted, mut deferred, mut retired) = (0, 0, 0);
+    let mut complete = false;
+    for _ in 0..6 {
+        let report = worker
+            .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+            .await
+            .unwrap();
+        converted += report.converted;
+        deferred += report.skipped_profile;
+        retired += report.skipped_retired;
+        assert!(report.parked_sessions.is_empty());
+        if report.remaining == 0 {
+            complete = true;
+            break;
+        }
+    }
+    assert!(complete);
+    assert_eq!((converted, deferred, retired), (1, 1, 11));
+    assert_eq!(publication_count(&f, &id).await, 2);
+    assert_eq!(publication_count(&f, &older).await, 0);
+    let a: (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT status,replaced_by_session_id,version FROM agent_session WHERE id=?",
+    )
+    .bind(&older_owner)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(a, ("suspended".into(), None, 1));
+    let retention = SessionJournalRetention::new(db.clone(), &store);
+    assert!(!retention.should_retire(&older_owner).await.unwrap());
+    let retry = worker
+        .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(retry.converted, 0);
+    assert_eq!(retry.remaining, 0);
+    assert!(retry.parked_sessions.is_empty());
+    sqlx::query("UPDATE agent_identity SET selected_profile_id='glm-profile',version=version+1 WHERE id='journal-agent'")
+        .execute(db.pool()).await.unwrap();
+    let resumed = worker
+        .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(resumed.converted, 1);
+    assert_eq!(resumed.remaining, 0);
+    assert!(resumed.parked_sessions.is_empty());
+    assert_eq!(publication_count(&f, &older).await, 2);
+    let mut expected = protected.snapshot;
+    expected
+        .extension_state
+        .remove(agent_runtime::harness::LCM_COMPONENT_ID);
+    let engine = store.journals().protected();
+    let lease = engine
+        .open(
+            &older,
+            JournalOpen {
+                root: JournalRootSelection::Latest,
+                expected_revision: None,
+                operation: JournalOperationId::new("profile-switch-read"),
+                pin: JournalPinId::new("profile-switch-read"),
+                intent: JournalOpenIntent::ReadOnly,
+            },
+        )
+        .await
+        .unwrap();
+    let imported = JournalReader::new(
+        &engine,
+        &lease,
+        JournalReadLimits {
+            objects: 100_000,
+            encoded_bytes: 32 * 1024 * 1024,
+            entries: 100_000,
+        },
+    )
+    .unwrap()
+    .snapshot()
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(imported, expected);
+    engine.close(lease).await.unwrap();
+    let after: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(before, after);
+    let owner: String =
+        sqlx::query_scalar("SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?")
+            .bind(&old.timeline_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(owner, id.as_str());
+}
+
+#[tokio::test]
+async fn shared_profile_switch_parks_without_selected_resume_target() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for empty_profile in [false, true] {
+        let (f, store, worker) = fixture().await;
+        let id = SessionId::new("missing-profile-target");
+        let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        let selected = if empty_profile {
+            sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('empty-profile','journal-agent','native','embedded','c','u')")
+                .execute(db.pool()).await.unwrap();
+            Some("empty-profile")
+        } else {
+            None
+        };
+        sqlx::query("UPDATE agent_identity SET selected_profile_id=? WHERE id='journal-agent'")
+            .bind(selected)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let mut cursor = ConversionCursor::default();
+        let mut parked = Vec::new();
+        for _ in 0..6 {
+            let report = worker
+                .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(report.converted, 0);
+            parked.extend(report.parked_sessions);
+            if report.remaining == 0 {
+                break;
+            }
+        }
+        assert_eq!(parked.len(), 2);
+        for entry in parked {
+            assert_eq!(entry.error_kind, "Conflict");
+            assert_eq!(
+                entry.error_message,
+                if empty_profile {
+                    "LCM shared chat selected profile has no resumable native session"
+                } else {
+                    "LCM shared chat identity has no selected profile"
+                }
+            );
+        }
+        assert_eq!(publication_count(&f, &id).await, 0);
+        assert_eq!(publication_count(&f, &older).await, 0);
+        let owner: String =
+            sqlx::query_scalar("SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?")
+                .bind(&old.timeline_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(owner, older.as_str());
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipts, 0);
     }
 }
 

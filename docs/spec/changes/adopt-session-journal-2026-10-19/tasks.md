@@ -820,3 +820,28 @@ No runtime bench crate becomes a production dependency.
 
 The v0.10.0 pin, revision constant and dependency contract are aligned; historical
 benchmark receipts predate the tag and no benchmark rerun is claimed.
+
+
+## 2026-10-24 shared LCM Profile-switch amendment
+
+- [x] **34. Selected-Profile ownership and safe switch-back import.** Reproduce the
+  two-Profile 10+3 suspended Main Chat shape before production changes; transfer
+  the pre-topic timeline to the selected Profile's resume target with all writer,
+  version, native-publication, claim, reference and rollback guards. Preserve
+  non-selected siblings as unreplaced legacy sessions and durably omit only their
+  relinquished LCM namespaces on future import. Keep same-Profile replacement.
+  Verify conversion, zero-provider lazy resume, cold retry, a switch-back turn,
+  A-first worker discovery, missing/empty selection parking, transaction rollback
+  and the generated-database dry-run entrypoint. Update architecture, spec and
+  Unreleased Fixed; run the requested focused suites, fmt and strict clippy.
+  Completed (2026-10-24): the generated 10+3 shape first reproduced the exact
+  cross-Profile Conflict. Selected-Profile transfer, durable relinquishment,
+  cold/idempotent retry, zero-provider lazy resume, switch-back import and a
+  rebuilt-LCM turn pass. A-first worker discovery defers the old Profile and
+  re-enables it when selection changes. Missing/empty selection parks precisely;
+  native/lease/version/reference guards and transactional rollback remain covered.
+  The actual dry-run entrypoint reports one conversion, one Profile deferral,
+  eleven retirement-policy skips and no parking on generated data. The requested
+  focused suites, migration units, strict Clippy, fmt and spec validation pass;
+  the two added reference guards pass their bounded module rerun. No real data
+  was accessed. Earlier unfinished tasks and Owner Decisions remain unchanged.
