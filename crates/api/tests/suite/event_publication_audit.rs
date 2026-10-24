@@ -274,13 +274,13 @@ async fn domain_event_broadcast_audit() {
             source: "crates/db/src/sqlite/agent_chat.rs",
         },
         Case {
-            // crates/services/src/milestone_runtime.rs — readiness/release.
+            // crates/services/src/milestone_runtime/release.rs — readiness/release.
             event_type: "milestone.released",
             entity_type: "milestone",
             entity_id: "audit-milestone-1",
             scope_type: "project",
             scope_id: "audit-project-2",
-            source: "crates/services/src/milestone_runtime.rs",
+            source: "crates/services/src/milestone_runtime/release.rs",
         },
         Case {
             // crates/db/src/sqlite/task_adaptive.rs — the adaptive-boundary

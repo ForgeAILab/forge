@@ -38,6 +38,29 @@ crates/
 └── config/        # Configuration loading, defaults
 ```
 
+### Service module layout
+
+Large services keep their existing `.rs` module roots and place implementation
+and test children in a directory with the same name. The roots retain the public
+and crate-visible entry paths; inherent methods stay on their original service
+types.
+
+| Root under `crates/services/src/` | Implementation children |
+|---|---|
+| `recovery.rs` | Startup recovery, heartbeat, leases, Task recovery, execution ownership, placement monitoring, owner failure, reconciliation, machine removal |
+| `task_service/workspace.rs` | Admission, claim preparation, workspace persistence, worktree recovery, reset |
+| `attention_service.rs` | Wake sweeping, admission, decisions, responders, projection, user actions, Mission Control |
+| `milestone_runtime.rs` | Definitions, inputs, readiness, release |
+| `task_service/execution/cascade.rs` | Completion, workflow guards, failure, review completion, comments, review recovery |
+| `workspace_cleanup.rs` | Existing garbage collection child; scheduler production code remains in the root |
+| `task_actions.rs` | Offer derivation; snapshot loading remains in the root |
+| `task_service/execution/recovery.rs` | Action ownership, queued actions, failure metadata, retry budgets, process continuation, restart, manual review, entry recovery |
+
+Unit tests remain below the same top-level module prefixes, including
+`task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
+assignments. Large test modules use topic children and shared fixtures in their
+test root.
+
 ### Dependency flow
 
 ```
