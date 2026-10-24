@@ -98,6 +98,181 @@ async fn fixture(id: &SessionId) -> (FileDb, Arc<SqliteProtectedRuntimeStore>) {
 }
 
 #[tokio::test]
+async fn pre_topic_checkpoint_lcm_converts_without_changing_legacy() {
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    let id = SessionId::new("pre-topic-conversion");
+    let (f, store) = fixture(&id).await;
+    let old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+    let before: (String, String) = sqlx::query_as(
+        "SELECT quote(snapshot_ciphertext), quote(checkpoint_ciphertext) FROM protected_agent_session_state",
+    ).fetch_one(f.database().pool()).await.unwrap();
+    let owner = f.ensure_session(&id).await.unwrap();
+    let result = store.convert_legacy_session(&owner, &id).await;
+    assert_eq!(result.unwrap(), ConversionOutcome::Converted);
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+    assert_eq!(
+        snapshot(&store.journals().ordinary(), &id).await,
+        old.snapshot
+    );
+    let after: (String, String) = sqlx::query_as(
+        "SELECT quote(snapshot_ciphertext), quote(checkpoint_ciphertext) FROM protected_agent_session_state",
+    ).fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(before, after);
+    let bound: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=?",
+    )
+    .bind(id.as_str())
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(bound, old.timeline_id);
+}
+
+#[tokio::test]
+async fn pre_topic_checkpoint_lcm_lazy_resume_preserves_session() {
+    use agent_runtime::harness::{
+        LcmCoordinator, LcmCoordinatorPolicy, LcmRecoveryPolicy, StaticLcmTimelineResolver,
+    };
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    let id = SessionId::new("pre-topic-lazy");
+    let (f, store) = fixture(&id).await;
+    let old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+    let lcm = store
+        .lcm_store_for_runtime_session(id.as_str(), "account", "journal-owner")
+        .await
+        .unwrap();
+    let binding = lcm.runtime_binding(id.clone()).unwrap();
+    let coordinator = LcmCoordinator::new(
+        Arc::new(lcm),
+        Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+        Arc::new(StaticLcmTimelineResolver::new(binding)),
+        LcmCoordinatorPolicy {
+            input_budget_tokens: 28_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let p = provider();
+    let rt = runtime_builder(store.clone(), p.clone())
+        .lcm(Arc::new(coordinator))
+        .build()
+        .unwrap();
+    let session = rt
+        .start_session(StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt))
+        .await
+        .unwrap();
+    assert_eq!(session.id(), &id);
+    assert_eq!(session.history(), old.snapshot.history.as_slice());
+    assert!(p.requests().is_empty());
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+}
+
+#[tokio::test]
+async fn pre_topic_failed_binding_and_unpublished_reservations_retry_successfully() {
+    use agent_runtime::{
+        core::error::ErrorKind,
+        harness::{LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver},
+        runtime::CheckpointRecoveryPolicy,
+    };
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    let id = SessionId::new("pre-topic-retry");
+    let (f, store) = fixture(&id).await;
+    let old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+    let wrong = old.bind_empty_replacement(&f).await;
+    let binding = wrong.runtime_binding(id.clone()).unwrap();
+    assert_ne!(binding.timeline.as_str(), old.timeline_id);
+    assert_eq!(binding.authorization_revision.as_str(), old.checkpoint.snapshot.extension_state[agent_runtime::harness::LCM_COMPONENT_ID].value["binding_revision"].as_str().unwrap());
+    // Reproduce the old background preflight and real runtime failure, leaving
+    // both encrypted reservations at epoch 2, without publishing either root.
+    for engine in [store.journals().protected(), store.journals().ordinary()] {
+        let lease = engine
+            .open(&id, open("preflight", JournalOpenIntent::ExclusiveWriter))
+            .await
+            .unwrap();
+        engine.close(lease).await.unwrap();
+    }
+    let coordinator = LcmCoordinator::new(
+        Arc::new(wrong),
+        Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+        Arc::new(StaticLcmTimelineResolver::new(binding)),
+        LcmCoordinatorPolicy {
+            input_budget_tokens: 28_000,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let p = provider();
+    let rt = runtime_builder(store.clone(), p.clone())
+        .lcm(Arc::new(coordinator))
+        .build()
+        .unwrap();
+    let error = rt
+        .start_session(
+            StartSession::resume(id.clone())
+                .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer),
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(
+        error.message,
+        "LCM state failed identity, binding, or frontier validation"
+    );
+    assert!(p.requests().is_empty());
+    drop(rt);
+    let reservations: Vec<(String, Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT role,writer_epoch,published FROM agent_session_journal_session WHERE runtime_session_id=? ORDER BY role",
+    ).bind(id.as_str()).fetch_all(f.database().pool()).await.unwrap();
+    assert_eq!(reservations.len(), 2);
+    for (_, epoch, published) in reservations {
+        assert_eq!(u64::from_be_bytes(epoch.try_into().unwrap()), 2);
+        assert!(!published);
+    }
+    let owner = f.ensure_session(&id).await.unwrap();
+    assert_eq!(
+        store.convert_legacy_session(&owner, &id).await.unwrap(),
+        ConversionOutcome::Converted
+    );
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+    assert_eq!(
+        snapshot(&store.journals().ordinary(), &id).await,
+        old.snapshot
+    );
+    let binding: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=?",
+    )
+    .bind(id.as_str())
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(binding, old.timeline_id);
+    let original: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM agent_lcm_entry WHERE timeline_id=?1),
+                (SELECT COUNT(*) FROM agent_lcm_node WHERE timeline_id=?1),
+                (SELECT COUNT(*) FROM agent_lcm_operation WHERE timeline_id=?1)",
+    )
+    .bind(&old.timeline_id)
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(original, (120, 1, 2));
+}
+
+#[tokio::test]
 async fn native_delta_and_projection() {
     let id = SessionId::new("projection");
     let (f, store) = fixture(&id).await;

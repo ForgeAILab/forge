@@ -102,7 +102,7 @@ impl SqliteProtectedRuntimeStore {
             .database()
             .session_persistence_flags(owner)
             .await
-            .map_err(|_| RuntimeError::internal("conversion probe failed"))?;
+            .map_err(crate::protected_store::protected_database_error)?;
         if flags.ordinary_published || flags.retired {
             return Ok(ConversionOutcome::AlreadyNative);
         }
@@ -167,20 +167,19 @@ impl SqliteProtectedRuntimeStore {
             let session = db
                 .get_agent_session(owner)
                 .await
-                .map_err(|_| RuntimeError::internal("conversion owner lookup failed"))?
+                .map_err(crate::protected_store::protected_database_error)?
                 .ok_or_else(|| RuntimeError::not_found("conversion owner removed"))?;
             let scope = db
                 .get_context_scope(&session.context_scope_id)
                 .await
-                .map_err(|_| RuntimeError::internal("conversion scope lookup failed"))?
+                .map_err(crate::protected_store::protected_database_error)?
                 .ok_or_else(|| RuntimeError::not_found("conversion scope removed"))?;
             let store = self
-                .lcm_store_for_runtime_session(id.as_str(), &scope.scope_type, &scope.scope_id)
-                .await
-                .map_err(|_| RuntimeError::conflict("conversion LCM binding deferred"))?;
-            let binding = store
-                .runtime_binding(id.clone())
-                .map_err(|_| RuntimeError::conflict("conversion LCM binding deferred"))?;
+                .resolve_lcm_store(id.as_str(), &scope.scope_type, &scope.scope_id, false)
+                .await?;
+            let binding = store.runtime_binding(id.clone()).map_err(|_| {
+                RuntimeError::conflict("conversion LCM timeline binding is invalid")
+            })?;
             builder = builder.lcm(Arc::new(LcmCoordinator::new(
                 Arc::new(store),
                 Arc::new(crate::DeterministicLcmSummaryModel::default()),
@@ -212,7 +211,7 @@ impl SqliteProtectedRuntimeStore {
             .database()
             .session_persistence_flags(owner)
             .await
-            .map_err(|_| RuntimeError::internal("conversion publication probe failed"))?;
+            .map_err(crate::protected_store::protected_database_error)?;
         if flags.ordinary_published && !flags.retired {
             // Import validation/publication precedes live ability activation.
             // A missing current tool composition may refuse activation after a

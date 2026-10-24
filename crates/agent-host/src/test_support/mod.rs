@@ -4,6 +4,8 @@ mod journal_events;
 pub use journal_events::JournalEvents;
 mod mapping;
 pub use mapping::MappingStorage;
+mod legacy_lcm;
+pub use legacy_lcm::LegacyLcmFixture;
 
 use std::{path::Path, sync::Arc};
 

@@ -184,6 +184,21 @@ The additive migration SHALL preserve existing data and leave protected_agent_se
 - **THEN** the next open repairs ordinary publication from matching unchanged import evidence once
 - **AND** it never overlays stale legacy data onto an advanced native head
 
+#### Scenario: Pre-topic checkpoint-only LCM
+- **WHEN** an older legacy snapshot omits LCM state and its checkpoint references an unretired owner-less timeline for the same identity and scope
+- **THEN** background conversion and lazy resume resolve that checkpoint timeline and use the same runtime importer validation
+- **AND** older tuning revisions and absent or stale Forge policy markers preserve the validated LCM state, canonical history and transcript
+- **AND** live resume delegates tuning metadata rebuild to the runtime; malformed identity, binding or frontier evidence remains a conflict
+
+#### Scenario: Retry after a failed LCM import
+- **WHEN** a failed import left unpublished writer reservations and an untouched empty replacement LCM binding
+- **THEN** retry may rebind to the session's own persisted timeline only while the replacement is unclaimed, revision zero, contains no entries, nodes or operations, and neither native domain has published or retired
+- **AND** the binding repair checks those conditions in one write transaction, preserves the original timeline and legacy payloads, and leaves a populated or differently owned binding in conflict
+
+#### Scenario: Transient LCM binding failure
+- **WHEN** LCM binding encounters a retryable database failure, including SQLite BUSY/LOCKED primary or extended codes
+- **THEN** conversion leaves the session eligible for a later sweep of the same worker and excludes it from parked conflicts
+
 #### Scenario: Data-preserving migration and downgrade
 - **WHEN** the one new V{YYYYMMDDHHMM} migration is applied
 - **THEN** it creates the pack schema without editing historical migration files or deleting legacy payloads

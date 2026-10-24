@@ -1024,7 +1024,10 @@ unreadable counts, allocated legacy/journal table-and-index bytes from `dbstat`
 before/after, conversion tick count, retention results and elapsed milliseconds
 for migrations, conversion and retention. `dbstat` allocation is not canonical
 live bytes or a file-shrink promise. Parked errors are excluded from remaining
-work for that worker lifetime and retried after restart; foreground lazy import
+work for that worker lifetime and retried after restart. Retryable database
+failures remain pending for a later sweep of the same worker, including LCM
+binding BUSY/LOCKED; the dry run reports non-convergence if they persist beyond
+its bounded sweep limit. Foreground lazy import
 remains available after repair. The generated-database regression invokes this
 same ignored entrypoint; it is not evidence from user data.
 

@@ -178,7 +178,10 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
             break;
         }
         if ticks > initial.saturating_mul(2).saturating_add(2) {
-            return Err("journal dry run did not converge; pending active sessions remain".into());
+            return Err(
+                "journal dry run did not converge; active sessions or retryable errors remain"
+                    .into(),
+            );
         }
         tokio::task::yield_now().await;
     }
@@ -363,6 +366,37 @@ async fn dry_run_entrypoint_on_generated_database() {
             > 0
     );
     println!("{summary}");
+}
+
+#[tokio::test]
+async fn dry_run_converts_pre_topic_main_chat_lcm() {
+    use forge_agent_host::test_support::{FileDb, LegacyLcmFixture};
+    let f = FileDb::new().await.unwrap();
+    let secret = b"synthetic-historical-lcm-secret";
+    let key: [u8; 32] = Sha256::digest(secret).into();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(f.database(), key, 1));
+    let id = super::session_journal_conversion::seed(&f, &store, "dryrun-pre-topic-main").await;
+    let old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+    old.bind_empty_replacement(&f).await;
+    let before: (String,String) = sqlx::query_as("SELECT quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state")
+        .fetch_one(f.database().pool()).await.unwrap();
+    let secret_path = f.directory().join("jwt_secret.bin");
+    std::fs::write(&secret_path, secret).unwrap();
+    let summary = run_copy(&f.directory().join("journal.db"), &secret_path)
+        .await
+        .unwrap();
+    assert_eq!(summary["converted"], 1);
+    assert_eq!(summary["remaining"], 0);
+    assert_eq!(summary["parked_by_reason"], serde_json::json!({}));
+    assert_eq!(summary["parked_sessions"], serde_json::json!([]));
+    let after: (String,String) = sqlx::query_as("SELECT quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state")
+        .fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(after, before);
+    let transcript: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_chat_message")
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap();
+    assert_eq!(transcript, 120);
 }
 
 #[tokio::test]

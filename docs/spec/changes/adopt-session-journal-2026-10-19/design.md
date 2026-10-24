@@ -756,9 +756,22 @@ importer owns validation and exact-first publication. No tools or credentialed
 provider are configured; the conversion provider refuses calls. Drop the handle
 without shutdown/persist so no synthetic boundary is written. Publication is
 checked after start: a live-composition refusal after successful import does not
-undo or misreport conversion. Typed conflicts defer; non-retryable serialization
+undo or misreport conversion. Non-retryable validation conflicts park; retryable
+database errors stay eligible for a later sweep. Non-retryable serialization
 failures use the capped unreadable tracker. Forge does not copy import encoding
 or infer publication from a successful activation alone.
+
+Pre-topic LCM discovery consults the legacy checkpoint when the ordinary
+snapshot omits that namespace, matching the runtime's protected-state overlay.
+It adopts only the referenced timeline for the same identity/scope and owner.
+An earlier failed snapshot-only lookup may have persisted an empty replacement
+binding. Before publication or retirement, the resolver may repair that binding
+in one transaction only if its replacement is unclaimed, revision zero, and has
+no entries, nodes or operations. A populated or differently owned binding stays
+in conflict. Both conversion and lazy resume retain the old LCM extension for
+runtime identity/binding/frontier validation and exact import; the live runtime
+rebuilds changed tuning metadata. Stale/NULL Forge policy markers do not justify
+discarding identity evidence or rewriting legacy payloads.
 
 **Scalar probes.** Return native publication, tombstone and checkpoint flags
 without decrypting a pack, selecting rows by the indexed `forge_session_id`. A reservation is absent publication; a tombstone is a
@@ -987,8 +1000,10 @@ a later sweep. Foreground opens hold read admission; an open already racing an
 in-flight conversion waits for it to finish rather than surfacing its writer
 conflict. The runtime's own writer fences cover writers outside this host
 admission. Active writer conflicts skip/retry, including a lazy importer winning
-first. Every other per-session error advances the cursor and parks that owner
-with its error-kind reason until worker restart, including validation conflicts.
+first. Retryable errors advance the cursor and remain eligible for the next
+sweep, including SQLite BUSY/LOCKED during LCM binding. Other per-session errors
+advance the cursor and park that owner with its error-kind reason until worker
+restart, including validation conflicts.
 Foreground lazy import remains available after repair; legacy rows stay intact.
 Both paths use the existing v3 importer, shared engines and exact-first validation
 with checkpoint recovery deferred, with no provider/tool I/O. Conversion never

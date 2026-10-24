@@ -22,7 +22,7 @@ const PARKED_ERROR_MESSAGE_LIMIT: usize = 1_024;
 pub struct ConversionCursor {
     after: String,
     // Process-local decisions preserve legacy rows. Restart retries parked
-    // errors; foreground lazy import remains available after an operator repair.
+    // non-retryable errors; transient failures stay eligible for the next sweep.
     excluded: BTreeMap<String, String>,
 }
 
@@ -170,6 +170,9 @@ impl SessionJournalConversion {
                         .convert_legacy_session(&owner, &SessionId::new(&runtime))
                         .await
                 }
+                Err(services::ServiceError::Db(error)) if error.is_transient() => Err(
+                    RuntimeError::internal("conversion retirement policy unavailable").retryable(),
+                ),
                 Err(_) => Err(agent_runtime::core::error::RuntimeError::internal(
                     "conversion retirement policy unavailable",
                 )),
@@ -178,6 +181,10 @@ impl SessionJournalConversion {
                 Ok(ConversionOutcome::Converted) => report.converted += 1,
                 Ok(ConversionOutcome::AlreadyNative) => {}
                 Ok(ConversionOutcome::SkippedActive) => report.skipped_active += 1,
+                Err(error) if error.retryable => {
+                    tracing::debug!(target: "forge_session_journal", runtime_session_id=runtime,
+                        error_kind=?error.kind, "background journal conversion deferred for retry");
+                }
                 Err(error) => {
                     if error.kind == ErrorKind::Serialization && !error.retryable {
                         ForgeJournalStorage::note_unreadable_session(&SessionId::new(&runtime));

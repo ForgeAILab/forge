@@ -63,6 +63,16 @@ fn log_store_error<E>(error: impl std::fmt::Display, fallback: E) -> E {
     fallback
 }
 
+pub(crate) fn protected_database_error(error: impl Into<db::DbError>) -> RuntimeError {
+    let error = error.into();
+    let failure = RuntimeError::internal("protected persistence database operation failed");
+    if error.is_transient() {
+        failure.retryable()
+    } else {
+        failure
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialRevocationOutcome {
     NotSupported,
@@ -307,7 +317,7 @@ impl SqliteProtectedRuntimeStore {
             .fetch_optional(self.db.pool())
             .await
         }
-        .map_err(|_| RuntimeError::internal("protected state lookup failed"))?
+        .map_err(protected_database_error)?
         .ok_or_else(|| RuntimeError::not_found("runtime session mapping not found"))
     }
 
@@ -658,7 +668,9 @@ impl SqliteProtectedRuntimeStore {
     /// or adopt the one pre-V149 owner-less timeline its *own* persisted LCM
     /// state references; that adoption stamps the owner in the same
     /// transaction, so no other runtime session can resolve to it afterwards.
-    /// Anything else gets a fresh timeline.
+    /// An empty, unclaimed non-Chat timeline may continue across runtimes.
+    /// Without a persisted reference, other sessions get a fresh timeline;
+    /// unavailable or differently owned references fail closed.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
@@ -667,6 +679,7 @@ impl SqliteProtectedRuntimeStore {
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
             .await
+            .map_err(|error| crate::AgentHostError::Runtime(error.to_string()))
     }
 
     /// Resolves a topic-rotation successor. A successor never adopts or
@@ -680,6 +693,7 @@ impl SqliteProtectedRuntimeStore {
     ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
             .await
+            .map_err(|error| crate::AgentHostError::Runtime(error.to_string()))
     }
 
     /// The LCM timeline the runtime session's own persisted state is bound
@@ -687,16 +701,24 @@ impl SqliteProtectedRuntimeStore {
     async fn referenced_lcm_timeline(
         &self,
         runtime_id: &str,
-    ) -> Result<Option<String>, crate::AgentHostError> {
+        flags: db::SessionPersistenceFlags,
+    ) -> Result<Option<String>, RuntimeError> {
         let id = SessionId::new(runtime_id);
-        let flags = self
-            .persistence_flags(&id)
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let state = self
+        let mut state = self
             .persisted_extension(&id, flags, agent_runtime::harness::LCM_COMPONENT_ID)
-            .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .await?;
+        // Pre-topic stores wrote the two copies independently. Resume overlays
+        // checkpoint-only namespaces, so timeline discovery must see them too.
+        if state.is_none() && flags.legacy_eligible && flags.checkpoint_present {
+            state = CheckpointStore::load_latest(self, &id)
+                .await?
+                .and_then(|mut checkpoint| {
+                    checkpoint
+                        .snapshot
+                        .extension_state
+                        .remove(agent_runtime::harness::LCM_COMPONENT_ID)
+                });
+        }
         Ok(state.and_then(|state| {
             state
                 .value
@@ -706,13 +728,13 @@ impl SqliteProtectedRuntimeStore {
         }))
     }
 
-    async fn resolve_lcm_store(
+    pub(crate) async fn resolve_lcm_store(
         &self,
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
         successor: bool,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         let row = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
@@ -731,17 +753,15 @@ impl SqliteProtectedRuntimeStore {
             .fetch_optional(self.db.pool())
             .await
         }
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-        .ok_or(crate::AgentHostError::SessionNotFound)?;
+        .map_err(protected_database_error)?
+        .ok_or_else(|| RuntimeError::not_found("LCM session binding not found"))?;
         let identity_id: String = row
             .try_get("identity_id")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?;
         let stored_scope_type: String = row
             .try_get("scope_type")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let stored_scope_id: String = row
-            .try_get("scope_id")
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?;
+        let stored_scope_id: String = row.try_get("scope_id").map_err(protected_database_error)?;
         let authorization_revision =
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
@@ -756,19 +776,20 @@ impl SqliteProtectedRuntimeStore {
         .fetch_one(self.db.pool())
         .await
         }
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(protected_database_error)?;
         // Reading native/legacy extension state happens outside the write transaction.
-        let referenced = if successor || has_binding {
+        let flags = self.persistence_flags(&SessionId::new(runtime_id)).await?;
+        let referenced = if successor || (has_binding && !flags.legacy_eligible) {
             None
         } else {
-            self.referenced_lcm_timeline(runtime_id).await?
+            self.referenced_lcm_timeline(runtime_id, flags).await?
         };
         let mut tx = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
             db::begin_immediate(self.db.pool()).await
         }
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(protected_database_error)?;
         let existing: Option<String> = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
@@ -779,8 +800,40 @@ impl SqliteProtectedRuntimeStore {
             .fetch_optional(&mut *tx)
             .await
         }
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
-        let timeline_id = if let Some(id) = existing {
+        .map_err(protected_database_error)?;
+        // An interrupted old resolver could bind an empty replacement before
+        // import rejected its timeline mismatch. Only unpublished legacy state
+        // may repair that binding, and only while the replacement is untouched.
+        let repair_empty = if flags.legacy_eligible
+            && referenced.is_some()
+            && existing
+                .as_ref()
+                .is_some_and(|id| Some(id) != referenced.as_ref())
+        {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline t
+                 WHERE t.id=? AND t.runtime_session_id=? AND t.retired_at IS NULL
+                   AND t.identity_id=? AND t.scope_type=? AND t.canonical_scope_id=?
+                   AND t.revision=0 AND t.claim_owner IS NULL AND t.claim_generation=0
+                   AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session j
+                                  WHERE j.runtime_session_id=t.runtime_session_id
+                                    AND (j.published=1 OR j.retired=1))
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e WHERE e.timeline_id=t.id)
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_node n WHERE n.timeline_id=t.id)
+                   AND NOT EXISTS(SELECT 1 FROM agent_lcm_operation o WHERE o.timeline_id=t.id))",
+            )
+            .bind(existing.as_deref())
+            .bind(runtime_id)
+            .bind(&identity_id)
+            .bind(&stored_scope_type)
+            .bind(&stored_scope_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(protected_database_error)?
+        } else {
+            false
+        };
+        let timeline_id = if let Some(id) = existing.filter(|_| !repair_empty) {
             id
         } else {
             let candidate: Option<String> = if successor {
@@ -792,8 +845,10 @@ impl SqliteProtectedRuntimeStore {
                     sqlx::query_scalar(
                         "SELECT id FROM agent_lcm_timeline
                      WHERE identity_id = ?1 AND scope_type = ?2 AND canonical_scope_id = ?3
+                       AND (?5 IS NULL OR id = ?5)
                        AND (runtime_session_id = ?4
-                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5)
+                            OR (runtime_session_id IS NULL AND retired_at IS NULL AND id = ?5
+                                AND (claim_owner IS NULL OR claim_owner = ?4))
                             OR (scope_type <> 'agent_chat' AND claim_owner IS NULL
                                 AND retired_at IS NULL
                                 AND NOT EXISTS(SELECT 1 FROM agent_lcm_entry e
@@ -808,7 +863,7 @@ impl SqliteProtectedRuntimeStore {
                     .fetch_optional(&mut *tx)
                     .await
                 }
-                .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
+                .map_err(protected_database_error)?
             };
             let id = match candidate {
                 Some(id) => {
@@ -827,8 +882,13 @@ impl SqliteProtectedRuntimeStore {
                         .execute(&mut *tx)
                         .await
                     }
-                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    .map_err(protected_database_error)?;
                     id
+                }
+                None if referenced.is_some() => {
+                    return Err(RuntimeError::conflict(
+                        "persisted LCM timeline is unavailable or belongs to another session",
+                    ));
                 }
                 None => {
                     let id = db::new_uuid_v4();
@@ -855,7 +915,7 @@ impl SqliteProtectedRuntimeStore {
                         .execute(&mut *tx)
                         .await
                     }
-                    .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+                    .map_err(protected_database_error)?;
                     id
                 }
             };
@@ -864,14 +924,14 @@ impl SqliteProtectedRuntimeStore {
                 let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0);
                 sqlx::query(
                     "INSERT INTO agent_runtime_lcm_binding (runtime_session_id, timeline_id)
-                 VALUES (?, ?)",
+                 VALUES (?, ?) ON CONFLICT(runtime_session_id) DO UPDATE SET timeline_id=excluded.timeline_id",
                 )
                 .bind(runtime_id)
                 .bind(&id)
                 .execute(&mut *tx)
                 .await
             }
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?;
             id
         };
         {
@@ -879,11 +939,31 @@ impl SqliteProtectedRuntimeStore {
             let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
             tx.commit().await
         }
-        .map_err(|_| crate::AgentHostError::ProtectedPersistence)?;
+        .map_err(|error| protected_database_error(error).retryable())?;
         let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
             .await
-            .map_err(|_| crate::AgentHostError::ProtectedPersistence)?
-            .ok_or(crate::AgentHostError::ProtectedPersistence)?;
+            .map_err(protected_database_error)?
+            .ok_or_else(|| RuntimeError::conflict("LCM binding timeline is missing"))?;
+        let matches_owner: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=?
+             AND identity_id=? AND scope_type=? AND canonical_scope_id=?
+             AND retired_at IS NULL
+             AND (scope_type <> 'agent_chat' OR runtime_session_id IS NULL OR runtime_session_id=?5)
+             AND (claim_owner IS NULL OR claim_owner=?5))",
+        )
+        .bind(&timeline_id)
+        .bind(&identity_id)
+        .bind(&stored_scope_type)
+        .bind(&stored_scope_id)
+        .bind(runtime_id)
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(protected_database_error)?;
+        if !matches_owner {
+            return Err(RuntimeError::conflict(
+                "LCM timeline does not match its session binding",
+            ));
+        }
         Ok(crate::SqliteLcmStore::new(self.db.clone(), timeline))
     }
 
@@ -1841,7 +1921,7 @@ impl SessionStore for SqliteProtectedRuntimeStore {
             .fetch_optional(self.db.pool())
             .await
         }
-        .map_err(|_| RuntimeError::internal("protected session load failed"))?;
+        .map_err(protected_database_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -1898,7 +1978,7 @@ impl CheckpointStore for SqliteProtectedRuntimeStore {
             .fetch_optional(self.db.pool())
             .await
         }
-        .map_err(|_| RuntimeError::internal("protected checkpoint load failed"))?;
+        .map_err(protected_database_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -2104,6 +2184,146 @@ mod tests {
                 .unwrap(),
             Some(checkpoint)
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn lcm_binding_busy_is_retryable_and_retry_keeps_the_timeline() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("busy-lcm-binding");
+        f.ensure_session(&id).await.unwrap();
+        let original = SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1);
+        let old = LegacyLcmFixture::seed(&f, &original, &id, false).await;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(f.directory().join("journal.db"))
+                    .busy_timeout(std::time::Duration::ZERO),
+            )
+            .await
+            .unwrap();
+        let store = SqliteProtectedRuntimeStore::new(Arc::new(SqliteDb::new(pool)), [7; 32], 1);
+        let held = db::begin_immediate(f.database().pool()).await.unwrap();
+        let error = store
+            .resolve_lcm_store(id.as_str(), "account", "journal-owner", false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Internal);
+        assert!(error.retryable);
+        held.rollback().await.unwrap();
+        let resolved = store
+            .resolve_lcm_store(id.as_str(), "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(resolved.timeline_id(), old.timeline_id);
+        assert_eq!(
+            SessionStore::load(&store, &id).await.unwrap().unwrap(),
+            old.snapshot
+        );
+        assert_eq!(
+            CheckpointStore::load_latest(&store, &id)
+                .await
+                .unwrap()
+                .unwrap(),
+            old.checkpoint
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn non_chat_empty_binding_continues_after_it_gains_entries() {
+        use crate::test_support::FileDb;
+        use agent_runtime::lcm::*;
+        let f = FileDb::new().await.unwrap();
+        for id in ["empty-source", "empty-successor"] {
+            f.ensure_session(&SessionId::new(id)).await.unwrap();
+        }
+        let store = SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1);
+        let source = store
+            .resolve_lcm_store("empty-source", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        let successor = store
+            .resolve_lcm_store("empty-successor", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(successor.timeline_id(), source.timeline_id());
+        successor
+            .append(
+                &successor.view(),
+                LcmAppendRequest::new(
+                    LcmOperationId::new("continued-append"),
+                    vec![LcmEntry::new(
+                        LcmTimelineId::new(successor.timeline_id()),
+                        LcmEntryId::new("continued-entry"),
+                        LcmSequence::new(0),
+                        crate::Message::user("continued non-Chat history"),
+                        LcmSourceMetadata::new(LcmClassification::new(
+                            crate::Sensitivity::Sensitive,
+                            crate::TrustClass::UserContent,
+                        )),
+                    )],
+                ),
+            )
+            .await
+            .unwrap();
+        let reopened = store
+            .resolve_lcm_store("empty-successor", "account", "journal-owner", false)
+            .await
+            .unwrap();
+        assert_eq!(reopened.timeline_id(), source.timeline_id());
+        assert_eq!(
+            reopened
+                .current_revision(&reopened.view())
+                .await
+                .unwrap()
+                .get(),
+            1
+        );
+    }
+
+    #[test]
+    fn lcm_binding_busy_and_locked_codes_are_retryable() {
+        #[derive(Debug)]
+        struct CodedSqliteError(u32);
+        impl std::fmt::Display for CodedSqliteError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "SQLite code {}", self.0)
+            }
+        }
+        impl std::error::Error for CodedSqliteError {}
+        impl sqlx::error::DatabaseError for CodedSqliteError {
+            fn message(&self) -> &str {
+                "synthetic SQLite error"
+            }
+            fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+                Some(self.0.to_string().into())
+            }
+            fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+        for code in [5, 6, 261, 262, 517, 518] {
+            let error =
+                protected_database_error(sqlx::Error::Database(Box::new(CodedSqliteError(code))));
+            assert_eq!(error.kind, ErrorKind::Internal);
+            assert!(error.retryable, "SQLite code {code}");
+        }
+        let constraint =
+            protected_database_error(sqlx::Error::Database(Box::new(CodedSqliteError(19))));
+        assert!(!constraint.retryable);
     }
 
     #[tokio::test]

@@ -423,13 +423,12 @@ async fn background_skips_replaced_and_suspended_task_sessions() {
 }
 
 #[tokio::test]
-async fn every_conversion_error_kind_parks_and_cursor_finishes() {
+async fn nonretryable_conversion_errors_park_and_cursor_finishes() {
     for error in [
         RuntimeError::conflict("validation conflict"),
         RuntimeError::not_found("missing owner"),
         RuntimeError::config("invalid builder"),
         RuntimeError::internal("ambiguous host mapping"),
-        RuntimeError::internal("transient database failure").retryable(),
     ] {
         let (f, store, worker) = fixture().await;
         let bad = seed(&f, &store, "a-parked").await;
@@ -465,6 +464,189 @@ async fn every_conversion_error_kind_parks_and_cursor_finishes() {
         assert_eq!(publication_count(&f, &good).await, 2);
         assert_eq!(legacy(&f, &bad).await, before);
     }
+}
+
+#[tokio::test]
+async fn retryable_conversion_error_is_retried_with_same_cursor() {
+    let (f, store, worker) = fixture().await;
+    let id = seed(&f, &store, "retryable-lcm-binding").await;
+    let before = legacy(&f, &id).await;
+    store.fail_conversion_for_test(
+        RuntimeError::internal("transient LCM binding failure").retryable(),
+    );
+    let mut cursor = ConversionCursor::default();
+    let first = worker.convert_once(&mut cursor).await.unwrap();
+    assert_eq!(
+        (
+            first.examined,
+            first.converted,
+            first.remaining,
+            first.conflicts
+        ),
+        (1, 0, 1, 0)
+    );
+    assert!(first.parked_by_reason.is_empty());
+    assert!(first.parked_sessions.is_empty());
+    assert_eq!(publication_count(&f, &id).await, 0);
+    // A keyset sweep resets at the end; the same worker/cursor retries next sweep.
+    assert_eq!(worker.convert_once(&mut cursor).await.unwrap().remaining, 1);
+    let retried = worker.convert_once(&mut cursor).await.unwrap();
+    assert_eq!((retried.converted, retried.remaining), (1, 0));
+    assert!(retried.parked_by_reason.is_empty());
+    assert_eq!(legacy(&f, &id).await, before);
+}
+
+#[tokio::test]
+async fn historical_main_chat_lcm_converts_with_unchanged_policy_markers_and_transcript() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for (marker, snapshot_has_lcm) in [
+        (None, false),
+        (Some("old-policy"), true),
+        (Some("forge-lcm-policy-2"), false),
+    ] {
+        let (f, store, worker) = fixture().await;
+        let id = seed(&f, &store, "historical-main").await;
+        let old = LegacyLcmFixture::seed(&f, &store, &id, snapshot_has_lcm).await;
+        let transcript: Vec<(i64, String)> =
+            sqlx::query_as("SELECT sequence,content FROM agent_chat_message ORDER BY sequence")
+                .fetch_all(f.database().pool())
+                .await
+                .unwrap();
+        assert_eq!(transcript.len(), 120);
+        sqlx::query("UPDATE protected_agent_session_state SET lcm_policy_revision=?, checkpoint_lcm_policy_revision=NULL")
+            .bind(marker).execute(f.database().pool()).await.unwrap();
+        let before = legacy(&f, &id).await;
+        let report = worker
+            .convert_with_budget_for_test(&mut ConversionCursor::default(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.converted, report.remaining, report.conflicts),
+            (1, 0, 0)
+        );
+        assert!(report.parked_sessions.is_empty());
+        assert_eq!(publication_count(&f, &id).await, 2);
+        assert_eq!(legacy(&f, &id).await, before);
+        let after_transcript: Vec<(i64, String)> =
+            sqlx::query_as("SELECT sequence,content FROM agent_chat_message ORDER BY sequence")
+                .fetch_all(f.database().pool())
+                .await
+                .unwrap();
+        assert_eq!(after_transcript, transcript);
+        let after: (Option<String>, Option<String>) = sqlx::query_as("SELECT lcm_policy_revision, checkpoint_lcm_policy_revision FROM protected_agent_session_state")
+            .fetch_one(f.database().pool()).await.unwrap();
+        assert_eq!(after, (marker.map(str::to_owned), None));
+        let binding: String = sqlx::query_scalar(
+            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=?",
+        )
+        .bind(id.as_str())
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap();
+        assert_eq!(binding, old.timeline_id);
+        let saved = f
+            .database()
+            .session_persistence_flags(&format!("journal-fixture:{}", id.as_str()))
+            .await
+            .unwrap();
+        assert!(saved.saved && saved.checkpoint_present && !saved.retired);
+    }
+}
+
+#[tokio::test]
+async fn corrupt_historical_lcm_identity_binding_and_frontier_stay_parked() {
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for (key, value) in [
+        ("schema_version", serde_json::json!(999)),
+        ("binding_revision", serde_json::json!("wrong-binding")),
+        ("store_revision", serde_json::json!("wrong-store")),
+        ("classifier_revision", serde_json::json!("wrong-classifier")),
+        ("immutable_frontier", serde_json::json!(0)),
+        ("history_len", serde_json::json!(121)),
+        ("timeline_id", serde_json::json!("another-timeline")),
+    ] {
+        let (f, store, worker) = fixture().await;
+        let id = seed(&f, &store, "corrupt-historical").await;
+        let mut old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+        old.checkpoint
+            .snapshot
+            .extension_state
+            .get_mut(LCM_COMPONENT_ID)
+            .unwrap()
+            .value[key] = value;
+        old.write(&store).await;
+        let before = legacy(&f, &id).await;
+        let mut cursor = ConversionCursor::default();
+        let report = worker
+            .convert_with_budget_for_test(&mut cursor, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.converted, report.conflicts, report.remaining),
+            (0, 1, 0),
+            "{key}"
+        );
+        assert_eq!(report.parked_by_reason.get("Conflict"), Some(&1));
+        assert_eq!(report.parked_sessions[0].runtime_session_id, id.as_str());
+        assert_eq!(publication_count(&f, &id).await, 0);
+        assert_eq!(legacy(&f, &id).await, before);
+        assert_eq!(worker.convert_once(&mut cursor).await.unwrap().examined, 0);
+    }
+}
+
+#[tokio::test]
+async fn populated_lcm_binding_mismatch_is_not_rebound() {
+    use agent_runtime::{context::Sensitivity, lcm::*, registry::TrustClass};
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    let (f, store, worker) = fixture().await;
+    let id = seed(&f, &store, "occupied-mismatch").await;
+    let old = LegacyLcmFixture::seed(&f, &store, &id, false).await;
+    let occupied = old.bind_empty_replacement(&f).await;
+    let occupied_id = occupied.timeline_id().to_owned();
+    occupied
+        .append(
+            &occupied.view(),
+            LcmAppendRequest::new(
+                LcmOperationId::new("occupied-append"),
+                vec![LcmEntry::new(
+                    LcmTimelineId::new(&occupied_id),
+                    LcmEntryId::new("occupied"),
+                    LcmSequence::new(0),
+                    Message::user("another timeline's retained content"),
+                    LcmSourceMetadata::new(LcmClassification::new(
+                        Sensitivity::Sensitive,
+                        TrustClass::UserContent,
+                    )),
+                )],
+            ),
+        )
+        .await
+        .unwrap();
+    let before = legacy(&f, &id).await;
+    let report = worker
+        .convert_with_budget_for_test(&mut ConversionCursor::default(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!((report.converted, report.conflicts), (0, 1));
+    assert_eq!(publication_count(&f, &id).await, 0);
+    assert_eq!(legacy(&f, &id).await, before);
+    let binding: String = sqlx::query_scalar(
+        "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=?",
+    )
+    .bind(id.as_str())
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(binding, occupied_id);
+    assert_eq!(
+        occupied
+            .load_range(&occupied.view(), LcmRange::single(LcmSequence::new(0)), 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[derive(Debug)]

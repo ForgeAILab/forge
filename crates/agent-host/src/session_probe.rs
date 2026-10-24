@@ -15,7 +15,7 @@ impl SqliteProtectedRuntimeStore {
             .db
             .session_persistence_flags(&forge_id)
             .await
-            .map_err(|_| RuntimeError::internal("session publication lookup failed"))?;
+            .map_err(protected_database_error)?;
         if flags.retired {
             return Err(RuntimeError::conflict("session journal is retired"));
         }

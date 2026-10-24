@@ -2492,8 +2492,10 @@ active sessions for a later sweep. Admission entries use weak references and
 remove unused entries on access. An already in-flight conversion completes before
 a racing foreground open proceeds, so its writer reservation cannot surface as
 a user conflict. Engine writer fences also protect callers outside host admission.
-Active-writer conflicts are skips for a later sweep. All per-session import
-errors, including validation conflicts, advance the cursor and park the owner
+Active-writer conflicts are skips for a later sweep. Retryable persistence
+errors, including SQLite BUSY/LOCKED binding failures, advance the cursor and
+remain eligible for the next sweep. Non-retryable per-session import errors,
+including validation conflicts, advance the cursor and park the owner
 with an error-kind reason for this worker lifetime. Restart retries parked errors;
 foreground lazy import stays available after repair. Empty legacy payloads are
 excluded. Retirement-policy skips are also excluded until restart. Lazy import remains the fallback if
@@ -2504,7 +2506,18 @@ make conversion itself faster or promise an instantaneous open during a race.
 
 `SqliteProtectedRuntimeStore::convert_legacy_session` uses the real decoders,
 shared stores and engines, and the existing runtime v3 importer through deferred
-resume. It resolves the existing Forge LCM binding when needed. It configures no
+resume. It resolves the existing Forge LCM binding when needed. Pre-topic
+stores wrote snapshots and checkpoints independently, so a checkpoint-only LCM
+reference can authorize adoption of that session's unretired owner-less timeline.
+Both background conversion and lazy resume use this resolver. An earlier failed
+attempt's empty replacement binding can be repaired only before either native
+domain publishes or retires, while the replacement is unclaimed, revision zero,
+and has no entries, nodes or operations. The check and binding replacement share
+one write transaction. A populated or differently owned binding is a conflict.
+Older tuning revisions and NULL/stale Forge policy markers do not discard LCM:
+the runtime validates identity, binding and frontier before exact import, then
+rebuilds tuning metadata on live resume. Legacy payloads and chat transcripts
+remain unchanged; corrupt state keeps failing validation. It configures no
 tools or credentialed provider, and its provider refuses calls. The handle is
 dropped without shutdown/persist, avoiding a synthetic boundary. Runtime import
 validation/publication happens before live ability activation; a later activation
@@ -2514,7 +2527,7 @@ capped unreadable tracker. Tracing on `forge_session_journal` reports converted,
 skipped-active, skipped-unreadable, conflicts, examined, remaining and budget
 exhaustion. Parked-error diagnostics include the opaque runtime id and error
 kind, never contents or keys. Remaining excludes parked and retirement-policy
-skips, includes active skips, and reaches zero after eligible work is exhausted.
+skips, includes active skips and retryable errors, and reaches zero after eligible work is exhausted.
 Legacy-table removal stays in the next release.
 
 Discovery pages only the clear dirty-session index, including corrupt records.
