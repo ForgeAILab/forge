@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 # Explicit integration-test support; never enabled through a self dependency.
-test-support = ["dep:tempfile", "dep:ring", "db/test-template"]
+test-support = ["dep:tempfile", "dep:ring", "db/test-template", "agent-runtime/test-support"]
 
 [[test]]
 name = "session_journal_conformance"

@@ -54,8 +54,8 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
 - **Per-session pack storage.** S1 batches new objects into one zstd level-3 pack
   (cut at a 1 MiB logical cap); S2 merges geometric tiers after terminal
   publication and repacks only fully live packs below 64 KiB or survivor packs
-  purged by that apply during collection, each moving only packs the acting
-  domain holds entirely; stable large and deferred-dead packs stay sealed. Imports and every repack obey the cap. S3 keeps kind-ordered bodies
+  purged by that apply during collection, each excluding packs fully held only by another
+  domain while permitting fully live mixed packs with no complete holder; stable large and deferred-dead packs stay sealed. Imports and every repack obey the cap. S3 keeps kind-ordered bodies
   and prefix/offset indexes inside
   sealed packs (separate index and body units), with full-id verification.
   Storage declares `JournalBodySharing::PerSession` and deduplicates only within

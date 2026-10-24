@@ -23,6 +23,30 @@ impl<S> Metered<S> {
 }
 #[async_trait]
 impl<S: JournalStorage> JournalStorage for Metered<S> {
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.apply_entered.notify_one();
+        self.inner.apply_collection(plan).await
+    }
     fn sharing(&self) -> JournalBodySharing {
         self.inner.sharing()
     }
@@ -123,6 +147,14 @@ impl SessionJournal for ReadMeter<'_> {
         c: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
         self.inner.commit(l, c).await
+    }
+    async fn commit_prepared(
+        &self,
+        l: &JournalLease,
+        c: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.inner.commit_prepared(l, c, hints).await
     }
     async fn renew(&self, l: &JournalLease) -> Result<JournalLease, RuntimeError> {
         self.inner.renew(l).await

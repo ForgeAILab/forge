@@ -355,7 +355,11 @@ impl ForgeJournalStorage {
             scope,
             &mut removals,
         )
-        .await
+        .await?;
+        if !changes.is_empty() {
+            self.rank_pins(conn, scope).await?;
+        }
+        Ok(())
     }
     /// One DELETE per chunk of keyed pin/catalog removals in this scope.
     async fn remove_keyed(

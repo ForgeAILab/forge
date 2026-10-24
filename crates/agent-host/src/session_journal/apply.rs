@@ -59,6 +59,13 @@ impl ForgeJournalStorage {
         &self,
         write: JournalWrite,
     ) -> Result<JournalApplyReceipt, RuntimeError> {
+        Ok(self.apply_bounded(write, None).await?.receipt)
+    }
+    pub(super) async fn apply_bounded(
+        &self,
+        write: JournalWrite,
+        max_units: Option<u32>,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("apply.apply_write", 0);
         let start = Instant::now();
@@ -107,9 +114,35 @@ impl ForgeJournalStorage {
             }
             .map_err(database_error)?;
             let locked = Instant::now();
-            let staged = self.apply_on(&mut tx, &scope, &write).await;
+            let staged = async {
+                let work = match max_units {
+                    Some(max_units) => Some(
+                        self.collection_work(
+                            &mut tx,
+                            &JournalCollectionPlan {
+                                write: write.clone(),
+                                max_units,
+                            },
+                        )
+                        .await?
+                        .ok_or_else(conflict)?,
+                    ),
+                    None => None,
+                };
+                let (next, receipt, staged) = self
+                    .apply_on(&mut tx, &scope, &write, work.as_ref())
+                    .await?;
+                let units = work
+                    .as_ref()
+                    .map_or(0, |w| staged.removed.len() as u32 + w.operation_units);
+                if work.as_ref().is_some_and(|w| units > w.units) {
+                    return Err(conflict());
+                }
+                Ok((next, receipt, staged, units))
+            }
+            .await;
             match staged {
-                Ok((next, applied_receipt, staged)) => {
+                Ok((next, applied_receipt, staged, rewritten_units)) => {
                     let commit = {
                         #[cfg(feature = "test-support")]
                         let _sql_profile = crate::session_journal::profile::timer("sql.COMMIT", 0);
@@ -134,7 +167,10 @@ impl ForgeJournalStorage {
                                 .and_then(|_| fail(&write, JournalCommitFailurePoint::AfterCommit))
                                 // Nothing after COMMIT may claim no durable effect.
                                 .map_err(RuntimeError::retryable)
-                                .map(|_| receipt)
+                                .map(|_| JournalCollectionReceipt {
+                                    receipt,
+                                    rewritten_units,
+                                })
                         }
                         Err(e) => Err(ambiguous_database_error(e)),
                     }
@@ -182,6 +218,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         write: &JournalWrite,
+        work: Option<&super::collection::CollectionWork>,
     ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt, Staged), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("apply.apply_on", 0);
@@ -273,7 +310,11 @@ impl ForgeJournalStorage {
                     .await?;
             }
         }
-        self.replace_record(conn, scope, &owner, &write.record, write.expect)
+        let mut record = write.record.clone();
+        if work.is_some_and(|w| w.more) {
+            record.collection_dirty = true;
+        }
+        self.replace_record(conn, scope, &owner, &record, write.expect)
             .await?;
         fail(write, JournalCommitFailurePoint::AfterHead)?;
         if let Some(operation) = &write.operation {
@@ -300,11 +341,12 @@ impl ForgeJournalStorage {
                 matches!(write.kind, JournalWriteKind::Collect)
                     && write.record.retirement.is_some(),
                 &mut staged,
+                work.map(|w| &w.packs),
             )
             .await?;
         let collect = matches!(write.kind, JournalWriteKind::Collect);
         if collect {
-            self.collection_repack(conn, scope, &purged, &mut staged)
+            self.collection_repack(conn, scope, &purged, &mut staged, work.map(|w| &w.packs))
                 .await?;
         }
         // Released bits live only in SQL. Without a purge (every removed pack

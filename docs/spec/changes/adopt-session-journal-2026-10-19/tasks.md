@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-22T04:13:54Z
+updated_at: 2026-10-24T07:10:52Z
 completed_at:
 ---
 
@@ -800,4 +800,24 @@ No runtime bench crate becomes a production dependency.
 - [ ] **33. Pin runtime speed release and rerun Forge gate.** After the runtime
   P1/P2/P4 release exists, pin it, update the benchmark report gate fields to
   the fixed budgets, and rerun D10; P3 optional.
-  Deferred: no runtime release/pin change is part of background conversion.
+  Task-33 receipt (2026-10-24): Part A implemented against owner-authorized interim
+  `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (still 0.9.0); final pin is the
+  **v0.10.0 tag**. Four bounded SQL storage methods, continuation scheduling,
+  revisioned equivalent projection and prepared-hint forwarding are implemented.
+  Unit/protocol/runtime/storage/retention/conversion/migration checks pass; the
+  new layout-continuation test fails without its guard. Two diagnostics were
+  superseded while locating missing optional fast-path opt-ins; final reports
+  assert prepared native commits and zero unprepared calls.
+  Actual numbers:
+  B/4000 plain: 2,191,360 / 1,359,872 L2 = 1.61145x; steady native/legacy 311.94/201.96 ms, overhead 109.98 ms; max collect 130.31 ms.
+  B/4000 tool: 2,498,560 / 1,392,640 L2 = 1.79412x; steady native/legacy 511.41/377.76 ms, overhead 133.65 ms; max collect 124.01 ms.
+  B/1000 plain delta writes: 10.336% (tracked <=10% miss).
+  B/1000 tool delta writes: 10.173% (tracked <=10% miss).
+  C/1000: 1.40000x L2, 30 packs; max collect 45.88 ms.
+  Final completed production rows: 13/14. Packing candidate:
+  **kept**; C/1000 improves from 1.48261x to 1.40000x L2 (33 to 30 packs). Unit 14/14, storage 30/30, conformance 18/18 and the added mixed-domain S2/collection/reopen regression pass; no completed baseline check becomes a new failure. The C/4000 supplemental run remains unfinished and explicitly NOT MET; no pass is claimed for that shape.
+  Fixed steady-turn misses: A/100 tool, B/100 tool.
+  Unfinished shapes: C/4000 tool. B/1000 <=10% remains tracked;
+  exact allocator heap and final release tag remain pending. Task 33 stays open.
+  Actual table and full evidence: design D10 receipt,
+  `docs/performance-testing.md`, `/Volumes/Data/tmp/refactor/c3-t33/report.md`.

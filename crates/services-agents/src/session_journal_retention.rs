@@ -42,6 +42,7 @@ pub struct RetentionReport {
     pub unreadable_sessions: usize,
     pub preserved_sessions: usize,
     pub collection_calls: usize,
+    pub collection_continuations: usize,
     pub reclaimed_objects: u64,
     pub reclaimed_bytes: u64,
     pub deleted_packs: u64,
@@ -243,6 +244,10 @@ impl SessionJournalRetention {
                 report.budget_exhausted = true;
                 break;
             }
+            if report.collection_calls >= 32 {
+                report.budget_exhausted = true;
+                break;
+            }
             match cursor.phase {
                 Phase::Retire => {
                     let page = self
@@ -260,26 +265,32 @@ impl SessionJournalRetention {
                     }
                 }
                 Phase::Protected => {
-                    self.collect(
-                        self.journals.protected(),
-                        JournalRole::Protected,
-                        cursor,
-                        &mut report,
-                        &mut unreadable,
-                    )
-                    .await?;
-                    cursor.phase = Phase::Ordinary;
+                    let more = self
+                        .collect(
+                            self.journals.protected(),
+                            JournalRole::Protected,
+                            cursor,
+                            &mut report,
+                            &mut unreadable,
+                        )
+                        .await?;
+                    if !more {
+                        cursor.phase = Phase::Ordinary;
+                    }
                 }
                 Phase::Ordinary => {
-                    self.collect(
-                        self.journals.ordinary(),
-                        JournalRole::Ordinary,
-                        cursor,
-                        &mut report,
-                        &mut unreadable,
-                    )
-                    .await?;
-                    cursor.phase = Phase::Drain;
+                    let more = self
+                        .collect(
+                            self.journals.ordinary(),
+                            JournalRole::Ordinary,
+                            cursor,
+                            &mut report,
+                            &mut unreadable,
+                        )
+                        .await?;
+                    if !more {
+                        cursor.phase = Phase::Drain;
+                    }
                 }
                 Phase::Drain => {
                     let batch = self.drain_deleted_packs(cursor.cleanup_after).await?;
@@ -300,7 +311,7 @@ impl SessionJournalRetention {
             retired_domains=report.retired_domains, conflicts=report.conflicts, deferred_domains=report.deferred_domains,
             unreadable_sessions=report.unreadable_sessions, preserved_sessions=report.preserved_sessions,
             unreadable_observations_total=ForgeJournalStorage::unreadable_session_observations(),
-            collection_calls=report.collection_calls, membership_release_limit=MEMBERSHIP_RELEASE_LIMIT,
+            collection_calls=report.collection_calls, collection_continuations=report.collection_continuations, membership_release_limit=MEMBERSHIP_RELEASE_LIMIT,
             reclaimed_objects=report.reclaimed_objects, reclaimed_bytes=report.reclaimed_bytes,
             cumulative_reclaimed_objects=cursor.reclaimed_objects, cumulative_reclaimed_bytes=cursor.reclaimed_bytes,
             deleted_packs=report.deleted_packs, deleted_canonical_bytes=report.deleted_canonical_bytes,
@@ -315,20 +326,27 @@ impl SessionJournalRetention {
         cursor: &mut RetentionCursor,
         report: &mut RetentionReport,
         unreadable: &mut HashSet<SessionId>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let request = JournalGcRequest {
             storage_id: engine.storage_id(),
             expected_root_epoch: engine
                 .root_epoch()
                 .map_err(|_| ServiceError::Domain("session journal epoch unavailable".into()))?,
             max_objects: MEMBERSHIP_RELEASE_LIMIT,
+            work_budget: JournalGcBudget::default(),
         };
         let started = Instant::now();
         let result = engine.collect(request).await;
         let collect_duration_us = started.elapsed().as_micros() as u64;
         report.collection_calls += 1;
+        let mut more = false;
         match result {
             Ok(gc) => {
+                more = gc.has_more && gc.zero_work_calls == 0;
+                report.collection_continuations += usize::from(more);
+                if !gc.over_capacity_sessions.is_empty() {
+                    tracing::warn!(target: "forge_session_journal", ?role, over_capacity_sessions=gc.over_capacity_sessions.len(), "journal collection cursor capacity exceeded; sessions preserved");
+                }
                 for id in &gc.unreadable_sessions {
                     ForgeJournalStorage::note_unreadable_session(id);
                     if unreadable.insert(id.clone()) {
@@ -352,7 +370,7 @@ impl SessionJournalRetention {
                     })?;
                 tracing::debug!(target: "forge_session_journal", ?role, collect_duration_us, gate_hold_upper_bound_us=collect_duration_us, examined=gc.examined,
                     reclaimed_objects=gc.deleted, reclaimed_bytes=gc.reclaimed_bytes,
-                    unreadable_sessions=gc.unreadable_sessions.len(), retained_bytes=stats.retained_bytes,
+                    unreadable_sessions=gc.unreadable_sessions.len(), has_more=gc.has_more, work_units=gc.work_units, zero_work_calls=gc.zero_work_calls, retained_bytes=stats.retained_bytes,
                     live_bytes=stats.live_bytes, deferred_bytes=stats.deferred_bytes,
                     diagnostic_skipped_sessions=stats.skipped_sessions, "journal collection");
             }
@@ -366,6 +384,6 @@ impl SessionJournalRetention {
                 ))
             }
         }
-        Ok(())
+        Ok(more)
     }
 }

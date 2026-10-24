@@ -41,7 +41,7 @@ Forge SHALL retire replaced topic/profile-rotation sources and suspended native 
 - **AND** the client must start a new session
 
 ### Requirement: Runtime-owned bounded collection without expiry
-Forge SHALL schedule engine collect calls for dirty sessions in both domains, using clones of the same long-lived engine per storage/domain as every runtime, with an object bound and scheduling time budget, initially 20,000 membership releases per call and 10 seconds between budget checks. The engine SHALL own root epochs, closures, liveness, pin/dependency handling, catalog release and replay-pruning selection; storage SHALL execute atomic release/physical-receipt writes and report retained canonical bytes including deferred bodies. max_objects SHALL bound membership releases, not promise an equal bound on previously deferred physical removals. No TTL or age rule SHALL expire live or retained roots.
+Forge SHALL schedule engine collect calls for dirty sessions in both domains, using clones of the same long-lived engine per storage/domain as every runtime, with explicit work budgets, initially 20,000 membership releases per call, a 250 ms soft target per call, a ten-second scheduling deadline and a 32-call cap per pass. Forge SHALL continue has_more with a refreshed root epoch while scheduling allowance remains. The engine SHALL own root epochs, closures, liveness, pin/dependency handling, catalog release and replay-pruning selection; storage SHALL execute atomic release/physical-receipt writes and report retained canonical bytes including deferred bodies. max_objects SHALL bound membership releases, not promise an equal bound on previously deferred physical removals. No TTL or age rule SHALL expire live or retained roots.
 
 #### Scenario: Live superseded checkpoints
 - **WHEN** a live session has superseded checkpoints/cache/manifest paths and the worker collects it
@@ -60,7 +60,7 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 #### Scenario: Unreadable session isolation and retirement dependencies
 - **WHEN** one dirty session cannot authenticate or otherwise fails non-retryably during collection
 - **THEN** the released engine reports it in unreadable_sessions, preserves its state and dirty hint, and collects other readable sessions
-- **AND** a second collect reports it again without loading its record more than once in that call
+- **AND** a later completed pass reports it again, without loading its record more than once in any call that visits it
 - **AND** Forge logs it once per process while the non-evicting 4,096-id warning tracker has capacity, without ids, contents or keys; diagnostics and compact skip the unreadable session
 - **AND** an unreadable retirement candidate prevents retirement of either domain, while unknown dependency metadata from another session conservatively defers retirement without falsely labelling the candidate unreadable
 
@@ -71,7 +71,7 @@ Forge SHALL schedule engine collect calls for dirty sessions in both domains, us
 - **AND** the worker keeps no lifetime id set; unreadable/preserved counts describe the current pass after repair, deletion or worker restart
 
 ### Requirement: Physical pack maintenance preserves membership
-Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during per-turn collection. Each pack SHALL belong to one runtime session; maintenance SHALL remap each holder domain's bitmap of that session atomically from its own previous bits, never granting a domain a slot it did not hold, without changing runtime objects, heads, membership or replay policy, and failure SHALL be retryable without undoing an acknowledged turn. Dead bodies SHALL become unreadable on release; sealed packs MAY defer their removal below 25% dead canonical body bytes. The apply reaching 25%, an empty scope and retired-session collection SHALL force purges even when optional merging is disabled. Receipts SHALL count physical copies and canonical encoded bytes only when removed, including earlier deferred bodies. Imports, admissions, purge rewrites and all repacks SHALL obey the 1 MiB canonical body cap; an oversized object SHALL be rejected atomically. Serialized operation packs SHALL also be capped at 1 MiB. Base repacking SHALL select only fully live packs below 64 KiB or fully live survivor packs purged by that apply; terminal equal-tier pairs SHALL fit the 1 MiB cap. Both SHALL select only packs the acting domain holds entirely, leaving a pack with a slot only another domain holds to that domain's maintenance. Stable large and deferred-dead packs SHALL stay sealed. `compact` SHALL use bounded per-session transactions, move only eligible fully live bodies so no dead removal escapes apply receipts, and SHALL NOT run a full VACUUM.
+Forge SHALL trigger S2 geometric-tier merging after successful terminal publication and base-pack repacking during per-turn collection. Each pack SHALL belong to one runtime session; maintenance SHALL remap each holder domain's bitmap of that session atomically from its own previous bits, never granting a domain a slot it did not hold, without changing runtime objects, heads, membership or replay policy, and failure SHALL be retryable without undoing an acknowledged turn. Dead bodies SHALL become unreadable on release; sealed packs MAY defer their removal below 25% dead canonical body bytes. The apply reaching 25%, an empty scope and retired-session collection SHALL force purges even when optional merging is disabled. Receipts SHALL count physical copies and canonical encoded bytes only when removed, including earlier deferred bodies. Imports, admissions, purge rewrites and all repacks SHALL obey the 1 MiB canonical body cap; an oversized object SHALL be rejected atomically. Serialized operation packs SHALL also be capped at 1 MiB. Base repacking SHALL select only fully live packs below 64 KiB or fully live survivor packs purged by that apply; terminal equal-tier pairs SHALL fit the 1 MiB cap. Both SHALL exclude a pack another domain holds entirely when the acting domain does not; fully live mixed packs with no complete holder SHALL remain eligible, with every holder bitmap remapped from its own previous bits. Stable large and deferred-dead packs SHALL stay sealed. `compact` SHALL use bounded per-session transactions, move only eligible fully live bodies so no dead removal escapes apply receipts, and SHALL NOT run a full VACUUM.
 
 #### Scenario: Deferred release and bounded threshold purge in a long session
 - **WHEN** collection after a turn releases superseded bodies in a 4000-message session
@@ -88,12 +88,17 @@ Forge SHALL trigger S2 geometric-tier merging after successful terminal publicat
 - **WHEN** terminal publication succeeds and equal-size pack tiers exist
 - **THEN** the async terminal hook merges them geometrically with fresh AEAD nonces
 - **AND** subsequent collection can form capped kind-ordered output from eligible fully live inputs (every slot held by at least one domain) in that same session only
-- **AND** neither the hook nor the collection of one domain moves a pack holding a slot only the other domain holds
+- **AND** neither path moves a pack fully held only by another domain; fully live mixed packs with no complete holder may move without granting any new membership
 
 #### Scenario: Physical compaction
 - **WHEN** compact repacks live bodies or reclaims free SQLite pages
 - **THEN** it changes no logical membership, root epoch or operation-retention decision
 - **AND** no physical page saving is misreported as JournalApplyReceipt canonical body bytes
+
+#### Scenario: Mixed fully live packs have no complete holder
+- **WHEN** protected and ordinary each hold disjoint slots across two fully live eligible packs, with neither holding an entire pack
+- **THEN** terminal and bounded collection repacking may merge those packs
+- **AND** each domain reads exactly its original slots before and after reopen, with no reclaimed-body receipt for moving live copies
 
 ### Requirement: Deletion cascades and bounded owned-pack cleanup
 Deleting an agent_session SHALL cascade its journal session, pin, catalog, membership and operation-pack rows in the deletion transaction. Pack rows SHALL retain indexed owner labels without a cascading owner FK so post-commit cleanup can delete all of the deleted session's packs, including below-threshold deferred bytes, in bounded transactions of at most 32 packs or 8 MiB retained canonical bytes, scanning candidates through an indexed orphan marker in pages of 5,000 pack ids. The marker SHALL be maintained by owner/membership cascades, and committed session deletions SHALL provide a post-commit cleanup nudge. Agent archival (the permanent user-facing Agent deletion, including machine-removal archival) and polymorphic chat deletion SHALL remove their saved sessions through repository code in the source transaction, including User/Project chat cascades. The migration SHALL contain only orphan projection triggers that must see FK cascades. Agent archival SHALL remove CLI resume handles too; it does not itself signal an already running CLI process, and late updates SHALL NOT recreate deleted rows. Cleanup SHALL recheck owner/membership under the write lock, resume after restart until drained, and preserve other sessions' independent copies. Removal outside apply SHALL be observed separately, not fabricated as a JournalApplyReceipt. Retirement SHALL retain its tombstone and any still-required metadata/operation results until session deletion, without promising zero physical bytes.
@@ -158,3 +163,16 @@ Forge SHALL assess native journal turn overhead against legacy at ≤approximate
 - **WHEN** the 2026-10-21 sharing measurements are assessed against fixed budgets
 - **THEN** disk passes at 1.60843× / 1.79118× while B/4000 turn overhead ~1,457 / 2,121 ms and C/4000 collect 2,106.75 ms fail pending runtime
 - **AND** turn/collect misses block release review pending the runtime release and rerun, while import conversion time is reported separately without applying the superseded relative gate
+
+### Requirement: Bounded collection continuation scheduling
+Forge SHALL pass an explicit JournalGcBudget and refresh the root epoch between continuation calls. Retention SHALL preserve its current domain phase while has_more, stopping at its ten-second scheduling deadline or 32 calls and backing off on zero-work reports. Background conversion SHALL keep its separate eight-candidate and two-second scheduling bounds. The measurement harness SHALL drain after-turn and final-shutdown continuations and dirty hints with a 10,000-call bound, reporting every individual call's duration and writes. Incomplete live membership reported in unreadable_sessions SHALL use the existing capped warning and preservation diagnostics.
+
+#### Scenario: Budget yield and final sweep
+- **WHEN** a successful bounded collection reports has_more
+- **THEN** the host continues with the engine's current root epoch while its scheduling allowance remains
+- **AND** final measurement shutdown drains to a stable dirty state within the explicit call bound
+
+#### Scenario: Incomplete live membership
+- **WHEN** the runtime proves that a live root lacks membership
+- **THEN** Forge preserves that session and surfaces the unreadable observation through the existing capped diagnostics
+- **AND** healthy sessions continue collection

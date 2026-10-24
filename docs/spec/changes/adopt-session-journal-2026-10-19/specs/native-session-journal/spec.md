@@ -218,3 +218,34 @@ Forge SHALL run assert_journal_storage_conformance unedited over production Forg
 - **WHEN** a Forge-backed decorator introduces a torn transaction, lost write, reordered publication, stale epoch, ignored control generation, premature deletion of a surviving holder's copy, or serving released/deferred bytes
 - **THEN** conformance rejects it at atomic_apply_cuts, restart_acknowledged_state, restart_commit_sequence, writer_epoch_fence, control_generation_fence, shared_body_last_membership, or membership_isolation_and_receipts/bounded_deferred_deletion respectively
 - **AND** a passing broken backend is a test failure
+
+### Requirement: Runtime speed-work bounded storage protocol
+Forge SHALL consume the owner-authorized interim runtime revision b0a8c90e96ccb85e4642a119117a8fd5d3a06993 (still versioned 0.9.0), with the final pin targeting the v0.10.0 tag. ForgeJournalStorage SHALL implement all four required collection methods with bounded SQL member/pin pages, full-fence and physical-layout continuation checks, read-only no-effect preflight, and complete atomic collection applies rechecked under the write lock. The additive paging migration SHALL preserve sealed user data, memberships and opaque runtime metadata. Forge SHALL NOT replace collection pages with whole-session result slicing or declare production collection unsupported.
+
+#### Scenario: Physical repack between member pages
+- **WHEN** S2 or compact changes a session's pack layout without changing its logical fence
+- **THEN** a continuation from the old layout conflicts instead of silently skipping or duplicating a member
+- **AND** a fresh page sequence enumerates exact membership, with at most one capped pack decoded per page
+
+#### Scenario: Collection plan exceeds physical allowance
+- **WHEN** an engine-selected release requires more physical units than the plan permits
+- **THEN** preflight requests a smaller release without changing durable state
+- **AND** apply independently rechecks the bound under BEGIN IMMEDIATE and applies the complete accepted batch atomically
+
+#### Scenario: Old encrypted pin metadata
+- **WHEN** a pre-upgrade scope first loads after the paging migration
+- **THEN** authenticated pin ids populate only relative ordering ranks outside collection
+- **AND** bounded pin pages preserve pin-id order without changing ciphertext or exposing clear pin ids
+
+### Requirement: Incremental ordinary projection preserves the approved policy
+ForgeJournalProjection SHALL opt into the runtime incremental projection protocol with a stable policy revision and SHALL return deltas equivalent to complete conservative D3 projection. It SHALL preserve previously projected positions, history, usage, manifests, restore-critical extensions and runtime-owned structured references. A Sensitive replacement in the optional forge.diagnostics. namespace SHALL become a removal, including when replacing a formerly visible value. Bootstrap, unknown revisions and opaque diagnostic references SHALL use complete projection rather than assert unproven equivalence.
+
+#### Scenario: Sensitivity changes at an existing diagnostic
+- **WHEN** an update replaces a RedactionSafe optional diagnostic with a Sensitive value
+- **THEN** incremental projection removes that namespace rather than retaining the formerly visible value
+- **AND** applying the projected delta equals applying the complete policy to the reconstructed candidate
+
+#### Scenario: Warm ordinary persistence
+- **WHEN** the current projected view and its encoding carry the same policy revision
+- **THEN** Forge projects only changed optional diagnostic updates through project_delta
+- **AND** it does not force the runtime's complete-projection fallback at every boundary

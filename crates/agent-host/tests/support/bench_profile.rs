@@ -292,14 +292,23 @@ impl Reference {
     async fn collect(&self) {
         for engine in [&self.protected, &self.ordinary] {
             let _p = timers::timer("reference.collect", 0);
-            engine
-                .collect(JournalGcRequest {
-                    storage_id: engine.storage_id(),
-                    expected_root_epoch: engine.root_epoch().unwrap(),
-                    max_objects: 20_000,
-                })
-                .await
-                .unwrap();
+            for call in 0..10_000 {
+                let report = engine
+                    .collect(
+                        JournalGcRequest::new(
+                            engine.storage_id(),
+                            engine.root_epoch().unwrap(),
+                            20_000,
+                        )
+                        .with_budget(JournalGcBudget::default()),
+                    )
+                    .await
+                    .unwrap();
+                if !report.has_more {
+                    break;
+                }
+                assert!(call < 9_999, "reference collection continuation bound");
+            }
         }
     }
 }

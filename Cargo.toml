@@ -34,9 +34,9 @@ homepage = "https://github.com/ForgeAILab/forge"
 repository = "https://github.com/ForgeAILab/forge"
 
 [workspace.dependencies]
-# agent-runtime v0.9.0 (all runtime packages and testkit share this immutable release pin).
-agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "8c19be5b226c2fdaeb6708ec5d39e91c235857a5", features = ["provider-summary"], version = "0.9.0" }
-agent-runtime-testkit = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "8c19be5b226c2fdaeb6708ec5d39e91c235857a5", version = "0.9.0" }
+# agent-runtime v0.10.0 (all runtime packages and testkit share this immutable release pin).
+agent-runtime = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "c036af7b4635cf7d76451aaa666a9df87405ca1a", features = ["provider-summary"], version = "0.10.0" }
+agent-runtime-testkit = { git = "https://github.com/ForgeAILab/agent-runtime.git", rev = "c036af7b4635cf7d76451aaa666a9df87405ca1a", version = "0.10.0" }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

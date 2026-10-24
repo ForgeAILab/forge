@@ -3113,7 +3113,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
 | `session-journal-conversion` | Immediate pass, 60-second Skip interval | 2-second scheduling budget / warn and await; eight candidates, one import at a time, yield, keyset cursor and durable publication progress |
-| `session-journal-retention` | Immediate pass, 60-second Skip interval and post-commit terminal/rotation/recovery/deletion Notify | 10-second scheduling budget / warn and await; 20,000 releases per engine collect, bounded retirement and cleanup batches, resumable cursors |
+| `session-journal-retention` | Immediate pass, 60-second Skip interval and post-commit terminal/rotation/recovery/deletion Notify | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 calls per pass, resumable retirement/collection/cleanup cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
@@ -8406,6 +8406,41 @@ pack holds at most 1 MiB of canonical bodies. Reads verify canonical envelopes,
 kinds and complete content ids, including prefix collisions. SQL holds no
 per-object id, prefix or keyed object index.
 
+`ForgeJournalProjection` opts into the runtime's incremental projection protocol
+at policy revision 1. It changes only updated optional diagnostic extensions:
+a Sensitive replacement becomes a removal, so a formerly visible value cannot
+survive. History, usage, manifests, restore-critical extensions and runtime-owned
+structured references stay exact. Bootstrap, unknown policy revisions and opaque
+diagnostic references use complete projection. Pointwise equivalence with the
+existing complete policy is tested across both sensitivity transitions and
+removals; the conservative redaction policy itself is unchanged.
+
+The runtime speed-work interim pin is `b0a8c90e96ccb85e4642a119117a8fd5d3a06993`
+(still versioned 0.9.0); the final release pin will be the v0.10.0 tag.
+`collection.rs` implements the required bounded storage protocol. Member pages
+keyset by pack id and slot, opening at most one capped pack per page; pin pages
+use an indexed relative rank, while pin ids and lookup HMACs stay unchanged.
+The additive `V202610240425__journal_collection_pages.sql` migration adds pin ranks and a
+per-domain session layout generation, with pack projection triggers updating
+all domains of that session. Continuations bind the full runtime fence and
+member positions additionally bind that layout generation, so S2/compact cannot
+silently skip a moved member. Old pin ranks hydrate once through authenticated
+non-collection reads; their encrypted payloads are preserved.
+
+Preflight is read-only. It counts touched input packs, forced deferred purges,
+bounded base-repack inputs and changed operation segments, at most 32 physical
+units of 1 MiB each. Apply repeats planning under BEGIN IMMEDIATE and commits
+all selected releases and metadata atomically, or changes nothing. Merge outputs
+are the transformation of their charged input packs. Deferred forced purges
+retain the durable dirty hint until a later bounded apply finishes them. Engine
+reports may now name incomplete live membership as unreadable; the existing
+capped warning tracker and per-pass diagnostics preserve those sessions too.
+The retention worker refreshes the root epoch for each continuation and keeps
+its domain phase while `has_more`, within its ten-second deadline and a 32-call
+cap. Background conversion retains its separate eight-candidate/two-second
+budget. Benchmark after-turn and final-shutdown drains have a 10,000-call bound,
+record every individual gate hold and refresh epochs between calls.
+
 `seal.rs` derives distinct AEAD and lookup keys with HKDF-SHA256 from the exact
 master key already passed to `SqliteProtectedRuntimeStore` (SHA-256 of the
 existing protected key material/server JWT secret). The labels are
@@ -8504,12 +8539,12 @@ until their removal and reconcile with the physical receipts.
 `maintenance.rs` provides async `post_terminal(domain, session)` for the native
 terminal/fork/abort hooks. It authenticates the record before rewriting and merges equal logical-byte tiers from a 4 KiB minimum,
 carrying geometrically only when a pair fits 1 MiB. Collection's base repack uses
-only packs below 64 KiB or survivors purged by that apply. Both paths select only
-packs the acting domain holds entirely (so they are fully live): a pack with a
-slot only the other domain holds is left to that domain's own hook and
-collection, so one domain never folds the other's stable history into its own
-short-lived bodies. A pack no domain holds entirely is moved only by explicit
-`compact`. Collection leaves stable large packs sealed; both
+only packs below 64 KiB or survivors purged by that apply. Both paths exclude
+a pack fully held by another domain when the acting domain does not hold it
+entirely. Fully live mixed packs with no complete holder remain eligible;
+merging them preserves each holder's own bits. This keeps another domain's
+complete stable history out of the acting domain's short-lived packs while
+reducing mixed-pack fragmentation. Collection leaves stable large packs sealed; both
 maintenance paths leave deferred-dead packs sealed. Repack output is partitioned by kind before cutting
 at 1 MiB; "fully live" means every slot is held by some domain, and each move
 remaps every holder domain's bitmap of that session from its own bits, so no

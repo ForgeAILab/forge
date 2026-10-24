@@ -10,6 +10,8 @@ pub struct Metered<S> {
     pub operations: Mutex<Vec<(JournalDomain, SessionId, JournalOperationRecord)>>,
     pub receipt: Mutex<JournalApplyReceipt>,
     pub admitted_objects: std::sync::atomic::AtomicU64,
+    pub prepared_commits: std::sync::atomic::AtomicU64,
+    pub unprepared_commits: std::sync::atomic::AtomicU64,
     pub admitted_bytes: std::sync::atomic::AtomicU64,
 }
 impl<S> Metered<S> {
@@ -20,6 +22,8 @@ impl<S> Metered<S> {
             operations: Mutex::new(vec![]),
             receipt: Mutex::new(JournalApplyReceipt::default()),
             admitted_objects: std::sync::atomic::AtomicU64::new(0),
+            prepared_commits: std::sync::atomic::AtomicU64::new(0),
+            unprepared_commits: std::sync::atomic::AtomicU64::new(0),
             admitted_bytes: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -33,6 +37,33 @@ impl<S> Metered<S> {
 }
 #[async_trait]
 impl<S: JournalStorage> JournalStorage for Metered<S> {
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.inner.collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.inner.collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.inner.prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        let result = self.inner.apply_collection(plan).await?;
+        let mut total = self.receipt.lock().unwrap();
+        total.reclaimed_objects += result.receipt.reclaimed_objects;
+        total.reclaimed_bytes += result.receipt.reclaimed_bytes;
+        Ok(result)
+    }
     fn sharing(&self) -> JournalBodySharing {
         self.inner.sharing()
     }

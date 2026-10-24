@@ -264,4 +264,32 @@ impl ForgeJournalStorage {
         }
         Ok(())
     }
+
+    pub(super) async fn prune_operation_units(
+        &self,
+        conn: &mut SqliteConnection,
+        scope: &Scope,
+        floor: Option<JournalRevision>,
+        epoch: u64,
+    ) -> Result<u32, RuntimeError> {
+        let Some(floor) = floor else {
+            return Ok(0);
+        };
+        let packs = self.operation_packs(conn, scope).await?;
+        let last = packs
+            .values()
+            .flatten()
+            .filter(|o| o.result.writer_epoch == epoch)
+            .map(|o| o.revision)
+            .max();
+        Ok(packs
+            .values()
+            .filter(|ops| {
+                ops.iter().any(|o| {
+                    o.revision < floor
+                        && !(o.result.writer_epoch == epoch && Some(o.revision) == last)
+                })
+            })
+            .count() as u32)
+    }
 }

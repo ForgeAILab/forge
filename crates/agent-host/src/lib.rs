@@ -153,7 +153,7 @@ impl From<agent_runtime::core::event::LimitKind> for AgentTurnLimit {
 
 /// The immutable revision Forge is built and tested against. A test checks it
 /// against the `agent-runtime` pin in `Cargo.lock`.
-pub const AGENT_RUNTIME_REVISION: &str = "8c19be5b226c2fdaeb6708ec5d39e91c235857a5";
+pub const AGENT_RUNTIME_REVISION: &str = "b0a8c90e96ccb85e4642a119117a8fd5d3a06993";
 pub const AGENT_RUNTIME_MINIMUM_RUST: &str = "1.86";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

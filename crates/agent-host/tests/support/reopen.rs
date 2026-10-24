@@ -33,6 +33,29 @@ impl Reopen {
 
 #[async_trait]
 impl JournalStorage for Reopen {
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.storage().collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.storage().collection_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        self.storage().prepare_collection_apply(plan).await
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.storage().apply_collection(plan).await
+    }
     fn sharing(&self) -> JournalBodySharing {
         self.storage().sharing()
     }

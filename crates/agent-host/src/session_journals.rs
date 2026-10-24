@@ -4,8 +4,8 @@ use std::sync::Arc;
 use agent_runtime::core::{
     error::RuntimeError,
     journal::{
-        JournalEngine, JournalEngineConfig, JournalProjectionPolicy, JournalStorage,
-        JournalStorageId,
+        JournalDeltaProjection, JournalEngine, JournalEngineConfig, JournalProjectionPolicy,
+        JournalSnapshotView, JournalStorage, JournalStorageId, JournalTransitionDelta,
     },
     store::{SessionSnapshot, SessionStateSensitivity},
 };
@@ -23,6 +23,40 @@ pub const JOURNAL_MEMO_BYTES: usize = 128 * 1024 * 1024;
 #[derive(Debug)]
 pub struct ForgeJournalProjection;
 impl JournalProjectionPolicy for ForgeJournalProjection {
+    fn revision(&self) -> Option<u64> {
+        Some(1)
+    }
+
+    fn project_delta(
+        &self,
+        _base: &JournalSnapshotView,
+        delta: &JournalTransitionDelta,
+        revision: u64,
+    ) -> Result<JournalDeltaProjection, RuntimeError> {
+        if revision != 1
+            || delta.bootstrap.is_some()
+            || delta
+                .extension_references
+                .keys()
+                .any(|namespace| namespace.starts_with("forge.diagnostics."))
+        {
+            return Ok(JournalDeltaProjection::FullProjectionRequired);
+        }
+        let mut projected = delta.clone();
+        for (namespace, state) in &mut projected.extension_updates {
+            if namespace.starts_with("forge.diagnostics.")
+                && state
+                    .as_ref()
+                    .is_some_and(|state| state.sensitivity == SessionStateSensitivity::Sensitive)
+            {
+                // A replacement may turn a previously visible diagnostic
+                // sensitive; removing its update would retain the old value.
+                *state = None;
+            }
+        }
+        Ok(JournalDeltaProjection::Projected(Box::new(projected)))
+    }
+
     fn project(&self, mut snapshot: SessionSnapshot) -> Result<SessionSnapshot, RuntimeError> {
         snapshot.extension_state.retain(|namespace, state| {
             !(namespace.starts_with("forge.diagnostics.")
@@ -321,4 +355,164 @@ impl SessionJournals {
 fn journal_lock_poisoned(error: &RuntimeError) -> bool {
     error.metadata.get("journal_lock_poisoned")
         == Some(&agent_runtime::core::metadata::MetaValue::Bool(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_runtime::{
+        core::{
+            clock::Timestamp,
+            content::Message,
+            ids::SessionId,
+            journal::{JournalBoundary, JournalObjectId},
+            store::VersionedSessionState,
+        },
+        registry::RegistryRevision,
+    };
+
+    fn state(sensitivity: SessionStateSensitivity) -> VersionedSessionState {
+        let mut state = VersionedSessionState::new(
+            RegistryRevision::new("projection-test"),
+            serde_json::json!({"value":"must preserve or redact exactly"}),
+        );
+        state.sensitivity = sensitivity;
+        state
+    }
+
+    fn snapshot() -> SessionSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id":"projection-equivalence", "history":[Message::user("old history")], "updated":1
+        }))
+        .unwrap()
+    }
+
+    fn delta() -> JournalTransitionDelta {
+        JournalTransitionDelta {
+            boundary: JournalBoundary {
+                version: 1,
+                session: SessionId::new("projection-equivalence"),
+                turn: None,
+                checkpoint_sequence: 0,
+                planned_step_count: 0,
+            },
+            bootstrap: None,
+            history_append: vec![Message::user("new history")],
+            usage_append: vec![],
+            extension_updates: Default::default(),
+            extension_references: Default::default(),
+            manifests_append: vec![],
+            manifest_references: vec![],
+        }
+    }
+
+    #[test]
+    fn incremental_projection_matches_complete_projection_and_removes_old_values() {
+        assert_eq!(ForgeJournalProjection.revision(), Some(1));
+        for initial in [
+            SessionStateSensitivity::Sensitive,
+            SessionStateSensitivity::RedactionSafe,
+        ] {
+            for replacement in [
+                None,
+                Some(SessionStateSensitivity::Sensitive),
+                Some(SessionStateSensitivity::RedactionSafe),
+            ] {
+                let mut base = snapshot();
+                for namespace in [
+                    "forge.diagnostics.request",
+                    "forge.diagnostics",
+                    "host.restore",
+                    "harness.semantic_summary",
+                    "runtime.previous_request_cache",
+                ] {
+                    base.extension_state
+                        .insert(namespace.into(), state(initial));
+                }
+                let base = ForgeJournalProjection.project(base).unwrap();
+                let view = JournalSnapshotView::from_snapshot(base.clone()).unwrap();
+                let mut changes = delta();
+                for namespace in [
+                    "forge.diagnostics.request",
+                    "forge.diagnostics.new",
+                    "forge.diagnostics",
+                    "host.restore",
+                    "harness.semantic_summary",
+                    "runtime.previous_request_cache",
+                ] {
+                    changes
+                        .extension_updates
+                        .insert(namespace.into(), replacement.map(state));
+                }
+                let mut expected = base.clone();
+                expected.history.extend(changes.history_append.clone());
+                expected.updated = Timestamp(2);
+                for (namespace, value) in &changes.extension_updates {
+                    if let Some(value) = value {
+                        expected
+                            .extension_state
+                            .insert(namespace.clone(), value.clone());
+                    } else {
+                        expected.extension_state.remove(namespace);
+                    }
+                }
+                expected = ForgeJournalProjection.project(expected).unwrap();
+                let JournalDeltaProjection::Projected(projected) = ForgeJournalProjection
+                    .project_delta(&view, &changes, 1)
+                    .unwrap()
+                else {
+                    panic!("stable pointwise policy must opt into incremental projection");
+                };
+                let mut actual = base;
+                actual.history.extend(projected.history_append.clone());
+                actual.updated = Timestamp(2);
+                for (namespace, value) in &projected.extension_updates {
+                    if let Some(value) = value {
+                        actual
+                            .extension_state
+                            .insert(namespace.clone(), value.clone());
+                    } else {
+                        actual.extension_state.remove(namespace);
+                    }
+                }
+                assert_eq!(actual, expected);
+                let mut untouched = *projected;
+                untouched.extension_updates = changes.extension_updates.clone();
+                assert_eq!(
+                    untouched, changes,
+                    "all non-extension delta fields stay exact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_revision_bootstrap_and_opaque_diagnostic_references_use_complete_policy() {
+        let view = JournalSnapshotView::from_snapshot(snapshot()).unwrap();
+        let mut changes = delta();
+        assert!(matches!(
+            ForgeJournalProjection
+                .project_delta(&view, &changes, 2)
+                .unwrap(),
+            JournalDeltaProjection::FullProjectionRequired
+        ));
+        changes.bootstrap = Some(Box::new(snapshot()));
+        assert!(matches!(
+            ForgeJournalProjection
+                .project_delta(&view, &changes, 1)
+                .unwrap(),
+            JournalDeltaProjection::FullProjectionRequired
+        ));
+        changes.bootstrap = None;
+        changes.extension_references.insert(
+            "forge.diagnostics.opaque".into(),
+            Some(JournalObjectId::from_bytes([1; 32])),
+        );
+        assert!(matches!(
+            ForgeJournalProjection
+                .project_delta(&view, &changes, 1)
+                .unwrap(),
+            JournalDeltaProjection::FullProjectionRequired
+        ));
+    }
 }

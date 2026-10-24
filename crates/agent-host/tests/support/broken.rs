@@ -23,6 +23,11 @@ pub enum Defect {
     StaleGeneration,
     SharedBodyDeleted,
     DeadBodyServed,
+    UnboundedPage,
+    StaleCollectionPage,
+    PartialCollectionApply,
+    UnderReportedUnits,
+    DroppedPinPage,
 }
 
 #[derive(Debug)]
@@ -61,6 +66,81 @@ impl Broken {
 
 #[async_trait]
 impl JournalStorage for Broken {
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        self.storage().collection_capability()
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        mut request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        let current = self
+            .storage()
+            .load(d, s)
+            .await?
+            .map_or(JournalFence::default(), |r| r.fence());
+        if self.defect == Defect::StaleCollectionPage && request.fence != current {
+            request.fence = current;
+            request.after = None;
+        }
+        if self.defect == Defect::UnboundedPage
+            && request.kind == JournalCollectionPageKind::Members
+            && request.fence == current
+        {
+            let ids = self.storage().members(d, s).await?;
+            return Ok(JournalCollectionPage {
+                fence: current,
+                bytes: ids.len() as u64 * 32,
+                items: JournalCollectionItems::Members(ids),
+                next: None,
+            });
+        }
+        let dropped = self.defect == Defect::DroppedPinPage
+            && request.kind == JournalCollectionPageKind::Pins
+            && request.after.is_some();
+        let mut page = self.storage().collection_page(d, s, request).await?;
+        if dropped {
+            page.items = JournalCollectionItems::Pins(vec![]);
+        }
+        Ok(page)
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        let result = self.storage().prepare_collection_apply(plan).await?;
+        Ok(
+            if self.defect == Defect::UnderReportedUnits
+                && matches!(result, JournalCollectionPreflight::Fits { .. })
+            {
+                JournalCollectionPreflight::Fits { units: 0 }
+            } else {
+                result
+            },
+        )
+    }
+    async fn apply_collection(
+        &self,
+        mut plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        if plan.write.kind != JournalWriteKind::Collect {
+            return self.storage().apply_collection(plan).await;
+        }
+        if self.defect == Defect::PartialCollectionApply {
+            plan.write
+                .release
+                .truncate(plan.write.release.len().div_ceil(2));
+            plan.write
+                .catalog
+                .truncate(plan.write.catalog.len().div_ceil(2));
+        }
+        // The faulted apply path must also see engine-directed releases.
+        Ok(JournalCollectionReceipt {
+            receipt: self.apply(plan.write).await?,
+            rewritten_units: 1,
+        })
+    }
     fn sharing(&self) -> JournalBodySharing {
         self.storage().sharing()
     }

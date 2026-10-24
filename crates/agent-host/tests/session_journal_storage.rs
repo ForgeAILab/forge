@@ -1558,14 +1558,17 @@ async fn engine_replay_window_edges() {
         );
         let stable = operation_rows(&f, &d, &s).await;
         // Zero membership budget still executes the real engine's S5 directive.
-        engine
-            .collect(JournalGcRequest {
+        drain_gc(
+            &engine,
+            JournalGcRequest {
                 storage_id: engine.storage_id(),
                 expected_root_epoch: engine.root_epoch().unwrap(),
                 max_objects: 0,
-            })
-            .await
-            .unwrap();
+                work_budget: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
         let after = operation_rows(&f, &d, &s).await;
         for tier in [1, 2] {
             assert_eq!(
@@ -2005,14 +2008,17 @@ async fn shared_domain_copy_and_independent_session_receipts() {
         .await
         .unwrap();
     engine.close(writer).await.unwrap();
-    let gc = engine
-        .collect(JournalGcRequest {
+    let gc = drain_gc(
+        &engine,
+        JournalGcRequest {
             storage_id: engine.storage_id(),
             expected_root_epoch: engine.root_epoch().unwrap(),
             max_objects: u64::MAX,
-        })
-        .await
-        .unwrap();
+            work_budget: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     assert!(gc.deleted > 0);
 }
 
@@ -3797,4 +3803,370 @@ async fn corrupt_shared_body_isolates_its_session() {
         assert!(reopened.apply(release).await.is_err());
     }
     assert_eq!(session_object_count(&f, &bad).await, 8);
+}
+
+#[tokio::test]
+async fn bounded_collection_pages_reject_repacked_positions() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("bounded-pages");
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), equal_objects("first", 4)))
+        .await
+        .unwrap();
+    for i in 0..4 {
+        add_objects(&raw, &d, &s, equal_objects(&format!("pack-{i}"), 4)).await;
+    }
+    let expected = raw.members(&d, &s).await.unwrap();
+    let cold = reopen(&f).await;
+    let fence = cold.load(&d, &s).await.unwrap().unwrap().fence();
+    let first = cold
+        .collection_page(
+            &d,
+            &s,
+            JournalCollectionPageRequest {
+                kind: JournalCollectionPageKind::Members,
+                fence,
+                after: None,
+                max_items: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(cold.cache_stats().unwrap().index_decodes, 1);
+    assert_eq!(cold.cache_stats().unwrap().body_decodes, 1);
+    let continuation = first.next.unwrap();
+    raw.post_terminal(&d, &s).await.unwrap();
+    assert_eq!(raw.load(&d, &s).await.unwrap().unwrap().fence(), fence);
+    assert_eq!(
+        cold.collection_page(
+            &d,
+            &s,
+            JournalCollectionPageRequest {
+                kind: JournalCollectionPageKind::Members,
+                fence,
+                after: Some(continuation),
+                max_items: 1,
+            }
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        ErrorKind::Conflict
+    );
+    let mut after = None;
+    let mut ids = Vec::new();
+    for call in 0..100 {
+        let page = cold
+            .collection_page(
+                &d,
+                &s,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Members,
+                    fence,
+                    after,
+                    max_items: 3,
+                },
+            )
+            .await
+            .unwrap();
+        let JournalCollectionItems::Members(batch) = page.items else {
+            panic!("member page");
+        };
+        assert!(batch.len() <= 3);
+        ids.extend(batch);
+        after = page.next;
+        if after.is_none() {
+            break;
+        }
+        assert!(call < 99);
+    }
+    ids.sort();
+    assert_eq!(ids, expected, "repacked page sequence is exact and unique");
+}
+
+#[tokio::test]
+async fn bounded_collection_split_and_atomic_apply() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("bounded-apply");
+    let first = equal_objects("one", 8);
+    let second = equal_objects("two", 8);
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), first.clone()))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, second.clone()).await;
+    let mut w = edit(&raw, &d, &s).await;
+    w.kind = JournalWriteKind::Collect;
+    w.release = first.iter().chain(&second).map(|o| o.id.clone()).collect();
+    let mut plan = JournalCollectionPlan {
+        write: w,
+        max_units: 1,
+    };
+    let record = raw.load(&d, &s).await.unwrap();
+    let packs = pack_rows(&f, &d, &s).await;
+    let members = raw.members(&d, &s).await.unwrap();
+    assert!(
+        matches!(raw.prepare_collection_apply(&plan).await.unwrap(), JournalCollectionPreflight::Split { max_release } if max_release > 0)
+    );
+    assert_eq!(
+        raw.apply_collection(plan.clone()).await.unwrap_err().kind,
+        ErrorKind::Conflict
+    );
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    assert_eq!(pack_rows(&f, &d, &s).await, packs);
+    assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+    plan.max_units = 32;
+    let JournalCollectionPreflight::Fits { units } =
+        raw.prepare_collection_apply(&plan).await.unwrap()
+    else {
+        panic!("fits");
+    };
+    assert_eq!(units, 2);
+    for &cut in JournalCommitFailurePoint::ALL {
+        if cut == JournalCommitFailurePoint::AfterCommit {
+            continue;
+        }
+        let mut failed = plan.clone();
+        failed.write.inject = Some(cut);
+        raw.apply_collection(failed).await.unwrap_err();
+        assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+        assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+        assert_eq!(pack_rows(&f, &d, &s).await, packs);
+    }
+    let receipt = raw.apply_collection(plan.clone()).await.unwrap();
+    assert_eq!(receipt.rewritten_units, 2);
+    assert_eq!(receipt.receipt.reclaimed_objects, 16);
+    assert_eq!(
+        receipt.receipt.reclaimed_bytes,
+        first
+            .iter()
+            .chain(&second)
+            .map(|o| o.bytes.len() as u64)
+            .sum::<u64>()
+    );
+    assert!(raw.members(&d, &s).await.unwrap().is_empty());
+    assert_eq!(
+        raw.apply_collection(plan).await.unwrap_err().kind,
+        ErrorKind::Conflict
+    );
+}
+
+#[tokio::test]
+async fn bounded_collection_upgrades_sealed_pin_order() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("pin-order-upgrade");
+    let mut w = write(&d, s.as_str(), equal_objects("pins", 4));
+    let JournalPinChange::Put(pin) = w.pins[0].clone() else {
+        unreachable!()
+    };
+    w.pins = ["z-last", "a-first", "m-middle"]
+        .into_iter()
+        .map(|id| {
+            JournalPinChange::Put(JournalPinRecord {
+                pin: JournalPinId::new(id),
+                ..pin.clone()
+            })
+        })
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(w)
+        .await
+        .unwrap();
+    let sealed: Vec<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT nonce,payload FROM agent_session_journal_pin ORDER BY pin_key")
+            .fetch_all(f.database().pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE agent_session_journal_pin SET pin_order=NULL")
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    let cold = reopen(&f).await;
+    let fence = cold.load(&d, &s).await.unwrap().unwrap().fence();
+    let mut after = None;
+    let mut pins = Vec::new();
+    for _ in 0..3 {
+        let page = cold
+            .collection_page(
+                &d,
+                &s,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Pins,
+                    fence,
+                    after,
+                    max_items: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let JournalCollectionItems::Pins(batch) = page.items else {
+            panic!("pin page");
+        };
+        assert_eq!(batch.len(), 1);
+        pins.extend(batch.into_iter().map(|p| p.pin.as_str().to_owned()));
+        after = page.next;
+    }
+    assert!(after.is_none());
+    assert_eq!(pins, ["a-first", "m-middle", "z-last"]);
+    let unchanged: Vec<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT nonce,payload FROM agent_session_journal_pin ORDER BY pin_key")
+            .fetch_all(f.database().pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        sealed, unchanged,
+        "upgrade changes no authenticated payload"
+    );
+}
+
+#[tokio::test]
+async fn bounded_retired_purge_keeps_dirty_until_drained() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("bounded-retired-purge");
+    let first = equal_objects("first", 8);
+    let second = equal_objects("second", 8);
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), first.clone()))
+        .await
+        .unwrap();
+    add_objects(&raw, &d, &s, second.clone()).await;
+    for o in [&first[0], &second[0]] {
+        let mut w = edit(&raw, &d, &s).await;
+        w.release = vec![o.id.clone()];
+        assert_eq!(raw.apply(w).await.unwrap(), JournalApplyReceipt::default());
+    }
+    let members = raw.members(&d, &s).await.unwrap();
+    let mut total = 0;
+    for call in 0..2 {
+        let mut w = edit(&raw, &d, &s).await;
+        w.kind = JournalWriteKind::Collect;
+        w.record.head = None;
+        w.record.has_checkpoint = false;
+        w.record.retirement = Some(JournalRetirement {
+            session: s.clone(),
+            revision: w.record.revision,
+            root_epoch: 1,
+            retired_at: Timestamp(100),
+        });
+        w.record.collection_dirty = false;
+        let plan = JournalCollectionPlan {
+            write: w,
+            max_units: 1,
+        };
+        assert_eq!(
+            raw.prepare_collection_apply(&plan).await.unwrap(),
+            JournalCollectionPreflight::Fits { units: 1 }
+        );
+        let receipt = raw.apply_collection(plan).await.unwrap();
+        assert_eq!(receipt.rewritten_units, 1);
+        total += receipt.receipt.reclaimed_objects;
+        assert_eq!(
+            raw.load(&d, &s).await.unwrap().unwrap().collection_dirty,
+            call == 0
+        );
+        assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+    }
+    assert_eq!(total, 2, "each earlier deferred copy is counted once");
+}
+
+#[tokio::test]
+async fn mixed_live_packs_merge_without_granting_membership() {
+    for collection in [false, true] {
+        let f = FileDb::new().await.unwrap();
+        let raw = storage(&f).await;
+        let p = domain(JournalRole::Protected);
+        let o = domain(JournalRole::Ordinary);
+        let s = SessionId::new(if collection {
+            "mixed-collection"
+        } else {
+            "mixed-terminal"
+        });
+        let first = equal_objects("first-mixed", 8);
+        let second = equal_objects("second-mixed", 8);
+        let mapped = MappingStorage::new(raw.clone(), f.clone());
+        mapped
+            .apply(write(&p, s.as_str(), first.clone()))
+            .await
+            .unwrap();
+        add_objects(&raw, &p, &s, second.clone()).await;
+        let ordinary: Vec<_> = first[4..].iter().chain(&second[4..]).cloned().collect();
+        mapped
+            .apply(write(&o, s.as_str(), ordinary.clone()))
+            .await
+            .unwrap();
+        let mut release = edit(&raw, &p, &s).await;
+        release.release = ordinary.iter().map(|v| v.id.clone()).collect();
+        assert_eq!(
+            raw.apply(release).await.unwrap(),
+            JournalApplyReceipt::default()
+        );
+        assert_eq!(session_pack_ids(&f, &s).await.len(), 2);
+        let objects: Vec<_> = first.iter().chain(&second).cloned().collect();
+        let ids: Vec<_> = objects.iter().map(|v| v.id.clone()).collect();
+        let before_p = raw.objects(&p, &s, &ids).await.unwrap();
+        let before_o = raw.objects(&o, &s, &ids).await.unwrap();
+        for (index, object) in objects.iter().enumerate() {
+            assert_eq!(
+                before_p[index],
+                (index % 8 < 4).then(|| object.bytes.clone())
+            );
+            assert_eq!(
+                before_o[index],
+                (index % 8 >= 4).then(|| object.bytes.clone())
+            );
+        }
+        if collection {
+            let mut w = edit(&raw, &o, &s).await;
+            w.kind = JournalWriteKind::Collect;
+            let plan = JournalCollectionPlan {
+                write: w,
+                max_units: 32,
+            };
+            assert_eq!(
+                raw.prepare_collection_apply(&plan).await.unwrap(),
+                JournalCollectionPreflight::Fits { units: 2 }
+            );
+            let receipt = raw.apply_collection(plan).await.unwrap();
+            assert_eq!(receipt.receipt, JournalApplyReceipt::default());
+            assert_eq!(receipt.rewritten_units, 2);
+        } else {
+            raw.post_terminal(&o, &s).await.unwrap();
+        }
+        assert_eq!(
+            session_pack_ids(&f, &s).await.len(),
+            1,
+            "fully live mixed packs with no complete holder remain eligible"
+        );
+        assert_eq!(raw.objects(&p, &s, &ids).await.unwrap(), before_p);
+        assert_eq!(raw.objects(&o, &s, &ids).await.unwrap(), before_o);
+        let cold = reopen(&f).await;
+        assert_eq!(cold.objects(&p, &s, &ids).await.unwrap(), before_p);
+        assert_eq!(cold.objects(&o, &s, &ids).await.unwrap(), before_o);
+    }
+}
+
+async fn drain_gc<S: JournalStorage>(
+    journal: &JournalEngine<S>,
+    mut request: JournalGcRequest,
+) -> Result<JournalGcReport, agent_runtime::core::error::RuntimeError> {
+    let mut total = journal.collect(request.clone()).await?;
+    for _ in 0..10_000 {
+        if !total.has_more {
+            return Ok(total);
+        }
+        request.expected_root_epoch = journal.root_epoch()?;
+        total.accumulate(journal.collect(request.clone()).await?);
+    }
+    panic!("collection continuation bound exhausted");
 }

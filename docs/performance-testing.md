@@ -957,3 +957,33 @@ under the same ignored report. It is a test-harness option, not a product flag.
 The report records numeric pass/fail values while validating all measurements;
 a successful report process is not an adoption-pass signal.
 <!-- session-journal-d10:end -->
+
+## Task 33 runtime hot-path rerun (2026-10-24)
+
+
+Measured receipt
+
+Interim runtime `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (0.9.0); final pin is the **v0.10.0 tag**. Forge now forwards preparation hints and opts into equivalent incremental projection. Source/verification/every test edit: `/Volumes/Data/tmp/refactor/c3-t33/report.md`. Full reports used the unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
+
+| Fixture | t24 disk/L2 | writes disk/L2 | Final disk/L2 | Delta writes | Native / legacy last turn ms | Overhead ms / check | Max collect ms incl. retirement |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| A/100 plain | 13.00000 | 10.50000 | 10.00000 | 434.868% | 43.99 / 3.07 (14.35x) | 40.93 / PASS | 6.78 |
+| A/100 tool | 13.50000 | 9.50000 | 9.50000 | 413.172% | 77.70 / 5.67 (13.70x) | 72.03 / FAIL | 10.08 |
+| A/1000 plain | 9.53846 | 6.46154 | 6.46154 | 44.206% | 56.92 / 13.91 (4.09x) | 43.02 / n/a | 17.32 |
+| A/1000 tool | 9.46154 | 6.46154 | 6.38462 | 46.276% | 104.26 / 25.11 (4.15x) | 79.16 / n/a | 17.14 |
+| A/4000 plain | 9.08000 | 5.78000 | 5.78000 | 11.258% | 120.11 / 50.08 (2.40x) | 70.03 / n/a | 64.18 |
+| A/4000 tool | 8.90196 | 5.68627 | 5.66667 | 11.893% | 180.09 / 92.83 (1.94x) | 87.26 / n/a | 63.90 |
+| B/100 plain | 4.20000 | 2.90000 | 2.90000 | 70.803% | 51.12 / 7.69 (6.65x) | 43.43 / PASS | 7.92 |
+| B/100 tool | 4.00000 | 2.72727 | 2.54545 | 121.206% | 98.47 / 12.32 (7.99x) | 86.16 / FAIL | 13.90 |
+| B/1000 plain | 2.96341 | 1.73171 | 1.73171 | 10.336% | 108.16 / 48.98 (2.21x) | 59.18 / n/a | 28.12 |
+| B/1000 tool | 3.28916 | 1.87952 | 1.87952 | 10.173% | 194.69 / 89.04 (2.19x) | 105.64 / n/a | 31.90 |
+| B/4000 plain | 2.84036 | 1.61145 | 1.61145 | 5.538% | 311.94 / 201.96 (1.54x) | 109.98 / PASS | 130.31 |
+| B/4000 tool | 3.23235 | 1.79412 | 1.79412 | 4.009% | 511.41 / 377.76 (1.35x) | 133.65 / PASS | 124.01 |
+| C/1000 tool | 2.43478 | 1.50000 | 1.40000 | 9.317% | 601.03 / 264.11 (2.28x) | 336.92 / n/a | 45.88 |
+| C/4000 tool | 2.23765 | 1.34568 | NOT MET: unfinished | n/a | n/a | n/a | n/a |
+
+Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to 30 packs). Unit 14/14, storage 30/30, conformance 18/18 and the added mixed-domain S2/collection/reopen regression pass; no completed baseline check becomes a new failure. The C/4000 supplemental run remains unfinished and explicitly NOT MET; no pass is claimed for that shape.
+
+100-dirty-session drains: protected 248.75 ms / 3 calls, ordinary 249.09 ms / 2 calls; both below one second. Target hydration 4.25 ms, 4 target packs out of 804; unrelated packs are excluded. Isolated B/100 plain identity diagnostic: 118,784 bytes, 2.90000x L2. Completed production rows have 26 cold misses and 26 warm hits in the explicit probes; cold validation spans 19.50–1636.28 ms. Internal scoped probe counters: {'rt.memo.hit': 26, 'rt.memo.miss': 26}. Estimated probe memo charge spans 1,047,126–65,150,820 bytes across both engines. Peak reported process RSS through completed cases 1767.94 MiB. These are probe counters/estimated charge and process RSS, not whole-run counters or allocator heap. Keep 128 MiB per engine unchanged.
+
+**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. The final v0.10.0 tag pin remains pending; the owner-authorized interim SHA is still versioned 0.9.0. All Owner Decisions below remain verbatim.

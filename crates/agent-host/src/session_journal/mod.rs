@@ -5,6 +5,7 @@ mod apply;
 mod audit;
 mod cache;
 mod codec;
+mod collection;
 mod diagnostics;
 pub use diagnostics::JournalByteStats;
 mod maintenance;

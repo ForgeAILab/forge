@@ -107,26 +107,20 @@ struct TapJournal {
     fault: Arc<Fault>,
     trace: Arc<Trace>,
 }
-#[async_trait]
-impl SessionJournal for TapJournal {
-    fn storage_id(&self) -> JournalStorageId {
-        self.inner.storage_id()
-    }
-    async fn open(&self, s: &SessionId, r: JournalOpen) -> Result<JournalLease, RuntimeError> {
-        self.inner.open(s, r).await
-    }
-    async fn read(&self, l: &JournalLease, id: &JournalObjectId) -> Result<Vec<u8>, RuntimeError> {
-        self.inner.read(l, id).await
-    }
-    async fn commit(
+impl TapJournal {
+    async fn commit_with_hints(
         &self,
         l: &JournalLease,
         c: JournalCommit,
+        hints: Option<JournalPreparationHints>,
     ) -> Result<JournalHead, RuntimeError> {
         if self.fault.attempts.fetch_add(1, Ordering::SeqCst) == self.fault.target {
             self.inner.fail_next_commit_at(self.fault.point)?;
         }
-        let head = self.inner.commit(l, c).await?;
+        let head = match hints {
+            Some(hints) => self.inner.commit_prepared(l, c, hints).await?,
+            None => self.inner.commit(l, c).await?,
+        };
         let lease = self
             .inner
             .open(
@@ -150,6 +144,39 @@ impl SessionJournal for TapJournal {
         }
         self.inner.close(lease).await?;
         Ok(head)
+    }
+}
+#[async_trait]
+impl SessionJournal for TapJournal {
+    fn storage_id(&self) -> JournalStorageId {
+        self.inner.storage_id()
+    }
+    async fn open(&self, s: &SessionId, r: JournalOpen) -> Result<JournalLease, RuntimeError> {
+        self.inner.open(s, r).await
+    }
+    async fn read(&self, l: &JournalLease, id: &JournalObjectId) -> Result<Vec<u8>, RuntimeError> {
+        self.inner.read(l, id).await
+    }
+    async fn commit(
+        &self,
+        l: &JournalLease,
+        c: JournalCommit,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.commit_with_hints(l, c, None).await
+    }
+    async fn commit_prepared(
+        &self,
+        l: &JournalLease,
+        c: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.commit_with_hints(l, c, Some(hints)).await
+    }
+    fn begin_read<'a>(
+        &'a self,
+        lease: &'a JournalLease,
+    ) -> Result<Option<Box<dyn JournalReadOperation + 'a>>, RuntimeError> {
+        self.inner.begin_read(lease)
     }
     async fn renew(&self, l: &JournalLease) -> Result<JournalLease, RuntimeError> {
         if self.fault.stop_renew.swap(false, Ordering::SeqCst) {

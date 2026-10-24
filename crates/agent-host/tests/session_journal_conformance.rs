@@ -241,3 +241,40 @@ async fn forge_legacy_decoder_accepts_native_materialized_checkpoint() {
         "the real consumer schema gate stays closed"
     );
 }
+
+#[tokio::test]
+async fn broken_storage_unbounded_collection_page() {
+    broken::rejects(broken::Defect::UnboundedPage, "bounded_collection_protocol").await;
+}
+#[tokio::test]
+async fn broken_storage_stale_collection_page() {
+    broken::rejects(
+        broken::Defect::StaleCollectionPage,
+        "bounded_collection_protocol",
+    )
+    .await;
+}
+#[tokio::test]
+async fn broken_storage_partial_collection_apply() {
+    broken::rejects(
+        broken::Defect::PartialCollectionApply,
+        "bounded_collection_protocol",
+    )
+    .await;
+}
+#[tokio::test]
+async fn broken_storage_underreported_collection_units() {
+    broken::rejects(
+        broken::Defect::UnderReportedUnits,
+        "bounded_collection_protocol",
+    )
+    .await;
+}
+#[tokio::test]
+async fn broken_storage_dropped_pin_page() {
+    broken::rejects(
+        broken::Defect::DroppedPinPage,
+        "bounded_collection_protocol",
+    )
+    .await;
+}

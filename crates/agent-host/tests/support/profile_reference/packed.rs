@@ -1,3 +1,9 @@
+// Test-only packed storage reference from agent-runtime b0a8c90; modeled sealing.
+macro_rules! journal_profile_scope {
+    ($label:expr, $body:block) => {
+        $body
+    };
+}
 use super::{
     codec::{self, Pack},
     commit_failure, conflict, failure as storage_failure, invalid_data, metadata,
@@ -26,6 +32,12 @@ struct State {
     loaded_sessions: BTreeSet<String>,
     version: i64,
     operations: BTreeMap<OperationKey, JournalOperationRecord>,
+    // Bumped on every cache refresh (another connection's commit).
+    physical: u64,
+    // Bumped when a session's own packs are rewritten. Member page positions
+    // are (pack, slot) and stay valid only while both are unchanged; a
+    // rewrite elsewhere never invalidates this session's continuation.
+    session_physical: HashMap<String, u64>,
 }
 
 impl State {
@@ -42,6 +54,7 @@ impl State {
         self.operations.clear();
         self.loaded_sessions.clear();
         self.version = version;
+        self.physical += 1;
         Ok(())
     }
     // A session's index is lazy and independent. Opening a storage or reading
@@ -119,6 +132,12 @@ impl State {
         Ok(())
     }
     fn update(&mut self, session: &SessionId, updates: Updates) {
+        if !updates.is_empty() {
+            *self
+                .session_physical
+                .entry(session.as_str().to_owned())
+                .or_default() += 1;
+        }
         for id in updates.keys() {
             if let Some(old) = self.packs.remove(id) {
                 for object in &old.objects {
@@ -199,6 +218,8 @@ impl PackedSqliteJournalStorage {
                 loaded_sessions: BTreeSet::new(),
                 version: -1,
                 operations: BTreeMap::new(),
+                physical: 0,
+                session_physical: HashMap::new(),
             })),
         };
         storage.lock()?.refresh()?;
@@ -208,6 +229,9 @@ impl PackedSqliteJournalStorage {
     /// collection). Equal size tiers merge; it never guesses liveness or releases
     /// members. No hook is automatically wired into production runtime code.
     pub fn post_terminal(&self, session: &SessionId) -> Result<(), RuntimeError> {
+        #[cfg(any())]
+        let _profile =
+            agent_runtime::core::journal::profile::enter_sync("rt.storage.post_terminal");
         let mut state = self.lock()?;
         state.session(session)?;
         let State {
@@ -226,7 +250,7 @@ impl PackedSqliteJournalStorage {
             return Err(conflict());
         }
         let mut updates = Updates::new();
-        repack(&tx, packs, &mut updates, session, false)?;
+        repack(&tx, packs, &mut updates, session, false, None)?;
         tx.commit().map_err(commit_failure)?;
         state.update(session, updates);
         Ok(())
@@ -239,6 +263,26 @@ impl PackedSqliteJournalStorage {
             .conn
             .query_row("SELECT bytes FROM write_meter", [], |r| r.get(0))
             .map_err(failure)
+    }
+    #[cfg(any())]
+    pub fn profile_cache(&self) -> Result<serde_json::Value, RuntimeError> {
+        let state = self.state.lock().map_err(storage_failure)?;
+        let bodies: usize = state
+            .packs
+            .values()
+            .flat_map(|p| p.objects.iter())
+            .map(|o| o.bytes.len())
+            .sum();
+        let index: usize = state
+            .locations
+            .keys()
+            .map(|(s, id)| s.capacity() + id.as_str().len())
+            .sum::<usize>()
+            + state.locations.capacity()
+                * (std::mem::size_of::<((String, JournalObjectId), (i64, usize))>() + 1);
+        Ok(
+            serde_json::json!({"packs":state.packs.len(),"objects":state.locations.len(),"canonical_body_bytes":bodies,"estimated_location_index_bytes":index,"operation_entries":state.operations.len(),"loaded_sessions":state.loaded_sessions.len(),"allocator_heap":null,"reason":"canonical bytes and index estimate are not total allocator heap"}),
+        )
     }
     fn lock(&self) -> Result<MutexGuard<'_, State>, RuntimeError> {
         let mut state = self.state.lock().map_err(storage_failure)?;
@@ -378,6 +422,8 @@ fn purge(
     touched: &BTreeSet<i64>,
     force: bool,
 ) -> Result<JournalApplyReceipt, RuntimeError> {
+    #[cfg(any())]
+    let _profile = agent_runtime::core::journal::profile::enter_sync("rt.storage.purge");
     let mut receipt = JournalApplyReceipt::default();
     for &pid in touched {
         let pack = updates
@@ -539,7 +585,10 @@ fn repack(
     updates: &mut Updates,
     session: &SessionId,
     base: bool,
+    limit: Option<usize>,
 ) -> Result<(), RuntimeError> {
+    #[cfg(any())]
+    let _profile = agent_runtime::core::journal::profile::enter_sync("rt.storage.repack");
     let mut ids: Vec<i64> = {
         let mut st = tx
             .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
@@ -580,6 +629,17 @@ fn repack(
                     .get(pid)
                     .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
         });
+        if let Some(limit) = limit {
+            // Bounded collection: packs this apply already rewrote, plus at
+            // most `limit` further small packs.
+            let mut extra = 0;
+            ids.retain(|pid| {
+                updates.contains_key(pid) || {
+                    extra += 1;
+                    extra <= limit
+                }
+            });
+        }
         if ids.len() > 1 {
             merge(tx, packs, updates, session, &ids)?;
         }
@@ -693,6 +753,8 @@ fn prune_operations(
     s: &SessionId,
     before: JournalRevision,
 ) -> Result<BTreeSet<JournalOperationId>, RuntimeError> {
+    #[cfg(any())]
+    let _profile = agent_runtime::core::journal::profile::enter_sync("rt.storage.prune_operations");
     let epoch = load(tx, d, s)?.ok_or_else(conflict)?.writer_epoch;
     let packs: Vec<(u32, Vec<metadata::Operation>)> = {
         let mut st = tx
@@ -743,51 +805,338 @@ fn prune_operations(
     Ok(removed)
 }
 
+/// One page is at most 256 member ids; one collection apply rewrites at most
+/// 32 sealed packs of at most `LOGICAL_PACK_CAP` canonical bytes each.
+const COLLECTION_LIMITS: JournalCollectionLimits = JournalCollectionLimits {
+    max_page_items: 256,
+    max_unit_bytes: LOGICAL_PACK_CAP as u64,
+    max_apply_units: 32,
+};
+
+// Members in (pack id, slot) order. The position also binds the cache epoch
+// and this session's physical pack version: a repack or compaction of this
+// session between pages rejects the continuation (never skips an id); other
+// sessions' rewrites do not affect it. Each step
+// decodes at most one bounded pack (cached packs are reused, never the whole
+// session's index).
+fn members_page(
+    state: &State,
+    d: &JournalDomain,
+    s: &SessionId,
+    fence: JournalFence,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<JournalCollectionPage, RuntimeError> {
+    let (mut pid, mut slot) = match after {
+        None => (i64::MIN, 0usize),
+        Some(position) => {
+            let position: [u8; 28] = position.try_into().map_err(|_| conflict())?;
+            let physical = u64::from_le_bytes(position[..8].try_into().expect("8 bytes"));
+            let version = u64::from_le_bytes(position[8..16].try_into().expect("8 bytes"));
+            if physical != state.physical || version != session_version(state, s) {
+                return Err(conflict());
+            }
+            (
+                i64::from_le_bytes(position[16..24].try_into().expect("8 bytes")),
+                u32::from_le_bytes(position[24..].try_into().expect("4 bytes")) as usize + 1,
+            )
+        }
+    };
+    let mut ids = Vec::new();
+    let mut last = None;
+    let mut more = false;
+    'packs: loop {
+        let row: Option<(i64, Vec<u8>)> = state
+            .conn
+            .query_row(
+                "SELECT pack_id,bits FROM membership WHERE storage=? AND role=? AND session=? AND pack_id>=? ORDER BY pack_id LIMIT 1",
+                params![d.storage_id.as_str(), role(d), s.as_str(), pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(failure)?;
+        let Some((found, bits)) = row else {
+            break;
+        };
+        if found != pid {
+            slot = 0;
+        }
+        pid = found;
+        let decoded;
+        let pack = match state.packs.get(&pid) {
+            Some(pack) => pack.as_ref(),
+            None => {
+                let payload: Vec<u8> = state
+                    .conn
+                    .query_row("SELECT payload FROM pack WHERE pack_id=?", [pid], |r| {
+                        r.get(0)
+                    })
+                    .map_err(failure)?;
+                decoded = Pack::decoded(&payload)?;
+                &decoded
+            }
+        };
+        while slot < pack.objects.len() {
+            if bit(&bits, slot) {
+                if ids.len() == limit {
+                    more = true;
+                    break 'packs;
+                }
+                ids.push(pack.objects[slot].id.clone());
+                last = Some((pid, slot));
+            }
+            slot += 1;
+        }
+        pid = pid.checked_add(1).ok_or_else(conflict)?;
+        slot = 0;
+    }
+    state.consistent()?;
+    let next = match (more, last) {
+        (true, Some((pid, slot))) => {
+            let mut position = state.physical.to_le_bytes().to_vec();
+            position.extend(session_version(state, s).to_le_bytes());
+            position.extend(pid.to_le_bytes());
+            position.extend((slot as u32).to_le_bytes());
+            Some(JournalCollectionContinuation::new(
+                d,
+                s,
+                fence,
+                JournalCollectionPageKind::Members,
+                position,
+            ))
+        }
+        _ => None,
+    };
+    Ok(JournalCollectionPage {
+        fence,
+        bytes: ids.len() as u64 * 32,
+        items: JournalCollectionItems::Members(ids),
+        next,
+    })
+}
+
+fn session_version(state: &State, s: &SessionId) -> u64 {
+    state
+        .session_physical
+        .get(s.as_str())
+        .copied()
+        .unwrap_or_default()
+}
+
+fn pins_page(
+    state: &State,
+    d: &JournalDomain,
+    s: &SessionId,
+    fence: JournalFence,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<JournalCollectionPage, RuntimeError> {
+    let after = after
+        .map(|position| std::str::from_utf8(position).map_err(|_| conflict()))
+        .transpose()?;
+    let mut st = state
+        .conn
+        .prepare(
+            "SELECT payload FROM pin WHERE storage=? AND role=? AND session=? AND (?4 IS NULL OR pin>?4) ORDER BY pin LIMIT ?5",
+        )
+        .map_err(failure)?;
+    let rows: Vec<Vec<u8>> = st
+        .query_map(
+            params![
+                d.storage_id.as_str(),
+                role(d),
+                s.as_str(),
+                after,
+                i64::try_from(limit + 1).unwrap_or(i64::MAX)
+            ],
+            |r| r.get(0),
+        )
+        .map_err(failure)?
+        .collect::<Result<_, _>>()
+        .map_err(failure)?;
+    let more = rows.len() > limit;
+    let mut bytes = 0;
+    let mut pins = Vec::new();
+    for raw in rows.into_iter().take(limit) {
+        bytes += raw.len() as u64;
+        pins.push(JournalPinRecord::from(codec::decode::<metadata::Pin>(
+            &raw,
+        )?));
+    }
+    let next = (more && !pins.is_empty()).then(|| {
+        JournalCollectionContinuation::new(
+            d,
+            s,
+            fence,
+            JournalCollectionPageKind::Pins,
+            pins.last().expect("pin").pin.as_str().as_bytes().to_vec(),
+        )
+    });
+    Ok(JournalCollectionPage {
+        fence,
+        bytes,
+        items: JournalCollectionItems::Pins(pins),
+        next,
+    })
+}
+
+// Read-only, no-effect count of the sealed packs a collection apply rewrites:
+// packs losing members (threshold purge), a retired session's forced purge
+// and the bounded base repack of small packs. A plan over the cap is split.
+fn preflight(
+    state: &mut State,
+    config: &PackedSqliteConfig,
+    plan: &JournalCollectionPlan,
+) -> Result<JournalCollectionPreflight, RuntimeError> {
+    let write = &plan.write;
+    if write.kind != JournalWriteKind::Collect {
+        return Err(conflict());
+    }
+    let (d, s) = (&write.domain, &write.session);
+    state.session(s)?;
+    let directory = directory(&state.conn, d, s)?;
+    let mut touched = BTreeSet::new();
+    for id in &write.release {
+        if let Some(&(pid, slot)) = state.locations.get(&(s.as_str().to_owned(), id.clone())) {
+            if directory.get(&pid).is_some_and(|bits| bit(bits, slot)) {
+                touched.insert(pid);
+            }
+        }
+    }
+    let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
+    if touched.len() > cap && write.release.len() > 1 {
+        return Ok(JournalCollectionPreflight::Split {
+            max_release: (write.release.len() / 2) as u64,
+        });
+    }
+    let owned: Vec<i64> = {
+        let mut st = state
+            .conn
+            .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
+            .map_err(failure)?;
+        st.query_map([s.as_str()], |r| r.get(0))
+            .map_err(failure)?
+            .collect::<Result<_, _>>()
+            .map_err(failure)?
+    };
+    let retired = write.record.retirement.is_some();
+    let maintenance = MaintenancePlan::new(
+        &touched,
+        &owned,
+        retired,
+        config.repack_on_collection,
+        |pid| {
+            state
+                .packs
+                .get(&pid)
+                .is_some_and(|p| pack_bytes(p) < SMALL_PACK_CAP)
+        },
+        cap,
+    );
+    state.consistent()?;
+    Ok(JournalCollectionPreflight::Fits {
+        units: u32::try_from(maintenance.units).unwrap_or(u32::MAX),
+    })
+}
+
+// Bounded physical maintenance of one collection apply: the packs a release
+// touches, then at most the remaining unit allowance of a retired session's
+// forced purge, then of base-repack candidates. Work left over stays for a
+// later apply (a retired session stays dirty until it is purged).
+struct MaintenancePlan {
+    forced: Vec<i64>,
+    forced_left: bool,
+    repack_limit: usize,
+    units: usize,
+}
+impl MaintenancePlan {
+    fn new(
+        touched: &BTreeSet<i64>,
+        owned: &[i64],
+        retired: bool,
+        repack: bool,
+        small: impl Fn(i64) -> bool,
+        cap: usize,
+    ) -> Self {
+        let mut room = cap.saturating_sub(touched.len());
+        let mut forced = Vec::new();
+        let mut forced_left = false;
+        if retired {
+            for pid in owned.iter().copied().filter(|pid| !touched.contains(pid)) {
+                if room == 0 {
+                    forced_left = true;
+                    break;
+                }
+                forced.push(pid);
+                room -= 1;
+            }
+        }
+        let base = if repack {
+            owned
+                .iter()
+                .copied()
+                .filter(|pid| !touched.contains(pid) && !forced.contains(pid) && small(*pid))
+                .count()
+                .min(room)
+        } else {
+            0
+        };
+        Self {
+            units: touched.len() + forced.len() + base,
+            forced,
+            forced_left,
+            repack_limit: room,
+        }
+    }
+}
+
 #[async_trait]
 impl JournalStorage for PackedSqliteJournalStorage {
     fn sharing(&self) -> JournalBodySharing {
         JournalBodySharing::PerSession
     }
     async fn retained_bytes(&self, d: &JournalDomain) -> Result<Option<u64>, RuntimeError> {
-        let mut state = self.lock()?;
-        let sessions: Vec<SessionId> = {
-            let mut st = state
-                .conn
-                .prepare(
-                    "SELECT session FROM session WHERE storage=?1 AND role=?2
+        journal_profile_scope!("rt.storage.retained_bytes", {
+            let mut state = self.lock()?;
+            let sessions: Vec<SessionId> = {
+                let mut st = state
+                    .conn
+                    .prepare(
+                        "SELECT session FROM session WHERE storage=?1 AND role=?2
                  UNION SELECT session FROM membership WHERE storage=?1 AND role=?2",
-                )
-                .map_err(failure)?;
-            st.query_map(params![d.storage_id.as_str(), role(d)], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(failure)?
-            .map(|r| r.map(SessionId::new).map_err(failure))
-            .collect::<Result<_, _>>()?
-        };
-        let mut bytes = 0;
-        for session in sessions {
-            state.session(&session)?;
-            let mut st = state
-                .conn
-                .prepare("SELECT pack_id FROM pack WHERE owner=?")
-                .map_err(failure)?;
-            for pid in st
-                .query_map([session.as_str()], |r| r.get::<_, i64>(0))
+                    )
+                    .map_err(failure)?;
+                st.query_map(params![d.storage_id.as_str(), role(d)], |r| {
+                    r.get::<_, String>(0)
+                })
                 .map_err(failure)?
-            {
-                bytes += pack_bytes(&state.packs[&pid.map_err(failure)?]) as u64;
+                .map(|r| r.map(SessionId::new).map_err(failure))
+                .collect::<Result<_, _>>()?
+            };
+            let mut bytes = 0;
+            for session in sessions {
+                state.session(&session)?;
+                let mut st = state
+                    .conn
+                    .prepare("SELECT pack_id FROM pack WHERE owner=?")
+                    .map_err(failure)?;
+                for pid in st
+                    .query_map([session.as_str()], |r| r.get::<_, i64>(0))
+                    .map_err(failure)?
+                {
+                    bytes += pack_bytes(&state.packs[&pid.map_err(failure)?]) as u64;
+                }
             }
-        }
-        state.consistent()?;
-        Ok(Some(bytes))
+            state.consistent()?;
+            Ok(Some(bytes))
+        })
     }
     async fn load(
         &self,
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Option<JournalSessionRecord>, RuntimeError> {
-        load(&self.lock()?.conn, d, s)
+        journal_profile_scope!("rt.storage.load", { load(&self.lock()?.conn, d, s) })
     }
     async fn objects(
         &self,
@@ -795,47 +1144,67 @@ impl JournalStorage for PackedSqliteJournalStorage {
         s: &SessionId,
         ids: &[JournalObjectId],
     ) -> Result<Vec<Option<Arc<[u8]>>>, RuntimeError> {
-        let mut state = self.lock()?;
-        state.session(s)?;
-        let members = directory(&state.conn, d, s)?;
-        state.consistent()?;
-        ids.iter()
-            .map(|id| {
-                let Some(&(pid, _)) = state.locations.get(&(s.as_str().to_owned(), id.clone()))
-                else {
-                    return Ok(None);
-                };
-                let Some(bits) = members.get(&pid) else {
-                    return Ok(None);
-                };
-                let pack = &state.packs[&pid];
-                let slot = pack.find(id)?.ok_or_else(conflict)?;
-                Ok(bit(bits, slot).then(|| pack.objects[slot].bytes.clone()))
-            })
-            .collect()
+        journal_profile_scope!("rt.storage.objects", {
+            let mut state = self.lock()?;
+            state.session(s)?;
+            let members = directory(&state.conn, d, s)?;
+            state.consistent()?;
+            let result: Result<Vec<_>, RuntimeError> = ids
+                .iter()
+                .map(|id| {
+                    let Some(&(pid, _)) = state.locations.get(&(s.as_str().to_owned(), id.clone()))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(bits) = members.get(&pid) else {
+                        return Ok(None);
+                    };
+                    let pack = &state.packs[&pid];
+                    let slot = pack.find(id)?.ok_or_else(conflict)?;
+                    Ok(bit(bits, slot).then(|| pack.objects[slot].bytes.clone()))
+                })
+                .collect();
+            #[cfg(any())]
+            agent_runtime::core::journal::profile::event(
+                "rt.work.body_reads",
+                ids.len() as u64,
+                result.as_ref().map_or(0, |values| {
+                    values.iter().flatten().map(|b| b.len() as u64).sum()
+                }),
+            );
+            result
+        })
     }
     async fn members(
         &self,
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalObjectId>, RuntimeError> {
-        let mut state = self.lock()?;
-        state.session(s)?;
-        let mut ids = Vec::new();
-        let directory = directory(&state.conn, d, s)?;
-        state.consistent()?;
-        for (pid, bits) in directory {
-            ids.extend(
-                state.packs[&pid]
-                    .objects
-                    .iter()
-                    .enumerate()
-                    .filter(|(slot, _)| bit(&bits, *slot))
-                    .map(|(_, o)| o.id.clone()),
+        journal_profile_scope!("rt.storage.members", {
+            let mut state = self.lock()?;
+            state.session(s)?;
+            let mut ids = Vec::new();
+            let directory = directory(&state.conn, d, s)?;
+            state.consistent()?;
+            for (pid, bits) in directory {
+                ids.extend(
+                    state.packs[&pid]
+                        .objects
+                        .iter()
+                        .enumerate()
+                        .filter(|(slot, _)| bit(&bits, *slot))
+                        .map(|(_, o)| o.id.clone()),
+                );
+            }
+            ids.sort();
+            #[cfg(any())]
+            agent_runtime::core::journal::profile::event(
+                "rt.work.member_units",
+                ids.len() as u64,
+                0,
             );
-        }
-        ids.sort();
-        Ok(ids)
+            Ok(ids)
+        })
     }
     async fn operation(
         &self,
@@ -843,37 +1212,41 @@ impl JournalStorage for PackedSqliteJournalStorage {
         s: &SessionId,
         op: &JournalOperationId,
     ) -> Result<Option<JournalOperationRecord>, RuntimeError> {
-        let mut state = self.lock()?;
-        state.session(s)?;
-        state.consistent()?;
-        Ok(state
-            .operations
-            .get(&(
-                d.storage_id.as_str().to_owned(),
-                role(d),
-                s.as_str().to_owned(),
-                op.clone(),
-            ))
-            .cloned())
+        journal_profile_scope!("rt.storage.operation", {
+            let mut state = self.lock()?;
+            state.session(s)?;
+            state.consistent()?;
+            Ok(state
+                .operations
+                .get(&(
+                    d.storage_id.as_str().to_owned(),
+                    role(d),
+                    s.as_str().to_owned(),
+                    op.clone(),
+                ))
+                .cloned())
+        })
     }
     async fn pins(
         &self,
         d: &JournalDomain,
         s: &SessionId,
     ) -> Result<Vec<JournalPinRecord>, RuntimeError> {
-        let state = self.lock()?;
-        let mut st = state
-            .conn
-            .prepare(
-                "SELECT payload FROM pin WHERE storage=? AND role=? AND session=? ORDER BY pin",
-            )
-            .map_err(failure)?;
-        st.query_map(params![d.storage_id.as_str(), role(d), s.as_str()], |r| {
-            r.get::<_, Vec<u8>>(0)
+        journal_profile_scope!("rt.storage.pins", {
+            let state = self.lock()?;
+            let mut st = state
+                .conn
+                .prepare(
+                    "SELECT payload FROM pin WHERE storage=? AND role=? AND session=? ORDER BY pin",
+                )
+                .map_err(failure)?;
+            st.query_map(params![d.storage_id.as_str(), role(d), s.as_str()], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .map_err(failure)?
+            .map(|r| codec::decode::<metadata::Pin>(&r.map_err(failure)?).map(Into::into))
+            .collect()
         })
-        .map_err(failure)?
-        .map(|r| codec::decode::<metadata::Pin>(&r.map_err(failure)?).map(Into::into))
-        .collect()
     }
     async fn catalog(
         &self,
@@ -881,8 +1254,9 @@ impl JournalStorage for PackedSqliteJournalStorage {
         s: &SessionId,
         head: &JournalObjectId,
     ) -> Result<Option<JournalCatalogEntry>, RuntimeError> {
-        let state = self.lock()?;
-        let raw: Option<Vec<u8>> = state
+        journal_profile_scope!("rt.storage.catalog", {
+            let state = self.lock()?;
+            let raw: Option<Vec<u8>> = state
             .conn
             .query_row(
                 "SELECT payload FROM catalog WHERE storage=? AND role=? AND session=? AND head=?",
@@ -896,13 +1270,14 @@ impl JournalStorage for PackedSqliteJournalStorage {
             )
             .optional()
             .map_err(failure)?;
-        raw.map(|b| {
-            codec::decode::<(u32, Vec<u8>)>(&b).map(|(version, bytes)| JournalCatalogEntry {
-                head: head.clone(),
-                engine: JournalEngineState { version, bytes },
+            raw.map(|b| {
+                codec::decode::<(u32, Vec<u8>)>(&b).map(|(version, bytes)| JournalCatalogEntry {
+                    head: head.clone(),
+                    engine: JournalEngineState { version, bytes },
+                })
             })
+            .transpose()
         })
-        .transpose()
     }
     async fn dirty_sessions(
         &self,
@@ -910,312 +1285,478 @@ impl JournalStorage for PackedSqliteJournalStorage {
         after: Option<&SessionId>,
         limit: usize,
     ) -> Result<Vec<SessionId>, RuntimeError> {
-        let state = self.lock()?;
-        let mut st=state.conn.prepare("SELECT session FROM session WHERE storage=? AND role=? AND dirty=1 AND (?3 IS NULL OR session>?3) ORDER BY session LIMIT ?4").map_err(failure)?;
-        st.query_map(
-            params![
-                d.storage_id.as_str(),
-                role(d),
-                after.map(SessionId::as_str),
-                i64::try_from(limit).unwrap_or(i64::MAX)
-            ],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(failure)?
-        .map(|r| r.map(SessionId::new).map_err(failure))
-        .collect()
+        journal_profile_scope!("rt.storage.dirty_sessions", {
+            #[cfg(any())]
+            agent_runtime::core::journal::profile::event(
+                "rt.work.discovery_pages",
+                1,
+                limit as u64,
+            );
+            let state = self.lock()?;
+            let mut st=state.conn.prepare("SELECT session FROM session WHERE storage=? AND role=? AND dirty=1 AND (?3 IS NULL OR session>?3) ORDER BY session LIMIT ?4").map_err(failure)?;
+            st.query_map(
+                params![
+                    d.storage_id.as_str(),
+                    role(d),
+                    after.map(SessionId::as_str),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(failure)?
+            .map(|r| r.map(SessionId::new).map_err(failure))
+            .collect()
+        })
     }
     async fn apply(&self, write: JournalWrite) -> Result<JournalApplyReceipt, RuntimeError> {
-        let mut state = self.lock()?;
-        state.session(&write.session)?;
-        let State {
-            conn,
-            packs,
-            locations,
-            version,
-            operations,
-            ..
-        } = &mut *state;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(failure)?;
-        // Refresh *inside* the transaction if another connection committed since
-        // lock(). The next call rebuilds the cache; this one safely refuses.
-        let current: i64 = tx
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .map_err(failure)?;
-        if current != *version {
-            return Err(conflict());
-        }
-        let d = &write.domain;
-        let s = &write.session;
-        let actual = load(&tx, d, s)?.map_or(JournalFence::default(), |r| r.fence());
-        if actual != write.expect
-            || write.expect.generation.checked_add(1) != Some(write.record.generation)
-            || write.objects.objects.windows(2).any(|p| p[0].id >= p[1].id)
+        Ok(self.apply_bounded(write, None).await?.0)
+    }
+    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+        self.compact_domain(domain).await
+    }
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        JournalCollectionCapability::Bounded(COLLECTION_LIMITS)
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        journal_profile_scope!("rt.storage.prepare_collection", {
+            let mut state = self.lock()?;
+            preflight(&mut state, &self.config, plan)
+        })
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        let cap = plan.max_units.min(COLLECTION_LIMITS.max_apply_units) as usize;
         {
-            return Err(conflict());
-        }
-        // Validate identities and immutable duplicates before performing any SQL.
-        for o in &write.objects.objects {
-            if o.bytes.len() > LOGICAL_PACK_CAP {
+            let mut state = self.lock()?;
+            if !matches!(
+                preflight(&mut state, &self.config, &plan)?,
+                JournalCollectionPreflight::Fits { .. }
+            ) {
                 return Err(conflict());
             }
-            if (JournalObject {
-                id: o.id.clone(),
-                bytes: o.bytes.to_vec(),
-            })
-            .kind()?
-                != o.kind
+        }
+        let (receipt, rewritten_units) = self.apply_bounded(plan.write, Some(cap)).await?;
+        Ok(JournalCollectionReceipt {
+            receipt,
+            rewritten_units,
+        })
+    }
+}
+
+impl PackedSqliteJournalStorage {
+    // One atomic fenced apply. `cap` bounds the physical units a collection
+    // write may rewrite (None keeps the unbounded maintenance of plain applies).
+    async fn apply_bounded(
+        &self,
+        write: JournalWrite,
+        cap: Option<usize>,
+    ) -> Result<(JournalApplyReceipt, u32), RuntimeError> {
+        journal_profile_scope!("rt.storage.apply", {
+            #[cfg(any())]
+            agent_runtime::core::journal::profile::event(
+                "rt.work.atomic_apply",
+                write.release.len() as u64,
+                write
+                    .objects
+                    .objects
+                    .iter()
+                    .map(|o| o.bytes.len() as u64)
+                    .sum(),
+            );
+            let mut state = self.lock()?;
+            {
+                #[cfg(any())]
+                let _profile = agent_runtime::core::journal::profile::enter_sync(
+                    "rt.storage.apply_session_index",
+                );
+                state.session(&write.session)?;
+            }
+            let State {
+                conn,
+                packs,
+                locations,
+                version,
+                operations,
+                ..
+            } = &mut *state;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(failure)?;
+            // Refresh *inside* the transaction if another connection committed since
+            // lock(). The next call rebuilds the cache; this one safely refuses.
+            let current: i64 = tx
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .map_err(failure)?;
+            if current != *version {
+                return Err(conflict());
+            }
+            let d = &write.domain;
+            let s = &write.session;
+            let actual = load(&tx, d, s)?.map_or(JournalFence::default(), |r| r.fence());
+            if actual != write.expect
+                || write.expect.generation.checked_add(1) != Some(write.record.generation)
+                || write.objects.objects.windows(2).any(|p| p[0].id >= p[1].id)
             {
                 return Err(conflict());
             }
-            if let Some(&(pid, slot)) = locations.get(&(s.as_str().to_owned(), o.id.clone())) {
-                if packs[&pid].objects[slot].bytes != o.bytes {
+            // Validate identities and immutable duplicates before performing any SQL.
+            for o in &write.objects.objects {
+                if o.bytes.len() > LOGICAL_PACK_CAP {
                     return Err(conflict());
                 }
-            }
-        }
-        let mut updates = Updates::new();
-        let mut directory = directory(&tx, d, s)?;
-        let mut next_pid: i64 = tx
-            .query_row("SELECT coalesce(max(pack_id),0)+1 FROM pack", [], |r| {
-                r.get(0)
-            })
-            .map_err(failure)?;
-        let mut admitted = HashMap::new();
-        for (step, cut) in [
-            JournalCommitFailurePoint::AfterObjects,
-            JournalCommitFailurePoint::AfterCheckpoint,
-            JournalCommitFailurePoint::AfterBatch,
-            JournalCommitFailurePoint::AfterHead,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mut new = Vec::new();
-            let mut changed = BTreeSet::new();
-            for o in write.objects.objects.iter().filter(|o| match o.kind {
-                JournalObjectKind::Checkpoint => step == 1,
-                JournalObjectKind::Batch => step == 2,
-                JournalObjectKind::Head => step == 3,
-                _ => step == 0,
-            }) {
-                if let Some(&(existing, slot)) =
-                    locations.get(&(s.as_str().to_owned(), o.id.clone()))
+                if (JournalObject {
+                    id: o.id.clone(),
+                    bytes: o.bytes.to_vec(),
+                })
+                .kind()?
+                    != o.kind
                 {
-                    let bits = directory
-                        .entry(existing)
-                        .or_insert_with(|| vec![0; packs[&existing].objects.len().div_ceil(8)]);
-                    set(bits, slot, true);
-                    changed.insert(existing);
+                    return Err(conflict());
+                }
+                if let Some(&(pid, slot)) = locations.get(&(s.as_str().to_owned(), o.id.clone())) {
+                    if packs[&pid].objects[slot].bytes != o.bytes {
+                        return Err(conflict());
+                    }
+                }
+            }
+            let mut updates = Updates::new();
+            let mut directory = directory(&tx, d, s)?;
+            let mut next_pid: i64 = tx
+                .query_row("SELECT coalesce(max(pack_id),0)+1 FROM pack", [], |r| {
+                    r.get(0)
+                })
+                .map_err(failure)?;
+            let mut admitted = HashMap::new();
+            for (step, cut) in [
+                JournalCommitFailurePoint::AfterObjects,
+                JournalCommitFailurePoint::AfterCheckpoint,
+                JournalCommitFailurePoint::AfterBatch,
+                JournalCommitFailurePoint::AfterHead,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut new = Vec::new();
+                let mut changed = BTreeSet::new();
+                for o in write.objects.objects.iter().filter(|o| match o.kind {
+                    JournalObjectKind::Checkpoint => step == 1,
+                    JournalObjectKind::Batch => step == 2,
+                    JournalObjectKind::Head => step == 3,
+                    _ => step == 0,
+                }) {
+                    if let Some(&(existing, slot)) =
+                        locations.get(&(s.as_str().to_owned(), o.id.clone()))
+                    {
+                        let bits = directory
+                            .entry(existing)
+                            .or_insert_with(|| vec![0; packs[&existing].objects.len().div_ceil(8)]);
+                        set(bits, slot, true);
+                        changed.insert(existing);
+                    } else {
+                        new.push(o.clone());
+                    }
+                }
+                for pid in changed {
+                    put_bits(&tx, d, s, pid, &directory[&pid])?;
+                }
+                for pack in split_packs(new)? {
+                    let pid = next_pid;
+                    next_pid += 1;
+                    save_pack(&tx, pid, s.as_str(), &pack)?;
+                    let mut bits = vec![0; pack.objects.len().div_ceil(8)];
+                    for (slot, object) in pack.objects.iter().enumerate() {
+                        set(&mut bits, slot, true);
+                        admitted.insert(object.id.clone(), (pid, slot));
+                    }
+                    put_bits(&tx, d, s, pid, &bits)?;
+                    directory.insert(pid, bits);
+                    updates.insert(pid, Some(Arc::new(pack)));
+                }
+                if step == 2 {
+                    fail(&write, cut)?;
+                    for pin in &write.pins {
+                        match pin {
+                            JournalPinChange::Put(p) => {
+                                tx.execute(
+                                    "INSERT OR REPLACE INTO pin VALUES (?,?,?,?,?,?)",
+                                    params![
+                                        d.storage_id.as_str(),
+                                        role(d),
+                                        s.as_str(),
+                                        p.pin.as_str(),
+                                        codec::encode(&metadata::Pin::from(p))?,
+                                        [0u8; 24].as_slice()
+                                    ],
+                                )
+                                .map_err(failure)?;
+                            }
+                            JournalPinChange::Remove(p) => {
+                                tx.execute("DELETE FROM pin WHERE storage=? AND role=? AND session=? AND pin=?",params![d.storage_id.as_str(),role(d),s.as_str(),p.as_str()]).map_err(failure)?;
+                            }
+                        }
+                    }
+                    #[cfg(any())]
+                    let _catalog = agent_runtime::core::journal::profile::enter_sync(
+                        "rt.storage.catalog_changes",
+                    );
+                    for entry in &write.catalog {
+                        match entry {
+                            JournalCatalogChange::Put(e) => {
+                                tx.execute(
+                                    "INSERT OR REPLACE INTO catalog VALUES (?,?,?,?,?,?)",
+                                    params![
+                                        d.storage_id.as_str(),
+                                        role(d),
+                                        s.as_str(),
+                                        e.head.to_bytes().as_slice(),
+                                        codec::encode(&(e.engine.version, &e.engine.bytes))?,
+                                        [0u8; 24].as_slice()
+                                    ],
+                                )
+                                .map_err(failure)?;
+                            }
+                            JournalCatalogChange::Remove(h) => {
+                                tx.execute("DELETE FROM catalog WHERE storage=? AND role=? AND session=? AND head=?",params![d.storage_id.as_str(),role(d),s.as_str(),h.to_bytes().as_slice()]).map_err(failure)?;
+                            }
+                        }
+                    }
+                    fail(&write, JournalCommitFailurePoint::AfterPin)?;
+                } else if step == 3 {
+                    let r = &write.record;
+                    tx.execute(
+                        "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?)",
+                        params![
+                            d.storage_id.as_str(),
+                            role(d),
+                            s.as_str(),
+                            r.revision.0,
+                            r.writer_epoch,
+                            r.collection_dirty,
+                            r.generation.to_le_bytes().as_slice(),
+                            codec::encode(&metadata::Record::from(r))?,
+                            [0u8; 24].as_slice()
+                        ],
+                    )
+                    .map_err(failure)?;
+                    fail(&write, cut)?;
                 } else {
-                    new.push(o.clone());
+                    fail(&write, cut)?;
                 }
             }
-            for pid in changed {
-                put_bits(&tx, d, s, pid, &directory[&pid])?;
-            }
-            for pack in split_packs(new)? {
-                let pid = next_pid;
-                next_pid += 1;
-                save_pack(&tx, pid, s.as_str(), &pack)?;
-                let mut bits = vec![0; pack.objects.len().div_ceil(8)];
-                for (slot, object) in pack.objects.iter().enumerate() {
-                    set(&mut bits, slot, true);
-                    admitted.insert(object.id.clone(), (pid, slot));
-                }
-                put_bits(&tx, d, s, pid, &bits)?;
-                directory.insert(pid, bits);
-                updates.insert(pid, Some(Arc::new(pack)));
-            }
-            if step == 2 {
-                fail(&write, cut)?;
-                for pin in &write.pins {
-                    match pin {
-                        JournalPinChange::Put(p) => {
-                            tx.execute(
-                                "INSERT OR REPLACE INTO pin VALUES (?,?,?,?,?,?)",
-                                params![
-                                    d.storage_id.as_str(),
-                                    role(d),
-                                    s.as_str(),
-                                    p.pin.as_str(),
-                                    codec::encode(&metadata::Pin::from(p))?,
-                                    [0u8; 24].as_slice()
-                                ],
-                            )
-                            .map_err(failure)?;
-                        }
-                        JournalPinChange::Remove(p) => {
-                            tx.execute("DELETE FROM pin WHERE storage=? AND role=? AND session=? AND pin=?",params![d.storage_id.as_str(),role(d),s.as_str(),p.as_str()]).map_err(failure)?;
-                        }
-                    }
-                }
-                for entry in &write.catalog {
-                    match entry {
-                        JournalCatalogChange::Put(e) => {
-                            tx.execute(
-                                "INSERT OR REPLACE INTO catalog VALUES (?,?,?,?,?,?)",
-                                params![
-                                    d.storage_id.as_str(),
-                                    role(d),
-                                    s.as_str(),
-                                    e.head.to_bytes().as_slice(),
-                                    codec::encode(&(e.engine.version, &e.engine.bytes))?,
-                                    [0u8; 24].as_slice()
-                                ],
-                            )
-                            .map_err(failure)?;
-                        }
-                        JournalCatalogChange::Remove(h) => {
-                            tx.execute("DELETE FROM catalog WHERE storage=? AND role=? AND session=? AND head=?",params![d.storage_id.as_str(),role(d),s.as_str(),h.to_bytes().as_slice()]).map_err(failure)?;
-                        }
-                    }
-                }
-                fail(&write, JournalCommitFailurePoint::AfterPin)?;
-            } else if step == 3 {
-                let r = &write.record;
-                tx.execute(
-                    "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?)",
-                    params![
-                        d.storage_id.as_str(),
-                        role(d),
-                        s.as_str(),
-                        r.revision.0,
-                        r.writer_epoch,
-                        r.collection_dirty,
-                        r.generation.to_le_bytes().as_slice(),
-                        codec::encode(&metadata::Record::from(r))?,
-                        [0u8; 24].as_slice()
-                    ],
-                )
-                .map_err(failure)?;
-                fail(&write, cut)?;
-            } else {
-                fail(&write, cut)?;
-            }
-        }
-        if let Some(op) = &write.operation {
-            let key = (
-                d.storage_id.as_str().to_owned(),
-                role(d),
-                s.as_str().to_owned(),
-                op.operation.clone(),
-            );
-            match operations.get(&key) {
-                Some(old) if old != op => return Err(conflict()),
-                Some(_) => {}
-                None => append_operation(&tx, d, s, op)?,
-            }
-        }
-        let pruned = write
-            .prune_operations_before
-            .map(|before| prune_operations(&tx, d, s, before))
-            .transpose()?
-            .unwrap_or_default();
-        fail(&write, JournalCommitFailurePoint::AfterIdempotency)?;
-        let mut touched = BTreeSet::new();
-        for id in &write.release {
-            let location = locations
-                .get(&(s.as_str().to_owned(), id.clone()))
-                .copied()
-                .or_else(|| admitted.get(id).copied());
-            if let Some((pid, slot)) = location {
-                if let Some(bits) = directory.get_mut(&pid) {
-                    if bit(bits, slot) {
-                        set(bits, slot, false);
-                        put_bits(&tx, d, s, pid, bits)?;
-                        touched.insert(pid);
-                    }
-                }
-            }
-        }
-        let retired = write.kind == JournalWriteKind::Collect
-            && load(&tx, d, s)?.is_some_and(|r| r.retirement.is_some());
-        if retired {
-            let mut st = tx
-                .prepare("SELECT pack_id FROM pack WHERE owner=?")
-                .map_err(failure)?;
-            touched.extend(
-                st.query_map([s.as_str()], |r| r.get::<_, i64>(0))
-                    .map_err(failure)?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(failure)?,
-            );
-        }
-        let receipt = purge(&tx, packs, &mut updates, &touched, retired)?;
-        if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
-            repack(&tx, packs, &mut updates, s, true)?;
-        }
-        tx.commit().map_err(commit_failure)?;
-        state.update(s, updates);
-        if let Some(op) = &write.operation {
-            state.operations.insert(
-                (
+            if let Some(op) = &write.operation {
+                let key = (
                     d.storage_id.as_str().to_owned(),
                     role(d),
                     s.as_str().to_owned(),
                     op.operation.clone(),
-                ),
-                op.clone(),
-            );
-        }
-        for operation in pruned {
-            state.operations.remove(&(
-                d.storage_id.as_str().to_owned(),
-                role(d),
-                s.as_str().to_owned(),
-                operation,
-            ));
-        }
-        fail(&write, JournalCommitFailurePoint::AfterCommit)?;
-        Ok(receipt)
+                );
+                match operations.get(&key) {
+                    Some(old) if old != op => return Err(conflict()),
+                    Some(_) => {}
+                    None => append_operation(&tx, d, s, op)?,
+                }
+            }
+            let pruned = write
+                .prune_operations_before
+                .map(|before| prune_operations(&tx, d, s, before))
+                .transpose()?
+                .unwrap_or_default();
+            fail(&write, JournalCommitFailurePoint::AfterIdempotency)?;
+            #[cfg(any())]
+            let release_timer =
+                agent_runtime::core::journal::profile::enter_sync("rt.storage.release_bits");
+            let mut touched = BTreeSet::new();
+            for id in &write.release {
+                let location = locations
+                    .get(&(s.as_str().to_owned(), id.clone()))
+                    .copied()
+                    .or_else(|| admitted.get(id).copied());
+                if let Some((pid, slot)) = location {
+                    if let Some(bits) = directory.get_mut(&pid) {
+                        if bit(bits, slot) {
+                            set(bits, slot, false);
+                            put_bits(&tx, d, s, pid, bits)?;
+                            touched.insert(pid);
+                        }
+                    }
+                }
+            }
+            let retired = write.kind == JournalWriteKind::Collect
+                && load(&tx, d, s)?.is_some_and(|r| r.retirement.is_some());
+            let mut repack_limit = None;
+            if retired || cap.is_some() {
+                let owned: Vec<i64> = {
+                    let mut st = tx
+                        .prepare("SELECT pack_id FROM pack WHERE owner=? ORDER BY pack_id")
+                        .map_err(failure)?;
+                    st.query_map([s.as_str()], |r| r.get::<_, i64>(0))
+                        .map_err(failure)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(failure)?
+                };
+                match cap {
+                    None => touched.extend(owned),
+                    Some(cap) => {
+                        let plan = MaintenancePlan::new(
+                            &touched,
+                            &owned,
+                            retired,
+                            self.config.repack_on_collection,
+                            |_| true,
+                            cap,
+                        );
+                        touched.extend(plan.forced.iter().copied());
+                        repack_limit = Some(plan.repack_limit);
+                        if plan.forced_left {
+                            // The rest of the retired purge is a later apply's
+                            // work: keep the session dirty until it is done.
+                            let mut r = write.record.clone();
+                            r.collection_dirty = true;
+                            tx.execute(
+                                "INSERT OR REPLACE INTO session VALUES (?,?,?,?,?,?,?,?,?)",
+                                params![
+                                    d.storage_id.as_str(),
+                                    role(d),
+                                    s.as_str(),
+                                    r.revision.0,
+                                    r.writer_epoch,
+                                    r.collection_dirty,
+                                    r.generation.to_le_bytes().as_slice(),
+                                    codec::encode(&metadata::Record::from(&r))?,
+                                    [0u8; 24].as_slice()
+                                ],
+                            )
+                            .map_err(failure)?;
+                        }
+                    }
+                }
+            }
+            #[cfg(any())]
+            drop(release_timer);
+            let receipt = purge(&tx, packs, &mut updates, &touched, retired)?;
+            if self.config.repack_on_collection && write.kind == JournalWriteKind::Collect {
+                repack(&tx, packs, &mut updates, s, true, repack_limit)?;
+            }
+            // Pre-existing sealed packs rewritten or deleted (merge outputs
+            // are the rewrite of their inputs, not extra units).
+            let rewritten = updates.keys().filter(|pid| packs.contains_key(pid)).count();
+            let rewritten = u32::try_from(rewritten).unwrap_or(u32::MAX);
+            {
+                #[cfg(any())]
+                let _commit =
+                    agent_runtime::core::journal::profile::enter_sync("rt.storage.commit");
+                tx.commit().map_err(commit_failure)?;
+            }
+            state.update(s, updates);
+            if let Some(op) = &write.operation {
+                state.operations.insert(
+                    (
+                        d.storage_id.as_str().to_owned(),
+                        role(d),
+                        s.as_str().to_owned(),
+                        op.operation.clone(),
+                    ),
+                    op.clone(),
+                );
+            }
+            for operation in pruned {
+                state.operations.remove(&(
+                    d.storage_id.as_str().to_owned(),
+                    role(d),
+                    s.as_str().to_owned(),
+                    operation,
+                ));
+            }
+            fail(&write, JournalCommitFailurePoint::AfterCommit)?;
+            Ok((receipt, rewritten))
+        })
     }
-    async fn compact(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
-        let mut state = self.lock()?;
-        let sessions: Vec<SessionId> = {
-            let mut st = state.conn.prepare("SELECT DISTINCT session FROM membership WHERE storage=? AND role=? ORDER BY session").map_err(failure)?;
-            st.query_map(params![domain.storage_id.as_str(), role(domain)], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(failure)?
-            .map(|r| r.map(SessionId::new).map_err(failure))
-            .collect::<Result<_, _>>()?
-        };
-        for session in &sessions {
-            state.session(session)?;
-        }
-        let State {
-            conn,
-            packs,
-            version,
-            ..
-        } = &mut *state;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(failure)?;
-        let current: i64 = tx
-            .query_row("PRAGMA data_version", [], |r| r.get(0))
-            .map_err(failure)?;
-        if current != *version {
-            return Err(conflict());
-        }
-        let mut changes = Vec::new();
-        for session in sessions {
-            let mut updates = Updates::new();
-            repack(&tx, packs, &mut updates, &session, true)?;
-            changes.push((session, updates));
-        }
-        tx.commit().map_err(commit_failure)?;
-        for (session, updates) in changes {
-            state.update(&session, updates);
-        }
-        state
-            .conn
-            .execute_batch(
-                "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
-            )
-            .map_err(failure)
+    async fn compact_domain(&self, domain: &JournalDomain) -> Result<(), RuntimeError> {
+        journal_profile_scope!("rt.storage.compact", {
+            let mut state = self.lock()?;
+            let sessions: Vec<SessionId> = {
+                let mut st = state.conn.prepare("SELECT DISTINCT session FROM membership WHERE storage=? AND role=? ORDER BY session").map_err(failure)?;
+                st.query_map(params![domain.storage_id.as_str(), role(domain)], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(failure)?
+                .map(|r| r.map(SessionId::new).map_err(failure))
+                .collect::<Result<_, _>>()?
+            };
+            for session in &sessions {
+                state.session(session)?;
+            }
+            let State {
+                conn,
+                packs,
+                version,
+                ..
+            } = &mut *state;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(failure)?;
+            let current: i64 = tx
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .map_err(failure)?;
+            if current != *version {
+                return Err(conflict());
+            }
+            let mut changes = Vec::new();
+            for session in sessions {
+                let mut updates = Updates::new();
+                repack(&tx, packs, &mut updates, &session, true, None)?;
+                changes.push((session, updates));
+            }
+            tx.commit().map_err(commit_failure)?;
+            for (session, updates) in changes {
+                state.update(&session, updates);
+            }
+            state
+                .conn
+                .execute_batch(
+                    "PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);",
+                )
+                .map_err(failure)
+        })
+    }
+    async fn page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        journal_profile_scope!("rt.storage.collection_page", {
+            let state = self.lock()?;
+            let fence = load(&state.conn, d, s)?.map_or(JournalFence::default(), |r| r.fence());
+            if fence != request.fence {
+                return Err(conflict());
+            }
+            let limit = request.max_items.min(COLLECTION_LIMITS.max_page_items) as usize;
+            let after = request
+                .after
+                .as_ref()
+                .map(|after| after.position(d, s, fence, request.kind))
+                .transpose()?;
+            match request.kind {
+                JournalCollectionPageKind::Members => {
+                    members_page(&state, d, s, fence, after, limit)
+                }
+                JournalCollectionPageKind::Pins => pins_page(&state, d, s, fence, after, limit),
+                _ => Err(conflict()),
+            }
+        })
     }
 }

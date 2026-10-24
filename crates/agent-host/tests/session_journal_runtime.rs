@@ -397,14 +397,17 @@ async fn runtime_and_collector_share_engine_leases() {
         competing.kind,
         agent_runtime::core::error::ErrorKind::Conflict
     );
-    collector
-        .collect(JournalGcRequest {
+    drain_gc(
+        &collector,
+        JournalGcRequest {
             storage_id: collector.storage_id(),
             expected_root_epoch: mark,
             max_objects: 20_000,
-        })
-        .await
-        .unwrap();
+            work_budget: Default::default(),
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         JournalReader::new(&collector, &historical, limits())
             .unwrap()
@@ -420,14 +423,17 @@ async fn runtime_and_collector_share_engine_leases() {
         .await
         .unwrap();
     assert!(collector.root_epoch().unwrap() > mark);
-    let stale = collector
-        .collect(JournalGcRequest {
+    let stale = drain_gc(
+        &collector,
+        JournalGcRequest {
             storage_id: collector.storage_id(),
             expected_root_epoch: mark,
             max_objects: 20_000,
-        })
-        .await
-        .unwrap_err();
+            work_budget: Default::default(),
+        },
+    )
+    .await
+    .unwrap_err();
     assert_eq!(stale.kind, agent_runtime::core::error::ErrorKind::Conflict);
     collector.close(lease).await.unwrap();
     drop(session);
@@ -1102,14 +1108,17 @@ async fn dirty_corruption_does_not_block_shared_collector() {
     );
     for run in 0..2 {
         let loads = storage.session_record_loads_for_test(&domain, &ids[1]);
-        let report = journal
-            .collect(JournalGcRequest {
+        let report = drain_gc(
+            &journal,
+            JournalGcRequest {
                 storage_id: journal.storage_id(),
                 expected_root_epoch: journal.root_epoch().unwrap(),
                 max_objects: 20_000,
-            })
-            .await
-            .unwrap();
+                work_budget: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(report.unreadable_sessions, vec![ids[1].clone()]);
         assert_eq!(
             storage.session_record_loads_for_test(&domain, &ids[1]) - loads,
@@ -1145,4 +1154,74 @@ async fn dirty_corruption_does_not_block_shared_collector() {
     for id in [&ids[0], &ids[2]] {
         assert!(snapshot(&journal, id).await.history.len() >= 5);
     }
+}
+
+async fn drain_gc<S: JournalStorage>(
+    journal: &JournalEngine<S>,
+    mut request: JournalGcRequest,
+) -> Result<JournalGcReport, agent_runtime::core::error::RuntimeError> {
+    let mut total = journal.collect(request.clone()).await?;
+    for _ in 0..10_000 {
+        if !total.has_more {
+            return Ok(total);
+        }
+        request.expected_root_epoch = journal.root_epoch()?;
+        total.accumulate(journal.collect(request.clone()).await?);
+    }
+    panic!("collection continuation bound exhausted");
+}
+
+#[tokio::test]
+async fn bounded_gc_reports_incomplete_live_membership() {
+    let id = SessionId::new("incomplete-live-membership");
+    let (f, store) = fixture(&id).await;
+    let rt = runtime(store.clone(), provider());
+    let session = rt
+        .start_session(StartSession::create(
+            id.clone(),
+            vec![Message::user("keep this history")],
+        ))
+        .await
+        .unwrap();
+    session
+        .run(UserInput::text("first"))
+        .await
+        .unwrap()
+        .completed()
+        .await;
+    session.shutdown().await.unwrap();
+    let journal = store.journals().protected();
+    let raw = store.journals().storage();
+    let domain = JournalDomain {
+        storage_id: journal.storage_id(),
+        role: JournalRole::Protected,
+    };
+    let record = raw.load(&domain, &id).await.unwrap().unwrap();
+    assert!(record.collection_dirty);
+    let packs: Vec<(i64,Vec<u8>,Vec<u8>)> = sqlx::query_as("SELECT pack_id,index_payload,body_payload FROM agent_session_journal_pack ORDER BY pack_id").fetch_all(f.database().pool()).await.unwrap();
+    sqlx::query("DELETE FROM agent_session_journal_membership WHERE storage_id=? AND role='protected' AND runtime_session_id=?")
+        .bind(domain.storage_id.as_str()).bind(id.as_str()).execute(f.database().pool()).await.unwrap();
+    let report = drain_gc(
+        &journal,
+        JournalGcRequest::new(journal.storage_id(), journal.root_epoch().unwrap(), 20_000)
+            .with_budget(JournalGcBudget {
+                max_work_units: 1,
+                ..Default::default()
+            }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.unreadable_sessions, vec![id.clone()]);
+    assert!(
+        report.work_units > 1,
+        "the pass drains several bounded calls"
+    );
+    assert!(!report.has_more);
+    assert_eq!(report.deleted, 0);
+    assert_eq!(raw.load(&domain, &id).await.unwrap().unwrap(), record);
+    let unchanged: Vec<(i64,Vec<u8>,Vec<u8>)> = sqlx::query_as("SELECT pack_id,index_payload,body_payload FROM agent_session_journal_pack ORDER BY pack_id").fetch_all(f.database().pool()).await.unwrap();
+    assert_eq!(
+        packs, unchanged,
+        "incomplete membership preserves every sealed pack"
+    );
 }

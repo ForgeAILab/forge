@@ -930,7 +930,12 @@ async fn rotation_and_retry() {
     assert_eq!(zero.collection_calls, 0);
     assert_eq!(retired(&store, "rotation-source").await, [false, false]);
     let pass = policy.maintain_once(&mut cursor).await.unwrap();
-    assert_eq!(pass.collection_calls, 2);
+    assert_eq!(
+        pass.collection_calls - pass.collection_continuations,
+        2,
+        "exactly one completed pass per domain; yielded calls remain counted"
+    );
+    assert!(pass.collection_calls <= 32);
     assert!(
         pass.retired_domains >= 5 && pass.conflicts >= 1 && pass.unreadable_sessions == 0,
         "{pass:?}"
@@ -1014,7 +1019,12 @@ async fn rotation_and_retry() {
     )
     .await;
     let damaged = policy.maintain_once(&mut cursor).await.unwrap();
-    assert_eq!(damaged.collection_calls, 2);
+    assert_eq!(
+        damaged.collection_calls - damaged.collection_continuations,
+        2,
+        "unreadable isolation still completes both domain passes"
+    );
+    assert!(damaged.collection_calls <= 32);
     assert_eq!(damaged.unreadable_sessions, 1, "{damaged:?}");
     assert!(
         damaged.deferred_domains >= 1,

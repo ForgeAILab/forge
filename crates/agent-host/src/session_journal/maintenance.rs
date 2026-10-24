@@ -153,6 +153,7 @@ impl ForgeJournalStorage {
         scope: &Scope,
         purged: &BTreeSet<i64>,
         staged: &mut Staged,
+        allowed: Option<&BTreeSet<i64>>,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("maintenance.collection_repack", 0);
@@ -162,9 +163,11 @@ impl ForgeJournalStorage {
         let views = self.directory(conn, scope, false).await?;
         let selected: Vec<_> = views
             .into_iter()
-            // Like S2, only packs the collecting domain holds entirely.
+            // Leave a pack fully held only by another domain to its maintenance.
             .filter(|v| {
-                v.fully_held()
+                allowed.is_none_or(|packs| packs.contains(&v.index.key.id))
+                    && v.fully_live()
+                    && !v.others_pack()
                     && (v.index.key.retained < SMALL_PACK || purged.contains(&v.index.key.id))
             })
             .collect();
@@ -206,12 +209,11 @@ impl ForgeJournalStorage {
             let mut views = self.directory(&mut tx, &scope, false).await?;
             loop {
                 let mut tiers = BTreeMap::<u32, Vec<PackView>>::new();
-                // A domain's hook moves only bodies that domain holds: a pack
-                // with a slot only another domain holds is that domain's to
-                // merge. Otherwise one hook pairs the other domain's stable
-                // history with its own short-lived bodies, and the next purge
-                // must rewrite the whole merged pack.
-                for view in views.iter().filter(|v| v.fully_held()) {
+                // Do not pair another domain's complete stable history with
+                // this domain's short-lived bodies. Mixed fully live packs
+                // without one complete holder remain eligible; remap each
+                // holder's own bits when merging them.
+                for view in views.iter().filter(|v| v.fully_live() && !v.others_pack()) {
                     tiers
                         .entry(view.index.key.retained.max(4096).ilog2())
                         .or_default()

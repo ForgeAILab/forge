@@ -106,7 +106,7 @@ impl Native {
         for (engine, _) in self.domains() {
             // Production max_objects is a membership-release bound. Sweep until
             // the durable dirty index is empty, never cancel an engine call.
-            loop {
+            for call in 0..10_000 {
                 let before = if profile::clean() {
                     0
                 } else {
@@ -133,6 +133,7 @@ impl Native {
                         storage_id: engine.storage_id(),
                         expected_root_epoch: engine.root_epoch().unwrap(),
                         max_objects: 20_000,
+                        work_budget: Default::default(),
                     })
                     .await
                     .unwrap();
@@ -156,6 +157,9 @@ impl Native {
                     writes(self.file.database().pool()).await.packs()
                 } - before;
                 assert!(report.unreadable_sessions.is_empty());
+                assert!(report.over_capacity_sessions.is_empty());
+                let has_more = report.has_more;
+                assert_eq!(report.zero_work_calls, 0, "collector must progress");
                 {
                     let mut m = self.maintenance.lock().unwrap();
                     m.calls += 1;
@@ -172,15 +176,17 @@ impl Native {
                         JournalRole::Ordinary
                     },
                 };
-                if self
-                    .raw
-                    .dirty_sessions(&domain, None, 1)
-                    .await
-                    .unwrap()
-                    .is_empty()
+                if !has_more
+                    && self
+                        .raw
+                        .dirty_sessions(&domain, None, 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
                 {
                     break;
                 }
+                assert!(call < 9_999, "bounded final collection sweep must drain");
             }
         }
     }
@@ -409,6 +415,8 @@ async fn cold_warm(file: &FileDb, id: &SessionId) -> Value {
     let meter = Arc::new(metered::Metered::new(raw.clone()));
     let owner = SessionJournals::with_test_memo_budget(meter.clone(), JOURNAL_MEMO_BYTES);
     let mut samples = vec![];
+    let mut memo_state = vec![];
+    let mut counters = std::collections::BTreeMap::<String, u64>::new();
     for (role, engine) in [
         ("protected", owner.protected()),
         ("ordinary", owner.ordinary()),
@@ -419,9 +427,22 @@ async fn cold_warm(file: &FileDb, id: &SessionId) -> Value {
             profile::phase(&format!("{phase}.{role}"), 0);
             meter.take();
             let start = Instant::now();
-            let lease = engine.open(id, open(phase)).await.unwrap();
+            let observer = agent_runtime::core::journal::profile::Observer::default();
+            let lease = observer.run(engine.open(id, open(phase))).await.unwrap();
             let us = start.elapsed().as_micros() as u64;
             let reads = meter.take();
+            for sample in observer.drain().unwrap() {
+                if [
+                    "rt.memo.hit",
+                    "rt.memo.miss",
+                    "rt.memo.eviction",
+                    "rt.memo.oversize",
+                ]
+                .contains(&sample.label)
+                {
+                    *counters.entry(sample.label.to_owned()).or_default() += sample.units;
+                }
+            }
             if reads == 0 {
                 hits += 1;
             } else {
@@ -434,8 +455,9 @@ async fn cold_warm(file: &FileDb, id: &SessionId) -> Value {
             }
         }
         samples.push(json!({"role":role,"observed_open_hits":hits,"observed_open_misses":misses}));
+        memo_state.push(json!({"role":role,"state":engine.profile_state().unwrap()}));
     }
-    json!({"samples":samples,"cache":cache_json(&raw),"memo_budget_per_engine":JOURNAL_MEMO_BYTES,"memo_charge_bytes":null,"memo_heap_bytes":null,"internal_hits":null,"internal_misses":null,"internal_evictions":null,"internal_oversize":null,"unavailable_reason":"v0.9.0 keeps RootMemo private and provides no telemetry API; observed open hits/misses are storage-read classification, not internal lookup counters","configured_charge_headroom_1_24_bytes":JOURNAL_MEMO_BYTES as f64*1.24,"peak_process_rss_bytes":rss_bytes()})
+    json!({"samples":samples,"cache":cache_json(&raw),"memo_budget_per_engine":JOURNAL_MEMO_BYTES,"memo_state":memo_state,"memo_charge_bytes":memo_state.iter().map(|s| s["state"]["memo_charge"].as_u64().unwrap()).sum::<u64>(),"memo_heap_bytes":null,"internal_probe_counters":counters,"probe_scope":"cold and warm validation/open only; not whole-run counters","unavailable_reason":"runtime exposes estimated charge and scoped probe counters, but not allocator heap","configured_charge_headroom_1_24_bytes":JOURNAL_MEMO_BYTES as f64*1.24,"peak_process_rss_bytes":rss_bytes()})
 }
 fn resume_runtime<S: SessionStore + CheckpointStore + 'static>(
     store: Arc<S>,
@@ -515,6 +537,15 @@ async fn measure(name: &str, n: usize, tools: bool, identity: bool) -> Value {
     assert_eq!(empty, legacy_empty, "common setup accounted identically");
     let native = Arc::new(Native::new(file.clone(), identity));
     let native_drive = fixture::drive(native.clone(), name, n, tools, id.clone()).await;
+    assert!(
+        native.meter.prepared_commits.load(Ordering::Relaxed) > 0,
+        "benchmark must exercise native preparation hints"
+    );
+    assert_eq!(
+        native.meter.unprepared_commits.load(Ordering::Relaxed),
+        0,
+        "benchmark decorator must not force complete commits"
+    );
     assert_eq!(native_drive.snapshot.history, legacy_drive.snapshot.history);
     let published_ordinary = view(&native.ordinary, &id).await;
     assert!(
@@ -650,7 +681,15 @@ async fn measure(name: &str, n: usize, tools: bool, identity: bool) -> Value {
     let native_delta_turn_us =
         native_drive.turns_us.last().unwrap() + native_drive.maintenance_us.last().unwrap();
     let legacy_delta_turn_us = *legacy_drive.turns_us.last().unwrap();
-    let perf = json!({"delta_write_ratio":delta_ratio,"delta_native_bytes_after_first_turn":delta_native,"delta_legacy_bytes_after_first_turn":delta_legacy,"delta_definition":"all writes after first terminal, including subsequent S2/collection and final shutdown sweep; cumulative totals also reported","delta_writes_le_10pct":if n>=1000{delta_ratio.map(|r|r<=0.1)}else{None},"native_mean_turn_including_maintenance_us":nt,"legacy_mean_turn_us":lt,"mean_turn_pass":nt<=lt*if n==100{1.1}else{1.0},"native_delta_turn_us":native_delta_turn_us,"native_delta_run_only_us":native_drive.turns_us.last(),"run_only_turn_pass":*native_drive.turns_us.last().unwrap() as f64<=legacy_delta_turn_us as f64*if n==100{1.1}else{1.0},"legacy_delta_turn_us":legacy_delta_turn_us,"turn_pass":native_delta_turn_us as f64<=legacy_delta_turn_us as f64*if n==100{1.1}else{1.0},"scalar_probe_us":scalar_probe_us,"import_us":import_us,"legacy_resume_us":legacy_resume_us,"import_le_2x_resume":import_us<=legacy_resume_us*2,"max_write_transaction_us":max_write_hold});
+    let turn_budget_us = if n == 100 {
+        Some(50_000u64)
+    } else if name == "B" && n == 4000 {
+        Some(250_000)
+    } else {
+        None
+    };
+    let longest_collect_us = native.maintenance.lock().unwrap().longest_collect_us;
+    let perf = json!({"delta_write_ratio":delta_ratio,"delta_native_bytes_after_first_turn":delta_native,"delta_legacy_bytes_after_first_turn":delta_legacy,"delta_definition":"all writes after first terminal, including subsequent S2/collection and final shutdown sweep; cumulative totals also reported","delta_writes_le_10pct":if n>=1000{delta_ratio.map(|r|r<=0.1)}else{None},"native_mean_turn_including_maintenance_us":nt,"legacy_mean_turn_us":lt,"mean_turn_pass":turn_budget_us.map(|b| nt <= lt + b as f64),"native_delta_turn_us":native_delta_turn_us,"native_delta_run_only_us":native_drive.turns_us.last(),"run_only_turn_pass":turn_budget_us.map(|b| *native_drive.turns_us.last().unwrap() <= legacy_delta_turn_us + b),"legacy_delta_turn_us":legacy_delta_turn_us,"turn_pass":turn_budget_us.map(|b| native_delta_turn_us <= legacy_delta_turn_us + b),"turn_overhead_budget_us":turn_budget_us,"native_delta_turn_overhead_us":native_delta_turn_us as i64-legacy_delta_turn_us as i64,"scalar_probe_us":scalar_probe_us,"import_us":import_us,"legacy_resume_us":legacy_resume_us,"import_latency_gated":false,"max_write_transaction_us":max_write_hold,"collect_gate_hold_under_1s":longest_collect_us<1_000_000,"collect_target_under_250ms":longest_collect_us<250_000,"collect_gate_includes_retirement":true});
     let maintenance = serde_json::to_value(&*native.maintenance.lock().unwrap()).unwrap();
     let s2_bytes = maintenance_after_collection["s2_pack_bytes"]
         .as_u64()
@@ -667,7 +706,7 @@ async fn measure(name: &str, n: usize, tools: bool, identity: bool) -> Value {
         .clone();
     let legacy_turn_cumulative = legacy.turn_bytes.lock().unwrap().clone();
     let old_plus_new_peak = overlap.physical_bytes.max(import_overlap.physical_bytes);
-    json!({"fixture":name,"n":n,"metering":"TEMP counters on all five SQLx connections; no main-DB or WAL instrumentation pages","tools":tools,"identity_policy_diagnostic":identity,"projection":"ForgeJournalProjection (conservative D3); independent encrypted domain copies","identity_projection_equal_for_fixture":identity_same,"cadence":"S2 + collect after every turn; final shutdown sweep (20,000 releases/call, drain to stable)","runtime_reference_c4000_cadence":"collect-at-end only; no upstream per-turn C4000 claim","legacy_blobs":2,"legacy_save_calls":legacy_calls,"legacy_digest_or_idempotent_skips":skipped,"legacy_row_unchanged_by_import":true,"legacy_ciphertext_lengths":[blobs.0,blobs.1],"legacy_nonce_lengths":[blobs.2,blobs.3],"legacy_empty":legacy_empty,"native_empty":empty,"legacy_l1":legacy_l1,"legacy_l2":legacy_l2,"before_final_collection":before,"after_collection":after,"after_retirement":retired,"actual_old_plus_new":overlap,"uncollected_import_old_plus_new":import_overlap,"runtime_open_observations":*native.opens.lock().unwrap(),"after_l2_ratio":native_only_ratio,"hard_disk_gate":if name=="B" && n==4000 && !identity {native_only_ratio.map(|r|r<=2.0)}else{None},"before_canonical":before_stats,"after_canonical":after_stats,"retired_canonical":retired_stats,"native_writes":native_writes,"commit_pack_bytes":commit_pack_bytes,"geometric_s2_write_amplification":ratio(commit_pack_bytes+s2_bytes,commit_pack_bytes),"all_maintenance_write_amplification":ratio(native_writes.packs(),commit_pack_bytes),"native_per_turn_pack_bytes":deltas(&native_turn_cumulative),"legacy_per_turn_payload_bytes":deltas(&legacy_turn_cumulative),"old_plus_new_peak_physical_bytes":old_plus_new_peak,"storage_cache_heap_bytes":null,"legacy_writes":legacy_writes,"native_drive":native_drive,"legacy_drive":legacy_drive,"final_sweep_wal_bytes":final_sweep_wal,"maintenance":maintenance_after_collection,"maintenance_including_retirement":maintenance,"replay":replay_evidence,"cold_warm":cold,"storage_cache":cache,"performance":perf,"physical_receipts_after_retirement":receipt_json(&native),"physical_receipts_after_collection":receipt_after_collection,"storage_object_reads":native.meter.reads(),"admitted_object_submissions":native.meter.admitted_objects.load(Ordering::Relaxed),"admitted_canonical_byte_submissions":native.meter.admitted_bytes.load(Ordering::Relaxed),"peak_process_rss_bytes":rss_bytes()})
+    json!({"fixture":name,"n":n,"metering":"TEMP counters on all five SQLx connections; no main-DB or WAL instrumentation pages","tools":tools,"identity_policy_diagnostic":identity,"projection":"ForgeJournalProjection (conservative D3); within-session encrypted body sharing","identity_projection_equal_for_fixture":identity_same,"cadence":"S2 + collect after every turn; final shutdown sweep (20,000 releases/call, drain to stable)","runtime_reference_c4000_cadence":"collect-at-end only; no upstream per-turn C4000 claim","legacy_blobs":2,"legacy_save_calls":legacy_calls,"legacy_digest_or_idempotent_skips":skipped,"legacy_row_unchanged_by_import":true,"legacy_ciphertext_lengths":[blobs.0,blobs.1],"legacy_nonce_lengths":[blobs.2,blobs.3],"legacy_empty":legacy_empty,"native_empty":empty,"legacy_l1":legacy_l1,"legacy_l2":legacy_l2,"before_final_collection":before,"after_collection":after,"after_retirement":retired,"actual_old_plus_new":overlap,"uncollected_import_old_plus_new":import_overlap,"runtime_open_observations":*native.opens.lock().unwrap(),"after_l2_ratio":native_only_ratio,"hard_disk_gate":if name=="B" && n==4000 && !identity {native_only_ratio.map(|r|r<=2.0)}else{None},"before_canonical":before_stats,"after_canonical":after_stats,"retired_canonical":retired_stats,"native_writes":native_writes,"commit_pack_bytes":commit_pack_bytes,"geometric_s2_write_amplification":ratio(commit_pack_bytes+s2_bytes,commit_pack_bytes),"all_maintenance_write_amplification":ratio(native_writes.packs(),commit_pack_bytes),"native_per_turn_pack_bytes":deltas(&native_turn_cumulative),"legacy_per_turn_payload_bytes":deltas(&legacy_turn_cumulative),"old_plus_new_peak_physical_bytes":old_plus_new_peak,"storage_cache_heap_bytes":null,"legacy_writes":legacy_writes,"native_drive":native_drive,"legacy_drive":legacy_drive,"final_sweep_wal_bytes":final_sweep_wal,"maintenance":maintenance_after_collection,"maintenance_including_retirement":maintenance,"replay":replay_evidence,"cold_warm":cold,"storage_cache":cache,"performance":perf,"physical_receipts_after_retirement":receipt_json(&native),"physical_receipts_after_collection":receipt_after_collection,"prepared_commits":native.meter.prepared_commits.load(Ordering::Relaxed),"unprepared_commits":native.meter.unprepared_commits.load(Ordering::Relaxed),"storage_object_reads":native.meter.reads(),"admitted_object_submissions":native.meter.admitted_objects.load(Ordering::Relaxed),"admitted_canonical_byte_submissions":native.meter.admitted_bytes.load(Ordering::Relaxed),"peak_process_rss_bytes":rss_bytes()})
 }
 fn deltas(cumulative: &[u64]) -> Vec<u64> {
     let mut previous = 0;
@@ -825,8 +864,22 @@ impl SessionJournal for Observed {
         l: &JournalLease,
         c: JournalCommit,
     ) -> Result<JournalHead, RuntimeError> {
+        self.meter
+            .unprepared_commits
+            .fetch_add(1, Ordering::Relaxed);
         let _profile = forge_agent_host::session_journal::profile::timer("engine.commit", 0);
         self.inner.commit(l, c).await
+    }
+    async fn commit_prepared(
+        &self,
+        l: &JournalLease,
+        c: JournalCommit,
+        hints: JournalPreparationHints,
+    ) -> Result<JournalHead, RuntimeError> {
+        self.meter.prepared_commits.fetch_add(1, Ordering::Relaxed);
+        let _profile =
+            forge_agent_host::session_journal::profile::timer("engine.commit_prepared", 0);
+        self.inner.commit_prepared(l, c, hints).await
     }
     async fn renew(&self, l: &JournalLease) -> Result<JournalLease, RuntimeError> {
         let _profile = forge_agent_host::session_journal::profile::timer("engine.renew", 0);
@@ -918,19 +971,52 @@ async fn scoped_and_dirty() -> Value {
         assert!(count >= 100);
         dirty.push(count);
         let start = Instant::now();
-        let report = engine
-            .collect(JournalGcRequest {
-                storage_id: engine.storage_id(),
-                expected_root_epoch: engine.root_epoch().unwrap(),
-                max_objects: 20_000,
-            })
-            .await
-            .unwrap();
-        let us = start.elapsed().as_micros() as u64;
-        collect.push(json!({"role":domain.role,"collect_gate_hold_upper_bound_us":us,"le_1second":us<=1_000_000,"report":report}));
+        let mut reports = Vec::new();
+        let mut longest = 0;
+        for call in 0..10_000 {
+            let one = Instant::now();
+            let report = engine
+                .collect(
+                    JournalGcRequest::new(
+                        engine.storage_id(),
+                        engine.root_epoch().unwrap(),
+                        20_000,
+                    )
+                    .with_budget(JournalGcBudget::default()),
+                )
+                .await
+                .unwrap();
+            longest = longest.max(one.elapsed().as_micros() as u64);
+            let more = report.has_more;
+            assert_eq!(report.zero_work_calls, 0);
+            reports.push(report);
+            if !more {
+                break;
+            }
+            assert!(call < 9_999, "100-dirty drain bound");
+        }
+        collect.push(json!({"role":domain.role,"collect_gate_hold_upper_bound_us":longest,"le_1second":longest<1_000_000,"drain_us":start.elapsed().as_micros() as u64,"reports":reports}));
     }
     json!({"unrelated_sessions":100,"storage_construction_us":construction_us,"construction_decodes":0,"target_scope_pack_count":own_packs,"all_pack_count":all_packs,"target_members":members.len(),"lazy_hydration_us":hydration_us,"cache_after_target":cache,"one_byte_cache":oversize,"bounded_cache_after_100_scopes":bounded,"dirty_sessions_per_domain":dirty,"collect_100_dirty":collect,"cold_validation_with_unrelated":cold_warm(&file,&id).await,"peak_process_rss_bytes":rss_bytes()})
 }
 
 #[path = "support/bench_profile.rs"]
 mod profile;
+
+#[tokio::test]
+#[ignore = "D10 isolated scoped hydration and 100-dirty-session measurement"]
+async fn forge_scoped_dirty_report() {
+    let report = scoped_and_dirty().await;
+    std::fs::create_dir_all(output()).unwrap();
+    std::fs::write(
+        output().join("scoped-and-dirty.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "D10 isolated identity-projection diagnostic"]
+async fn forge_identity_projection_report() {
+    save(&[measure("B", 100, false, true).await]);
+}

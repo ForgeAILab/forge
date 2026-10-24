@@ -83,9 +83,14 @@ impl PackView {
     pub fn fully_live(&self) -> bool {
         (0..self.index.key.count).all(|s| self.live(s))
     }
-    /// The viewing domain holds every slot (so the pack is also fully live).
-    pub fn fully_held(&self) -> bool {
-        (0..self.index.key.count).all(|s| self.held(s))
+    /// Another domain holds every slot and the viewing domain does not.
+    pub fn others_pack(&self) -> bool {
+        let n = self.index.key.count;
+        !(0..n).all(|s| self.held(s))
+            && self
+                .others
+                .iter()
+                .any(|(_, bits)| (0..n).all(|s| bit(bits, s)))
     }
 }
 /// Final surviving bodies keyed by pack id, plus ids invalidated by the transaction.
@@ -286,6 +291,41 @@ impl ForgeJournalStorage {
         })
         .await
     }
+    pub(super) async fn pin_row(
+        &self,
+        domain: &JournalDomain,
+        session: &SessionId,
+        row: SqliteRow,
+    ) -> Result<JournalPinRecord, RuntimeError> {
+        self.revision(&row)?;
+        let keys = self.keys.clone();
+        let domain = domain.clone();
+        let session = session.clone();
+        self.work(move || {
+            let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
+            let key: Vec<u8> = row.try_get("pin_key").map_err(|_| corrupt())?;
+            let raw = keys.open(
+                &Binding {
+                    unit: Unit::Pin,
+                    domain: Some(&domain),
+                    session: &session,
+                    owner: &owner,
+                    row: &key,
+                    generation: 0,
+                },
+                &row.try_get::<Vec<u8>, _>("nonce").map_err(|_| corrupt())?,
+                &row.try_get::<Vec<u8>, _>("payload")
+                    .map_err(|_| corrupt())?,
+                wire::MAX_METADATA,
+            )?;
+            let p = wire::pin(&raw)?;
+            if keys.lookup(Unit::Pin, &domain, &session, p.pin.as_str().as_bytes()) != key {
+                return Err(corrupt());
+            }
+            Ok(p)
+        })
+        .await
+    }
     pub(super) async fn load_on(
         &self,
         conn: &mut SqliteConnection,
@@ -316,15 +356,27 @@ impl ForgeJournalStorage {
         publish: bool,
         prior: Option<Arc<ScopeDirectory>>,
     ) -> Result<Vec<PackView>, RuntimeError> {
+        self.directory_range(conn, scope, publish, prior, 0, i64::MAX)
+            .await
+    }
+    pub(super) async fn directory_range(
+        &self,
+        conn: &mut SqliteConnection,
+        scope: &Scope,
+        publish: bool,
+        prior: Option<Arc<ScopeDirectory>>,
+        first_pack: i64,
+        limit: i64,
+    ) -> Result<Vec<PackView>, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("storage.directory_from", 0);
         let (domain, session) = scope;
-        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,forge_session_id,key_revision,format FROM agent_session_journal_pack WHERE runtime_session_id=? ORDER BY pack_id")
-            .bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
+        let rows={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT pack_id,generation,object_count,retained_canonical_bytes,forge_session_id,key_revision,format FROM agent_session_journal_pack WHERE runtime_session_id=? AND pack_id>=? ORDER BY pack_id LIMIT ?")
+            .bind(session.as_str()).bind(first_pack).bind(limit).fetch_all(&mut *conn).await }.map_err(database_error)?;
         // Every domain's bitmap in the same snapshot; the composite FK binds
         // each row to its pack's session and Forge owner label.
-        let members={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT storage_id,role,pack_id,bitmap FROM agent_session_journal_membership WHERE runtime_session_id=? ORDER BY pack_id,storage_id,role")
-            .bind(session.as_str()).fetch_all(&mut *conn).await }.map_err(database_error)?;
+        let members={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0); sqlx::query("SELECT storage_id,role,pack_id,bitmap FROM agent_session_journal_membership WHERE runtime_session_id=? AND pack_id IN (SELECT pack_id FROM agent_session_journal_pack WHERE runtime_session_id=? AND pack_id>=? ORDER BY pack_id LIMIT ?) ORDER BY pack_id,storage_id,role")
+            .bind(session.as_str()).bind(session.as_str()).bind(first_pack).bind(limit).fetch_all(&mut *conn).await }.map_err(database_error)?;
         let mut bitmaps = BTreeMap::<i64, (Option<Vec<u8>>, Vec<(JournalDomain, Vec<u8>)>)>::new();
         for row in members {
             let holder = domain_of(
@@ -631,6 +683,37 @@ pub(super) fn validate_bitmap(bits: &[u8], count: usize) -> Result<(), RuntimeEr
 
 #[async_trait]
 impl JournalStorage for ForgeJournalStorage {
+    fn collection_capability(&self) -> JournalCollectionCapability {
+        JournalCollectionCapability::Bounded(super::collection::LIMITS)
+    }
+    async fn collection_page(
+        &self,
+        d: &JournalDomain,
+        s: &SessionId,
+        request: JournalCollectionPageRequest,
+    ) -> Result<JournalCollectionPage, RuntimeError> {
+        self.bounded_page(d, s, request).await
+    }
+    async fn prepare_collection_apply(
+        &self,
+        plan: &JournalCollectionPlan,
+    ) -> Result<JournalCollectionPreflight, RuntimeError> {
+        let mut tx = self.db.pool().begin().await.map_err(database_error)?;
+        let result = self
+            .collection_work(&mut tx, plan)
+            .await?
+            .map(|work| JournalCollectionPreflight::Fits { units: work.units });
+        tx.commit().await.map_err(database_error)?;
+        Ok(result.unwrap_or(JournalCollectionPreflight::Split {
+            max_release: (plan.write.release.len() / 2) as u64,
+        }))
+    }
+    async fn apply_collection(
+        &self,
+        plan: JournalCollectionPlan,
+    ) -> Result<JournalCollectionReceipt, RuntimeError> {
+        self.apply_bounded(plan.write, Some(plan.max_units)).await
+    }
     fn sharing(&self) -> JournalBodySharing {
         JournalBodySharing::PerSession
     }
@@ -674,6 +757,7 @@ impl JournalStorage for ForgeJournalStorage {
             tx.commit().await
         }
         .map_err(database_error)?;
+        self.upgrade_pin_ranks(domain, session).await?;
         Ok(result)
     }
     async fn objects(
@@ -824,36 +908,7 @@ impl JournalStorage for ForgeJournalStorage {
             .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_all(&mut *tx).await }.map_err(database_error)?;
         let mut pins = Vec::new();
         for row in rows {
-            self.revision(&row)?;
-            let keys = self.keys.clone();
-            let domain = domain.clone();
-            let session = session.clone();
-            pins.push(
-                self.work(move || {
-                    let owner: String = row.try_get("forge_session_id").map_err(|_| corrupt())?;
-                    let key: Vec<u8> = row.try_get("pin_key").map_err(|_| corrupt())?;
-                    let raw = keys.open(
-                        &Binding {
-                            unit: Unit::Pin,
-                            domain: Some(&domain),
-                            session: &session,
-                            owner: &owner,
-                            row: &key,
-                            generation: 0,
-                        },
-                        &row.try_get::<Vec<u8>, _>("nonce").map_err(|_| corrupt())?,
-                        &row.try_get::<Vec<u8>, _>("payload")
-                            .map_err(|_| corrupt())?,
-                        wire::MAX_METADATA,
-                    )?;
-                    let p = wire::pin(&raw)?;
-                    if keys.lookup(Unit::Pin, &domain, &session, p.pin.as_str().as_bytes()) != key {
-                        return Err(corrupt());
-                    }
-                    Ok(p)
-                })
-                .await?,
-            );
+            pins.push(self.pin_row(domain, session, row).await?);
         }
         pins.sort_by(|a, b| a.pin.cmp(&b.pin));
         {

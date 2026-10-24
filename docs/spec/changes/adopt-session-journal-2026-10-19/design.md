@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-22T04:13:54Z
+updated_at: 2026-10-24T07:10:52Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -116,6 +116,22 @@ PerSession/deferred-removal contract, reviewer gate fix and D-1 authority checks
 Forge uses shared engine clones regardless. Missing pieces block adoption;
 they are not Forge engine jobs.
 
+Task 33 also opts `ForgeJournalProjection` into `revision`/`project_delta` at
+revision 1. The policy is pointwise and idempotent: previously projected positions
+stay unchanged, and only updated Sensitive optional diagnostic values become
+removals. A replacement must remove any formerly visible value. Complete
+projection remains the authority for bootstrap, unknown revisions and opaque
+diagnostic references. This preserves D3's policy; it does not substitute an
+identity projector. Equivalence tests cover both sensitivity transitions,
+removals, unknown namespaces and unchanged non-extension delta fields.
+
+**Task 33 interim adoption (2026-10-24).** The owner-authorized interim pin is
+`b0a8c90e96ccb85e4642a119117a8fd5d3a06993`, still versioned 0.9.0, containing
+runtime P1/P2/P4 and review fixes merged with main. The final pin is the
+**v0.10.0 tag**, whose remaining upstream changes are version strings. This
+interim receipt does not claim the tag already exists. Forge has no direct
+`SessionState` field consumers; it uses the still-public `SessionSnapshot`.
+
 The public boundary is `JournalStorage: Send + Sync + Debug + 'static`.
 `sharing()` is synchronous and Forge explicitly returns
 `JournalBodySharing::PerSession` (the trait default is Global). The following
@@ -126,7 +142,7 @@ arguments are borrowed `&JournalDomain` / `&SessionId`.
 | --- | --- | --- |
 | `load(domain, session)` | — | `Option<JournalSessionRecord>` |
 | `objects(domain, session, ids)` | `ids: &[JournalObjectId]` | `Vec<Option<Arc<[u8]>>>`, in request order; non-member = `None` |
-| `members(domain, session)` | — | `Vec<JournalObjectId>`; collection's membership inventory |
+| `members(domain, session)` | — | `Vec<JournalObjectId>`; non-collection inventory |
 | `operation(domain, session, operation)` | `&JournalOperationId` | `Option<JournalOperationRecord>` |
 | `pins(domain, session)` | — | `Vec<JournalPinRecord>` |
 | `catalog(domain, session, head)` | `&JournalObjectId` | `Option<JournalCatalogEntry>` |
@@ -134,6 +150,10 @@ arguments are borrowed `&JournalDomain` / `&SessionId`.
 | `apply(write)` | owned `JournalWrite` | `JournalApplyReceipt` |
 | `retained_bytes(domain)` | — | `Option<u64>`; Forge returns `Some` canonical body bytes physically retained, including deferred dead bytes (D4), not the trait's default `None` |
 | `compact(domain)` | — | `()`; physical work only, no membership change |
+| `collection_capability()` | synchronous | `Bounded`: 256 page items, 1 MiB canonical bytes per physical unit, 32 apply units |
+| `collection_page(domain, session, request)` | full fence, kind, opaque continuation, item cap | bounded member/pin page; no whole-session slicing |
+| `prepare_collection_apply(plan)` | exact write and unit allowance | read-only `Fits { units }` or no-effect `Split { max_release }` |
+| `apply_collection(plan)` | same exact plan | atomic fenced receipt plus actual rewritten input-unit count |
 
 DTOs are preserved losslessly, including unknown opaque engine-state versions;
 Forge does not parse private engine metadata or recompute runtime roots.
@@ -565,16 +585,14 @@ Stable large packs and packs containing deferred dead slots stay sealed; merging
 the latter could concentrate dead bytes above 25% in an output pack. Terminal
 equal-tier merges likewise select fully live inputs and only merge a pair whose
 combined logical bytes fit the 1 MiB cap. "Fully live" means every slot is held
-by at least one domain. Within a shared session both paths further select only
-packs the acting domain (the hook's or the collecting domain) holds entirely; a
-pack with a slot only another domain holds is left to that domain's own
-maintenance; a pack that no domain holds entirely is then moved only by explicit
-`compact`. Otherwise one domain's hook folds the other domain's stable history
-into its own short-lived bodies (request settings, checkpoints), and the next
-purge rewrites the whole merged pack (measured: B/N=1000 delta writes 10.7% →
-35.9% before this rule, 10.3% after). The cost is fragmentation: C/N=1000
-after collection rises from 1.27× to 1.50× L2 (13 → 33 packs) and C/N=4000 from
-1.14× to 1.35× (41 → 127 packs); B/N=4000 is unchanged. Every move remaps each holder domain's bitmap of the
+by at least one domain. Within a shared session both paths exclude a pack
+another domain holds entirely when the acting domain does not. Fully live mixed
+packs that no single domain holds entirely remain eligible. This retains the
+protection against pairing another domain's complete stable history with the
+acting domain's short-lived bodies, while reducing the fragmentation of mixed
+packs. The earlier fully-held-only rule measured B/N=1000 delta writes at 10.3%
+after the 35.9% regression, but left C/N=1000 at 33 packs. Task 33's bounded
+others-pack evaluation records the current size/write tradeoff below. Every move remaps each holder domain's bitmap of the
 owning session atomically from that domain's own previous bits, without touching
 another session.
 
@@ -621,6 +639,18 @@ measures retained tiers after actual pruning; it is no longer a projection.
 Task 1 verified this floor and single-operation exception in `v0.8.0`
 (`engine/controls.rs:332`, `storage/volatile.rs:397`); no replay-rule correction
 was needed.
+
+Task 33 adds `V202610240425__journal_collection_pages.sql` without changing sealed rows or
+membership: session `layout_generation` advances for physical pack changes,
+and indexed pin `pin_order` stores only relative order. Pin mutations maintain
+ranks; an old scope's first authenticated load backfills missing ranks outside
+collection. Member continuations bind layout generation as well as full fence,
+rejecting repack/compact positions even when logical generation is unchanged.
+Read-only preflight and the write-lock recheck count touched packs, deferred
+purges, bounded base-repack inputs and changed operation segments. Merge
+outputs transform their charged inputs. A bounded forced purge leaves
+`collection_dirty` true while physical work remains. Receipts retain the
+existing physical-copy and canonical-byte rules.
 
 ### D5. Forge adapter and engine-call mapping
 
@@ -914,12 +944,14 @@ The implemented cursor resumes retirement pages, protected collect, ordinary
 collect and cleanup batches after the scheduling budget expires. The worker
 records collect duration as a conservative gate-hold upper bound including gate
 wait; the scheduling deadline never cancels an in-flight engine control. The
-call visits every dirty session; max_objects bounds membership releases, not
-previously deferred physical copy/byte removals, sessions or time. The 10 s
-budget therefore bounds the worker loop, not the gate hold.
-D10 measures the longest collect call with many dirty sessions. At or above 1 s it
-is a release-review blocker (target below 250 ms) and a runtime follow-up (a per-call session or time
-bound); Forge does not page sessions around the engine. Engine collection owns
+runtime speed-work call cooperatively yields under `JournalGcBudget` (250 ms
+soft target, 256 items per unit). `has_more` continues the engine-owned pass;
+Forge refreshes the root epoch for each call. `max_objects` still bounds only
+membership releases, not previously deferred physical removals. The worker
+checks its ten-second deadline and 32-call cap between calls, retaining its
+phase when a continuation remains. D10 records each individual call; at or above
+1 s remains a release-review blocker, targeting below 250 ms. Forge never
+replaces the engine's session/mark cursor with host tracing. Engine collection owns
 live-closure calculation, pin and
 root-epoch checks, catalog release, dirty clearing and S5. Storage executes
 release/receipt accounting and S2 pack work. Live sessions are collected too;
@@ -1070,6 +1102,18 @@ substitute for Forge's own measurement. Forge must still pass D10 through
 production storage. A's tiny-message overhead stays report-only; schema 5 stays
 out of scope.
 
+Task 33 uses explicit `JournalGcBudget` values (runtime defaults: 250 ms soft
+target, 256 items per unit) and refreshes `expected_root_epoch` between bounded
+calls. The retention phase continues while `has_more` within the existing
+10-second scheduling deadline, at most 32 calls per pass; zero-work reports
+back off. Conversion keeps eight candidates and two seconds, without cancelling
+an in-flight import. The report's after-turn and final shutdown sweeps drain
+continuations and durable dirty hints with a 10,000-call assertion bound.
+Incomplete live membership in `unreadable_sessions` uses the same capped
+warning/health path as authentication failures; over-capacity counts are logged
+without ids. The benchmark records each call rather than treating a whole drain
+as one held gate.
+
 ### D9. Rollout and documentation
 
 Ship both journal capabilities directly after the runtime release gate, storage
@@ -1185,6 +1229,33 @@ runtime. Turn/collect budget misses remain release-review blockers. No
 import-latency claim is implied by background scheduling. Output JSON plus a Markdown table in
 `docs/performance-testing.md`. This revision adopts the measured method; it does
 not claim Forge has run or passed it.
+
+### Task 33 measurement receipt (2026-10-24)
+
+Interim runtime `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (0.9.0); final pin is the **v0.10.0 tag**. Forge now forwards preparation hints and opts into equivalent incremental projection. Source/verification/every test edit: `/Volumes/Data/tmp/refactor/c3-t33/report.md`. Full reports used the unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
+
+| Fixture | t24 disk/L2 | writes disk/L2 | Final disk/L2 | Delta writes | Native / legacy last turn ms | Overhead ms / check | Max collect ms incl. retirement |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| A/100 plain | 13.00000 | 10.50000 | 10.00000 | 434.868% | 43.99 / 3.07 (14.35x) | 40.93 / PASS | 6.78 |
+| A/100 tool | 13.50000 | 9.50000 | 9.50000 | 413.172% | 77.70 / 5.67 (13.70x) | 72.03 / FAIL | 10.08 |
+| A/1000 plain | 9.53846 | 6.46154 | 6.46154 | 44.206% | 56.92 / 13.91 (4.09x) | 43.02 / n/a | 17.32 |
+| A/1000 tool | 9.46154 | 6.46154 | 6.38462 | 46.276% | 104.26 / 25.11 (4.15x) | 79.16 / n/a | 17.14 |
+| A/4000 plain | 9.08000 | 5.78000 | 5.78000 | 11.258% | 120.11 / 50.08 (2.40x) | 70.03 / n/a | 64.18 |
+| A/4000 tool | 8.90196 | 5.68627 | 5.66667 | 11.893% | 180.09 / 92.83 (1.94x) | 87.26 / n/a | 63.90 |
+| B/100 plain | 4.20000 | 2.90000 | 2.90000 | 70.803% | 51.12 / 7.69 (6.65x) | 43.43 / PASS | 7.92 |
+| B/100 tool | 4.00000 | 2.72727 | 2.54545 | 121.206% | 98.47 / 12.32 (7.99x) | 86.16 / FAIL | 13.90 |
+| B/1000 plain | 2.96341 | 1.73171 | 1.73171 | 10.336% | 108.16 / 48.98 (2.21x) | 59.18 / n/a | 28.12 |
+| B/1000 tool | 3.28916 | 1.87952 | 1.87952 | 10.173% | 194.69 / 89.04 (2.19x) | 105.64 / n/a | 31.90 |
+| B/4000 plain | 2.84036 | 1.61145 | 1.61145 | 5.538% | 311.94 / 201.96 (1.54x) | 109.98 / PASS | 130.31 |
+| B/4000 tool | 3.23235 | 1.79412 | 1.79412 | 4.009% | 511.41 / 377.76 (1.35x) | 133.65 / PASS | 124.01 |
+| C/1000 tool | 2.43478 | 1.50000 | 1.40000 | 9.317% | 601.03 / 264.11 (2.28x) | 336.92 / n/a | 45.88 |
+| C/4000 tool | 2.23765 | 1.34568 | NOT MET: unfinished | n/a | n/a | n/a | n/a |
+
+Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to 30 packs). Unit 14/14, storage 30/30, conformance 18/18 and the added mixed-domain S2/collection/reopen regression pass; no completed baseline check becomes a new failure. The C/4000 supplemental run remains unfinished and explicitly NOT MET; no pass is claimed for that shape.
+
+100-dirty-session drains: protected 248.75 ms / 3 calls, ordinary 249.09 ms / 2 calls; both below one second. Target hydration 4.25 ms, 4 target packs out of 804; unrelated packs are excluded. Isolated B/100 plain identity diagnostic: 118,784 bytes, 2.90000x L2. Completed production rows have 26 cold misses and 26 warm hits in the explicit probes; cold validation spans 19.50–1636.28 ms. Internal scoped probe counters: {'rt.memo.hit': 26, 'rt.memo.miss': 26}. Estimated probe memo charge spans 1,047,126–65,150,820 bytes across both engines. Peak reported process RSS through completed cases 1767.94 MiB. These are probe counters/estimated charge and process RSS, not whole-run counters or allocator heap. Keep 128 MiB per engine unchanged.
+
+**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. The final v0.10.0 tag pin remains pending; the owner-authorized interim SHA is still versioned 0.9.0. All Owner Decisions below remain verbatim.
 
 ## Risks / Trade-offs
 

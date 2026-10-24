@@ -10,7 +10,7 @@ use forge_agent_host::AGENT_RUNTIME_REVISION;
 
 #[tokio::test]
 async fn engine_release_contract() {
-    const RELEASE_SHA: &str = "8c19be5b226c2fdaeb6708ec5d39e91c235857a5";
+    const RELEASE_SHA: &str = "b0a8c90e96ccb85e4642a119117a8fd5d3a06993";
     assert_eq!(AGENT_RUNTIME_REVISION, RELEASE_SHA);
     let mut packages = 0;
     let mut testkit = false;

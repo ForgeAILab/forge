@@ -126,6 +126,7 @@ impl ForgeJournalStorage {
         release: &[JournalObjectId],
         retired_collection: bool,
         staged: &mut Staged,
+        allowed: Option<&BTreeSet<i64>>,
     ) -> Result<(JournalApplyReceipt, BTreeSet<i64>), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("release.release_objects", 0);
@@ -161,6 +162,9 @@ impl ForgeJournalStorage {
         let empty = views.iter().all(|v| v.bitmap.iter().all(|b| *b == 0));
         let mut purge = BTreeSet::new();
         for view in &*views {
+            if allowed.is_some_and(|packs| !packs.contains(&view.index.key.id)) {
+                continue;
+            }
             if !retired_collection && !empty && !touched.contains(&view.index.key.id) {
                 continue;
             }
