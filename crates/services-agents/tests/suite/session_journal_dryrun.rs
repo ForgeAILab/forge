@@ -400,6 +400,71 @@ async fn dry_run_converts_pre_topic_main_chat_lcm() {
 }
 
 #[tokio::test]
+async fn dry_run_entrypoint_converts_shared_pre_topic_main_chat() {
+    use agent_runtime::core::ids::SessionId;
+    use forge_agent_host::test_support::{FileDb, LegacyLcmFixture};
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let secret = b"synthetic-shared-pre-topic-chat-secret";
+    let store = SqliteProtectedRuntimeStore::new(db.clone(), Sha256::digest(secret).into(), 1);
+    let id = SessionId::new("dryrun-shared-pre-topic-main");
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_chat(&f, &store, &id).await;
+    let before: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    std::fs::write(f.directory().join("jwt_secret.bin"), secret).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "session_journal_dryrun::journal_real_data_dry_run",
+            "--nocapture",
+        ])
+        .env("FORGE_JOURNAL_DRYRUN_DB", f.directory().join("journal.db"))
+        .env(
+            "FORGE_JOURNAL_DRYRUN_SECRET_FILE",
+            f.directory().join("jwt_secret.bin"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let summary = stdout
+        .lines()
+        .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .expect(&stdout);
+    assert_eq!(summary["converted"], 1);
+    assert_eq!(summary["skipped"]["retirement_policy"], 1);
+    assert_eq!(summary["skipped"]["active"], 0);
+    assert_eq!(summary["parked_by_reason"], serde_json::json!({}));
+    assert_eq!(summary["parked_sessions"], serde_json::json!([]));
+    assert_eq!(summary["remaining"], 0);
+    let after: Vec<(String,String,String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+        .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(after, before);
+    let rows: (String, i64, i64, i64, i64) = sqlx::query_as("SELECT runtime_session_id,revision,(SELECT COUNT(*) FROM agent_lcm_entry),(SELECT COUNT(*) FROM agent_lcm_operation),(SELECT COUNT(*) FROM agent_lcm_timeline) FROM agent_lcm_timeline WHERE id=?")
+        .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(rows, (id.to_string(), 131, 114, 121, 1));
+    let superseded: (String, Option<String>) = sqlx::query_as(
+        "SELECT status,replaced_by_session_id FROM agent_session WHERE runtime_session_id=?",
+    )
+    .bind(older.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        superseded,
+        ("replaced".into(), Some(format!("journal-fixture:{id}")))
+    );
+    assert!(!stdout.contains(std::str::from_utf8(secret).unwrap()));
+    assert!(!stdout.contains("Synthetic historical message"));
+    println!("{summary}");
+}
+
+#[tokio::test]
 async fn dry_run_facts_use_read_only_queries_without_native_state() {
     use forge_agent_host::test_support::FileDb;
     let fixture = FileDb::new().await.unwrap();

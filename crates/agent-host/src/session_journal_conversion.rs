@@ -31,7 +31,7 @@ pub(crate) struct ConversionAdmission {
     failure: Mutex<Option<RuntimeError>>,
 }
 impl ConversionAdmission {
-    fn session(&self, id: &SessionId) -> Result<Arc<RwLock<()>>, RuntimeError> {
+    pub(crate) fn session(&self, id: &SessionId) -> Result<Arc<RwLock<()>>, RuntimeError> {
         let mut entries = self
             .sessions
             .lock()
@@ -245,14 +245,14 @@ impl Provider for ConversionProvider {
 }
 
 #[derive(Default)]
-struct WriterChecks(
-    Vec<(
+pub(crate) struct WriterChecks(
+    pub(crate)  Vec<(
         JournalEngine<crate::session_journal::ForgeJournalStorage>,
         JournalLease,
     )>,
 );
 impl WriterChecks {
-    async fn close(&mut self) -> Result<(), RuntimeError> {
+    pub(crate) async fn close(&mut self) -> Result<(), RuntimeError> {
         while let Some((engine, lease)) = self.0.pop() {
             engine.close(lease).await?;
         }

@@ -59,6 +59,73 @@ impl LegacyLcmFixture {
         session: &SessionId,
         snapshot_has_lcm: bool,
     ) -> Self {
+        Self::seed_history(fixture, store, session, snapshot_has_lcm, 120).await
+    }
+
+    /// A pre-topic Main Chat shared by two unlinked suspended runtimes. The
+    /// older runtime owns the timeline, but the newer runtime last wrote it.
+    pub async fn shared_pre_topic_chat(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+    ) -> (Self, SessionId) {
+        let newer = fixture.ensure_session(session).await.unwrap();
+        let older_runtime = SessionId::new(format!("{}:older", session.as_str()));
+        let older = fixture.ensure_session(&older_runtime).await.unwrap();
+        let db = fixture.database();
+        let chat = format!("chat:{}", session.as_str());
+        sqlx::query("INSERT INTO user (id,email,password_hash,created_at,updated_at) VALUES (?1,?1,'hash','c','u')")
+            .bind(format!("owner:{}", session.as_str())).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO agent_chat (id,kind,account_id,status,created_at,updated_at) VALUES (?,'account_main',?,'ready','c','u')")
+            .bind(&chat).bind(format!("owner:{}", session.as_str())).execute(db.pool()).await.unwrap();
+        sqlx::query("UPDATE agent_context_scope SET scope_type='agent_chat',scope_id=? WHERE id='journal-scope'")
+            .bind(&chat).execute(db.pool()).await.unwrap();
+        for (id, created) in [
+            (&older, "2026-09-23T02:09:00Z"),
+            (&newer, "2026-09-24T08:34:00Z"),
+        ] {
+            sqlx::query("UPDATE agent_session SET created_at=?,updated_at=? WHERE id=?")
+                .bind(created)
+                .bind(created)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let old = Self::seed_history(fixture, store, session, false, 114).await;
+        // V149 leaves runtime owners NULL. This is the later, observed owner
+        // assignment, after the older runtime opened the migrated timeline.
+        sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=?,created_at='2026-09-17T00:00:00Z',updated_at='2026-09-24T08:37:00Z' WHERE id=?")
+            .bind(older_runtime.as_str()).bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runtime_lcm_binding(runtime_session_id,timeline_id) VALUES (?,?)",
+        )
+        .bind(older_runtime.as_str())
+        .bind(&old.timeline_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut older_snapshot = old.snapshot.clone();
+        older_snapshot.id = older_runtime.clone();
+        store
+            .seed_legacy_bytes(
+                &older_runtime,
+                Some(&serde_json::to_vec(&older_snapshot).unwrap()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        (old, older_runtime)
+    }
+
+    async fn seed_history(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+        snapshot_has_lcm: bool,
+        history_len: usize,
+    ) -> Self {
         let db = fixture.database();
         let (identity, scope_type, scope_id): (String, String, String) = sqlx::query_as(
             "SELECT s.identity_id, c.scope_type, c.scope_id FROM agent_session s
@@ -87,7 +154,7 @@ impl LegacyLcmFixture {
             .unwrap();
         let timeline_id = timeline.id.clone();
         let lcm = SqliteLcmStore::new(db.clone(), timeline);
-        let history: Vec<_> = (0..120)
+        let history: Vec<_> = (0..history_len)
             .map(|n| {
                 let text = format!(
                     "Synthetic historical message {n}. {}",
@@ -140,12 +207,53 @@ impl LegacyLcmFixture {
             })
             .collect();
         let view = lcm.view();
-        lcm.append(
-            &view,
-            LcmAppendRequest::new(LcmOperationId::new("legacy-append"), entries.clone()),
-        )
-        .await
-        .unwrap();
+        if history_len == 114 {
+            for (n, entry) in entries.iter().enumerate() {
+                lcm.append(
+                    &view,
+                    LcmAppendRequest::new(
+                        LcmOperationId::new(format!("legacy-append:{n}")),
+                        vec![entry.clone()],
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            for n in 0..6 {
+                let start = 106 + n;
+                // Ten historical tail truncations plus six re-appends produce
+                // revision 131 with 121 operations and 114 retained entries.
+                if n < 4 {
+                    db.truncate_lcm_entries_from(
+                        &timeline_id,
+                        start as i64 + 1,
+                        &db::now_rfc3339(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                db.truncate_lcm_entries_from(&timeline_id, start as i64, &db::now_rfc3339(), None)
+                    .await
+                    .unwrap();
+                lcm.append(
+                    &view,
+                    LcmAppendRequest::new(
+                        LcmOperationId::new(format!("legacy-reappend:{n}")),
+                        entries[start..].to_vec(),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        } else {
+            lcm.append(
+                &view,
+                LcmAppendRequest::new(LcmOperationId::new("legacy-append"), entries.clone()),
+            )
+            .await
+            .unwrap();
+        }
         let policy = RegistryRevision::from_content("forge-lcm-pressure-3");
         let algorithm = RegistryRevision::from_content("agent-runtime-lcm-1");
         let sizer = RegistryRevision::from_content("forge-lcm-sizer-1");

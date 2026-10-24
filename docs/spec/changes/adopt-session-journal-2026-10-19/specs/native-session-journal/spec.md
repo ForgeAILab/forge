@@ -195,6 +195,14 @@ The additive migration SHALL preserve existing data and leave protected_agent_se
 - **THEN** retry may rebind to the session's own persisted timeline only while the replacement is unclaimed, revision zero, contains no entries, nodes or operations, and neither native domain has published or retired
 - **AND** the binding repair checks those conditions in one write transaction, preserves the original timeline and legacy payloads, and leaves a populated or differently owned binding in conflict
 
+#### Scenario: Shared pre-topic Chat timeline owned by a superseded sibling
+- **WHEN** the Chat's resume target references a shared pre-topic timeline owned by an older, unlinked suspended native sibling of the same identity, context scope and Profile
+- **AND** the timeline predates the target and was updated after its creation, neither runtime has published or retired native state, and no claim, lease, topic/rotation, competing resumable session or additional reference makes ownership ambiguous
+- **THEN** conversion and lazy resume transfer the original timeline's runtime ownership and binding to the resume target in the same immediate transaction
+- **AND** that transaction marks the older session replaced by the target with its version fence, preserving its legacy payload and making it retire-eligible even after the target activates
+- **AND** no timeline, entry, node or operation is duplicated or discarded; retries are idempotent and a failed binding write rolls back the whole transfer
+- **AND** an active owner, another resumable Profile or tied newest session, native publication/retirement, or additional ownership evidence keeps the target parked with a precise Conflict reason
+
 #### Scenario: Transient LCM binding failure
 - **WHEN** LCM binding encounters a retryable database failure, including SQLite BUSY/LOCKED primary or extended codes
 - **THEN** conversion leaves the session eligible for a later sweep of the same worker and excludes it from parked conflicts

@@ -42,6 +42,9 @@ mod legacy_test_support;
 #[path = "session_probe.rs"]
 mod session_probe;
 
+#[path = "lcm_legacy_owner.rs"]
+mod lcm_legacy_owner;
+
 fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
     serde_json::from_slice(bytes).map_err(|_| {
         RuntimeError::new(
@@ -670,7 +673,9 @@ impl SqliteProtectedRuntimeStore {
     /// transaction, so no other runtime session can resolve to it afterwards.
     /// An empty, unclaimed non-Chat timeline may continue across runtimes.
     /// Without a persisted reference, other sessions get a fresh timeline;
-    /// unavailable or differently owned references fail closed.
+    /// A shared pre-topic Chat timeline may move from an inactive, superseded
+    /// legacy sibling to the session Chat resume selects. Ownership, binding,
+    /// and supersession change in one transaction; ambiguous references fail closed.
     pub async fn lcm_store_for_runtime_session(
         &self,
         runtime_id: &str,
@@ -784,6 +789,12 @@ impl SqliteProtectedRuntimeStore {
         } else {
             self.referenced_lcm_timeline(runtime_id, flags).await?
         };
+        let sibling_admission = if flags.legacy_eligible {
+            self.prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref())
+                .await?
+        } else {
+            None
+        };
         let mut tx = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.BEGIN_IMMEDIATE", 0);
@@ -833,6 +844,17 @@ impl SqliteProtectedRuntimeStore {
         } else {
             false
         };
+        if flags.legacy_eligible && (existing.is_none() || repair_empty) {
+            if let Some(timeline) = referenced.as_deref() {
+                self.transfer_legacy_chat_lcm_owner(
+                    &mut tx,
+                    runtime_id,
+                    timeline,
+                    sibling_admission.as_ref(),
+                )
+                .await?
+            }
+        }
         let timeline_id = if let Some(id) = existing.filter(|_| !repair_empty) {
             id
         } else {
@@ -940,6 +962,9 @@ impl SqliteProtectedRuntimeStore {
             tx.commit().await
         }
         .map_err(|error| protected_database_error(error).retryable())?;
+        if let Some(admission) = sibling_admission {
+            admission.close().await.map_err(RuntimeError::retryable)?;
+        }
         let timeline = db::AgentLcmRepo::get_lcm_timeline(&*self.db, &timeline_id)
             .await
             .map_err(protected_database_error)?

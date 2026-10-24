@@ -2513,7 +2513,30 @@ Both background conversion and lazy resume use this resolver. An earlier failed
 attempt's empty replacement binding can be repaired only before either native
 domain publishes or retires, while the replacement is unclaimed, revision zero,
 and has no entries, nodes or operations. The check and binding replacement share
-one write transaction. A populated or differently owned binding is a conflict.
+one write transaction. A populated replacement binding is a conflict.
+
+Pre-V149 Agent Chat timelines were shared by successive runtimes of the same
+chat. V149 backfills canonical scope and retirement metadata but leaves runtime
+ownership NULL; a subsequent open can assign a shared timeline to an older
+sibling. Chat resolution prefers the active session, otherwise the newest
+unreplaced suspended native session for the same identity, context scope and
+Profile. Conversion and lazy resume can transfer a referenced pre-topic timeline
+to that resume target when its current owner is an older suspended sibling of
+the same Profile. The timeline must predate the target and have been written
+after its creation. Neither runtime may have published or retired a native
+journal; claims, leases, topic/rotation references, other runtime bindings,
+other resumable sessions and additional legacy sibling references prevent
+transfer with a specific Conflict reason. Other siblings' native state also
+prevents transfer when exclusive legacy ownership cannot be established.
+The resolver holds exclusive admission and both journal writer leases for the
+old owner, including unpublished reservations with no pin row, and checks these
+conditions in its immediate write transaction. That transaction moves the
+timeline's runtime owner and binding and marks the older session replaced by
+the resume target, using its version fence. This makes the older session
+retire-eligible even after the target becomes active. It neither copies the
+timeline nor rewrites either legacy payload; failed binding writes roll back
+all three changes and retries reuse the transferred timeline.
+
 Older tuning revisions and NULL/stale Forge policy markers do not discard LCM:
 the runtime validates identity, binding and frontier before exact import, then
 rebuilds tuning metadata on live resume. Legacy payloads and chat transcripts

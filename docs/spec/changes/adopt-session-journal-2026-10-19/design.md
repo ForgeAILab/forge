@@ -767,8 +767,21 @@ It adopts only the referenced timeline for the same identity/scope and owner.
 An earlier failed snapshot-only lookup may have persisted an empty replacement
 binding. Before publication or retirement, the resolver may repair that binding
 in one transaction only if its replacement is unclaimed, revision zero, and has
-no entries, nodes or operations. A populated or differently owned binding stays
-in conflict. Both conversion and lazy resume retain the old LCM extension for
+no entries, nodes or operations. A populated replacement stays in conflict.
+For a shared pre-V149 Chat timeline owned by an older, unlinked suspended
+sibling, conversion and lazy resume may transfer ownership to the session
+the Chat actually resumes: active first, otherwise newest suspended native
+session per identity/context scope/Profile. The owner must be an older
+same-Profile legacy sibling, the timeline must predate and have been updated
+after the target's creation, and neither runtime may have published or retired
+native state. Claims, leases, topics/rotations, competing resumable sessions,
+other bindings, additional legacy references, or another sibling's native state
+leave a precise Conflict. The same immediate transaction moves runtime ownership
+and binding and marks the older session replaced by the target with its version
+fence, preserving its legacy row and making it retire-eligible after foreground
+activation. The original timeline, entries, nodes and operations are retained.
+V149 is unchanged; it backfills scope/retirement metadata, not runtime ownership.
+Both conversion and lazy resume retain the old LCM extension for
 runtime identity/binding/frontier validation and exact import; the live runtime
 rebuilds changed tuning metadata. Stale/NULL Forge policy markers do not justify
 discarding identity evidence or rewriting legacy payloads.

@@ -1031,6 +1031,14 @@ its bounded sweep limit. Foreground lazy import
 remains available after repair. The generated-database regression invokes this
 same ignored entrypoint; it is not evidence from user data.
 
+`session_journal_dryrun::dry_run_entrypoint_converts_shared_pre_topic_main_chat`
+also invokes that entrypoint on a generated Main Chat database with two unlinked
+suspended sessions. The newer session's revision-6 checkpoint references the
+older session's timeline (revision 131, 114 entries, 121 operations), last written
+after the newer session was created. It verifies one conversion, one superseded
+legacy owner skipped by retirement policy, no parked sessions, unchanged legacy
+ciphertext and all LCM rows retained in the original timeline.
+
 The conversion report also retains at most 32 `parked_sessions` per pass, with
 the Forge/runtime session IDs, owner scope kind, error kind and runtime error
 message (at most 1,024 characters; no error metadata or session content).

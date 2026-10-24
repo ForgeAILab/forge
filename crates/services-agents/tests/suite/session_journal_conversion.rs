@@ -130,6 +130,112 @@ impl CheckpointStore for NativeOnly {
 }
 
 #[tokio::test]
+async fn shared_pre_topic_chat_converts_resume_target_and_supersedes_owner() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    use services_agents::session_journal_retention::SessionJournalRetention;
+    let (f, store, worker) = fixture().await;
+    let id = SessionId::new("shared-pre-topic-worker");
+    let (old, older) = LegacyLcmFixture::shared_pre_topic_chat(&f, &store, &id).await;
+    let older_id = f.ensure_session(&older).await.unwrap();
+    let target = f.ensure_session(&id).await.unwrap();
+    let retention = SessionJournalRetention::new(f.database(), &store);
+    assert!(retention.should_retire(&older_id).await.unwrap());
+    assert!(!retention.should_retire(&target).await.unwrap());
+    let before = legacy(&f, &older).await;
+    let mut cursor = ConversionCursor::default();
+    let report = worker
+        .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(report.converted, 1);
+    assert_eq!(report.skipped_retired, 1);
+    assert!(report.parked_sessions.is_empty());
+    assert_eq!(report.remaining, 0);
+    assert_eq!(publication_count(&f, &id).await, 2);
+    assert_eq!(publication_count(&f, &older).await, 0);
+    assert_eq!(legacy(&f, &older).await, before);
+    let timeline: (String, i64, i64, i64) = sqlx::query_as("SELECT runtime_session_id,revision,(SELECT COUNT(*) FROM agent_lcm_entry),(SELECT COUNT(*) FROM agent_lcm_operation) FROM agent_lcm_timeline WHERE id=?")
+        .bind(&old.timeline_id).fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(timeline, (id.to_string(), 131, 114, 121));
+    sqlx::query("UPDATE agent_session SET status='ready',version=version+1 WHERE id=?")
+        .bind(&target)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    assert!(retention.should_retire(&older_id).await.unwrap());
+    assert!(!retention.should_retire(&target).await.unwrap());
+    let retry = worker
+        .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(retry.converted, 0);
+    assert_eq!(retry.remaining, 0);
+    assert!(retry.parked_sessions.is_empty());
+}
+
+#[tokio::test]
+async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for (case, reason) in [
+        ("active", "LCM sibling owner is active"),
+        (
+            "profile",
+            "LCM sibling owner remains resumable for another profile",
+        ),
+        (
+            "tie",
+            "LCM chat ownership is ambiguous: suspended sessions have the same creation time",
+        ),
+    ] {
+        let (f, store, worker) = fixture().await;
+        let id = SessionId::new(format!("park-shared-{case}"));
+        let (old, older) = LegacyLcmFixture::shared_pre_topic_chat(&f, &store, &id).await;
+        let db = f.database();
+        match case {
+            "active" => {
+                sqlx::query("UPDATE agent_session SET status='ready' WHERE runtime_session_id=?")
+                    .bind(older.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            "profile" => {
+                sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('other-profile','journal-agent','native','embedded','c','u')")
+                    .execute(db.pool()).await.unwrap();
+                sqlx::query("UPDATE agent_session SET profile_id='other-profile' WHERE runtime_session_id=?")
+                    .bind(older.as_str()).execute(db.pool()).await.unwrap();
+            }
+            "tie" => {
+                sqlx::query("UPDATE agent_session SET created_at='2026-09-24T08:34:00Z' WHERE runtime_session_id=?")
+                    .bind(older.as_str()).execute(db.pool()).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = legacy(&f, &id).await;
+        let report = worker
+            .convert_with_budget_for_test(&mut ConversionCursor::default(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let parked = report
+            .parked_sessions
+            .iter()
+            .find(|s| s.runtime_session_id == id.as_str())
+            .expect(case);
+        assert_eq!(parked.error_kind, "Conflict", "{case}");
+        assert_eq!(parked.error_message, reason, "{case}");
+        assert_eq!(publication_count(&f, &id).await, 0, "{case}");
+        assert_eq!(legacy(&f, &id).await, before, "{case}");
+        let owner: String =
+            sqlx::query_scalar("SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?")
+                .bind(&old.timeline_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(owner, older.as_str(), "{case}");
+    }
+}
+
+#[tokio::test]
 async fn background_converts_dormant_next_open_native_only() {
     let (f, store, worker) = fixture().await;
     let id = seed(&f, &store, "dormant").await;
