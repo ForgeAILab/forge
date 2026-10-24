@@ -3,7 +3,7 @@ use super::{
     cache::{PackKey, Scope},
     codec, corrupt,
     seal::Unit,
-    storage::{ForgeJournalStorage, PackView, Staged, bit, database_error, prefix},
+    storage::{DecodedBodies, ForgeJournalStorage, PackView, Staged, bit, database_error, prefix},
 };
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use sqlx::SqliteConnection;
@@ -144,6 +144,7 @@ impl ForgeJournalStorage {
         retired_collection: bool,
         staged: &mut Staged,
         allowed: Option<&BTreeSet<i64>>,
+        mut decoded: Option<&mut DecodedBodies>,
     ) -> Result<(JournalApplyReceipt, BTreeSet<i64>), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("release.release_objects", 0);
@@ -158,7 +159,12 @@ impl ForgeJournalStorage {
             })
             .map(|v| v.index.key.id)
             .collect();
-        let bodies = self.bodies(conn, views, &wanted, false).await?;
+        let bodies = if let Some(decoded) = decoded.as_deref_mut() {
+            self.collection_bodies(conn, views, &wanted, decoded, staged)
+                .await?
+        } else {
+            self.bodies(conn, views, &wanted, false).await?
+        };
         let mut touched = BTreeSet::new();
         for view in &mut *views {
             if let Some(objects) = bodies.get(&view.index.key.id) {
@@ -203,11 +209,17 @@ impl ForgeJournalStorage {
                 purge.insert(view.index.key.id);
             }
         }
-        // Decode/authenticate even all-dead packs before physical removal. Only
-        // the separate post-deletion orphan cleanup may bypass body decryption.
+        // Decode even all-dead packs before physical removal, from the
+        // pack-key-validated cache or by authenticated decrypt. Only the separate
+        // post-deletion orphan cleanup may bypass body decoding.
         let missing = purge.difference(&wanted).copied().collect();
         let mut bodies = bodies;
-        bodies.extend(self.bodies(conn, views, &missing, false).await?);
+        bodies.extend(if let Some(decoded) = decoded {
+            self.collection_bodies(conn, views, &missing, decoded, staged)
+                .await?
+        } else {
+            self.bodies(conn, views, &missing, false).await?
+        });
         let mut receipt = JournalApplyReceipt::default();
         let mut survivors = BTreeSet::new();
         for view in views.iter().filter(|v| purge.contains(&v.index.key.id)) {

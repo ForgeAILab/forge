@@ -3974,6 +3974,85 @@ async fn bounded_collection_split_and_atomic_apply() {
 }
 
 #[tokio::test]
+async fn collection_apply_decrypts_each_pack_once_under_lock() {
+    check_collection_apply_decrypts_under_lock(false).await;
+}
+
+#[tokio::test]
+async fn collection_apply_uses_warm_cache_without_in_lock_decrypts() {
+    check_collection_apply_decrypts_under_lock(true).await;
+}
+
+async fn check_collection_apply_decrypts_under_lock(warm: bool) {
+    for released in [8, 2] {
+        let f = FileDb::new().await.unwrap();
+        let raw = storage(&f).await;
+        if !warm {
+            raw.set_cache_budget(0).unwrap();
+        }
+        let d = domain(JournalRole::Protected);
+        let s = SessionId::new("collection-decrypt-once");
+        let first = equal_objects("decode-first", 8);
+        MappingStorage::new(raw.clone(), f.clone())
+            .apply(write(&d, s.as_str(), first.clone()))
+            .await
+            .unwrap();
+        add_objects(&raw, &d, &s, equal_objects("decode-second", 8)).await;
+        add_objects(&raw, &d, &s, equal_objects("decode-third", 8)).await;
+        for revision in [8, 9] {
+            let mut w = edit(&raw, &d, &s).await;
+            w.operation = Some(model_operation(
+                &d,
+                &s,
+                &format!("decode-op-{revision}"),
+                revision,
+                11,
+                revision,
+            ));
+            raw.apply(w).await.unwrap();
+        }
+        let packs = session_pack_ids(&f, &s).await;
+        assert_eq!(packs.len(), 3);
+        let tiers: Vec<_> = operation_rows(&f, &d, &s).await.into_keys().collect();
+        assert_eq!(tiers.len(), 2);
+        let mut w = edit(&raw, &d, &s).await;
+        w.kind = JournalWriteKind::Collect;
+        w.release = first.iter().take(released).map(|o| o.id.clone()).collect();
+        w.prune_operations_before = Some(JournalRevision(10));
+        let plan = JournalCollectionPlan {
+            write: w,
+            max_units: 32,
+        };
+        assert!(matches!(
+            raw.prepare_collection_apply(&plan).await.unwrap(),
+            JournalCollectionPreflight::Fits { .. }
+        ));
+        if warm {
+            assert_eq!(raw.cached_body_packs(&s).unwrap().len(), packs.len());
+        }
+        raw.reset_decrypt_counts_for_test();
+        let receipt = raw.apply_collection(plan).await.unwrap();
+        assert_eq!(receipt.rewritten_units, 4);
+        assert_eq!(receipt.receipt.reclaimed_objects, released as u64);
+        let bodies: Vec<_> = packs
+            .iter()
+            .map(|&id| raw.decrypt_count_for_test(&s, TestSealedUnit::PackBody(id)))
+            .collect();
+        let operations: Vec<_> = tiers
+            .iter()
+            .map(|&tier| raw.decrypt_count_for_test(&s, TestSealedUnit::Operations(tier)))
+            .collect();
+        eprintln!("in-lock body decrypts={bodies:?}, operation decrypts={operations:?}");
+        if warm {
+            assert_eq!(bodies, vec![0, 0, 0]);
+        } else {
+            assert_eq!(bodies, vec![1, 1, 1]);
+        }
+        assert_eq!(operations, vec![1, 1]);
+    }
+}
+
+#[tokio::test]
 async fn bounded_collection_upgrades_sealed_pin_order() {
     let f = FileDb::new().await.unwrap();
     let raw = storage(&f).await;
@@ -4482,6 +4561,95 @@ async fn bounded_empty_domain_forces_deferred_purge_without_retirement() {
         );
     }
     assert_eq!(reclaimed, 2);
+}
+
+#[tokio::test]
+async fn deferred_forced_purge_dirty_hint_survives_engine_write() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let p = domain(JournalRole::Protected);
+    let o = domain(JournalRole::Ordinary);
+    let s = SessionId::new("dirty-hint-survives");
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    let mut empty = write(&p, s.as_str(), vec![]);
+    empty.record.head = None;
+    empty.pins.clear();
+    empty.catalog.clear();
+    empty.operation = None;
+    mapped.apply(empty).await.unwrap();
+    let first = equal_objects("dirty-first", 8);
+    let second = equal_objects("dirty-second", 8);
+    mapped
+        .apply(write(&o, s.as_str(), first.clone()))
+        .await
+        .unwrap();
+    add_objects(&raw, &o, &s, second.clone()).await;
+    for object in [&first[0], &second[0]] {
+        let mut w = edit(&raw, &o, &s).await;
+        w.release = vec![object.id.clone()];
+        assert_eq!(raw.apply(w).await.unwrap(), JournalApplyReceipt::default());
+    }
+    let collect = |mut w: JournalWrite| {
+        w.kind = JournalWriteKind::Collect;
+        w.record.collection_dirty = false;
+        JournalCollectionPlan {
+            write: w,
+            max_units: 1,
+        }
+    };
+    let receipt = raw
+        .apply_collection(collect(edit(&raw, &p, &s).await))
+        .await
+        .unwrap();
+    assert_eq!(receipt.receipt.reclaimed_objects, 1);
+    assert!(raw.load(&p, &s).await.unwrap().unwrap().collection_dirty);
+    let mut later = edit(&raw, &p, &s).await;
+    assert!(raw.members(&p, &s).await.unwrap().is_empty());
+    assert!(later.record.retirement.is_none());
+    assert!(later.record.head.is_none());
+    assert!(raw.pins(&p, &s).await.unwrap().is_empty());
+    // An admission without a retained root stops this write from forcing an
+    // empty-bitmap purge. The engine still has no live roots in this domain.
+    let unrooted = object("unrooted later admission");
+    later.objects.objects = vec![unrooted.clone()];
+    later.record.collection_dirty = false;
+    raw.apply(later).await.unwrap();
+    assert_eq!(
+        raw.dirty_sessions(&p, None, 10).await.unwrap(),
+        vec![s.clone()],
+        "a later empty-domain write must preserve the unserviced purge hint"
+    );
+    let cold = reopen(&f).await;
+    assert_eq!(
+        cold.dirty_sessions(&p, None, 10).await.unwrap(),
+        vec![s.clone()]
+    );
+    let mut next = collect(edit(&cold, &p, &s).await);
+    next.max_units = 2;
+    next.write.release = vec![unrooted.id];
+    let receipt = cold.apply_collection(next).await.unwrap();
+    assert_eq!(receipt.receipt.reclaimed_objects, 2);
+    assert_eq!(
+        receipt.receipt.reclaimed_bytes,
+        (second[0].bytes.len() + unrooted.bytes.len()) as u64
+    );
+    assert!(cold.dirty_sessions(&p, None, 10).await.unwrap().is_empty());
+    let kept: Vec<_> = first
+        .iter()
+        .skip(1)
+        .chain(second.iter().skip(1))
+        .cloned()
+        .collect();
+    let members = cold.members(&o, &s).await.unwrap();
+    assert_eq!(members.len(), kept.len());
+    assert!(
+        cold.objects(&o, &s, &members)
+            .await
+            .unwrap()
+            .iter()
+            .all(Option::is_some)
+    );
 }
 
 #[tokio::test]

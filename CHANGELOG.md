@@ -100,6 +100,12 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Session-journal retention no longer lets a backlog of protected sessions starve
+  ordinary collection, orphan cleanup and retirement: protected work takes at most
+  16 of the 32 calls in a pass and resumes where it stopped.
+- Bounded journal collection decrypts each pack at most once under the write lock
+  (warm packs come from the cache), always fits operation pruning into the
+  remaining work units, and keeps a deferred purge hint until the purge is done.
 - Convert pre-topic Main Chats across profile switches by assigning shared LCM history to the selected profile and rebuilding relinquished LCM state when an older profile resumes.
 - Native Task context manifests use the host session matching the final runtime
   output after retirement rotation, including reviewer corrections. Retired-open

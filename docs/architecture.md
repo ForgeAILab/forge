@@ -2625,7 +2625,17 @@ refusals, collection receipts, readable retained/live/deferred bytes, omitted
 session counts and deletion counts. Collect-call duration is a conservative
 gate-hold upper bound including gate wait; the 10-second budget bounds scheduling,
 not the engine's individual gate hold. Collection refreshes the root epoch on
-each continuation and makes at most 32 calls per pass. Byte diagnostics sample
+each continuation and makes at most 32 collection calls per pass. Protected
+collection receives at most 16 calls, then yields to Ordinary without discarding
+its runtime continuation. Ordinary can use the remaining calls, including any
+Protected did not use. If Ordinary rewrites or deletes packs while Protected is
+mid-session, the session-wide layout generation invalidates Protected's member
+continuation. The engine restarts that mark; after its per-mark restart bound,
+it skips the session and keeps it dirty for a later sweep. This can defer
+Protected collection but has no effect on journal data. Orphan cleanup still
+runs when the collection call budget
+is exhausted. Within the scheduling deadline, a pass resuming in collection
+also completes its retirement phase before returning. Byte diagnostics sample
 the ordinary domain at most once per pass only when `forge_session_journal`
 debug logging is enabled; its domain-scoped values are not whole-database totals.
 A retire-phase error advances to collection and orphan cleanup in that same
@@ -2637,6 +2647,10 @@ below `max(current_revision - 64, 0)`, preserving every operation at or above
 that floor plus the current writer epoch's last operation, even below the floor.
 The engine selects pruning; storage never prunes without its directive. Replaying
 a pruned operation conflicts instead of applying it again.
+Bounded collection prunes only as many operation segments as fit after the
+release packs, keeping the session dirty for remaining segments. A single
+release therefore makes progress even when the operation inventory alone
+exceeds the 32-unit apply limit.
 
 Session deletion immediately cascades journal records, pins, catalog,
 operation packs and memberships. Project/Task scopes and physical Agent deletion
@@ -3231,7 +3245,7 @@ faults also enter `recent_errors` and raise Operations severity to `attention`.
 | `workspace-cleanup` | Independent immediate 60-second cleanup and 10-minute terminal sweep Skip intervals | 1 hour / cancel |
 | `storage-maintenance` | Immediate 5-second Skip interval, same 100-page incremental vacuum; Task step retention on the first tick and hourly after | 5 minutes / cancel |
 | `session-journal-conversion` | Immediate pass, 60-second Skip interval | 2-second scheduling budget / warn and await; eight candidates, one import at a time, yield, keyset cursor and durable publication progress |
-| `session-journal-retention` | Immediate pass, 60-second Skip interval and shared pool domain-event/terminal/deletion activity Notify with a fixed one-second debounce | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 calls per pass, resumable retirement/collection/cleanup cursors |
+| `session-journal-retention` | Immediate pass, 60-second Skip interval and shared pool domain-event/terminal/deletion activity Notify with a fixed one-second debounce | 10-second scheduling budget / warn and await; 20,000 releases per bounded engine collect, 250 ms soft work target, at most 32 collection calls per pass (Protected at most 16; Ordinary receives unused calls), cleanup after the call cap, resumable retirement/collection/cleanup cursors |
 | `daemon-monitor` | Immediate check, then 30 seconds after each pass; stop Notify | 5 minutes / cancel |
 | `embedded-daemon` | Immediate CLI scan/report, then 60 seconds after each pass; stop Notify; server and Solo | 5 minutes / cancel |
 | `shared-media-cleanup` | One startup pass, then create 60-second Burst interval and consume initial tick | 5 minutes / cancel |
@@ -8555,13 +8569,39 @@ Preflight is read-only. It counts touched input packs, forced deferred purges,
 bounded base-repack inputs and changed operation segments, at most 32 physical
 units of 1 MiB each. Apply repeats planning under BEGIN IMMEDIATE and commits
 all selected releases and metadata atomically, or changes nothing. Merge outputs
-are the transformation of their charged input packs. Deferred forced purges
-retain the durable dirty hint until a later bounded apply finishes them. Engine
+are the transformation of their charged input packs. Planning carries decoded
+bodies and operation segments into mutation within that same write transaction;
+reuse verifies the exact row identity, owner, generation, ciphertext digest,
+format and key revision. SHA-256 digests cover the length-delimited ciphertext
+and nonce fields, so carried inputs do not retain ciphertext copies alongside
+plaintext. The first body lookup uses the shared cache after checking the pack
+key against the current row. Each input pack is decrypted at most once under
+the lock, and freshly written purge outputs can be repacked directly from their
+staged bodies.
+Preflight returns only a unit estimate and discards its plaintext: its separate
+read transaction cannot supply a write-transaction snapshot across intervening
+writers. A zero-unit collection cap returns a split preflight result and apply
+rejects it without changes. Deferred forced purges retain the durable dirty hint
+across later clean engine writes, including empty non-retired domains. The hint
+clears when collection services the remaining physical work, or when the domain
+regains a live member and collection finds no remaining forced work. In the
+latter case, a pre-existing gap leaves the dead bytes in place until a later
+release touches that pack and passes the 25% dead-byte threshold, or the domain
+empties or retires.
+The pinned engine marks every non-Collect write dirty; preserving a hint across
+a clean non-Collect write hardens the storage contract. Engine
 reports may now name incomplete live membership as unreadable; the existing
 capped warning tracker and per-pass diagnostics preserve those sessions too.
-The retention worker refreshes the root epoch for each continuation and keeps
-its domain phase while `has_more`, within its ten-second deadline and a 32-call
-cap. Background conversion retains its separate eight-candidate/two-second
+The retention worker refreshes the root epoch for each continuation within its
+ten-second deadline and a 32-call collection cap. Protected yields after 16
+calls while preserving its continuation for the next pass; Ordinary receives
+the remaining calls, and orphan cleanup can run after the collection cap. A pass
+that resumes mid-cycle also visits retirement before it returns, within the
+scheduling deadline. Ordinary physical work on the same session can invalidate
+a mid-session Protected member continuation through the shared layout generation:
+the engine restarts, then skips with dirty kept after its per-mark restart bound,
+without a data effect.
+Background conversion retains its separate eight-candidate/two-second
 budget. Benchmark after-turn and final-shutdown drains have a 10,000-call bound,
 record every individual gate hold and refresh epochs between calls.
 

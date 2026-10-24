@@ -7,6 +7,7 @@ use super::{
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
 use async_trait::async_trait;
 use db::SqliteDb;
+use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, sqlite::SqliteRow};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,6 +17,40 @@ use std::{
 use tokio::sync::Semaphore;
 
 type Bodies = BTreeMap<i64, Arc<Vec<JournalStoredObject>>>;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SealedInput {
+    owner: String,
+    key_revision: i64,
+    format: i64,
+    ciphertext_digest: [u8; 32],
+}
+impl SealedInput {
+    pub(super) fn read(row: &SqliteRow, columns: &[&str]) -> Result<Self, RuntimeError> {
+        let mut digest = Sha256::new();
+        for column in columns {
+            let bytes: &[u8] = row.try_get(*column).map_err(|_| corrupt())?;
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        Ok(Self {
+            owner: row.try_get("forge_session_id").map_err(|_| corrupt())?,
+            key_revision: row.try_get("key_revision").map_err(|_| corrupt())?,
+            format: row.try_get("format").map_err(|_| corrupt())?,
+            ciphertext_digest: digest.finalize().into(),
+        })
+    }
+}
+#[derive(PartialEq, Eq)]
+struct BodyInput {
+    key: PackKey,
+    sealed: SealedInput,
+}
+pub(super) struct DecodedBody {
+    input: BodyInput,
+    objects: Arc<Vec<JournalStoredObject>>,
+}
+pub(super) type DecodedBodies = BTreeMap<i64, DecodedBody>;
 
 /// Encrypted sqlx storage, independent of the runtime's journal semantics.
 /// Construct with the same master key and revision as SqliteProtectedRuntimeStore.
@@ -626,6 +661,133 @@ impl ForgeJournalStorage {
         }
         Ok(bodies)
     }
+
+    /// Transaction-local plaintext is reusable only for the same row input.
+    /// The first lookup can use the shared cache after checking the pack key.
+    pub(super) async fn collection_bodies(
+        &self,
+        conn: &mut SqliteConnection,
+        views: &[PackView],
+        wanted: &BTreeSet<i64>,
+        decoded: &mut DecodedBodies,
+        staged: &Staged,
+    ) -> Result<Bodies, RuntimeError> {
+        let mut bodies = BTreeMap::new();
+        let views: BTreeMap<_, _> = views.iter().map(|v| (v.index.key.id, v)).collect();
+        for chunk in wanted.iter().copied().collect::<Vec<_>>().chunks(400) {
+            let mut q = QueryBuilder::<Sqlite>::new(
+                "SELECT * FROM agent_session_journal_pack WHERE pack_id IN (",
+            );
+            let mut separated = q.separated(",");
+            for id in chunk {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+            let rows = q
+                .build()
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(database_error)?;
+            self.cache_lock()?.pack_queries += 1;
+            for row in rows {
+                let id: i64 = row.try_get("pack_id").map_err(|_| corrupt())?;
+                let view = views.get(&id).ok_or_else(corrupt)?;
+                let key = PackKey {
+                    id,
+                    session: SessionId::new(
+                        row.try_get::<String, _>("runtime_session_id")
+                            .map_err(|_| corrupt())?,
+                    ),
+                    owner: row.try_get("forge_session_id").map_err(|_| corrupt())?,
+                    generation: counter(&row, "generation")?,
+                    count: row
+                        .try_get::<i64, _>("object_count")
+                        .map_err(|_| corrupt())?
+                        .try_into()
+                        .map_err(|_| corrupt())?,
+                    retained: row
+                        .try_get::<i64, _>("retained_canonical_bytes")
+                        .map_err(|_| corrupt())?
+                        .try_into()
+                        .map_err(|_| corrupt())?,
+                };
+                if key != view.index.key {
+                    return Err(super::conflict());
+                }
+                let input = BodyInput {
+                    key,
+                    sealed: SealedInput::read(
+                        &row,
+                        &["body_nonce", "body_payload", "index_nonce", "index_payload"],
+                    )?,
+                };
+                if let Some(previous) = decoded.get(&id) {
+                    if !staged.written.contains_key(&id) && previous.input != input {
+                        return Err(super::conflict());
+                    }
+                }
+                self.revision(&row)?;
+                let objects = if let Some((key, objects)) = staged.written.get(&id) {
+                    if key != &input.key {
+                        return Err(super::conflict());
+                    }
+                    objects.clone()
+                } else if let Some(previous) = decoded.get(&id) {
+                    previous.objects.clone()
+                } else {
+                    let cached = self.cache_lock()?.body(&input.key);
+                    if let Some(objects) = cached {
+                        objects
+                    } else {
+                        let keys = self.keys.clone();
+                        let index = view.index.clone();
+                        let nonce: Vec<u8> = row.try_get("body_nonce").map_err(|_| corrupt())?;
+                        let payload: Vec<u8> =
+                            row.try_get("body_payload").map_err(|_| corrupt())?;
+                        let objects = self
+                            .work(move || {
+                                let key = &index.key;
+                                let raw = keys.open(
+                                    &Binding {
+                                        unit: Unit::PackBody,
+                                        domain: None,
+                                        session: &key.session,
+                                        owner: &key.owner,
+                                        row: &key.id.to_be_bytes(),
+                                        generation: key.generation,
+                                    },
+                                    &nonce,
+                                    &payload,
+                                    codec::MAX_COMPRESSED_BYTES,
+                                )?;
+                                Ok(Arc::new(codec::decode_body(&index.directory, &raw)?))
+                            })
+                            .await?;
+                        self.cache_lock()?.body_decodes += 1;
+                        objects
+                    }
+                };
+                decoded.insert(
+                    id,
+                    DecodedBody {
+                        input,
+                        objects: objects.clone(),
+                    },
+                );
+                bodies.insert(id, objects);
+            }
+        }
+        if bodies.len() != wanted.len() {
+            if wanted
+                .iter()
+                .any(|id| decoded.contains_key(id) && !bodies.contains_key(id))
+            {
+                return Err(super::conflict());
+            }
+            return Err(corrupt());
+        }
+        Ok(bodies)
+    }
     pub(super) async fn operation_on(
         &self,
         conn: &mut SqliteConnection,
@@ -1157,6 +1319,118 @@ mod error_contract_tests {
                 mapped.metadata.get("journal_database_contention").is_none(),
                 "availability failures are not routine contention"
             );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod collection_decode_tests {
+    use super::*;
+    use crate::test_support::FileDb;
+
+    #[tokio::test]
+    async fn carried_bodies_reject_changed_rows_under_the_same_lock() {
+        let f = FileDb::new().await.unwrap();
+        let storage = ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+        storage.set_repacking(false);
+        let scope = (
+            JournalDomain {
+                storage_id: JournalStorageId::new("body-input"),
+                role: JournalRole::Protected,
+            },
+            SessionId::new("body-input"),
+        );
+        f.ensure_session(&scope.1).await.unwrap();
+        let object =
+            JournalObject::encode(JournalObjectKind::JsonInline, &"authenticated body").unwrap();
+        let id = object.id.clone();
+        let mut write = JournalWrite {
+            domain: scope.0.clone(),
+            session: scope.1.clone(),
+            kind: JournalWriteKind::Commit,
+            expect: Default::default(),
+            record: JournalSessionRecord {
+                generation: 1,
+                revision: JournalRevision(0),
+                writer_epoch: 0,
+                head: None,
+                has_checkpoint: false,
+                retirement: None,
+                collection_dirty: true,
+                engine: JournalEngineState {
+                    version: u32::MAX,
+                    bytes: vec![],
+                },
+            },
+            objects: JournalObjectBatch {
+                objects: vec![JournalStoredObject {
+                    id: object.id,
+                    kind: JournalObjectKind::JsonInline,
+                    bytes: object.bytes.into(),
+                }],
+            },
+            operation: None,
+            pins: vec![],
+            catalog: vec![],
+            release: vec![],
+            prune_operations_before: None,
+            inject: None,
+        };
+        storage.apply(write.clone()).await.unwrap();
+        write.expect = write.record.fence();
+        write.record.generation += 1;
+        write.kind = JournalWriteKind::Collect;
+        write.objects = Default::default();
+        write.release = vec![id];
+        let plan = JournalCollectionPlan {
+            write,
+            max_units: 32,
+        };
+        for change in [
+            "body_nonce=zeroblob(24)",
+            "body_payload=zeroblob(length(body_payload))",
+            "index_nonce=zeroblob(24)",
+            "index_payload=zeroblob(length(index_payload))",
+            "key_revision=2",
+            "format=2",
+            "generation=X'0000000000000001'",
+            "object_count=object_count+1",
+            "retained_canonical_bytes=retained_canonical_bytes+1",
+            "delete",
+        ] {
+            let mut tx = db::begin_immediate(f.database().pool()).await.unwrap();
+            let mut work = storage
+                .collection_work(&mut tx, &plan)
+                .await
+                .unwrap()
+                .unwrap();
+            let views = storage.directory(&mut tx, &scope, false).await.unwrap();
+            let query = if change == "delete" {
+                "DELETE FROM agent_session_journal_pack WHERE runtime_session_id=?".to_owned()
+            } else {
+                format!("UPDATE agent_session_journal_pack SET {change} WHERE runtime_session_id=?")
+            };
+            sqlx::query(&query)
+                .bind(scope.1.as_str())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            let error = storage
+                .collection_bodies(
+                    &mut tx,
+                    &views,
+                    &work.packs,
+                    &mut work.bodies,
+                    &Staged::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind,
+                agent_runtime::core::error::ErrorKind::Conflict,
+                "{change}"
+            );
+            tx.rollback().await.unwrap();
         }
     }
 }

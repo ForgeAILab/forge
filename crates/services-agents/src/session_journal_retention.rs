@@ -15,6 +15,8 @@ pub const RETENTION_DEBOUNCE: Duration = Duration::from_secs(1);
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 pub const RETENTION_SCHEDULING_BUDGET: Duration = Duration::from_secs(10);
 pub const MEMBERSHIP_RELEASE_LIMIT: u64 = 20_000;
+const COLLECTION_CALL_LIMIT: usize = 32;
+const PROTECTED_CALL_LIMIT: usize = 16;
 
 #[derive(Default)]
 enum Phase {
@@ -35,6 +37,16 @@ pub struct RetentionCursor {
     reclaimed_objects: u64,
     reclaimed_bytes: u64,
     warned_retirement_causes: HashSet<String>,
+}
+
+#[cfg(feature = "test-support")]
+impl RetentionCursor {
+    pub fn protected_for_test() -> Self {
+        Self {
+            phase: Phase::Protected,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -313,12 +325,10 @@ impl SessionJournalRetention {
         let mut report = RetentionReport::default();
         let mut unreadable = HashSet::new();
         let mut over_capacity = HashSet::new();
+        let mut protected_calls = 0;
+        let mut retired_this_pass = false;
         loop {
             if Instant::now() >= deadline {
-                report.budget_exhausted = true;
-                break;
-            }
-            if report.collection_calls >= 32 {
                 report.budget_exhausted = true;
                 break;
             }
@@ -337,6 +347,10 @@ impl SessionJournalRetention {
                             }
                             cursor.retire_after.clear();
                             cursor.phase = Phase::Protected;
+                            if report.collection_calls > 0 {
+                                break;
+                            }
+                            retired_this_pass = true;
                             continue;
                         }
                     };
@@ -349,9 +363,19 @@ impl SessionJournalRetention {
                     } else {
                         cursor.retire_after.clear();
                         cursor.phase = Phase::Protected;
+                        if report.collection_calls > 0 {
+                            break;
+                        }
+                        retired_this_pass = true;
                     }
                 }
                 Phase::Protected => {
+                    if protected_calls >= PROTECTED_CALL_LIMIT {
+                        report.budget_exhausted = true;
+                        cursor.phase = Phase::Ordinary;
+                        continue;
+                    }
+                    protected_calls += 1;
                     let more = self
                         .collect(
                             self.journals.protected(),
@@ -367,6 +391,11 @@ impl SessionJournalRetention {
                     }
                 }
                 Phase::Ordinary => {
+                    if report.collection_calls >= COLLECTION_CALL_LIMIT {
+                        report.budget_exhausted = true;
+                        cursor.phase = Phase::Drain;
+                        continue;
+                    }
                     let more = self
                         .collect(
                             self.journals.ordinary(),
@@ -390,7 +419,9 @@ impl SessionJournalRetention {
                     } else {
                         cursor.cleanup_after = 0;
                         cursor.phase = Phase::Retire;
-                        break;
+                        if retired_this_pass {
+                            break;
+                        }
                     }
                 }
             }

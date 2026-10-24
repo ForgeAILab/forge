@@ -3,7 +3,7 @@ use super::{
     cache::Scope,
     codec, conflict, corrupt,
     seal::{Binding, FORMAT, Unit, role},
-    storage::{ForgeJournalStorage, database_error},
+    storage::{ForgeJournalStorage, SealedInput, database_error},
     wire,
 };
 use agent_runtime::core::{error::RuntimeError, journal::*};
@@ -15,11 +15,275 @@ use std::{
 
 type Packs = BTreeMap<i64, Vec<JournalOperationRecord>>;
 
+pub(super) struct OperationPrune {
+    scope: Scope,
+    floor: JournalRevision,
+    epoch: u64,
+    inputs: BTreeMap<i64, SealedInput>,
+    packs: Packs,
+    pub tiers: BTreeSet<i64>,
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use crate::test_support::FileDb;
+    use agent_runtime::core::{clock::Timestamp, ids::SessionId};
+
+    async fn inventory() -> (
+        FileDb,
+        ForgeJournalStorage,
+        JournalDomain,
+        SessionId,
+        JournalObjectId,
+    ) {
+        let f = FileDb::new().await.unwrap();
+        let storage = ForgeJournalStorage::new(f.database(), [7; 32], 1).unwrap();
+        storage.set_repacking(false);
+        let domain = JournalDomain {
+            storage_id: JournalStorageId::new("operation-budget"),
+            role: JournalRole::Protected,
+        };
+        let session = SessionId::new("single-release-many-operations");
+        f.ensure_session(&session).await.unwrap();
+        let object = JournalObject::encode(JournalObjectKind::JsonInline, &"release me").unwrap();
+        let object_id = object.id.clone();
+        let record = JournalSessionRecord {
+            generation: 1,
+            revision: JournalRevision(100),
+            writer_epoch: 1,
+            head: None,
+            has_checkpoint: false,
+            retirement: None,
+            collection_dirty: true,
+            engine: JournalEngineState {
+                version: u32::MAX,
+                bytes: vec![],
+            },
+        };
+        storage
+            .apply(JournalWrite {
+                domain: domain.clone(),
+                session: session.clone(),
+                kind: JournalWriteKind::Commit,
+                expect: Default::default(),
+                record,
+                objects: JournalObjectBatch {
+                    objects: vec![JournalStoredObject {
+                        id: object.id,
+                        kind: JournalObjectKind::JsonInline,
+                        bytes: object.bytes.into(),
+                    }],
+                },
+                operation: None,
+                pins: vec![],
+                catalog: vec![],
+                release: vec![],
+                prune_operations_before: None,
+                inject: None,
+            })
+            .await
+            .unwrap();
+        let scope = (domain.clone(), session.clone());
+        let mut tx = db::begin_immediate(f.database().pool()).await.unwrap();
+        let owner = storage.mapping(&mut tx, &scope).await.unwrap();
+        // Overflow tiers allow a synthetic >32-segment inventory without
+        // constructing the astronomical binary-carry history of normal tiers.
+        for tier in 64..97 {
+            let head = JournalHead {
+                schema_version: JOURNAL_SCHEMA_VERSION,
+                storage_id: domain.storage_id.clone(),
+                role: domain.role,
+                session: session.clone(),
+                revision: JournalRevision(1),
+                writer_epoch: 0,
+                batch_sequence: tier as u64,
+                batch: object_id.clone(),
+                snapshot: JournalSnapshotRoots {
+                    history: Default::default(),
+                    history_chain: journal_history_chain(std::iter::empty()),
+                    usage: Default::default(),
+                    extensions: Default::default(),
+                    manifests: Default::default(),
+                    planned_step_count: 0,
+                    identity: Default::default(),
+                    updated: Timestamp(1),
+                },
+                checkpoint: None,
+                superseded_by: None,
+                retirement: None,
+                created: Timestamp(1),
+                updated: Timestamp(1),
+            };
+            storage
+                .save_operations(
+                    &mut tx,
+                    &scope,
+                    &owner,
+                    tier,
+                    vec![JournalOperationRecord {
+                        operation: JournalOperationId::new(format!("synthetic-{tier}")),
+                        digest: journal_history_chain(std::iter::empty()),
+                        revision: JournalRevision(1),
+                        result: head,
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        (f, storage, domain, session, object_id)
+    }
+
+    #[tokio::test]
+    async fn single_release_caps_operation_units_and_finishes() {
+        let (f, storage, domain, session, object_id) = inventory().await;
+        for (call, units, remaining) in [(0, 32, 2), (1, 2, 0)] {
+            let mut record = storage.load(&domain, &session).await.unwrap().unwrap();
+            let expect = record.fence();
+            record.generation += 1;
+            record.collection_dirty = false;
+            let plan = JournalCollectionPlan {
+                max_units: 32,
+                write: JournalWrite {
+                    domain: domain.clone(),
+                    session: session.clone(),
+                    kind: JournalWriteKind::Collect,
+                    expect,
+                    record,
+                    objects: Default::default(),
+                    operation: None,
+                    pins: vec![],
+                    catalog: vec![],
+                    release: if call == 0 {
+                        vec![object_id.clone()]
+                    } else {
+                        vec![]
+                    },
+                    prune_operations_before: Some(JournalRevision(2)),
+                    inject: None,
+                },
+            };
+            assert_eq!(
+                storage.prepare_collection_apply(&plan).await.unwrap(),
+                JournalCollectionPreflight::Fits { units }
+            );
+            let receipt = storage.apply_collection(plan).await.unwrap();
+            assert_eq!(receipt.rewritten_units, units);
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_session_journal_operation_pack WHERE runtime_session_id=?")
+                .bind(session.as_str()).fetch_one(f.database().pool()).await.unwrap();
+            assert_eq!(count, remaining);
+            assert_eq!(
+                storage
+                    .load(&domain, &session)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .collection_dirty,
+                call == 0
+            );
+        }
+        assert!(storage.members(&domain, &session).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_cap_rejects_pending_operation_pruning() {
+        let (f, storage, domain, session, _) = inventory().await;
+        let before = storage.load(&domain, &session).await.unwrap().unwrap();
+        let mut record = before.clone();
+        record.generation += 1;
+        record.collection_dirty = false;
+        let plan = JournalCollectionPlan {
+            max_units: 0,
+            write: JournalWrite {
+                domain: domain.clone(),
+                session: session.clone(),
+                kind: JournalWriteKind::Collect,
+                expect: before.fence(),
+                record,
+                objects: Default::default(),
+                operation: None,
+                pins: vec![],
+                catalog: vec![],
+                release: vec![],
+                prune_operations_before: Some(JournalRevision(2)),
+                inject: None,
+            },
+        };
+        assert_eq!(
+            storage.prepare_collection_apply(&plan).await.unwrap(),
+            JournalCollectionPreflight::Split { max_release: 0 }
+        );
+        assert_eq!(
+            storage.apply_collection(plan).await.unwrap_err().kind,
+            agent_runtime::core::error::ErrorKind::Conflict
+        );
+        assert_eq!(storage.load(&domain, &session).await.unwrap(), Some(before));
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_session_journal_operation_pack WHERE runtime_session_id=?",
+        )
+        .bind(session.as_str())
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 33);
+    }
+
+    #[tokio::test]
+    async fn prepared_prune_rejects_changed_ciphertext_key_and_tier() {
+        let (f, storage, domain, session, _) = inventory().await;
+        let scope = (domain, session);
+        for change in [
+            "nonce=zeroblob(24)",
+            "payload=zeroblob(length(payload))",
+            "key_revision=2",
+            "format=2",
+            "tier=100",
+        ] {
+            let mut tx = db::begin_immediate(f.database().pool()).await.unwrap();
+            let prepared = storage
+                .prepare_operation_prune(&mut tx, &scope, Some(JournalRevision(2)), 1)
+                .await
+                .unwrap()
+                .unwrap();
+            let owner = storage.mapping(&mut tx, &scope).await.unwrap();
+            sqlx::query(&format!("UPDATE agent_session_journal_operation_pack SET {change} WHERE runtime_session_id=? AND tier=64"))
+                .bind(scope.1.as_str()).execute(&mut *tx).await.unwrap();
+            let error = storage
+                .prune_operations(
+                    &mut tx,
+                    &scope,
+                    &owner,
+                    JournalRevision(2),
+                    1,
+                    Some(&prepared),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind,
+                agent_runtime::core::error::ErrorKind::Conflict,
+                "{change}"
+            );
+            tx.rollback().await.unwrap();
+        }
+    }
+}
+
 impl ForgeJournalStorage {
     pub(super) async fn operation_packs(
         &self,
         conn: &mut SqliteConnection,
         scope: &Scope,
+    ) -> Result<Packs, RuntimeError> {
+        self.operation_packs_with_inputs(conn, scope, None).await
+    }
+
+    async fn operation_packs_with_inputs(
+        &self,
+        conn: &mut SqliteConnection,
+        scope: &Scope,
+        mut inputs: Option<&mut BTreeMap<i64, SealedInput>>,
     ) -> Result<Packs, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("operations.operation_packs", 0);
@@ -29,6 +293,12 @@ impl ForgeJournalStorage {
         let mut ids = BTreeSet::new();
         for row in rows {
             self.revision(&row)?;
+            if let Some(inputs) = inputs.as_mut() {
+                inputs.insert(
+                    row.try_get("tier").map_err(|_| corrupt())?,
+                    SealedInput::read(&row, &["nonce", "payload"])?,
+                );
+            }
             let keys = self.keys.clone();
             let scope = scope.clone();
             let (tier, ops) = self
@@ -217,10 +487,35 @@ impl ForgeJournalStorage {
         owner: &str,
         floor: JournalRevision,
         epoch: u64,
+        prepared: Option<&OperationPrune>,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("operations.prune_operations", 0);
-        let mut packs = self.operation_packs(conn, scope).await?;
+        let mut packs = if let Some(prepared) = prepared {
+            let rows = sqlx::query("SELECT * FROM agent_session_journal_operation_pack WHERE storage_id=? AND role=? AND runtime_session_id=? ORDER BY tier")
+                .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str())
+                .fetch_all(&mut *conn).await.map_err(database_error)?;
+            let mut inputs = BTreeMap::new();
+            for row in &rows {
+                inputs.insert(
+                    row.try_get("tier").map_err(|_| corrupt())?,
+                    SealedInput::read(row, &["nonce", "payload"])?,
+                );
+            }
+            if prepared.scope != *scope
+                || prepared.floor != floor
+                || prepared.epoch != epoch
+                || prepared.inputs != inputs
+            {
+                return Err(conflict());
+            }
+            for row in &rows {
+                self.revision(row)?;
+            }
+            prepared.packs.clone()
+        } else {
+            self.operation_packs(conn, scope).await?
+        };
         let last = packs
             .values()
             .flatten()
@@ -232,6 +527,7 @@ impl ForgeJournalStorage {
         let mut survivors = Vec::new();
         let changed: Vec<_> = packs
             .iter()
+            .filter(|(tier, _)| prepared.is_none_or(|p| p.tiers.contains(tier)))
             .filter_map(|(&tier, ops)| {
                 let kept: Vec<_> = ops
                     .iter()
@@ -265,31 +561,43 @@ impl ForgeJournalStorage {
         Ok(())
     }
 
-    pub(super) async fn prune_operation_units(
+    pub(super) async fn prepare_operation_prune(
         &self,
         conn: &mut SqliteConnection,
         scope: &Scope,
         floor: Option<JournalRevision>,
         epoch: u64,
-    ) -> Result<u32, RuntimeError> {
+    ) -> Result<Option<OperationPrune>, RuntimeError> {
         let Some(floor) = floor else {
-            return Ok(0);
+            return Ok(None);
         };
-        let packs = self.operation_packs(conn, scope).await?;
+        let mut inputs = BTreeMap::new();
+        let packs = self
+            .operation_packs_with_inputs(conn, scope, Some(&mut inputs))
+            .await?;
         let last = packs
             .values()
             .flatten()
             .filter(|o| o.result.writer_epoch == epoch)
             .map(|o| o.revision)
             .max();
-        Ok(packs
-            .values()
-            .filter(|ops| {
+        let tiers = packs
+            .iter()
+            .filter(|(_, ops)| {
                 ops.iter().any(|o| {
                     o.revision < floor
                         && !(o.result.writer_epoch == epoch && Some(o.revision) == last)
                 })
             })
-            .count() as u32)
+            .map(|(&tier, _)| tier)
+            .collect();
+        Ok(Some(OperationPrune {
+            scope: scope.clone(),
+            floor,
+            epoch,
+            inputs,
+            packs,
+            tiers,
+        }))
     }
 }
