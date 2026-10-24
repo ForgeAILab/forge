@@ -50,6 +50,244 @@ async fn physical_bytes(pool: &sqlx::SqlitePool) -> TestResult<serde_json::Value
     Ok(serde_json::json!({"legacy_dbstat":legacy,"journal_dbstat":journal}))
 }
 
+async fn legacy_chat_lcm_facts(
+    pool: &sqlx::SqlitePool,
+    store: &SqliteProtectedRuntimeStore,
+) -> TestResult<Vec<serde_json::Value>> {
+    use agent_runtime::core::{checkpoint::CheckpointStore, ids::SessionId, store::SessionStore};
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT s.id,s.runtime_session_id,s.profile_id,i.selected_profile_id
+         FROM agent_session s JOIN agent_identity i ON i.id=s.identity_id
+         JOIN agent_context_scope c ON c.id=s.context_scope_id
+         JOIN agent_chat chat ON c.scope_type='agent_chat' AND chat.id=c.scope_id
+         JOIN protected_agent_session_state l ON l.session_id=s.id
+         WHERE chat.kind='account_main' AND s.runtime_session_id IS NOT NULL ORDER BY s.id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut facts = Vec::new();
+    for (owner, runtime, profile, selected) in rows {
+        let id = SessionId::new(&runtime);
+        let snapshot = SessionStore::load(store, &id)
+            .await
+            .map_err(|_| "legacy snapshot metadata could not be decoded")?;
+        let checkpoint = CheckpointStore::load_latest(store, &id)
+            .await
+            .map_err(|_| "legacy checkpoint metadata could not be decoded")?;
+        let state = |snapshot: &agent_runtime::core::store::SessionSnapshot| {
+            let lcm = snapshot.extension_state.get(LCM_COMPONENT_ID);
+            serde_json::json!({
+                "history_entries":snapshot.history.len(),
+                "timeline_id":lcm.and_then(|s| s.value.get("timeline_id")).and_then(serde_json::Value::as_str),
+                "dag_revision":lcm.and_then(|s| s.value.get("dag_revision")).and_then(serde_json::Value::as_u64)
+            })
+        };
+        facts.push(serde_json::json!({
+            "forge_session_id":owner,"runtime_session_id":runtime,"profile_id":profile,
+            "selected_profile_id":selected,"snapshot":snapshot.as_ref().map(&state),
+            "checkpoint":checkpoint.as_ref().map(|c| state(&c.snapshot))
+        }));
+    }
+    Ok(facts)
+}
+
+#[tokio::test]
+#[ignore = "reads metadata from an explicitly selected disposable database copy"]
+async fn journal_real_data_lcm_metadata() -> TestResult<()> {
+    let path = copy_file(Path::new(&std::env::var("FORGE_JOURNAL_DRYRUN_DB")?))?;
+    let secret_path = copy_file(Path::new(&std::env::var(
+        "FORGE_JOURNAL_DRYRUN_SECRET_FILE",
+    )?))?;
+    let key: [u8; 32] = Sha256::digest(std::fs::read(secret_path)?).into();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true),
+        )
+        .await?;
+    let store = SqliteProtectedRuntimeStore::new(Arc::new(db::SqliteDb::new(pool.clone())), key, 1);
+    println!(
+        "{}",
+        serde_json::to_string(&legacy_chat_lcm_facts(&pool, &store).await?)?
+    );
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "resumes only converted Main Chats on an explicitly selected disposable copy"]
+async fn journal_real_data_lazy_resume() -> TestResult<()> {
+    use agent_runtime::{
+        core::{
+            catalog::{ModelLimits, ResolvedModelProfile},
+            checkpoint::CheckpointStore,
+            ids::SessionId,
+            journal::*,
+            provider::{Capabilities, ModelId},
+            store::SessionStore,
+        },
+        harness::{
+            LcmCoordinator, LcmCoordinatorPolicy, LcmRecoveryPolicy, StaticLcmTimelineResolver,
+            LCM_COMPONENT_ID,
+        },
+        provider::fake::FakeProvider,
+        runtime::{CheckpointRecoveryPolicy, RuntimeBuilder, StartSession},
+    };
+    let path = copy_file(Path::new(&std::env::var("FORGE_JOURNAL_DRYRUN_DB")?))?;
+    let secret_path = copy_file(Path::new(&std::env::var(
+        "FORGE_JOURNAL_DRYRUN_SECRET_FILE",
+    )?))?;
+    let key: [u8; 32] = Sha256::digest(std::fs::read(secret_path)?).into();
+    let pool = db::create_sqlite_pool(&format!("sqlite://{}", path.display())).await?;
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(
+        Arc::new(db::SqliteDb::new(pool.clone())),
+        key,
+        1,
+    ));
+    let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT s.runtime_session_id,c.scope_id,s.profile_id,i.selected_profile_id
+         FROM agent_session s JOIN agent_identity i ON i.id=s.identity_id
+         JOIN agent_context_scope c ON c.id=s.context_scope_id
+         JOIN agent_chat chat ON c.scope_type='agent_chat' AND chat.id=c.scope_id
+         WHERE chat.kind='account_main' AND s.replaced_by_session_id IS NULL
+           AND EXISTS(SELECT 1 FROM agent_session_journal_session j WHERE j.runtime_session_id=s.runtime_session_id AND j.role='ordinary' AND j.published=1 AND j.retired=0)",
+    ).fetch_all(&pool).await?;
+    if rows.is_empty() {
+        return Err("no converted Main Chat was available for lazy resume".into());
+    }
+    let mut facts = Vec::new();
+    for (runtime, chat, profile, selected) in rows {
+        let id = SessionId::new(&runtime);
+        let ordinary = SessionStore::load(&*store, &id)
+            .await
+            .map_err(|_| "legacy snapshot could not be decoded")?
+            .ok_or("legacy snapshot absent")?;
+        let protected = CheckpointStore::load_latest(&*store, &id)
+            .await
+            .map_err(|_| "legacy checkpoint could not be decoded")?
+            .ok_or("legacy checkpoint absent")?;
+        let mut counts = Vec::new();
+        for (engine, expected) in [
+            (store.journals().ordinary(), &ordinary),
+            (store.journals().protected(), &protected.snapshot),
+        ] {
+            let nonce = db::new_uuid_v4();
+            let lease = engine
+                .open(
+                    &id,
+                    JournalOpen {
+                        root: JournalRootSelection::Latest,
+                        expected_revision: None,
+                        operation: JournalOperationId::new(&nonce),
+                        pin: JournalPinId::new(&nonce),
+                        intent: JournalOpenIntent::ReadOnly,
+                    },
+                )
+                .await
+                .map_err(|e| format!("native inspection failed: {:?}", e.kind))?;
+            let imported = JournalReader::new(
+                &engine,
+                &lease,
+                JournalReadLimits {
+                    objects: 100_000,
+                    encoded_bytes: 32 * 1024 * 1024,
+                    entries: 100_000,
+                },
+            )
+            .map_err(|_| "native reader unavailable")?
+            .snapshot()
+            .await
+            .map_err(|_| "native snapshot could not be decoded")?
+            .ok_or("native snapshot absent")?;
+            // Boolean assertions keep private payloads out of failure output.
+            assert!(
+                imported == *expected,
+                "native import differs from its receipt-filtered legacy state"
+            );
+            counts.push(imported.history.len());
+            engine
+                .close(lease)
+                .await
+                .map_err(|_| "native read lease could not close")?;
+        }
+        let mut resumed = false;
+        let provider = Arc::new(FakeProvider::new(
+            "fake",
+            Capabilities::basic_streaming(),
+            Vec::new(),
+        ));
+        if selected.as_deref() == Some(&profile) {
+            let lcm = store
+                .lcm_store_for_runtime_session(&runtime, "agent_chat", &chat)
+                .await
+                .map_err(|_| "converted LCM binding unavailable")?;
+            let expected_timeline = protected
+                .snapshot
+                .extension_state
+                .get(LCM_COMPONENT_ID)
+                .and_then(|s| s.value.get("timeline_id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or("selected target has no LCM reference")?;
+            assert!(
+                lcm.timeline_id() == expected_timeline,
+                "selected target lost the shared timeline"
+            );
+            let binding = lcm
+                .runtime_binding(id.clone())
+                .map_err(|_| "runtime LCM binding unavailable")?;
+            let coordinator = LcmCoordinator::new(
+                Arc::new(lcm),
+                Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+                Arc::new(StaticLcmTimelineResolver::new(binding)),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: 28_000,
+                    ..Default::default()
+                },
+            )
+            .map_err(|_| "LCM coordinator unavailable")?;
+            let rt = RuntimeBuilder::new(ModelId::new("fake"))
+                .provider_name("fake")
+                .provider(provider.clone())
+                .model_profile(ResolvedModelProfile::explicit(
+                    "fake",
+                    ModelId::new("fake"),
+                    ModelLimits::new(32_000, 28_000, 4_000),
+                ))
+                .session_store(store.clone())
+                .checkpoint_store(store.clone())
+                .lcm(Arc::new(coordinator))
+                .build()
+                .map_err(|_| "lazy runtime unavailable")?;
+            let session = rt
+                .start_session(
+                    StartSession::resume(id)
+                        .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
+                        .with_lcm_policy(LcmRecoveryPolicy::Adopt),
+                )
+                .await
+                .map_err(|e| format!("lazy resume failed: {:?}", e.kind))?;
+            assert!(
+                session.history() == protected.snapshot.history.as_slice(),
+                "lazy resume changed the selected target history"
+            );
+            resumed = true;
+            drop(session);
+            drop(rt);
+        }
+        assert!(
+            provider.requests().is_empty(),
+            "lazy resume called the provider"
+        );
+        facts.push(serde_json::json!({"runtime_session_id":runtime,"ordinary_entries":counts[0],"protected_entries":counts[1],
+            "lcm_namespaces":usize::from(protected.snapshot.extension_state.contains_key(LCM_COMPONENT_ID)),"resumed":resumed,"provider_calls":provider.requests().len()}));
+    }
+    println!("{}", serde_json::to_string(&facts)?);
+    pool.close().await;
+    Ok(())
+}
+
 async fn metadata_rows(
     pool: &sqlx::SqlitePool,
     query: &str,
@@ -147,14 +385,8 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let initial = db.legacy_journal_conversion_remaining(&[]).await?;
     let conversion_started = Instant::now();
     let mut cursor = ConversionCursor::default();
-    let (
-        mut ticks,
-        mut converted,
-        mut skipped_retired,
-        mut skipped_active,
-        mut skipped_profile,
-        mut unreadable,
-    ) = (0, 0, 0, 0, 0, 0);
+    let (mut ticks, mut converted, mut skipped_retired, mut skipped_active, mut unreadable) =
+        (0, 0, 0, 0, 0);
     let mut parked = BTreeMap::<String, usize>::new();
     let mut parked_sessions = Vec::new();
     let mut parked_sessions_omitted = 0;
@@ -166,7 +398,6 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
         converted += report.converted;
         skipped_retired += report.skipped_retired;
         skipped_active += report.skipped_active;
-        skipped_profile += report.skipped_profile;
         unreadable += report.skipped_unreadable;
         for (reason, count) in report.parked_by_reason {
             *parked.entry(reason).or_default() += count;
@@ -201,7 +432,7 @@ async fn run_copy(path: &Path, secret_path: &Path) -> TestResult<serde_json::Val
     let retention_ms = retention_started.elapsed().as_millis();
     let after = physical_bytes(&pool).await?;
     let summary = serde_json::json!({
-        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active,"profile_selection":skipped_profile},
+        "converted":converted, "skipped":{"retirement_policy":skipped_retired,"active":skipped_active},
         "parked_by_reason":parked, "unreadable":{"conversion":unreadable,"retention":collected.unreadable_sessions},
         "parked_sessions":parked_sessions,"parked_sessions_omitted":parked_sessions_omitted,
         "remaining":0, "conversion_ticks":ticks, "bytes":{"before":before,"after":after},
@@ -480,7 +711,7 @@ async fn dry_run_entrypoint_converts_selected_profile_shared_main_chat() {
     let secret = b"synthetic-selected-profile-chat-secret";
     let store = SqliteProtectedRuntimeStore::new(db.clone(), Sha256::digest(secret).into(), 1);
     let id = SessionId::new("dryrun-selected-profile-main");
-    let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+    let (old, older) = LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
     let before:Vec<(String,String,String)>=sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
         .fetch_all(db.pool()).await.unwrap();
     std::fs::write(f.directory().join("jwt_secret.bin"), secret).unwrap();
@@ -508,9 +739,8 @@ async fn dry_run_entrypoint_converts_selected_profile_shared_main_chat() {
         .lines()
         .find_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .expect(&stdout);
-    assert_eq!(summary["converted"], 1);
-    assert_eq!(summary["skipped"]["retirement_policy"], 11);
-    assert_eq!(summary["skipped"]["profile_selection"], 1);
+    assert_eq!(summary["converted"], 2);
+    assert_eq!(summary["skipped"]["retirement_policy"], 9);
     assert_eq!(summary["skipped"]["active"], 0);
     assert_eq!(summary["parked_by_reason"], serde_json::json!({}));
     assert_eq!(summary["parked_sessions"], serde_json::json!([]));
@@ -526,13 +756,13 @@ async fn dry_run_entrypoint_converts_selected_profile_shared_main_chat() {
     assert_eq!(a, ("suspended".into(), None, 1));
     let old_native:i64=sqlx::query_scalar("SELECT COUNT(*) FROM agent_session_journal_session j JOIN agent_session s ON s.id=j.forge_session_id WHERE s.profile_id='glm-profile' AND (j.published=1 OR j.retired=1)")
         .fetch_one(db.pool()).await.unwrap();
-    assert_eq!(old_native, 0);
+    assert_eq!(old_native, 2);
     let relinquishments: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment")
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert_eq!(relinquishments, 12);
+    assert_eq!(relinquishments, 10);
     assert!(!stdout.contains(std::str::from_utf8(secret).unwrap()));
     assert!(!stdout.contains("Synthetic historical message"));
     println!("selected-profile-generated-dryrun {summary}");

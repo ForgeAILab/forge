@@ -1040,15 +1040,31 @@ legacy owner skipped by retirement policy, no parked sessions, unchanged legacy
 ciphertext and all LCM rows retained in the original timeline.
 
 `session_journal_dryrun::dry_run_entrypoint_converts_selected_profile_shared_main_chat`
-uses the same entrypoint with two Profiles and 10+3 unlinked suspended sessions.
+uses the same entrypoint with two Profiles and 8+3 unlinked suspended sessions,
+an unowned/unbound pre-topic timeline and no summary nodes, matching the supplied
+offline copy's post-migration shape. Both B stores reference revision 131;
+A's stores have their own 60-entry history and revision-70 LCM state.
 It verifies that the selected Profile's newest session receives the original
 114-entry timeline, its two older same-Profile siblings are replaced, and the
-other Profile's ten sessions remain suspended and unreplaced. The JSON summary
-reports one conversion, eleven retirement-policy skips, one
-`skipped.profile_selection` deferral and no parked sessions. Profile deferral
-preserves legacy authority and becomes eligible again when selection changes;
-it is separate from retirement and parking. All legacy ciphertext and original
+other Profile's eight sessions remain suspended and unreplaced. The JSON summary
+reports two conversions, nine retirement-policy skips and no parked sessions.
+The non-selected resume target converts with its own history and protected state,
+omitting only its receipted shared LCM namespaces. There is no
+`skipped.profile_selection` category. Both cursor orders and fresh-cursor retries
+are covered by the worker suite. All legacy ciphertext and original
 LCM rows remain unchanged. This generated fixture uses no installation data.
+
+Two additional ignored tests use the same explicit path/secret inputs and refuse
+installation paths. `session_journal_dryrun::journal_real_data_lcm_metadata` opens
+the migrated copy read-only and emits only session/Profile/timeline IDs, history
+counts and DAG revisions from the two legacy copies.
+`session_journal_dryrun::journal_real_data_lazy_resume` runs after conversion. It
+compares both native domains with their receipt-filtered legacy state using
+content-free failure messages, then resumes selected Main Chats through the
+runtime builder, existing LCM binding and deferred checkpoint recovery. A fake
+provider with no scripts must receive zero calls; no turn is run or persisted.
+Its output contains only IDs, history/namespace/provider-call counts and resume
+status. These tests never print payloads, text or secrets.
 
 The conversion report also retains at most 32 `parked_sessions` per pass, with
 the Forge/runtime session IDs, owner scope kind, error kind and runtime error

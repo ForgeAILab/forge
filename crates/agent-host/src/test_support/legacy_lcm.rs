@@ -59,7 +59,7 @@ impl LegacyLcmFixture {
         session: &SessionId,
         snapshot_has_lcm: bool,
     ) -> Self {
-        Self::seed_history(fixture, store, session, snapshot_has_lcm, 120).await
+        Self::seed_history(fixture, store, session, snapshot_has_lcm, 120, true).await
     }
 
     /// A pre-topic Main Chat shared by two unlinked suspended runtimes. The
@@ -68,6 +68,15 @@ impl LegacyLcmFixture {
         fixture: &FileDb,
         store: &SqliteProtectedRuntimeStore,
         session: &SessionId,
+    ) -> (Self, SessionId) {
+        Self::shared_chat(fixture, store, session, true).await
+    }
+
+    async fn shared_chat(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+        summarized: bool,
     ) -> (Self, SessionId) {
         let newer = fixture.ensure_session(session).await.unwrap();
         let older_runtime = SessionId::new(format!("{}:older", session.as_str()));
@@ -94,7 +103,7 @@ impl LegacyLcmFixture {
                 .await
                 .unwrap();
         }
-        let old = Self::seed_history(fixture, store, session, false, 114).await;
+        let old = Self::seed_history(fixture, store, session, false, 114, summarized).await;
         // V149 leaves runtime owners NULL. This is the later, observed owner
         // assignment, after the older runtime opened the migrated timeline.
         sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=?,created_at='2026-09-17T00:00:00Z',updated_at='2026-09-24T08:37:00Z' WHERE id=?")
@@ -128,8 +137,39 @@ impl LegacyLcmFixture {
         store: &SqliteProtectedRuntimeStore,
         session: &SessionId,
     ) -> (Self, SessionId) {
-        let (old, older) = Self::shared_pre_topic_chat(fixture, store, session).await;
+        Self::profile_switch(fixture, store, session, true).await
+    }
+
+    /// Post-migration real-copy shape: no runtime owner or binding, 8 GLM / 3
+    /// Gemini sessions, B references in both stores, and no summary nodes.
+    pub async fn unowned_pre_topic_profile_switch(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+    ) -> (Self, SessionId) {
+        Self::profile_switch(fixture, store, session, false).await
+    }
+
+    async fn profile_switch(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+        assigned_owner: bool,
+    ) -> (Self, SessionId) {
+        let (mut old, older) = Self::shared_chat(fixture, store, session, assigned_owner).await;
         let db = fixture.database();
+        if !assigned_owner {
+            sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE timeline_id=?")
+                .bind(&old.timeline_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=NULL WHERE id=?")
+                .bind(&old.timeline_id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
         sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,provider,created_at,updated_at) VALUES ('gemini-profile','journal-agent','native','embedded','gemini','2026-09-23T03:58:00Z','2026-09-23T03:58:00Z')")
             .execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,provider,created_at,updated_at) VALUES ('glm-profile','journal-agent','native','embedded','glm','2026-09-17T00:00:00Z','2026-09-17T00:00:00Z')")
@@ -139,7 +179,7 @@ impl LegacyLcmFixture {
             "glm-profile",
             "2026-09-23T02:09:00Z".to_owned(),
         )];
-        for n in 0..9 {
+        for n in 0..if assigned_owner { 9 } else { 7 } {
             siblings.push((
                 SessionId::new(format!("{}:glm:{n}", session.as_str())),
                 "glm-profile",
@@ -170,6 +210,52 @@ impl LegacyLcmFixture {
             .unwrap();
             let mut snapshot = old.checkpoint.snapshot.clone();
             snapshot.id = runtime.clone();
+            if !assigned_owner {
+                let (length, revision) = if runtime == older {
+                    (60, 70)
+                } else if profile == "gemini-profile" {
+                    if runtime.as_str().ends_with(":0") {
+                        (84, 86)
+                    } else {
+                        (119, 116)
+                    }
+                } else {
+                    let n: usize = runtime
+                        .as_str()
+                        .rsplit(':')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    [
+                        (58, 64),
+                        (28, 27),
+                        (3, 2),
+                        (48, 54),
+                        (31, 21),
+                        (29, 32),
+                        (53, 47),
+                    ][n]
+                };
+                snapshot.history.truncate(length);
+                while snapshot.history.len() < length {
+                    snapshot.history.push(Message::user(format!(
+                        "Synthetic earlier tail {}",
+                        snapshot.history.len()
+                    )));
+                }
+                let state = &mut snapshot
+                    .extension_state
+                    .get_mut(LCM_COMPONENT_ID)
+                    .unwrap()
+                    .value;
+                state["history_len"] = json!(length);
+                state["immutable_frontier"] = json!(length - 1);
+                state["dag_revision"] = json!(revision);
+                state["history_fingerprint"] = json!(Fingerprint::of(
+                    serde_json::to_vec(&snapshot.history).unwrap()
+                ));
+            }
             snapshot.extension_state.insert(
                 "fixture.protected".into(),
                 VersionedSessionState::new(
@@ -201,6 +287,10 @@ impl LegacyLcmFixture {
             .execute(db.pool())
             .await
             .unwrap();
+        if !assigned_owner {
+            old.snapshot = old.checkpoint.snapshot.clone();
+            old = old.write(store).await;
+        }
         (old, older)
     }
 
@@ -210,6 +300,7 @@ impl LegacyLcmFixture {
         session: &SessionId,
         snapshot_has_lcm: bool,
         history_len: usize,
+        summarized: bool,
     ) -> Self {
         let db = fixture.database();
         let (identity, scope_type, scope_id): (String, String, String) = sqlx::query_as(
@@ -308,7 +399,7 @@ impl LegacyLcmFixture {
                 let start = 106 + n;
                 // Ten historical tail truncations plus six re-appends produce
                 // revision 131 with 121 operations and 114 retained entries.
-                if n < 4 {
+                if n < if summarized { 4 } else { 3 } {
                     db.truncate_lcm_entries_from(
                         &timeline_id,
                         start as i64 + 1,
@@ -347,33 +438,48 @@ impl LegacyLcmFixture {
             .iter()
             .map(|entry| 4 + (serde_json::to_vec(&entry.content).unwrap().len() as u64).div_ceil(4))
             .sum();
-        lcm.commit_leaf(
-            &view,
-            LeafCommit {
-                expected_revision: lcm.current_revision(&view).await.unwrap(),
-                operation_id: LcmOperationId::new("legacy-leaf"),
-                node_id: LcmNodeId::new("legacy-leaf"),
-                range: LcmRange::new(LcmSequence::new(0), LcmSequence::new(1)).unwrap(),
-                entry_ids: entries[..2].iter().map(|entry| entry.id.clone()).collect(),
-                source_fingerprint: source_fingerprint_entries(&entries[..2]),
-                summary: summary.into(),
-                token_count: 4 + (summary.len() as u64).div_ceil(4),
-                source_token_count: source_tokens,
-                policy_revision: policy.clone(),
-                algorithm_revision: algorithm.clone(),
-                sizer_revision: sizer.clone(),
-                provenance: SummaryProvenance::Deterministic {
-                    revision: algorithm.clone(),
-                },
-                classification: LcmClassification::new(
-                    Sensitivity::Sensitive,
-                    TrustClass::ExternalContent,
+        if !summarized {
+            db.truncate_lcm_entries_from(&timeline_id, 112, &db::now_rfc3339(), None)
+                .await
+                .unwrap();
+            lcm.append(
+                &view,
+                LcmAppendRequest::new(
+                    LcmOperationId::new("legacy-final-reappend"),
+                    entries[112..].to_vec(),
                 ),
-                operation_fingerprint: None,
-            },
-        )
-        .await
-        .unwrap();
+            )
+            .await
+            .unwrap();
+        } else {
+            lcm.commit_leaf(
+                &view,
+                LeafCommit {
+                    expected_revision: lcm.current_revision(&view).await.unwrap(),
+                    operation_id: LcmOperationId::new("legacy-leaf"),
+                    node_id: LcmNodeId::new("legacy-leaf"),
+                    range: LcmRange::new(LcmSequence::new(0), LcmSequence::new(1)).unwrap(),
+                    entry_ids: entries[..2].iter().map(|entry| entry.id.clone()).collect(),
+                    source_fingerprint: source_fingerprint_entries(&entries[..2]),
+                    summary: summary.into(),
+                    token_count: 4 + (summary.len() as u64).div_ceil(4),
+                    source_token_count: source_tokens,
+                    policy_revision: policy.clone(),
+                    algorithm_revision: algorithm.clone(),
+                    sizer_revision: sizer.clone(),
+                    provenance: SummaryProvenance::Deterministic {
+                        revision: algorithm.clone(),
+                    },
+                    classification: LcmClassification::new(
+                        Sensitivity::Sensitive,
+                        TrustClass::ExternalContent,
+                    ),
+                    operation_fingerprint: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
         let nodes: Vec<_> = lcm.active_nodes(&view).await.unwrap().iter().map(|node| json!({
             "id": node.id, "revision": node.revision, "range": node.range,
             "source_fingerprint": node.source_fingerprint, "summary_revision": node.summary_revision,

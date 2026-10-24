@@ -741,6 +741,21 @@ impl SqliteProtectedRuntimeStore {
         scope_id: &str,
         successor: bool,
     ) -> Result<crate::SqliteLcmStore, RuntimeError> {
+        self.resolve_lcm_store_admitted(
+            runtime_id, scope_type, scope_id, successor, runtime_id, None,
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_lcm_store_admitted(
+        &self,
+        runtime_id: &str,
+        scope_type: &str,
+        scope_id: &str,
+        successor: bool,
+        admitted_runtime: &str,
+        expected_legacy_timeline: Option<&str>,
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         let row = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
@@ -790,8 +805,13 @@ impl SqliteProtectedRuntimeStore {
         } else {
             self.referenced_lcm_timeline(runtime_id, flags).await?
         };
+        if expected_legacy_timeline.is_some_and(|id| referenced.as_deref() != Some(id)) {
+            return Err(RuntimeError::conflict(
+                "LCM selected chat resume target does not reference the shared timeline",
+            ));
+        }
         let sibling_admission = if flags.legacy_eligible {
-            self.prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref())
+            self.prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref(), admitted_runtime)
                 .await?
         } else {
             None
@@ -845,6 +865,13 @@ impl SqliteProtectedRuntimeStore {
         } else {
             false
         };
+        if expected_legacy_timeline.is_some_and(|expected| {
+            !repair_empty && existing.as_deref().is_some_and(|id| id != expected)
+        }) {
+            return Err(RuntimeError::conflict(
+                "LCM selected chat resume target is bound to a different timeline",
+            ));
+        }
         if flags.legacy_eligible && (existing.is_none() || repair_empty) {
             if let Some(timeline) = referenced.as_deref() {
                 self.transfer_legacy_chat_lcm_owner(

@@ -2517,12 +2517,11 @@ one write transaction. A populated replacement binding is a conflict.
 
 Pre-V149 Agent Chat timelines were shared by successive runtimes of the same
 chat. V149 backfills canonical scope and retirement metadata but leaves runtime
-ownership NULL; a subsequent open can assign a shared timeline to an older
-sibling. Chat resolution prefers the active session, otherwise the newest
+ownership NULL. Chat resolution prefers the active session, otherwise the newest
 unreplaced suspended native session for the same identity, context scope and
 Profile. The resume target for the identity's **currently selected Profile** owns
-the shared pre-topic timeline, even when its older suspended owner belongs to
-another Profile. The timeline must predate the target and have been written
+the shared pre-topic timeline, whether it is still unowned or its older suspended
+owner belongs to another Profile. The timeline must predate the target and have been written
 after its creation. Neither runtime nor another sibling may have published or
 retired a native journal; claims, leases, topic/rotation references, other
 runtime bindings, active siblings and tied/newer selected-Profile sessions
@@ -2538,9 +2537,17 @@ timeline's runtime owner and binding and records every relinquishing sibling
 in `agent_legacy_lcm_relinquishment`, fenced by its session version. Same-Profile
 siblings are marked replaced by the target. Other-Profile siblings retain their
 status, links and version, so their newest session remains resumable after a
-Profile switch. Background conversion defers these unselected siblings, even if
-it encounters the old owner first; a selection change makes them eligible again
-in the same worker. This deferral is neither retirement nor a parked error.
+Profile switch. Before importing any sibling that is not the selected resume
+target, conversion resolves the target's binding and commits the ownership and
+receipts first. That includes an unowned timeline immediately after V149 and an
+older sibling of the selected Profile. It also admits the selected target while
+converting another session; an active target or writer remains a conflict.
+Conversion then reloads both legacy copies through the receipts and imports the
+sibling's own transcript and other protected state immediately. A-first and
+B-first cursor orders therefore produce the same timeline owner and native
+imports. There is no selection-based deferral or worker exclusion to revive.
+An unowned timeline with no sibling keeps normal reference-based adoption;
+shared-timeline arbitration does not change standalone legacy conversion.
 
 Migration `V202610241249` adds only the relinquishment table. Its receipts belong
 to the losing session and survive deletion of the transferred timeline, so a

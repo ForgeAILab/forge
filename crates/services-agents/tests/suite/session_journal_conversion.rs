@@ -238,7 +238,7 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
 }
 
 #[tokio::test]
-async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection_changes() {
+async fn profile_switch_worker_converts_old_owner_before_target_and_keeps_it_resumable() {
     use forge_agent_host::{
         session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
     };
@@ -275,12 +275,10 @@ async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection
             .convert_legacy_session(&older_owner, &older)
             .await
             .unwrap(),
-        ConversionOutcome::SkippedProfile {
-            selected_profile: "gemini-profile".into()
-        }
+        ConversionOutcome::Converted
     );
     let mut cursor = ConversionCursor::default();
-    let (mut converted, mut deferred, mut retired) = (0, 0, 0);
+    let (mut converted, mut retired) = (0, 0);
     let mut complete = false;
     for _ in 0..6 {
         let report = worker
@@ -288,7 +286,6 @@ async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection
             .await
             .unwrap();
         converted += report.converted;
-        deferred += report.skipped_profile;
         retired += report.skipped_retired;
         assert!(report.parked_sessions.is_empty());
         if report.remaining == 0 {
@@ -297,9 +294,9 @@ async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection
         }
     }
     assert!(complete);
-    assert_eq!((converted, deferred, retired), (1, 1, 11));
+    assert_eq!((converted, retired), (1, 11));
     assert_eq!(publication_count(&f, &id).await, 2);
-    assert_eq!(publication_count(&f, &older).await, 0);
+    assert_eq!(publication_count(&f, &older).await, 2);
     let a: (String, Option<String>, i64) = sqlx::query_as(
         "SELECT status,replaced_by_session_id,version FROM agent_session WHERE id=?",
     )
@@ -323,7 +320,7 @@ async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection
         .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
         .await
         .unwrap();
-    assert_eq!(resumed.converted, 1);
+    assert_eq!(resumed.converted, 0);
     assert_eq!(resumed.remaining, 0);
     assert!(resumed.parked_sessions.is_empty());
     assert_eq!(publication_count(&f, &older).await, 2);
@@ -371,6 +368,64 @@ async fn profile_switch_worker_defers_old_owner_then_converts_it_after_selection
             .await
             .unwrap();
     assert_eq!(owner, id.as_str());
+}
+
+#[tokio::test]
+async fn unowned_profile_switch_worker_handles_both_cursor_orders() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for a_first in [true, false] {
+        let (f, store, worker) = fixture().await;
+        let id = SessionId::new(format!("unowned-worker-order-{a_first}"));
+        let (old, older) =
+            LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        let first = if a_first { &older } else { &id };
+        let original = f.ensure_session(first).await.unwrap();
+        let mut tx = db::begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys=ON")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_session SET id='000-first-owner' WHERE id=?")
+            .bind(&original)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE protected_agent_session_state SET session_id='000-first-owner' WHERE session_id=?")
+            .bind(&original).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let before: Vec<(String, String, String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+            .fetch_all(db.pool()).await.unwrap();
+        for cold in [false, true] {
+            let mut cursor = ConversionCursor::default();
+            let (mut converted, mut retired, mut complete) = (0, 0, false);
+            for _ in 0..6 {
+                let report = worker
+                    .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+                converted += report.converted;
+                retired += report.skipped_retired;
+                assert!(report.parked_sessions.is_empty());
+                assert_eq!(report.skipped_unreadable, 0);
+                assert_eq!(report.skipped_active, 0);
+                if report.remaining == 0 {
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            assert_eq!((converted, retired), (if cold { 0 } else { 2 }, 9));
+        }
+        assert_eq!(publication_count(&f, &id).await, 2);
+        assert_eq!(publication_count(&f, &older).await, 2);
+        let ownership: (String, i64) = sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=t.id) FROM agent_lcm_timeline t WHERE id=?")
+            .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(ownership, (id.to_string(), 10));
+        let after: Vec<(String, String, String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+            .fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+    }
 }
 
 #[tokio::test]

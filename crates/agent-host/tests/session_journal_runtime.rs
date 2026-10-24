@@ -130,6 +130,103 @@ async fn profile_lcm_runtime(
 }
 
 #[tokio::test]
+async fn unowned_shared_lcm_conversion_is_independent_of_session_order() {
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    for a_first in [true, false] {
+        let id = SessionId::new(format!("unowned-profile-order-{a_first}"));
+        let (f, store) = fixture(&id).await;
+        let (old, older) =
+            LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        let original_a = CheckpointStore::load_latest(&*store, &older)
+            .await
+            .unwrap()
+            .unwrap();
+        let before: Vec<(String, String, String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+            .fetch_all(db.pool()).await.unwrap();
+        for runtime in if a_first {
+            [&older, &id]
+        } else {
+            [&id, &older]
+        } {
+            let owner = f.ensure_session(runtime).await.unwrap();
+            assert_eq!(
+                store.convert_legacy_session(&owner, runtime).await.unwrap(),
+                ConversionOutcome::Converted
+            );
+            if runtime == &older {
+                let imported = snapshot(&store.journals().protected(), &older).await;
+                assert!(!imported.extension_state.contains_key(LCM_COMPONENT_ID));
+                let mut expected = original_a.snapshot.clone();
+                expected.extension_state.remove(LCM_COMPONENT_ID);
+                assert_eq!(imported, expected);
+                let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE session_id=? AND timeline_id=? AND transferred_to_runtime_session_id=?")
+                    .bind(&owner).bind(&old.timeline_id).bind(id.as_str()).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(receipts, 1);
+            }
+        }
+        assert_eq!(
+            snapshot(&store.journals().protected(), &id).await,
+            old.checkpoint.snapshot
+        );
+        let facts: (String, i64, i64, i64, i64) = sqlx::query_as("SELECT runtime_session_id,revision,(SELECT COUNT(*) FROM agent_lcm_entry WHERE timeline_id=t.id),(SELECT COUNT(*) FROM agent_lcm_node WHERE timeline_id=t.id),(SELECT COUNT(*) FROM agent_lcm_operation WHERE timeline_id=t.id) FROM agent_lcm_timeline t WHERE id=?")
+            .bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(facts, (id.to_string(), 131, 114, 0, 121));
+        let after: Vec<(String, String, String)> = sqlx::query_as("SELECT session_id,quote(snapshot_ciphertext),quote(checkpoint_ciphertext) FROM protected_agent_session_state ORDER BY session_id")
+            .fetch_all(db.pool()).await.unwrap();
+        assert_eq!(before, after);
+    }
+}
+
+#[tokio::test]
+async fn shared_lcm_nonresume_same_profile_converts_without_lcm() {
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    let id = SessionId::new("same-profile-nontarget");
+    let (f, store) = fixture(&id).await;
+    let (old, _) = LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+    let sibling = SessionId::new(format!("{id}:gemini:0"));
+    let mut expected = CheckpointStore::load_latest(&*store, &sibling)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    assert_eq!(expected.history.len(), 84);
+    expected.extension_state.remove(LCM_COMPONENT_ID);
+    let owner = f.ensure_session(&sibling).await.unwrap();
+    assert_eq!(
+        store
+            .convert_legacy_session(&owner, &sibling)
+            .await
+            .unwrap(),
+        ConversionOutcome::Converted
+    );
+    assert_eq!(
+        snapshot(&store.journals().protected(), &sibling).await,
+        expected
+    );
+    assert_eq!(
+        store
+            .convert_legacy_session(&f.ensure_session(&id).await.unwrap(), &id)
+            .await
+            .unwrap(),
+        ConversionOutcome::Converted
+    );
+    assert_eq!(
+        snapshot(&store.journals().protected(), &id).await,
+        old.checkpoint.snapshot
+    );
+    let receipt: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE session_id=? AND timeline_id=? AND transferred_to_runtime_session_id=?")
+        .bind(owner).bind(old.timeline_id).bind(id.as_str()).fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(receipt, 1);
+}
+
+#[tokio::test]
 async fn selected_profile_owns_shared_pre_topic_lcm_after_profile_switch() {
     use agent_runtime::harness::{LCM_COMPONENT_ID, LcmRecoveryPolicy};
     use forge_agent_host::{

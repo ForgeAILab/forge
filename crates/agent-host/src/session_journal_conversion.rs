@@ -51,7 +51,6 @@ pub enum ConversionOutcome {
     Converted,
     AlreadyNative,
     SkippedActive,
-    SkippedProfile { selected_profile: String },
 }
 
 impl SqliteProtectedRuntimeStore {
@@ -141,8 +140,8 @@ impl SqliteProtectedRuntimeStore {
 
         // Resolve LCM only when the real legacy state requires it. The runtime
         // importer still decodes and validates both stores itself before publish.
-        let snapshot = SessionStore::load(&**self, id).await?;
-        let checkpoint = CheckpointStore::load_latest(&**self, id).await?;
+        let mut snapshot = SessionStore::load(&**self, id).await?;
+        let mut checkpoint = CheckpointStore::load_latest(&**self, id).await?;
         let referenced = snapshot
             .iter()
             .chain(checkpoint.iter().map(|c| &c.snapshot))
@@ -153,11 +152,23 @@ impl SqliteProtectedRuntimeStore {
                     .get("timeline_id")
                     .and_then(serde_json::Value::as_str)
             });
-        if let Some(selected_profile) = self
-            .legacy_lcm_conversion_profile(id.as_str(), referenced)
+        if let Some((target, scope, timeline)) = self
+            .legacy_lcm_conversion_target(id.as_str(), referenced)
             .await?
         {
-            return Ok(ConversionOutcome::SkippedProfile { selected_profile });
+            // Assign the shared timeline before publishing this sibling. The
+            // receipt changes only its import view, so reload both legacy copies.
+            self.resolve_lcm_store_admitted(
+                &target,
+                "agent_chat",
+                &scope,
+                false,
+                id.as_str(),
+                Some(&timeline),
+            )
+            .await?;
+            snapshot = SessionStore::load(&**self, id).await?;
+            checkpoint = CheckpointStore::load_latest(&**self, id).await?;
         }
         let needs_lcm = snapshot
             .iter()

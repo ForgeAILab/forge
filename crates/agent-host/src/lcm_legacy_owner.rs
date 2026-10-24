@@ -41,33 +41,86 @@ impl SqliteProtectedRuntimeStore {
                 "LCM shared chat selected profile has no resumable native session",
             )
         })?;
+        let tied: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_session s JOIN agent_session target ON target.id=?
+             WHERE s.identity_id=target.identity_id AND s.context_scope_id=target.context_scope_id
+               AND s.profile_id=target.profile_id AND s.id<>target.id
+               AND s.backend_kind='native' AND s.status='suspended' AND target.status='suspended'
+               AND s.replaced_by_session_id IS NULL AND s.created_at=target.created_at)",
+        )
+        .bind(&target)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(protected_database_error)?;
+        if tied {
+            return Err(RuntimeError::conflict(
+                "LCM chat ownership is ambiguous: suspended sessions have the same creation time",
+            ));
+        }
         Ok((selected, target))
     }
 
-    pub(crate) async fn legacy_lcm_conversion_profile(
+    pub(crate) async fn legacy_lcm_conversion_target(
         &self,
         runtime: &str,
         timeline: Option<&str>,
-    ) -> Result<Option<String>, RuntimeError> {
+    ) -> Result<Option<(String, String, String)>, RuntimeError> {
         let mut tx = db::begin_immediate(self.db.pool())
             .await
             .map_err(protected_database_error)?;
-        let session: Option<(String,String,String)> = sqlx::query_as(
-            "SELECT s.profile_id,s.identity_id,s.context_scope_id FROM agent_session s
+        let session: Option<(String,String,String,String,String)> = sqlx::query_as(
+            "SELECT s.id,s.identity_id,s.context_scope_id,c.scope_id,t.id FROM agent_session s
              JOIN agent_context_scope c ON c.id=s.context_scope_id
+             JOIN agent_lcm_timeline t ON t.identity_id=s.identity_id AND t.scope_type='agent_chat'
+                 AND t.scope_id=c.scope_id AND t.canonical_scope_id=c.scope_id AND t.retired_at IS NULL
              WHERE s.runtime_session_id=?1 AND c.scope_type='agent_chat'
-               AND (EXISTS(SELECT 1 FROM agent_lcm_timeline t
-                   WHERE t.identity_id=s.identity_id AND t.scope_type='agent_chat'
-                     AND t.scope_id=c.scope_id AND t.canonical_scope_id=c.scope_id AND t.retired_at IS NULL
-                     AND t.runtime_session_id IS NOT NULL
-                     AND (t.id=?2 OR EXISTS(SELECT 1 FROM agent_runtime_lcm_binding b
-                          WHERE b.runtime_session_id=?1 AND b.timeline_id=t.id)))
-                 OR EXISTS(SELECT 1 FROM agent_legacy_lcm_relinquishment r WHERE r.session_id=s.id))",
+               AND (t.id=?2 OR EXISTS(SELECT 1 FROM agent_runtime_lcm_binding b
+                   WHERE b.runtime_session_id=?1 AND b.timeline_id=t.id))
+               AND (t.runtime_session_id IS NOT NULL OR EXISTS(SELECT 1 FROM agent_session sibling
+                   WHERE sibling.identity_id=s.identity_id AND sibling.context_scope_id=s.context_scope_id
+                     AND sibling.id<>s.id))",
         ).bind(runtime).bind(timeline).fetch_optional(&mut *tx).await.map_err(protected_database_error)?;
-        let result = if let Some((profile, identity, context)) = session {
-            let (selected, _) =
-                Self::selected_chat_lcm_target(&mut tx, &identity, &context).await?;
-            (profile != selected).then_some(selected)
+        let result = if let Some((owner, identity, context, scope, timeline)) = session {
+            let (_, target) = Self::selected_chat_lcm_target(&mut tx, &identity, &context).await?;
+            if owner == target {
+                None
+            } else {
+                let (runtime, status): (Option<String>, String) = sqlx::query_as(
+                    "SELECT runtime_session_id,status FROM agent_session WHERE id=?",
+                )
+                .bind(target)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(protected_database_error)?;
+                if matches!(
+                    status.as_str(),
+                    "starting" | "ready" | "running" | "degraded"
+                ) {
+                    let old_runtime: Option<String> = sqlx::query_scalar(
+                        "SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?",
+                    )
+                    .bind(&timeline)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(protected_database_error)?;
+                    return Err(RuntimeError::conflict(
+                        if old_runtime.is_some() && old_runtime == runtime {
+                            "LCM sibling owner is active"
+                        } else {
+                            "LCM selected chat resume target is active"
+                        },
+                    ));
+                }
+                Some((
+                    runtime.ok_or_else(|| {
+                        RuntimeError::conflict(
+                            "LCM selected chat resume target has no runtime mapping",
+                        )
+                    })?,
+                    scope,
+                    timeline,
+                ))
+            }
         } else {
             None
         };
@@ -111,30 +164,50 @@ impl SqliteProtectedRuntimeStore {
         &self,
         runtime: &str,
         timeline: Option<&str>,
+        admitted_runtime: &str,
     ) -> Result<Option<LegacyLcmOwnerAdmission>, RuntimeError> {
         let Some(timeline) = timeline else {
             return Ok(None);
         };
-        let old_runtime: Option<String> = sqlx::query_scalar(
-            "SELECT t.runtime_session_id FROM agent_lcm_timeline t
+        let shared: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline t
              JOIN agent_session s ON s.runtime_session_id=?1
              JOIN agent_context_scope c ON c.id=s.context_scope_id
              WHERE t.id=?2 AND t.identity_id=s.identity_id AND t.scope_type='agent_chat'
                AND c.scope_type=t.scope_type AND c.scope_id=t.canonical_scope_id
-               AND t.runtime_session_id IS NOT NULL AND t.runtime_session_id<>?1",
+               AND t.scope_id=t.canonical_scope_id AND t.retired_at IS NULL
+               AND NOT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding b
+                   WHERE b.runtime_session_id=?1 AND b.timeline_id=t.id AND t.runtime_session_id=?1))",
         )
         .bind(runtime)
         .bind(timeline)
-        .fetch_optional(self.db.pool())
+        .fetch_one(self.db.pool())
         .await
         .map_err(protected_database_error)?;
-        let Some(old_runtime) = old_runtime else {
+        if !shared {
             return Ok(None);
-        };
+        }
+        if admitted_runtime != runtime {
+            let active: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM agent_session WHERE runtime_session_id=?
+                 AND status IN ('starting','ready','running','degraded'))",
+            )
+            .bind(runtime)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(protected_database_error)?;
+            if active {
+                return Err(RuntimeError::conflict(
+                    "LCM selected chat resume target is active",
+                ));
+            }
+        }
         let ineligible: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_session WHERE runtime_session_id=?1 AND status IN ('starting','ready','running','degraded'))
-                 OR EXISTS(SELECT 1 FROM agent_session_journal_session WHERE runtime_session_id=?1 AND (published=1 OR retired=1))",
-        ).bind(&old_runtime).fetch_one(self.db.pool()).await.map_err(protected_database_error)?;
+            "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline t JOIN agent_session s ON s.runtime_session_id=t.runtime_session_id
+                 WHERE t.id=?1 AND t.runtime_session_id<>?2 AND s.status IN ('starting','ready','running','degraded'))
+                 OR EXISTS(SELECT 1 FROM agent_session_journal_session j JOIN agent_lcm_timeline t ON t.runtime_session_id=j.runtime_session_id
+                     WHERE t.id=?1 AND t.runtime_session_id<>?2 AND (j.published=1 OR j.retired=1))",
+        ).bind(timeline).bind(runtime).fetch_one(self.db.pool()).await.map_err(protected_database_error)?;
         if ineligible {
             // The transaction below reports the durable reason without opening
             // or changing a native/active owner's journal writer epoch.
@@ -142,14 +215,14 @@ impl SqliteProtectedRuntimeStore {
         }
         let siblings: Vec<String> = sqlx::query_scalar(
             "SELECT s.runtime_session_id FROM agent_session s
-             JOIN agent_session target ON target.runtime_session_id=?
+             JOIN agent_session target ON target.runtime_session_id=?1
              WHERE s.identity_id=target.identity_id AND s.context_scope_id=target.context_scope_id
-               AND s.id<>target.id AND s.runtime_session_id IS NOT NULL
+               AND (s.id<>target.id OR ?1<>?2) AND s.runtime_session_id IS NOT NULL
                AND s.status NOT IN ('starting','ready','running','degraded')
                AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session j
                    WHERE j.runtime_session_id=s.runtime_session_id AND (j.published=1 OR j.retired=1))
              ORDER BY s.runtime_session_id",
-        ).bind(runtime).fetch_all(self.db.pool()).await.map_err(protected_database_error)?;
+        ).bind(runtime).bind(admitted_runtime).fetch_all(self.db.pool()).await.map_err(protected_database_error)?;
         let mut guard = LegacyLcmOwnerAdmission {
             writers: WriterChecks::default(),
             _admissions: Vec::new(),
@@ -158,16 +231,18 @@ impl SqliteProtectedRuntimeStore {
         // A writer on an unpublished root has no durable pin. Engine admission
         // must precede BEGIN IMMEDIATE because opening/closing leases writes.
         for sibling in siblings {
-            guard._admissions.push(
-                self.conversion_admission
-                    .session(&SessionId::new(&sibling))?
-                    .try_write_owned()
-                    .map_err(|_| {
-                        RuntimeError::conflict(
-                            "LCM sibling owner has foreground or conversion work",
-                        )
-                    })?,
-            );
+            if sibling != admitted_runtime {
+                guard._admissions.push(
+                    self.conversion_admission
+                        .session(&SessionId::new(&sibling))?
+                        .try_write_owned()
+                        .map_err(|_| {
+                            RuntimeError::conflict(
+                                "LCM sibling owner has foreground or conversion work",
+                            )
+                        })?,
+                );
+            }
             for engine in [self.journals().protected(), self.journals().ordinary()] {
                 let nonce = db::new_uuid_v4();
                 match engine
@@ -201,8 +276,8 @@ impl SqliteProtectedRuntimeStore {
         Ok(Some(guard))
     }
 
-    /// Pre-topic timelines belonged to the chat. An older runtime may have
-    /// opened one first after V149 even though the newer runtime last wrote it.
+    /// Claim or move the pre-topic timeline to the selected resume target and
+    /// receipt its siblings' import views before any native publication.
     pub(super) async fn transfer_legacy_chat_lcm_owner(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -223,9 +298,6 @@ impl SqliteProtectedRuntimeStore {
         let old_runtime: Option<String> = t
             .try_get("runtime_session_id")
             .map_err(protected_database_error)?;
-        let Some(old_runtime) = old_runtime.filter(|id| id != runtime) else {
-            return Ok(());
-        };
         if t.get::<String, _>("scope_type") != "agent_chat" {
             return Ok(());
         }
@@ -237,7 +309,7 @@ impl SqliteProtectedRuntimeStore {
              WHERE s.runtime_session_id IN (?,?)",
         )
         .bind(runtime)
-        .bind(&old_runtime)
+        .bind(old_runtime.as_deref())
         .fetch_all(&mut **tx)
         .await
         .map_err(protected_database_error)?;
@@ -247,23 +319,51 @@ impl SqliteProtectedRuntimeStore {
             .collect();
         let source: Vec<_> = sessions
             .iter()
-            .filter(|s| s.get::<String, _>("runtime_session_id") == old_runtime)
+            .filter(|s| {
+                old_runtime.as_deref().is_some_and(|old| {
+                    old != runtime && s.get::<String, _>("runtime_session_id") == old
+                })
+            })
             .collect();
-        let ([target], [source]) = (target.as_slice(), source.as_slice()) else {
+        let [target] = target.as_slice() else {
             return Err(RuntimeError::conflict(
                 "LCM sibling ownership has an ambiguous runtime mapping",
             ));
+        };
+        let source = match source.as_slice() {
+            [source] => Some(*source),
+            [] if old_runtime.as_deref().is_none_or(|old| old == runtime) => None,
+            _ => {
+                return Err(RuntimeError::conflict(
+                    "LCM sibling ownership has an ambiguous runtime mapping",
+                ));
+            }
         };
         let identity: String = target.get("identity_id");
         let context: String = target.get("context_scope_id");
         let profile: String = target.get("profile_id");
         let scope: String = target.get("scope_id");
         let target_id: String = target.get("id");
-        let source_id: String = source.get("id");
+        let source_id: Option<String> = source.map(|source| source.get("id"));
         let created: String = target.get("created_at");
-        if source.get::<String, _>("identity_id") != identity
-            || source.get::<String, _>("context_scope_id") != context
-            || target.get::<String, _>("scope_type") != "agent_chat"
+        let mut relinquishing = if source.is_none() {
+            self.legacy_lcm_references(tx, &identity, &context, &target_id, timeline)
+                .await?
+        } else {
+            Vec::new()
+        };
+        if source.is_none() && relinquishing.is_empty() {
+            let has_siblings: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM agent_session WHERE identity_id=? AND context_scope_id=? AND id<>?)",
+            ).bind(&identity).bind(&context).bind(&target_id).fetch_one(&mut **tx).await.map_err(protected_database_error)?;
+            if !has_siblings {
+                return Ok(());
+            }
+        }
+        if source.is_some_and(|s| {
+            s.get::<String, _>("identity_id") != identity
+                || s.get::<String, _>("context_scope_id") != context
+        }) || target.get::<String, _>("scope_type") != "agent_chat"
             || t.get::<String, _>("identity_id") != identity
             || t.get::<Option<String>, _>("canonical_scope_id").as_deref() != Some(&scope)
             || t.get::<String, _>("scope_id") != scope
@@ -273,31 +373,38 @@ impl SqliteProtectedRuntimeStore {
                 "persisted LCM timeline is not a shared pre-topic chat timeline",
             ));
         }
-        if matches!(
-            source.get::<String, _>("status").as_str(),
-            "starting" | "ready" | "running" | "degraded"
-        ) {
+        if source.is_some_and(|s| {
+            matches!(
+                s.get::<String, _>("status").as_str(),
+                "starting" | "ready" | "running" | "degraded"
+            )
+        }) {
             return Err(RuntimeError::conflict("LCM sibling owner is active"));
         }
-        if source.get::<String, _>("created_at") == created {
+        if source.is_some_and(|s| s.get::<String, _>("created_at") == created) {
             return Err(RuntimeError::conflict(
                 "LCM chat ownership is ambiguous: suspended sessions have the same creation time",
             ));
         }
-        if source.get::<String, _>("backend_kind") != "native"
-            || target.get::<String, _>("backend_kind") != "native"
-            || source.get::<String, _>("status") != "suspended"
-            || source.get::<String, _>("created_at") >= created
+        if source.is_some_and(|s| {
+            s.get::<String, _>("backend_kind") != "native"
+                || s.get::<String, _>("status") != "suspended"
+                || s.get::<String, _>("created_at") >= created
+                || s.get::<Option<String>, _>("replaced_by_session_id")
+                    .is_some()
+                || s.get::<Option<String>, _>("predecessor_session_id")
+                    .is_some()
+        }) || target.get::<String, _>("backend_kind") != "native"
             || !matches!(
                 target.get::<String, _>("status").as_str(),
                 "suspended" | "starting" | "ready" | "running" | "degraded"
             )
-            || [*source, *target].iter().any(|s| {
-                s.get::<Option<String>, _>("replaced_by_session_id")
-                    .is_some()
-                    || s.get::<Option<String>, _>("predecessor_session_id")
-                        .is_some()
-            })
+            || target
+                .get::<Option<String>, _>("replaced_by_session_id")
+                .is_some()
+            || target
+                .get::<Option<String>, _>("predecessor_session_id")
+                .is_some()
         {
             return Err(RuntimeError::conflict(
                 "LCM sibling owner is not superseded by the chat resume target",
@@ -343,6 +450,20 @@ impl SqliteProtectedRuntimeStore {
                 "LCM shared chat has a topic or pending rotation reference",
             ));
         }
+        let native: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_session_journal_session
+             WHERE runtime_session_id IN (?,?) AND (published=1 OR retired=1))",
+        )
+        .bind(old_runtime.as_deref())
+        .bind(runtime)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(protected_database_error)?;
+        if native {
+            return Err(RuntimeError::conflict(
+                "LCM sibling ownership cannot move after native journal publication or retirement",
+            ));
+        }
         if t.get::<Option<String>, _>("claim_owner").is_some()
             || t.get::<i64, _>("claim_generation") != 0
         {
@@ -356,24 +477,10 @@ impl SqliteProtectedRuntimeStore {
                 "LCM timeline does not establish pre-topic continuity with the chat resume target",
             ));
         }
-        let native: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_session_journal_session
-             WHERE runtime_session_id IN (?,?) AND (published=1 OR retired=1))",
-        )
-        .bind(&old_runtime)
-        .bind(runtime)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(protected_database_error)?;
-        if native {
-            return Err(RuntimeError::conflict(
-                "LCM sibling ownership cannot move after native journal publication or retirement",
-            ));
-        }
         let pinned: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_session_journal_pin WHERE runtime_session_id=?)",
         )
-        .bind(&old_runtime)
+        .bind(old_runtime.as_deref())
         .fetch_one(&mut **tx)
         .await
         .map_err(protected_database_error)?;
@@ -384,11 +491,12 @@ impl SqliteProtectedRuntimeStore {
         }
         let other_binding: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding
-             WHERE timeline_id=? AND runtime_session_id NOT IN (?,?))",
+             WHERE timeline_id=? AND runtime_session_id<>? AND (? IS NULL OR runtime_session_id<>?))",
         )
         .bind(timeline)
-        .bind(&old_runtime)
         .bind(runtime)
+        .bind(old_runtime.as_deref())
+        .bind(old_runtime.as_deref())
         .fetch_one(&mut **tx)
         .await
         .map_err(protected_database_error)?;
@@ -399,19 +507,22 @@ impl SqliteProtectedRuntimeStore {
         }
         let other_source_binding: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id=? AND timeline_id<>?)",
-        ).bind(&old_runtime).bind(timeline).fetch_one(&mut **tx).await.map_err(protected_database_error)?;
+        ).bind(old_runtime.as_deref()).bind(timeline).fetch_one(&mut **tx).await.map_err(protected_database_error)?;
         if other_source_binding {
             return Err(RuntimeError::conflict(
                 "LCM sibling owner is bound to a different timeline",
             ));
         }
-        let mut relinquishing = self
-            .legacy_lcm_references(tx, &identity, &context, &target_id, timeline)
-            .await?;
-        if !relinquishing
-            .iter()
-            .any(|s| s.get::<String, _>("id") == source_id)
-        {
+        if source.is_some() {
+            relinquishing = self
+                .legacy_lcm_references(tx, &identity, &context, &target_id, timeline)
+                .await?;
+        }
+        if let Some(source_id) = source_id.filter(|source_id| {
+            !relinquishing
+                .iter()
+                .any(|s| s.get::<String, _>("id") == *source_id)
+        }) {
             relinquishing.push(
                 sqlx::query("SELECT * FROM agent_session WHERE id=?")
                     .bind(&source_id)
@@ -420,7 +531,10 @@ impl SqliteProtectedRuntimeStore {
                     .map_err(protected_database_error)?,
             );
         }
-        if admission.is_none_or(|guard| !guard.runtimes.contains(&old_runtime)) {
+        if source.is_some()
+            && admission
+                .is_none_or(|guard| !guard.runtimes.contains(old_runtime.as_deref().unwrap()))
+        {
             return Err(RuntimeError::conflict(
                 "LCM sibling ownership changed before writer admission",
             )
@@ -429,13 +543,13 @@ impl SqliteProtectedRuntimeStore {
         sqlx::query(
             "DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id=? AND timeline_id=?",
         )
-        .bind(&old_runtime)
+        .bind(old_runtime.as_deref().filter(|old| *old != runtime))
         .bind(timeline)
         .execute(&mut **tx)
         .await
         .map_err(protected_database_error)?;
-        sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=? WHERE id=? AND runtime_session_id=?")
-            .bind(runtime).bind(timeline).bind(&old_runtime).execute(&mut **tx).await.map_err(protected_database_error)?;
+        sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=? WHERE id=? AND runtime_session_id IS ?")
+            .bind(runtime).bind(timeline).bind(old_runtime.as_deref()).execute(&mut **tx).await.map_err(protected_database_error)?;
         for sibling in relinquishing {
             let sibling_runtime: Option<String> = sibling.get("runtime_session_id");
             let sibling_runtime = sibling_runtime.ok_or_else(|| {
@@ -581,7 +695,7 @@ mod tests {
     ) -> (
         Vec<(String, String)>,
         Vec<(Option<String>, String, Option<String>, i64)>,
-        String,
+        Option<String>,
         Vec<(String, String, String)>,
     ) {
         let db = f.database();
@@ -598,6 +712,224 @@ mod tests {
         let receipts = sqlx::query_as("SELECT session_id,timeline_id,transferred_to_runtime_session_id FROM agent_legacy_lcm_relinquishment ORDER BY session_id,timeline_id")
             .fetch_all(db.pool()).await.unwrap();
         (bindings, sessions, owner, receipts)
+    }
+
+    #[tokio::test]
+    async fn unowned_profile_switch_guards_hold_before_other_profile_publication() {
+        for (case, expected) in [
+            (
+                "no-selected-profile",
+                "LCM shared chat identity has no selected profile",
+            ),
+            (
+                "selected-profile-without-session",
+                "LCM shared chat selected profile has no resumable native session",
+            ),
+            ("claim", "LCM shared timeline has a runtime claim"),
+            (
+                "binding",
+                "LCM shared timeline has an additional runtime binding",
+            ),
+            (
+                "rotation",
+                "LCM shared chat has a topic or pending rotation reference",
+            ),
+            (
+                "failed-reference",
+                "LCM referenced sibling is not an inactive legacy predecessor",
+            ),
+            (
+                "target-foreground",
+                "LCM sibling owner has foreground or conversion work",
+            ),
+            ("target-writer", "LCM sibling owner has a journal writer"),
+            ("target-active", "LCM selected chat resume target is active"),
+            (
+                "target-unmapped",
+                "LCM selected chat resume target has no runtime mapping",
+            ),
+            (
+                "target-other-reference",
+                "LCM selected chat resume target does not reference the shared timeline",
+            ),
+            (
+                "target-no-reference",
+                "LCM selected chat resume target does not reference the shared timeline",
+            ),
+            (
+                "target-binding",
+                "LCM selected chat resume target is bound to a different timeline",
+            ),
+            (
+                "target-tie",
+                "LCM chat ownership is ambiguous: suspended sessions have the same creation time",
+            ),
+        ] {
+            let f = FileDb::new().await.unwrap();
+            let db = f.database();
+            let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+            let id = SessionId::new(format!("unowned-guard-{case}"));
+            let (old, older) =
+                LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+            let mut held = None;
+            let mut writer = None;
+            match case {
+                "no-selected-profile" => {
+                    sqlx::query("UPDATE agent_identity SET selected_profile_id=NULL WHERE id='journal-agent'").execute(db.pool()).await.unwrap();
+                }
+                "selected-profile-without-session" => {
+                    sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('empty-profile','journal-agent','native','embedded','c','u')").execute(db.pool()).await.unwrap();
+                    sqlx::query("UPDATE agent_identity SET selected_profile_id='empty-profile' WHERE id='journal-agent'").execute(db.pool()).await.unwrap();
+                }
+                "claim" => {
+                    sqlx::query("UPDATE agent_lcm_timeline SET claim_owner='other-writer',claim_generation=1 WHERE id=?").bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+                }
+                "binding" => {
+                    sqlx::query("INSERT INTO agent_runtime_lcm_binding(runtime_session_id,timeline_id) VALUES ('other-runtime',?)").bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+                }
+                "rotation" => {
+                    sqlx::query("INSERT INTO agent_chat_topic_rotation(chat_id,id,label,cause,created_at) VALUES (?,'pending-rotation','Pending','idle','c')").bind(format!("chat:{id}")).execute(db.pool()).await.unwrap();
+                }
+                "failed-reference" => {
+                    sqlx::query(
+                        "UPDATE agent_session SET status='failed' WHERE runtime_session_id=?",
+                    )
+                    .bind(format!("{id}:glm:0"))
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                "target-active" => {
+                    sqlx::query(
+                        "UPDATE agent_session SET status='ready' WHERE runtime_session_id=?",
+                    )
+                    .bind(id.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                }
+                "target-unmapped" => {
+                    sqlx::query("UPDATE agent_session SET runtime_session_id=NULL WHERE runtime_session_id=?").bind(id.as_str()).execute(db.pool()).await.unwrap();
+                }
+                "target-other-reference" | "target-no-reference" => {
+                    let mut snapshot = old.snapshot.clone();
+                    if case == "target-no-reference" {
+                        snapshot
+                            .extension_state
+                            .remove(agent_runtime::harness::LCM_COMPONENT_ID);
+                    } else {
+                        snapshot
+                            .extension_state
+                            .get_mut(agent_runtime::harness::LCM_COMPONENT_ID)
+                            .unwrap()
+                            .value["timeline_id"] = serde_json::json!("other-timeline");
+                    }
+                    let checkpoint = TurnCheckpoint::session_boundary(snapshot.clone(), 6).unwrap();
+                    store
+                        .seed_legacy_bytes(
+                            &id,
+                            Some(&serde_json::to_vec(&snapshot).unwrap()),
+                            Some(&serde_json::to_vec(&checkpoint).unwrap()),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
+                "target-tie" => {
+                    sqlx::query("UPDATE agent_session SET created_at='2026-09-24T08:34:00Z' WHERE runtime_session_id=?")
+                        .bind(format!("{id}:gemini:0")).execute(db.pool()).await.unwrap();
+                }
+                "target-binding" => {
+                    let replacement = old.bind_empty_replacement(&f).await;
+                    sqlx::query("UPDATE agent_lcm_timeline SET revision=1 WHERE id=?")
+                        .bind(replacement.timeline_id())
+                        .execute(db.pool())
+                        .await
+                        .unwrap();
+                }
+                "target-foreground" => {
+                    held = Some(store.foreground_session(&id).await.unwrap());
+                }
+                "target-writer" => {
+                    let engine = store.journals().ordinary();
+                    let lease = engine
+                        .open(
+                            &id,
+                            JournalOpen {
+                                root: JournalRootSelection::Latest,
+                                expected_revision: None,
+                                operation: JournalOperationId::new("target-writer"),
+                                pin: JournalPinId::new("target-writer"),
+                                intent: JournalOpenIntent::ExclusiveWriter,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    writer = Some((engine, lease));
+                }
+                _ => unreachable!(),
+            }
+            let before = ownership(&f).await;
+            let error = store
+                .convert_legacy_session(&f.ensure_session(&older).await.unwrap(), &older)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Conflict, "{case}");
+            assert_eq!(error.message, expected, "{case}");
+            assert_eq!(ownership(&f).await, before, "{case}");
+            let published: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_session_journal_session WHERE published=1 OR retired=1",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(published, 0, "{case}");
+            if let Some((engine, lease)) = writer {
+                engine.close(lease).await.unwrap();
+            }
+            drop(held);
+        }
+    }
+
+    #[tokio::test]
+    async fn unowned_profile_switch_rolls_back_before_old_profile_import() {
+        let f = FileDb::new().await.unwrap();
+        let db = f.database();
+        let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+        let id = SessionId::new("unowned-rollback");
+        let (old, older) =
+            LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+        let owner = f.ensure_session(&older).await.unwrap();
+        let before = ownership(&f).await;
+        sqlx::query("CREATE TRIGGER reject_unowned_binding BEFORE INSERT ON agent_runtime_lcm_binding WHEN NEW.runtime_session_id='unowned-rollback' BEGIN SELECT RAISE(ABORT,'injected binding failure'); END").execute(db.pool()).await.unwrap();
+        assert!(store.convert_legacy_session(&owner, &older).await.is_err());
+        assert_eq!(ownership(&f).await, before);
+        let published: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_session_journal_session WHERE published=1 OR retired=1",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(published, 0);
+        sqlx::query("DROP TRIGGER reject_unowned_binding")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.convert_legacy_session(&owner, &older).await.unwrap(),
+            crate::session_journal_conversion::ConversionOutcome::Converted
+        );
+        let after = ownership(&f).await;
+        assert_eq!(after.2, Some(id.to_string()));
+        assert_eq!(after.3.len(), 10);
+        let binding: String = sqlx::query_scalar(
+            "SELECT timeline_id FROM agent_runtime_lcm_binding WHERE runtime_session_id=?",
+        )
+        .bind(id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(binding, old.timeline_id);
     }
 
     #[tokio::test]
@@ -734,16 +1066,67 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    assert_eq!(
-                        store
-                            .convert_legacy_session(
-                                &f.ensure_session(&older).await.unwrap(),
-                                &older
-                            )
-                            .await
-                            .unwrap(),
-                        crate::session_journal_conversion::ConversionOutcome::Converted
-                    );
+                    // Reproduce an owner published before this conversion rule
+                    // through the runtime importer, bypassing host arbitration.
+                    use agent_runtime::{
+                        core::{
+                            catalog::{ModelLimits, ResolvedModelProfile},
+                            provider::{Capabilities, ModelId},
+                        },
+                        harness::{
+                            LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver,
+                        },
+                        provider::fake::FakeProvider,
+                        runtime::{RuntimeBuilder, StartSession},
+                    };
+                    let lcm = store
+                        .resolve_lcm_store(
+                            older.as_str(),
+                            "agent_chat",
+                            &format!("chat:{id}"),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                    let binding = lcm.runtime_binding(older.clone()).unwrap();
+                    let coordinator = LcmCoordinator::new(
+                        Arc::new(lcm),
+                        Arc::new(crate::DeterministicLcmSummaryModel::default()),
+                        Arc::new(StaticLcmTimelineResolver::new(binding)),
+                        LcmCoordinatorPolicy {
+                            input_budget_tokens: 28_000,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    let provider = Arc::new(FakeProvider::new(
+                        "fake",
+                        Capabilities::basic_streaming(),
+                        Vec::new(),
+                    ));
+                    let rt = RuntimeBuilder::new(ModelId::new("fake"))
+                        .provider_name("fake")
+                        .provider(provider.clone())
+                        .model_profile(ResolvedModelProfile::explicit(
+                            "fake",
+                            ModelId::new("fake"),
+                            ModelLimits::new(32_000, 28_000, 4_000),
+                        ))
+                        .session_store(store.clone())
+                        .checkpoint_store(store.clone())
+                        .lcm(Arc::new(coordinator))
+                        .build()
+                        .unwrap();
+                    let session = rt
+                        .start_session(
+                            StartSession::resume(older.clone())
+                                .with_lcm_policy(agent_runtime::harness::LcmRecoveryPolicy::Adopt),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(provider.requests().is_empty());
+                    drop(session);
+                    drop(rt);
                 }
                 "claim" => {
                     sqlx::query(

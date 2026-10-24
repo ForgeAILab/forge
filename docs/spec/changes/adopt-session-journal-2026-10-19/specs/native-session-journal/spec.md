@@ -291,7 +291,9 @@ The session resumed for an identity's currently selected Profile SHALL own a gua
 - **AND** the original encrypted legacy payloads remain unchanged and the runtime rebuilds missing LCM-derived state against a fresh session timeline without failure or parking
 - **AND** the relinquishment receipt survives process restart and deletion of the transferred timeline; an unrecorded binding mismatch still fails closed
 
-#### Scenario: Background discovery encounters the non-selected owner first
-- **WHEN** a conversion page reaches a non-selected Profile's legacy shared-timeline owner before the selected Profile's resume target
-- **THEN** the worker defers that owner without native publication, retirement or a parked error, and converts the selected target with the full shared history
-- **AND** a later Profile selection change re-enables the deferred owner in the same worker; retries do not duplicate native publication or relinquishment receipts
+#### Scenario: Shared timeline conversion is independent of cursor order
+- **WHEN** conversion reaches any legacy sibling other than the selected Profile's resume target, before or after that target, and the shared pre-topic timeline is unowned after V149 or owned by a guarded legacy sibling
+- **THEN** ownership, target binding, version-fenced relinquishment receipts and same-Profile replacement commit together before that sibling can publish
+- **AND** conversion reloads both sibling stores through the receipts and publishes only its own transcript and other protected state without the shared LCM-derived namespaces; the selected target imports the full original LCM history
+- **AND** an active selected target or writer, missing selection/resume target, or any existing ownership ambiguity remains a precise Conflict; failures roll back every ownership effect
+- **AND** both cursor orders and fresh-cursor retries preserve the same owner and unchanged legacy ciphertext without duplicate publications, timelines or receipts

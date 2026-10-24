@@ -163,3 +163,10 @@ relinquishment transactionally so future import omits only their shared
 LCM-derived state and rebuilds it from retained history. The appended design
 Owner Decisions record the maintainer's instruction verbatim; task 34 and the
 native-session-journal delta cover implementation and focused verification.
+
+The real-copy correction covers the post-V149 unowned/unbound timeline as well
+as a previously assigned owner. Conversion assigns ownership and records
+relinquishment before any non-target sibling publishes, then imports that
+sibling's own transcript and protected state immediately. Both worker cursor
+orders, unchanged legacy data and a zero-provider native Main Chat resume are
+required; Profile-based conversion deferral is removed.

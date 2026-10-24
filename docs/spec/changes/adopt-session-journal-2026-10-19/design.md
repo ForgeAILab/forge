@@ -1439,8 +1439,8 @@ Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 8
 
 This amendment supersedes the same-Profile-only ownership restrictions in D5.
 
-For a shared pre-V149 Chat timeline owned by an older, unlinked suspended
-sibling, conversion and lazy resume transfer ownership to the resume target for
+For a shared pre-V149 Chat timeline that is unowned or owned by an older,
+unlinked suspended sibling, conversion and lazy resume assign ownership to the resume target for
 the identity's currently selected Profile. Active-first/newest-suspended native
 resolution still applies within that Profile; another dormant Profile does not
 compete. The timeline must predate and have been updated after the target's
@@ -1460,10 +1460,15 @@ timeline deletion and cascade only with the losing session. On a later Profile
 switch, legacy decoding omits only the recorded LCM and semantic-summary state
 from the import view. The transcript and other protected state import exactly;
 Forge binds a fresh timeline and the runtime rebuilds its missing derived state.
-Unrecorded binding mismatches still fail closed. Background conversion defers a
-non-selected shared-timeline sibling before it can publish, including when it
-appears before the selected target in a keyset page, and retries it in the same
-worker after the selection changes. Failures roll back receipts and all labels;
+Unrecorded binding mismatches still fail closed. Before a non-target sibling can
+publish, background conversion assigns the timeline and binding to the selected
+resume target and records relinquishment. It then reloads both sibling stores
+through the receipts and converts the sibling's own state without shared LCM.
+This applies to unowned post-V149 timelines and previously assigned timelines,
+and to non-target siblings of either Profile. When routing another session's
+conversion it admits the selected target as well; an active target or writer is
+a conflict. Both cursor orders have identical outcomes, with no selection-based
+worker exclusion. Failures roll back receipts and all labels;
 retries reuse the original timeline without duplicating history.
 V149 is unchanged; it backfills scope/retirement metadata, not runtime ownership.
 

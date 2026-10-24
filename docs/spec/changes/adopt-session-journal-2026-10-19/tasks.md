@@ -845,3 +845,29 @@ benchmark receipts predate the tag and no benchmark rerun is claimed.
   focused suites, migration units, strict Clippy, fmt and spec validation pass;
   the two added reference guards pass their bounded module rerun. No real data
   was accessed. Earlier unfinished tasks and Owner Decisions remain unchanged.
+
+## 2026-10-24 real-copy shared LCM correction
+
+- [x] **35. Order-independent ownership before sibling publication.** Reproduce
+  the supplied copy's unowned/unbound post-V149 timeline, both-store references,
+  distinct sibling histories, 8+3 sessions and zero nodes; retain fail-without
+  evidence. Assign the selected resume target and receipt all relinquishments
+  before any non-target sibling imports, then convert that sibling's own state.
+  Verify both cursor orders, cold retries, same-Profile non-target import,
+  rollback and all ownership/writer/reference guards. Run the real-copy dry run,
+  compare retained ciphertext and LCM rows, and prove converted Main Chat lazy
+  resume with zero provider calls. Finish requested focused suites, strict
+  three-package Clippy, fmt and documentation; delete disposable work copies.
+  Completed (2026-10-24): the exact unowned 8+3 shape fails without the fix.
+  Both cursor orders, cold retries, same-Profile non-target import and all
+  ownership/claim/writer/reference/rollback guards pass. The final fresh real
+  copy converts A, B and the other Main Chat: three conversions, nine retirement
+  skips, zero parked/unreadable/remaining. B retains the original 114 entries,
+  zero nodes and 121 operations; ten receipts preserve sibling import views.
+  Both native domains match receipt-filtered legacy state. B's lazy resume uses
+  zero provider calls; its claim advances revision 131 to 132 without history
+  changes. Legacy ciphertext and LCM entry/node/operation rows compare unchanged.
+  Focused suites, strict three-package Clippy, fmt and spec validation pass.
+  Standalone conversion remains unchanged; two existing regressions caught and
+  verified that restriction without fixture/assertion changes. All work copies
+  are deleted. Earlier unfinished tasks and Owner Decisions remain unchanged.

@@ -24,7 +24,6 @@ pub struct ConversionCursor {
     // Process-local decisions preserve legacy rows. Restart retries parked
     // non-retryable errors; transient failures stay eligible for the next sweep.
     excluded: BTreeMap<String, String>,
-    profile_selections: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -33,7 +32,6 @@ pub struct ConversionReport {
     pub converted: usize,
     pub skipped_active: usize,
     pub skipped_retired: usize,
-    pub skipped_profile: usize,
     pub parked_by_reason: BTreeMap<String, usize>,
     pub parked_sessions: Vec<ParkedSession>,
     pub skipped_unreadable: usize,
@@ -140,27 +138,6 @@ impl SessionJournalConversion {
         let started = Instant::now();
         let deadline = started + budget;
         let mut report = ConversionReport::default();
-        if !cursor.profile_selections.is_empty() {
-            let owners =
-                serde_json::json!(cursor.profile_selections.keys().collect::<Vec<_>>()).to_string();
-            let selections: Vec<(String, Option<String>)> = sqlx::query_as(
-                "SELECT s.id,i.selected_profile_id FROM agent_session s
-                 JOIN agent_identity i ON i.id=s.identity_id
-                 WHERE s.id IN (SELECT value FROM json_each(?))",
-            )
-            .bind(owners)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db::DbError::from)?;
-            for (owner, selected) in selections {
-                if cursor.profile_selections.get(&owner).map(String::as_str) != selected.as_deref()
-                {
-                    cursor.profile_selections.remove(&owner);
-                    cursor.excluded.remove(&owner);
-                    cursor.after.clear();
-                }
-            }
-        }
         let page = self
             .db
             .legacy_journal_conversion_page(
@@ -204,15 +181,6 @@ impl SessionJournalConversion {
                 Ok(ConversionOutcome::Converted) => report.converted += 1,
                 Ok(ConversionOutcome::AlreadyNative) => {}
                 Ok(ConversionOutcome::SkippedActive) => report.skipped_active += 1,
-                Ok(ConversionOutcome::SkippedProfile { selected_profile }) => {
-                    report.skipped_profile += 1;
-                    cursor
-                        .profile_selections
-                        .insert(owner.clone(), selected_profile);
-                    cursor
-                        .excluded
-                        .insert(owner.clone(), "profile_selection".into());
-                }
                 Err(error) if error.retryable => {
                     tracing::debug!(target: "forge_session_journal", runtime_session_id=runtime,
                         error_kind=?error.kind, "background journal conversion deferred for retry");
@@ -257,7 +225,6 @@ impl SessionJournalConversion {
             .await?;
         tracing::debug!(target: "forge_session_journal", duration_us=started.elapsed().as_micros() as u64,
             examined=report.examined, converted=report.converted, skipped_active=report.skipped_active, skipped_retired=report.skipped_retired, parked_by_reason=?report.parked_by_reason,
-            skipped_profile=report.skipped_profile,
             skipped_unreadable=report.skipped_unreadable, conflicts=report.conflicts, remaining=report.remaining,
             budget_exhausted=report.budget_exhausted, "journal conversion pass");
         Ok(report)
