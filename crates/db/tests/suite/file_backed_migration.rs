@@ -11,8 +11,248 @@ use sqlx::Row;
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const ORIGINAL_V146_SQL: &str = include_str!("../fixtures/v146_original.sql");
+const V146_FILENAME: &str = "V146__drop_execution_progress_events.sql";
+
+async fn v145_file_backed_database() -> (tempfile::TempDir, PathBuf, sqlx::SqlitePool) {
+    let fixture = tempfile::tempdir().expect("fixture directory creates");
+    let migration_dir = fixture.path().join("migrations");
+    fs::create_dir(&migration_dir).unwrap();
+    copy_migrations_up_to(145, &migration_dir);
+    let pool = create_sqlite_pool(&format!(
+        "sqlite://{}",
+        fixture.path().join("forge.db").display()
+    ))
+    .await
+    .unwrap();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    (fixture, migration_dir, pool)
+}
+
+#[tokio::test]
+async fn v146_prunes_progress_history_with_indexed_cascades() {
+    let (_fixture, migration_dir, pool) = v145_file_backed_database().await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::raw_sql(
+        "WITH RECURSIVE numbers(n) AS (
+             VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 6000
+         ), kinds(kind, event_type) AS (
+             VALUES('progress', 'execution.progressed'), ('other', 'execution.started')
+         )
+         INSERT INTO domain_event (
+             id, event_type, entity_type, entity_id, actor_type,
+             scope_type, scope_id, correlation_id, dedupe_key, created_at
+         )
+         SELECT 'v146-' || kind || '-' || n, event_type, 'execution', 'execution',
+                'system', 'system', 'system', 'correlation', kind || '-' || n, 'now'
+         FROM numbers CROSS JOIN kinds;
+
+         WITH consumers(name) AS (VALUES('a'), ('b'), ('c'), ('d'), ('e'))
+         INSERT INTO event_projection_receipt (consumer_name, event_id, dedupe_key, processed_at)
+         SELECT name, id, id, 'now' FROM domain_event CROSS JOIN consumers;
+         INSERT INTO event_processing_lease (
+             consumer_name, event_sequence, lease_owner, leased_until, updated_at
+         )
+         SELECT 'a', sequence, 'owner', 'later', 'now' FROM domain_event;
+
+         INSERT INTO attention_projection (
+             id, attention_type, scope_type, scope_id, source_event_id,
+             priority, summary, dedupe_key, occurred_at, updated_at
+         )
+         SELECT id, 'test', 'system', 'system', id, 0, 'retained attention', id, 'now', 'now'
+         FROM domain_event WHERE event_type = 'execution.started' OR id = 'v146-progress-1';
+         INSERT INTO command_receipt (
+             id, principal_type, principal_id, scope_type, scope_id, operation,
+             idempotency_key, input_digest, policy_result, correlation_id,
+             event_id, outcome_json, committed_at
+         )
+         SELECT id, 'system', 'owner', 'account', 'account', 'test', id, 'digest',
+                'allowed', 'correlation', id, '{}', 'now'
+         FROM domain_event WHERE event_type = 'execution.started' OR id = 'v146-progress-2';
+         INSERT INTO agent_wake_disposition (
+             id, consumer_name, source_event_id, source_event_sequence,
+             attempt_number, max_attempts, disposition, reason, created_at, updated_at
+         )
+         SELECT id, 'wake', id, sequence, 1, 1, 'deterministically_suppressed',
+                'retained wake', 'now', 'now'
+         FROM domain_event
+         WHERE event_type = 'execution.started' OR id IN ('v146-progress-3', 'v146-progress-4');
+         INSERT INTO agent_wake_disposition_current (
+             consumer_name, source_event_id, disposition_id, attempt_number, updated_at
+         )
+         SELECT consumer_name, source_event_id, id, 1, 'now' FROM agent_wake_disposition
+         WHERE source_event_id != 'v146-progress-3';
+         INSERT INTO memory_item_legacy (
+             id, scope_type, scope_id, source_event_id, source_type, kind, title, body, created_at
+         )
+         SELECT id, 'project', 'project', id, 'event', 'observation', 'Memory', 'kept body', 'now'
+         FROM domain_event
+         WHERE event_type = 'execution.started' OR id IN ('v146-progress-1', 'v146-progress-5');",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let schema_before: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, sql FROM sqlite_schema ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let patched_sql = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(V146_FILENAME),
+    )
+    .unwrap();
+    assert!(
+        patched_sql.contains(ORIGINAL_V146_SQL),
+        "original DELETE must stay byte-for-byte unchanged"
+    );
+    fs::write(migration_dir.join(V146_FILENAME), patched_sql).unwrap();
+    let started = Instant::now();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    let elapsed = started.elapsed();
+    eprintln!("V146 upgrade: {elapsed:?} (6,000 progress events, 60,000 receipts)");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "V146 took {elapsed:?}; event child lookups must use indexes"
+    );
+
+    let retained_progress: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM domain_event WHERE event_type = 'execution.progressed' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained_progress,
+        [
+            "v146-progress-1",
+            "v146-progress-2",
+            "v146-progress-3",
+            "v146-progress-4"
+        ]
+    );
+    for (table, expected) in [
+        ("domain_event", 6004),
+        ("event_projection_receipt", 30_020),
+        ("event_processing_lease", 6004),
+        ("attention_projection", 6001),
+        ("command_receipt", 6001),
+        ("agent_wake_disposition", 6002),
+        ("agent_wake_disposition_current", 6001),
+        ("memory_item_legacy", 6002),
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "{table} retains exactly its expected rows");
+    }
+    let memory: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, source_event_id, body FROM memory_item_legacy
+         WHERE id LIKE 'v146-progress-%' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        memory,
+        vec![
+            (
+                "v146-progress-1".into(),
+                Some("v146-progress-1".into()),
+                "kept body".into()
+            ),
+            ("v146-progress-5".into(), None, "kept body".into()),
+        ]
+    );
+    let schema_after: Vec<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, sql FROM sqlite_schema ORDER BY name")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        schema_before, schema_after,
+        "temporary indexes leave no schema changes"
+    );
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .is_empty());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn v146_already_applied_original_sql_is_skipped_by_patched_bundle() {
+    let (_fixture, migration_dir, pool) = v145_file_backed_database().await;
+    let insert_progress = "INSERT INTO domain_event (
+        id, event_type, entity_type, entity_id, actor_type,
+        scope_type, scope_id, correlation_id, created_at
+    ) VALUES (?, 'execution.progressed', 'execution', 'execution', 'system',
+              'system', 'system', 'correlation', 'now')";
+    sqlx::query(insert_progress)
+        .bind("before-original")
+        .execute(&pool)
+        .await
+        .unwrap();
+    fs::write(migration_dir.join(V146_FILENAME), ORIGINAL_V146_SQL).unwrap();
+    run_migrations_from(&pool, &migration_dir).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event WHERE id = 'before-original'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    let original_record: (i64, String, String) =
+        sqlx::query_as("SELECT version, name, applied_at FROM _migration WHERE version = 146")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(insert_progress)
+        .bind("after-original")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // A populated V146 database must use the production replay path, including
+    // its version/name identity check, rather than a fresh test template.
+    run_migrations(&pool)
+        .await
+        .expect("patched embedded bundle accepts old V146");
+    let current_record: (i64, String, String) =
+        sqlx::query_as("SELECT version, name, applied_at FROM _migration WHERE version = 146")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(original_record, current_record);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM domain_event WHERE id = 'after-original'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1,
+        "V146 must not delete a newly inserted progress event on restart"
+    );
+    pool.close().await;
+}
 
 fn unique_temp_path(name: &str) -> PathBuf {
     let nanos = SystemTime::now()

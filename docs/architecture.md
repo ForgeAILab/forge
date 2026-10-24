@@ -8724,6 +8724,13 @@ Without that check, the second migration would be skipped without an error and
 its schema would never exist. The one known reconciled exception is a V053
 `integration_credentials` row from early hosts, which V054 repairs.
 
+SQL contents are not checksummed; an applied version with the same name is
+skipped. On 2026-10-24, V146 received a one-time historical repair so old
+databases can finish upgrading: seven temporary indexes cover unindexed event
+child references before its unchanged progress-event DELETE, then are dropped.
+The existing wake-disposition source-event index is reused. Already-applied
+V146 databases skip the repair and retain their migration record and data.
+
 After the whole bundle and its reconciliation finish, outside every migration
 transaction and before workers start, the runner requests
 `PRAGMA wal_checkpoint(TRUNCATE)`. A successful checkpoint syncs committed
@@ -8810,9 +8817,10 @@ original timestamp, source ID, and source sequence, with source provenance
 preserved. A binding is inferred only from one safe eligible responder;
 ambiguous or invalid cases become explicit `agent_setup_required` state, and a
 primary Worker is never promoted. Expired or ambiguous leases become finite
-retry/terminal states rather than remaining silently leased. Historical
-migration files are never edited. V075 quarantines the retired Room and
-Project-agent-membership tables under `legacy_*`, remaps Room-scoped semantic
+retry/terminal states rather than remaining silently leased. Apart from the
+one-time V146 index repair above, historical migration files are never edited.
+V075 quarantines the retired Room and Project-agent-membership tables under
+`legacy_*`, remaps Room-scoped semantic
 memory to the owning Agent Chat, and adds database guards that reject new Room
 context, LCM, memory-binding, or manifest authority. Historical source IDs and
 sequences remain available only as provenance.
