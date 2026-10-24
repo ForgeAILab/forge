@@ -71,6 +71,7 @@ a reminder to run `make types`.
 - **Clippy clean** — `cargo clippy --workspace --all-targets --features db/test-template,services/test-support -- -D warnings` must pass (`./scripts/ci-rust.sh lint` runs it)
 - **Formatted** — run `cargo fmt` before committing
 - **Frontend** — `pnpm lint` with zero warnings
+- **File sizes** — `python3 scripts/check-file-sizes.py` enforces 2,000 Rust / 1,000 TS/TSX lines and the shrinking `scripts/file-size-allowlist.txt`; never raise or add an entry, split by responsibility instead (see [CLAUDE.md](CLAUDE.md#when-working-on-this-repo)).
 
 ## Pull Request Process
 

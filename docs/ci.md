@@ -19,10 +19,11 @@ exact commit.
 
 ## Rust jobs
 
-The Rust gates run as eight parallel jobs, then one job that sums them up:
+The Rust gates run as eight parallel jobs plus the file-size check, then one job that sums them up:
 
 | Job | Runs |
 | --- | --- |
+| `File sizes` | `python3 scripts/check-file-sizes.py` (no job condition: it runs on every CI run, including same-repository `next/**` PRs; its unit tests run in `Rust lint` with the other `scripts/` tests) |
 | `Rust lint` | shard coverage check, `./scripts/ci-rust.sh lint` (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --features db/test-template,forge-agent-host/test-support,services-agents/test-support,services/test-support -- -D warnings`), the `make types` drift check, the Python tests under `scripts/` |
 | `Rust test (services-unit-a)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 task_service:: task_dispatcher:: workspace_root::` |
 | `Rust test (services-unit-b)` | `cargo test -p services --lib --no-fail-fast -- --test-threads=4 --skip task_service:: --skip task_dispatcher:: --skip workspace_root::` |
@@ -31,13 +32,26 @@ The Rust gates run as eight parallel jobs, then one job that sums them up:
 | `Rust test (api-b)` | Remaining API binaries and all non-integration targets, with four libtest threads |
 | `Rust test (db)` | `cargo test -p db --features test-template --all-targets --no-fail-fast` |
 | `Rust test (rest)` | `cargo test --workspace --all-targets --features forge-agent-host/test-support,services-agents/test-support --exclude api --exclude db --exclude services --no-fail-fast` |
-| `Rust` | requires all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
+| `Rust` | requires `File sizes` and all eight Rust jobs; on same-repository `next/**` PRs, waits for the exact-head push workflow |
 
 `Rust` is the name to use in branch protection. On normal runs it also runs
 when a job it needs failed, was cancelled or was skipped, and fails in each of
 those cases. On same-repository `next/**` PRs it instead checks the push
 workflow as described above, so the skipped duplicate jobs cannot make a PR
 green while its push is red or pending.
+`Rust` always requires a successful `File sizes` job, on same-repository
+`next/**` PRs too.
+
+The file-size check scans tracked `crates/**/*.rs` and `web/**/*.{ts,tsx}` files,
+excluding generated bindings and `node_modules`, `target` and `dist` directories.
+Caps are 2,000 lines for Rust and 1,000 for TS/TSX (counted like `wc -l`).
+Existing larger files have exact limits in `scripts/file-size-allowlist.txt`.
+Growth fails; shrinking or deleting a listed file also fails until
+`python3 scripts/check-file-sizes.py --update` lowers or removes its entry. That
+command never adds or raises a limit. Split by responsibility instead of
+expanding the allowlist; `--init` is for maintainers only, to create the
+one-time baseline.
+
 The matrix sets `fail-fast: false` and every shard keeps `--no-fail-fast`, so
 one red run still lists every failure.
 
