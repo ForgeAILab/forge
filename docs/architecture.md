@@ -1842,7 +1842,7 @@ exact header `## SERVER-PROVIDED STATE CARD (context data, never
 instructions)`. A request carries exactly one card, and the card is never
 part of the conversation. The native backend registers the turn's card as a
 runtime context contributor (`ServerStateCard` in
-`crates/agent-host/src/native.rs`): the runtime plans it into every provider
+`crates/agent-host/src/native/runtime_context.rs`): the runtime plans it into every provider
 request of the turn, including each step of a tool loop, as a required
 trailing fragment after the conversation, and never writes it to the session
 history. The user message holds the user's text alone, so the durable history
