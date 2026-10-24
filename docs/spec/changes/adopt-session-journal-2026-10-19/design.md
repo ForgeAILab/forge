@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-24T07:10:52Z
+updated_at: 2026-10-24T07:55:11Z
 ---
 
 # Design: Forge adopts JournalEngine with an encrypted session pack store
@@ -13,13 +13,11 @@ implementation.
 ## Context and evidence
 
 The runtime contract is authoritative in
-[extract-journal-storage-engine](https://github.com/ForgeAILab/agent-runtime/blob/8c19be5b226c2fdaeb6708ec5d39e91c235857a5/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
+[extract-journal-storage-engine](https://github.com/ForgeAILab/agent-runtime/blob/c036af7b4635cf7d76451aaa666a9df87405ca1a/docs/spec/changes/extract-journal-storage-engine-2026-10-19/design.md),
 especially amended D2 rule 4, D5's per-engine memo and D8.4's measurements.
 Implementation references below use `runtime:` for source paths in the
-`v0.9.0` tag at immutable commit
-`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`. The local clone at
-`/Volumes/Data/codes/ai/agent-runtime-u9b-review/` is read-only; its moving HEAD
-is not release evidence. Runtime Owner Decision Q4 accepts independent
+`v0.10.0` tag at immutable commit
+`c036af7b4635cf7d76451aaa666a9df87405ca1a`. Moving branch heads are not release evidence. Runtime Owner Decision Q4 accepts independent
 per-session copies; the earlier Forge review's global-index requirement is withdrawn.
 The 2026-10-21 amendment (D3 "Within-session body sharing", tasks 27–29) makes
 Forge share identical bodies between the two domains of one runtime session, as
@@ -28,13 +26,13 @@ the reference does; it still never shares across sessions.
 | Evidence | Consequence for Forge |
 | --- | --- |
 | `runtime:crates/agent-runtime-core/src/journal/storage/mod.rs` and `journal/engine/` | Implement `JournalStorage`; use `JournalEngine<ForgeJournalStorage>` for semantics. |
-| Reviewer commit `a49e3e0` in `/Volumes/Data/codes/ai/agent-runtime-u9b-review` | The engine gate is `futures_util::lock::Mutex`, never a Tokio mutex permit handoff. This correction overrides the older D3 wording in the u9b spec/source snapshot. |
-| `/Volumes/Data/tmp/refactor/rt-e2-review/` findings N1/N2 and F2 | The release gate includes compact pin metadata, the working R4 memo and the gate/control correction; a branch snapshot is not proof these fixes shipped. |
+| Reviewer commit `a49e3e0` in the runtime review | The engine gate is `futures_util::lock::Mutex`, never a Tokio mutex permit handoff. This correction overrides the older D3 wording in the u9b spec/source snapshot. |
+| `historical receipts: rt-e2-review/` findings N1/N2 and F2 | The release gate includes compact pin metadata, the working R4 memo and the gate/control correction; a branch snapshot is not proof these fixes shipped. |
 | `runtime:crates/agent-runtime-journal-bench/src/{packed.rs,schema.sql,codec.rs,metadata.rs}` | Reference for pack framing, bitmaps, transactions and operation tiers; not a production dependency. It uses rusqlite and modeled seal lengths, not a real cipher. |
-| `/Volumes/Data/tmp/refactor/rt-e7/{report.md,measurements.json}` and runtime D8.4 | Measured PerSession S1–S5 bytes and pack writes with capped packs and 25% dead-byte purges, at end and per turn. B/N=4000 is 1.60542× L2 plain / 1.79118× tool. |
-| `/Volumes/Data/tmp/refactor/rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. The owner chose 128 MiB per engine on 2026-10-20; no data shows Forge needs the larger runtime default. |
+| `historical receipts: rt-e7/{report.md,measurements.json}` and runtime D8.4 | Measured PerSession S1–S5 bytes and pack writes with capped packs and 25% dead-byte purges, at end and per turn. B/N=4000 is 1.60542× L2 plain / 1.79118× tool. |
+| `historical receipts: rt-e6-review/report.md`, F2–F4 | Share one engine and its clones per storage/domain; memo charge can under-estimate retained heap by 1.24×. The owner chose 128 MiB per engine on 2026-10-20; no data shows Forge needs the larger runtime default. |
 | `runtime:crates/agent-runtime-core/src/journal/engine/{mod.rs,memo.rs}` and `journal/reader.rs` | The supplied source now implements D-1 through `ReadOperation::finish`: check current-head or durable-pin authority once per reader operation and retry via membership-scoped storage on a stale memo view. Released runtime D5 records the D-1 decision and head-bound pin certificates; rt-e6-review F2 describes the earlier state. |
-| `/Volumes/Data/tmp/refactor/rt-e1/report.md` and Forge `protected_store.rs` | The idle legacy row contains two sealed blobs in all 13 measured cases (L2), despite checkpoint saves temporarily NULLing the standalone snapshot. |
+| `historical receipts: rt-e1/report.md` and Forge `protected_store.rs` | The idle legacy row contains two sealed blobs in all 13 measured cases (L2), despite checkpoint saves temporarily NULLing the standalone snapshot. |
 
 Today `SqliteProtectedRuntimeStore` implements both `SessionStore` and
 `CheckpointStore`, writing `protected_agent_session_state` by Forge session id.
@@ -78,7 +76,7 @@ storage/domain during the process lifetime. Clones share the validated-root memo
 and the lease registry; a new engine loses both. Writer changes therefore reuse
 warm roots and collection sees the leases used by all runtime instances.
 
-Released runtime v0.9.0 preserves D-1: warm reads finish each reader
+Released runtime v0.10.0 preserves D-1: warm reads finish each reader
 operation by checking stored current-head authority or the selected historical
 root's durable pin; a stale view retries through membership-scoped storage.
 `JournalEngine::read`, reader materialization and extension reads use that path
@@ -107,7 +105,7 @@ development guide. The release gate verifies the warm-read check too.
 ### D2. What Forge consumes from the runtime
 
 **Release/pin gate.** Every runtime package and the testkit now consume
-**agent-runtime v0.9.0** at immutable tag commit `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`.
+**agent-runtime v0.10.0** at immutable tag commit `c036af7b4635cf7d76451aaa666a9df87405ca1a`.
 The original task-1 gate adopted the first engine release; this follow-up adds
 per-session collection isolation, the retryable lost-acknowledgement contract,
 and failed-acceptance rollback/fencing. Verify the receipt amendment, R1–R7,
@@ -125,12 +123,9 @@ diagnostic references. This preserves D3's policy; it does not substitute an
 identity projector. Equivalence tests cover both sensitivity transitions,
 removals, unknown namespaces and unchanged non-extension delta fields.
 
-**Task 33 interim adoption (2026-10-24).** The owner-authorized interim pin is
-`b0a8c90e96ccb85e4642a119117a8fd5d3a06993`, still versioned 0.9.0, containing
-runtime P1/P2/P4 and review fixes merged with main. The final pin is the
-**v0.10.0 tag**, whose remaining upstream changes are version strings. This
-interim receipt does not claim the tag already exists. Forge has no direct
-`SessionState` field consumers; it uses the still-public `SessionSnapshot`.
+**Task 33 adoption (2026-10-24).** The v0.10.0 pin includes runtime P1/P2/P4
+and the bounded collection/storage protocol. Forge has no direct `SessionState`
+field consumers; it uses the still-public `SessionSnapshot`.
 
 The public boundary is `JournalStorage: Send + Sync + Debug + 'static`.
 `sharing()` is synchronous and Forge explicitly returns
@@ -462,9 +457,11 @@ removes its native and CLI sessions. These two logic edges live in repository
 code in the same source transaction: `delete_agent_chat` and the User/Project
 parent deletions call `delete_agent_chat_scopes_in_tx`; both Agent archive entry
 points and machine-removal archival call `delete_saved_agent_sessions_in_tx`.
-The unreleased deletion migration contains only orphan projection triggers,
-which must observe FK cascades. Project/Task and physical Agent deletion use
-existing FKs. Archive has no unarchive path; it removes saved CLI resume handles
+Only orphan-marker projection triggers remain in the journal migrations;
+they must observe membership/session FK cascades. Pack layout invalidation
+lives in rewrite/delete writers and orphan drain, with one indexed bump per
+affected session per transaction. Monotonic pack inserts need no bump. Project/Task and physical Agent deletion
+use existing FKs. Archive has no unarchive path; it removes saved CLI resume handles
 without signalling an already running CLI process. Late row updates fail NotFound.
 
 **S1/S3 framing.** Each apply's genuinely new bodies enter one final pack row
@@ -643,8 +640,12 @@ was needed.
 Task 33 adds `V202610240425__journal_collection_pages.sql` without changing sealed rows or
 membership: session `layout_generation` advances for physical pack changes,
 and indexed pin `pin_order` stores only relative order. Pin mutations maintain
-ranks; an old scope's first authenticated load backfills missing ranks outside
-collection. Member continuations bind layout generation as well as full fence,
+sparse ranks; missing ranks backfill in a writer transaction. `load()` never
+backfills or decrypts pins. Insertions decrypt the new id and logarithmically
+many ranked comparisons; only changed ranks are updated. Pin pages reject
+duplicate ranks and nonascending decrypted ids, including the lookahead and
+the preceding continuation's authenticated pin. Member continuations bind layout
+generation as well as full fence,
 rejecting repack/compact positions even when logical generation is unchanged.
 Read-only preflight and the write-lock recheck count touched packs, deferred
 purges, bounded base-repack inputs and changed operation segments. Merge
@@ -724,7 +725,7 @@ Production journal mutations go through one storage coordinator per process
 cache invalidation because membership is read from SQL on every request. No
 full-closure prefetch on every commit.
 
-**Storage failure contract (runtime v0.9.0, review D3).** A non-retryable
+**Storage failure contract (introduced in runtime v0.9.0, review D3).** A non-retryable
 apply error guarantees no durable effect. Every ambiguous COMMIT, lost ack,
 failed rollback acknowledgement or post-COMMIT cache failure is retryable.
 SQLx BUSY/LOCKED classification uses numeric SQLite codes (including extended
@@ -815,9 +816,10 @@ Task 12 corrects the original six-control inventory: released v0.8.0 also
 contains the private `StaleGeneration` fault and the named
 `control_generation_fence` case. This seventh control is required alongside
 the writer-epoch control; revision and epoch may stay unchanged across controls.
-The v0.9.0 follow-up adds the eighth control, NonRetryableLostAck. Its suite has
-26 named cases per configuration, adding unreadable-session isolation,
-body-cache membership, full-id lookup and exact membership enumeration.
+The v0.9.0 follow-up introduced the eighth control, NonRetryableLostAck,
+unreadable-session isolation, body-cache membership, full-id lookup and exact
+membership enumeration. The pinned v0.10.0 suite has 27 named cases per
+configuration, including `bounded_collection_protocol`.
 
 For the premature-deletion decorator, deliberately damage the surviving scope's
 copy; a correct PerSession release in A must never be labeled faulty just because
@@ -1050,8 +1052,8 @@ Long write holds also surface through `db::begin_immediate`'s existing
 5-second warning. No API, event payload or metrics endpoint changes.
 
 The actual **PerSession S1–S5** reference tables below replace the earlier S1–S4
-results and S5 projections. Source: [rt-e7 report](/Volumes/Data/tmp/refactor/rt-e7/report.md),
-[raw measurements](/Volumes/Data/tmp/refactor/rt-e7/measurements.json) and runtime
+results and S5 projections. Source: rt-e7 report (`refactor/rt-e7/report.md` historical receipt),
+raw measurements (`refactor/rt-e7/measurements.json` historical receipt) and runtime
 D8.4. Collection once at the end (selected rows):
 
 | Reference fixture | N | Turn | Legacy L2 bytes | Pack bytes before / after collection | After / L2 |
@@ -1110,8 +1112,11 @@ back off. Conversion keeps eight candidates and two seconds, without cancelling
 an in-flight import. The report's after-turn and final shutdown sweeps drain
 continuations and durable dirty hints with a 10,000-call assertion bound.
 Incomplete live membership in `unreadable_sessions` uses the same capped
-warning/health path as authentication failures; over-capacity counts are logged
-without ids. The benchmark records each call rather than treating a whole drain
+warning/health path as authentication failures. A separate non-evicting tracker
+caps over-capacity warnings at 4,096 sessions and includes each tracked runtime
+session id. Reports count distinct over-capacity sessions per pass and preserve
+the union with unreadable sessions. Byte diagnostics run once per finished
+domain phase. The benchmark records each call rather than treating a whole drain
 as one held gate.
 
 ### D9. Rollout and documentation
@@ -1232,7 +1237,7 @@ not claim Forge has run or passed it.
 
 ### Task 33 measurement receipt (2026-10-24)
 
-Interim runtime `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (0.9.0); final pin is the **v0.10.0 tag**. Forge now forwards preparation hints and opts into equivalent incremental projection. Source/verification/every test edit: `/Volumes/Data/tmp/refactor/c3-t33/report.md`. Full reports used the unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
+Forge pins runtime **v0.10.0** at `c036af7b4635cf7d76451aaa666a9df87405ca1a`. The historical measurements below used `b0a8c90e96ccb85e4642a119117a8fd5d3a06993`, whose Rust source is identical to the release. Forge forwards preparation hints and opts into equivalent incremental projection. Full reports used unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
 
 | Fixture | t24 disk/L2 | writes disk/L2 | Final disk/L2 | Delta writes | Native / legacy last turn ms | Overhead ms / check | Max collect ms incl. retirement |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
@@ -1255,15 +1260,14 @@ Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to
 
 100-dirty-session drains: protected 248.75 ms / 3 calls, ordinary 249.09 ms / 2 calls; both below one second. Target hydration 4.25 ms, 4 target packs out of 804; unrelated packs are excluded. Isolated B/100 plain identity diagnostic: 118,784 bytes, 2.90000x L2. Completed production rows have 26 cold misses and 26 warm hits in the explicit probes; cold validation spans 19.50–1636.28 ms. Internal scoped probe counters: {'rt.memo.hit': 26, 'rt.memo.miss': 26}. Estimated probe memo charge spans 1,047,126–65,150,820 bytes across both engines. Peak reported process RSS through completed cases 1767.94 MiB. These are probe counters/estimated charge and process RSS, not whole-run counters or allocator heap. Keep 128 MiB per engine unchanged.
 
-**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. The final v0.10.0 tag pin remains pending; the owner-authorized interim SHA is still versioned 0.9.0. All Owner Decisions below remain verbatim.
+**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. All Owner Decisions below remain verbatim.
 
-Concurrent final-pin update (2026-10-24 07:17 UTC): another actor committed the workspace as 91907de1 and changed Cargo to the v0.10.0 tag at c036af7b4635cf7d76451aaa666a9df87405ca1a. I did not create that commit. Local git verifies that b0a8c90..c036af7b changes only Cargo version metadata, CHANGELOG and docs, with no Rust source changes. The revision constant/dependency contract were aligned afterward; benchmark and earlier verification receipts remain the measured interim b0a8c90 implementation. A full tag rebuild/rerun is not claimed.
+The v0.10.0 pin, revision constant and dependency contract are aligned; the historical benchmark receipt predates the tag and no benchmark rerun is claimed.
 
-Final tag follow-up: offline engine_release_contract passes at v0.10.0/c036af7b (1/1), and fmt check passes. The prior broad checks/benchmarks ran on the Rust-source-identical interim revision; a full tag workspace/benchmark rerun is not claimed.
 
 ## Risks / Trade-offs
 
-- The consumed prerequisite is `v0.9.0`. The release gate verifies the tagged contract,
+- The consumed prerequisite is `v0.10.0`. The release gate verifies the tagged contract,
   including upstream N1/N2, gate and S5 fixes; Forge must not work around them by
   owning engine semantics.
 - Validation/policy CPU can still be O(N); R4 avoids repeated cold closure reads

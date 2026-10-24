@@ -920,7 +920,14 @@ async fn rotation_and_retry() {
         .execute(db.pool())
         .await
         .unwrap();
-    let policy = Arc::new(SessionJournalRetention::new(db.clone(), &store));
+    let policy = Arc::new(
+        SessionJournalRetention::new(db.clone(), &store).with_collection_budget_for_test(
+            JournalGcBudget {
+                max_work_units: 16,
+                ..JournalGcBudget::default()
+            },
+        ),
+    );
     let mut cursor = RetentionCursor::default();
     let zero = policy
         .maintain_with_budget_for_test(&mut cursor, Duration::ZERO)
@@ -929,11 +936,21 @@ async fn rotation_and_retry() {
     assert!(zero.budget_exhausted);
     assert_eq!(zero.collection_calls, 0);
     assert_eq!(retired(&store, "rotation-source").await, [false, false]);
+    let diagnostics_before = store.journals().storage().diagnostic_calls_for_test().0;
     let pass = policy.maintain_once(&mut cursor).await.unwrap();
+    assert!(
+        pass.collection_calls > 2,
+        "fixture must exercise continuations"
+    );
+    assert_eq!(
+        store.journals().storage().diagnostic_calls_for_test().0 - diagnostics_before,
+        2,
+        "byte diagnostics run once per finished domain phase, including yielded calls"
+    );
     assert_eq!(
         pass.collection_calls - pass.collection_continuations,
         2,
-        "exactly one completed pass per domain; yielded calls remain counted"
+        "both domain phases advanced; yielded calls remain counted"
     );
     assert!(pass.collection_calls <= 32);
     assert!(
@@ -1022,7 +1039,7 @@ async fn rotation_and_retry() {
     assert_eq!(
         damaged.collection_calls - damaged.collection_continuations,
         2,
-        "unreadable isolation still completes both domain passes"
+        "unreadable isolation still advances both domain phases"
     );
     assert!(damaged.collection_calls <= 32);
     assert_eq!(damaged.unreadable_sessions, 1, "{damaged:?}");
@@ -1378,4 +1395,70 @@ async fn unreadable_counts_are_per_pass_across_repair_delete_and_restart() {
         );
         assert_eq!(report.unreadable_sessions, 0);
     }
+}
+
+#[tokio::test]
+async fn over_capacity_sessions_are_reported_and_preserved_per_pass() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    let f = FileDb::new().await.unwrap();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(f.database(), [7; 32], 1));
+    let sid = SessionId::new("capacity-preserved");
+    publish(&f, store.clone(), sid.as_str()).await;
+    update(
+        &f,
+        sid.as_str(),
+        "journal-scope",
+        "journal-profile",
+        "ready",
+        "c",
+    )
+    .await;
+    let engine = store.journals().protected();
+    engine.set_collection_cursor_cap(0).unwrap();
+    let domain = JournalDomain {
+        storage_id: engine.storage_id(),
+        role: JournalRole::Protected,
+    };
+    let members = store
+        .journals()
+        .storage()
+        .members(&domain, &sid)
+        .await
+        .unwrap();
+    let bodies = store
+        .journals()
+        .storage()
+        .objects(&domain, &sid, &members)
+        .await
+        .unwrap();
+    let policy = SessionJournalRetention::new(f.database(), &store);
+    let mut cursor = RetentionCursor::default();
+    for _ in 0..2 {
+        let report = policy.maintain_once(&mut cursor).await.unwrap();
+        assert_eq!(report.over_capacity_sessions, 1, "{report:?}");
+        assert_eq!(report.preserved_sessions, 1, "{report:?}");
+        assert_eq!(report.unreadable_sessions, 0);
+        assert_eq!(
+            store
+                .journals()
+                .storage()
+                .members(&domain, &sid)
+                .await
+                .unwrap(),
+            members
+        );
+        assert_eq!(
+            store
+                .journals()
+                .storage()
+                .objects(&domain, &sid, &members)
+                .await
+                .unwrap(),
+            bodies
+        );
+    }
+    engine.set_collection_cursor_cap(16 * 1024 * 1024).unwrap();
+    let report = policy.maintain_once(&mut cursor).await.unwrap();
+    assert_eq!(report.over_capacity_sessions, 0);
+    assert_eq!(report.preserved_sessions, 0);
 }

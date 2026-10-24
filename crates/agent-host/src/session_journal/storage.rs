@@ -35,6 +35,10 @@ pub struct ForgeJournalStorage {
     pub(super) repack: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-support")]
     pub(super) compact_observations: Arc<Mutex<(u64, usize)>>,
+    #[cfg(feature = "test-support")]
+    pub(super) byte_stats_calls: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(feature = "test-support")]
+    pub(super) pin_rank_reads: Arc<std::sync::atomic::AtomicU64>,
 }
 impl fmt::Debug for ForgeJournalStorage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,6 +104,7 @@ impl PackView {
 pub(super) struct Staged {
     pub written: BTreeMap<i64, (PackKey, Arc<Vec<JournalStoredObject>>)>,
     pub removed: BTreeSet<i64>,
+    pub layout_bumped: bool,
 }
 pub(super) fn domain_of(storage_id: String, role: &str) -> Result<JournalDomain, RuntimeError> {
     Ok(JournalDomain {
@@ -160,6 +165,10 @@ impl ForgeJournalStorage {
             repack: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(feature = "test-support")]
             compact_observations: Arc::new(Mutex::new((0, 0))),
+            #[cfg(feature = "test-support")]
+            byte_stats_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            pin_rank_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
     #[cfg(feature = "test-support")]
@@ -757,7 +766,6 @@ impl JournalStorage for ForgeJournalStorage {
             tx.commit().await
         }
         .map_err(database_error)?;
-        self.upgrade_pin_ranks(domain, session).await?;
         Ok(result)
     }
     async fn objects(

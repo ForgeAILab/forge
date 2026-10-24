@@ -114,6 +114,34 @@ impl ForgeJournalStorage {
             .observations
     }
 
+    /// Uses its own capped tracker so capacity pressure cannot suppress
+    /// unreadable-session warnings or grow process memory without a bound.
+    pub fn note_over_capacity_session(session: &SessionId) {
+        static WARNED: OnceLock<Mutex<WarningTracker>> = OnceLock::new();
+        let decision = WARNED
+            .get_or_init(|| Mutex::new(WarningTracker::new(WARNING_SESSION_CAP)))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(session);
+        if decision.session {
+            tracing::warn!(target: "forge_session_journal", runtime_session_id=session.as_str(),
+                "journal collection cursor capacity exceeded; session preserved");
+        }
+        if decision.overflow {
+            tracing::warn!(target: "forge_session_journal", warning_session_cap=WARNING_SESSION_CAP,
+                "over-capacity session warning capacity reached; further session warnings suppressed");
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_calls_for_test(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering;
+        (
+            self.byte_stats_calls.load(Ordering::Relaxed),
+            self.pin_rank_reads.load(Ordering::Relaxed),
+        )
+    }
+
     /// Includes orphan and deferred copies, but omits an entire session when
     /// its record or any index cannot authenticate. The omission is explicit
     /// in skipped_sessions, not a claim that unreadable bytes disappeared.
@@ -121,6 +149,9 @@ impl ForgeJournalStorage {
         &self,
         domain: &JournalDomain,
     ) -> Result<JournalByteStats, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        self.byte_stats_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut tx = self.db.pool().begin().await.map_err(database_error)?;
         let mut after: Option<String> = None;
         let mut total = JournalByteStats::default();

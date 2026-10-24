@@ -475,3 +475,107 @@ async fn migration_preserves_legacy_and_scoped_packs() {
     );
     pool.close().await;
 }
+
+#[tokio::test]
+async fn collection_page_migration_preserves_rows_and_layout_bump_is_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let migrations = directory.path().join("migrations");
+    fs::create_dir(&migrations).unwrap();
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    const PAGES: &str = "V202610240425__journal_collection_pages.sql";
+    for entry in fs::read_dir(&bundled).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|ext| ext == "sql") && entry.file_name() != PAGES {
+            fs::copy(entry.path(), migrations.join(entry.file_name())).unwrap();
+        }
+    }
+    let pool = create_sqlite_pool("sqlite::memory:").await.unwrap();
+    run_migrations_from(&pool, &migrations).await.unwrap();
+    for sql in [
+        "INSERT INTO agent_identity (id,name,created_at,updated_at) VALUES ('schema-agent','Schema','c','u')",
+        "INSERT INTO agent_profile (id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('schema-profile','schema-agent','native','embedded','c','u')",
+        "INSERT INTO agent_context_scope (id,identity_id,scope_type,scope_id,created_at,updated_at) VALUES ('schema-scope','schema-agent','account','schema-owner','c','u')",
+    ] { sqlx::query(sql).execute(&pool).await.unwrap(); }
+    for id in ["page-target", "page-unrelated"] {
+        host_session(&pool, id, Some(id)).await;
+        session(&pool, "store", "protected", id, id).await;
+        let pack = pack(&pool, id, id).await;
+        membership(&pool, ("store", "protected", id, id), pack, &[1])
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agent_session_journal_pin (storage_id,role,runtime_session_id,forge_session_id,pin_key,key_revision,format,nonce,payload) VALUES ('store','protected',?,?,zeroblob(32),1,1,zeroblob(24),zeroblob(16))")
+            .bind(id).bind(id).execute(&pool).await.unwrap();
+    }
+    let mut before = Vec::new();
+    for table in [
+        "session",
+        "pin",
+        "catalog",
+        "membership",
+        "operation_pack",
+        "pack",
+    ] {
+        before.push((
+            table,
+            raw_rows(&pool, &format!("agent_session_journal_{table}")).await,
+        ));
+    }
+    fs::copy(bundled.join(PAGES), migrations.join(PAGES)).unwrap();
+    run_migrations_from(&pool, &migrations).await.unwrap();
+    for (table, old) in before {
+        let new = raw_rows(&pool, &format!("agent_session_journal_{table}")).await;
+        assert_eq!(new.len(), old.len(), "{table}");
+        for (new, old) in new.iter().zip(old) {
+            assert_eq!(
+                &new[..old.len()],
+                old,
+                "all original values survive: {table}"
+            );
+        }
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_session_journal_pin WHERE pin_order IS NULL"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name LIKE 'journal_pack_%_layout'")
+        .fetch_one(&pool).await.unwrap(), 0);
+    let index_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_index_info('idx_session_journal_session_runtime')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(index_columns, ["runtime_session_id"]);
+    let mut tx = db::begin_immediate(&pool).await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::SqliteDb::bump_session_journal_layout_in_tx(&mut tx, "page-target")
+            .await
+            .unwrap(),
+        1
+    );
+    let after: i64 = sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(
+        after - before,
+        1,
+        "one row changes, without trigger side effects"
+    );
+    let layouts: Vec<(String, i64)> = sqlx::query_as("SELECT runtime_session_id,layout_generation FROM agent_session_journal_session ORDER BY runtime_session_id")
+        .fetch_all(&mut *tx).await.unwrap();
+    assert_eq!(
+        layouts,
+        [("page-target".into(), 1), ("page-unrelated".into(), 0)]
+    );
+    tx.commit().await.unwrap();
+}

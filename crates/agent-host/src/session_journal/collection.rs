@@ -24,49 +24,96 @@ pub(super) struct CollectionWork {
 }
 
 impl ForgeJournalStorage {
-    // Pin ids stay sealed. Persist only their relative ranks, at pin mutation or
-    // once when hydrating a pre-upgrade scope, never in a collector page.
+    // Backfill only on a writer path. Ranked pins need no decryption unless
+    // compared with a new id; sparse ranks normally avoid updating other rows.
     pub(super) async fn rank_pins(
         &self,
         conn: &mut SqliteConnection,
         scope: &Scope,
     ) -> Result<(), RuntimeError> {
-        let rows = sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=?")
+        let missing: Vec<Vec<u8>> = sqlx::query_scalar("SELECT pin_key FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_order IS NULL")
             .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str())
             .fetch_all(&mut *conn).await.map_err(database_error)?;
-        let mut pins = Vec::with_capacity(rows.len());
-        for row in rows {
-            let key: Vec<u8> = row.try_get("pin_key").map_err(|_| corrupt())?;
-            pins.push((self.pin_row(&scope.0, &scope.1, row).await?.pin, key));
+        if missing.is_empty() {
+            return Ok(());
         }
-        pins.sort_by(|a, b| a.0.cmp(&b.0));
-        for (rank, (_, key)) in pins.into_iter().enumerate() {
-            sqlx::query("UPDATE agent_session_journal_pin SET pin_order=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
-                .bind(i64::try_from(rank).map_err(|_| corrupt())?).bind(scope.0.storage_id.as_str())
-                .bind(role(&scope.0)).bind(scope.1.as_str()).bind(key)
-                .execute(&mut *conn).await.map_err(database_error)?;
+        let mut ranked: Vec<(Vec<u8>, i64)> = sqlx::query_as("SELECT pin_key,pin_order FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_order IS NOT NULL ORDER BY pin_order")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str())
+            .fetch_all(&mut *conn).await.map_err(database_error)?;
+        if ranked.first().is_some_and(|p| p.1 < 0) || ranked.windows(2).any(|p| p[0].1 >= p[1].1) {
+            return Err(corrupt());
+        }
+        let mut decoded = std::collections::HashMap::new();
+        const STEP: i64 = 1 << 32;
+        for key in missing {
+            let pin = self.pin_id_for_rank(conn, scope, &key).await?;
+            let (mut lo, mut hi) = (0, ranked.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let other_key = &ranked[mid].0;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    decoded.entry(other_key.clone())
+                {
+                    entry.insert(self.pin_id_for_rank(conn, scope, other_key).await?);
+                }
+                match decoded[other_key].cmp(&pin) {
+                    std::cmp::Ordering::Less => lo = mid + 1,
+                    std::cmp::Ordering::Greater => hi = mid,
+                    std::cmp::Ordering::Equal => return Err(corrupt()),
+                }
+            }
+            let rank_between = |ranked: &[(Vec<u8>, i64)]| {
+                let left = lo.checked_sub(1).map_or(0, |i| ranked[i].1);
+                let right = ranked
+                    .get(lo)
+                    .map_or_else(|| left.checked_add(STEP), |p| Some(p.1))?;
+                (right - left > 1).then(|| left + (right - left) / 2)
+            };
+            if rank_between(&ranked).is_none() {
+                for (index, (key, old)) in ranked.iter_mut().enumerate() {
+                    let rank = i64::try_from(index + 1)
+                        .ok()
+                        .and_then(|n| n.checked_mul(STEP))
+                        .ok_or_else(corrupt)?;
+                    if *old != rank {
+                        self.set_pin_rank(conn, scope, key, rank).await?;
+                        *old = rank;
+                    }
+                }
+            }
+            let rank = rank_between(&ranked).ok_or_else(corrupt)?;
+            self.set_pin_rank(conn, scope, &key, rank).await?;
+            decoded.insert(key.clone(), pin);
+            ranked.insert(lo, (key, rank));
         }
         Ok(())
     }
 
-    pub(super) async fn upgrade_pin_ranks(
+    async fn pin_id_for_rank(
         &self,
-        domain: &JournalDomain,
-        session: &SessionId,
+        conn: &mut SqliteConnection,
+        scope: &Scope,
+        key: &[u8],
+    ) -> Result<JournalPinId, RuntimeError> {
+        #[cfg(feature = "test-support")]
+        self.pin_rank_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let row = sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
+            .bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key)
+            .fetch_one(&mut *conn).await.map_err(database_error)?;
+        Ok(self.pin_row(&scope.0, &scope.1, row).await?.pin)
+    }
+
+    async fn set_pin_rank(
+        &self,
+        conn: &mut SqliteConnection,
+        scope: &Scope,
+        key: &[u8],
+        rank: i64,
     ) -> Result<(), RuntimeError> {
-        let missing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_order IS NULL)")
-            .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str())
-            .fetch_one(self.db.pool()).await.map_err(database_error)?;
-        if missing {
-            let mut tx = db::begin_immediate(self.db.pool())
-                .await
-                .map_err(database_error)?;
-            self.rank_pins(&mut tx, &(domain.clone(), session.clone()))
-                .await?;
-            tx.commit()
-                .await
-                .map_err(super::storage::ambiguous_database_error)?;
-        }
+        sqlx::query("UPDATE agent_session_journal_pin SET pin_order=? WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_key=?")
+            .bind(rank).bind(scope.0.storage_id.as_str()).bind(role(&scope.0)).bind(scope.1.as_str()).bind(key)
+            .execute(conn).await.map_err(database_error)?;
         Ok(())
     }
 
@@ -161,18 +208,23 @@ impl ForgeJournalStorage {
                 (JournalCollectionItems::Members(ids), bytes, next)
             }
             JournalCollectionPageKind::Pins => {
-                let after = position
-                    .map(|p| {
-                        <[u8; 8]>::try_from(p)
-                            .map(i64::from_be_bytes)
-                            .map_err(|_| conflict())
-                    })
-                    .transpose()?
-                    .unwrap_or(-1);
-                let missing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_order IS NULL)")
+                let scope = (domain.clone(), session.clone());
+                let (after, mut previous) = if let Some(p) = position {
+                    if p.len() != 40 {
+                        return Err(conflict());
+                    }
+                    let rank = i64::from_be_bytes(p[..8].try_into().map_err(|_| conflict())?);
+                    let row = sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=?1 AND role=?2 AND runtime_session_id=?3 AND pin_key=?4 AND pin_order=?5 AND 1=(SELECT count(*) FROM agent_session_journal_pin WHERE storage_id=?1 AND role=?2 AND runtime_session_id=?3 AND pin_order=?5)")
+                        .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).bind(&p[8..]).bind(rank)
+                        .fetch_optional(&mut *tx).await.map_err(database_error)?.ok_or_else(corrupt)?;
+                    (rank, Some(self.pin_row(domain, session, row).await?.pin))
+                } else {
+                    (-1, None)
+                };
+                let missing: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND (pin_order IS NULL OR pin_order<0))")
                     .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).fetch_one(&mut *tx).await.map_err(database_error)?;
                 if missing {
-                    return Err(conflict());
+                    return Err(corrupt());
                 }
                 let rows = sqlx::query("SELECT * FROM agent_session_journal_pin WHERE storage_id=? AND role=? AND runtime_session_id=? AND pin_order>? ORDER BY pin_order LIMIT ?")
                     .bind(domain.storage_id.as_str()).bind(role(domain)).bind(session.as_str()).bind(after).bind((limit+1) as i64)
@@ -181,19 +233,37 @@ impl ForgeJournalStorage {
                 let mut pins = Vec::new();
                 let mut bytes = 0;
                 let mut last = after;
-                for row in rows.into_iter().take(limit) {
-                    last = row.try_get("pin_order").map_err(|_| corrupt())?;
-                    let pin = self.pin_row(domain, session, row).await?;
-                    bytes += wire::pin_bytes(&pin)?.len() as u64;
-                    pins.push(pin);
+                let mut next = None;
+                // Validate the lookahead too: a duplicated boundary rank must
+                // fail before a continuation could skip the second pin.
+                for row in rows {
+                    let rank: i64 = row.try_get("pin_order").map_err(|_| corrupt())?;
+                    let key: Vec<u8> = row.try_get("pin_key").map_err(|_| corrupt())?;
+                    let pin = self.pin_row(&scope.0, &scope.1, row).await?;
+                    if rank <= last || previous.as_ref().is_some_and(|p| p >= &pin.pin) {
+                        return Err(corrupt());
+                    }
+                    last = rank;
+                    previous = Some(pin.pin.clone());
+                    if pins.len() < limit {
+                        bytes += wire::pin_bytes(&pin)?.len() as u64;
+                        pins.push(pin);
+                        let mut p = rank.to_be_bytes().to_vec();
+                        p.extend(key);
+                        next = Some(p);
+                    }
                 }
                 (
                     JournalCollectionItems::Pins(pins),
                     bytes,
-                    more.then(|| last.to_be_bytes().to_vec()),
+                    if more { next } else { None },
                 )
             }
-            _ => return Err(conflict()),
+            _ => {
+                return Err(RuntimeError::internal(
+                    "invalid journal collection page kind",
+                ));
+            }
         };
         tx.commit().await.map_err(database_error)?;
         Ok(JournalCollectionPage {

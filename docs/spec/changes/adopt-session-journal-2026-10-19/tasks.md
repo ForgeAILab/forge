@@ -50,7 +50,7 @@ No runtime bench crate becomes a production dependency.
   warnings denied, strict spec validation and whitespace checks. No production
   call-site adaptation was needed; native persistence remains materialized.
   Upstream LCM planning changes are documented in CHANGELOG and architecture.
-  Tagged source checklist and command receipts: `/Volumes/Data/tmp/refactor/c3-t1/report.md`.
+  Tagged source checklist and command receipts: `historical-receipts/c3-t1/report.md`.
 
   Follow-up on 2026-10-20: all eight runtime/testkit packages now use
   **v0.9.0**, commit `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`.
@@ -93,7 +93,7 @@ No runtime bench crate becomes a production dependency.
   file-backed upgrade test passes with duplicate and NULL runtime ids, byte-exact
   legacy rows, strict scoped memberships, cascade checks and surviving packs.
   Both migration-runner checks, fmt and two-package all-target Clippy pass.
-  Task 2–3 command receipts: `/Volumes/Data/tmp/refactor/c3-t2-3/report.md`.
+  Task 2–3 command receipts: `historical-receipts/c3-t2-3/report.md`.
 
 ## JournalStorage implementation
 
@@ -291,7 +291,7 @@ No runtime bench crate becomes a production dependency.
   D6, this inventory, the proposal and native delta now include the seventh
   released control (StaleGeneration), correcting the original six-control list.
   No fault adapter is part of a production module or runtime path. Evidence:
-  `/Volumes/Data/tmp/refactor/c3-t11-12/report.md`.
+  `historical-receipts/c3-t11-12/report.md`.
   The v0.9.0 follow-up adds NonRetryableLostAck (atomic_apply_cuts), for eight
   negative controls. DeadBodyServed is rejected earlier by the new
   body_cache_membership case; its exact expected named rejection follows the
@@ -451,7 +451,7 @@ No runtime bench crate becomes a production dependency.
   still publishes once more, and protected stays at its prior head. Every later
   turn then fails with "canonical session history and terminal checkpoint are
   from different boundaries", on a fresh backend and a restarted store too.
-  Reproducer: `/Volumes/Data/tmp/refactor/c3-t19/diag-protected-cut-plain.rs`.
+  Reproducer: `historical-receipts/c3-t19/diag-protected-cut-plain.rs`.
   Runtime v0.9.0 now rolls back proven unaccepted input and fences unresolved
   acceptance until reopen. Both wedge regressions and Forge's new
   unresolved_acceptance_preserves_turn_failure_and_reopens case cover the fix.
@@ -518,7 +518,7 @@ No runtime bench crate becomes a production dependency.
   unreadable isolation/dependency deferral, worker registry/nudge/shutdown,
   deletion drain and zero scheduling budget. The existing selection and deletion
   regressions, plus the new chat-delete and native/CLI archive tests, pass.
-  Evidence: `/Volumes/Data/tmp/refactor/c3-t21/report.md`.
+  Evidence: `historical-receipts/c3-t21/report.md`.
 
   Review follow-up: dormant selection and active reuse rotate tombstoned native
   rows through the existing versioned transaction. Native open reports typed
@@ -531,7 +531,7 @@ No runtime bench crate becomes a production dependency.
   and after provider I/O with nonzero per-turn usage. Small-cap warning and
   repair/delete/restart regressions establish bounded tracking and per-pass counts. Regressions cover the older
   dormant/newer replaced profile scenario, a selection/open race and non-chat
-  resume. Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix/report.md`.
+  resume. Evidence: `historical-receipts/c3-t21-fix/report.md`.
 
   Re-review follow-up: Task manifest hashing and `agent_session_id` use the host
   row matching the final successful runtime output, including reviewer-correction
@@ -540,7 +540,7 @@ No runtime bench crate becomes a production dependency.
   opens cannot accumulate obsolete runtime markers. Real Task executor and
   correction regressions check B's runtime, B's host manifest link and B's manifest
   hash; eight repeated Chat open races check an empty failure-marker set.
-  Evidence: `/Volumes/Data/tmp/refactor/c3-t21-fix2/report.md`.
+  Evidence: `historical-receipts/c3-t21-fix2/report.md`.
 
 - [x] **22. Approved unresumable-session retirement (≤2 h).**
   Include non-Agent-Chat native sessions suspended at restart and Agent Chat rows
@@ -635,7 +635,7 @@ No runtime bench crate becomes a production dependency.
   explanation; no private-state decoding, unsafe inspection or runtime patch
   was used. The checkbox remains open for this telemetry gap. The approved
   128 MiB per-engine budget and conservative D3 policy remain unchanged.
-  Outputs: /Volumes/Data/tmp/refactor/c3-t24-25/; full report/table in
+  Outputs: historical-receipts/c3-t24-25/; full report/table in
   report.md and docs/performance-testing.md.
 
 - [x] **25. Run Forge disk/performance gate (≤3 h).**
@@ -668,7 +668,7 @@ No runtime bench crate becomes a production dependency.
   write transactions, memo observations, cache/RSS and post-retirement metadata
   are recorded without presenting rt-e7's modeled/shared-domain numbers as Forge
   outcomes. Exact internal memo/heap telemetry remains the task-24 NOT MET item.
-  Full results and verification: /Volumes/Data/tmp/refactor/c3-t24-25/report.md.
+  Full results and verification: historical-receipts/c3-t24-25/report.md.
   Task 26 and the overall change completion stamp remain untouched.
 
   Re-measured after within-session sharing (task 29, 2026-10-21): the B/4000
@@ -690,7 +690,7 @@ No runtime bench crate becomes a production dependency.
   10%; pre-sharing 10.675% / 10.492%), B/4000 5.348% / 4.006%, C/1000 8.805%,
   C/4000 2.574%. B/4000 disk 1.61145× / 1.79412× (PASS). Fragmentation cost:
   C/1000 1.26522× → 1.50000×, C/4000 1.13992× → 1.34568×, C/4000 max collect
-  2,106.75 → 2,955.71 ms. Evidence: `/Volumes/Data/tmp/refactor/c3-writes/report.md`.
+  2,106.75 → 2,955.71 ms. Evidence: `historical-receipts/c3-writes/report.md`.
 
 - [ ] **26. Implementation docs, CHANGELOG and spec validation (≤2 h).**
   Update architecture, getting-started, performance table and Unreleased
@@ -711,7 +711,7 @@ No runtime bench crate becomes a production dependency.
 
 - [x] **27. Share identical bodies between a session's domains (≤5 h with 28–29).**
   Amend D2 rule 4, D3 ("Within-session body sharing"), D4 and the D10 risk per
-  the task-25 profiling evidence (`/Volumes/Data/tmp/refactor/c3-profile/report.md`,
+  the task-25 profiling evidence (`historical-receipts/c3-profile/report.md`,
   section 4 and ranked option 1). In the unreleased session-journal migration,
   packs become runtime-session owned `(runtime_session_id, forge_session_id)`
   with per-domain membership bitmaps; pack index/body units use the
@@ -733,7 +733,7 @@ No runtime bench crate becomes a production dependency.
   `ordinary_never_reads_protected_only_bodies`, `two_domain_release_crash_cuts`,
   `deletion_drain_removes_shared_session_packs_once` and
   `corrupt_shared_body_isolates_its_session` pass, and each fails on the
-  pre-sharing commit. Evidence: `/Volumes/Data/tmp/refactor/c3-share/report.md`.
+  pre-sharing commit. Evidence: `historical-receipts/c3-share/report.md`.
 
 - [x] **28. Storage-only speed fixes (profile option 3).**
   Keep unchanged immutable body-cache entries across S2/compact instead of
@@ -760,7 +760,7 @@ No runtime bench crate becomes a production dependency.
   overhead fails the revised fixed budget; import is no longer latency-gated.
   C/4000's longest collect call is 2,106.75 ms,
   above D8's 1-second bound. Table in `docs/performance-testing.md`; raw output
-  in `/Volumes/Data/tmp/refactor/c3-share/gate/`.
+  in `historical-receipts/c3-share/gate/`.
 
 ## 2026-10-21 background conversion amendment
 
@@ -784,7 +784,7 @@ No runtime bench crate becomes a production dependency.
   two native domain publications at revision 1, no legacy load on next open,
   preserved ciphertext, active host/runtime writer skips, scheduling stop after
   one in-flight import, eight-candidate cap, and fresh-pool restart progress.
-  Evidence: /Volumes/Data/tmp/refactor/c3-bgconv/report.md.
+  Evidence: historical-receipts/c3-bgconv/report.md.
 - [x] **32. Background docs and focused verification.** Update architecture and
   Unreleased changelog, strictly validate this change, fmt check, exact new
   tests, services retention, named agent-host import tests, full
@@ -800,9 +800,9 @@ No runtime bench crate becomes a production dependency.
 - [ ] **33. Pin runtime speed release and rerun Forge gate.** After the runtime
   P1/P2/P4 release exists, pin it, update the benchmark report gate fields to
   the fixed budgets, and rerun D10; P3 optional.
-  Task-33 receipt (2026-10-24): Part A implemented against owner-authorized interim
-  `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (still 0.9.0); final pin is the
-  **v0.10.0 tag**. Four bounded SQL storage methods, continuation scheduling,
+  Task-33 receipt (2026-10-24): Part A pins **v0.10.0** at
+  `c036af7b4635cf7d76451aaa666a9df87405ca1a`. Historical measurements used the
+  Rust-source-identical interim `b0a8c90e96ccb85e4642a119117a8fd5d3a06993`. Four bounded SQL storage methods, continuation scheduling,
   revisioned equivalent projection and prepared-hint forwarding are implemented.
   Unit/protocol/runtime/storage/retention/conversion/migration checks pass; the
   new layout-continuation test fails without its guard. Two diagnostics were
@@ -818,10 +818,10 @@ No runtime bench crate becomes a production dependency.
   **kept**; C/1000 improves from 1.48261x to 1.40000x L2 (33 to 30 packs). Unit 14/14, storage 30/30, conformance 18/18 and the added mixed-domain S2/collection/reopen regression pass; no completed baseline check becomes a new failure. The C/4000 supplemental run remains unfinished and explicitly NOT MET; no pass is claimed for that shape.
   Fixed steady-turn misses: A/100 tool, B/100 tool.
   Unfinished shapes: C/4000 tool. B/1000 <=10% remains tracked;
-  exact allocator heap and final release tag remain pending. Task 33 stays open.
+  exact allocator heap remains unavailable. The release tag is pinned; Task 33
+  stays open for its remaining measurement gates.
   Actual table and full evidence: design D10 receipt,
-  `docs/performance-testing.md`, `/Volumes/Data/tmp/refactor/c3-t33/report.md`.
+  `docs/performance-testing.md`, `historical-receipts/c3-t33/report.md`.
 
-Concurrent final-pin update (2026-10-24 07:17 UTC): another actor committed the workspace as 91907de1 and changed Cargo to the v0.10.0 tag at c036af7b4635cf7d76451aaa666a9df87405ca1a. I did not create that commit. Local git verifies that b0a8c90..c036af7b changes only Cargo version metadata, CHANGELOG and docs, with no Rust source changes. The revision constant/dependency contract were aligned afterward; benchmark and earlier verification receipts remain the measured interim b0a8c90 implementation. A full tag rebuild/rerun is not claimed.
-
-Final tag follow-up: offline engine_release_contract passes at v0.10.0/c036af7b (1/1), and fmt check passes. The prior broad checks/benchmarks ran on the Rust-source-identical interim revision; a full tag workspace/benchmark rerun is not claimed.
+The v0.10.0 pin, revision constant and dependency contract are aligned; historical
+benchmark receipts predate the tag and no benchmark rerun is claimed.

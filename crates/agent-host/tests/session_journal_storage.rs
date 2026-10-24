@@ -3574,6 +3574,22 @@ async fn maintenance_moves_only_packs_the_domain_fully_holds() {
         raw.apply(collect).await.unwrap();
         assert_eq!(session_pack_ids(&f, &s).await, vec![z, xy], "{:?}", d.role);
     }
+    for d in [&p, &o] {
+        let mut collect = edit(&raw, d, &s).await;
+        collect.kind = JournalWriteKind::Collect;
+        raw.apply_collection(JournalCollectionPlan {
+            write: collect,
+            max_units: 32,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            session_pack_ids(&f, &s).await,
+            vec![z, xy],
+            "bounded {:?}",
+            d.role
+        );
+    }
     // A second small protected pack is still merged by protected's repack.
     add_objects(&raw, &p, &s, extra.clone()).await;
     let mut collect = edit(&raw, &p, &s).await;
@@ -3990,7 +4006,26 @@ async fn bounded_collection_upgrades_sealed_pin_order() {
         .await
         .unwrap();
     let cold = reopen(&f).await;
+    let writer = db::begin_immediate(f.database().pool()).await.unwrap();
+    let record = tokio::time::timeout(std::time::Duration::from_secs(1), cold.load(&d, &s))
+        .await
+        .expect("load must not wait for the writer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM agent_session_journal_pin WHERE pin_order IS NULL"
+        )
+        .fetch_one(f.database().pool())
+        .await
+        .unwrap(),
+        3
+    );
+    writer.rollback().await.unwrap();
+    assert_eq!(cold.pins(&d, &s).await.unwrap().len(), 3);
+    cold.apply(edit(&cold, &d, &s).await).await.unwrap();
     let fence = cold.load(&d, &s).await.unwrap().unwrap().fence();
+    assert_eq!(fence.generation, record.generation + 1);
     let mut after = None;
     let mut pins = Vec::new();
     for _ in 0..3 {
@@ -4033,6 +4068,7 @@ async fn bounded_retired_purge_keeps_dirty_until_drained() {
     let raw = storage(&f).await;
     raw.set_repacking(false);
     let d = domain(JournalRole::Protected);
+    let other = domain(JournalRole::Ordinary);
     let s = SessionId::new("bounded-retired-purge");
     let first = equal_objects("first", 8);
     let second = equal_objects("second", 8);
@@ -4041,12 +4077,26 @@ async fn bounded_retired_purge_keeps_dirty_until_drained() {
         .await
         .unwrap();
     add_objects(&raw, &d, &s, second.clone()).await;
+    let other_objects: Vec<_> = first[4..].iter().chain(&second[4..]).cloned().collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&other, s.as_str(), other_objects.clone()))
+        .await
+        .unwrap();
+    let other_before = raw.objects(&other, &s, &ids(&other_objects)).await.unwrap();
+    assert_eq!(
+        other_before,
+        other_objects
+            .iter()
+            .map(|o| Some(o.bytes.clone()))
+            .collect::<Vec<_>>()
+    );
     for o in [&first[0], &second[0]] {
         let mut w = edit(&raw, &d, &s).await;
         w.release = vec![o.id.clone()];
         assert_eq!(raw.apply(w).await.unwrap(), JournalApplyReceipt::default());
     }
     let members = raw.members(&d, &s).await.unwrap();
+    let protected_before = raw.objects(&d, &s, &members).await.unwrap();
     let mut total = 0;
     for call in 0..2 {
         let mut w = edit(&raw, &d, &s).await;
@@ -4076,6 +4126,26 @@ async fn bounded_retired_purge_keeps_dirty_until_drained() {
             call == 0
         );
         assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+        assert_eq!(
+            raw.objects(&d, &s, &members).await.unwrap(),
+            protected_before
+        );
+        assert_eq!(
+            raw.objects(&other, &s, &ids(&other_objects)).await.unwrap(),
+            other_before
+        );
+        let reopened = reopen(&f).await;
+        assert_eq!(
+            reopened.objects(&d, &s, &members).await.unwrap(),
+            protected_before
+        );
+        assert_eq!(
+            reopened
+                .objects(&other, &s, &ids(&other_objects))
+                .await
+                .unwrap(),
+            other_before
+        );
     }
     assert_eq!(total, 2, "each earlier deferred copy is counted once");
 }
@@ -4169,4 +4239,366 @@ async fn drain_gc<S: JournalStorage>(
         total.accumulate(journal.collect(request.clone()).await?);
     }
     panic!("collection continuation bound exhausted");
+}
+
+#[tokio::test]
+async fn bounded_pin_pages_reject_duplicate_and_reversed_ranks() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("invalid-pin-ranks");
+    let mut w = write(&d, s.as_str(), equal_objects("pins", 4));
+    let JournalPinChange::Put(template) = w.pins[0].clone() else {
+        unreachable!()
+    };
+    w.pins = ["a", "b", "c"]
+        .into_iter()
+        .map(|id| {
+            JournalPinChange::Put(JournalPinRecord {
+                pin: JournalPinId::new(id),
+                ..template.clone()
+            })
+        })
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(w)
+        .await
+        .unwrap();
+    let fence = raw.load(&d, &s).await.unwrap().unwrap().fence();
+    let saved: Vec<(Vec<u8>, i64)> = sqlx::query_as(
+        "SELECT pin_key,pin_order FROM agent_session_journal_pin ORDER BY pin_order",
+    )
+    .fetch_all(f.database().pool())
+    .await
+    .unwrap();
+    let request = JournalCollectionPageRequest {
+        kind: JournalCollectionPageKind::Pins,
+        fence,
+        after: None,
+        max_items: 1,
+    };
+    let first = raw.collection_page(&d, &s, request.clone()).await.unwrap();
+    assert!(first.next.is_some());
+    sqlx::query("UPDATE agent_session_journal_pin SET pin_order=? WHERE pin_key=?")
+        .bind(saved[0].1)
+        .bind(&saved[1].0)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.collection_page(&d, &s, request.clone())
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Serialization,
+        "lookahead must detect a duplicate at a one-item boundary"
+    );
+    assert_eq!(
+        raw.collection_page(
+            &d,
+            &s,
+            JournalCollectionPageRequest {
+                after: first.next.clone(),
+                ..request.clone()
+            }
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        ErrorKind::Serialization,
+        "a duplicated previous rank introduced between pages is unreadable"
+    );
+    sqlx::query("UPDATE agent_session_journal_pin SET pin_order=? WHERE pin_key=?")
+        .bind(saved[1].1)
+        .bind(&saved[1].0)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_session_journal_pin SET pin_order=? WHERE pin_key=?")
+        .bind(saved[2].1 + 1)
+        .bind(&saved[1].0)
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        raw.collection_page(
+            &d,
+            &s,
+            JournalCollectionPageRequest {
+                after: first.next,
+                ..request
+            }
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        ErrorKind::Serialization,
+        "decrypted ids must ascend across the continuation"
+    );
+}
+
+#[tokio::test]
+async fn pin_rank_writes_are_incremental_and_load_ignores_unreadable_rank() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("incremental-pin-ranks");
+    let mut w = write(&d, s.as_str(), equal_objects("pins", 4));
+    let JournalPinChange::Put(template) = w.pins[0].clone() else {
+        unreachable!()
+    };
+    w.pins = (0..128)
+        .map(|i| {
+            JournalPinChange::Put(JournalPinRecord {
+                pin: JournalPinId::new(format!("pin-{i:03}")),
+                ..template.clone()
+            })
+        })
+        .collect();
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(w)
+        .await
+        .unwrap();
+    let before: Vec<(Vec<u8>, i64)> =
+        sqlx::query_as("SELECT pin_key,pin_order FROM agent_session_journal_pin ORDER BY pin_key")
+            .fetch_all(f.database().pool())
+            .await
+            .unwrap();
+    let reads = raw.diagnostic_calls_for_test().1;
+    let mut next = edit(&raw, &d, &s).await;
+    next.pins = vec![JournalPinChange::Put(JournalPinRecord {
+        pin: JournalPinId::new("pin-064-middle"),
+        ..template
+    })];
+    raw.apply(next).await.unwrap();
+    assert!(
+        raw.diagnostic_calls_for_test().1 - reads <= 9,
+        "one insertion uses logarithmic decrypts"
+    );
+    let after: Vec<(Vec<u8>, i64)> =
+        sqlx::query_as("SELECT pin_key,pin_order FROM agent_session_journal_pin ORDER BY pin_key")
+            .fetch_all(f.database().pool())
+            .await
+            .unwrap();
+    assert!(
+        before.iter().all(|entry| after.contains(entry)),
+        "existing sparse ranks stay unchanged"
+    );
+    let record = raw.load(&d, &s).await.unwrap();
+    sqlx::query("UPDATE agent_session_journal_pin SET pin_order=NULL,payload=zeroblob(length(payload)) WHERE pin_key=?")
+        .bind(&before[0].0).execute(f.database().pool()).await.unwrap();
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    assert_eq!(
+        raw.pins(&d, &s).await.unwrap_err().kind,
+        ErrorKind::Serialization
+    );
+}
+
+#[tokio::test]
+async fn bounded_collection_rechecks_fence_after_preflight() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    let d = domain(JournalRole::Protected);
+    let s = SessionId::new("changed-after-preflight");
+    let objects = equal_objects("preflight", 8);
+    MappingStorage::new(raw.clone(), f.clone())
+        .apply(write(&d, s.as_str(), objects.clone()))
+        .await
+        .unwrap();
+    let mut w = edit(&raw, &d, &s).await;
+    w.kind = JournalWriteKind::Collect;
+    w.release = ids(&objects[..1]);
+    let plan = JournalCollectionPlan {
+        write: w,
+        max_units: 32,
+    };
+    assert!(matches!(
+        raw.prepare_collection_apply(&plan).await.unwrap(),
+        JournalCollectionPreflight::Fits { .. }
+    ));
+    add_objects(&raw, &d, &s, equal_objects("racing-writer", 2)).await;
+    let record = raw.load(&d, &s).await.unwrap();
+    let members = raw.members(&d, &s).await.unwrap();
+    let bodies = raw.objects(&d, &s, &members).await.unwrap();
+    let packs = pack_rows(&f, &d, &s).await;
+    assert_eq!(
+        raw.apply_collection(plan).await.unwrap_err().kind,
+        ErrorKind::Conflict
+    );
+    assert_eq!(raw.load(&d, &s).await.unwrap(), record);
+    assert_eq!(raw.members(&d, &s).await.unwrap(), members);
+    assert_eq!(raw.objects(&d, &s, &members).await.unwrap(), bodies);
+    assert_eq!(pack_rows(&f, &d, &s).await, packs);
+}
+
+#[tokio::test]
+async fn bounded_empty_domain_forces_deferred_purge_without_retirement() {
+    let f = FileDb::new().await.unwrap();
+    let raw = storage(&f).await;
+    raw.set_repacking(false);
+    let p = domain(JournalRole::Protected);
+    let o = domain(JournalRole::Ordinary);
+    let s = SessionId::new("empty-domain-forced-purge");
+    let first = equal_objects("empty-first", 8);
+    let second = equal_objects("empty-second", 8);
+    let mapped = MappingStorage::new(raw.clone(), f.clone());
+    mapped.apply(write(&p, s.as_str(), vec![])).await.unwrap();
+    mapped
+        .apply(write(&o, s.as_str(), first.clone()))
+        .await
+        .unwrap();
+    add_objects(&raw, &o, &s, second.clone()).await;
+    for object in [&first[0], &second[0]] {
+        let mut w = edit(&raw, &o, &s).await;
+        w.release = vec![object.id.clone()];
+        assert_eq!(raw.apply(w).await.unwrap(), JournalApplyReceipt::default());
+    }
+    let members = raw.members(&o, &s).await.unwrap();
+    let bodies = raw.objects(&o, &s, &members).await.unwrap();
+    let mut reclaimed = 0;
+    for call in 0..2 {
+        let mut w = edit(&raw, &p, &s).await;
+        w.kind = JournalWriteKind::Collect;
+        w.record.collection_dirty = false;
+        assert!(w.record.retirement.is_none());
+        assert!(raw.members(&p, &s).await.unwrap().is_empty());
+        let receipt = raw
+            .apply_collection(JournalCollectionPlan {
+                write: w,
+                max_units: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.rewritten_units, 1);
+        reclaimed += receipt.receipt.reclaimed_objects;
+        assert_eq!(
+            raw.load(&p, &s).await.unwrap().unwrap().collection_dirty,
+            call == 0
+        );
+        assert_eq!(raw.objects(&o, &s, &members).await.unwrap(), bodies);
+        assert_eq!(
+            reopen(&f).await.objects(&o, &s, &members).await.unwrap(),
+            bodies
+        );
+    }
+    assert_eq!(reclaimed, 2);
+}
+
+#[tokio::test]
+async fn bounded_member_continuations_reject_all_layout_writers() {
+    for writer in [
+        "purge-rewrite",
+        "other-repack",
+        "delete",
+        "orphan-drain",
+        "insert",
+    ] {
+        let f = FileDb::new().await.unwrap();
+        let raw = storage(&f).await;
+        let p = domain(JournalRole::Protected);
+        let o = domain(JournalRole::Ordinary);
+        let s = SessionId::new(format!("layout-{writer}"));
+        let first = equal_objects("layout-first", 8);
+        let second = equal_objects("layout-second", 8);
+        let extra = equal_objects("layout-extra", 4);
+        let mapped = MappingStorage::new(raw.clone(), f.clone());
+        mapped
+            .apply(write(&p, s.as_str(), first.clone()))
+            .await
+            .unwrap();
+        add_objects(&raw, &p, &s, second.clone()).await;
+        mapped
+            .apply(write(
+                &o,
+                s.as_str(),
+                first.iter().chain(&second).cloned().collect(),
+            ))
+            .await
+            .unwrap();
+        if writer == "purge-rewrite" {
+            let mut w = edit(&raw, &p, &s).await;
+            w.release = ids(&first[..2]);
+            raw.apply(w).await.unwrap();
+        }
+        if matches!(writer, "delete" | "orphan-drain") {
+            add_objects(&raw, &o, &s, extra.clone()).await;
+        }
+        let fence = raw.load(&p, &s).await.unwrap().unwrap().fence();
+        let members = raw.members(&p, &s).await.unwrap();
+        let bodies = raw.objects(&p, &s, &members).await.unwrap();
+        let first_page = raw
+            .collection_page(
+                &p,
+                &s,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Members,
+                    fence,
+                    after: None,
+                    max_items: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(first_page.next.is_some());
+        match writer {
+            "purge-rewrite" => {
+                let mut w = edit(&raw, &o, &s).await;
+                w.release = ids(&first[..2]);
+                assert_eq!(raw.apply(w).await.unwrap().reclaimed_objects, 2);
+            }
+            "other-repack" => raw.post_terminal(&o, &s).await.unwrap(),
+            "delete" => {
+                let mut w = edit(&raw, &o, &s).await;
+                w.release = ids(&extra);
+                assert_eq!(raw.apply(w).await.unwrap().reclaimed_objects, 4);
+            }
+            "orphan-drain" => {
+                // Same membership cascade used by owner deletion, scoped to
+                // the ordinary record so protected readers remain present.
+                sqlx::query("DELETE FROM agent_session_journal_session WHERE runtime_session_id=? AND role='ordinary'")
+                    .bind(s.as_str()).execute(f.database().pool()).await.unwrap();
+                assert_eq!(
+                    f.database()
+                        .drain_session_journal_orphans(0)
+                        .await
+                        .unwrap()
+                        .deleted_packs,
+                    1
+                );
+            }
+            "insert" => add_objects(&raw, &o, &s, extra).await,
+            _ => unreachable!(),
+        }
+        assert_eq!(raw.load(&p, &s).await.unwrap().unwrap().fence(), fence);
+        let continuation = raw
+            .collection_page(
+                &p,
+                &s,
+                JournalCollectionPageRequest {
+                    kind: JournalCollectionPageKind::Members,
+                    fence,
+                    after: first_page.next,
+                    max_items: 1,
+                },
+            )
+            .await;
+        if writer == "insert" {
+            assert!(
+                continuation.is_ok(),
+                "monotonic insertion preserves existing positions"
+            );
+        } else {
+            assert_eq!(
+                continuation.unwrap_err().kind,
+                ErrorKind::Conflict,
+                "{writer}"
+            );
+        }
+        assert_eq!(raw.members(&p, &s).await.unwrap(), members, "{writer}");
+        assert_eq!(
+            raw.objects(&p, &s, &members).await.unwrap(),
+            bodies,
+            "{writer}"
+        );
+    }
 }

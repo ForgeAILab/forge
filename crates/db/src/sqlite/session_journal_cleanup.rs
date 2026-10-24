@@ -19,6 +19,16 @@ pub struct JournalCleanupBatch {
 }
 
 impl SqliteDb {
+    /// Invalidate physical member positions in every domain of this session.
+    /// The runtime-session index bounds this update to the session's own rows.
+    pub async fn bump_session_journal_layout_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        runtime_session_id: &str,
+    ) -> crate::Result<u64> {
+        Ok(sqlx::query("UPDATE agent_session_journal_session SET layout_generation=layout_generation+1 WHERE runtime_session_id=?")
+            .bind(runtime_session_id).execute(conn).await?.rows_affected())
+    }
+
     /// Post-commit activity wakeup shared with domain-event consumers. The
     /// durable orphan index is authoritative; unrelated wakes are harmless.
     /// Task 21 will attach its worker to this signal and retry from zero on
@@ -54,11 +64,12 @@ impl SqliteDb {
         }
         let mut tx = crate::begin_immediate(self.pool()).await?;
         let locked = Instant::now();
+        let mut bumped = std::collections::HashSet::new();
         for (id, candidate_owner) in candidates {
             // Re-read under the write lock. A writer can re-admit an orphan or
             // an owner label can change after discovery; neither is deletion.
             let row = sqlx::query(
-                "SELECT p.forge_session_id, p.orphaned, p.object_count, p.retained_canonical_bytes,
+                "SELECT p.runtime_session_id, p.forge_session_id, p.orphaned, p.object_count, p.retained_canonical_bytes,
                     EXISTS(SELECT 1 FROM agent_session s WHERE s.id=p.forge_session_id) AS owner_present,
                     EXISTS(SELECT 1 FROM agent_session_journal_membership m WHERE m.pack_id=p.pack_id) AS held
                  FROM agent_session_journal_pack p WHERE p.pack_id=?",
@@ -100,6 +111,10 @@ impl SqliteDb {
             .rows_affected();
             report.after_pack_id = id;
             if removed == 1 {
+                let session: String = row.try_get("runtime_session_id")?;
+                if bumped.insert(session.clone()) {
+                    Self::bump_session_journal_layout_in_tx(&mut tx, &session).await?;
+                }
                 report.deleted_packs += 1;
                 report.deleted_objects += objects;
                 report.deleted_canonical_bytes += bytes;

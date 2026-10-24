@@ -6,7 +6,94 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ## [Unreleased]
 
+### Breaking
+
+- Explicit Agent Session resume now returns `409 session_retired` when native
+  journal history was retired; clients must start a new session. Automatic native
+  selection and open races rotate to a fresh runtime id with one bounded retry.
+- New native session state uses encrypted journal packs. Older Forge builds
+  cannot resume that state and refuse the newer database; downgrading requires
+  a backup taken before upgrading. Journal migrations V202610200941,
+  V202610201253 and V202610240425 are one-way; sealed data remains untouched.
+  Existing legacy rows remain readable and are imported automatically when resumed.
+
+### Added
+
+- Data-preserving session-journal foundation migration: six new tables for
+  session records, pins, catalogs, session-owned packs, per-domain bitmap
+  memberships and operation packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
+  unchanged; new native session state uses the journal tables. One-way migration
+  V202610240425 adds page layout generations, indexed session lookup and pin
+  ranks without rewriting sealed data; missing ranks backfill on the next write.
+
+### Changed
+
+- Convert legacy native sessions in a supervised background pass, one session at
+  a time with active-turn skips, bounded scheduling and restart recovery. Lazy
+  import remains the fallback on early open; legacy rows remain until the next
+  release. Conversion reuses the runtime importer and shared journal engines.
+- Native session disk reclamation now runs automatically after terminal
+  publication and on a 60-second maintenance tick. It retires replaced and
+  unresumable sessions, preserves resumable chats and reusable Task sessions,
+  and drains deleted-owner packs in bounded batches. Unreadable sessions remain
+  untouched while healthy collection continues; unknown dependencies can safely
+  defer retirement. Collection is bounded and resumable: the worker refreshes
+  the root epoch on each continuation, within 10 seconds and 32 calls per pass.
+  Byte diagnostics run once per finished domain phase. Retention logs add
+  `collection_continuations`, `has_more`, `work_units`, `zero_work_calls` and
+  `over_capacity_sessions`; capped per-session warnings identify capacity skips.
+- Deleting a Project or Agent Chat, or archiving an Agent, removes saved native
+  session metadata and journal memberships. Agent deletion also removes CLI
+  resume handles; it does not itself signal an already running CLI process.
+  Chat deletion and Agent archival use repository transactions; only the journal
+  orphan-marker projection triggers remain in the journal migrations. Pack
+  layout invalidation runs in indexed repository writers and orphan drain.
+- Sessions now persist through the native session journal, using agent-runtime
+  v0.10.0 (`c036af7b4635cf7d76451aaa666a9df87405ca1a`, previously v0.8.0)
+  and encrypted delta packs. All runtime packages and the testkit use that pin;
+  ambiguous storage acknowledgements and SQLite contention are retryable.
+  Chat and Task continuity work as before; the disk layout of newly saved state
+  changes. Legacy rows are still read for automatic import and remain stored.
+  Protected recovery is exact; ordinary state omits optional sensitive host
+  diagnostics while preserving conversation and restore-critical state.
+- A session's protected and ordinary journal state now store each identical
+  body once: packs belong to the runtime session and each domain reads only
+  through its own membership. Bodies are never shared across sessions, and the
+  ordinary state still never reads content its projection excludes. Pack units
+  are sealed under a session-scoped binding. This changes the unreleased
+  journal layout in place; there is no separate migration.
+  Measured B/N=4000 retained size after collection falls from 2.84×/3.23× to
+  1.61×/1.79× of the legacy row (plain/tool), meeting the 2.0× disk gate;
+  turn and import times are unchanged and still slower than legacy.
+- Session-journal storage keeps unchanged decoded pack bodies cached across
+  terminal maintenance, compaction and collection rewrites, batches pin/catalog
+  removals and validates admitted bodies once. S2 and collection base repack can
+  merge fully live mixed-holder packs while preserving each domain's own bits;
+  a pack fully held by another domain remains excluded unless the acting domain
+  also holds it completely.
+- A failed native turn acceptance no longer leaves unaccepted input in later
+  saved history. Unresolved acceptance fences persistence until reopen; Forge
+  preserves the original turn failure and the next turn recovers automatically.
+- Native Agent Chat now uses the runtime's `agent-runtime-lcm-4` planning:
+  condensation carries a full covered-entry size tier instead of merging on
+  active-node count. Without token pressure, summaries can occupy more context;
+  existing soft/hard pressure limits still apply and persisted LCM state remains
+  resumable.
+
 ### Fixed
+
+- Native Task context manifests use the host session matching the final runtime
+  output after retirement rotation, including reviewer corrections. Retired-open
+  races no longer retain obsolete runtime ids in unchanged-read failure tracking.
+- Sessions with incomplete journal membership are reported through the capped
+  unreadable-session warning and preserved while healthy collection continues.
+- Unreadable-journal warning tracking retains at most 4,096 ids per process,
+  without eviction, and emits one overflow warning before suppressing further
+  session warnings. Aggregate counters continue; worker preservation counts now
+  cover only the current pass and no longer retain repaired/deleted ids.
+- Cancelled native turns retain their cancellation outcome and per-turn usage
+  when shutdown or persistence is fenced by unresolved acceptance. Cleanup closes
+  leases and removes the active registration; the next request reopens normally.
 
 - Task detail: Escape in the title or description editor discards the draft,
   refreshes the stored Task and board values, and no longer also closes the
@@ -116,15 +203,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Breaking
 
-- Explicit Agent Session resume now returns `409 session_retired` when native
-  journal history was retired; clients must start a new session. Automatic native
-  selection and open races rotate to a fresh runtime id with one bounded retry.
-
-- New native session state uses encrypted journal packs. Older Forge builds
-  cannot resume that state and refuse the newer database; downgrading requires
-  a backup taken before upgrading. Existing legacy rows remain readable and
-  are imported automatically when resumed.
-
 - Review parks with a `review_needs_owner` condition now use Attention category
   `review_needs_owner` instead of `execution_failed`. Clients matching category
   values must handle this owner-decision category.
@@ -197,11 +275,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Added
 
-- Data-preserving session-journal foundation migration: six new tables for
-  session records, pins, catalogs, session-owned packs, per-domain bitmap
-  memberships and operation packs, plus indexes. Existing legacy rows and encrypted payload bytes remain
-  unchanged; new native session state uses the journal tables.
-
 - HTTPS-only HttpOnly `__Host-forge_session` and `__Host-forge_refresh` cookies on
   registration, login and refresh, with matching logout cleanup.
   REST, web startup and SSE support cookie-only sessions while password-login
@@ -212,52 +285,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   returns to `/login` without a loop or storing the returned tokens.
 
 ### Changed
-
-- Convert legacy native sessions in a supervised background pass, one session at
-  a time with active-turn skips, bounded scheduling and restart recovery. Lazy
-  import remains the fallback on early open; legacy rows remain until the next
-  release. Conversion reuses the runtime importer and shared journal engines.
-
-- Native session disk reclamation now runs automatically after terminal
-  publication and on a 60-second maintenance tick. It retires replaced and
-  unresumable sessions, preserves resumable chats and reusable Task sessions,
-  and drains deleted-owner packs in bounded batches. Unreadable sessions remain
-  untouched while healthy collection continues; unknown dependencies can safely
-  defer retirement.
-- Deleting a Project or Agent Chat, or archiving an Agent, removes saved native
-  session metadata and journal memberships. Agent deletion also removes CLI
-  resume handles; it does not itself signal an already running CLI process.
-  Chat deletion and Agent archival use repository transactions; only the journal
-  orphan-marker projection triggers remain in the unreleased migration.
-
-- Sessions now persist through the native session journal, using agent-runtime
-  v0.9.0 (`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, previously v0.8.0)
-  and encrypted delta packs. All runtime packages and the testkit use that pin;
-  ambiguous storage acknowledgements and SQLite contention are retryable.
-  Chat and Task continuity work as before; the disk layout of newly saved state
-  changes. Legacy rows are still read for automatic import and remain stored.
-  Protected recovery is exact; ordinary state omits optional sensitive host
-  diagnostics while preserving conversation and restore-critical state.
-- A session's protected and ordinary journal state now store each identical
-  body once: packs belong to the runtime session and each domain reads only
-  through its own membership. Bodies are never shared across sessions, and the
-  ordinary state still never reads content its projection excludes. Pack units
-  are sealed under a session-scoped binding. This changes the unreleased
-  journal layout in place; there is no separate migration.
-  Measured B/N=4000 retained size after collection falls from 2.84×/3.23× to
-  1.61×/1.79× of the legacy row (plain/tool), meeting the 2.0× disk gate;
-  turn and import times are unchanged and still slower than legacy.
-- Session-journal storage keeps unchanged decoded pack bodies cached across
-  terminal maintenance, compaction and collection rewrites, batches pin/catalog
-  removals and validates admitted bodies once.
-- A failed native turn acceptance no longer leaves unaccepted input in later
-  saved history. Unresolved acceptance fences persistence until reopen; Forge
-  preserves the original turn failure and the next turn recovers automatically.
-- Native Agent Chat now uses the runtime's `agent-runtime-lcm-4` planning:
-  condensation carries a full covered-entry size tier instead of merging on
-  active-node count. Without token pressure, summaries can occupy more context;
-  existing soft/hard pressure limits still apply and persisted LCM state remains
-  resumable.
 
 - A native turn failed by a provider rejection now reads
   `Provider: provider rejected the request…` instead of `Config: …` in Task
@@ -320,19 +347,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   including board moves; failed entries and unused payloads leave no orphan.
 
 ### Fixed
-
-- Native Task context manifests use the host session matching the final runtime
-  output after retirement rotation, including reviewer corrections. Retired-open
-  races no longer retain obsolete runtime ids in unchanged-read failure tracking.
-
-- Unreadable-journal warning tracking retains at most 4,096 ids per process,
-  without eviction, and emits one overflow warning before suppressing further
-  session warnings. Aggregate counters continue; worker preservation counts now
-  cover only the current pass and no longer retain repaired/deleted ids.
-
-- Cancelled native turns retain their cancellation outcome and per-turn usage
-  when shutdown or persistence is fenced by unresolved acceptance. Cleanup closes
-  leases and removes the active registration; the next request reopens normally.
 
 - Native Task and reviewer-correction turns now feed provider entry health.
   They were classified from error text, and the runtime's fixed provider
@@ -2159,7 +2173,6 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   with step-level ids when signatures are unavailable. Review checklists show
   checked findings only when resolved by that review, omitting older resolutions.
 
-
 - Review comments show the finding checklist and drop the full report. Read the
   full report in the Review tab or `/api/v1/tasks/{id}/reviews`; reviews without
   findings retain a 2 KiB excerpt. The checklist lists open findings first and
@@ -3522,9 +3535,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 - Extract failures from prefixed pnpm/turbo monorepo test output, with independent bounded runner state per package/task and captured fixtures. Each identity is qualified with its package, so the same package-relative test in two packages stays two failures.
 
-
 - Project `review_ci_triage` (`full`, `report`, `off`), a durable rerun and exact-commit base comparison, queue-head CI triage, and Project Attention categories `flaky_check` and `base_check_failing` with Mission Control warnings.
-
 
 - Check steps report normalised failing test signatures from cargo test,
   vitest/jest, pytest, Go tests and JUnit XML in `FORGE_CI_REPORT_DIR`, with

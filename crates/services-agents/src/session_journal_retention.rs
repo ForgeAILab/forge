@@ -40,6 +40,7 @@ pub struct RetentionReport {
     pub conflicts: usize,
     pub deferred_domains: usize,
     pub unreadable_sessions: usize,
+    pub over_capacity_sessions: usize,
     pub preserved_sessions: usize,
     pub collection_calls: usize,
     pub collection_continuations: usize,
@@ -54,6 +55,8 @@ pub struct RetentionReport {
 pub struct SessionJournalRetention {
     db: Arc<SqliteDb>,
     journals: SessionJournals,
+    #[cfg(feature = "test-support")]
+    collection_budget: JournalGcBudget,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -72,7 +75,15 @@ impl SessionJournalRetention {
         Self {
             db,
             journals: store.journals().clone(),
+            #[cfg(feature = "test-support")]
+            collection_budget: JournalGcBudget::default(),
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn with_collection_budget_for_test(mut self, budget: JournalGcBudget) -> Self {
+        self.collection_budget = budget;
+        self
     }
 
     /// The resume query is authoritative per identity, scope AND profile.
@@ -239,6 +250,7 @@ impl SessionJournalRetention {
         let deadline = started + budget;
         let mut report = RetentionReport::default();
         let mut unreadable = HashSet::new();
+        let mut over_capacity = HashSet::new();
         loop {
             if Instant::now() >= deadline {
                 report.budget_exhausted = true;
@@ -272,6 +284,7 @@ impl SessionJournalRetention {
                             cursor,
                             &mut report,
                             &mut unreadable,
+                            &mut over_capacity,
                         )
                         .await?;
                     if !more {
@@ -286,6 +299,7 @@ impl SessionJournalRetention {
                             cursor,
                             &mut report,
                             &mut unreadable,
+                            &mut over_capacity,
                         )
                         .await?;
                     if !more {
@@ -306,10 +320,11 @@ impl SessionJournalRetention {
                 }
             }
         }
-        report.preserved_sessions = unreadable.len();
+        report.preserved_sessions = unreadable.union(&over_capacity).count();
+        report.over_capacity_sessions = over_capacity.len();
         tracing::debug!(target: "forge_session_journal", duration_us=started.elapsed().as_micros() as u64,
             retired_domains=report.retired_domains, conflicts=report.conflicts, deferred_domains=report.deferred_domains,
-            unreadable_sessions=report.unreadable_sessions, preserved_sessions=report.preserved_sessions,
+            unreadable_sessions=report.unreadable_sessions, over_capacity_sessions=report.over_capacity_sessions, preserved_sessions=report.preserved_sessions,
             unreadable_observations_total=ForgeJournalStorage::unreadable_session_observations(),
             collection_calls=report.collection_calls, collection_continuations=report.collection_continuations, membership_release_limit=MEMBERSHIP_RELEASE_LIMIT,
             reclaimed_objects=report.reclaimed_objects, reclaimed_bytes=report.reclaimed_bytes,
@@ -326,6 +341,7 @@ impl SessionJournalRetention {
         cursor: &mut RetentionCursor,
         report: &mut RetentionReport,
         unreadable: &mut HashSet<SessionId>,
+        over_capacity: &mut HashSet<SessionId>,
     ) -> Result<bool> {
         let request = JournalGcRequest {
             storage_id: engine.storage_id(),
@@ -333,7 +349,16 @@ impl SessionJournalRetention {
                 .root_epoch()
                 .map_err(|_| ServiceError::Domain("session journal epoch unavailable".into()))?,
             max_objects: MEMBERSHIP_RELEASE_LIMIT,
-            work_budget: JournalGcBudget::default(),
+            work_budget: {
+                #[cfg(feature = "test-support")]
+                {
+                    self.collection_budget
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    JournalGcBudget::default()
+                }
+            },
         };
         let started = Instant::now();
         let result = engine.collect(request).await;
@@ -344,8 +369,9 @@ impl SessionJournalRetention {
             Ok(gc) => {
                 more = gc.has_more && gc.zero_work_calls == 0;
                 report.collection_continuations += usize::from(more);
-                if !gc.over_capacity_sessions.is_empty() {
-                    tracing::warn!(target: "forge_session_journal", ?role, over_capacity_sessions=gc.over_capacity_sessions.len(), "journal collection cursor capacity exceeded; sessions preserved");
+                for id in &gc.over_capacity_sessions {
+                    ForgeJournalStorage::note_over_capacity_session(id);
+                    over_capacity.insert(id.clone());
                 }
                 for id in &gc.unreadable_sessions {
                     ForgeJournalStorage::note_unreadable_session(id);
@@ -357,22 +383,26 @@ impl SessionJournalRetention {
                 report.reclaimed_bytes += gc.reclaimed_bytes;
                 cursor.reclaimed_objects = cursor.reclaimed_objects.saturating_add(gc.deleted);
                 cursor.reclaimed_bytes = cursor.reclaimed_bytes.saturating_add(gc.reclaimed_bytes);
-                let stats = self
-                    .journals
-                    .storage()
-                    .byte_stats(&JournalDomain {
-                        storage_id: engine.storage_id(),
-                        role,
-                    })
-                    .await
-                    .map_err(|_| {
-                        ServiceError::Domain("session journal byte diagnostic deferred".into())
-                    })?;
                 tracing::debug!(target: "forge_session_journal", ?role, collect_duration_us, gate_hold_upper_bound_us=collect_duration_us, examined=gc.examined,
                     reclaimed_objects=gc.deleted, reclaimed_bytes=gc.reclaimed_bytes,
-                    unreadable_sessions=gc.unreadable_sessions.len(), has_more=gc.has_more, work_units=gc.work_units, zero_work_calls=gc.zero_work_calls, retained_bytes=stats.retained_bytes,
-                    live_bytes=stats.live_bytes, deferred_bytes=stats.deferred_bytes,
-                    diagnostic_skipped_sessions=stats.skipped_sessions, "journal collection");
+                    unreadable_sessions=gc.unreadable_sessions.len(), over_capacity_sessions=gc.over_capacity_sessions.len(),
+                    has_more=gc.has_more, work_units=gc.work_units, zero_work_calls=gc.zero_work_calls, "journal collection");
+                if !more {
+                    let stats = self
+                        .journals
+                        .storage()
+                        .byte_stats(&JournalDomain {
+                            storage_id: engine.storage_id(),
+                            role,
+                        })
+                        .await
+                        .map_err(|_| {
+                            ServiceError::Domain("session journal byte diagnostic deferred".into())
+                        })?;
+                    tracing::debug!(target: "forge_session_journal", ?role, retained_bytes=stats.retained_bytes,
+                        live_bytes=stats.live_bytes, deferred_bytes=stats.deferred_bytes,
+                        diagnostic_skipped_sessions=stats.skipped_sessions, "journal collection phase finished");
+                }
             }
             Err(error) if error.kind == ErrorKind::Conflict => {
                 report.conflicts += 1;

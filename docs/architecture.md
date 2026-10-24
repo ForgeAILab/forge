@@ -2505,14 +2505,18 @@ exhaustion, without ids, contents or keys. Remaining includes unreadable/active
 rows. Legacy-table removal stays in the next release.
 
 Discovery pages only the clear dirty-session index, including corrupt records.
-Runtime v0.9.0 reports per-session non-retryable failures in `unreadable_sessions`,
-keeps their state and dirty hints, and continues healthy collection. A second
-collect reports the bad session again with at most one record load in that call.
+Runtime v0.10.0 reports per-session non-retryable failures in `unreadable_sessions`,
+keeps their state and dirty hints, and continues healthy collection. Bounded
+collect calls resume through continuations; a later pass reports still-unreadable
+sessions again, with at most one record load per session in each call.
 Conflicts skip silently; retryable/domain-wide errors abort. The worker and
 storage share a capped, non-evicting process warning tracker. It retains at most
 4,096 ids, warns once per tracked session and emits one overflow warning when
 capacity is reached. Further per-session warnings are suppressed while aggregate
-observations keep counting. Logs contain no ids, contents or keys. Diagnostics
+observations keep counting. Unreadable warnings contain no ids, contents or keys.
+Over-capacity warnings use a separate tracker with the same 4,096-session cap and include the runtime
+session id. `over_capacity_sessions` counts distinct affected sessions per pass;
+`preserved_sessions` counts the union with unreadable sessions. Diagnostics
 and compact skip unreadable sessions. The worker deduplicates unreadable ids only
 within the current pass: `preserved_sessions` and `unreadable_sessions` are
 current-pass counts, with no lifetime id set in the restartable cursor.
@@ -2520,7 +2524,9 @@ current-pass counts, with no lifetime id set in the restartable cursor.
 refusals, collection receipts, readable retained/live/deferred bytes, omitted
 session counts and deletion counts. Collect-call duration is a conservative
 gate-hold upper bound including gate wait; the 10-second budget bounds scheduling,
-not the engine's individual gate hold.
+not the engine's individual gate hold. Collection refreshes the root epoch on
+each continuation and makes at most 32 calls per pass. Byte diagnostics run
+once per finished domain phase, rather than on each yielded call.
 
 Session deletion immediately cascades journal records, pins, catalog,
 operation packs and memberships. Project/Task scopes and physical Agent deletion
@@ -2566,7 +2572,7 @@ Cache/manifests may contain content; broader free-text redaction has no approved
 recovery-equivalence evidence. Both domains remain encrypted. Credentials stay in
 their existing protected tables and leases, outside journal state.
 
-The pin is agent-runtime v0.9.0 (`8c19be5b226c2fdaeb6708ec5d39e91c235857a5`).
+The pin is agent-runtime v0.10.0 (`c036af7b4635cf7d76451aaa666a9df87405ca1a`).
 The release rolls back proven unaccepted turn input and fences unresolved
 acceptance until reopen. Forge separates terminal outcomes and per-turn usage
 from shutdown/persist cleanup. Failed and cancelled turns retain their original
@@ -2754,7 +2760,7 @@ the hard cap, and runtime-derived pressure/leaf/round defaults govern compaction
 Forge's serialized-entry sizer, chars/4 overhead calculation and pressure overrides
 are removed.
 
-The pinned agent-runtime v0.9.0 uses `agent-runtime-lcm-4`: normal condensation
+The pinned agent-runtime v0.10.0 uses `agent-runtime-lcm-4`: normal condensation
 carries the newest full covered-entry size tier rather than triggering on active
 node count. Depth stays logarithmic; without token pressure, the frontier can
 retain about `fanout - 1` summaries per tier and use more context. Existing
@@ -8417,17 +8423,23 @@ diagnostic references use complete projection. Pointwise equivalence with the
 existing complete policy is tested across both sensitivity transitions and
 removals; the conservative redaction policy itself is unchanged.
 
-The runtime speed-work interim pin is `b0a8c90e96ccb85e4642a119117a8fd5d3a06993`
-(still versioned 0.9.0); the final release pin will be the v0.10.0 tag.
+The runtime is pinned to v0.10.0 at `c036af7b4635cf7d76451aaa666a9df87405ca1a`.
 `collection.rs` implements the required bounded storage protocol. Member pages
 keyset by pack id and slot, opening at most one capped pack per page; pin pages
 use an indexed relative rank, while pin ids and lookup HMACs stay unchanged.
 The additive `V202610240425__journal_collection_pages.sql` migration adds pin ranks and a
-per-domain session layout generation, with pack projection triggers updating
-all domains of that session. Continuations bind the full runtime fence and
-member positions additionally bind that layout generation, so S2/compact cannot
-silently skip a moved member. Old pin ranks hydrate once through authenticated
-non-collection reads; their encrypted payloads are preserved.
+per-domain session layout generation and an index on runtime session id.
+Pack rewrite/delete writers and orphan drain bump all domains of the affected
+session through that index, once per transaction; no layout triggers remain.
+Monotonic inserts cannot move an existing position and need no layout bump.
+Continuations bind the full runtime fence; member positions additionally bind
+that layout generation, so S2/compact cannot
+silently skip a moved member. Missing pin ranks backfill in the next writer
+transaction; `load()` remains read-only and independent of pin readability. Sparse ranks make an insertion
+decrypt only its new pin and logarithmically many comparisons, updating existing
+ranks only when a gap is exhausted. Pin pages authenticate ids and verify strict
+id/rank ordering through the lookahead and across continuations; unreadable or
+duplicate ranks fail conservatively. Encrypted pin payloads are preserved.
 
 Preflight is read-only. It counts touched input packs, forced deferred purges,
 bounded base-repack inputs and changed operation segments, at most 32 physical
@@ -8563,20 +8575,22 @@ Agent-host's explicit `test-support` feature provides file-backed fixtures whose
 storage decorators retain their temporary directories and create host mappings
 on the first apply for arbitrary runtime ids. Read-test seeding and generation
 resealing helpers exist only under that feature. Engine conformance factories
-now use the production sqlx adapter with real AEAD. The unedited v0.9.0 testkit
-storage suite passes all 26 named cases in each of three configurations:
+now use the production sqlx adapter with real AEAD. The unedited v0.10.0 testkit
+storage suite exercises all 27 named cases, including
+`bounded_collection_protocol`, in each of three configurations:
 `storage_conformance_no_repack`, `storage_conformance_repack`, and
 `storage_conformance_reopen` (a fresh independent pool and empty storage caches
 on every hydration load). All declare PerSession with within-session domain sharing;
 S2 off keeps mandatory purges enabled. The testkit supplies the engine collection
 host implementation; Forge adds no collector semantics.
 
-Eight test-target-only broken-storage decorators are each rejected at their
+Thirteen test-target-only broken-storage decorators are each rejected at their
 named conformance case: torn transactions, lost acknowledged writes, reordered
 n+1 publication, ignored writer epoch, ignored control generation, premature
 unlinking of a remaining holder's copy, serving released bytes to a non-member,
-and a non-retryable lost acknowledgement. The non-member defect is now rejected
-first by v0.9.0's body_cache_membership case; NonRetryableLostAck is rejected by
+and a non-retryable lost acknowledgement. Five bounded-protocol controls cover
+unbounded or stale pages, partial applies, underreported units and dropped pin
+pages. The non-member defect is rejected by `body_cache_membership` (added in v0.9.0); NonRetryableLostAck is rejected by
 atomic_apply_cuts. Valid releases preserve other holders and reclaim only bytes
 no domain of the session still holds. The focused `session_journal_storage` target retains the
 codec/storage/maintenance regressions. Legacy decoder tests use the real

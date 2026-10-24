@@ -1,19 +1,19 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-22T04:13:54Z
+updated_at: 2026-10-24T07:52:00Z
 ---
 
 ## Why
 
 Forge rewrites, compresses and encrypts complete native session snapshots and
 checkpoints at every persistence barrier. The runtime now has a storage-generic
-`JournalEngine<S>` in release `v0.9.0`; Forge should consume that engine rather
+`JournalEngine<S>` in release `v0.10.0`; Forge should consume that engine rather
 than implement journal semantics. The reference packed SQLite adapter measured
 fixture B/N=4000 at **1.60542× L2 plain and 1.79118× L2 tool**, both with
 collect-at-end and per-turn collection.
 L2 is today's actual idle legacy row with **two sealed blobs**, not the earlier
 one-blob assumption. These are measured **PerSession S1–S5** results from
-`/Volumes/Data/tmp/refactor/rt-e7/report.md`, with modeled seal lengths and
+`historical-receipts/rt-e7/report.md`, with modeled seal lengths and
 within-session domain sharing. Forge now shares bodies between a session's two
 domains too (2026-10-21 amendment). Its real-AEAD/sqlx B/4000 disk gate now
 passes at 1.60843× / 1.79118×; turn/collect gates await runtime speed work.
@@ -31,7 +31,8 @@ the supplemental C/N=4000 collect-at-end run is **1.22863× L2**.
   version, branch-only production pin or Forge semantic workaround. The rebased
   baseline pinned `1de6d7d` (0.7.0 + U9 groups C/D); task 1 adopted the first
   engine release. The retention follow-up now pins all eight runtime/testkit
-  packages to `v0.9.0` at `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, including
+  packages to `v0.10.0` at `c036af7b4635cf7d76451aaa666a9df87405ca1a`, including
+  bounded resumable collection,
   per-session collection isolation, retryable ambiguous acknowledgements and
   failed-acceptance rollback/fencing.
 - **Forge implements only `JournalStorage`.** Two long-lived

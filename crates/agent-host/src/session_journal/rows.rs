@@ -198,6 +198,8 @@ impl ForgeJournalStorage {
         let encoded = self.work(move || codec::encode_validated(&encode)).await?;
         // Reserve the AUTOINCREMENT identity inside this transaction; this
         // placeholder is replaced by authenticated units before any commit.
+        // Inserts cannot move an existing continuation: ids only increase,
+        // the writing domain advances its fence, and merges delete inputs.
         let id:i64={ #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.INSERT", 0); sqlx::query_scalar("INSERT INTO agent_session_journal_pack (runtime_session_id,forge_session_id,generation,object_count,retained_canonical_bytes,key_revision,format,index_nonce,index_payload,body_nonce,body_payload) VALUES (?,?,?, ?,?,?,?,zeroblob(24),zeroblob(16),zeroblob(24),zeroblob(16)) RETURNING pack_id")
             .bind(session.as_str()).bind(owner).bind(0u64.to_be_bytes().as_slice())
             .bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(self.keys.revision).bind(FORMAT).fetch_one(&mut *conn).await }.map_err(database_error)?;
@@ -356,9 +358,7 @@ impl ForgeJournalStorage {
             &mut removals,
         )
         .await?;
-        if !changes.is_empty() {
-            self.rank_pins(conn, scope).await?;
-        }
+        self.rank_pins(conn, scope).await?;
         Ok(())
     }
     /// One DELETE per chunk of keyed pin/catalog removals in this scope.

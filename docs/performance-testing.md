@@ -159,13 +159,14 @@ checks must succeed. Choose a new or empty fixture directory and new report
 files: the tools refuse to overwrite existing data/results.
 
 ```bash
-export TMPDIR=/Volumes/Data/tmp CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
+# Set TMPDIR to a writable scratch directory.
+export CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
 # Optional explicit test HOME for child servers; otherwise each gets a scratch HOME.
-export FORGE_PERF_HOME=/Volumes/Data/tmp/test-home
-python3 scripts/perf_fixture.py build --baseline-binary /path/to/baseline/forge --out /Volumes/Data/tmp/perf/heavy/fixture --profile heavy --port 18101
-python3 scripts/perf_bench.py run --binary /path/to/baseline/forge --fixture /Volumes/Data/tmp/perf/heavy/fixture --label baseline --out /Volumes/Data/tmp/perf/heavy/baseline.json --port 18101
-python3 scripts/perf_bench.py run --binary /path/to/candidate/forge --fixture /Volumes/Data/tmp/perf/heavy/fixture --label candidate --out /Volumes/Data/tmp/perf/heavy/candidate.json --port 18102
-python3 scripts/perf_bench.py compare /Volumes/Data/tmp/perf/heavy/baseline.json /Volumes/Data/tmp/perf/heavy/candidate.json
+export FORGE_PERF_HOME=$TMPDIR/test-home
+python3 scripts/perf_fixture.py build --baseline-binary /path/to/baseline/forge --out $TMPDIR/perf/heavy/fixture --profile heavy --port 18101
+python3 scripts/perf_bench.py run --binary /path/to/baseline/forge --fixture $TMPDIR/perf/heavy/fixture --label baseline --out $TMPDIR/perf/heavy/baseline.json --port 18101
+python3 scripts/perf_bench.py run --binary /path/to/candidate/forge --fixture $TMPDIR/perf/heavy/fixture --label candidate --out $TMPDIR/perf/heavy/candidate.json --port 18102
+python3 scripts/perf_bench.py compare $TMPDIR/perf/heavy/baseline.json $TMPDIR/perf/heavy/candidate.json
 ```
 
 The `heavy` profile contains one owned heavy Project and repository, using the
@@ -300,7 +301,7 @@ constructs responses without additional slot reads.
 
 Local validation on 2026-10-02 used macOS 27 / ARM64 release binaries and the
 unchanged generation-2 heavy fixture. Reports are under
-`/Volumes/Data/tmp/perf/heavy/`:
+`$TMPDIR/perf/heavy/`:
 
 | Build/report | Project GET p50 ms | Project list p50 ms |
 | --- | ---: | ---: |
@@ -353,8 +354,8 @@ To prove row determinism with the actual baseline, build a second fixture into
 another empty directory, then run the optional read-only comparison test:
 
 ```bash
-PERF_FIXTURE_A=/Volumes/Data/tmp/perf/heavy/fixture \
-PERF_FIXTURE_B=/Volumes/Data/tmp/perf/heavy/fixture-repeat \
+PERF_FIXTURE_A=$TMPDIR/perf/heavy/fixture \
+PERF_FIXTURE_B=$TMPDIR/perf/heavy/fixture-repeat \
   python3 -m unittest discover -s scripts -p test_perf_fixture.py -v
 ```
 
@@ -491,13 +492,14 @@ write-lock waits are excluded. RSS is sampled with
 `proc_pidinfo` on macOS and `/proc` on Linux.
 
 ```sh
-export TMPDIR=/Volumes/Data/tmp CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
+# Set TMPDIR to a writable scratch directory.
+export CARGO_TARGET_DIR=$PWD/target FORGE_SKIP_WEB_BUILD=1
 python3 scripts/perf_usage_reads.py prepare --binary "$PWD/target/release/forge" \
-  --fixture /Volumes/Data/tmp/perf/heavy/fixture-v2 --scale 20 --estimated \
-  --out /Volumes/Data/tmp/perf/usage-estimated20
+  --fixture $TMPDIR/perf/heavy/fixture-v2 --scale 20 --estimated \
+  --out $TMPDIR/perf/usage-estimated20
 python3 scripts/perf_usage_reads.py run --binary "$PWD/target/release/forge" \
-  --fixture /Volumes/Data/tmp/perf/usage-estimated20 --clients 4 --requests 100 \
-  --out /Volumes/Data/tmp/perf/usage-estimated20-4clients.json
+  --fixture $TMPDIR/perf/usage-estimated20 --clients 4 --requests 100 \
+  --out $TMPDIR/perf/usage-estimated20-4clients.json
 ```
 
 Agent page execution counts/success rates and running occupancy use the same
@@ -534,7 +536,7 @@ Each includes two constant usage/statistics header probes, one grouped
 assignment statement, three effective-status statements and page-wide runnable
 facts. Project membership adds one statement. Native runnable health adds one
 statement. Counts and scalar-response comparisons are recorded in
-`/Volumes/Data/tmp/usage-merge/test-api-environment_surface_lists-final.log`.
+`$TMPDIR/usage-merge/test-api-environment_surface_lists-final.log`.
 
 The merge benchmark also exposed unused CLI availability probes for paused
 Agents in the new runnable projection. The heavy fixture pauses all seven
@@ -570,7 +572,7 @@ offline, and requires every mutation to compile and fail a repository test:
 
 ```sh
 python3 scripts/test_usage_mutations.py \
-  --scratch /Volumes/Data/tmp/usage-mutations --no-debug-info
+  --scratch $TMPDIR/usage-mutations --no-debug-info
 ```
 
 The first-pass activity/scale results below were produced by the predecessor
@@ -580,7 +582,7 @@ of `scripts/perf_usage_reads.py`. First-pass binaries and outputs are preserved 
 ### Release validation, 2026-10-02
 
 Darwin arm64, release binaries, the original fixture digest intact. The full
-idle replay is `/Volumes/Data/tmp/perf/heavy/usage2.json`: 40 scenarios,
+idle replay is `$TMPDIR/perf/heavy/usage2.json`: 40 scenarios,
 zero request errors, no seeded activity changes. P50/p95 ms are Operations
 0.840/1.144, account Agents 0.423/0.459, Project Agents 0.456/0.508.
 
@@ -664,7 +666,7 @@ RSS columns are MiB: before the cold request → after cold → after idle → a
 | R55× | 4 | agents | 1.074 / 1.511 | 2732.388 / 3034.957 | 2776.996 | 47.7 / 60.7 / 62.9 / 66.8 |
 | R55× | 4 | project agents | 1.458 / 1.938 | 2852.462 / 2891.145 | 2960.271 | 47.5 / 59.9 / 61.9 / 67.2 |
 
-Outputs are under `/Volumes/Data/tmp/usage-fixes/`: `bench6-after-{reported1,reported20,estimated1,estimated20}-{1,4}.json` and `bench5-after-reported55-{1,4}.json`.
+Outputs are under `$TMPDIR/usage-fixes/`: `bench6-after-{reported1,reported20,estimated1,estimated20}-{1,4}.json` and `bench5-after-reported55-{1,4}.json`.
 
 The same over-bound fixture on base `5db8ea0b`:
 
@@ -679,15 +681,15 @@ The same over-bound fixture on base `5db8ea0b`:
 
 Base outputs: `bench3-base-reported55-{1,4}.json`. The over-bound new build improves p50/p95 and cold latency on all three reads and both client counts. It retains zero index summaries: 232.4 MiB is the rejected minimum allocation, not allocated memory. The response memo keeps idle reads constant; source batches keep active RSS below 80 MiB in these runs.
 
-All 28 projection tests pass. Pure fold uses 3,000 deterministic seeds; repository differential tests cover all surfaces, legacy shapes, batched changes, deletion, timestamps/ownership, running counts and cold/warm equality. Cancellation tests cover every poll boundary through completion for event/reprice deltas. All 18 final-source mutations compiled and were caught by repository tests; results are `/Volumes/Data/tmp/usage-fixes/mutations-final-results.json` and `mutations-ultimate.log`. Clippy (warnings denied), formatting for db/services/api, the release build, and named DB/pricing/Operations/API-Agent tests pass.
+All 28 projection tests pass. Pure fold uses 3,000 deterministic seeds; repository differential tests cover all surfaces, legacy shapes, batched changes, deletion, timestamps/ownership, running counts and cold/warm equality. Cancellation tests cover every poll boundary through completion for event/reprice deltas. All 18 final-source mutations compiled and were caught by repository tests; results are `$TMPDIR/usage-fixes/mutations-final-results.json` and `mutations-ultimate.log`. Clippy (warnings denied), formatting for db/services/api, the release build, and named DB/pricing/Operations/API-Agent tests pass.
 
 The standard runner also completed all 40 scenarios without errors on the final
-release binary: `/Volumes/Data/tmp/perf/heavy/usage5.json` and the repeat
-`/Volumes/Data/tmp/perf/heavy/usage-repeat.json`. Repeat warm p50/p95 was
+release binary: `$TMPDIR/perf/heavy/usage5.json` and the repeat
+`$TMPDIR/perf/heavy/usage-repeat.json`. Repeat warm p50/p95 was
 0.873/1.294 ms for Operations, 0.499/0.636 ms for Agents, and 0.508/0.688 ms for
 Project Agents, against 36.716/44.502, 11.052/11.862 and 10.709/12.950 ms in
 `final-next.json`. A paired base run is `base-paired.json`; its comparison with
-`usage5.json` is `/Volumes/Data/tmp/usage-fixes/paired-comparison.md`.
+`usage5.json` is `$TMPDIR/usage-fixes/paired-comparison.md`.
 Unchanged Task list routes varied by +0.122/+0.187/+0.158 ms (limits 20/50/100,
 4–8%) on the repeat versus that paired base. These small host/run differences
 are recorded rather than treated as evidence of a change to those routes.
@@ -714,15 +716,15 @@ The final release tree includes the Project slot memo, runtime worker/relay diag
 
 The merge preserves constant statement counts and removes the paused-CLI probe regression. Absolute Operations latency is higher than the usage-only branch; the merged route also reports live worker, relay and machine-capacity sections. Both history sizes remain in low single digits, and both Agent routes remain below 2 ms. The measurements do not establish identical absolute timing to the earlier branch.
 
-Final outputs: `/Volumes/Data/tmp/usage-merge/bench-reported1.json` and `bench-reported20.json`; commands are in `benchmark-commands.json`. Complete verification logs and exit/pass/failure records are in `verification-all.json`. All requested Rust modules/targets, type export, TypeScript checking, workspace clippy and formatting passed. The additional environment regression module passed three tests. No Rust test reported FAILED.
+Final outputs: `$TMPDIR/usage-merge/bench-reported1.json` and `bench-reported20.json`; commands are in `benchmark-commands.json`. Complete verification logs and exit/pass/failure records are in `verification-all.json`. All requested Rust modules/targets, type export, TypeScript checking, workspace clippy and formatting passed. The additional environment regression module passed three tests. No Rust test reported FAILED.
 
 `pnpm typecheck` unexpectedly invoked automatic dependency installation, contrary to the requested no-install constraint; the first attempt was interrupted, but the later invocation completed installation and typecheck. This deviation is recorded in `typecheck-note.log` and `web-typecheck.log`. Type generation introduced no additional tracked web diff.
 
 <!-- session-journal-d10:start -->
-## Session journal D10 measurements (2026-10-21)
+## Historical session journal D10 measurements (2026-10-21)
 
 **Disk gate: MET after within-session sharing (task 29); turn/collect
-checks: NOT MET pending runtime. Import is no longer latency-gated.** These are actual Forge measurements at agent-runtime v0.9.0 /
+checks: NOT MET pending runtime. Import is no longer latency-gated.** These historical Forge measurements used agent-runtime v0.9.0 /
 `8c19be5b226c2fdaeb6708ec5d39e91c235857a5`, from the production SQLx storage and
 real AEAD. The tables after the task-29 section are the original task-25 run,
 with independent domain copies, kept for comparison.
@@ -764,7 +766,7 @@ each physical pack write once, so this is not double counting.
 Commit `79996e80` limits S2 tiers and the collection base repack to packs the
 acting domain holds entirely. Same ignored release report, fixtures, seeds,
 projection, baseline, cadence and thresholds. Raw output:
-`/Volumes/Data/tmp/refactor/c3-writes/gate/`.
+`$TMPDIR/refactor/c3-writes/gate/`.
 
 | Fixture | Delta writes / legacy, task 29 → fix | Forge/L2, task 29 → fix | Packs after collection | Max collect call, ms |
 | --- | ---: | ---: | ---: | ---: |
@@ -791,7 +793,7 @@ heavy load of task 29's run; see the JSON for them.
 
 Same ignored release report, fixtures, seeds, projection, L2 baseline, cadence
 and thresholds. The only changes are session-owned shared packs and the
-storage-only fixes (task 28). Raw output: `/Volumes/Data/tmp/refactor/c3-share/gate/`.
+storage-only fixes (task 28). Raw output: `$TMPDIR/refactor/c3-share/gate/`.
 
 | Fixture | Actual L2 | After collection, task 25 → 29 | Forge/L2, task 25 → 29 | ≤2.0× |
 | --- | ---: | ---: | ---: | --- |
@@ -937,7 +939,7 @@ The longest collect call overall is C/4000 tool at **2992.81 ms**: **FAIL** agai
 
 
 The complete JSON, candidate patch and verification receipts are retained under
-`/Volumes/Data/tmp/refactor/c3-t24-25/`. Native-only retirement sizes exclude the
+`$TMPDIR/refactor/c3-t24-25/`. Native-only retirement sizes exclude the
 legacy row only for measurement; production retirement retains legacy payloads.
 Old-plus-new peak is the larger of the two measured overlap layouts, not an
 in-flight WAL/allocator peak. Source and method live in
@@ -963,7 +965,7 @@ a successful report process is not an adoption-pass signal.
 
 Measured receipt
 
-Interim runtime `b0a8c90e96ccb85e4642a119117a8fd5d3a06993` (0.9.0); final pin is the **v0.10.0 tag**. Forge now forwards preparation hints and opts into equivalent incremental projection. Source/verification/every test edit: `/Volumes/Data/tmp/refactor/c3-t33/report.md`. Full reports used the unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
+Forge pins runtime **v0.10.0** at `c036af7b4635cf7d76451aaa666a9df87405ca1a`. The historical measurements below used `b0a8c90e96ccb85e4642a119117a8fd5d3a06993`, whose Rust source is identical to the release. Forge forwards preparation hints and opts into equivalent incremental projection. Full reports used unchanged fixtures, production projection, real AEAD/sqlx, same-run legacy L2, S2/per-turn collection and bounded final drains.
 
 | Fixture | t24 disk/L2 | writes disk/L2 | Final disk/L2 | Delta writes | Native / legacy last turn ms | Overhead ms / check | Max collect ms incl. retirement |
 | --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
@@ -986,8 +988,6 @@ Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to
 
 100-dirty-session drains: protected 248.75 ms / 3 calls, ordinary 249.09 ms / 2 calls; both below one second. Target hydration 4.25 ms, 4 target packs out of 804; unrelated packs are excluded. Isolated B/100 plain identity diagnostic: 118,784 bytes, 2.90000x L2. Completed production rows have 26 cold misses and 26 warm hits in the explicit probes; cold validation spans 19.50–1636.28 ms. Internal scoped probe counters: {'rt.memo.hit': 26, 'rt.memo.miss': 26}. Estimated probe memo charge spans 1,047,126–65,150,820 bytes across both engines. Peak reported process RSS through completed cases 1767.94 MiB. These are probe counters/estimated charge and process RSS, not whole-run counters or allocator heap. Keep 128 MiB per engine unchanged.
 
-**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. The final v0.10.0 tag pin remains pending; the owner-authorized interim SHA is still versioned 0.9.0. All Owner Decisions below remain verbatim.
+**NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. All Owner Decisions below remain verbatim.
 
-Concurrent final-pin update (2026-10-24 07:17 UTC): another actor committed the workspace as 91907de1 and changed Cargo to the v0.10.0 tag at c036af7b4635cf7d76451aaa666a9df87405ca1a. I did not create that commit. Local git verifies that b0a8c90..c036af7b changes only Cargo version metadata, CHANGELOG and docs, with no Rust source changes. The revision constant/dependency contract were aligned afterward; benchmark and earlier verification receipts remain the measured interim b0a8c90 implementation. A full tag rebuild/rerun is not claimed.
-
-Final tag follow-up: offline engine_release_contract passes at v0.10.0/c036af7b (1/1), and fmt check passes. The prior broad checks/benchmarks ran on the Rust-source-identical interim revision; a full tag workspace/benchmark rerun is not claimed.
+The v0.10.0 pin, revision constant and dependency contract are aligned; the historical benchmark receipt predates the tag and no benchmark rerun is claimed.

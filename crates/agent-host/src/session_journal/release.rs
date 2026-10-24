@@ -27,6 +27,21 @@ pub(super) fn remap(view: &PackView, kept: &[usize]) -> Vec<(JournalDomain, Vec<
 }
 
 impl ForgeJournalStorage {
+    async fn bump_layout(
+        &self,
+        conn: &mut SqliteConnection,
+        session: &SessionId,
+        staged: &mut Staged,
+    ) -> Result<(), RuntimeError> {
+        if !staged.layout_bumped {
+            db::SqliteDb::bump_session_journal_layout_in_tx(conn, session.as_str())
+                .await
+                .map_err(database_error)?;
+            staged.layout_bumped = true;
+        }
+        Ok(())
+    }
+
     pub(super) async fn delete_pack(
         &self,
         conn: &mut SqliteConnection,
@@ -34,6 +49,7 @@ impl ForgeJournalStorage {
         id: i64,
         staged: &mut Staged,
     ) -> Result<(), RuntimeError> {
+        self.bump_layout(conn, session, staged).await?;
         // Membership rows of every domain cascade with the pack row.
         {
             #[cfg(feature = "test-support")]
@@ -92,6 +108,7 @@ impl ForgeJournalStorage {
                 encoded.body,
             )
             .await?;
+        self.bump_layout(conn, session, staged).await?;
         { #[cfg(feature = "test-support")] let _sql_profile = crate::session_journal::profile::timer("sql.UPDATE", 0); sqlx::query("UPDATE agent_session_journal_pack SET generation=?,object_count=?,retained_canonical_bytes=?,index_nonce=?,index_payload=?,body_nonce=?,body_payload=? WHERE pack_id=? AND runtime_session_id=?")
             .bind(generation.to_be_bytes().as_slice()).bind(encoded.count as i64).bind(encoded.canonical_bytes as i64).bind(index.nonce).bind(index.payload).bind(body.nonce).bind(body.payload).bind(key.id).bind(session.as_str()).execute(&mut *conn).await }.map_err(database_error)?;
         for (domain, bits) in holders {
