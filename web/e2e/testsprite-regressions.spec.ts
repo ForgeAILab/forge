@@ -129,6 +129,143 @@ async function loadAllTaskPages(page: Page) {
 }
 
 for (const concurrent of [false, true]) {
+  test(`KBD-001 clearing board search restores every card (${concurrent ? 'concurrent writer' : 'alone'})`, async ({
+    page,
+    request,
+  }) => {
+    const projectId = await demo(request)
+    await page.addInitScript(() => {
+      const events: { event_type: string; entity_id: string }[] = []
+      Object.assign(window, { kbdTaskEvents: events })
+      const OriginalEventSource = window.EventSource
+      window.EventSource = class extends OriginalEventSource {
+        constructor(url: string | URL, options?: EventSourceInit) {
+          super(url, options)
+          this.addEventListener('message', (event) => {
+            const payload = JSON.parse(event.data)
+            if (payload.event_type?.startsWith('task.')) events.push(payload)
+          })
+        }
+      }
+    })
+    await page.goto(`/projects/${projectId}/board`)
+    await expect(page.getByRole('button', { name: `Open ${seedTitle}`, exact: true })).toBeVisible()
+    await page.waitForTimeout(1200)
+    const cards = page.locator('article > button[aria-label^="Open "]')
+    const cardNames = () =>
+      cards.evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute('aria-label')).sort(),
+      )
+    const expected = await cardNames()
+    expect(expected.length).toBeGreaterThan(1)
+    const field = page.getByRole('textbox', { name: 'Search board tasks' })
+    for (const method of ['Delete', 'Backspace', 'fill', 'Clear all'] as const) {
+      await field.pressSequentially('WebSocket', { delay: 10 })
+      await expect(cards).toHaveCount(1)
+      await expect(cards).toHaveAttribute(
+        'aria-label',
+        'Open Add WebSocket support for live updates',
+      )
+      let release = () => {}
+      let heldSearch = false
+      let heldFull = false
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const pattern = `**/api/v1/projects/${projectId}/tasks?*`
+      const holdReads = async (route: Route) => {
+        if (route.request().method() !== 'GET') return route.continue()
+        const response = await route.fetch()
+        const q = new URL(route.request().url()).searchParams.get('q')
+        if (q === 'WebSocket' && !heldSearch) {
+          heldSearch = true
+          await gate
+        } else if (!q && !heldFull) {
+          heldFull = true
+          await gate
+        }
+        await route.fulfill({ response }).catch(() => {})
+      }
+      let created: Task | undefined
+      const create = async (title: string) => {
+        const response = await request.post(`/api/v1/projects/${projectId}/tasks`, {
+          data: { title },
+        })
+        expect(response.ok(), `writer POST: ${response.status()}`).toBe(true)
+        return response.json() as Promise<Task>
+      }
+      try {
+        if (concurrent) {
+          await page.route(pattern, holdReads)
+          created = await create(`KBD before clear ${crypto.randomUUID()}`)
+          await expect.poll(() => heldSearch).toBe(true)
+          created = await patch(request, created, { description: 'Edited while search was active' })
+        }
+        if (method === 'fill') await field.fill('')
+        else if (method === 'Clear all') {
+          await page.getByRole('button', { name: 'Filters', exact: true }).click()
+          await page.getByRole('button', { name: 'Clear all', exact: true }).click()
+          await page.getByRole('button', { name: 'Filters', exact: true }).click()
+        } else {
+          await field.focus()
+          await field.press('ControlOrMeta+A')
+          await field.press(method)
+        }
+        await expect(field).toHaveValue('')
+        await expect(page).not.toHaveURL(/[?&]q=/)
+        if (concurrent && created) {
+          await expect.poll(() => heldFull).toBe(true)
+          const second = await create(`KBD during clear ${crypto.randomUUID()}`)
+          created = await patch(request, created, { title: `KBD edited ${crypto.randomUUID()}` })
+          expected.push(`Open ${created.title}`, `Open ${second.title}`)
+          await expect
+            .poll(() =>
+              page.evaluate(
+                (id) =>
+                  (
+                    window as unknown as {
+                      kbdTaskEvents: { event_type: string; entity_id: string }[]
+                    }
+                  ).kbdTaskEvents.some(
+                    (event) => event.event_type === 'task.updated' && event.entity_id === id,
+                  ),
+                created!.id,
+              ),
+            )
+            .toBe(true)
+          // Keep both reads in flight across the task-list invalidation throttle.
+          await page.waitForTimeout(1800)
+        }
+        release()
+        await expect.poll(cardNames).toEqual([...expected].sort())
+        await test.info().attach(`kbd-${method}`, {
+          body: JSON.stringify(
+            {
+              url: page.url(),
+              input: await field.inputValue(),
+              cards: await cardNames(),
+              dom: await page.locator('body').innerText(),
+            },
+            null,
+            2,
+          ),
+          contentType: 'application/json',
+        })
+      } finally {
+        release()
+        if (concurrent) await page.unroute(pattern, holdReads)
+      }
+    }
+    await test.info().attach('kbd-task-events', {
+      body: JSON.stringify(
+        await page.evaluate(
+          () => (window as unknown as { kbdTaskEvents: unknown[] }).kbdTaskEvents,
+        ),
+      ),
+      contentType: 'application/json',
+    })
+  })
+
   test(`TDT-007 Escape discards a title draft (${concurrent ? 'concurrent, disconnected SSE' : 'alone'})`, async ({
     page,
     request,

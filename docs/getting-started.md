@@ -1300,6 +1300,11 @@ removes the selections and restores the unfiltered list. Status options come fro
 the Project workflow, loaded Tasks and the current selection; blocked is a separate
 condition filter.
 
+The Kanban search also searches Task text. Clearing it with select-all and
+Delete/Backspace, or using **Filters → Clear all**, restores the board under the
+remaining filters. Task events from other clients refresh the current search;
+clearing the search must also include their newly created and edited Tasks.
+
 Creating a Task from the board dialog puts it in Todo. The Todo badge and Project
 Overview refresh from the server, including changes from other connected clients.
 Overview's Backlog metric groups `backlog`, `todo`, `ready`, `pending` and `queued`;
