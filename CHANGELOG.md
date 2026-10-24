@@ -8,6 +8,7 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Old databases no longer hang on upgrade at V146; this historical migration was edited once to index child references before deleting progress events.
 - Task detail: Escape in the title or description editor discards the draft,
   refreshes the stored Task and board values, and no longer also closes the
   dialog; a second Escape closes it.
