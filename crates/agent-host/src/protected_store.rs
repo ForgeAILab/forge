@@ -45,6 +45,14 @@ mod session_probe;
 #[path = "lcm_legacy_owner.rs"]
 mod lcm_legacy_owner;
 
+pub(crate) enum LcmResolveAdmission<'a> {
+    Foreground,
+    Conversion {
+        runtime: &'a str,
+        timeline: Option<&'a str>,
+    },
+}
+
 fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint, RuntimeError> {
     serde_json::from_slice(bytes).map_err(|_| {
         RuntimeError::new(
@@ -682,10 +690,9 @@ impl SqliteProtectedRuntimeStore {
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, false)
             .await
-            .map_err(|error| crate::AgentHostError::Runtime(error.to_string()))
     }
 
     /// Resolves a topic-rotation successor. A successor never adopts or
@@ -696,10 +703,9 @@ impl SqliteProtectedRuntimeStore {
         runtime_id: &str,
         scope_type: &str,
         scope_id: &str,
-    ) -> Result<crate::SqliteLcmStore, crate::AgentHostError> {
+    ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         self.resolve_lcm_store(runtime_id, scope_type, scope_id, true)
             .await
-            .map_err(|error| crate::AgentHostError::Runtime(error.to_string()))
     }
 
     /// The LCM timeline the runtime session's own persisted state is bound
@@ -742,7 +748,11 @@ impl SqliteProtectedRuntimeStore {
         successor: bool,
     ) -> Result<crate::SqliteLcmStore, RuntimeError> {
         self.resolve_lcm_store_admitted(
-            runtime_id, scope_type, scope_id, successor, runtime_id, None,
+            runtime_id,
+            scope_type,
+            scope_id,
+            successor,
+            LcmResolveAdmission::Foreground,
         )
         .await
     }
@@ -753,9 +763,12 @@ impl SqliteProtectedRuntimeStore {
         scope_type: &str,
         scope_id: &str,
         successor: bool,
-        admitted_runtime: &str,
-        expected_legacy_timeline: Option<&str>,
+        admission: LcmResolveAdmission<'_>,
     ) -> Result<crate::SqliteLcmStore, RuntimeError> {
+        let (admitted_runtime, expected_legacy_timeline, foreground) = match admission {
+            LcmResolveAdmission::Foreground => (runtime_id, None, true),
+            LcmResolveAdmission::Conversion { runtime, timeline } => (runtime, timeline, false),
+        };
         let row = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
@@ -787,11 +800,14 @@ impl SqliteProtectedRuntimeStore {
             agent_runtime::registry::RegistryRevision::from_content(format!(
                 "forge-lcm-authorization-v1\n{identity_id}\n{stored_scope_type}\n{stored_scope_id}"
             ));
-        let has_binding: bool = {
+        let (has_binding, owns_shared_timeline): (bool, bool) = {
             #[cfg(feature = "test-support")]
             let _sql_profile = crate::session_journal::profile::timer("sql.SELECT", 0);
-            sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id = ?)",
+            sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_lcm_binding WHERE runtime_session_id=?1),
+                    EXISTS(SELECT 1 FROM agent_runtime_lcm_binding b JOIN agent_lcm_timeline t ON t.id=b.timeline_id
+                        WHERE b.runtime_session_id=?1 AND t.runtime_session_id=?1 AND t.scope_type='agent_chat'
+                          AND t.scope_id=t.canonical_scope_id AND t.retired_at IS NULL)",
         )
         .bind(runtime_id)
         .fetch_one(self.db.pool())
@@ -800,7 +816,12 @@ impl SqliteProtectedRuntimeStore {
         .map_err(protected_database_error)?;
         // Reading native/legacy extension state happens outside the write transaction.
         let flags = self.persistence_flags(&SessionId::new(runtime_id)).await?;
-        let referenced = if successor || (has_binding && !flags.legacy_eligible) {
+        let referenced = if successor
+            || (has_binding
+                && !flags.legacy_eligible
+                && expected_legacy_timeline.is_none()
+                && !owns_shared_timeline)
+        {
             None
         } else {
             self.referenced_lcm_timeline(runtime_id, flags).await?
@@ -810,9 +831,32 @@ impl SqliteProtectedRuntimeStore {
                 "LCM selected chat resume target does not reference the shared timeline",
             ));
         }
-        let sibling_admission = if flags.legacy_eligible {
-            self.prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref(), admitted_runtime)
-                .await?
+        let mut arbitration_deferred = None;
+        let sibling_admission = if flags.legacy_eligible
+            || expected_legacy_timeline.is_some()
+            || owns_shared_timeline
+        {
+            let mut prepared = self
+                .prepare_legacy_chat_lcm_owner(runtime_id, referenced.as_deref(), admitted_runtime)
+                .await;
+            if foreground && prepared.as_ref().is_err_and(|e| e.retryable) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                prepared = self
+                    .prepare_legacy_chat_lcm_owner(
+                        runtime_id,
+                        referenced.as_deref(),
+                        admitted_runtime,
+                    )
+                    .await;
+            }
+            match prepared {
+                Ok(admission) => admission,
+                Err(error) if foreground => {
+                    arbitration_deferred = Some(error);
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -872,15 +916,48 @@ impl SqliteProtectedRuntimeStore {
                 "LCM selected chat resume target is bound to a different timeline",
             ));
         }
-        if flags.legacy_eligible && (existing.is_none() || repair_empty) {
+        if (flags.legacy_eligible || expected_legacy_timeline.is_some() || owns_shared_timeline)
+            && (existing.is_none() || repair_empty || sibling_admission.is_some())
+        {
             if let Some(timeline) = referenced.as_deref() {
-                self.transfer_legacy_chat_lcm_owner(
-                    &mut tx,
-                    runtime_id,
-                    timeline,
-                    sibling_admission.as_ref(),
-                )
-                .await?
+                let fallback: bool = foreground && sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=? AND (runtime_session_id IS NULL OR runtime_session_id=?))",
+                ).bind(timeline).bind(runtime_id).fetch_one(&mut *tx).await.map_err(protected_database_error)?;
+                if !fallback {
+                    if let Some(error) = arbitration_deferred.take() {
+                        return Err(error);
+                    }
+                }
+                if arbitration_deferred.is_none() {
+                    sqlx::query("SAVEPOINT legacy_lcm_arbitration")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(protected_database_error)?;
+                    let transfer = self
+                        .transfer_legacy_chat_lcm_owner(
+                            &mut tx,
+                            runtime_id,
+                            timeline,
+                            sibling_admission.as_ref(),
+                        )
+                        .await;
+                    match transfer {
+                        Ok(()) => {}
+                        Err(_) if fallback => {
+                            // Forge already selected this foreground session. Restore the
+                            // old adoption path if arbitration cannot prove exclusive receipts.
+                            sqlx::query("ROLLBACK TO legacy_lcm_arbitration")
+                                .execute(&mut *tx)
+                                .await
+                                .map_err(protected_database_error)?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    sqlx::query("RELEASE legacy_lcm_arbitration")
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(protected_database_error)?;
+                }
             }
         }
         let timeline_id = if let Some(id) = existing.filter(|_| !repair_empty) {
@@ -997,10 +1074,11 @@ impl SqliteProtectedRuntimeStore {
             .await
             .map_err(protected_database_error)?
             .ok_or_else(|| RuntimeError::conflict("LCM binding timeline is missing"))?;
+        // V149 retirement frees the canonical scope without revoking the
+        // owning runtime's binding or its fenced claim.
         let matches_owner: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM agent_lcm_timeline WHERE id=?
              AND identity_id=? AND scope_type=? AND canonical_scope_id=?
-             AND retired_at IS NULL
              AND (scope_type <> 'agent_chat' OR runtime_session_id IS NULL OR runtime_session_id=?5)
              AND (claim_owner IS NULL OR claim_owner=?5))",
         )
@@ -2287,6 +2365,104 @@ mod tests {
                 .unwrap(),
             old.checkpoint
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn retired_chat_binding_resumes_without_shared_ownership_transfer() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("retired-chat-binding");
+        let db = f.database();
+        let store = SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1);
+        let (old, _) =
+            LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+        let chat = format!("chat:{}", id.as_str());
+        let retired = "2026-09-25T00:00:00Z";
+        sqlx::query("UPDATE agent_lcm_timeline SET scope_id=canonical_scope_id || '#retired:' || id,retired_at=? WHERE id=?")
+            .bind(retired).bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+        for keep_binding in [true, false] {
+            if !keep_binding {
+                sqlx::query("DELETE FROM agent_runtime_lcm_binding WHERE runtime_session_id=?")
+                    .bind(id.as_str())
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            for _ in 0..2 {
+                let resolved = store
+                    .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &chat)
+                    .await
+                    .unwrap();
+                assert_eq!(resolved.timeline_id(), old.timeline_id);
+                let state: (String, String, String, Option<String>, i64, String) = sqlx::query_as(
+                    "SELECT runtime_session_id,scope_id,canonical_scope_id,claim_owner,claim_generation,retired_at FROM agent_lcm_timeline WHERE id=?",
+                ).bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+                assert_eq!(
+                    state,
+                    (
+                        id.as_str().to_owned(),
+                        format!("{chat}#retired:{}", old.timeline_id),
+                        chat.clone(),
+                        None,
+                        0,
+                        retired.to_owned()
+                    )
+                );
+                let receipts: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+                )
+                .bind(&old.timeline_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(receipts, 0, "retired timelines bypass shared arbitration");
+                let replaced: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM agent_session WHERE replaced_by_session_id IS NOT NULL",
+                )
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+                assert_eq!(replaced, 0);
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn retired_chat_binding_rejects_foreign_owners_and_scopes() {
+        use crate::test_support::{FileDb, LegacyLcmFixture};
+        let f = FileDb::new().await.unwrap();
+        let id = SessionId::new("retired-chat-authorization");
+        let db = f.database();
+        let store = SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1);
+        let (old, older) =
+            LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+        let chat = format!("chat:{}", id.as_str());
+        for (runtime_owner, claim_owner, scope_type, canonical_scope) in [
+            (older.as_str(), None, "agent_chat", chat.as_str()),
+            (
+                id.as_str(),
+                Some(older.as_str()),
+                "agent_chat",
+                chat.as_str(),
+            ),
+            (id.as_str(), None, "account", chat.as_str()),
+            (id.as_str(), None, "agent_chat", "another-chat"),
+        ] {
+            sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=?,claim_owner=?,scope_type=?,canonical_scope_id=?,scope_id=? || '#retired:' || id,retired_at='2026-09-25T00:00:00Z' WHERE id=?")
+                .bind(runtime_owner).bind(claim_owner).bind(scope_type).bind(canonical_scope).bind(canonical_scope)
+                .bind(&old.timeline_id).execute(db.pool()).await.unwrap();
+            let error = store
+                .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &chat)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, ErrorKind::Conflict);
+            assert_eq!(
+                error.message,
+                "LCM timeline does not match its session binding"
+            );
+        }
     }
 
     #[cfg(feature = "test-support")]

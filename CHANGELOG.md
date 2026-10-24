@@ -18,7 +18,8 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 - New native session state uses encrypted journal packs. Older Forge builds
   cannot resume that state and refuse the newer database; downgrading requires
   a backup taken before upgrading. Journal migrations V202610200941,
-  V202610201253 and V202610240425 are one-way; sealed data remains untouched.
+  V202610201253, V202610240425 and V202610241249 are one-way; sealed data remains
+  untouched.
   Existing legacy rows remain readable and are imported automatically when resumed.
 
 ### Added
@@ -36,8 +37,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   a time with active-turn skips, bounded scheduling and restart recovery. Lazy
   import remains the fallback on early open; legacy rows remain until the next
   release. Conversion skips sessions selected by the shared retirement policy
-  and parks per-session errors by reason until restart, preserving the legacy row.
-  Conversion reuses the runtime importer and shared journal engines.
+  and retries active sessions, journal writers and transient persistence failures
+  on later sweeps. Non-retryable per-session errors park by reason until restart,
+  preserving the legacy row. Conversion reuses the runtime importer and shared
+  journal engines.
   Legacy and native payloads coexist: measured B/4000 retained overlap is about
   2.6–2.8× legacy-only disk size, and small sessions can grow more. Older databases
   without incremental vacuum retain their file high-water mark; stop Forge and

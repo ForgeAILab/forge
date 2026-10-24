@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-24T07:52:00Z
+updated_at: 2026-10-24T15:41:33Z
 ---
 
 ## Why
@@ -170,3 +170,13 @@ relinquishment before any non-target sibling publishes, then imports that
 sibling's own transcript and protected state immediately. Both worker cursor
 orders, unchanged legacy data and a zero-provider native Main Chat resume are
 required; Profile-based conversion deferral is removed.
+
+
+The review repair preserves Forge's foreground resume choice. Receipts cover all
+referencing sibling statuses and rotation-linked switches; unrelated native,
+topic and rotation rows do not block. Own-bound timelines convert normally under
+another selection, and target-owned timelines support receipt-only arbitration
+before or after native publication. Transient contention retries within the same
+worker lifetime, corrupt sibling errors stay with that sibling, and a no-LCM
+copy retains its semantic summary. Task 36 covers these fixes and foreground-first
+real-copy resume with zero provider calls.

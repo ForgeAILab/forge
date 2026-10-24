@@ -1439,38 +1439,40 @@ Waive and ship: the fixed turn-latency misses (A/100 tool 72 ms and B/100 tool 8
 
 This amendment supersedes the same-Profile-only ownership restrictions in D5.
 
-For a shared pre-V149 Chat timeline that is unowned or owned by an older,
-unlinked suspended sibling, conversion and lazy resume assign ownership to the resume target for
-the identity's currently selected Profile. Active-first/newest-suspended native
-resolution still applies within that Profile; another dormant Profile does not
-compete. The timeline must predate and have been updated after the target's
-creation. Claims, leases (including unpublished writer reservations), topics or
-rotations, competing active/tied/newer selected-Profile sessions, extra bindings
-and any sibling's published/retired native state remain conflicts. An identity
-without a selected Profile, or a selected Profile without a resumable native
-session, parks with a precise reason.
+The selected Profile's Forge resume target receives a shared canonical timeline
+only when its own saved state references that timeline. A session already owning
+and binding T converts through that binding even when the selected Profile uses
+a topic timeline or has no session in this chat. Foreground resume preserves the
+old adoption behavior: an arbitration guard cannot reject a resume that worked
+before this branch. After a brief retry for sibling contention, unowned T may be
+adopted by the resuming session without receipts; partial arbitration changes
+roll back first. Existing owners can also resume while receipts are deferred.
 
-The resolver admits the legacy siblings exclusively and holds both engine
-writer leases before its immediate transaction. Ownership, binding, version-fenced
-relinquishment receipts and same-Profile replacement commit together. Siblings
-under another Profile keep their status, links, version and legacy ciphertext.
-Every referencing legacy sibling and the old owner receives a receipt in the
-additive `agent_legacy_lcm_relinquishment` table (V202610241249); receipts survive
-timeline deletion and cascade only with the losing session. On a later Profile
-switch, legacy decoding omits only the recorded LCM and semantic-summary state
-from the import view. The transcript and other protected state import exactly;
-Forge binds a fresh timeline and the runtime rebuilds its missing derived state.
-Unrecorded binding mismatches still fail closed. Before a non-target sibling can
-publish, background conversion assigns the timeline and binding to the selected
-resume target and records relinquishment. It then reloads both sibling stores
-through the receipts and converts the sibling's own state without shared LCM.
-This applies to unowned post-V149 timelines and previously assigned timelines,
-and to non-target siblings of either Profile. When routing another session's
-conversion it admits the selected target as well; an active target or writer is
-a conflict. Both cursor orders have identical outcomes, with no selection-based
-worker exclusion. Failures roll back receipts and all labels;
-retries reuse the original timeline without duplicating history.
-V149 is unchanged; it backfills scope/retirement metadata, not runtime ownership.
+A replaced predecessor in the same identity/context scope is valid. Receipts
+cover every referencing sibling, including failed, cancelled, replaced, linked
+and newer other-Profile rows, without changing status or links. Replacement is
+limited to older, unlinked, suspended native siblings of the target's Profile.
+Chat topics and rotations do not block this process; native state blocks only
+when that sibling owns, binds or references T. Ownership moves still require
+canonical pre-topic continuity, no conflicting claim/binding, admissions, writer
+leases and version fences. When the selected target already owns and binds T,
+the same fences authorize receipts alone, including after publication if its
+native state references T. No transcript, checkpoint or LCM history is rewritten in that path.
+
+Background conversion routes a non-target sibling through the selected target
+only if the target references T, commits receipts, then reloads and imports the
+sibling's own state. Busy targets, sibling admissions and journal writers remain
+retryable on later sweeps. Corrupt sibling copies are attributed to that sibling
+and cannot park the target. The public LCM resolver preserves typed errors;
+Native maps retryability and missing sessions at its boundary.
+
+Receipts in additive V202610241249 survive deletion of T and cascade only with
+the losing session. A copy referencing receipted T omits its LCM and semantic
+summary; a copy with no LCM keeps its semantic summary. Ciphertext, transcripts
+and other protected state remain exact. A switch back rebuilds derived state on
+a fresh timeline. Unrecorded mismatches fail closed, failed writes roll back all
+ownership effects, and retries do not duplicate receipts or history. V149 is
+unchanged. Both cursor orders and foreground-first unowned resume are required.
 
 
 ## Owner Decisions (2026-10-24; shared LCM across a profile switch)

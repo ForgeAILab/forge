@@ -98,6 +98,11 @@ impl SqliteProtectedRuntimeStore {
                 barrier.wait().await;
             }
         }
+        let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_session WHERE id=? AND runtime_session_id=? AND status IN ('starting','ready','running','degraded'))")
+            .bind(owner).bind(id.as_str()).fetch_one(self.database().pool()).await.map_err(crate::protected_store::protected_database_error)?;
+        if active {
+            return Ok(ConversionOutcome::SkippedActive);
+        }
         let flags = self
             .database()
             .session_persistence_flags(owner)
@@ -163,8 +168,10 @@ impl SqliteProtectedRuntimeStore {
                 "agent_chat",
                 &scope,
                 false,
-                id.as_str(),
-                Some(&timeline),
+                crate::protected_store::LcmResolveAdmission::Conversion {
+                    runtime: id.as_str(),
+                    timeline: Some(&timeline),
+                },
             )
             .await?;
             snapshot = SessionStore::load(&**self, id).await?;
@@ -203,7 +210,16 @@ impl SqliteProtectedRuntimeStore {
                 .map_err(crate::protected_store::protected_database_error)?
                 .ok_or_else(|| RuntimeError::not_found("conversion scope removed"))?;
             let store = self
-                .resolve_lcm_store(id.as_str(), &scope.scope_type, &scope.scope_id, false)
+                .resolve_lcm_store_admitted(
+                    id.as_str(),
+                    &scope.scope_type,
+                    &scope.scope_id,
+                    false,
+                    crate::protected_store::LcmResolveAdmission::Conversion {
+                        runtime: id.as_str(),
+                        timeline: None,
+                    },
+                )
                 .await?;
             let binding = store.runtime_binding(id.clone()).map_err(|_| {
                 RuntimeError::conflict("conversion LCM timeline binding is invalid")

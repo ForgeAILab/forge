@@ -275,25 +275,41 @@ ForgeJournalProjection SHALL opt into the runtime incremental projection protoco
 
 
 ### Requirement: Selected-Profile ownership of shared pre-topic LCM
-The session resumed for an identity's currently selected Profile SHALL own a guarded shared pre-topic Chat timeline. This requirement supersedes the same-Profile-only restrictions in the earlier shared-timeline scenario. Other-Profile legacy siblings SHALL remain resumable and unreplaced, and only a durable, transactionally recorded relinquishment SHALL authorize omitting shared LCM-derived namespaces from their otherwise exact protected import.
+Arbitration SHALL follow Forge's selected-Profile Chat resume choice when that session's own saved state references the shared pre-topic timeline. It SHALL preserve every foreground resume that succeeded before this branch. Other-Profile siblings SHALL remain resumable and unreplaced; a durable version-fenced receipt SHALL authorize omitting only the recorded timeline's derived state from otherwise exact import.
 
-#### Scenario: Shared pre-topic Chat timeline owned by a superseded sibling
-- **WHEN** the resume target for the identity's currently selected Profile references a shared pre-topic timeline owned by an older, unlinked suspended native sibling of the same identity and context scope
-- **AND** the timeline predates the target and was updated after its creation, neither runtime nor another sibling has published or retired native state, and no claim, lease, topic/rotation, active or tied/newer selected-Profile session, additional binding or reference outside the guarded legacy siblings makes ownership ambiguous
-- **THEN** conversion and lazy resume transfer the original timeline's runtime ownership and binding to the resume target in the same immediate transaction
-- **AND** that transaction records a version-fenced relinquishment for every legacy sibling referencing the timeline and its old owner, marks same-Profile siblings replaced by the target, and preserves other-Profile siblings' status, links, version and legacy payloads
-- **AND** no timeline, entry, node or operation is duplicated or discarded; retries are idempotent and a failed binding write rolls back the whole transfer
-- **AND** another dormant Profile does not cause parking; no selected Profile, no resumable native session for the selected Profile, an active owner, a tied newest session, native publication/retirement, or additional ownership evidence keeps the target parked with a precise Conflict reason
+#### Scenario: Shared timeline assignment and sibling receipts
+- **WHEN** the selected resume target references unowned T or T owned by an eligible legacy sibling in the same identity/context scope
+- **THEN** ownership, binding and version-fenced receipts commit in one immediate transaction before another sibling publishes
+- **AND** every referencing sibling receives a receipt regardless of status, age or replacement links; only older, unlinked, suspended same-Profile native siblings become replaced
+- **AND** a replaced predecessor in the same scope is accepted, topics/rotations do not block, and native-state refusal is limited to siblings owning, binding or referencing T
+- **AND** conflicting claims/bindings, unsafe ownership moves and version races retain their fences; failed writes roll back every ownership effect
+
+#### Scenario: Foreground resume wins over arbitration guards
+- **WHEN** Forge resumes a session referencing unowned T before background conversion or while a sibling converts
+- **THEN** arbitration retries contention briefly and otherwise falls back to the pre-branch adoption behavior without returning an arbitration Conflict
+- **AND** partial arbitration effects roll back before adoption, and the full original transcript resumes with zero provider calls
+- **AND** an existing owner can resume through its own binding while receipt work is deferred
+
+#### Scenario: Own canonical timeline while another Profile is selected
+- **WHEN** a session already owns and binds T and the selected Profile uses a topic timeline or has no session in this chat
+- **THEN** background conversion preserves that session's binding and imports normally without routing it through the unrelated selected Profile
+
+#### Scenario: Selected target already owns the timeline
+- **WHEN** the selected target already owns and binds T and its unpublished or published saved state references T
+- **THEN** the same admissions, writer checks and version fences authorize a receipt-only transaction
+- **AND** siblings convert and resume after a Profile switch back without moving T or republishing the target's state
 
 #### Scenario: Resume a Profile that relinquished shared pre-topic LCM
-- **WHEN** the identity switches back to a Profile whose retained legacy session relinquished the shared timeline
-- **THEN** conversion and lazy import preserve its transcript and all other protected state while omitting only the recorded timeline's LCM and semantic-summary namespaces from its import view
-- **AND** the original encrypted legacy payloads remain unchanged and the runtime rebuilds missing LCM-derived state against a fresh session timeline without failure or parking
-- **AND** the relinquishment receipt survives process restart and deletion of the transferred timeline; an unrecorded binding mismatch still fails closed
+- **WHEN** a retained session resumes after relinquishing T
+- **THEN** each legacy copy referencing receipted T omits its LCM and semantic-summary namespaces and preserves its transcript and other protected state exactly
+- **AND** a copy without LCM state keeps its semantic summary; original ciphertext remains unchanged
+- **AND** a fresh timeline rebuilds missing derived state, receipts survive deletion of T, and unrecorded binding mismatches still fail closed
+
+#### Scenario: Transient and unreadable siblings
+- **WHEN** the selected target is active, a sibling has foreground/conversion admission, or a journal writer is present
+- **THEN** background conversion remains eligible for another sweep with the same worker cursor
+- **AND** a corrupt sibling's decode error is attributed to that sibling, which can be parked as unreadable without blocking target conversion or resume
 
 #### Scenario: Shared timeline conversion is independent of cursor order
-- **WHEN** conversion reaches any legacy sibling other than the selected Profile's resume target, before or after that target, and the shared pre-topic timeline is unowned after V149 or owned by a guarded legacy sibling
-- **THEN** ownership, target binding, version-fenced relinquishment receipts and same-Profile replacement commit together before that sibling can publish
-- **AND** conversion reloads both sibling stores through the receipts and publishes only its own transcript and other protected state without the shared LCM-derived namespaces; the selected target imports the full original LCM history
-- **AND** an active selected target or writer, missing selection/resume target, or any existing ownership ambiguity remains a precise Conflict; failures roll back every ownership effect
-- **AND** both cursor orders and fresh-cursor retries preserve the same owner and unchanged legacy ciphertext without duplicate publications, timelines or receipts
+- **WHEN** conversion reaches any eligible legacy sibling before or after the selected resume target
+- **THEN** both orders and fresh-cursor retries preserve the same owner, exact sibling imports, unchanged ciphertext and original LCM history, without duplicate timelines, receipts or publications

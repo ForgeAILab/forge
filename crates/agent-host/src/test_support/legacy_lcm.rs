@@ -150,6 +150,31 @@ impl LegacyLcmFixture {
         Self::profile_switch(fixture, store, session, false).await
     }
 
+    /// Released resolver shape: the selected session already owns and binds T.
+    pub async fn target_owned_pre_topic_profile_switch(
+        fixture: &FileDb,
+        store: &SqliteProtectedRuntimeStore,
+        session: &SessionId,
+    ) -> (Self, SessionId) {
+        let (old, older) = Self::unowned_pre_topic_profile_switch(fixture, store, session).await;
+        let db = fixture.database();
+        sqlx::query("UPDATE agent_lcm_timeline SET runtime_session_id=? WHERE id=?")
+            .bind(session.as_str())
+            .bind(&old.timeline_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO agent_runtime_lcm_binding(runtime_session_id,timeline_id) VALUES (?,?)",
+        )
+        .bind(session.as_str())
+        .bind(&old.timeline_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        (old, older)
+    }
+
     async fn profile_switch(
         fixture: &FileDb,
         store: &SqliteProtectedRuntimeStore,

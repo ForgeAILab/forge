@@ -130,6 +130,354 @@ async fn profile_lcm_runtime(
 }
 
 #[tokio::test]
+async fn review_m1_foreground_accepts_legacy_sibling_shapes() {
+    use agent_runtime::harness::{LCM_COMPONENT_ID, LcmRecoveryPolicy};
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    for case in [
+        "rotation-linked",
+        "failed",
+        "cancelled",
+        "replaced",
+        "newer",
+        "topic",
+        "rotation",
+        "unrelated-published",
+        "unrelated-retired",
+    ] {
+        let id = SessionId::new(format!("review-m1-{case}"));
+        let (f, store) = fixture(&id).await;
+        let (old, older) =
+            LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        let target = f.ensure_session(&id).await.unwrap();
+        let source = f.ensure_session(&older).await.unwrap();
+        match case {
+            "rotation-linked" => {
+                sqlx::query("UPDATE agent_session SET status='replaced',replaced_by_session_id=? WHERE id=?").bind(&target).bind(&source).execute(db.pool()).await.unwrap();
+                sqlx::query("UPDATE agent_session SET predecessor_session_id=? WHERE id=?")
+                    .bind(&source)
+                    .bind(&target)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            "failed" | "cancelled" | "replaced" => {
+                sqlx::query("UPDATE agent_session SET status=? WHERE id=?")
+                    .bind(case)
+                    .bind(&source)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            }
+            "newer" => {
+                sqlx::query(
+                    "UPDATE agent_session SET created_at='2026-09-25T00:00:00Z' WHERE id=?",
+                )
+                .bind(&source)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            "topic" => {
+                sqlx::query("INSERT INTO agent_chat_topic(id,chat_id,sequence,label,starting_message_sequence,principal_type,created_at,runtime_session_id) VALUES ('topic',?,0,'Synthetic',0,'system','c',?)").bind(format!("chat:{id}")).bind(id.as_str()).execute(db.pool()).await.unwrap();
+            }
+            "rotation" => {
+                sqlx::query("INSERT INTO agent_chat_topic_rotation(chat_id,id,label,cause,created_at) VALUES (?,'rotation','Synthetic','idle','c')").bind(format!("chat:{id}")).execute(db.pool()).await.unwrap();
+            }
+            "unrelated-published" | "unrelated-retired" => {
+                let unrelated = SessionId::new(format!("{id}:unrelated"));
+                let owner = format!("journal-fixture:{unrelated}");
+                sqlx::query("INSERT INTO agent_session(id,identity_id,profile_id,context_scope_id,backend_kind,runtime_session_id,status,created_at,updated_at) VALUES (?,'journal-agent','glm-profile','journal-scope','native',?,'suspended','2026-09-16T00:00:00Z','c')")
+                    .bind(&owner).bind(unrelated.as_str()).execute(db.pool()).await.unwrap();
+                let mut plain = old.snapshot.clone();
+                plain.id = unrelated.clone();
+                plain.extension_state.remove(LCM_COMPONENT_ID);
+                store
+                    .seed_legacy_bytes(
+                        &unrelated,
+                        Some(&serde_json::to_vec(&plain).unwrap()),
+                        None,
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .convert_legacy_session(&owner, &unrelated)
+                    .await
+                    .unwrap();
+                if case == "unrelated-retired" {
+                    sqlx::query("UPDATE agent_session_journal_session SET retired=1 WHERE runtime_session_id=?").bind(unrelated.as_str()).execute(db.pool()).await.unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        let before: (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status,replaced_by_session_id,version FROM agent_session WHERE id=?",
+        )
+        .bind(&source)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let p = provider();
+        let (rt, timeline) =
+            profile_lcm_runtime(store.clone(), p.clone(), &id, &format!("chat:{id}")).await;
+        assert_eq!(timeline, old.timeline_id, "{case}");
+        let session = rt
+            .start_session(
+                StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.history(),
+            old.checkpoint.snapshot.history.as_slice(),
+            "{case}"
+        );
+        assert!(p.requests().is_empty(), "{case}");
+        drop(session);
+        drop(rt);
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+        )
+        .bind(&old.timeline_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipts, 10, "{case}");
+        let after: (String, Option<String>, i64) = sqlx::query_as(
+            "SELECT status,replaced_by_session_id,version FROM agent_session WHERE id=?",
+        )
+        .bind(&source)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            after, before,
+            "receipt must retain other-profile status and links: {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn review_m2_owned_timeline_converts_with_another_profile_selected() {
+    use agent_runtime::harness::LCM_COMPONENT_ID;
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    for empty_profile in [false, true] {
+        let id = SessionId::new(format!("review-m2-{empty_profile}"));
+        let (f, store) = fixture(&id).await;
+        let (old, older) = LegacyLcmFixture::shared_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        if empty_profile {
+            sqlx::query("INSERT INTO agent_profile(id,identity_id,backend_kind,executor_type,created_at,updated_at) VALUES ('empty','journal-agent','native','embedded','c','u')").execute(db.pool()).await.unwrap();
+            sqlx::query(
+                "UPDATE agent_identity SET selected_profile_id='empty' WHERE id='journal-agent'",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+        } else {
+            let replacement = old.bind_empty_replacement(&f).await;
+            let mut target = old.checkpoint.snapshot.clone();
+            target
+                .extension_state
+                .get_mut(LCM_COMPONENT_ID)
+                .unwrap()
+                .value["timeline_id"] = serde_json::json!(replacement.timeline_id());
+            let cp = TurnCheckpoint::session_boundary(target.clone(), 6).unwrap();
+            store
+                .seed_legacy_bytes(
+                    &id,
+                    Some(&serde_json::to_vec(&target).unwrap()),
+                    Some(&serde_json::to_vec(&cp).unwrap()),
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+        let expected = SessionStore::load(&*store, &older).await.unwrap().unwrap();
+        let owner = f.ensure_session(&older).await.unwrap();
+        assert_eq!(
+            store.convert_legacy_session(&owner, &older).await.unwrap(),
+            ConversionOutcome::Converted
+        );
+        assert_eq!(
+            snapshot(&store.journals().ordinary(), &older).await,
+            expected
+        );
+        let facts:(String,i64)=sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment) FROM agent_lcm_timeline WHERE id=?").bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(facts, (older.to_string(), 0));
+    }
+}
+
+#[tokio::test]
+async fn review_m3_target_owned_timeline_receipts_allow_switch_back() {
+    use agent_runtime::harness::{LCM_COMPONENT_ID, LcmRecoveryPolicy};
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    for published in [false, true] {
+        let id = SessionId::new(format!("review-m3-{published}"));
+        let (f, store) = fixture(&id).await;
+        let (old, older) =
+            LegacyLcmFixture::target_owned_pre_topic_profile_switch(&f, &store, &id).await;
+        let db = f.database();
+        let mut expected = CheckpointStore::load_latest(&*store, &older)
+            .await
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        expected.extension_state.remove(LCM_COMPONENT_ID);
+        if published {
+            // Publish using the importer directly, as a released build did.
+            use agent_runtime::harness::{
+                LcmCoordinator, LcmCoordinatorPolicy, StaticLcmTimelineResolver,
+            };
+            use db::AgentLcmRepo;
+            let lcm = forge_agent_host::SqliteLcmStore::new(
+                db.clone(),
+                db.get_lcm_timeline(&old.timeline_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            let binding = lcm.runtime_binding(id.clone()).unwrap();
+            let coordinator = LcmCoordinator::new(
+                Arc::new(lcm),
+                Arc::new(forge_agent_host::DeterministicLcmSummaryModel::default()),
+                Arc::new(StaticLcmTimelineResolver::new(binding)),
+                LcmCoordinatorPolicy {
+                    input_budget_tokens: 28_000,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let rt = runtime_builder(store.clone(), provider())
+                .lcm(Arc::new(coordinator))
+                .build()
+                .unwrap();
+            let session = rt
+                .start_session(
+                    StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt),
+                )
+                .await
+                .unwrap();
+            drop(session);
+            drop(rt);
+        }
+        if published {
+            // Foreground resolve of the already-native owner must receipt siblings
+            // before the user switches back, without reimporting that owner.
+            let before = snapshot(&store.journals().protected(), &id).await;
+            assert_eq!(
+                store
+                    .lcm_store_for_runtime_session(id.as_str(), "agent_chat", &format!("chat:{id}"))
+                    .await
+                    .unwrap()
+                    .timeline_id(),
+                old.timeline_id
+            );
+            assert_eq!(snapshot(&store.journals().protected(), &id).await, before);
+            let receipts: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+            )
+            .bind(&old.timeline_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(receipts, 10);
+            sqlx::query("UPDATE agent_identity SET selected_profile_id='glm-profile' WHERE id='journal-agent'").execute(db.pool()).await.unwrap();
+        }
+        let source = f.ensure_session(&older).await.unwrap();
+        assert_eq!(
+            store.convert_legacy_session(&source, &older).await.unwrap(),
+            ConversionOutcome::Converted
+        );
+        assert_eq!(
+            snapshot(&store.journals().protected(), &older).await,
+            expected
+        );
+        let facts:(String,i64)=sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=t.id) FROM agent_lcm_timeline t WHERE id=?").bind(&old.timeline_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(facts, (id.to_string(), 10));
+        sqlx::query(
+            "UPDATE agent_identity SET selected_profile_id='glm-profile' WHERE id='journal-agent'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let p = provider();
+        let (rt, new_timeline) =
+            profile_lcm_runtime(store.clone(), p.clone(), &older, &format!("chat:{id}")).await;
+        assert_ne!(new_timeline, old.timeline_id);
+        let session = rt
+            .start_session(
+                StartSession::resume(older.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.history(), expected.history.as_slice());
+        assert!(p.requests().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn foreground_unowned_resume_succeeds_while_sibling_conversion_is_admitted() {
+    use agent_runtime::harness::{LCM_COMPONENT_ID, LcmRecoveryPolicy};
+    use forge_agent_host::{
+        session_journal_conversion::ConversionOutcome, test_support::LegacyLcmFixture,
+    };
+    let id = SessionId::new("review-foreground-race");
+    let (f, store) = fixture(&id).await;
+    let (old, older) = LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+    let source = f.ensure_session(&older).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    store.pause_conversion_for_test(barrier.clone());
+    let pending = tokio::spawn({
+        let store = store.clone();
+        let older = older.clone();
+        async move { store.convert_legacy_session(&source, &older).await }
+    });
+    barrier.wait().await;
+    let foreground = store.foreground_session(&id).await.unwrap();
+    let p = provider();
+    let (rt, timeline) =
+        profile_lcm_runtime(store.clone(), p.clone(), &id, &format!("chat:{id}")).await;
+    assert_eq!(timeline, old.timeline_id);
+    let session = rt
+        .start_session(StartSession::resume(id.clone()).with_lcm_policy(LcmRecoveryPolicy::Adopt))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.history(),
+        old.checkpoint.snapshot.history.as_slice()
+    );
+    assert!(p.requests().is_empty());
+    drop(session);
+    drop(rt);
+    drop(foreground);
+    barrier.wait().await;
+    assert_eq!(
+        pending.await.unwrap().unwrap(),
+        ConversionOutcome::Converted
+    );
+    assert!(
+        !snapshot(&store.journals().protected(), &older)
+            .await
+            .extension_state
+            .contains_key(LCM_COMPONENT_ID)
+    );
+    let receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_legacy_lcm_relinquishment WHERE timeline_id=?",
+    )
+    .bind(&old.timeline_id)
+    .fetch_one(f.database().pool())
+    .await
+    .unwrap();
+    assert_eq!(receipts, 10);
+}
+
+#[tokio::test]
 async fn unowned_shared_lcm_conversion_is_independent_of_session_order() {
     use agent_runtime::harness::LCM_COMPONENT_ID;
     use forge_agent_host::{

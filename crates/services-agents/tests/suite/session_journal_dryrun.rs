@@ -116,15 +116,202 @@ async fn journal_real_data_lcm_metadata() -> TestResult<()> {
     Ok(())
 }
 
+// Live LCM recovery may publish a repaired ordinary successor. Inspect the
+// retained import boundary so exact-import assertions still cover every field.
+async fn native_import_counts(
+    raw: &forge_agent_host::session_journal::ForgeJournalStorage,
+    store: &SqliteProtectedRuntimeStore,
+    id: &agent_runtime::core::ids::SessionId,
+    ordinary: &agent_runtime::core::store::SessionSnapshot,
+    protected: &agent_runtime::core::store::SessionSnapshot,
+    first_import: bool,
+) -> TestResult<Vec<usize>> {
+    use agent_runtime::core::journal::*;
+    let projected = forge_agent_host::session_journals::ForgeJournalProjection
+        .project(ordinary.clone())
+        .map_err(|_| "ordinary projection unavailable")?;
+    let mut counts = Vec::new();
+    for (engine, role, expected) in [
+        (
+            store.journals().ordinary(),
+            JournalRole::Ordinary,
+            &projected,
+        ),
+        (
+            store.journals().protected(),
+            JournalRole::Protected,
+            protected,
+        ),
+    ] {
+        let root = if first_import && role == JournalRole::Ordinary {
+            let domain = JournalDomain {
+                storage_id: engine.storage_id(),
+                role: JournalRole::Ordinary,
+            };
+            let members = raw
+                .members(&domain, id)
+                .await
+                .map_err(|_| "native import members unavailable")?;
+            let mut roots = Vec::new();
+            for ids in members.chunks(128) {
+                let bodies = raw
+                    .objects(&domain, id, ids)
+                    .await
+                    .map_err(|_| "native import bodies unavailable")?;
+                for (object_id, bytes) in ids.iter().zip(bodies) {
+                    let bytes = bytes.ok_or("native import object absent")?;
+                    let object = JournalObject {
+                        id: object_id.clone(),
+                        bytes: bytes.to_vec(),
+                    };
+                    if let Ok(head) = object.decode::<JournalHead>(JournalObjectKind::Head) {
+                        if head.session == *id
+                            && head.role == JournalRole::Ordinary
+                            && head.revision == JournalRevision(1)
+                        {
+                            roots.push(object_id.clone());
+                        }
+                    }
+                }
+            }
+            assert!(
+                roots.len() == 1,
+                "expected exactly one original ordinary import root"
+            );
+            JournalRootSelection::Retained {
+                root: roots.remove(0),
+            }
+        } else {
+            JournalRootSelection::Latest
+        };
+        let nonce = db::new_uuid_v4();
+        let lease = engine
+            .open(
+                id,
+                JournalOpen {
+                    root,
+                    expected_revision: None,
+                    operation: JournalOperationId::new(&nonce),
+                    pin: JournalPinId::new(&nonce),
+                    intent: JournalOpenIntent::ReadOnly,
+                },
+            )
+            .await
+            .map_err(|e| format!("native inspection failed: {:?}", e.kind))?;
+        let imported = JournalReader::new(
+            &engine,
+            &lease,
+            JournalReadLimits {
+                objects: 100_000,
+                encoded_bytes: 32 * 1024 * 1024,
+                entries: 100_000,
+            },
+        )
+        .map_err(|_| "native reader unavailable")?
+        .snapshot()
+        .await
+        .map_err(|_| "native snapshot could not be decoded")?
+        .ok_or("native snapshot absent")?;
+        assert!(
+            imported == *expected,
+            "native import differs from its receipt-filtered legacy state"
+        );
+        counts.push(imported.history.len());
+        engine
+            .close(lease)
+            .await
+            .map_err(|_| "native read lease could not close")?;
+    }
+    Ok(counts)
+}
+
+#[tokio::test]
+async fn retained_import_inspection_is_exact_after_a_live_successor() -> TestResult<()> {
+    use agent_runtime::{
+        core::{
+            catalog::{ModelLimits, ResolvedModelProfile},
+            checkpoint::TurnCheckpoint,
+            content::Message,
+            ids::SessionId,
+            journal::*,
+            provider::{Capabilities, ModelId},
+            store::SessionSnapshot,
+        },
+        provider::fake::FakeProvider,
+        runtime::{RuntimeBuilder, StartSession},
+    };
+    let f = forge_agent_host::test_support::FileDb::new().await?;
+    let id = SessionId::new("retained-import-inspection");
+    let owner = f.ensure_session(&id).await?;
+    let db = f.database();
+    let raw = forge_agent_host::session_journal::ForgeJournalStorage::new(db.clone(), [7; 32], 1)?;
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db, [7; 32], 1));
+    let mut original: SessionSnapshot =
+        serde_json::from_value(serde_json::json!({"id":id,"history":[],"updated":1}))?;
+    original
+        .history
+        .push(Message::user("Synthetic retained import"));
+    let checkpoint = TurnCheckpoint::session_boundary(original.clone(), 6)?;
+    store
+        .seed_legacy_bytes(
+            &id,
+            Some(&serde_json::to_vec(&original)?),
+            Some(&serde_json::to_vec(&checkpoint)?),
+            false,
+        )
+        .await?;
+    store.convert_legacy_session(&owner, &id).await?;
+    let provider = Arc::new(FakeProvider::new(
+        "fake",
+        Capabilities::basic_streaming(),
+        Vec::new(),
+    ));
+    let rt = RuntimeBuilder::new(ModelId::new("fake"))
+        .provider_name("fake")
+        .provider(provider.clone())
+        .model_profile(ResolvedModelProfile::explicit(
+            "fake",
+            ModelId::new("fake"),
+            ModelLimits::new(32_000, 28_000, 4_000),
+        ))
+        .session_store(store.clone())
+        .checkpoint_store(store.clone())
+        .build()?;
+    let session = rt.start_session(StartSession::resume(id.clone())).await?;
+    session.persist().await?;
+    assert!(provider.requests().is_empty());
+    drop(session);
+    drop(rt);
+    let domain = JournalDomain {
+        storage_id: store.journals().ordinary().storage_id(),
+        role: JournalRole::Ordinary,
+    };
+    assert!(raw.load(&domain, &id).await?.unwrap().revision.0 > 1);
+    assert_eq!(
+        native_import_counts(&raw, &store, &id, &original, &checkpoint.snapshot, true).await?,
+        vec![1, 1]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "resumes only converted Main Chats on an explicitly selected disposable copy"]
 async fn journal_real_data_lazy_resume() -> TestResult<()> {
+    lazy_resume_copy(false).await
+}
+
+#[tokio::test]
+#[ignore = "resumes selected Main Chats before background conversion on a disposable copy"]
+async fn journal_real_data_unconverted_lazy_resume() -> TestResult<()> {
+    lazy_resume_copy(true).await
+}
+
+async fn lazy_resume_copy(unconverted: bool) -> TestResult<()> {
     use agent_runtime::{
         core::{
             catalog::{ModelLimits, ResolvedModelProfile},
             checkpoint::CheckpointStore,
             ids::SessionId,
-            journal::*,
             provider::{Capabilities, ModelId},
             store::SessionStore,
         },
@@ -141,25 +328,36 @@ async fn journal_real_data_lazy_resume() -> TestResult<()> {
     )?))?;
     let key: [u8; 32] = Sha256::digest(std::fs::read(secret_path)?).into();
     let pool = db::create_sqlite_pool(&format!("sqlite://{}", path.display())).await?;
-    let store = Arc::new(SqliteProtectedRuntimeStore::new(
-        Arc::new(db::SqliteDb::new(pool.clone())),
-        key,
-        1,
-    ));
+    db::run_migrations(&pool).await?;
+    let db = Arc::new(db::SqliteDb::new(pool.clone()));
+    let raw = forge_agent_host::session_journal::ForgeJournalStorage::new(db.clone(), key, 1)
+        .map_err(|_| "native inspection storage unavailable")?;
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db, key, 1));
     let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT s.runtime_session_id,c.scope_id,s.profile_id,i.selected_profile_id
          FROM agent_session s JOIN agent_identity i ON i.id=s.identity_id
          JOIN agent_context_scope c ON c.id=s.context_scope_id
          JOIN agent_chat chat ON c.scope_type='agent_chat' AND chat.id=c.scope_id
          WHERE chat.kind='account_main' AND s.replaced_by_session_id IS NULL
-           AND EXISTS(SELECT 1 FROM agent_session_journal_session j WHERE j.runtime_session_id=s.runtime_session_id AND j.role='ordinary' AND j.published=1 AND j.retired=0)",
-    ).fetch_all(&pool).await?;
+           AND ((?1=0 AND EXISTS(SELECT 1 FROM agent_session_journal_session j WHERE j.runtime_session_id=s.runtime_session_id AND j.role='ordinary' AND j.published=1 AND j.retired=0))
+             OR (?1=1 AND s.profile_id=i.selected_profile_id AND s.id=(
+                 SELECT candidate.id FROM agent_session candidate WHERE candidate.identity_id=s.identity_id
+                   AND candidate.context_scope_id=s.context_scope_id AND candidate.profile_id=s.profile_id
+                   AND candidate.backend_kind='native' AND candidate.replaced_by_session_id IS NULL
+                   AND candidate.status IN ('starting','ready','running','degraded','suspended')
+                 ORDER BY candidate.status='suspended',candidate.created_at DESC LIMIT 1)
+                 AND NOT EXISTS(SELECT 1 FROM agent_session_journal_session j WHERE j.runtime_session_id=s.runtime_session_id AND (j.published=1 OR j.retired=1))))",
+    ).bind(unconverted).fetch_all(&pool).await?;
     if rows.is_empty() {
-        return Err("no converted Main Chat was available for lazy resume".into());
+        return Err("no matching Main Chat was available for lazy resume".into());
     }
     let mut facts = Vec::new();
     for (runtime, chat, profile, selected) in rows {
         let id = SessionId::new(&runtime);
+        let _foreground = store
+            .foreground_session(&id)
+            .await
+            .map_err(|_| "foreground admission unavailable")?;
         let ordinary = SessionStore::load(&*store, &id)
             .await
             .map_err(|_| "legacy snapshot could not be decoded")?
@@ -168,50 +366,11 @@ async fn journal_real_data_lazy_resume() -> TestResult<()> {
             .await
             .map_err(|_| "legacy checkpoint could not be decoded")?
             .ok_or("legacy checkpoint absent")?;
-        let mut counts = Vec::new();
-        for (engine, expected) in [
-            (store.journals().ordinary(), &ordinary),
-            (store.journals().protected(), &protected.snapshot),
-        ] {
-            let nonce = db::new_uuid_v4();
-            let lease = engine
-                .open(
-                    &id,
-                    JournalOpen {
-                        root: JournalRootSelection::Latest,
-                        expected_revision: None,
-                        operation: JournalOperationId::new(&nonce),
-                        pin: JournalPinId::new(&nonce),
-                        intent: JournalOpenIntent::ReadOnly,
-                    },
-                )
-                .await
-                .map_err(|e| format!("native inspection failed: {:?}", e.kind))?;
-            let imported = JournalReader::new(
-                &engine,
-                &lease,
-                JournalReadLimits {
-                    objects: 100_000,
-                    encoded_bytes: 32 * 1024 * 1024,
-                    entries: 100_000,
-                },
-            )
-            .map_err(|_| "native reader unavailable")?
-            .snapshot()
-            .await
-            .map_err(|_| "native snapshot could not be decoded")?
-            .ok_or("native snapshot absent")?;
-            // Boolean assertions keep private payloads out of failure output.
-            assert!(
-                imported == *expected,
-                "native import differs from its receipt-filtered legacy state"
-            );
-            counts.push(imported.history.len());
-            engine
-                .close(lease)
-                .await
-                .map_err(|_| "native read lease could not close")?;
-        }
+        let mut counts = if unconverted {
+            Vec::new()
+        } else {
+            native_import_counts(&raw, &store, &id, &ordinary, &protected.snapshot, false).await?
+        };
         let mut resumed = false;
         let provider = Arc::new(FakeProvider::new(
             "fake",
@@ -262,7 +421,7 @@ async fn journal_real_data_lazy_resume() -> TestResult<()> {
                 .map_err(|_| "lazy runtime unavailable")?;
             let session = rt
                 .start_session(
-                    StartSession::resume(id)
+                    StartSession::resume(id.clone())
                         .with_checkpoint_recovery(CheckpointRecoveryPolicy::Defer)
                         .with_lcm_policy(LcmRecoveryPolicy::Adopt),
                 )
@@ -276,12 +435,16 @@ async fn journal_real_data_lazy_resume() -> TestResult<()> {
             drop(session);
             drop(rt);
         }
+        if unconverted {
+            counts = native_import_counts(&raw, &store, &id, &ordinary, &protected.snapshot, true)
+                .await?;
+        }
         assert!(
             provider.requests().is_empty(),
             "lazy resume called the provider"
         );
         facts.push(serde_json::json!({"runtime_session_id":runtime,"ordinary_entries":counts[0],"protected_entries":counts[1],
-            "lcm_namespaces":usize::from(protected.snapshot.extension_state.contains_key(LCM_COMPONENT_ID)),"resumed":resumed,"provider_calls":provider.requests().len()}));
+            "lcm_namespaces":usize::from(protected.snapshot.extension_state.contains_key(LCM_COMPONENT_ID)),"resumed":resumed,"provider_calls":provider.requests().len(),"foreground_first":unconverted}));
     }
     println!("{}", serde_json::to_string(&facts)?);
     pool.close().await;

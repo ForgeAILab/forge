@@ -180,7 +180,7 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
         ("active", "LCM sibling owner is active"),
         (
             "no-selected-profile",
-            "LCM shared chat identity has no selected profile",
+            "LCM shared chat has no selected resume target",
         ),
         (
             "tie",
@@ -214,10 +214,38 @@ async fn shared_pre_topic_chat_parks_ambiguous_sibling_owners_with_reasons() {
             _ => unreachable!(),
         }
         let before = legacy(&f, &id).await;
+        let mut cursor = ConversionCursor::default();
         let report = worker
-            .convert_with_budget_for_test(&mut ConversionCursor::default(), Duration::from_secs(60))
+            .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
             .await
             .unwrap();
+        if case == "active" {
+            assert!(report.parked_sessions.is_empty());
+            assert!(report.remaining > 0);
+            assert_eq!(report.converted, 0);
+            assert_eq!(publication_count(&f, &id).await, 0);
+            sqlx::query("UPDATE agent_session SET status='suspended' WHERE runtime_session_id=?")
+                .bind(older.as_str())
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let mut converted = 0;
+            for _ in 0..4 {
+                let retried = worker
+                    .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+                assert!(retried.parked_sessions.is_empty());
+                converted += retried.converted;
+                if retried.remaining == 0 {
+                    break;
+                }
+            }
+            assert_eq!(converted, 1);
+            assert_eq!(publication_count(&f, &id).await, 2);
+            assert_eq!(legacy(&f, &id).await, before);
+            continue;
+        }
         let parked = report
             .parked_sessions
             .iter()
@@ -429,7 +457,7 @@ async fn unowned_profile_switch_worker_handles_both_cursor_orders() {
 }
 
 #[tokio::test]
-async fn shared_profile_switch_parks_without_selected_resume_target() {
+async fn shared_profile_switch_converts_own_timeline_without_selected_resume_target() {
     use forge_agent_host::test_support::LegacyLcmFixture;
     for empty_profile in [false, true] {
         let (f, store, worker) = fixture().await;
@@ -450,31 +478,28 @@ async fn shared_profile_switch_parks_without_selected_resume_target() {
             .unwrap();
         let mut cursor = ConversionCursor::default();
         let mut parked = Vec::new();
+        let mut converted = 0;
         for _ in 0..6 {
             let report = worker
                 .convert_with_budget_for_test(&mut cursor, Duration::from_secs(60))
                 .await
                 .unwrap();
-            assert_eq!(report.converted, 0);
+            converted += report.converted;
             parked.extend(report.parked_sessions);
             if report.remaining == 0 {
                 break;
             }
         }
-        assert_eq!(parked.len(), 2);
-        for entry in parked {
-            assert_eq!(entry.error_kind, "Conflict");
-            assert_eq!(
-                entry.error_message,
-                if empty_profile {
-                    "LCM shared chat selected profile has no resumable native session"
-                } else {
-                    "LCM shared chat identity has no selected profile"
-                }
-            );
-        }
+        assert_eq!(converted, 1);
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].runtime_session_id, id.to_string());
+        assert_eq!(parked[0].error_kind, "Conflict");
+        assert_eq!(
+            parked[0].error_message,
+            "LCM shared chat has no selected resume target"
+        );
         assert_eq!(publication_count(&f, &id).await, 0);
-        assert_eq!(publication_count(&f, &older).await, 0);
+        assert_eq!(publication_count(&f, &older).await, 2);
         let owner: String =
             sqlx::query_scalar("SELECT runtime_session_id FROM agent_lcm_timeline WHERE id=?")
                 .bind(&old.timeline_id)
@@ -1159,4 +1184,93 @@ async fn background_converts_agent_chat_lcm_and_next_turn_is_native_only() {
         before,
         "next native turn never rewrites legacy state"
     );
+}
+
+#[tokio::test]
+async fn corrupt_sibling_is_parked_without_blocking_selected_target() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    let (f, store, worker) = fixture().await;
+    let id = SessionId::new("corrupt-sibling-target");
+    let (old, older) = LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+    let source = f.ensure_session(&older).await.unwrap();
+    store
+        .seed_legacy_bytes(
+            &older,
+            Some(b"{invalid sibling"),
+            Some(b"{invalid sibling"),
+            false,
+        )
+        .await
+        .unwrap();
+    let mut cursor = ConversionCursor::default();
+    let mut parked = Vec::new();
+    let mut unreadable = 0;
+    let mut converted = 0;
+    for _ in 0..5 {
+        let report = worker
+            .convert_with_budget_for_test(&mut cursor, Duration::from_secs(30))
+            .await
+            .unwrap();
+        converted += report.converted;
+        unreadable += report.skipped_unreadable;
+        parked.extend(report.parked_sessions);
+        if report.remaining == 0 {
+            break;
+        }
+    }
+    assert_eq!(converted, 1);
+    assert_eq!(unreadable, 1);
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].forge_session_id, source);
+    assert_eq!(parked[0].runtime_session_id, older.to_string());
+    assert_eq!(parked[0].error_kind, "Serialization");
+    let owner = f.ensure_session(&id).await.unwrap();
+    assert!(
+        f.database()
+            .session_persistence_flags(&owner)
+            .await
+            .unwrap()
+            .ordinary_published
+    );
+    let facts:(String,i64)=sqlx::query_as("SELECT runtime_session_id,(SELECT COUNT(*) FROM agent_lcm_entry WHERE timeline_id=t.id) FROM agent_lcm_timeline t WHERE id=?").bind(&old.timeline_id).fetch_one(f.database().pool()).await.unwrap();
+    assert_eq!(facts, (id.to_string(), 114));
+}
+
+#[tokio::test]
+async fn active_selected_target_is_retried_by_the_same_worker_cursor() {
+    use forge_agent_host::test_support::LegacyLcmFixture;
+    let (f, store, worker) = fixture().await;
+    let id = SessionId::new("active-selected-target");
+    LegacyLcmFixture::unowned_pre_topic_profile_switch(&f, &store, &id).await;
+    sqlx::query("UPDATE agent_session SET status='ready' WHERE runtime_session_id=?")
+        .bind(id.as_str())
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    let mut cursor = ConversionCursor::default();
+    let first = worker
+        .convert_with_budget_for_test(&mut cursor, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(first.parked_sessions.is_empty());
+    assert_eq!(first.skipped_unreadable, 0);
+    assert!(first.remaining > 0);
+    sqlx::query("UPDATE agent_session SET status='suspended' WHERE runtime_session_id=?")
+        .bind(id.as_str())
+        .execute(f.database().pool())
+        .await
+        .unwrap();
+    let mut converted = first.converted;
+    for _ in 0..5 {
+        let report = worker
+            .convert_with_budget_for_test(&mut cursor, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(report.parked_sessions.is_empty());
+        converted += report.converted;
+        if report.remaining == 0 {
+            break;
+        }
+    }
+    assert_eq!(converted, 2);
 }

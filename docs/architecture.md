@@ -2517,48 +2517,60 @@ one write transaction. A populated replacement binding is a conflict.
 
 Pre-V149 Agent Chat timelines were shared by successive runtimes of the same
 chat. V149 backfills canonical scope and retirement metadata but leaves runtime
-ownership NULL. Chat resolution prefers the active session, otherwise the newest
-unreplaced suspended native session for the same identity, context scope and
-Profile. The resume target for the identity's **currently selected Profile** owns
-the shared pre-topic timeline, whether it is still unowned or its older suspended
-owner belongs to another Profile. The timeline must predate the target and have been written
-after its creation. Neither runtime nor another sibling may have published or
-retired a native journal; claims, leases, topic/rotation references, other
-runtime bindings, active siblings and tied/newer selected-Profile sessions
-prevent transfer with a specific Conflict reason. No selected Profile, or no
-resumable native session for that Profile, also parks with a precise reason.
-Unlinked suspended legacy siblings of the same identity/context scope may
-reference the shared timeline; another dormant Profile does not compete.
+ownership NULL. Forge chooses an active session first, otherwise the newest
+unreplaced suspended native session for the selected Profile in that chat.
+Arbitration follows that choice only when the selected session's own saved state
+references the shared timeline. A session that already owns and binds its own
+timeline converts normally when another Profile is selected, including when that
+Profile has no session in this chat or uses a topic timeline.
 
-The resolver holds exclusive admission and both journal writer leases for the
-legacy siblings, including unpublished reservations with no pin row, and checks
-the guards in its immediate write transaction. The transaction moves the
-timeline's runtime owner and binding and records every relinquishing sibling
-in `agent_legacy_lcm_relinquishment`, fenced by its session version. Same-Profile
-siblings are marked replaced by the target. Other-Profile siblings retain their
-status, links and version, so their newest session remains resumable after a
-Profile switch. Before importing any sibling that is not the selected resume
-target, conversion resolves the target's binding and commits the ownership and
-receipts first. That includes an unowned timeline immediately after V149 and an
-older sibling of the selected Profile. It also admits the selected target while
-converting another session; an active target or writer remains a conflict.
-Conversion then reloads both legacy copies through the receipts and imports the
-sibling's own transcript and other protected state immediately. A-first and
-B-first cursor orders therefore produce the same timeline owner and native
-imports. There is no selection-based deferral or worker exclusion to revive.
-An unowned timeline with no sibling keeps normal reference-based adoption;
-shared-timeline arbitration does not change standalone legacy conversion.
+Foreground resume keeps the pre-branch adoption behavior: arbitration guards
+must never turn a previously resumable chat into a Conflict. The resolver retries
+briefly when a sibling is converting or has a writer. If receipts cannot be
+proved for an unowned timeline, it rolls back arbitration's partial changes and
+lets the Forge-chosen resuming session adopt its own referenced timeline. A
+session already owning its binding can also resume while receipts are deferred.
+Historical V149 retirement does not revoke a session's existing binding or
+prevent it from resolving its own persisted timeline again. Such a timeline
+still loads and receives its first fenced claim exactly once; its retired scope
+and timestamp remain intact. Identity, canonical scope, runtime ownership and
+claim ownership must still match. Retired timelines never enter shared pre-topic
+ownership arbitration.
+Background active-target, sibling-admission and journal-writer conflicts remain
+retryable on subsequent sweeps rather than parked until restart. The public LCM
+resolver retains typed runtime errors; the native host boundary preserves
+transience and missing-session classification.
 
-Migration `V202610241249` adds only the relinquishment table. Its receipts belong
-to the losing session and survive deletion of the transferred timeline, so a
-stale reference cannot resurrect. Legacy snapshot/checkpoint decoding omits
-only the recorded timeline's LCM and semantic-summary namespaces from the import
-view. The legacy ciphertext, transcript and other protected state remain exact.
-When that Profile resumes, Forge binds a fresh timeline and the runtime rebuilds
-missing LCM state from its retained history. Arbitrary binding mismatches still
-fail closed. No original timeline, entry, node or operation is copied or removed;
-failed writes roll back ownership, binding, receipts and same-Profile replacement
-together, and retries reuse the committed transfer.
+Ownership changes still require an unretired shared canonical timeline with
+pre-topic continuity, exclusive sibling admissions, writer leases and version
+fences. Native publication or retirement blocks transfer only for a sibling that
+owns, binds or references that timeline. Unrelated native siblings and chat topic
+or rotation rows do not block arbitration. A replaced predecessor in the same
+identity/context scope is valid for a rotation-linked Profile switch. Receipts
+cover every referencing sibling regardless of status, age or replacement links.
+Only older, unlinked, suspended native siblings of the same Profile are marked
+replaced; all receipt-only siblings retain their status, links and version.
+
+When the selected target already owns and binds the timeline, arbitration records
+receipts without moving ownership or republishing the target's state. This also
+works after publication when the target's native state references the timeline.
+The same admissions, writer checks and version fences apply. Before publishing
+another sibling, conversion routes through the selected target only if that
+target references the shared timeline, then reloads the sibling through its
+receipt. Both cursor orders preserve the selected target's full LCM history and
+each sibling's own transcript and other protected state. A corrupt sibling's
+legacy copy is reported against that sibling and does not prevent the target's
+conversion or resume; the worker parks the corrupt session on its own turn.
+
+Migration `V202610241249` adds only `agent_legacy_lcm_relinquishment`. Receipts
+survive deletion of the transferred timeline and cascade only with the losing
+session. Legacy decoding omits the recorded timeline's LCM and semantic-summary
+namespaces only in a copy that references that timeline. A semantic summary in a
+copy without LCM state is preserved. Original ciphertext, transcripts and LCM
+entries, nodes and operations remain unchanged. On a later Profile switch,
+receipted sessions bind a fresh timeline and rebuild missing derived state from
+retained history. Unrecorded binding mismatches still fail closed. Failed
+arbitration writes roll back ownership, binding, receipts and replacement together.
 
 Older tuning revisions and NULL/stale Forge policy markers do not discard LCM:
 the runtime validates identity, binding and frontier before exact import, then

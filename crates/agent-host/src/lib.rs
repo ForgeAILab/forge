@@ -527,6 +527,26 @@ impl AgentHostError {
     }
 }
 
+impl From<agent_runtime::core::error::RuntimeError> for AgentHostError {
+    fn from(error: agent_runtime::core::error::RuntimeError) -> Self {
+        if error.kind == agent_runtime::core::error::ErrorKind::NotFound {
+            return Self::SessionNotFound;
+        }
+        Self::RuntimeWithUsage {
+            message: error.to_string(),
+            failure: if error.retryable {
+                api_types::TurnFailure::Transient {
+                    retry_after: error.retry_after_ms,
+                }
+            } else {
+                api_types::TurnFailure::Unclassified
+            },
+            provider_auth_rejected: false,
+            usage_reports: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod turn_limit_tests {
     use super::*;

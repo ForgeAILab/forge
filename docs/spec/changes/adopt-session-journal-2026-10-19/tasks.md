@@ -1,6 +1,6 @@
 ---
 created_at: 2026-10-19T00:00:00Z
-updated_at: 2026-10-24T07:10:52Z
+updated_at: 2026-10-24T15:41:33Z
 completed_at:
 ---
 
@@ -871,3 +871,30 @@ benchmark receipts predate the tag and no benchmark rerun is claimed.
   Standalone conversion remains unchanged; two existing regressions caught and
   verified that restriction without fixture/assertion changes. All work copies
   are deleted. Earlier unfinished tasks and Owner Decisions remain unchanged.
+
+
+- [x] **36. Repair shared LCM arbitration review.** Preserve Forge's foreground
+  resume choice with pre-branch unowned adoption fallback. Receipt all referencing
+  sibling statuses and rotation links, scope native refusal to T, bypass unrelated
+  Profile selection for own-bound timelines, and handle target-owned T with
+  receipts before or after publication. Preserve typed transient errors, retry
+  contention without restart, isolate corrupt siblings and retain no-LCM semantic
+  summaries. Prove M1–M3 fail without, run requested focused suites and migration
+  check, and verify converted and foreground-first unconverted real-copy Main Chat
+  resume with 114 entries and zero provider calls. Record L4 as a follow-up.
+  Completed (2026-10-24): M1–M3 each fail without the repair and pass with it.
+  All referencing statuses and rotation links are receipted; unrelated native
+  state and chat topics/rotations do not block. Existing owners convert under
+  unrelated selection, and unpublished/published selected owners issue receipts,
+  including on foreground native resolve before a switch back. Busy states retry
+  with the same cursor, typed errors survive, corrupt siblings park themselves,
+  and no-LCM semantic summaries remain exact. Foreground adoption survives a
+  receipt-write failure and rolls back partial replacement before retry.
+  Requested focused suites, the V202610241249 migration test and strict Clippy
+  pass. A fresh real-copy dry run converts three sessions with zero parked,
+  unreadable or remaining; Main Chat keeps 114 entries, zero nodes, 121 operations
+  and ten receipts. Converted and foreground-first unconverted resume use zero
+  provider calls. Exact original import roots, protected state, retained ciphertext
+  and LCM rows are verified; all disposable copies are deleted. L4's decode-under-
+  write-transaction performance work remains a follow-up; the read-only probe uses
+  a deferred transaction. Earlier unfinished tasks and Owner Decisions remain intact.

@@ -1054,7 +1054,7 @@ omitting only its receipted shared LCM namespaces. There is no
 are covered by the worker suite. All legacy ciphertext and original
 LCM rows remain unchanged. This generated fixture uses no installation data.
 
-Two additional ignored tests use the same explicit path/secret inputs and refuse
+Three additional ignored tests use the same explicit path/secret inputs and refuse
 installation paths. `session_journal_dryrun::journal_real_data_lcm_metadata` opens
 the migrated copy read-only and emits only session/Profile/timeline IDs, history
 counts and DAG revisions from the two legacy copies.
@@ -1063,6 +1063,17 @@ compares both native domains with their receipt-filtered legacy state using
 content-free failure messages, then resumes selected Main Chats through the
 runtime builder, existing LCM binding and deferred checkpoint recovery. A fake
 provider with no scripts must receive zero calls; no turn is run or persisted.
+`session_journal_dryrun::journal_real_data_unconverted_lazy_resume` migrates a fresh
+disposable copy and resumes the Forge-selected Main Chat before any background
+conversion. It holds foreground admission and requires exact resumed history with
+zero provider calls. Live LCM recovery may publish a repaired ordinary successor,
+so it compares the retained revision-1 ordinary import and the protected domain
+with the complete legacy snapshots. The generated
+`retained_import_inspection_is_exact_after_a_live_successor` regression verifies
+that inspection after an ordinary successor publication. The converted-copy test
+compares native state before live resume. Outputs contain only IDs, counts and
+boolean outcomes. Busy arbitration is retryable;
+foreground unowned adoption keeps the pre-branch behavior.
 Its output contains only IDs, history/namespace/provider-call counts and resume
 status. These tests never print payloads, text or secrets.
 
