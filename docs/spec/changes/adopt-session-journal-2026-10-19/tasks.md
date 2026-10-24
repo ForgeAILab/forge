@@ -821,3 +821,7 @@ No runtime bench crate becomes a production dependency.
   exact allocator heap and final release tag remain pending. Task 33 stays open.
   Actual table and full evidence: design D10 receipt,
   `docs/performance-testing.md`, `/Volumes/Data/tmp/refactor/c3-t33/report.md`.
+
+Concurrent final-pin update (2026-10-24 07:17 UTC): another actor committed the workspace as 91907de1 and changed Cargo to the v0.10.0 tag at c036af7b4635cf7d76451aaa666a9df87405ca1a. I did not create that commit. Local git verifies that b0a8c90..c036af7b changes only Cargo version metadata, CHANGELOG and docs, with no Rust source changes. The revision constant/dependency contract were aligned afterward; benchmark and earlier verification receipts remain the measured interim b0a8c90 implementation. A full tag rebuild/rerun is not claimed.
+
+Final tag follow-up: offline engine_release_contract passes at v0.10.0/c036af7b (1/1), and fmt check passes. The prior broad checks/benchmarks ran on the Rust-source-identical interim revision; a full tag workspace/benchmark rerun is not claimed.

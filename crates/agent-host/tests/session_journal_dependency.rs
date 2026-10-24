@@ -10,7 +10,7 @@ use forge_agent_host::AGENT_RUNTIME_REVISION;
 
 #[tokio::test]
 async fn engine_release_contract() {
-    const RELEASE_SHA: &str = "b0a8c90e96ccb85e4642a119117a8fd5d3a06993";
+    const RELEASE_SHA: &str = "c036af7b4635cf7d76451aaa666a9df87405ca1a";
     assert_eq!(AGENT_RUNTIME_REVISION, RELEASE_SHA);
     let mut packages = 0;
     let mut testkit = false;
@@ -23,7 +23,7 @@ async fn engine_release_contract() {
         else {
             continue;
         };
-        assert!(package.contains("\nversion = \"0.9.0\"\n"), "{name}");
+        assert!(package.contains("\nversion = \"0.10.0\"\n"), "{name}");
         let source = package
             .lines()
             .find_map(|line| line.strip_prefix("source = \""))

@@ -1257,6 +1257,10 @@ Packing candidate: **kept**. C/1000 improves from 1.48261x to 1.40000x L2 (33 to
 
 **NOT MET:** Fixed steady-turn overhead: A/100 tool, B/100 tool. Mean across both turns (including cold first-turn work) fails its recorded fixed check for: A/100 plain, A/100 tool, B/100 plain, B/100 tool, B/4000 plain, B/4000 tool; keep it separate from the steady delta-turn metric. B/1000 delta-write <=10% remains tracked; see measured percentages above. The 1.5x disk aim is separate from the passing 2.0x B/4000 hard gate. Unfinished production shapes: C/4000 tool. A timed-out full report is not a completed gate; no missing C/4000 values are inferred. Exact allocator heap is unavailable through the runtime API; telemetry is estimated charge/scoped counters plus RSS. Task 24 remains open for that gap. The final v0.10.0 tag pin remains pending; the owner-authorized interim SHA is still versioned 0.9.0. All Owner Decisions below remain verbatim.
 
+Concurrent final-pin update (2026-10-24 07:17 UTC): another actor committed the workspace as 91907de1 and changed Cargo to the v0.10.0 tag at c036af7b4635cf7d76451aaa666a9df87405ca1a. I did not create that commit. Local git verifies that b0a8c90..c036af7b changes only Cargo version metadata, CHANGELOG and docs, with no Rust source changes. The revision constant/dependency contract were aligned afterward; benchmark and earlier verification receipts remain the measured interim b0a8c90 implementation. A full tag rebuild/rerun is not claimed.
+
+Final tag follow-up: offline engine_release_contract passes at v0.10.0/c036af7b (1/1), and fmt check passes. The prior broad checks/benchmarks ran on the Rust-source-identical interim revision; a full tag workspace/benchmark rerun is not claimed.
+
 ## Risks / Trade-offs
 
 - The consumed prerequisite is `v0.9.0`. The release gate verifies the tagged contract,
