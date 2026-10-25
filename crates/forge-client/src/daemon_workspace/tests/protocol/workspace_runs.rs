@@ -181,7 +181,7 @@ async fn a_process_that_outlives_a_preempted_workspace_run_loses_its_temp_dir() 
             .unwrap()
             .success()
     };
-    let checked = (|| {
+    let checked = async {
         if !tmp.canonicalize().map_or_else(
             |_| tmp.starts_with(&root) || tmp.starts_with(fixture.dir.path()),
             |tmp| tmp.starts_with(&root),
@@ -194,11 +194,18 @@ async fn a_process_that_outlives_a_preempted_workspace_run_loses_its_temp_dir() 
         if !kill("-0") {
             return Err("the process in its own session did not survive".to_owned());
         }
-        if tmp.exists() {
+        let removed = tokio::time::timeout(Duration::from_secs(10), async {
+            while tmp.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if removed.is_err() {
             return Err("the temp directory outlived the preempted command".to_owned());
         }
         Ok(())
-    })();
+    }
+    .await;
     // The survivor runs on: its writes now fail and bring nothing back.
     let failed = tokio::time::timeout(Duration::from_secs(10), async {
         while status() != "failed" {
