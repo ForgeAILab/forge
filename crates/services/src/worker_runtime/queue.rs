@@ -1800,7 +1800,7 @@ impl TaskStepWorker {
             }
         }
         let blocked = (status == "parked").then(|| {
-            serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop", "kind":api_types::FailureKind::WorkflowLoop, "created_at":now})
+            serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop"})
                 .to_string()
         });
         let written = self

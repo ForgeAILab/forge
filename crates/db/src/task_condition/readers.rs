@@ -334,8 +334,8 @@ impl TaskCondition {
     }
 }
 
-/// Read workflow-loop metadata, including pre-upgrade rows that recorded
-/// `blocked_at` but no `created_at` or kind. Enrich only the public projection:
+/// A workflow-loop block's time is its `blocked_at`; its kind comes from `source`.
+/// Enrich only the public projection:
 /// mapped conditions and event/Attention material retain their original fields.
 fn read_workflow_loop_interruption(raw: &str) -> Option<InterruptionMetadata> {
     let mut value: Value = serde_json::from_str(raw).ok()?;
@@ -863,3 +863,7 @@ fn projected_message(raw: Option<&str>, fallback: &str) -> Option<String> {
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+#[path = "workflow_loop_tests.rs"]
+mod workflow_loop_tests;

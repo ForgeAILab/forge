@@ -16,8 +16,14 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
     let task = worker.drain("t").await.unwrap();
     let blocked: serde_json::Value =
         serde_json::from_str(task.blocked_json.as_deref().unwrap()).unwrap();
-    assert_eq!(blocked["kind"], "workflow_loop");
-    assert_eq!(blocked["created_at"], blocked["blocked_at"]);
+    assert_eq!(
+        blocked,
+        serde_json::json!({
+            "reason": blocked["reason"],
+            "blocked_at": blocked["blocked_at"],
+            "source": "workflow_loop"
+        })
+    );
     let public = serde_json::to_value(task.condition.public()).unwrap();
     let interruption: api_types::InterruptionMetadata =
         serde_json::from_value(public["details"]["interruption"].clone())
@@ -43,14 +49,6 @@ async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
             .unwrap(),
     );
     drop(connection);
-    assert_eq!(
-        task.condition.typed(),
-        db::map_legacy_condition(&input).typed()
-    );
-    let mut old_block = blocked.clone();
-    old_block.as_object_mut().unwrap().remove("kind");
-    old_block.as_object_mut().unwrap().remove("created_at");
-    input.blocked_json = Some(old_block.to_string());
     assert_eq!(
         task.condition.typed(),
         db::map_legacy_condition(&input).typed()

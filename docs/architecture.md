@@ -8108,16 +8108,12 @@ normal shape of an upgraded Task whose inline hooks finished.
 
 Only cascades consume automatic chain positions and edges. Repeated unchanged-
 evidence edges or more than 64 hops park with workflow_loop; fresh Review/rebase
-head evidence starts a new segment. The block records `kind: "workflow_loop"`
-and matching `created_at`/`blocked_at` timestamps alongside its reason and
-source. The public reader also exposes pre-upgrade loop blocks using
-`blocked_at` when `created_at` is absent. That fallback only enriches the read:
-stored condition semantics and historical event/Attention material remain
-unchanged, so an upgrade does not re-arm the incident or wake. The writer's
-redundant kind and matching timestamp are public presentation fields: the
-mapper excludes them from its semantic and material inputs, while retaining
-the full stored block for the public reader. New and pre-upgrade loop shapes
-therefore have equal `typed()` conditions, including `since`. Failed steps whose failure blocks retain
+head evidence starts a new segment. The block records `reason`, `blocked_at`,
+and `source`. The public reader derives kind `workflow_loop` from `source`
+and `created_at` from `blocked_at`. This only enriches the public projection;
+typed conditions (including `since`) and event/Attention material stay unchanged,
+so reading a loop block does not re-arm its incident or wake.
+Failed steps whose failure blocks retain
 cascade_failed or the existing specific blocking annotation. Failed/parked history and operator status
 keep the established queue retention and recovery contract.
 

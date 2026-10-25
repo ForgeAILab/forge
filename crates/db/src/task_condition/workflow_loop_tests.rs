@@ -1,4 +1,4 @@
-use super::*;
+use super::super::*;
 use serde_json::json;
 
 const BLOCKED: &str = r#"{"reason":"Automatic workflow loop detected","blocked_at":"2026-10-01T00:00:00Z","source":"workflow_loop"}"#;
@@ -68,32 +68,4 @@ fn pre_upgrade_loop_reader_keeps_failure_precedence_and_rejects_unrelated_blocks
             "{blocked}"
         );
     }
-    let current = json!({"reason":"loop", "created_at":"2026-10-02T00:00:00Z", "blocked_at":"2026-10-01T00:00:00Z", "kind":"workflow_loop", "source":"workflow_loop"});
-    let condition = map_legacy_condition(&LegacyConditionInput {
-        blocked_json: Some(current.to_string()),
-        ..Default::default()
-    });
-    assert_eq!(
-        condition.read().interruption.unwrap().created_at,
-        "2026-10-02T00:00:00Z"
-    );
-}
-
-#[test]
-fn workflow_loop_public_fields_do_not_change_the_typed_mapping() {
-    let mut input = LegacyConditionInput {
-        error_annotation: Some(r#"{"type":"workflow_loop","state":"todo","message":"Automatic workflow loop detected","detected_at":"2026-10-01T00:00:00Z","task_step_id":"loop-step"}"#.into()),
-        blocked_json: Some(BLOCKED.into()),
-        ..Default::default()
-    };
-    let before = map_legacy_condition(&input);
-    let mut block: serde_json::Value = serde_json::from_str(BLOCKED).unwrap();
-    block["kind"] = json!(api_types::FailureKind::WorkflowLoop);
-    block["created_at"] = block["blocked_at"].clone();
-    input.blocked_json = Some(block.to_string());
-    let after = map_legacy_condition(&input);
-    assert_eq!(after.typed(), before.typed());
-    assert_eq!(material_blocker(&after), material_blocker(&before));
-    assert_eq!(after.public(), before.public());
-    assert_eq!(after.evidence().blocked_json, input.blocked_json);
 }
