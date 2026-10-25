@@ -55,8 +55,8 @@ fn project_turn_query_boundary_does_not_rewalk_main_provenance() {
     let mut loader = source[start..end].to_owned();
     assert!(!loader.contains("sqlx::"));
     let db_sources = [
-        include_str!("../../../../db/src/sqlite/agent.rs"),
-        include_str!("../../../../db/src/sqlite/agent_chat.rs"),
+        include_str!("../../../../db/src/sqlite/agent/authority.rs"),
+        include_str!("../../../../db/src/sqlite/agent_chat/queries.rs"),
         include_str!("../../../../db/src/sqlite/orchestration/turn_admission.rs"),
     ];
     let mut statements = 0;

@@ -82,7 +82,7 @@ Findings are rated **Critical** (latent incorrectness), **High** (structural blo
 | Follow-up dispatch | `execution/follow_up.rs:243` | `"system"` (via `From<i64>`) | **Agent** |
 | Historical subtask transitions | Former subtask transition module (deleted; ordered-sequence coordination now lives in `task_service/subtask.rs` and `execution/cascade.rs`) | `"system"` (via `From<i64>`) | **Agent/System** |
 | Initial scheduling | `task_dispatcher/initial_scheduling.rs:98` | `"system:task_dispatcher"` | System |
-| **MCP `forge_transition_task`** | `mcp-server/tools/handlers.rs:479` | `"system"` (via `From<i64>`) | **Agent ✗** |
+| **MCP `forge_transition_task`** | `mcp-server/tools/handlers.rs:514` | `"system"` (via `From<i64>`) | **Agent ✗** |
 
 **The only `"agent:"` emitter in the whole codebase is `claim.rs:250`.** Every other agent-driven path — including the MCP tool an agent uses to transition a task — runs as `"system"`.
 
@@ -257,7 +257,7 @@ executor.run_execution() returns ExecutionOutcome::Completed
 ```
 POST /mcp  { method:"forge_transition_task", params:{ task_id, status, version } }
 │
-└─ mcp-server/tools/handlers.rs:479  forge_transition_task()
+└─ mcp-server/tools/handlers.rs:514  forge_transition_task()
    └─ state.task_service.transition(task_id, status.into(), version)
       └─ …identical to Flow B: triggered_by = "system" via From<i64>
 ```
@@ -325,7 +325,7 @@ This is where F1 is actually fixed. Map each call site to its real actor:
 
 - `claim.rs:250` → `Actor::Agent` (intent already correct).
 - `execution/launch.rs` and `execution/follow_up.rs` (agent-driven) → `Actor::System` is honest for launch/cascade. Ordered-child sequencing now lives in `task_service/subtask.rs` and `execution/cascade.rs`; child executions are independent and serial in the root workspace, so the former subtask transition path is not a current behavior to preserve.
-- **`mcp-server/tools/handlers.rs:479` `forge_transition_task`** → `Actor::Agent { id: <calling agent> }`. This requires the MCP layer to know the calling agent (it has `McpState`); if agent identity is not yet plumbed through, this is the place to add it. This single change is what makes `AgentOnly` meaningful.
+- **`mcp-server/tools/handlers.rs:514` `forge_transition_task`** → `Actor::Agent { id: <calling agent> }`. This requires the MCP layer to know the calling agent (it has `McpState`); if agent identity is not yet plumbed through, this is the place to add it. This single change is what makes `AgentOnly` meaningful.
 - `gates.rs:73,113`, `transitions.rs:15` → `Actor::User`.
 - `recovery.rs:829,1569` (user-driven) → `Actor::User`; system-driven recovery → `Actor::System`.
 - `task_dispatcher/initial_scheduling.rs:98` → `Actor::System { component: "task_dispatcher" }`.
@@ -418,7 +418,7 @@ Plus the implicit `"system"` via `From<i64>` at:
 crates/services/src/task_service/execution/launch.rs:190,365,573
 crates/services/src/task_service/execution/follow_up.rs:243
 crates/services/src/task_service/subtask.rs and execution/cascade.rs (ordered-child sequencing)
-crates/mcp-server/src/tools/handlers.rs:479  (forge_transition_task)
+crates/mcp-server/src/tools/handlers.rs:514  (forge_transition_task)
 ```
 
 ## Appendix B — Key file references
@@ -439,6 +439,6 @@ crates/mcp-server/src/tools/handlers.rs:479  (forge_transition_task)
 | `transition_inner` (lifecycle) | `crates/services/src/workflow/engine/mod.rs:523` |
 | `hook_audience_matches` (the divergence) | `crates/services/src/workflow/engine/hooks.rs:95` |
 | User entrypoint | `crates/api/src/routes/tasks/transitions.rs:8` |
-| MCP entrypoint | `crates/mcp-server/src/tools/handlers.rs:479` |
+| MCP entrypoint | `crates/mcp-server/src/tools/handlers.rs:514` |
 | Execution completion | `crates/services/src/task_service/execution/runner.rs` (`run_execution`) |
 | Sole `"agent:"` emitter | `crates/services/src/task_service/claim.rs:250` |

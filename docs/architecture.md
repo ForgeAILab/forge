@@ -264,7 +264,22 @@ The `models.rs` and `repository.rs` roots re-export aggregate child modules
 from `models/` and `repository/`, preserving their existing import paths. Large
 SQLite implementations keep their `.rs` roots and place responsibility-specific
 children under the matching directory: `task/`, `pricing/`, `execution/`,
-`analytics/`, and `shared_media/`.
+`analytics/`, `shared_media/`, `agent/`, and `agent_chat/`. The Agent root
+retains roster/Profile persistence; its children own Attention/health reads,
+action and binding authority, and scope/eligibility context. The Agent Chat
+root retains the turn transaction repository (admission through completion,
+failure and cancellation), event/message helpers and row mappers; its children own
+bindings/receipts, ordinary repositories, admission validation, scope/worker
+queries, and tests. `sqlite.rs` remains the shared database root, with execution
+creation and admission fences in `sqlite/execution_admission.rs`.
+
+The MCP `tools/handlers.rs` root retains Task and Project handlers and re-exports
+Agent Chat and memory handlers from `handlers/`; its unit tests live in
+`handlers/tests.rs`. The `api-types/project_orchestration.rs` root retains shared
+provenance, canonical digests, and topic types, re-exporting Charter, Document and
+Decision, milestone/evidence/release, Overview, and mutation contracts from
+`project_orchestration/`. TypeScript exports retain their existing names and
+binding files. Its unit tests live in `project_orchestration/tests.rs`.
 
 The `pricing` crate keeps `lib.rs` as its public root, re-exporting catalog,
 refresh client, selection, event estimate, and retrospective modules. Its SQLite
