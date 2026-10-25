@@ -231,10 +231,16 @@ impl ConditionRead {
 impl TaskCondition {
     /// Omit private evidence, ownership witnesses and migrated metadata from live values.
     pub fn public(&self) -> api_types::TaskCondition {
-        let read = self.read();
+        let mut read = self.read();
         // Which stored record the one public `interruption` is: the failure
         // record wins, and a blocked record beside it is still reported.
         let evidence = self.evidence();
+        if read.interruption.is_none() && !read.hard_failure && evidence.failed_json.is_none() {
+            read.interruption = evidence
+                .blocked_json
+                .as_deref()
+                .and_then(read_workflow_loop_interruption);
+        }
         // A condition a writer stated carries no copy of the legacy records:
         // which record the interruption is comes from its typed presentation.
         let integration_primary = matches!(
@@ -326,6 +332,26 @@ impl TaskCondition {
         }
         serde_json::from_value(value).expect("private and public condition variants agree")
     }
+}
+
+/// A workflow-loop block's time is its `blocked_at`; its kind comes from `source`.
+/// Enrich only the public projection:
+/// mapped conditions and event/Attention material retain their original fields.
+fn read_workflow_loop_interruption(raw: &str) -> Option<InterruptionMetadata> {
+    let mut value: Value = serde_json::from_str(raw).ok()?;
+    let fields = value.as_object_mut()?;
+    if fields.get("source")?.as_str()? != "workflow_loop" {
+        return None;
+    }
+    if !fields.contains_key("created_at") {
+        let at = fields.get("blocked_at")?.as_str()?.to_owned();
+        fields.insert("created_at".into(), Value::String(at));
+    }
+    fields
+        .entry("kind")
+        .or_insert_with(|| serde_json::json!(FailureKind::WorkflowLoop));
+    bound(&mut value);
+    serde_json::from_value(value).ok()
 }
 
 /// The public reading of an annotation that is not a typed blocking
@@ -837,3 +863,7 @@ fn projected_message(raw: Option<&str>, fallback: &str) -> Option<String> {
             .to_owned(),
     )
 }
+
+#[cfg(test)]
+#[path = "workflow_loop_tests.rs"]
+mod workflow_loop_tests;

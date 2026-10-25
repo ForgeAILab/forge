@@ -8116,7 +8116,12 @@ normal shape of an upgraded Task whose inline hooks finished.
 
 Only cascades consume automatic chain positions and edges. Repeated unchanged-
 evidence edges or more than 64 hops park with workflow_loop; fresh Review/rebase
-head evidence starts a new segment. Failed steps whose failure blocks retain
+head evidence starts a new segment. The block records `reason`, `blocked_at`,
+and `source`. The public reader derives kind `workflow_loop` from `source`
+and `created_at` from `blocked_at`. This only enriches the public projection;
+typed conditions (including `since`) and event/Attention material stay unchanged,
+so reading a loop block does not re-arm its incident or wake.
+Failed steps whose failure blocks retain
 cascade_failed or the existing specific blocking annotation. Failed/parked history and operator status
 keep the established queue retention and recovery contract.
 

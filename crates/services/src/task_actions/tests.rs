@@ -683,3 +683,21 @@ fn entry_barrier_and_flow_parks_offer_one_apply_reason_per_verb() {
         .iter()
         .any(|offer| offer.reason == "review_needs_owner"));
 }
+
+#[test]
+fn workflow_loop_keeps_failure_kind_and_offers() {
+    let mut old = snapshot("todo", Some(FailureKind::WorkflowLoop));
+    old.task.blocked_json = Some(
+        r#"{"reason":"loop","blocked_at":"2026-10-01T00:00:00Z","source":"workflow_loop"}"#.into(),
+    );
+    old.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&old.task));
+    let offers = available_actions(&old);
+    assert_eq!(
+        offers,
+        legacy::available_actions(&legacy::TaskSnapshot::from(&old))
+    );
+    assert_eq!(old.condition(), Some(FailureKind::WorkflowLoop));
+    assert!(offers
+        .iter()
+        .any(|offer| matches!(offer.action, TaskAction::Restart { .. })));
+}

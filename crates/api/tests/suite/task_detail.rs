@@ -567,3 +567,128 @@ async fn create_task(
     )
     .await
 }
+
+#[tokio::test]
+async fn workflow_loop_interruption_is_visible_for_worker_and_pre_upgrade_rows() {
+    use db::{TaskRepo, TaskStepRepo};
+    let workspace_root = common::TestDir::new("task-detail-workflow-loop");
+    let harness = common::test_app(workspace_root.path(), "task-detail-workflow-loop").await;
+    let project: ProjectResponse = common::json_request(
+        &harness.app,
+        Method::POST,
+        "/api/v1/projects",
+        json!({"name":"Workflow loop"}),
+        StatusCode::OK,
+    )
+    .await;
+    for pre_upgrade in [false, true] {
+        let task = create_task(&harness.app, &project.id, "Loop", None).await;
+        let row = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        if pre_upgrade {
+            const BLOCKED: &str = r#"{"reason":"Automatic workflow loop detected","blocked_at":"2026-10-01T00:00:00Z","source":"workflow_loop"}"#;
+            sqlx::query("UPDATE task SET blocked_json=?,error_annotation=? WHERE id=?")
+                .bind(BLOCKED)
+                .bind(r#"{"type":"workflow_loop","state":"todo","message":"Automatic workflow loop detected","detected_at":"2026-10-01T00:00:00Z","task_step_id":"old-loop"}"#)
+                .bind(&task.id).execute(harness.state.db.pool()).await.unwrap();
+            harness
+                .state
+                .db
+                .check_task_conditions_of(std::slice::from_ref(&task.id))
+                .await
+                .unwrap();
+        } else {
+            let project_row = db::ProjectRepo::get_by_id(&*harness.state.db, &project.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let workflow = services::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+                &row,
+                &project_row.workflow_definition,
+                &api_types::Actor::system(api_types::SystemComponent::Workflow),
+            );
+            let target = workflow
+                .outgoing_trigger_targets(&row.status)
+                .next()
+                .unwrap()
+                .1;
+            let id = new_uuid_v4();
+            harness
+                .state
+                .db
+                .enqueue_step(&db::EnqueueTaskStep {
+                    id: id.clone(),
+                    task_id: task.id.clone(),
+                    kind: "cascade".into(),
+                    payload_json: json!({
+                        "to":target, "reason":"automatic", "rejection":false,
+                        "skip_before_exit":false, "workflow_ref":db::WorkflowReference::Project,
+                        "clear_review_passed_at_on_commit":false, "evidence":null
+                    })
+                    .to_string(),
+                    causation_step_id: None,
+                    causation_key: id.clone(),
+                    chain_id: id,
+                    chain_position: services::worker_runtime::queue::CHAIN_LIMIT + 1,
+                    expected_status: row.status,
+                    expected_version: row.version,
+                    expected_epoch: None,
+                    lane: "fast".into(),
+                    available_at: now_rfc3339(),
+                })
+                .await
+                .unwrap();
+            harness
+                .state
+                .task_service
+                .task_step_worker()
+                .drain(&task.id)
+                .await
+                .unwrap();
+        }
+        let stored = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let block: serde_json::Value =
+            serde_json::from_str(stored.blocked_json.as_deref().unwrap()).unwrap();
+        let event = db::CreateDomainEvent::task_interruption_changed(&stored);
+        let typed = stored.condition.typed();
+        for suffix in ["", "/detail"] {
+            let response: serde_json::Value = common::empty_request(
+                &harness.app,
+                Method::GET,
+                &format!("/api/v1/tasks/{}{suffix}", task.id),
+                StatusCode::OK,
+            )
+            .await;
+            let task_json = if suffix.is_empty() {
+                &response
+            } else {
+                &response["task"]
+            };
+            let details = &task_json["condition"]["details"];
+            assert_eq!(
+                details["interruption"],
+                json!({
+                    "reason":block["reason"], "kind":"workflow_loop",
+                    "created_at":block["blocked_at"], "source":"workflow_loop"
+                }),
+                "pre_upgrade={pre_upgrade}, endpoint={suffix}"
+            );
+            assert_eq!(details["failure_kind"], "workflow_loop");
+            assert_eq!(details["blocked"], true);
+        }
+        let after = TaskRepo::get_by_id(&*harness.state.db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.condition.typed(), typed);
+        assert_eq!(
+            db::CreateDomainEvent::task_interruption_changed(&after).dedupe_key,
+            event.dedupe_key
+        );
+    }
+}

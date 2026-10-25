@@ -109,6 +109,11 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- A Task blocked by a workflow loop now shows its loop reason on the board
+  card and in the Task list, is included by the Blocked filter, and exposes
+  `condition.details.interruption` (reason, kind, time) with
+  `details.blocked: true` in REST and MCP, including Tasks blocked before
+  upgrade. Recovery offers and Attention incidents are unchanged.
 - An Integration or Check step on a coordination root waiting for aggregate
   review no longer fails with "Task condition differs from its legacy and owner
   witnesses" while subtasks are unfinished (held, failed or not) or when no
