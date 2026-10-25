@@ -1938,3 +1938,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) mod condition_tests;
+
+#[cfg(test)]
+mod workflow_loop_tests;

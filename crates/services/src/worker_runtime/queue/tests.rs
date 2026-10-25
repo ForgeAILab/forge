@@ -817,7 +817,7 @@ async fn command_waiter_re_registers_a_lost_sender_for_its_live_step() {
     assert!(replies.lock().unwrap().is_empty());
 }
 
-async fn fixture() -> (Arc<db::SqliteDb>, TaskStepWorker) {
+pub(super) async fn fixture() -> (Arc<db::SqliteDb>, TaskStepWorker) {
     let pool = db::create_sqlite_pool("sqlite::memory:").await.unwrap();
     db::run_migrations(&pool).await.unwrap();
     let db = Arc::new(db::SqliteDb::new(pool));
@@ -1028,7 +1028,7 @@ fn workflow() -> WorkflowDefinition {
         cancellation_state: None,
     }
 }
-fn step(to: &str) -> EnqueueTaskStep {
+pub(super) fn step(to: &str) -> EnqueueTaskStep {
     EnqueueTaskStep {
         kind: "cascade".into(),
         id: db::new_uuid_v4(),
@@ -1470,54 +1470,6 @@ async fn queued_hop_propagates_producer_review_clear_flag() {
     let result = worker.drain("t").await.unwrap();
     assert_eq!(result.status, "done");
     assert!(result.review_passed_at.is_none());
-}
-
-#[tokio::test]
-async fn loop_event_is_broadcast_once_with_durable_audit_envelope() {
-    let (db, worker) = fixture().await;
-    let mut events = worker.engine.event_bus.subscribe();
-    let relay = crate::domain_event_broadcast::DomainEventBroadcastConsumer::new(
-        db.clone(),
-        worker.engine.event_bus.clone(),
-        Some(db.domain_event_head().await.unwrap()),
-    );
-    let mut input = step("done");
-    input.chain_position = CHAIN_LIMIT + 1;
-    db.enqueue_step(&input).await.unwrap();
-    let task = worker.drain("t").await.unwrap();
-    assert!(task.blocked_json.is_some());
-    relay.broadcast_once(100).await.unwrap();
-    relay.broadcast_once(100).await.unwrap();
-    let collected = std::iter::from_fn(|| events.try_recv().ok()).collect::<Vec<_>>();
-    assert_eq!(
-        collected
-            .iter()
-            .filter(|event| event.event_type == "transition.loop_detected")
-            .count(),
-        1
-    );
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM domain_event WHERE event_type='transition.loop_detected'",
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
-    assert_eq!(count, 1);
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(task.error_annotation.as_deref().unwrap())
-            .unwrap()["type"],
-        "workflow_loop"
-    );
-    let snapshot = worker
-        .task_service
-        .task_action_snapshot("t", &Actor::user(api_types::UserActionSource::Test))
-        .await
-        .unwrap();
-    let offers = crate::available_actions(&snapshot);
-    assert!(offers.iter().any(|offer| matches!(
-        offer.action,
-        api_types::TaskAction::Restart { .. } | api_types::TaskAction::Approve { .. }
-    )));
 }
 
 #[tokio::test]
