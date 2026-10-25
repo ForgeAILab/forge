@@ -2,6 +2,35 @@
 
 use super::*;
 
+const MAX_PUBLIC_SEARCH_QUERY_CHARS: usize = 512;
+
+const MAX_PUBLIC_SEARCH_RESULTS: u64 = 10;
+
+fn prepare_authority_denial(
+    error: AgentHostError,
+    operation: &str,
+    tool_name: &str,
+    scope: &CanonicalScope,
+    ctx: &PreparationContext,
+    permission: &'static str,
+) -> Result<PreparedToolCall, RuntimeError> {
+    let AgentHostError::StructuredOutcome(outcome) = error else {
+        return Err(RuntimeError::tool(error.to_string()));
+    };
+    Ok(PreparedToolCall::new(
+        ctx.call_id.clone(),
+        tool_name,
+        json!({"operation":operation,"__forge_authority_denial":outcome}),
+        PermissionSet::single(Permission::other(permission)),
+        SecurityResource::other(
+            "forge.scope",
+            format!("{}:{}", scope_type_name(scope.scope_type), scope.scope_id),
+        ),
+        ToolEffects::new(Vec::new()),
+        ToolCallDisplay::new("Forge authority revoked"),
+    ))
+}
+
 #[derive(Debug)]
 pub(super) struct ForgeScopeSecurityCheck {
     pub(super) id: SecurityCheckId,

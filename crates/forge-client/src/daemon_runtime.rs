@@ -845,7 +845,9 @@ fn terminal_notification_from_result(
         outbox_entries: Vec::new(),
         plan_text: None,
         failure_class: result.failure_class.map(|class| match class {
-            ExecutionFailureClass::TaskFailed => RemoteExecutionFailureClass::TaskFailed,
+            ExecutionFailureClass::TaskFailed | ExecutionFailureClass::UncommittedWorktree => {
+                RemoteExecutionFailureClass::TaskFailed
+            }
             ExecutionFailureClass::ExecutorUnavailable => {
                 RemoteExecutionFailureClass::ExecutorUnavailable
             }
@@ -1547,6 +1549,28 @@ mod tests {
         drop(first);
         let _second = tracker.track("exec-1".to_owned());
         assert_eq!(tracker.active_ids(), ["exec-1"]);
+    }
+
+    #[test]
+    fn delivery_failure_keeps_the_existing_remote_task_failure_shape() {
+        let notification = terminal_notification_from_result(
+            "execution-delivery".to_owned(),
+            ExecutionResult {
+                status: ExecutionOutcome::Failed,
+                error: Some("worker output was not committed".to_owned()),
+                failure_class: Some(ExecutionFailureClass::UncommittedWorktree),
+                ..Default::default()
+            },
+        );
+        assert_eq!(notification.status.as_deref(), Some("failed"));
+        assert_eq!(
+            notification.failure_class,
+            Some(RemoteExecutionFailureClass::TaskFailed)
+        );
+        assert_eq!(
+            notification.error.as_deref(),
+            Some("worker output was not committed")
+        );
     }
 
     #[test]

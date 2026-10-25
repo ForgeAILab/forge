@@ -1,4 +1,4 @@
-//! Workspace reset recovery cases.
+//! Daemon worktree recovery and reset receipts that preserve owner generations.
 
 use super::*;
 

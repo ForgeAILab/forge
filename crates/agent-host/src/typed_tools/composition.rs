@@ -2,6 +2,69 @@
 
 use super::*;
 
+fn public_search_permission(
+    scope_type: CanonicalScopeType,
+    project_agent_chat: bool,
+) -> &'static str {
+    match (scope_type, project_agent_chat) {
+        (CanonicalScopeType::Account, _) | (CanonicalScopeType::AgentChat, false) => {
+            "propose_discovery"
+        }
+        (CanonicalScopeType::Project, true) | (CanonicalScopeType::Project, false) => {
+            "read_project"
+        }
+        (CanonicalScopeType::AgentChat, true) => "read_agent_chat",
+        (CanonicalScopeType::Task, _) => "__unknown_public_search_permission__",
+    }
+}
+
+/// Whether this composition is an ephemeral inquiry sub-agent's own scope.
+///
+/// An inquiry runs under the Account scope with a scratch directory, which is
+/// a shape nothing else uses: a Main Chat holds `account_scratch` too but is
+/// an Agent Chat, and every other Account session denies filesystem access.
+fn is_inquiry_scope(scope: &CanonicalScope) -> bool {
+    scope.is_ephemeral_inquiry()
+}
+
+fn orchestration_surface(
+    scope_type: CanonicalScopeType,
+    project_agent_chat: bool,
+) -> Option<OperationSurface> {
+    match scope_type {
+        CanonicalScopeType::Account => Some(OperationSurface::MainOrchestration),
+        CanonicalScopeType::Project => Some(OperationSurface::ProjectOrchestration),
+        CanonicalScopeType::AgentChat => Some(if project_agent_chat {
+            OperationSurface::ProjectOrchestration
+        } else {
+            OperationSurface::MainOrchestration
+        }),
+        CanonicalScopeType::Task => None,
+    }
+}
+
+fn orchestration_descriptor(
+    surface: OperationSurface,
+) -> (&'static str, &'static str, &'static str) {
+    match surface {
+        OperationSurface::MainOrchestration => (
+            FORGE_MAIN_ORCHESTRATION_READ_TOOL,
+            FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
+            "the authenticated global Main Agent account/Chat scope",
+        ),
+        OperationSurface::ProjectOrchestration => (
+            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
+            FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
+            "the authenticated single-Project Project Agent scope",
+        ),
+        OperationSurface::Coordination => unreachable!("coordination has no typed descriptor"),
+    }
+}
+
+fn bound_chat_tool_error(message: String, limit: usize) -> String {
+    message.chars().take(limit).collect()
+}
+
 impl ScopeToolComposition {
     /// Composes one scope using a server-computed effective permission set.
     ///

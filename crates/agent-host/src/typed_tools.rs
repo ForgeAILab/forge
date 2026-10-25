@@ -77,16 +77,8 @@ pub const FORGE_PROJECT_ORCHESTRATION_READ_TOOL: &str = "forge_project_orchestra
 /// Stable native tool name for Project Agent orchestration proposals.
 pub const FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL: &str = "forge_project_orchestration_propose";
 
-const MAX_FILE_READ_BYTES: usize = 128 * 1024;
-const MAX_FILE_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 256;
 const MAX_DIRECTORY_GLOB_CHARS: usize = 256;
-const MAX_COMMAND_OUTPUT_BYTES: usize = 128 * 1024;
-/// A Task command that runs longer is stopped, so a watch mode, a server, or
-/// a hung test suite cannot hold the execution until its hard deadline.
-const TASK_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-const MAX_PUBLIC_SEARCH_QUERY_CHARS: usize = 512;
-const MAX_PUBLIC_SEARCH_RESULTS: u64 = 10;
 
 /// The server-derived role of a public search invocation.  An Agent Chat's
 /// opaque chat id is never enough to choose this value; native composition
@@ -512,31 +504,6 @@ fn public_search_scope(
     }
 }
 
-fn public_search_permission(
-    scope_type: CanonicalScopeType,
-    project_agent_chat: bool,
-) -> &'static str {
-    match (scope_type, project_agent_chat) {
-        (CanonicalScopeType::Account, _) | (CanonicalScopeType::AgentChat, false) => {
-            "propose_discovery"
-        }
-        (CanonicalScopeType::Project, true) | (CanonicalScopeType::Project, false) => {
-            "read_project"
-        }
-        (CanonicalScopeType::AgentChat, true) => "read_agent_chat",
-        (CanonicalScopeType::Task, _) => "__unknown_public_search_permission__",
-    }
-}
-
-/// Whether this composition is an ephemeral inquiry sub-agent's own scope.
-///
-/// An inquiry runs under the Account scope with a scratch directory, which is
-/// a shape nothing else uses: a Main Chat holds `account_scratch` too but is
-/// an Agent Chat, and every other Account session denies filesystem access.
-fn is_inquiry_scope(scope: &CanonicalScope) -> bool {
-    scope.is_ephemeral_inquiry()
-}
-
 /// Whether a scope may dispatch an ephemeral inquiry sub-agent.
 ///
 /// Only an Agent Chat can: a Main Chat is a conversation a user is watching,
@@ -545,40 +512,6 @@ fn is_inquiry_scope(scope: &CanonicalScope) -> bool {
 /// that exclusion is what caps dispatch depth at one.
 fn dispatches_inquiries(scope_type: CanonicalScopeType) -> bool {
     matches!(scope_type, CanonicalScopeType::AgentChat)
-}
-
-fn orchestration_surface(
-    scope_type: CanonicalScopeType,
-    project_agent_chat: bool,
-) -> Option<OperationSurface> {
-    match scope_type {
-        CanonicalScopeType::Account => Some(OperationSurface::MainOrchestration),
-        CanonicalScopeType::Project => Some(OperationSurface::ProjectOrchestration),
-        CanonicalScopeType::AgentChat => Some(if project_agent_chat {
-            OperationSurface::ProjectOrchestration
-        } else {
-            OperationSurface::MainOrchestration
-        }),
-        CanonicalScopeType::Task => None,
-    }
-}
-
-fn orchestration_descriptor(
-    surface: OperationSurface,
-) -> (&'static str, &'static str, &'static str) {
-    match surface {
-        OperationSurface::MainOrchestration => (
-            FORGE_MAIN_ORCHESTRATION_READ_TOOL,
-            FORGE_MAIN_ORCHESTRATION_PROPOSE_TOOL,
-            "the authenticated global Main Agent account/Chat scope",
-        ),
-        OperationSurface::ProjectOrchestration => (
-            FORGE_PROJECT_ORCHESTRATION_READ_TOOL,
-            FORGE_PROJECT_ORCHESTRATION_PROPOSE_TOOL,
-            "the authenticated single-Project Project Agent scope",
-        ),
-        OperationSurface::Coordination => unreachable!("coordination has no typed descriptor"),
-    }
 }
 
 fn task_operations() -> (Vec<String>, Vec<String>) {
@@ -762,110 +695,6 @@ fn validate_orchestration_read_arguments(
     ))
 }
 
-fn string_array(arguments: &Value, field: &str) -> Result<Vec<String>, RuntimeError> {
-    let Some(value) = arguments.get(field) else {
-        return Ok(Vec::new());
-    };
-    value
-        .as_array()
-        .ok_or_else(|| RuntimeError::tool(format!("{field} must be an array")))?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| RuntimeError::tool(format!("{field} must contain strings")))
-        })
-        .collect()
-}
-
-fn directory_glob(arguments: &Value) -> Result<Option<&str>, RuntimeError> {
-    let Some(value) = arguments.get("glob") else {
-        return Ok(None);
-    };
-    let glob = value
-        .as_str()
-        .ok_or_else(|| RuntimeError::tool("Task Workspace glob must be a string"))?;
-    if glob.is_empty() || glob.chars().count() > MAX_DIRECTORY_GLOB_CHARS {
-        return Err(RuntimeError::tool(format!(
-            "Task Workspace glob must contain 1 to {MAX_DIRECTORY_GLOB_CHARS} characters"
-        )));
-    }
-    if glob.contains('/') || glob.contains('\\') {
-        return Err(RuntimeError::tool(
-            "Task Workspace glob filters direct entry names and cannot contain path separators",
-        ));
-    }
-    Ok(Some(glob))
-}
-
-fn directory_entries(
-    workspace_root: &str,
-    directory: &str,
-    glob: Option<&str>,
-) -> Result<(Vec<Value>, bool), RuntimeError> {
-    let read_dir = std::fs::read_dir(directory).map_err(|error| match error.kind() {
-        ErrorKind::NotFound => RuntimeError::not_found(format!(
-            "Task Workspace directory not found: {}",
-            workspace_relative_path(workspace_root, directory)
-                .unwrap_or_else(|_| directory.to_owned())
-        )),
-        _ => RuntimeError::tool(format!(
-            "Task Workspace directory could not be listed ({:?})",
-            error.kind()
-        )),
-    })?;
-    let mut entries = BTreeMap::new();
-    let mut truncated = false;
-    for entry in read_dir {
-        let entry = entry.map_err(|error| {
-            RuntimeError::tool(format!(
-                "Task Workspace directory entry could not be read ({:?})",
-                error.kind()
-            ))
-        })?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| RuntimeError::workspace("Task Workspace entry is not valid UTF-8"))?;
-        if glob.is_some_and(|pattern| !glob_matches(pattern, &name)) {
-            continue;
-        }
-        let file_type = entry.file_type().map_err(|error| {
-            RuntimeError::tool(format!(
-                "Task Workspace entry type could not be read ({:?})",
-                error.kind()
-            ))
-        })?;
-        let kind = if file_type.is_dir() {
-            "directory"
-        } else if file_type.is_file() {
-            "file"
-        } else if file_type.is_symlink() {
-            "symlink"
-        } else {
-            "other"
-        };
-        let entry_path = entry.path();
-        let entry_path = entry_path
-            .to_str()
-            .ok_or_else(|| RuntimeError::workspace("Task Workspace entry is not valid UTF-8"))?;
-        entries.insert(
-            name.clone(),
-            json!({
-                "name": name,
-                "path": workspace_relative_path(workspace_root, entry_path)?,
-                "kind": kind,
-            }),
-        );
-        if entries.len() > MAX_DIRECTORY_ENTRIES {
-            entries.pop_last();
-            truncated = true;
-        }
-    }
-    Ok((entries.into_values().collect(), truncated))
-}
-
 fn glob_matches(pattern: &str, value: &str) -> bool {
     let value = value.chars().collect::<Vec<_>>();
     let mut previous = vec![false; value.len() + 1];
@@ -916,60 +745,6 @@ fn tool_error_outcome(value: Value) -> ToolOutcome {
     outcome
 }
 
-fn bounded_workspace_path(workspace: &dyn Workspace, raw: &str) -> Result<String, RuntimeError> {
-    if raw.trim().is_empty() {
-        return Err(RuntimeError::workspace(
-            "Task Workspace path cannot be empty",
-        ));
-    }
-    let raw_path = Path::new(raw);
-    if raw_path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(RuntimeError::workspace(
-            "Task Workspace path contains a forbidden traversal component",
-        ));
-    }
-    let root = Path::new(workspace.root());
-    let candidate = if raw_path.is_absolute() {
-        raw_path.to_path_buf()
-    } else {
-        root.join(raw_path)
-    };
-    let candidate = candidate
-        .to_str()
-        .ok_or_else(|| RuntimeError::workspace("Task Workspace path is not valid UTF-8"))?;
-    if !workspace.contains(candidate) {
-        return Err(RuntimeError::workspace(
-            "Task Workspace path resolves outside its root",
-        ));
-    }
-    workspace.resolve(candidate)
-}
-
-fn filesystem_resource(root: &str, path: &str) -> Result<SecurityResource, RuntimeError> {
-    let root_path = Path::new(root);
-    let path = Path::new(path);
-    let relative = path
-        .strip_prefix(root_path)
-        .map_err(|_| RuntimeError::workspace("Task Workspace path is outside its root"))?;
-    let segments = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_owned),
-            Component::CurDir => None,
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if segments.iter().any(|segment| segment.is_empty()) {
-        return Err(RuntimeError::workspace(
-            "Task Workspace resource contains an invalid component",
-        ));
-    }
-    Ok(SecurityResource::filesystem(root.to_owned(), segments))
-}
-
 fn validate_command_program(
     allowlist: &CommandAllowlist,
     program: &str,
@@ -979,25 +754,6 @@ fn validate_command_program(
             "`{program}` is not in this workspace's command allowlist; the owner configures it \
              under `commands` in the Forge config or `command_allowlist` in the Project settings"
         )));
-    }
-    Ok(())
-}
-
-fn validate_command_args(args: &[String]) -> Result<(), RuntimeError> {
-    if args.len() > 128 {
-        return Err(RuntimeError::tool("Task command has too many arguments"));
-    }
-    for arg in args {
-        let path = Path::new(arg);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| component == Component::ParentDir)
-        {
-            return Err(RuntimeError::tool(
-                "Task command arguments cannot escape the admitted workspace",
-            ));
-        }
     }
     Ok(())
 }
@@ -1086,35 +842,6 @@ fn host_error_to_runtime(error: AgentHostError) -> RuntimeError {
         AgentHostError::SessionRetired => RuntimeError::conflict("session journal is retired"),
         AgentHostError::ProtectedPersistence => RuntimeError::tool("Forge tool provider failed"),
     }
-}
-
-fn bound_chat_tool_error(message: String, limit: usize) -> String {
-    message.chars().take(limit).collect()
-}
-
-fn prepare_authority_denial(
-    error: AgentHostError,
-    operation: &str,
-    tool_name: &str,
-    scope: &CanonicalScope,
-    ctx: &PreparationContext,
-    permission: &'static str,
-) -> Result<PreparedToolCall, RuntimeError> {
-    let AgentHostError::StructuredOutcome(outcome) = error else {
-        return Err(RuntimeError::tool(error.to_string()));
-    };
-    Ok(PreparedToolCall::new(
-        ctx.call_id.clone(),
-        tool_name,
-        json!({"operation":operation,"__forge_authority_denial":outcome}),
-        PermissionSet::single(Permission::other(permission)),
-        SecurityResource::other(
-            "forge.scope",
-            format!("{}:{}", scope_type_name(scope.scope_type), scope.scope_id),
-        ),
-        ToolEffects::new(Vec::new()),
-        ToolCallDisplay::new("Forge authority revoked"),
-    ))
 }
 
 #[cfg(test)]

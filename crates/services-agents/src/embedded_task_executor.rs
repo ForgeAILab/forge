@@ -580,6 +580,8 @@ impl EmbeddedTaskExecutor {
                         after_sha: git::get_current_sha(&worktree_path).await.ok(),
                         agent_session_id: Some(agent_session_id),
                         summary: Some(summary),
+                        failure_class: matches!(&error, ExecutorError::UncommittedWorktree(_))
+                            .then_some(ExecutionFailureClass::UncommittedWorktree),
                         error: Some(error.to_string()),
                         usage_reports: {
                             for report in &mut usage_reports {
@@ -1267,7 +1269,7 @@ async fn validate_write_capable_delivery(
         ))
     })?;
     if after_sha == before_sha && !worktree_clean {
-        return Err(ExecutorError::Other(
+        return Err(ExecutorError::UncommittedWorktree(
             UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
         ));
     }
@@ -1794,6 +1796,22 @@ mod tests {
         assert_eq!(
             result.error.as_deref(),
             Some("native runtime turn limit reached: output")
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_native_delivery_carries_a_typed_marker_with_the_original_message() {
+        let (repo, before_sha) = task_repo().await;
+        tokio::fs::write(repo.path().join("app.ts"), "export const ready = true;\n")
+            .await
+            .unwrap();
+        let error = validate_write_capable_delivery(repo.path(), &before_sha)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, ExecutorError::UncommittedWorktree(_)));
+        assert_eq!(
+            error.to_string(),
+            ExecutorError::Other(UNCOMMITTED_WORKTREE_FAILURE.to_owned()).to_string()
         );
     }
 

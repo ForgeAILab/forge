@@ -1,7 +1,6 @@
 mod agent_chat;
 mod memory;
 
-use super::registry;
 pub(super) use agent_chat::{
     forge_create_agent_handoff, forge_get_agent_chat, forge_get_agent_handoff,
     forge_get_agent_session, forge_get_main_agent, forge_get_project_agent,
@@ -980,18 +979,6 @@ async fn authenticated_user_record(
     UserRepo::get_user_by_id(&*state.db, user_id)
         .await?
         .ok_or_else(|| McpToolError::new(-32001, "authenticated MCP user is required"))
-}
-
-fn setup_required(message: &str) -> McpToolError {
-    McpToolError::new(-32004, message).with_data(json!({ "code": "agent_setup_required" }))
-}
-
-fn policy_json(value: Value) -> String {
-    if value.is_null() {
-        "{}".to_owned()
-    } else {
-        value.to_string()
-    }
 }
 
 fn serialize_public<T: serde::Serialize>(value: T) -> Value {

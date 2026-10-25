@@ -1,4 +1,4 @@
-//! Admission cases.
+//! Placement admission reservation, fencing, reclaim and expiry cases.
 
 use super::*;
 

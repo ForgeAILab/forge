@@ -22,7 +22,7 @@ pub(crate) async fn forge_list_agent_sessions(
     let user_id = authenticated_user(context)?;
     let mut visible = Vec::new();
     for session in sessions {
-        if super::registry::require_session_scope(state, &session, user_id)
+        if crate::tools::registry::require_session_scope(state, &session, user_id)
             .await
             .is_ok()
         {
@@ -356,6 +356,18 @@ pub(crate) async fn forge_create_agent_handoff(
         outcome.handoff,
         project_id,
     )))
+}
+
+fn setup_required(message: &str) -> McpToolError {
+    McpToolError::new(-32004, message).with_data(json!({ "code": "agent_setup_required" }))
+}
+
+fn policy_json(value: Value) -> String {
+    if value.is_null() {
+        "{}".to_owned()
+    } else {
+        value.to_string()
+    }
 }
 
 fn main_binding_response(

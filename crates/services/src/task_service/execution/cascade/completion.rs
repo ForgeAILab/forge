@@ -67,11 +67,13 @@ impl TaskService {
                 let project_version = ProjectRepo::get_by_id(&*self.db, &task.project_id)
                     .await?
                     .map(|project| project.version);
-                if super::super::execution_dispatch_project_version(&execution) != project_version {
+                if crate::task_service::execution_dispatch_project_version(&execution)
+                    != project_version
+                {
                     tracing::info!(
                         task_id = %task.id,
                         execution_id = %execution.id,
-                        dispatch_project_version = ?super::super::execution_dispatch_project_version(&execution),
+                        dispatch_project_version = ?crate::task_service::execution_dispatch_project_version(&execution),
                         current_project_version = ?project_version,
                         "ignoring reviewer terminal effects from a superseded Project revision"
                     );
@@ -102,10 +104,14 @@ impl TaskService {
                 return Ok(());
             }
         };
-        if super::active_plan_publication_claim_owner(&task)?.as_deref()
+        if crate::task_service::execution::active_plan_publication_claim_owner(&task)?.as_deref()
             == Some(execution.id.as_str())
-            && !super::plan_publication_matches_current_state_entry(&self.db, &task, &execution.id)
-                .await?
+            && !crate::task_service::execution::plan_publication_matches_current_state_entry(
+                &self.db,
+                &task,
+                &execution.id,
+            )
+            .await?
         {
             // The transition authorized by this claim already committed, but
             // cleanup crashed and the Task later re-entered the same named
@@ -113,8 +119,13 @@ impl TaskService {
             // claim/private bytes and never roll the canonical file back.
             self.discard_brokered_execution_plan_stage(&execution)
                 .await?;
-            super::clear_settled_plan_publication(&self.db, &task.id, &execution.id, &task.status)
-                .await?;
+            crate::task_service::execution::clear_settled_plan_publication(
+                &self.db,
+                &task.id,
+                &execution.id,
+                &task.status,
+            )
+            .await?;
             return Ok(());
         }
         let project = match ProjectRepo::get_by_id(&*self.db, &task.project_id).await? {
@@ -125,11 +136,12 @@ impl TaskService {
                 return Ok(());
             }
         };
-        let brokered_plan = super::execution_uses_brokered_plan(&execution);
+        let brokered_plan =
+            crate::task_service::execution::execution_uses_brokered_plan(&execution);
         let dispatch_project_version = if brokered_plan {
-            super::brokered_plan_dispatch_project_version(&execution)
+            crate::task_service::execution::brokered_plan_dispatch_project_version(&execution)
         } else {
-            super::super::execution_dispatch_project_version(&execution)
+            crate::task_service::execution_dispatch_project_version(&execution)
         };
         if dispatch_project_version != Some(project.version) {
             // Every workflow-role terminal effect is interpreted under the
@@ -149,20 +161,28 @@ impl TaskService {
             );
             return Ok(());
         }
-        if super::execution_completion_settled_for_current_state_entry(&self.db, &task, &execution)
-            .await?
+        if crate::task_service::execution::execution_completion_settled_for_current_state_entry(
+            &self.db, &task, &execution,
+        )
+        .await?
         {
-            if super::pending_plan_publication_cleanup_owner(&task)?.as_deref()
+            if crate::task_service::execution::pending_plan_publication_cleanup_owner(&task)?
+                .as_deref()
                 == Some(execution.id.as_str())
             {
-                super::cleanup_execution_plan_private_files(
+                crate::task_service::execution::cleanup_execution_plan_private_files(
                     &self.db,
                     &self.workspace_backend_router,
                     &task,
                     &execution.id,
                 )
                 .await?;
-                super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+                crate::task_service::execution::clear_plan_publication_cleanup(
+                    &self.db,
+                    &task,
+                    &execution.id,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -314,24 +334,24 @@ impl TaskService {
             return result;
         }
         if brokered_plan && !planning_marker_matches_execution {
-            match super::claim_plan_publication(&self.db, &task, &execution, project.version)
+            match crate::task_service::execution::claim_plan_publication(&self.db, &task, &execution, project.version)
                 .await?
             {
-                super::PlanPublicationClaimOutcome::Claimed(claimed_task) => {
+                crate::task_service::execution::PlanPublicationClaimOutcome::Claimed(claimed_task) => {
                     task = *claimed_task;
                 }
-                super::PlanPublicationClaimOutcome::VersionRace => {
+                crate::task_service::execution::PlanPublicationClaimOutcome::VersionRace => {
                     // Preserve the only frozen bytes. The next dispatcher pass
                     // retries the claim from the newer Task snapshot.
                     return Ok(());
                 }
-                super::PlanPublicationClaimOutcome::OwnedByOther => {
+                crate::task_service::execution::PlanPublicationClaimOutcome::OwnedByOther => {
                     // A durable same-state owner proves this candidate lost.
                     self.discard_brokered_execution_plan_stage(&execution)
                         .await?;
                     return Ok(());
                 }
-                super::PlanPublicationClaimOutcome::StaleWorkflowAuthority => {
+                crate::task_service::execution::PlanPublicationClaimOutcome::StaleWorkflowAuthority => {
                     self.abandon_brokered_plan_authority(&task, &execution)
                         .await?;
                     return Ok(());
@@ -403,7 +423,10 @@ impl TaskService {
                     if candidate_required {
                         self.discard_brokered_execution_plan_stage(&execution)
                             .await?;
-                        task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                        task = crate::task_service::execution::release_plan_publication(
+                            &self.db, &task, &execution,
+                        )
+                        .await?;
                         let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(
                             |error| {
                                 ServiceError::invalid_operation(format!(
@@ -418,7 +441,7 @@ impl TaskService {
                             .and_then(Value::as_str)
                             == Some("plan_review")
                         {
-                            task = super::set_planning_awaiting_review_metadata(
+                            task = crate::task_service::execution::set_planning_awaiting_review_metadata(
                                 &self.db, &task, None, false,
                             )
                             .await?;
@@ -462,7 +485,10 @@ impl TaskService {
                             .await?;
                         self.discard_brokered_execution_plan_stage(&execution)
                             .await?;
-                        task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                        task = crate::task_service::execution::release_plan_publication(
+                            &self.db, &task, &execution,
+                        )
+                        .await?;
                     }
                     let metadata =
                         TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
@@ -477,10 +503,11 @@ impl TaskService {
                         .and_then(Value::as_str)
                         == Some("plan_review")
                     {
-                        task = super::set_planning_awaiting_review_metadata(
-                            &self.db, &task, None, false,
-                        )
-                        .await?;
+                        task =
+                            crate::task_service::execution::set_planning_awaiting_review_metadata(
+                                &self.db, &task, None, false,
+                            )
+                            .await?;
                     }
                     let result = self
                         .handle_executor_completion_guard_rejection(
@@ -499,8 +526,10 @@ impl TaskService {
             if gate_requires_user_approval {
                 if !planning_marker_matches_execution {
                     if brokered_plan {
-                        match super::settle_plan_publication_for_review(&self.db, &task, &execution)
-                            .await
+                        match crate::task_service::execution::settle_plan_publication_for_review(
+                            &self.db, &task, &execution,
+                        )
+                        .await
                         {
                             Ok(settled_task) => task = settled_task,
                             Err(ServiceError::Db(DbError::VersionConflict)) => {
@@ -513,7 +542,7 @@ impl TaskService {
                             Err(error) => return Err(error),
                         }
                     } else {
-                        super::set_planning_awaiting_review_metadata(
+                        crate::task_service::execution::set_planning_awaiting_review_metadata(
                             &self.db,
                             &task,
                             Some(&execution.id),
@@ -525,7 +554,12 @@ impl TaskService {
                 if brokered_plan {
                     self.discard_brokered_execution_plan_stage(&execution)
                         .await?;
-                    super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+                    crate::task_service::execution::clear_plan_publication_cleanup(
+                        &self.db,
+                        &task,
+                        &execution.id,
+                    )
+                    .await?;
                 }
                 return Ok(());
             }
@@ -537,8 +571,10 @@ impl TaskService {
             || (is_planning_gate && !gate_requires_user_approval);
         if !auto_advances {
             if brokered_plan && !planning_marker_matches_execution {
-                match super::settle_plan_publication_without_transition(&self.db, &task, &execution)
-                    .await
+                match crate::task_service::execution::settle_plan_publication_without_transition(
+                    &self.db, &task, &execution,
+                )
+                .await
                 {
                     Ok(settled_task) => task = settled_task,
                     Err(ServiceError::Db(DbError::VersionConflict)) => {
@@ -552,7 +588,12 @@ impl TaskService {
             if brokered_plan {
                 self.discard_brokered_execution_plan_stage(&execution)
                     .await?;
-                super::clear_plan_publication_cleanup(&self.db, &task, &execution.id).await?;
+                crate::task_service::execution::clear_plan_publication_cleanup(
+                    &self.db,
+                    &task,
+                    &execution.id,
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -582,13 +623,14 @@ impl TaskService {
                 if brokered_plan {
                     self.discard_brokered_execution_plan_stage(&execution)
                         .await?;
-                    if let Err(error) = super::clear_settled_plan_publication(
-                        &self.db,
-                        &task.id,
-                        &execution.id,
-                        &from,
-                    )
-                    .await
+                    if let Err(error) =
+                        crate::task_service::execution::clear_settled_plan_publication(
+                            &self.db,
+                            &task.id,
+                            &execution.id,
+                            &from,
+                        )
+                        .await
                     {
                         tracing::warn!(task_id = %task.id, %error, "failed to clear settled plan publication claim");
                     }
@@ -625,13 +667,14 @@ impl TaskService {
                 {
                     self.discard_brokered_execution_plan_stage(&execution)
                         .await?;
-                    if let Err(error) = super::clear_settled_plan_publication(
-                        &self.db,
-                        &task.id,
-                        &execution.id,
-                        &task.status,
-                    )
-                    .await
+                    if let Err(error) =
+                        crate::task_service::execution::clear_settled_plan_publication(
+                            &self.db,
+                            &task.id,
+                            &execution.id,
+                            &task.status,
+                        )
+                        .await
                     {
                         tracing::warn!(
                             task_id = %task.id,
@@ -651,7 +694,10 @@ impl TaskService {
                         .await?;
                     self.discard_brokered_execution_plan_stage(&execution)
                         .await?;
-                    task = super::release_plan_publication(&self.db, &task, &execution).await?;
+                    task = crate::task_service::execution::release_plan_publication(
+                        &self.db, &task, &execution,
+                    )
+                    .await?;
                 }
                 let result = self
                     .handle_executor_completion_guard_rejection(
@@ -672,11 +718,11 @@ impl TaskService {
         &self,
         execution: &Execution,
     ) -> Result<()> {
-        if !super::execution_uses_brokered_plan(execution) {
+        if !crate::task_service::execution::execution_uses_brokered_plan(execution) {
             return Ok(());
         }
         if let Some(task) = TaskRepo::get_by_id(&*self.db, &execution.task_id, true).await? {
-            return super::cleanup_execution_plan_private_files(
+            return crate::task_service::execution::cleanup_execution_plan_private_files(
                 &self.db,
                 &self.workspace_backend_router,
                 &task,
@@ -710,23 +756,29 @@ impl TaskService {
         task: &Task,
         execution: &Execution,
     ) -> Result<()> {
-        if super::execution_uses_brokered_plan(execution)
-            && super::active_plan_publication_claim_owner(task)?.as_deref()
+        if crate::task_service::execution::execution_uses_brokered_plan(execution)
+            && crate::task_service::execution::active_plan_publication_claim_owner(task)?.as_deref()
                 == Some(execution.id.as_str())
         {
             self.restore_brokered_execution_plan(task, execution)
                 .await?;
             self.discard_brokered_execution_plan_stage(execution)
                 .await?;
-            super::release_plan_publication(&self.db, task, execution).await?;
+            crate::task_service::execution::release_plan_publication(&self.db, task, execution)
+                .await?;
             return Ok(());
         }
         self.discard_brokered_execution_plan_stage(execution)
             .await?;
-        if super::pending_plan_publication_cleanup_owner(task)?.as_deref()
+        if crate::task_service::execution::pending_plan_publication_cleanup_owner(task)?.as_deref()
             == Some(execution.id.as_str())
         {
-            super::clear_plan_publication_cleanup(&self.db, task, &execution.id).await?;
+            crate::task_service::execution::clear_plan_publication_cleanup(
+                &self.db,
+                task,
+                &execution.id,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -736,7 +788,9 @@ impl TaskService {
         task: &Task,
         execution_id: &str,
     ) -> Result<()> {
-        if super::active_plan_publication_claim_owner(task)?.as_deref() != Some(execution_id) {
+        if crate::task_service::execution::active_plan_publication_claim_owner(task)?.as_deref()
+            != Some(execution_id)
+        {
             return Ok(());
         }
         let execution = ExecutionRepo::get_by_id(&*self.db, execution_id).await?;
@@ -762,14 +816,19 @@ impl TaskService {
                 )
             })?;
         }
-        super::cleanup_execution_plan_private_files(
+        crate::task_service::execution::cleanup_execution_plan_private_files(
             &self.db,
             &self.workspace_backend_router,
             task,
             execution_id,
         )
         .await?;
-        super::release_plan_publication_for_execution_id(&self.db, task, execution_id).await?;
+        crate::task_service::execution::release_plan_publication_for_execution_id(
+            &self.db,
+            task,
+            execution_id,
+        )
+        .await?;
         Ok(())
     }
 
@@ -784,7 +843,7 @@ impl TaskService {
             return Ok(true);
         };
         let Some(claim_project_version) =
-            super::plan_publication_project_version(&task, &execution.id)?
+            crate::task_service::execution::plan_publication_project_version(&task, &execution.id)?
         else {
             return Ok(false);
         };
@@ -805,7 +864,7 @@ impl TaskService {
         task: &Task,
         execution: &Execution,
     ) -> Result<()> {
-        if !super::execution_uses_brokered_plan(execution) {
+        if !crate::task_service::execution::execution_uses_brokered_plan(execution) {
             return Ok(());
         }
         let workspace = match execution.workspace_id.as_deref() {

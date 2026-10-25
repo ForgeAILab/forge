@@ -212,7 +212,10 @@ impl From<&executors::ExecutorError> for ExecutorError {
                 reason: reason.clone(),
                 usage_reports: usage_reports.clone(),
             },
-            executors::ExecutorError::Other(message) => Self::Other(message.clone()),
+            executors::ExecutorError::Other(message)
+            | executors::ExecutorError::UncommittedWorktree(message) => {
+                Self::Other(message.clone())
+            }
         }
     }
 }
@@ -602,5 +605,19 @@ impl From<StoredServiceError> for ServiceError {
                 Self::TerminalInvalidInput { message }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_failure_retains_the_existing_stored_error_shape() {
+        let error = executors::ExecutorError::UncommittedWorktree("delivery diagnostic".to_owned());
+        assert_eq!(
+            serde_json::to_value(ExecutorError::from(&error)).unwrap(),
+            serde_json::json!({"Other": "delivery diagnostic"})
+        );
     }
 }

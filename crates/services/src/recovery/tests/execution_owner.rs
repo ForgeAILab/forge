@@ -1,4 +1,4 @@
-//! Execution owner recovery cases.
+//! Daemon report reconciliation and placement-derived execution ownership.
 
 use super::*;
 

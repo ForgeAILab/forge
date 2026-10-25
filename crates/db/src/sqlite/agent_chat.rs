@@ -31,7 +31,6 @@ mod main_baseline_revision_tests;
 
 use super::*;
 use crate::RetryAgentChatTurn;
-use sha2::{Digest, Sha256};
 
 // Insertion order distinguishes retries/continuations even when timestamps tie.
 // Only a failed or cancelled turn can offer a retry, so the supersession
@@ -1484,37 +1483,6 @@ pub(super) fn map_agent_chat_turn_job(row: SqliteRow) -> Result<AgentChatTurnJob
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
-}
-
-/// Compute the same schema-versioned digest used by the services admission
-/// resolver for a pre-canonicalized JSON value.  The Genesis composite lives
-/// in `db`, so it uses this helper rather than importing service-layer types.
-pub(crate) fn admission_digest_for_json(value: &serde_json::Value) -> Result<String> {
-    let envelope = serde_json::json!({
-        "schema_version": "forge.agent-turn-admission/v1",
-        "value": value,
-    });
-    let canonical = serde_json::to_string(&canonicalize_admission_json(&envelope))
-        .map_err(|_| DbError::Check("Agent Chat admission JSON is invalid".to_owned()))?;
-    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
-}
-
-fn canonicalize_admission_json(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(values) => {
-            let mut keys: Vec<_> = values.keys().collect();
-            keys.sort_unstable();
-            let mut result = serde_json::Map::new();
-            for key in keys {
-                result.insert(key.clone(), canonicalize_admission_json(&values[key]));
-            }
-            serde_json::Value::Object(result)
-        }
-        serde_json::Value::Array(values) => {
-            serde_json::Value::Array(values.iter().map(canonicalize_admission_json).collect())
-        }
-        scalar => scalar.clone(),
-    }
 }
 
 fn map_agent_handoff(row: SqliteRow) -> Result<AgentHandoff> {

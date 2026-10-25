@@ -1,4 +1,4 @@
-//! Owner wait cases.
+//! Offline-owner waits and daemon describe failures at claim.
 
 use super::*;
 

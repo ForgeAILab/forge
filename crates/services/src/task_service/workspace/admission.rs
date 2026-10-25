@@ -833,7 +833,7 @@ impl TaskService {
                 update.execution_daemon_id = Some(execution_daemon_id);
                 update.workspace_handle = Some(None);
                 update.state = Some(PlacementState::Reserved);
-                update.reserved_until = Some(Some(super::execution::rfc3339_after(
+                update.reserved_until = Some(Some(crate::task_service::execution::rfc3339_after(
                     &now,
                     PLACEMENT_RESERVATION_SECONDS,
                 )));
@@ -869,7 +869,7 @@ impl TaskService {
                     state: PlacementState::Reserved,
                     selected_by,
                     selection_reason: reason,
-                    reserved_until: Some(super::execution::rfc3339_after(
+                    reserved_until: Some(crate::task_service::execution::rfc3339_after(
                         &now,
                         PLACEMENT_RESERVATION_SECONDS,
                     )),

@@ -1,4 +1,4 @@
-//! Startup recovery cases.
+//! Crash recovery of active Tasks, native sessions and dead-run temporary directories.
 
 use super::*;
 

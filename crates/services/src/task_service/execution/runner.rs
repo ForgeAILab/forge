@@ -1355,9 +1355,9 @@ impl TaskService {
             ));
         }
         let uncommitted_worktree_failure = result.status == ExecutionOutcome::Failed
-            && result.error.as_deref().is_some_and(|error| {
-                error.ends_with(crate::task_service::execution::UNCOMMITTED_WORKTREE_FAILURE)
-            });
+            && !max_turns_exceeded
+            && !hard_deadline_exceeded
+            && result.failure_class == Some(executors::ExecutionFailureClass::UncommittedWorktree);
         // A write-capable implementation execution that "completes" while
         // leaving the repository untouched and firing no workflow transition
         // has done nothing the pipeline can advance on — the task would sit

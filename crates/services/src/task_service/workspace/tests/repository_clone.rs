@@ -1,4 +1,4 @@
-//! Repository clone cases.
+//! Managed-clone verification, path repair and clone-failure backoff.
 
 use super::*;
 

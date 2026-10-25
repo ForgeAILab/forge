@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
+mod attachment_mutation;
 mod repository;
 
 fn map_media_asset(row: &SqliteRow) -> Result<MediaAsset> {

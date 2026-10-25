@@ -1,4 +1,4 @@
-//! Preparation cases.
+//! Workspace creation and reuse for root Tasks, subtasks and claims.
 
 use super::*;
 

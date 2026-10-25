@@ -61,7 +61,7 @@ impl TaskService {
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task_id.to_owned()))?;
         let updated = self.clear_recovery_metadata_at_version(&task).await?;
-        super::clear_execution_retry_metadata(&self.db, &updated).await?;
+        crate::task_service::execution::clear_execution_retry_metadata(&self.db, &updated).await?;
         Ok(updated)
     }
 

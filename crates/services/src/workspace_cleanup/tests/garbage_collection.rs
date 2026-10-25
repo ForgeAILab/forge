@@ -1,4 +1,4 @@
-//! Garbage collection cases.
+//! Workspace-root GC: adoption, quarantine, build and compiler-cache eviction.
 
 use super::*;
 

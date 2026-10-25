@@ -225,10 +225,10 @@ impl AgentChatMessageRepo for SqliteDb {
             allocate_chat_sequence(&mut transaction, &input.chat_id, &input.created_at).await?;
         let input = CreateAgentChatMessage { sequence, ..input };
         let message = insert_chat_message(&mut transaction, &input).await?;
-        super::chat_read_events::append(
+        crate::sqlite::chat_read_events::append(
             self,
             &mut transaction,
-            super::chat_read_events::ChatReadEvent {
+            crate::sqlite::chat_read_events::ChatReadEvent {
                 event_type: "agent_chat.message.appended",
                 entity_type: "agent_chat_message",
                 entity_id: &input.id,
@@ -446,7 +446,7 @@ impl AgentHandoffRepo for SqliteDb {
         .execute(&mut *transaction)
         .await
         .map_err(map_chat_write_error)?;
-        super::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
+        crate::sqlite::agent_chat_topic::enqueue_native_topic_rotation_in_tx(
             &mut transaction,
             Some(&input.source_chat_id),
             "After handoff",

@@ -74,7 +74,8 @@ impl TaskService {
             );
         }
 
-        super::clear_execution_retry_metadata(&self.db, &recovered).await?;
+        crate::task_service::execution::clear_execution_retry_metadata(&self.db, &recovered)
+            .await?;
         if task.condition.read().interruption_present {
             self.publish(ForgeEvent {
                 event_type: "task.unblocked".to_owned(),
@@ -137,7 +138,8 @@ impl TaskService {
             .workspace_backend_router
             .resolve(&self.db, &workspace)
             .await?;
-        super::super::workspace::reset_daemon_workspace(&self.db, &workspace, &resolved).await?;
+        crate::task_service::workspace::reset_daemon_workspace(&self.db, &workspace, &resolved)
+            .await?;
         Ok(())
     }
 }

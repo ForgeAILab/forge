@@ -335,7 +335,9 @@ impl TaskRepo for SqliteDb {
         // on one that the same order requires to wait for it. Roll back the
         // whole order if the implicit waits close a prerequisite cycle.
         let ids: Vec<&str> = ordered_ids.iter().map(String::as_str).collect();
-        if super::task_dependency::dependency_cycle_any_in_tx(&mut transaction, &ids, None).await? {
+        if crate::sqlite::task_dependency::dependency_cycle_any_in_tx(&mut transaction, &ids, None)
+            .await?
+        {
             return Err(DbError::CycleDetected);
         }
         // Child witnesses follow the sequence order.

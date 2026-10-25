@@ -269,9 +269,12 @@ retains roster/Profile persistence; its children own Attention/health reads,
 action and binding authority, and scope/eligibility context. The Agent Chat
 root retains the turn transaction repository (admission through completion,
 failure and cancellation), event/message helpers and row mappers; its children own
-bindings/receipts, ordinary repositories, admission validation, scope/worker
-queries, and tests. `sqlite.rs` remains the shared database root, with execution
-creation and admission fences in `sqlite/execution_admission.rs`.
+bindings/receipts, ordinary repositories, admission validation and provenance
+digests, scope/worker queries, and tests. Execution ledger settlement and Project
+media attachment mutations have dedicated implementation children; the repository
+trait methods delegate to those helpers without changing their contracts.
+`sqlite.rs` remains the shared database root, with execution creation and admission
+fences in `sqlite/execution_admission.rs`.
 
 The MCP `tools/handlers.rs` root retains Task and Project handlers and re-exports
 Agent Chat and memory handlers from `handlers/`; its unit tests live in
@@ -5131,6 +5134,10 @@ policy in the Task runner. Within the execution retry budget, Forge records a
 system comment instructing the assigned worker to inspect the preserved diff,
 finish or clean it up, validate it, and commit before completion, then schedules
 a deferred redispatch. Exhausted retries block visibly instead of looping.
+The embedded adapter carries this delivery failure to the runner as a typed
+in-memory execution classification; provider diagnostic text cannot establish
+that worktree condition. Stored errors, domain events and transport payloads
+retain their existing shapes and wording.
 Read-only planner/reviewer and read-only task-type runs remain governed by the
 separate restore-and-fail backstop. CLI adapters commit whatever a
 write-capable run leaves in its worktree after the process exits, but never

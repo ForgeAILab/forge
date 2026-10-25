@@ -1,4 +1,4 @@
-//! Repository loss cases.
+//! Cleanup when a Task's repository is gone or temporarily missing.
 
 use super::*;
 

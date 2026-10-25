@@ -2,6 +2,65 @@
 
 use super::*;
 
+const REMOTE_TERMINAL_MAX_CAS_RETRIES: u8 = 2;
+
+fn bounded_redacted_remote_optional(value: Option<&str>) -> Option<String> {
+    value.map(bounded_redacted_remote_diagnostic)
+}
+
+fn remote_owner_belongs_to_daemon(owner: &str, daemon_id: &str) -> bool {
+    owner.starts_with(&format!("daemon:{daemon_id}:connection:"))
+}
+
+fn remote_terminal_report_digest(
+    notification: &api_types::ExecutionTerminalNotification,
+) -> Result<String> {
+    let payload = serde_json::to_vec(notification).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "failed to fingerprint remote terminal notification: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn remote_usage_reports(reports: &[api_types::RemoteUsageReport]) -> Vec<executors::UsageReport> {
+    reports
+        .iter()
+        .map(|report| executors::UsageReport {
+            report_id: report.report_id.clone(),
+            request_id: report.request_id.clone(),
+            report_sequence: report.report_sequence,
+            candidate_key: report.candidate_key.clone(),
+            attempt_ordinal: report.attempt_ordinal,
+            provider_id: report.provider_id.clone(),
+            model_id: report.model_id.clone(),
+            counters: executors::UsageCounters {
+                input_tokens: report.input_tokens,
+                output_tokens: report.output_tokens,
+                cache_read_tokens: report.cache_read_tokens,
+                cache_write_tokens: report.cache_write_tokens,
+            },
+            telemetry_state: match report.telemetry_state {
+                api_types::UsageTelemetryState::Metered => executors::UsageTelemetryState::Metered,
+                api_types::UsageTelemetryState::Unmetered => {
+                    executors::UsageTelemetryState::Unmetered
+                }
+                api_types::UsageTelemetryState::Pending => executors::UsageTelemetryState::Pending,
+                api_types::UsageTelemetryState::Unsettled => {
+                    executors::UsageTelemetryState::Unsettled
+                }
+            },
+            context_tokens: report.context_tokens,
+            selected_tier: report.selected_tier.clone(),
+            reported_cost_usd: report.reported_cost_usd.clone(),
+            outcome: None,
+            partial: report.partial,
+        })
+        .collect()
+}
+
 impl TaskService {
     /// Retain a bounded diagnostic when a terminal notification arrives after
     /// another actor already won the execution CAS.  The terminal CAS event
@@ -662,110 +721,5 @@ impl TaskService {
             execution::publish_terminal_execution_event(self, execution);
         }
         Ok(())
-    }
-
-    pub(crate) async fn execution_owns_current_role_attempt(
-        &self,
-        task: &Task,
-        execution: &Execution,
-    ) -> Result<bool> {
-        if !execution::execution_belongs_to_current_state_entry(&self.db, task, execution).await? {
-            return Ok(false);
-        }
-        let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
-            return Ok(false);
-        };
-        let workflow = WorkflowEngine::resolve_workflow_for_task(
-            task,
-            &project.workflow_definition,
-            &Actor::system(api_types::SystemComponent::Workflow),
-        );
-        let current_role = workflow
-            .states
-            .iter()
-            .find(|state| state.name == task.status)
-            .and_then(crate::workflow::effective_role);
-        let role_matches = execution.role == "interactive"
-            || current_role == Some(execution.role.as_str())
-            || (current_role == Some(crate::workflow::default_roles::CODER)
-                && execution.role == "executor");
-        if !role_matches {
-            return Ok(false);
-        }
-        if execution.role != "interactive" {
-            let assignment_role = if execution.role == "executor" {
-                crate::workflow::default_roles::CODER
-            } else {
-                execution.role.as_str()
-            };
-            // The own row is live ownership for every role but one: a
-            // subtask's step check is held by its root's lead, through the
-            // resolver. (A default worker stays admission authority only;
-            // see the inherited-coder arm below.)
-            let assignment = if crate::task_hierarchy::step_check_root(task, assignment_role)
-                .is_some()
-            {
-                crate::task_hierarchy::effective_role_assignment(&self.db, task, assignment_role)
-                    .await?
-                    .map(|resolved| resolved.assignment)
-            } else {
-                TaskRoleAssignmentRepo::get_by_task_and_role(&*self.db, &task.id, assignment_role)
-                    .await?
-            };
-            if let Some(assignment) = assignment {
-                if assignment.assignee_type.as_ref() != Some(&db::AssigneeKind::Agent)
-                    || assignment.assignee_id.as_deref() != execution.agent_id.as_deref()
-                {
-                    return Ok(false);
-                }
-                if chrono::DateTime::parse_from_rfc3339(&assignment.updated_at)
-                    .ok()
-                    .zip(chrono::DateTime::parse_from_rfc3339(&execution.updated_at).ok())
-                    .is_some_and(|(assignment, execution)| assignment > execution)
-                {
-                    return Ok(false);
-                }
-            } else if assignment_role == crate::workflow::default_roles::CODER
-                && task.parent_task_id.is_some()
-            {
-                // An inherited root assignment is admission authority, not
-                // live ownership of an already-running child. Root default
-                // changes intentionally affect only children that have not
-                // started, so an admitted child with no own coder keeps its
-                // current role attempt through completion.
-            } else if execution.agent_id.is_some() {
-                return Ok(false);
-            }
-        }
-        let roles: &[&str] = if matches!(execution.role.as_str(), "coder" | "executor") {
-            &["coder", "executor"]
-        } else {
-            &[execution.role.as_str()]
-        };
-        let mut latest: Option<Execution> = None;
-        for role in roles {
-            let page = ExecutionRepo::list_by_task_and_role(
-                &*self.db,
-                &task.id,
-                role,
-                db::PageRequest {
-                    cursor: None,
-                    limit: 1,
-                    include_total: false,
-                    sort_by: db::SortBy::CreatedAt,
-                    sort_order: db::SortOrder::Desc,
-                },
-            )
-            .await?;
-            if let Some(candidate) = page.items.into_iter().next() {
-                let replace = latest.as_ref().is_none_or(|current| {
-                    (&candidate.created_at, &candidate.id) > (&current.created_at, &current.id)
-                });
-                if replace {
-                    latest = Some(candidate);
-                }
-            }
-        }
-        Ok(latest.is_some_and(|latest| latest.id == execution.id))
     }
 }

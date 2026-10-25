@@ -1,4 +1,4 @@
-//! Placements recovery cases.
+//! Placement monitor suspension, guards and reconcile sweeps.
 
 use super::*;
 

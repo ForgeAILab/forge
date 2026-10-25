@@ -341,11 +341,11 @@ impl SqliteProtectedRuntimeStore {
     }
 }
 
-pub(super) fn intersect_permissions(target: &mut BTreeSet<String>, layer: &BTreeSet<String>) {
+fn intersect_permissions(target: &mut BTreeSet<String>, layer: &BTreeSet<String>) {
     *target = target.intersection(layer).cloned().collect();
 }
 
-pub(super) fn scope_permission_set(
+fn scope_permission_set(
     scope_type: crate::CanonicalScopeType,
     workspace_access: crate::WorkspaceAccess,
     project_agent_chat: bool,
@@ -375,3 +375,6 @@ fn workspace_access_name(access: crate::WorkspaceAccess) -> &'static str {
         crate::WorkspaceAccess::AccountScratch => "account_scratch",
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -14,7 +14,9 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+        if crate::task_service::execution_dispatch_project_version(execution)
+            != Some(project.version)
+        {
             return Ok(());
         }
         if guard == "subtask_sequence_complete"
@@ -65,7 +67,7 @@ impl TaskService {
             &*self.db,
             &task.id,
             task.version,
-            super::latest_execution_authority(execution, project.version),
+            crate::task_service::execution::latest_execution_authority(execution, project.version),
             vec![
                 db::TaskMetadataMutation::Budget(db::budget::Mutation::Charge {
                     key: db::budget::Kind::WorkflowGuard.key().into(),
@@ -203,7 +205,9 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        if super::super::execution_dispatch_project_version(execution) != Some(project.version) {
+        if crate::task_service::execution_dispatch_project_version(execution)
+            != Some(project.version)
+        {
             return Ok(());
         }
         let annotation = api_types::TaskBlockingAnnotation {
@@ -246,7 +250,7 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
-            super::latest_execution_authority(execution, project.version),
+            crate::task_service::execution::latest_execution_authority(execution, project.version),
         )
         .await?
         else {
@@ -311,7 +315,10 @@ impl TaskService {
                 &*self.db,
                 &task.id,
                 task.version,
-                super::latest_execution_authority(execution, project_version),
+                crate::task_service::execution::latest_execution_authority(
+                    execution,
+                    project_version,
+                ),
                 Self::guard_success_mutations(task, &execution.id),
                 &now_rfc3339(),
             )
