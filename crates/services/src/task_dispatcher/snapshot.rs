@@ -213,6 +213,10 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
         || stored.unparsed_metadata != fresh.unparsed_metadata)
         .then_some(legacy)
 }
+#[cfg(test)]
+pub(crate) fn condition_is_stale_for_test(task: &db::Task) -> bool {
+    stale_condition(&task.condition, task).is_some()
+}
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
         &self,

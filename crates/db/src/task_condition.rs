@@ -1282,7 +1282,6 @@ pub use intent::{
     ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
     SavedTaskCondition, StatedCondition,
 };
-mod diagnostic_projection;
 mod diagnostics;
 pub use diagnostics::{
     DiagnosticOwner, RecordTaskDiagnosticText, TaskDiagnosticText, TaskDiagnosticTextPage,

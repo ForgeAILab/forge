@@ -26,6 +26,8 @@ mod reconciliation;
 mod replan;
 mod snapshot;
 pub(crate) use helpers::is_blocking_annotation_type;
+#[cfg(test)]
+pub(crate) use snapshot::condition_is_stale_for_test;
 mod initial_scheduling;
 mod repo_pause_sync;
 pub mod slots;

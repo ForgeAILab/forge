@@ -147,7 +147,6 @@ pub(super) async fn derive_with_policy(
                 Some(
                     ConditionStatement::Preserve
                         | ConditionStatement::Edit { .. }
-                        | ConditionStatement::ReplaceDiagnostic { .. }
                         | ConditionStatement::Restore { .. }
                 )
             )
@@ -159,14 +158,7 @@ pub(super) async fn derive_with_policy(
         Some(ConditionStatement::Edit { edit }) => {
             Some(edit.apply_at_epoch(base, Some(snapshot.epoch))?)
         }
-        Some(ConditionStatement::ReplaceDiagnostic {
-            replacement,
-            preserve_interruption,
-        }) => Some(diagnostic_projection::apply(
-            base,
-            replacement,
-            *preserve_interruption,
-        )?),
+        Some(ConditionStatement::Ownership { .. }) => None,
         Some(statement) => Some(statement.apply(base)),
         _ => None,
     };
@@ -225,8 +217,8 @@ pub(super) async fn derive_with_policy(
     {
         recovery::load_owners(c, &mut facts).await?;
     }
-    if let Some(ConditionStatement::ReplaceDiagnostic { replacement, .. }) = statement {
-        if replacement.identity.epoch() != snapshot.epoch {
+    if let Some(ConditionStatement::Ownership { identity, .. }) = statement {
+        if identity.epoch() != snapshot.epoch {
             return Err(DbError::VersionConflict);
         }
     }
@@ -335,6 +327,23 @@ pub(super) async fn derive_with_policy(
     } else {
         facts.apply(mapped)
     };
+    let condition = if let Some(ConditionStatement::Ownership { owner, identity }) = statement
+        .filter(|_| corruption.is_none() || policy == recovery::UnreadablePolicy::DurableOwners)
+    {
+        let mut condition = facts.condition(&snapshot.input).typed();
+        let evidence = condition.evidence_mut();
+        evidence.stated = true;
+        evidence.ownership.push(ConditionOwnership {
+            owner: *owner,
+            identity: identity.clone(),
+            reason: None,
+            state: None,
+            material: None,
+        });
+        condition
+    } else {
+        condition
+    };
     integration::validate(&condition)?;
     check::validate(&condition)?;
     let mut condition = condition;
@@ -384,7 +393,8 @@ pub(crate) async fn produce(
 
 /// The seam for a writer that states its condition: same transaction, after
 /// its write. The stored condition is edited by the statement and the durable
-/// facts are laid over it; the fields the writer wrote are not mapped.
+/// facts are laid over it. Ownership-only statements instead annotate the
+/// post-write legacy mapping.
 pub(crate) async fn state(
     c: &mut SqliteConnection,
     task_id: &str,

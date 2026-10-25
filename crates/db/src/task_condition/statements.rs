@@ -1,5 +1,6 @@
-//! Typed statements: a writer says what its write means for the Task and the
-//! condition is edited from that, never re-read from the fields it wrote.
+//! Typed semantic statements edit the stored condition from writer intent.
+//! Ownership-only statements attach identity to the post-write legacy mapping
+//! in the producer, without editing its meaning.
 //!
 //! A statement owns the reasons its writer owns. Every other reason on the
 //! Task (an entry block, a placement denial, a human gate, a Project pause)
@@ -19,11 +20,11 @@ pub enum ConditionStatement {
     Edit {
         edit: Box<ConditionOwnerEdit>,
     },
-    /// Replace the diagnostic slot with the same supersession as its legacy write.
-    /// An annotation-only writer leaves the existing interruption intact.
-    ReplaceDiagnostic {
-        replacement: Box<ConditionReplacement>,
-        preserve_interruption: bool,
+    /// Attach an owner identity to the post-write legacy mapping. Presentation,
+    /// reasons and continuation remain entirely owned by that mapping.
+    Ownership {
+        owner: ConditionReasonOwner,
+        identity: ConditionIdentity,
     },
     /// Rollback under the enclosing command's unchanged-version/admission fences.
     Restore {
@@ -261,7 +262,7 @@ impl ConditionStatement {
         match self {
             Self::Preserve
             | Self::Edit { .. }
-            | Self::ReplaceDiagnostic { .. }
+            | Self::Ownership { .. }
             | Self::Restore { .. }
             | Self::Integration { .. }
             | Self::IntegrationHandedOff { .. }

@@ -218,16 +218,6 @@ pub(super) async fn record_statement_text(
                 },
             },
         )),
-        ConditionStatement::ReplaceDiagnostic { replacement, .. } => {
-            let edit = ConditionStatement::Edit {
-                edit: Box::new(ConditionOwnerEdit {
-                    owner: ConditionReasonOwner::Diagnostic,
-                    expected: None,
-                    replacement: Some(*replacement.clone()),
-                }),
-            };
-            return Box::pin(record_statement_text(c, task_id, &edit)).await;
-        }
         ConditionStatement::Edit { edit } => {
             if let Some(replacement) = &edit.replacement {
                 let presentation = match &replacement.condition {

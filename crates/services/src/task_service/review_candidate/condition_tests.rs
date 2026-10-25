@@ -1,121 +1,31 @@
-// Unit A conversion target: keep this real-writer, two-write legacy oracle active.
 use super::*;
-use crate::recovery::test_support::{seed_project_repo, seed_task, sqlite_db};
-use db::{EnqueueTaskStep, TaskStepRepo};
+use crate::recovery::test_support::{conditions::*, seed_project_repo, seed_task, sqlite_db};
 
 #[tokio::test]
 async fn missing_candidate_real_writer_equals_legacy_oracle() {
     let db = Arc::new(sqlite_db().await);
     let (project, _) = seed_project_repo(&db).await;
-    let mut writer_marks = Vec::new();
-    for deferred in [false, true] {
+    let service = TaskService::new_for_test(db.clone(), Arc::new(EventBus::new(32)));
+    for shape in SHAPES {
         let task = seed_task(&db, project.clone(), "review".into(), None).await;
-        let service = TaskService::new_for_test(db.clone(), Arc::new(EventBus::new(32)));
-        let id = new_uuid_v4();
-        db.enqueue_step(&EnqueueTaskStep {
-            id: id.clone(),
-            task_id: task.id.clone(),
-            kind: "command".into(),
-            payload_json: "{}".into(),
-            causation_step_id: None,
-            causation_key: id.clone(),
-            chain_id: id,
-            chain_position: 1,
-            expected_status: task.status.clone(),
-            expected_version: task.version,
-            expected_epoch: None,
-            lane: "fast".into(),
-            available_at: now_rfc3339(),
-        })
-        .await
-        .unwrap();
-        let step = db
-            .claim_step(
-                "candidate-condition-test",
-                Some(&task.id),
-                &db::task_writer::lease_deadline(),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let result = db::task_writer::in_task_step(step.clone(), async {
-        let at = now_rfc3339();
-        TaskRepo::update_recovery_metadata_if_no_running_execution(
-            &*db, &task.id, task.version,
-            Some(db::ConditionStatement::hold_operator_text("user", "owner measurements", &at)),
-            Some(serde_json::json!({"kind":"manual_stop", "reason":"owner measurements", "created_at":at}).to_string()),
-            None, &at, None, vec![], vec![],
-            Some(db::ConditionStatement::Hold { actor: "user".into(), reason: "owner measurements".into(), at: at.clone() }),
-        ).await.unwrap();
-        let held = TaskRepo::mutate_metadata(&*db, &task.id, None, vec![
-            db::TaskMetadataMutation::Set { key: "owner_wait".into(), value: serde_json::json!({"daemon_id":"waiting-daemon", "started_at":at}) },
-            db::TaskMetadataMutation::Set { key: "queued_recovery".into(), value: serde_json::json!({"id":"queued-review-command"}) },
-        ], &at).await.unwrap();
-        let held = if deferred {
-            TaskRepo::mutate_metadata(&*db, &task.id, None, vec![db::TaskMetadataMutation::Set {
-                key: "deferred_dispatch".into(), value: serde_json::json!({"not_before":"2099-01-01T00:00:00Z", "reason":"retry later", "target_state":"review"})
-            }], &at).await.unwrap()
-        } else { held };
-        service.missing_review_candidate(&held).await.unwrap()
-    }).await;
-        assert!(result.target.is_none());
-        let row = TaskRepo::get_by_id(&*db, &task.id, false)
-            .await
-            .unwrap()
-            .unwrap();
-
-        writer_marks.push((
-            row.condition.evidence().stated,
-            row.condition.evidence().ownership.len(),
-        ));
-        let mut connection = db.pool().acquire().await.unwrap();
-        let facts = db::ConditionFacts::load(&mut connection, &task.id)
-            .await
-            .unwrap();
-        let mut legacy = db::LegacyConditionInput::from(&row);
-        drop(connection);
-        legacy.facts = Some(facts);
-        let mapped = db::map_legacy_condition(&legacy);
+        let step = claim(&db, &task).await;
         db::task_writer::in_task_step(step, async {
-            let mut tx = db.pool().begin().await.unwrap();
-            db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy)
-                .await
-                .unwrap();
-            tx.commit().await.unwrap();
-        })
-        .await;
-        let after = TaskRepo::get_by_id(&*db, &task.id, false)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            after.condition.typed(),
-            row.condition.typed(),
-            "two-write condition stability"
-        );
-        assert_eq!(row.condition.typed(), mapped.typed());
-        assert_eq!(row.condition.public(), mapped.public());
-        crate::task_actions::test_support::assert_legacy_offers(&db, &row, &mapped).await;
-        assert_eq!(
-            db::material_blocker(&row.condition),
-            db::material_blocker(&mapped)
-        );
-        assert_eq!(after.condition.typed(), mapped.typed());
-        assert_eq!(after.condition.public(), mapped.public());
-        crate::task_actions::test_support::assert_legacy_offers(&db, &after, &mapped).await;
-        assert_eq!(
-            db::material_blocker(&after.condition),
-            db::material_blocker(&mapped)
-        );
-        assert_eq!(
-            db::CreateDomainEvent::task_interruption_changed(&row).dedupe_key,
-            db::CreateDomainEvent::task_interruption_changed(&after).dedupe_key
-        );
+            seed_shape(&db, &task, shape).await;
+            let before = read(&db, &task.id).await;
+            let result = service.missing_review_candidate(&before).await.unwrap();
+            assert!(result.target.is_none());
+            let row = read(&db, &task.id).await;
+            let expected = candidate_columns(&before, &row);
+            assert_columns(&row, &expected);
+            let identity = db.task_condition_entry_identity(&row.id, row.version).await.unwrap();
+            assert_write_and_next(&db, &row, identity, shape, "candidate").await;
+            let message = "nothing to review: no implementation run or branch commits were delivered; send back to add work, or cancel the Task";
+            assert_full_text(&db, &task.id, message, "diagnostic").await;
+            if *shape == "long_reason" { assert_full_text(&db, &task.id, &"h".repeat(200_000), "hold").await; }
+            clear_own_columns(&db, &row.id, true, shape).await;
+            println!("S2A candidate {shape}: legacy oracle, two writes, check, dispatcher, clear, text PASS");
+        }).await;
     }
-    // The unit-A target currently runs the base writer; no typed ownership is introduced.
-    assert!(writer_marks
-        .iter()
-        .all(|(stated, count)| !stated && *count == 0));
 }
 
 #[tokio::test]

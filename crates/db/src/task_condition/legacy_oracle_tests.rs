@@ -34,9 +34,9 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
             expected_epoch: 0,
             expected_condition_digest: diagnostics::digest(b"{}"),
         },
-        ConditionStatement::ReplaceDiagnostic {
-            replacement: Box::new(replacement.clone()),
-            preserve_interruption: true,
+        ConditionStatement::Ownership {
+            owner: ConditionReasonOwner::Diagnostic,
+            identity: replacement.identity.clone(),
         },
         ConditionStatement::Edit {
             edit: Box::new(ConditionOwnerEdit {

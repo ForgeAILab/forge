@@ -275,17 +275,32 @@ pub(super) async fn annotate_owner_workspace_reset(
     let annotation = json!({"type": api_types::FailureKind::WorkspaceResetRequired,
         "blocking_reason": "owner_workspace_reset_required", "blocked_by": actor.display(),
         "blocked_at": now_rfc3339(), "message": message});
-    TaskRepo::update_status(
-        db,
-        UpdateTaskStatus {
-            id: task.id.clone(),
-            expected_version: task.version,
-            status: task.status,
-            assignee_id: None,
-            error_annotation: Some(Some(annotation.to_string())),
-            blocked_json: None,
-            failed_json: None,
-            updated_at: now_rfc3339(),
+    let identity = db
+        .task_condition_entry_identity(&task.id, task.version)
+        .await?;
+    db.apply_conditioned_task_mutation::<Task>(
+        &task.id,
+        db::Conditioned {
+            condition: db::ConditionStatement::Ownership {
+                owner: db::ConditionReasonOwner::Diagnostic,
+                identity: db::ConditionIdentity::Operation {
+                    epoch: identity.epoch(),
+                    operation_id: placement.id.clone(),
+                    generation: placement.generation,
+                },
+            },
+            input: db::TaskMutation::TaskUpdateStatus {
+                input: UpdateTaskStatus {
+                    id: task.id.clone(),
+                    expected_version: task.version,
+                    status: task.status,
+                    assignee_id: None,
+                    error_annotation: Some(Some(annotation.to_string())),
+                    blocked_json: None,
+                    failed_json: None,
+                    updated_at: now_rfc3339(),
+                },
+            },
         },
     )
     .await?;

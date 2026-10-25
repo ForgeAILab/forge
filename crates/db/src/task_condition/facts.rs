@@ -1022,14 +1022,6 @@ impl Snapshot {
             Some(ConditionStatement::Edit { edit }) => stored()
                 .map(|stored| edit.apply_at_epoch(&stored, Some(self.epoch)))
                 .transpose()?,
-            Some(ConditionStatement::ReplaceDiagnostic {
-                replacement,
-                preserve_interruption,
-            }) => stored()
-                .map(|stored| {
-                    diagnostic_projection::apply(&stored, &replacement, preserve_interruption)
-                })
-                .transpose()?,
             Some(ConditionStatement::Preserve | ConditionStatement::Restore { .. }) => stored(),
             _ if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle => {
                 Some(map_view(&self.input.view()))

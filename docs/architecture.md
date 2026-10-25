@@ -6178,10 +6178,11 @@ the existing mapper. Column/key removal, the final reader guard and diagnostic
 REST/UI exposure belong to later gates. This checkpoint adds
 `task_diagnostic_text` and captures full source text in it. It retains internal
 typed contracts for later writer conversions; it does not delete or rewrite
-existing Task data. Under the active `LegacyOracle` policy, stored condition
-bytes, public projections, offers, failure kinds, Operations text and Attention
-digests remain equal to main `6120c133`, including corruption repair and existing
-Integration/Check refusal outcomes.
+existing Task data. Under the active `LegacyOracle` policy, public projections, offers, failure
+kinds, Operations text and Attention digests remain equal to main `6120c133`,
+including corruption repair and existing Integration/Check refusal outcomes.
+Ordinary mapped writes retain main's encoding; the converted writers below
+store stated typed conditions with no legacy evidence copies.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
 owner `Edit`, and typed `Restore` alongside Hold/Release and the independently
@@ -6193,10 +6194,12 @@ belong to the current epoch. A mismatching expected identity refuses the write;
 a clear removes only that owner's reasons and retains other owners. Owner
 records retain typed presentation and material-blocker projections, so clearing
 a primary reason reveals the remaining owner's diagnosis. The owner-edit contract
-can preserve a foreign hold. `ReplaceDiagnostic` describes diagnostic-slot
-supersession; its writer conversions remain unit A targets, alongside the hold
-writers. Those conversions must retain the exact legacy interruption reasons,
-failure-kind precedence and assignment guidance across two writes. Integration and check ownership still require their original
+can preserve a foreign hold. `Ownership { owner, identity }` adds only a typed
+owner record to `facts.condition(input).typed()` over the post-write legacy
+columns. It marks the row stated and removes the legacy evidence copies, as
+Hold/Release do; it supplies no reasons, presentation, material or continuation.
+The mapping retains diagnostic text, interruption content, assignment guidance
+and failure-kind precedence across the next write. Integration and check ownership still require their original
 claimed-step seam.
 
 Converted writers still shipping at this checkpoint:
@@ -6205,6 +6208,8 @@ Converted writers still shipping at this checkpoint:
 |---|---|---|---|
 | `TaskService::hold_waiting_task` (owner Hold on a Task with no run) | `Hold { actor, reason, at }` | `Held`, the diagnostic, the interruption; drops failure, queued command, retry timer, dispatch refusal, environment wait, owner wait | entry block, placement denial, daemon-upgrade refusal, Project pause, human decision, plan settlement wait |
 | `TaskService::release_to_dispatch_queue` (owner Release of a waiting hold) | `Release` | clears diagnostic, interruption, failure | everything else, including a recorded retry timer |
+| `annotate_owner_workspace_reset` | `Ownership { Diagnostic, Operation { epoch, operation_id: placement.id, generation } }` | identity of the workspace-reset annotation writer | the complete post-write legacy mapping; no presentation edit |
+| `TaskService::missing_review_candidate` (missing-candidate park) | `Ownership { Diagnostic, Entry { epoch, transition_id: None } }` | identity of the status entry that found no candidate | the complete post-write legacy mapping; no presentation edit |
 
 The hold's legacy annotation and operator text remain one rendering of the same
 typed fields (`ConditionStatement::hold_operator_text`), byte for byte what the
@@ -6244,18 +6249,26 @@ callers exposed by the compiler. Historical Sql, update, queued rollback and Tas
 receipt encodings remain decodable and replayable; their retained legacy SQL and
 archive import need deliberate translation before 5b drops storage.
 
-The workspace-owner reset annotation and missing review-candidate park retain
-their base repository writes. Their active two-write equivalence tests are unit A
-conversion targets, including retry/budget exhaustion, historical timeout, kind-less
-workflow loops and Deferred retries. They capture new diagnostic text after the
-legacy commit on a best-effort basis; capture failure leaves the full legacy text
-and the base write outcome intact. Waiting Hold/Release and integration/check
-statements remain in use. Other S caller files and aggregates A–E still need their own
-conversion. Unconverted writers continue to map legacy after their write, so an
-intermediate gate does not silently change their intent. The mapping remains the
+The workspace-owner reset annotation and missing review-candidate park keep
+exactly their legacy column updates inside a `Conditioned<TaskMutation>` envelope.
+Their ownership-only statements use the existing version/epoch and Task-step
+fences. The stored owner record has only its owner and identity (`reason`, `state`
+and `material` are absent/null); all semantic fields come from the legacy oracle.
+Their active acceptance fixtures cover both writes, interruption assignment guidance,
+all four exhaustion kinds, historical timeout, kind-less workflow loops, Deferred
+retries, 200 KB text and 400-child coordination roots. They capture new diagnostic
+text after the legacy commit on a best-effort basis; capture failure leaves the full
+legacy text and the base write outcome intact. Other S caller files and aggregates
+A–E still need their own conversion. The next unconverted write that runs a
+condition producer stores the full legacy mapping, including its legacy evidence
+copies, with `stated = false` and empty ownership, exactly as after Hold/Release.
+Unrelated metadata changes skip the producer and retain the stated row, also as
+on main. A mapped write does not carry ownership forward. Clearing the writer's legacy columns leaves other columns and queued
+intent intact; the mapping determines the surviving blockers and continuation. The mapping remains the
 independent per-writer oracle while dual write continues. Existing Hold/Release
-and Integration/Check statements edit the stored condition as on main; only the
-new statement contracts remove previously projected lifecycle facts first.
+and Integration/Check statements edit the stored condition as on main.
+Preserve/Edit/Restore remove previously projected lifecycle facts before editing;
+Ownership instead maps the current columns and facts directly.
 Stated rows compare by their typed condition, as on main. Unstated rows compare
 exact stored bytes, including all legacy evidence copies. Typed/public causes
 and material Attention inputs agree immediately and after an ordinary legacy

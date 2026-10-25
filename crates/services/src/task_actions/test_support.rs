@@ -57,10 +57,17 @@ pub(crate) async fn assert_legacy_offers(
     let expected = load_snapshot(db, legacy.clone(), workflow, &actor, None)
         .await
         .unwrap();
-    assert_eq!(
-        task.condition.read().failure_kind,
-        legacy_task_condition(&legacy)
-    );
+    // The loop writer has no kind. After its annotation is cleared, the
+    // mapper's Failure reason still supplies WorkflowLoop to the typed read.
+    let legacy_kind = legacy_task_condition(&legacy).or_else(|| {
+        legacy
+            .blocked_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .filter(|value| value.get("kind").is_none() && value["source"] == "workflow_loop")
+            .map(|_| FailureKind::WorkflowLoop)
+    });
+    assert_eq!(task.condition.read().failure_kind, legacy_kind);
     assert!(
         !available_actions(&actual).is_empty(),
         "real offers path must be exercised"
