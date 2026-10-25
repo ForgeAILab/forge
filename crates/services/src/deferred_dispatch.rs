@@ -542,6 +542,7 @@ async fn record_disposition(
     capacity_scope: Option<&str>,
     project_wait: Option<ProjectWait>,
 ) -> Result<bool> {
+    debug_assert_eq!(capability == "project_capacity", project_wait.is_some());
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;

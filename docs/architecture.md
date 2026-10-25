@@ -7869,8 +7869,11 @@ Capacity waits record `project_capacity` dispatch dispositions with a typed
 from that subcause; both remain the public `Capacity(Project)` condition.
 `read_pre_upgrade_project_wait` reads rows written before this field existed,
 using their original `project_waiting_on_owner: ` prefix rule only when the field
-is absent. Existing rows keep their public condition, offers, Operations text,
-and Attention material/digest on upgrade. `workflow_health` projects the current
+is absent. `ConditionRefusal` keeps its stored field order, with `project_wait`
+appended last and omitted when absent. Existing dispatch-disposition rows keep
+their stored condition bytes and Project list revision during invariant checks,
+as well as their public condition, offers, Operations text, and Attention
+material/digest on upgrade. `workflow_health` projects the current
 message and reason to cards and Task detail. Unlike sticky role
 refusals, these waits are reconsidered every tick as other Tasks free capacity.
 Recording a changed capacity disposition or clearing one publishes `task.updated`

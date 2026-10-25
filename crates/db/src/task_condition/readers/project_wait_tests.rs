@@ -16,6 +16,24 @@ fn refusal(project_wait: Option<&str>, message: &str) -> ConditionRefusal {
 }
 
 #[test]
+fn refusal_serialization_keeps_main_field_order() {
+    let refusal = refusal(None, "project_at_capacity: waiting for a slot");
+    assert_eq!(
+        serde_json::to_string(&refusal).unwrap(),
+        r#"{"task_version":1,"capability":"project_capacity","blocker_digest":"sha256:unchanged","recorded_at":"2026-10-25T00:00:00Z","safe_message":"project_at_capacity: waiting for a slot"}"#
+    );
+    let disk = ConditionRefusal {
+        capability: "machine_capacity".into(),
+        capacity_scope: Some("disk".into()),
+        ..refusal
+    };
+    assert_eq!(
+        serde_json::to_string(&disk).unwrap(),
+        r#"{"task_version":1,"capability":"machine_capacity","blocker_digest":"sha256:unchanged","recorded_at":"2026-10-25T00:00:00Z","safe_message":"project_at_capacity: waiting for a slot","capacity_scope":"disk"}"#
+    );
+}
+
+#[test]
 fn typed_project_at_capacity_overrides_owner_prefix() {
     let refusal = refusal(
         Some("at_capacity"),
@@ -88,48 +106,40 @@ fn pre_upgrade_project_wait_uses_the_original_prefix_rule() {
 
 #[tokio::test]
 async fn literal_pre_upgrade_rows_keep_public_projection_and_attention_digest() {
-    use crate::task_condition::tests::{db, task};
     use crate::{CreateDomainEvent, TaskRepo};
 
-    let db = db().await;
-    let rows: Vec<serde_json::Value> =
-        serde_json::from_str(include_str!("fixtures/pre_upgrade_project_waits.json")).unwrap();
-    for (index, row) in rows.iter().enumerate() {
-        let id = format!("pre-upgrade-{index}");
-        task(&db, &id).await;
+    for row in pre_upgrade_rows() {
+        let db = load_pre_upgrade_row(&row).await;
+        let id = row["id"].as_str().unwrap();
         let condition_json = row["condition_json"].as_str().unwrap();
         let metadata_json = row["metadata_json"].as_str().unwrap();
-        sqlx::query("UPDATE task SET condition_json=?, metadata_json=?, version=1 WHERE id=?")
-            .bind(condition_json)
-            .bind(metadata_json)
-            .bind(&id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let task = TaskRepo::get_by_id(&db, &id, false).await.unwrap().unwrap();
+        let task = TaskRepo::get_by_id(&db, id, false).await.unwrap().unwrap();
         let refusal = task.condition.read().refusal.unwrap();
         assert_eq!(refusal.project_wait, None);
-        assert_eq!(
-            refusal.capacity_reason(),
-            (
-                row["reason"].as_str().unwrap(),
-                row["message"].as_str().unwrap()
-            )
-        );
+        if refusal.capability == "coder" {
+            assert_eq!(refusal.safe_message, "no coder agent");
+        } else {
+            assert_eq!(
+                refusal.capacity_reason(),
+                (
+                    row["reason"].as_str().unwrap(),
+                    row["message"].as_str().unwrap()
+                )
+            );
+        }
         assert_eq!(
             serde_json::to_value(task.condition.public()).unwrap(),
-            json!({
-                "kind":"parked", "primary":{"kind":"capacity","scope":"project"},
-                "additional":[], "resume":{"kind":"reconcile"}, "since":null,
-                "details":{"failure_kind":null,"diagnostic":null,"interruption":null,
-                    "failed":false,"blocked":false,"human_wait":false,"entry_wait":false}
-            })
+            row["public_condition"]
         );
         assert_eq!(task.condition.read().operator_reason, None);
         let event = CreateDomainEvent::task_interruption_changed(&task);
         assert_eq!(event.dedupe_key, Some(format!("task-interruption-update:{id}:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401")));
+        assert_eq!(
+            serde_json::to_value(event.dedupe_key).unwrap(),
+            row["attention_dedupe_key"]
+        );
         let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-            .bind(&id)
+            .bind(id)
             .fetch_one(db.pool())
             .await
             .unwrap();
@@ -139,4 +149,80 @@ async fn literal_pre_upgrade_rows_keep_public_projection_and_attention_digest() 
         );
         assert_eq!(task.metadata_json.as_deref(), Some(metadata_json));
     }
+}
+
+fn pre_upgrade_rows() -> Vec<serde_json::Value> {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/pre_upgrade_project_waits.json")).unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["reason"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "project_at_capacity",
+            "project_waiting_on_owner",
+            "machine_capacity",
+            "disk_pressure",
+            "dispatch_parked"
+        ]
+    );
+    rows
+}
+
+async fn load_pre_upgrade_row(row: &serde_json::Value) -> crate::SqliteDb {
+    use crate::task_condition::tests::{db, task};
+
+    let db = db().await;
+    let id = row["id"].as_str().unwrap();
+    task(&db, id).await;
+    // Recreate main's creation fact: the initial entry witness uses this time.
+    // Keep the fixture's stored JSON bytes untouched, including refusal order.
+    sqlx::query(
+        "UPDATE task SET condition_json=?, metadata_json=?, version=?, created_at=? WHERE id=?",
+    )
+    .bind(row["condition_json"].as_str().unwrap())
+    .bind(row["metadata_json"].as_str().unwrap())
+    .bind(row["version"].as_i64().unwrap())
+    .bind(row["created_at"].as_str().unwrap())
+    .bind(id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    db
+}
+
+#[tokio::test]
+async fn literal_pre_upgrade_rows_need_no_repairs_or_list_revision_changes() {
+    let mut observations = Vec::new();
+    for row in pre_upgrade_rows() {
+        let db = load_pre_upgrade_row(&row).await;
+        let id = row["id"].as_str().unwrap().to_owned();
+        let before: i64 = sqlx::query_scalar("SELECT list_revision FROM project WHERE id='p'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let repaired = db
+            .check_task_conditions_of(std::slice::from_ref(&id))
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT list_revision FROM project WHERE id='p'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let (condition, metadata): (String, String) =
+            sqlx::query_as("SELECT condition_json, metadata_json FROM task WHERE id=?")
+                .bind(&id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        observations.push((
+            repaired,
+            after - before,
+            condition == row["condition_json"].as_str().unwrap(),
+            metadata == row["metadata_json"].as_str().unwrap(),
+        ));
+    }
+    assert_eq!(observations, vec![(0, 0, true, true); 5],
+        "main-written Project, machine, disk and role rows must remain byte-identical after checking");
 }

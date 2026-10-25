@@ -14,10 +14,14 @@ pub struct ConditionRetry {
     pub reason: String,
     pub target_state: String,
 }
+/// Field order is part of `condition_json`'s stored encoding.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConditionRefusal {
-    pub blocker_digest: String,
+    pub task_version: i64,
     pub capability: String,
+    pub blocker_digest: String,
+    pub recorded_at: String,
+    pub safe_message: String,
     /// What a `machine_capacity` wait is for when it is not a run slot
     /// (`disk`). The typed fact every reader decides on; the message is
     /// for people only.
@@ -25,9 +29,6 @@ pub struct ConditionRefusal {
     pub capacity_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_wait: Option<ProjectWait>,
-    pub recorded_at: String,
-    pub safe_message: String,
-    pub task_version: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

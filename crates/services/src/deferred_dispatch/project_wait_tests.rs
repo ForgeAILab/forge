@@ -118,15 +118,22 @@ async fn literal_pre_upgrade_waits_keep_offers_health_operations_and_attention_m
         "../../../db/src/task_condition/readers/fixtures/pre_upgrade_project_waits.json"
     ))
     .unwrap();
+    assert_eq!(rows.len(), 5);
+    let mut project_rows = 0;
     for row in rows {
         let (db, task) = fixture().await;
-        sqlx::query("UPDATE task SET condition_json=?, metadata_json=?, version=1 WHERE id=?")
-            .bind(row["condition_json"].as_str().unwrap())
-            .bind(row["metadata_json"].as_str().unwrap())
-            .bind(&task.id)
-            .execute(db.pool())
-            .await
-            .unwrap();
+        // Match the main-written Task's creation fact without rewriting its JSON.
+        sqlx::query(
+            "UPDATE task SET condition_json=?, metadata_json=?, version=?, created_at=? WHERE id=?",
+        )
+        .bind(row["condition_json"].as_str().unwrap())
+        .bind(row["metadata_json"].as_str().unwrap())
+        .bind(row["version"].as_i64().unwrap())
+        .bind(row["created_at"].as_str().unwrap())
+        .bind(&task.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
         let before = TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()
@@ -138,7 +145,10 @@ async fn literal_pre_upgrade_waits_keep_offers_health_operations_and_attention_m
             offers,
             crate::task_actions::legacy::available_actions(&(&snapshot).into())
         );
-        assert!(offers.iter().any(|offer| offer.reason == "dispatch_wait"));
+        assert_eq!(
+            offers.iter().any(|offer| offer.reason == "dispatch_wait"),
+            row["reason"] != "dispatch_parked"
+        );
         let health = crate::task_diagnostics::derive_workflow_health(
             &before,
             &snapshot.workflow,
@@ -154,7 +164,22 @@ async fn literal_pre_upgrade_waits_keep_offers_health_operations_and_attention_m
         assert_eq!(before.condition.read().operator_reason, None);
         assert!(db.blocked_task_operator_rows().await.unwrap().is_empty());
         assert!(db.task_operator_retry_rows().await.unwrap().is_empty());
+        assert_eq!(
+            serde_json::to_value(before.condition.public()).unwrap(),
+            row["public_condition"]
+        );
+        assert_eq!(
+            serde_json::to_value(
+                db::CreateDomainEvent::task_interruption_changed(&before).dedupe_key
+            )
+            .unwrap(),
+            row["attention_dedupe_key"]
+        );
 
+        if row["project_wait"].is_null() {
+            continue;
+        }
+        project_rows += 1;
         let wait: ProjectWait = serde_json::from_value(row["project_wait"].clone()).unwrap();
         assert!(!record_project_capacity_wait(
             &db,
@@ -204,6 +229,7 @@ async fn literal_pre_upgrade_waits_keep_offers_health_operations_and_attention_m
         assert_eq!(old_event.payload_json, typed_event.payload_json);
         assert!(!db::material_blocker(&typed.condition).requires_intervention);
     }
+    assert_eq!(project_rows, 2);
 }
 
 #[tokio::test]
