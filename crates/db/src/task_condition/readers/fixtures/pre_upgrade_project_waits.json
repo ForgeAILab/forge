@@ -1,0 +1,183 @@
+[
+  {
+    "attention_dedupe_key": "task-interruption-update:task:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401",
+    "condition_json": "{\"kind\":\"parked\",\"primary\":{\"kind\":\"capacity\",\"scope\":\"project\"},\"additional\":[],\"resume\":{\"kind\":\"reconcile\"},\"since\":null,\"evidence\":{\"presentation\":{\"owner\":null,\"recovery\":null,\"diagnostic\":null,\"diagnostic_present\":false,\"interruption\":null,\"interruption_present\":false,\"failure_message\":null,\"blocked_message\":null,\"exception_message\":null,\"interruption_execution_id\":null,\"hard_failure\":false,\"failure_kind\":null,\"entry\":null,\"entry_recorded\":false,\"human_wait\":false,\"explicit_human_wait\":false,\"queued_command\":false,\"external_merge\":false,\"retry_recorded\":false,\"retry\":null,\"retry_display\":null,\"retry_kind\":null,\"refusal\":{\"task_version\":1,\"capability\":\"project_capacity\",\"blocker_digest\":\"sha256:0edd8644100c42baf95fce06088fb941da70463e2438bc9c447bb7e5fcdf4166\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"project_at_capacity: waiting for a slot (5/5 active)\"},\"environment\":null,\"environment_recorded\":false,\"placement\":null,\"failed_step_id\":null,\"slot_blocker\":false,\"review_wait\":false,\"review_failure\":false,\"operator_reason\":null,\"placement_matches_diagnostic\":false},\"witnesses\":[{\"kind\":\"entry\",\"task_id\":\"task\",\"epoch\":0,\"transition_id\":null,\"since\":\"2026-10-25T22:16:46.333343+00:00\",\"initial\":true,\"human_wait\":false,\"review_wait\":false,\"review_failure\":false}],\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{\"dispatch_disposition\":\"{\\\"blocker_digest\\\":\\\"sha256:0edd8644100c42baf95fce06088fb941da70463e2438bc9c447bb7e5fcdf4166\\\",\\\"capability\\\":\\\"project_capacity\\\",\\\"recorded_at\\\":\\\"2026-10-25T00:00:00Z\\\",\\\"safe_message\\\":\\\"project_at_capacity: waiting for a slot (5/5 active)\\\",\\\"task_version\\\":1}\"},\"unparsed_metadata\":null}}",
+    "created_at": "2026-10-25T22:16:46.333343+00:00",
+    "id": "task",
+    "label": "Waiting for a Slot",
+    "message": "waiting for a slot (5/5 active)",
+    "metadata_json": "{\"dispatch_disposition\":{\"blocker_digest\":\"sha256:0edd8644100c42baf95fce06088fb941da70463e2438bc9c447bb7e5fcdf4166\",\"capability\":\"project_capacity\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"project_at_capacity: waiting for a slot (5/5 active)\",\"task_version\":1}}",
+    "operator_reason": null,
+    "project_wait": "at_capacity",
+    "public_condition": {
+      "additional": [],
+      "details": {
+        "blocked": false,
+        "diagnostic": null,
+        "entry_wait": false,
+        "failed": false,
+        "failure_kind": null,
+        "human_wait": false,
+        "interruption": null
+      },
+      "kind": "parked",
+      "primary": {
+        "kind": "capacity",
+        "scope": "project"
+      },
+      "resume": {
+        "kind": "reconcile"
+      },
+      "since": null
+    },
+    "reason": "project_at_capacity",
+    "safe_message": "project_at_capacity: waiting for a slot (5/5 active)",
+    "source_commit": "9296fb764f52ec6418ed53d582cbae8fc0635811",
+    "version": 1
+  },
+  {
+    "attention_dedupe_key": "task-interruption-update:task:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401",
+    "condition_json": "{\"kind\":\"parked\",\"primary\":{\"kind\":\"capacity\",\"scope\":\"project\"},\"additional\":[],\"resume\":{\"kind\":\"reconcile\"},\"since\":null,\"evidence\":{\"presentation\":{\"owner\":null,\"recovery\":null,\"diagnostic\":null,\"diagnostic_present\":false,\"interruption\":null,\"interruption_present\":false,\"failure_message\":null,\"blocked_message\":null,\"exception_message\":null,\"interruption_execution_id\":null,\"hard_failure\":false,\"failure_kind\":null,\"entry\":null,\"entry_recorded\":false,\"human_wait\":false,\"explicit_human_wait\":false,\"queued_command\":false,\"external_merge\":false,\"retry_recorded\":false,\"retry\":null,\"retry_display\":null,\"retry_kind\":null,\"refusal\":{\"task_version\":1,\"capability\":\"project_capacity\",\"blocker_digest\":\"sha256:7b8713172d2b40c4b9ad259e6ac4e94e0a4fe0e266550efdb505edca28603283\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"project_waiting_on_owner: 10 parked tasks waiting on the owner\"},\"environment\":null,\"environment_recorded\":false,\"placement\":null,\"failed_step_id\":null,\"slot_blocker\":false,\"review_wait\":false,\"review_failure\":false,\"operator_reason\":null,\"placement_matches_diagnostic\":false},\"witnesses\":[{\"kind\":\"entry\",\"task_id\":\"task\",\"epoch\":0,\"transition_id\":null,\"since\":\"2026-10-25T22:16:46.349841+00:00\",\"initial\":true,\"human_wait\":false,\"review_wait\":false,\"review_failure\":false}],\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{\"dispatch_disposition\":\"{\\\"blocker_digest\\\":\\\"sha256:7b8713172d2b40c4b9ad259e6ac4e94e0a4fe0e266550efdb505edca28603283\\\",\\\"capability\\\":\\\"project_capacity\\\",\\\"recorded_at\\\":\\\"2026-10-25T00:00:00Z\\\",\\\"safe_message\\\":\\\"project_waiting_on_owner: 10 parked tasks waiting on the owner\\\",\\\"task_version\\\":1}\"},\"unparsed_metadata\":null}}",
+    "created_at": "2026-10-25T22:16:46.349841+00:00",
+    "id": "task",
+    "label": "Waiting on Owner",
+    "message": "10 parked tasks waiting on the owner",
+    "metadata_json": "{\"dispatch_disposition\":{\"blocker_digest\":\"sha256:7b8713172d2b40c4b9ad259e6ac4e94e0a4fe0e266550efdb505edca28603283\",\"capability\":\"project_capacity\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"project_waiting_on_owner: 10 parked tasks waiting on the owner\",\"task_version\":1}}",
+    "operator_reason": null,
+    "project_wait": "waiting_on_owner",
+    "public_condition": {
+      "additional": [],
+      "details": {
+        "blocked": false,
+        "diagnostic": null,
+        "entry_wait": false,
+        "failed": false,
+        "failure_kind": null,
+        "human_wait": false,
+        "interruption": null
+      },
+      "kind": "parked",
+      "primary": {
+        "kind": "capacity",
+        "scope": "project"
+      },
+      "resume": {
+        "kind": "reconcile"
+      },
+      "since": null
+    },
+    "reason": "project_waiting_on_owner",
+    "safe_message": "project_waiting_on_owner: 10 parked tasks waiting on the owner",
+    "source_commit": "9296fb764f52ec6418ed53d582cbae8fc0635811",
+    "version": 1
+  },
+  {
+    "attention_dedupe_key": "task-interruption-update:task:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401",
+    "condition_json": "{\"kind\":\"parked\",\"primary\":{\"kind\":\"capacity\",\"scope\":\"machine\"},\"additional\":[],\"resume\":{\"kind\":\"reconcile\"},\"since\":null,\"evidence\":{\"presentation\":{\"owner\":null,\"recovery\":null,\"diagnostic\":null,\"diagnostic_present\":false,\"interruption\":null,\"interruption_present\":false,\"failure_message\":null,\"blocked_message\":null,\"exception_message\":null,\"interruption_execution_id\":null,\"hard_failure\":false,\"failure_kind\":null,\"entry\":null,\"entry_recorded\":false,\"human_wait\":false,\"explicit_human_wait\":false,\"queued_command\":false,\"external_merge\":false,\"retry_recorded\":false,\"retry\":null,\"retry_display\":null,\"retry_kind\":null,\"refusal\":{\"task_version\":1,\"capability\":\"machine_capacity\",\"blocker_digest\":\"sha256:449d7eeb18ee4f7009de5ab90ce51f3f3b431398c0488ad9056db46ed4e0d808\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"machine_capacity: waiting for a machine run slot\"},\"environment\":null,\"environment_recorded\":false,\"placement\":null,\"failed_step_id\":null,\"slot_blocker\":false,\"review_wait\":false,\"review_failure\":false,\"operator_reason\":null,\"placement_matches_diagnostic\":false},\"witnesses\":[{\"kind\":\"entry\",\"task_id\":\"task\",\"epoch\":0,\"transition_id\":null,\"since\":\"2026-10-25T22:16:46.363506+00:00\",\"initial\":true,\"human_wait\":false,\"review_wait\":false,\"review_failure\":false}],\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{\"dispatch_disposition\":\"{\\\"blocker_digest\\\":\\\"sha256:449d7eeb18ee4f7009de5ab90ce51f3f3b431398c0488ad9056db46ed4e0d808\\\",\\\"capability\\\":\\\"machine_capacity\\\",\\\"recorded_at\\\":\\\"2026-10-25T00:00:00Z\\\",\\\"safe_message\\\":\\\"machine_capacity: waiting for a machine run slot\\\",\\\"task_version\\\":1}\"},\"unparsed_metadata\":null}}",
+    "created_at": "2026-10-25T22:16:46.363506+00:00",
+    "id": "task",
+    "label": "Waiting for a Machine Slot",
+    "message": "waiting for a machine run slot",
+    "metadata_json": "{\"dispatch_disposition\":{\"blocker_digest\":\"sha256:449d7eeb18ee4f7009de5ab90ce51f3f3b431398c0488ad9056db46ed4e0d808\",\"capability\":\"machine_capacity\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"machine_capacity: waiting for a machine run slot\",\"task_version\":1}}",
+    "operator_reason": null,
+    "project_wait": null,
+    "public_condition": {
+      "additional": [],
+      "details": {
+        "blocked": false,
+        "diagnostic": null,
+        "entry_wait": false,
+        "failed": false,
+        "failure_kind": null,
+        "human_wait": false,
+        "interruption": null
+      },
+      "kind": "parked",
+      "primary": {
+        "kind": "capacity",
+        "scope": "machine"
+      },
+      "resume": {
+        "kind": "reconcile"
+      },
+      "since": null
+    },
+    "reason": "machine_capacity",
+    "safe_message": "machine_capacity: waiting for a machine run slot",
+    "source_commit": "9296fb764f52ec6418ed53d582cbae8fc0635811",
+    "version": 1
+  },
+  {
+    "attention_dedupe_key": "task-interruption-update:task:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401",
+    "condition_json": "{\"kind\":\"parked\",\"primary\":{\"kind\":\"capacity\",\"scope\":\"disk\"},\"additional\":[],\"resume\":{\"kind\":\"reconcile\"},\"since\":null,\"evidence\":{\"presentation\":{\"owner\":null,\"recovery\":null,\"diagnostic\":null,\"diagnostic_present\":false,\"interruption\":null,\"interruption_present\":false,\"failure_message\":null,\"blocked_message\":null,\"exception_message\":null,\"interruption_execution_id\":null,\"hard_failure\":false,\"failure_kind\":null,\"entry\":null,\"entry_recorded\":false,\"human_wait\":false,\"explicit_human_wait\":false,\"queued_command\":false,\"external_merge\":false,\"retry_recorded\":false,\"retry\":null,\"retry_display\":null,\"retry_kind\":null,\"refusal\":{\"task_version\":1,\"capability\":\"machine_capacity\",\"blocker_digest\":\"sha256:bd28f94edde7dc3cfbb43bf54772a02fa792c11f38f52122ad0a29d2b4edb7ff\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"disk low\",\"capacity_scope\":\"disk\"},\"environment\":null,\"environment_recorded\":false,\"placement\":null,\"failed_step_id\":null,\"slot_blocker\":false,\"review_wait\":false,\"review_failure\":false,\"operator_reason\":null,\"placement_matches_diagnostic\":false},\"witnesses\":[{\"kind\":\"entry\",\"task_id\":\"task\",\"epoch\":0,\"transition_id\":null,\"since\":\"2026-10-25T22:16:46.376609+00:00\",\"initial\":true,\"human_wait\":false,\"review_wait\":false,\"review_failure\":false}],\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{\"dispatch_disposition\":\"{\\\"blocker_digest\\\":\\\"sha256:bd28f94edde7dc3cfbb43bf54772a02fa792c11f38f52122ad0a29d2b4edb7ff\\\",\\\"capability\\\":\\\"machine_capacity\\\",\\\"capacity_scope\\\":\\\"disk\\\",\\\"recorded_at\\\":\\\"2026-10-25T00:00:00Z\\\",\\\"safe_message\\\":\\\"disk low\\\",\\\"task_version\\\":1}\"},\"unparsed_metadata\":null}}",
+    "created_at": "2026-10-25T22:16:46.376609+00:00",
+    "id": "task",
+    "label": "Waiting for Disk Space",
+    "message": "disk low",
+    "metadata_json": "{\"dispatch_disposition\":{\"blocker_digest\":\"sha256:bd28f94edde7dc3cfbb43bf54772a02fa792c11f38f52122ad0a29d2b4edb7ff\",\"capability\":\"machine_capacity\",\"capacity_scope\":\"disk\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"disk low\",\"task_version\":1}}",
+    "operator_reason": null,
+    "project_wait": null,
+    "public_condition": {
+      "additional": [],
+      "details": {
+        "blocked": false,
+        "diagnostic": null,
+        "entry_wait": false,
+        "failed": false,
+        "failure_kind": null,
+        "human_wait": false,
+        "interruption": null
+      },
+      "kind": "parked",
+      "primary": {
+        "kind": "capacity",
+        "scope": "disk"
+      },
+      "resume": {
+        "kind": "reconcile"
+      },
+      "since": null
+    },
+    "reason": "disk_pressure",
+    "safe_message": "disk low",
+    "source_commit": "9296fb764f52ec6418ed53d582cbae8fc0635811",
+    "version": 1
+  },
+  {
+    "attention_dedupe_key": "task-interruption-update:task:1:52a0d1ac4568bf4775c96f9c143cda7e9f03d01566c0839e8c74c3327a89f401",
+    "condition_json": "{\"kind\":\"parked\",\"primary\":{\"kind\":\"dispatch_refusal\",\"capability\":\"coder\",\"blocker_digest\":\"sha256:f5020b2fd541c96caadb78afd01c269499717e237ed9a889459eb5522b3168ea\"},\"additional\":[],\"resume\":{\"kind\":\"reconcile\"},\"since\":null,\"evidence\":{\"presentation\":{\"owner\":null,\"recovery\":null,\"diagnostic\":null,\"diagnostic_present\":false,\"interruption\":null,\"interruption_present\":false,\"failure_message\":null,\"blocked_message\":null,\"exception_message\":null,\"interruption_execution_id\":null,\"hard_failure\":false,\"failure_kind\":null,\"entry\":null,\"entry_recorded\":false,\"human_wait\":false,\"explicit_human_wait\":false,\"queued_command\":false,\"external_merge\":false,\"retry_recorded\":false,\"retry\":null,\"retry_display\":null,\"retry_kind\":null,\"refusal\":{\"task_version\":1,\"capability\":\"coder\",\"blocker_digest\":\"sha256:f5020b2fd541c96caadb78afd01c269499717e237ed9a889459eb5522b3168ea\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"no coder agent\"},\"environment\":null,\"environment_recorded\":false,\"placement\":null,\"failed_step_id\":null,\"slot_blocker\":false,\"review_wait\":false,\"review_failure\":false,\"operator_reason\":null,\"placement_matches_diagnostic\":false},\"witnesses\":[{\"kind\":\"entry\",\"task_id\":\"task\",\"epoch\":0,\"transition_id\":null,\"since\":\"2026-10-25T22:16:46.390800+00:00\",\"initial\":true,\"human_wait\":false,\"review_wait\":false,\"review_failure\":false}],\"error_annotation\":null,\"blocked_json\":null,\"failed_json\":null,\"entry_barrier_json\":null,\"metadata\":{\"dispatch_disposition\":\"{\\\"blocker_digest\\\":\\\"sha256:f5020b2fd541c96caadb78afd01c269499717e237ed9a889459eb5522b3168ea\\\",\\\"capability\\\":\\\"coder\\\",\\\"recorded_at\\\":\\\"2026-10-25T00:00:00Z\\\",\\\"safe_message\\\":\\\"no coder agent\\\",\\\"task_version\\\":1}\"},\"unparsed_metadata\":null}}",
+    "created_at": "2026-10-25T22:16:46.390800+00:00",
+    "id": "task",
+    "label": "Dispatch Parked",
+    "message": "coder dispatch is parked until this Task changes or is woken: no coder agent",
+    "metadata_json": "{\"dispatch_disposition\":{\"blocker_digest\":\"sha256:f5020b2fd541c96caadb78afd01c269499717e237ed9a889459eb5522b3168ea\",\"capability\":\"coder\",\"recorded_at\":\"2026-10-25T00:00:00Z\",\"safe_message\":\"no coder agent\",\"task_version\":1}}",
+    "operator_reason": null,
+    "project_wait": null,
+    "public_condition": {
+      "additional": [],
+      "details": {
+        "blocked": false,
+        "diagnostic": null,
+        "entry_wait": false,
+        "failed": false,
+        "failure_kind": null,
+        "human_wait": false,
+        "interruption": null
+      },
+      "kind": "parked",
+      "primary": {
+        "blocker_digest": "sha256:f5020b2fd541c96caadb78afd01c269499717e237ed9a889459eb5522b3168ea",
+        "capability": "coder",
+        "kind": "dispatch_refusal"
+      },
+      "resume": {
+        "kind": "reconcile"
+      },
+      "since": null
+    },
+    "reason": "dispatch_parked",
+    "safe_message": "no coder agent",
+    "source_commit": "9296fb764f52ec6418ed53d582cbae8fc0635811",
+    "version": 1
+  }
+]

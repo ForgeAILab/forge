@@ -7891,9 +7891,18 @@ must obtain Project room before it un-parks; a full Project replaces the machine
 reason with a parked `project_capacity` wait and retries on later ticks.
 
 The Project response exposes `{limit, active, parked, queued}` as `slots`.
-Capacity waits record `project_capacity` dispatch dispositions with
-`project_at_capacity` or `project_waiting_on_owner`; `workflow_health` projects
-the current message and reason to cards and Task detail. Unlike sticky role
+Capacity waits record `project_capacity` dispatch dispositions with a typed
+`project_wait` subcause (`at_capacity` or `waiting_on_owner`) beside the unchanged
+`safe_message`. Readers select `project_at_capacity` or `project_waiting_on_owner`
+from that subcause; both remain the public `Capacity(Project)` condition.
+`read_pre_upgrade_project_wait` reads rows written before this field existed,
+using their original `project_waiting_on_owner: ` prefix rule only when the field
+is absent. `ConditionRefusal` keeps its stored field order, with `project_wait`
+appended last and omitted when absent. Existing dispatch-disposition rows keep
+their stored condition bytes and Project list revision during invariant checks,
+as well as their public condition, offers, Operations text, and Attention
+material/digest on upgrade. `workflow_health` projects the current
+message and reason to cards and Task detail. Unlike sticky role
 refusals, these waits are reconsidered every tick as other Tasks free capacity.
 Recording a changed capacity disposition or clearing one publishes `task.updated`
 to refresh cards, Task detail, and Project slot usage; unchanged ticks emit nothing.

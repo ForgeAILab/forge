@@ -1,10 +1,15 @@
 use chrono::{DateTime, Utc};
-use db::{now_rfc3339, Task, TaskMetadata, TaskMetadataMutation, TaskRepo};
+use db::{
+    now_rfc3339, ConditionRefusal, ProjectWait, Task, TaskMetadata, TaskMetadataMutation, TaskRepo,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{Result, ServiceError};
+
+#[cfg(test)]
+mod project_wait_tests;
 
 const METADATA_KEY: &str = "deferred_dispatch";
 pub(crate) const QUEUED_RECOVERY_KEY: &str = "queued_recovery";
@@ -350,7 +355,7 @@ pub(crate) async fn clear_paused_integration(
 // exactly the infinite churn F11 describes. The ten-second scan re-attempts
 // dispatch and re-logs the identical denial forever, and review never runs.
 //
-// A `DispatchDisposition` instead records the last attempt's outcome keyed by
+// A `ConditionRefusal` instead records the last attempt's outcome keyed by
 // the Task's own `version`, the execution capability the scan was attempting,
 // and a digest of what blocked it. While the Task's current
 // `(version, capability)` still matches a stored disposition, nothing has
@@ -373,22 +378,7 @@ const DISPOSITION_METADATA_KEY: &str = "dispatch_disposition";
 /// changes or is woken (a dependency finished, a link was removed).
 pub(crate) const DEPENDENCY_WAIT_CAPABILITY: &str = "dependency_wait";
 
-/// The stored record of one dispatch attempt's deterministic refusal. See the
-/// notes above for the invalidation contract.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub(crate) struct DispatchDisposition {
-    pub task_version: i64,
-    pub capability: String,
-    pub blocker_digest: String,
-    pub recorded_at: String,
-    pub safe_message: String,
-    /// What a `machine_capacity` wait is for when it is not a run slot:
-    /// `disk`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity_scope: Option<String>,
-}
-
-pub(crate) fn dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
+pub(crate) fn dispatch_disposition(task: &Task) -> Option<ConditionRefusal> {
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).ok()?;
     serde_json::from_value(metadata.extra.get(DISPOSITION_METADATA_KEY)?.clone()).ok()
 }
@@ -412,7 +402,7 @@ pub(crate) fn dispatch_disposition_is_current(task: &Task, capability: &str) -> 
 /// Role dispositions wait for a Task change or explicit wake. The
 /// `project_capacity` and `machine_capacity` capabilities explain temporary
 /// queueing and are rechecked each tick, since another Task can free a slot.
-pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<DispatchDisposition> {
+pub(crate) fn current_dispatch_disposition(task: &Task) -> Option<ConditionRefusal> {
     dispatch_disposition(task).filter(|disposition| {
         disposition.task_version == task.version
             || matches!(
@@ -432,6 +422,24 @@ pub(crate) async fn record_dispatch_disposition(
     safe_message: &str,
 ) -> Result<bool> {
     record_dispatch_disposition_naming(db, task, capability, safe_message, &[]).await
+}
+
+pub(crate) async fn record_project_capacity_wait(
+    db: &db::SqliteDb,
+    task: &Task,
+    project_wait: ProjectWait,
+    safe_message: &str,
+) -> Result<bool> {
+    record_disposition(
+        db,
+        task,
+        "project_capacity",
+        safe_message,
+        &[],
+        None,
+        Some(project_wait),
+    )
+    .await
 }
 
 /// The wait message of a Task no machine can take for lack of a run slot.
@@ -458,6 +466,7 @@ pub(crate) async fn record_capacity_wait(
                 &message,
                 &[],
                 Some(api_types::CAPACITY_SCOPE_DISK),
+                None,
             )
             .await
         }
@@ -512,7 +521,16 @@ pub(crate) async fn record_dispatch_disposition_naming(
     safe_message: &str,
     dependency_ids: &[String],
 ) -> Result<bool> {
-    record_disposition(db, task, capability, safe_message, dependency_ids, None).await
+    record_disposition(
+        db,
+        task,
+        capability,
+        safe_message,
+        dependency_ids,
+        None,
+        None,
+    )
+    .await
 }
 
 async fn record_disposition(
@@ -522,7 +540,9 @@ async fn record_disposition(
     safe_message: &str,
     dependency_ids: &[String],
     capacity_scope: Option<&str>,
+    project_wait: Option<ProjectWait>,
 ) -> Result<bool> {
+    debug_assert_eq!(capability == "project_capacity", project_wait.is_some());
     let metadata = TaskMetadata::parse(task.metadata_json.as_deref()).map_err(|error| {
         ServiceError::invalid_operation(format!("invalid task metadata for {}: {error}", task.id))
     })?;
@@ -534,6 +554,7 @@ async fn record_disposition(
                 && disposition.capability == capability
                 && disposition.blocker_digest == blocker_digest
                 && disposition.safe_message == safe_message
+                && project_wait.is_none_or(|wait| disposition.project_wait_subcause() == Some(wait))
         })
     {
         return Ok(false);
@@ -550,6 +571,9 @@ async fn record_disposition(
     }
     if let Some(scope) = capacity_scope {
         value["capacity_scope"] = json!(scope);
+    }
+    if let Some(wait) = project_wait {
+        value["project_wait"] = json!(wait);
     }
     let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
         Some(expected) => TaskMetadataMutation::SetIf {
@@ -616,7 +640,7 @@ pub(crate) async fn clear_dispatch_disposition(db: &db::SqliteDb, task: &Task) -
 }
 
 #[cfg(test)]
-pub(crate) fn dispatch_disposition_for_test(task: &Task) -> Option<DispatchDisposition> {
+pub(crate) fn dispatch_disposition_for_test(task: &Task) -> Option<ConditionRefusal> {
     dispatch_disposition(task)
 }
 
@@ -723,6 +747,7 @@ pub(crate) async fn finish_machine_wait(
                 &d.safe_message,
                 &[],
                 d.capacity_scope.as_deref(),
+                d.project_wait_subcause(),
             )
             .await?;
         }
