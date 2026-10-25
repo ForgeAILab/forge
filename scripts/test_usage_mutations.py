@@ -36,14 +36,56 @@ MUTATIONS=[
 ]
 
 
+def mutation_sources(root: Path) -> dict[Path, str]:
+    file = root/'crates/services/src/usage_projection/ledger_index.rs'
+    files = [file, *sorted(file.with_suffix('').rglob('*.rs'))]
+    return {path: path.read_text() for path in files}
+
+
+def mutation_site(originals: dict[Path, str], identity: str, old: str) -> tuple[Path, int]:
+    # Faults target production code; existing test assertions can contain the
+    # same text (for example M5b's last_key_value call).
+    sites = {path: text.count(old) for path, text in originals.items()
+             if not path.stem.endswith('tests')}
+    matches = sum(sites.values())
+    expected = 2 if identity == 'M15' else 1
+    if matches != expected:
+        raise ValueError(f'{identity}: expected {expected} mutation site(s), found {matches}')
+    holders = [path for path, count in sites.items() if count]
+    if len(holders) != 1:
+        # Base replaced the first site in one file; sites split across files
+        # would make "first" depend on file order.
+        raise ValueError(f'{identity}: mutation sites span {len(holders)} files')
+    return holders[0], matches
+
+
 def main()->None:
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--scratch',type=Path,required=True)
+    p.add_argument('--scratch',type=Path)
+    p.add_argument('--dry-run',action='store_true',help='check mutation site counts without copying or running cargo')
     p.add_argument('--only',nargs='*')
     p.add_argument('--resume',action='store_true')
     p.add_argument('--no-debug-info',action='store_true')
     args=p.parse_args()
     source=Path(__file__).resolve().parents[1]
+    if args.dry_run:
+        originals = mutation_sources(source)
+        errors = []
+        for identity, _, old, _ in MUTATIONS:
+            if args.only and identity not in args.only:continue
+            try:
+                file, matches = mutation_site(originals, identity, old)
+            except ValueError as error:
+                print(error)
+                errors.append(str(error))
+                continue
+            print(f'{identity}: {matches} site(s); first in {file.relative_to(source)}')
+            test_matches = sum(text.count(old) for path, text in originals.items()
+                               if path.stem.endswith('tests'))
+            if test_matches:print(f'  excluded {test_matches} occurrence(s) in test files')
+        if errors:raise SystemExit(1)
+        return
+    if args.scratch is None:p.error('--scratch is required unless --dry-run is supplied')
     scratch=args.scratch.resolve()
     if not scratch.is_relative_to('/Volumes/Data/tmp') or scratch==source:
         raise ValueError('scratch must be a separate directory under /Volumes/Data/tmp')
@@ -61,7 +103,7 @@ def main()->None:
     if target.resolve()==(source/'target').resolve():raise ValueError('source target must never be used')
     if args.no_debug_info:
         env.update(CARGO_PROFILE_TEST_DEBUG='0',CARGO_PROFILE_DEV_DEBUG='0')
-    file=root/'crates/services/src/usage_projection/ledger_index.rs';original=file.read_text()
+    originals=mutation_sources(root)
     # Warm the isolated target and establish that the copied test gate passes.
     command=['cargo','test','--offline','-p','services','--lib','usage_projection::ledger_index::tests::','--','--test-threads','4']
     with (scratch/'baseline.log').open('w') as log:
@@ -70,9 +112,8 @@ def main()->None:
     results=[]
     for identity,description,old,new in MUTATIONS:
         if args.only and identity not in args.only:continue
-        matches=original.count(old)
-        expected=2 if identity=='M15' else 1
-        if matches!=expected:raise ValueError(f'{identity}: expected {expected} mutation site(s), found {matches}')
+        file, _ = mutation_site(originals, identity, old)
+        original = originals[file]
         file.write_text(original.replace(old,new,1));start=time.perf_counter()
         try:
             with (scratch/(identity+'.log')).open('w') as log:

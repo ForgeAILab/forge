@@ -57,6 +57,12 @@ types.
 | `workspace_cleanup.rs` | Existing garbage collection child; scheduler production code remains in the root |
 | `task_actions.rs` | Offer derivation; snapshot loading remains in the root |
 | `task_service/execution/recovery.rs` | Action ownership, queued actions, failure metadata, retry budgets, process continuation, restart, manual review, entry recovery |
+| `usage_projection/ledger_index.rs` | Query, budget, and synchronization operations in `ledger_index/queries.rs`; state and folds remain in the root |
+| `daemon_transport/workspace_client.rs` | Object transfer in `workspace_client/object_transfer.rs`; RPC, receipt, and retry tests in `workspace_client/tests.rs` |
+| `project_artifact_commands.rs` | Command execution in `project_artifact_commands/execution.rs`; validation observation and manifest tests in `project_artifact_commands/tests.rs` |
+| `operating_skills.rs` | Rendering and digest tests in `operating_skills/tests.rs`; doctrine cutover tests in `operating_skills/doctrine_cutover_tests.rs`; protocol strings remain in the root |
+| `project_milestone_commands.rs` | Milestone definition, readiness, and release request execution in `project_milestone_commands/execution.rs` |
+| `terminal_service.rs` | Embedded PTY tasks, output, and cleanup in `terminal_service/embedded.rs`; session and control tests in `terminal_service/tests.rs` |
 
 Unit tests remain below the same top-level module prefixes, including
 `task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
