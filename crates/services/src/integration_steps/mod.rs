@@ -44,6 +44,8 @@ use db::{
 use std::sync::Arc;
 
 pub(crate) mod admission;
+#[cfg(test)]
+mod condition_tests;
 pub(crate) mod deferral;
 pub(crate) mod gate;
 pub mod import;
