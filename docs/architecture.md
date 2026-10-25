@@ -92,6 +92,14 @@ continue through the roots, and inherent methods remain on their original types.
 Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
 `daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
 
+The same layout applies to these agents and database modules:
+
+| Root | Implementation children |
+|---|---|
+| `services-agents/src/provider_authorization.rs` | OAuth protocol helpers and service types stay in the root; the service implementation (constructor, capability registry, browser/device flows and state handling) lives in `provider_authorization/flows.rs`, with tests in `provider_authorization/tests.rs` |
+| `db/src/sqlite/project.rs` | Project repository operations and chat/binding bootstrap stay in the root; authority, settings, ownership, typed projections, primary-milestone writes and owner bootstrap live in `project/queries.rs` (the `WorkflowProjectAuthorityRow` type stays in the root), with public items re-exported through the root |
+| `db/src/sqlite/orchestration/charters.rs` | Charter reads, revisions, and approval records stay in the root; atomic approval application lives in `charters/apply_approval.rs`, re-exported at its original scope |
+
 ### Dependency flow
 
 ```

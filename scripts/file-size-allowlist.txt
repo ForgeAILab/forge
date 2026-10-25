@@ -14,8 +14,6 @@
 2654 crates/db/src/check_run/tests.rs
 2266 crates/db/src/integration_queue/activation_tests.rs
 2028 crates/db/src/integration_queue/fencing.rs
-2471 crates/db/src/sqlite/orchestration/charters.rs
-2193 crates/db/src/sqlite/project.rs
 2303 crates/db/src/task_condition/tests.rs
 2189 crates/db/src/task_step.rs
 12529 crates/db/src/tests.rs
@@ -23,7 +21,6 @@
 2035 crates/forge-client/src/daemon_workspace/tests/protocol.rs
 2931 crates/forge-solo/src/session.rs
 3168 crates/mcp-server/src/tests.rs
-2108 crates/services-agents/src/provider_authorization.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
 4199 crates/services-agents/tests/suite/native_chat_tool_exchanges.rs
