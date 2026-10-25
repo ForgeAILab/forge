@@ -20,10 +20,8 @@
 3168 crates/mcp-server/src/tests.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
 2124 crates/services-agents/tests/suite/direct_command_classification.rs
-4199 crates/services-agents/tests/suite/native_chat_tool_exchanges.rs
 3907 crates/services-agents/tests/suite/native_scope_composition.rs
 4144 crates/services-agents/tests/suite/wake_turn_consumer.rs
-3607 crates/services/src/check_runner/tests.rs
 3541 crates/services/src/integration_steps/gate_tests.rs
 5222 crates/services/src/integration_steps/tests.rs
 3329 crates/services/src/integration_worker/tests.rs
@@ -37,10 +35,8 @@
 2858 crates/services/src/task_service/execution/runner.rs
 2113 crates/services/src/task_service/governance.rs
 10367 crates/services/src/task_service/tests/service_tests/cases/executions.rs
-2129 crates/services/src/usage_projection/ledger_index/tests.rs
 2001 crates/services/src/worker_runtime/queue/tests.rs
 4897 crates/services/src/workflow/actions/tests.rs
 2227 crates/services/src/workflow/dispatch/tests.rs
 5532 crates/services/src/workflow/engine/tests.rs
 3009 crates/services/src/workflow/engine/tests/durable_23b.rs
-2362 crates/services/tests/suite/project_milestone_command.rs
