@@ -63,6 +63,10 @@ types.
 | `operating_skills.rs` | Rendering and digest tests in `operating_skills/tests.rs`; doctrine cutover tests in `operating_skills/doctrine_cutover_tests.rs`; protocol strings remain in the root |
 | `project_milestone_commands.rs` | Milestone definition, readiness, and release request execution in `project_milestone_commands/execution.rs` |
 | `terminal_service.rs` | Embedded PTY tasks, output, and cleanup in `terminal_service/embedded.rs`; session and control tests in `terminal_service/tests.rs` |
+| `coordination_service.rs` | Commitment, inbox, action, and policy code stays in the root; tests live in `coordination_service/tests.rs`, alongside the existing test-only `base_policy.rs` oracle |
+| `task_service/execution/ledger.rs` | Pricing admission, frozen selections, and usage-event construction stay in the root; settlement preparation and terminal payloads live in `ledger/settlement.rs`, with tests in `ledger/tests.rs` |
+| `integration_worker/driver.rs` | Head sessions, scheduling, retries, and transfer coordination stay in the root; validation, rebase, check, fast-forward, and reconciliation stages live in `driver/states.rs` |
+| `integration_owner.rs` | Server owner admission, Git effects, object transfer, and receipt validation stay in the root; tests live in `integration_owner/tests.rs` |
 
 Unit tests remain below the same top-level module prefixes, including
 `task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard

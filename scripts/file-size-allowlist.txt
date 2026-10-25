@@ -27,11 +27,8 @@
 3907 crates/services-agents/tests/suite/native_scope_composition.rs
 4144 crates/services-agents/tests/suite/wake_turn_consumer.rs
 3607 crates/services/src/check_runner/tests.rs
-2372 crates/services/src/coordination_service.rs
-2037 crates/services/src/integration_owner.rs
 3541 crates/services/src/integration_steps/gate_tests.rs
 5222 crates/services/src/integration_steps/tests.rs
-2216 crates/services/src/integration_worker/driver.rs
 3329 crates/services/src/integration_worker/tests.rs
 2993 crates/services/src/operator_status.rs
 2919 crates/services/src/placement/selection.rs
@@ -40,7 +37,6 @@
 2036 crates/services/src/task_dispatcher/tests/equivalence.rs
 2342 crates/services/src/task_dispatcher/tests/lead_check.rs
 2541 crates/services/src/task_dispatcher/tests/lead_operations.rs
-2529 crates/services/src/task_service/execution/ledger.rs
 2858 crates/services/src/task_service/execution/runner.rs
 2113 crates/services/src/task_service/governance.rs
 10367 crates/services/src/task_service/tests/service_tests/cases/executions.rs

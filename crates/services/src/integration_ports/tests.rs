@@ -433,6 +433,10 @@ fn nothing_on_the_head_side_can_recreate_a_worktree() {
             include_str!("../integration_worker/driver.rs"),
         ),
         (
+            "integration_worker/driver/states",
+            include_str!("../integration_worker/driver/states.rs"),
+        ),
+        (
             "integration_worker/ports",
             include_str!("../integration_worker/ports.rs"),
         ),
