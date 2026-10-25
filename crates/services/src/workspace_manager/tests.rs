@@ -1265,7 +1265,11 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     // Manager and backend internals.
     // (two of these are the anchor definitions themselves)
     ("services/src/workspace_manager.rs", 7),
-    ("services/src/task_service/workspace.rs", 2),
+    ("services/src/task_service/workspace/reset.rs", 1),
+    (
+        "services/src/task_service/workspace/worktree_recovery.rs",
+        1,
+    ),
     ("services/src/workspace_backend/embedded.rs", 4),
     ("services/src/workspace_backend/review.rs", 10),
     ("review/src/workspace.rs", 2),
@@ -1282,9 +1286,10 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     ("services/src/terminal_service.rs", 1),
     // Task-root anchors only: plan and outbox files beside the worktree.
     ("services/src/plan_artifact.rs", 5),
-    // recovery.rs: also the directory that holds the Task roots, to sweep
+    ("services/src/recovery.rs", 1),
+    // recovery/crash.rs: the directory that holds the Task roots, to sweep
     // the temp directories of dead runs.
-    ("services/src/recovery.rs", 2),
+    ("services/src/recovery/crash.rs", 1),
     ("services/src/task_service/execution.rs", 1),
 ];
 
