@@ -338,10 +338,8 @@ impl TaskCondition {
     /// does not carry.
     pub(crate) fn stored_agrees(stored: &[u8], expected: &Self, encoded: &str) -> bool {
         stored == encoded.as_bytes()
-            || serde_json::from_slice::<Self>(stored).is_ok_and(|stored| {
-                (stored.evidence().stated || !stored.evidence().diagnostic_ids.is_empty())
-                    && stored.typed() == expected.typed()
-            })
+            || serde_json::from_slice::<Self>(stored)
+                .is_ok_and(|stored| stored.evidence().stated && stored.typed() == expected.typed())
     }
 }
 

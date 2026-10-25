@@ -135,12 +135,23 @@ pub(super) async fn derive_with_policy(
     let carried = (!explicit)
         .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
         .flatten();
-    // Statements edit typed owners; lifecycle facts are laid over the result.
+    // New owner contracts replace projected lifecycle facts. Existing
+    // statements edit the stored condition exactly as before.
     let statement = stated;
     let empty = TaskCondition::default();
     let stored_base = carried.as_ref().or(stored.as_ref());
     let refreshed_base = stored_base
-        .filter(|_| statement.is_some())
+        .filter(|_| {
+            matches!(
+                statement,
+                Some(
+                    ConditionStatement::Preserve
+                        | ConditionStatement::Edit { .. }
+                        | ConditionStatement::ReplaceDiagnostic { .. }
+                        | ConditionStatement::Restore { .. }
+                )
+            )
+        })
         .map(recovery::owner_base);
     let base = refreshed_base.as_ref().or(stored_base).unwrap_or(&empty);
     let stated = match statement {
@@ -329,7 +340,9 @@ pub(super) async fn derive_with_policy(
     let mut condition = condition;
     if corruption.is_some() {
         let id = recovery::record_raw(c, task_id, &snapshot.stored).await?;
-        condition.evidence_mut().diagnostic_ids.push(id);
+        if policy == recovery::UnreadablePolicy::DurableOwners {
+            condition.evidence_mut().diagnostic_ids.push(id);
+        }
     }
     if let Some(statement) = statement {
         write::record_statement_text(c, task_id, statement).await?;

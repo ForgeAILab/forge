@@ -160,7 +160,11 @@ pub(super) async fn set_condition(
     condition: &str,
     expected_version: Option<i64>,
 ) -> Result<()> {
-    let _written =
+    debug_assert!(
+        decode(condition).is_ok_and(|decoded| encode(&decoded) == condition),
+        "Task condition must round-trip through its stored form"
+    );
+    let written =
         sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
             .bind(condition)
             .bind(task_id)
@@ -168,6 +172,7 @@ pub(super) async fn set_condition(
             .execute(connection)
             .await?
             .rows_affected();
+    debug_assert!(written <= 1, "one Task owns one condition");
     Ok(())
 }
 
@@ -448,11 +453,7 @@ impl SqliteDb {
             if condition.integration_reason().is_some() || condition.check_witness().is_some() {
                 expected.typed() == condition.typed()
             } else {
-                let mut expected = expected;
-                let mut actual = condition.clone();
-                expected.evidence_mut().diagnostic_ids.clear();
-                actual.evidence_mut().diagnostic_ids.clear();
-                expected == actual
+                expected == *condition
             }
         };
         if !stated.is_some_and(agrees) {

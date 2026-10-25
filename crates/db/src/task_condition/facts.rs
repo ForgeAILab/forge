@@ -1011,32 +1011,42 @@ impl Snapshot {
     /// Failure recovery launches the assigned implementation role. Human work
     /// without a failure keeps its ordinary presentation and incurs no read.
     async fn missing_recovery_role(&self, c: &mut SqliteConnection) -> Result<Option<String>> {
-        let stored = write::applied_condition(&self.id, &self.stored, self.version).or_else(|| {
-            std::str::from_utf8(&self.stored)
-                .ok()
-                .and_then(|s| decode(s).ok())
-        });
-        let mapped = match (write::current_statement(&self.id), stored) {
-            (Some(ConditionStatement::Edit { edit }), Some(stored)) => {
-                edit.apply_at_epoch(&stored, Some(self.epoch))?
-            }
-            (
-                Some(ConditionStatement::ReplaceDiagnostic {
-                    replacement,
-                    preserve_interruption,
-                }),
-                Some(stored),
-            ) => diagnostic_projection::apply(&stored, &replacement, preserve_interruption)?,
-            (
-                Some(ConditionStatement::Preserve | ConditionStatement::Restore { .. }),
-                Some(stored),
-            ) => stored,
+        let stored = || {
+            write::applied_condition(&self.id, &self.stored, self.version).or_else(|| {
+                std::str::from_utf8(&self.stored)
+                    .ok()
+                    .and_then(|s| decode(s).ok())
+            })
+        };
+        let mapped = match write::current_statement(&self.id) {
+            Some(ConditionStatement::Edit { edit }) => stored()
+                .map(|stored| edit.apply_at_epoch(&stored, Some(self.epoch)))
+                .transpose()?,
+            Some(ConditionStatement::ReplaceDiagnostic {
+                replacement,
+                preserve_interruption,
+            }) => stored()
+                .map(|stored| {
+                    diagnostic_projection::apply(&stored, &replacement, preserve_interruption)
+                })
+                .transpose()?,
+            Some(ConditionStatement::Preserve | ConditionStatement::Restore { .. }) => stored(),
             _ if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle => {
+                Some(map_view(&self.input.view()))
+            }
+            _ => match stored() {
+                Some(stored) if !recovery::unreadable(&stored) => {
+                    Some(map_view(&self.input.view()))
+                }
+                _ => None,
+            },
+        };
+        let mapped = match mapped {
+            Some(mapped) => mapped,
+            None if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle => {
                 map_view(&self.input.view())
             }
-            (_, Some(stored)) if recovery::unreadable(&stored) => return Ok(None),
-            (_, None) => return Ok(None),
-            _ => map_view(&self.input.view()),
+            None => return Ok(None),
         };
         if !matches!(
             mapped,

@@ -121,6 +121,8 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
             } else {
                 result.unwrap_or_else(|e| panic!("{statement:?}: {e:?}"));
                 tx.commit().await.unwrap();
+                let raw = raw_condition(&db, &id).await;
+                assert_eq!(raw, encode(&expected), "{statement:?}: MAIN repair bytes");
                 let actual = db.task_condition(&id).await.unwrap();
                 assert_eq!(actual.typed(), expected.typed(), "{statement:?}");
                 assert_eq!(actual.public(), expected.public(), "{statement:?}");
@@ -143,6 +145,172 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
         })
         .await;
     }
+}
+
+async fn raw_condition(db: &SqliteDb, id: &str) -> String {
+    sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn legacy_oracle(db: &SqliteDb, id: &str) -> TaskCondition {
+    let row = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
+    let mut c = db.pool().acquire().await.unwrap();
+    let facts = ConditionFacts::load(&mut c, id).await.unwrap();
+    let mut input = LegacyConditionInput::from(&row);
+    input.facts = Some(facts);
+    map_legacy_condition(&input)
+}
+
+#[tokio::test]
+async fn corrupt_background_check_stores_main_repair_bytes() {
+    let db = db().await;
+    task(&db, "corrupt-check").await;
+    sqlx::query("UPDATE task SET condition_json='{}' WHERE id='corrupt-check'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let expected = encode(&legacy_oracle(&db, "corrupt-check").await);
+    let status = db
+        .check_task_conditions(CONDITION_CHECK_PAGE)
+        .await
+        .unwrap();
+    assert_eq!(status.repaired, 1);
+    assert_eq!(raw_condition(&db, "corrupt-check").await, expected);
+    let texts = db
+        .task_diagnostic_texts("corrupt-check", None, 100)
+        .await
+        .unwrap();
+    assert_eq!(texts.items.len(), 1);
+    assert_eq!(texts.items[0].text, "{}");
+    assert_eq!(texts.items[0].occurrence_count, 1);
+}
+
+#[tokio::test]
+async fn once_corrupt_legacy_copy_is_repaired_on_first_targeted_check() {
+    let db = db().await;
+    task(&db, "stale-copy").await;
+    sqlx::query("UPDATE task SET condition_json='{}' WHERE id='stale-copy'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let ids = ["stale-copy".to_owned()];
+    assert_eq!(db.check_task_conditions_of(&ids).await.unwrap(), 1);
+    let before = db.task_condition("stale-copy").await.unwrap();
+    sqlx::query("UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.awaiting_human',json('false')) WHERE id='stale-copy'")
+        .execute(db.pool()).await.unwrap();
+    let expected = legacy_oracle(&db, "stale-copy").await;
+    assert_eq!(before.typed(), expected.typed());
+    assert_ne!(raw_condition(&db, "stale-copy").await, encode(&expected));
+    assert_eq!(db.check_task_conditions_of(&ids).await.unwrap(), 1);
+    assert_eq!(raw_condition(&db, "stale-copy").await, encode(&expected));
+    assert_eq!(db.check_task_conditions_of(&ids).await.unwrap(), 0);
+}
+
+// Independent oracle for 6120c133's derive + strict seam: edit the stored
+// condition directly, overlay facts, and compare with the legacy/fact mapping.
+// It deliberately does not use derive, owner_base, or the production setter.
+async fn main_statement_outcome(
+    db: &SqliteDb,
+    id: &str,
+    statement: &ConditionStatement,
+) -> std::result::Result<(), String> {
+    let row = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
+    let mut c = db.pool().acquire().await.unwrap();
+    let mut facts = ConditionFacts::load(&mut c, id).await.unwrap();
+    match statement {
+        ConditionStatement::Integration { reason } => facts.integration = Some(reason.clone()),
+        ConditionStatement::Check { wait, epoch } => facts.check = Some((wait.clone(), *epoch)),
+        _ => panic!("oracle expects Integration or Check"),
+    }
+    let candidate = facts.apply(statement.apply(&row.condition));
+    let expected = facts.condition(&LegacyConditionInput::from(&row));
+    if candidate.typed() == expected.typed() {
+        Ok(())
+    } else {
+        Err("Task condition differs from its legacy and owner witnesses".into())
+    }
+}
+
+async fn coordination_statement_parity(block: Option<&str>, visible_children: bool) {
+    for integration in [false, true] {
+        let db = db().await;
+        task(&db, "root").await;
+        if visible_children {
+            task(&db, "child").await;
+            super::producer_tests::set_parent(&db, "root", &["child"]).await;
+        }
+        let annotation =
+            block.map(|kind| json!({"type":kind,"blocking_reason":"blocked root"}).to_string());
+        let mut tx = db.pool().begin().await.unwrap();
+        sqlx::query("UPDATE task SET error_annotation=?,metadata_json='{\"coordination_review_pending\":true}' WHERE id='root'")
+            .bind(annotation).execute(&mut *tx).await.unwrap();
+        db.sync_condition_in_tx(&mut tx, "root").await.unwrap();
+        tx.commit().await.unwrap();
+        let step = claim(&db, "root").await;
+        let raw_before = raw_condition(&db, "root").await;
+        let statement = if integration {
+            ConditionStatement::Integration {
+                reason: IntegrationReason::Waiting {
+                    attempt_id: IntegrationAttemptId::new("attempt"),
+                },
+            }
+        } else {
+            ConditionStatement::Check {
+                wait: CheckWait {
+                    consumer_id: "consumer".into(),
+                    origin: "entry".into(),
+                    phase: CheckWaitPhase::Result,
+                },
+                epoch: 0,
+            }
+        };
+        let expected = main_statement_outcome(&db, "root", &statement).await;
+        assert_eq!(
+            expected,
+            Err("Task condition differs from its legacy and owner witnesses".into()),
+            "fixture must reach MAIN's strict refusal"
+        );
+        crate::task_writer::in_task_step(step, async {
+            let mut tx = db.pool().begin().await.unwrap();
+            let actual = db
+                .state_integration_condition_in_tx(&mut tx, "root", &statement)
+                .await;
+            let actual = match actual {
+                Ok(()) => Ok(()),
+                Err(DbError::Check(message)) => Err(message),
+                Err(error) => panic!("unexpected error: {error:?}"),
+            };
+            assert_eq!(actual, expected, "{statement:?}");
+            assert_eq!(
+                sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id='root'")
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap(),
+                raw_before
+            );
+            tx.rollback().await.unwrap();
+        })
+        .await;
+        assert_eq!(raw_condition(&db, "root").await, raw_before);
+    }
+}
+
+#[tokio::test]
+async fn integration_and_check_match_main_on_held_root_with_children() {
+    coordination_statement_parity(Some("manual_stop"), true).await;
+}
+
+#[tokio::test]
+async fn integration_and_check_match_main_on_failed_root_with_children() {
+    coordination_statement_parity(Some("workspace_error"), true).await;
+}
+
+#[tokio::test]
+async fn integration_and_check_match_main_on_flagged_root_without_children() {
+    coordination_statement_parity(None, false).await;
 }
 
 #[tokio::test]

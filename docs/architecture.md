@@ -6175,8 +6175,13 @@ parks, wait/deadline rows, queue receipts, pending cancellations or immutable ev
 3.1 converts writers before removing storage. Writers still write the four
 legacy columns and condition metadata; unconverted aggregates continue to use
 the existing mapper. Column/key removal, the final reader guard and diagnostic
-REST/UI exposure belong to later gates. This checkpoint adds an additive text
-table; it does not delete or rewrite existing Task data.
+REST/UI exposure belong to later gates. This checkpoint adds
+`task_diagnostic_text` and captures full source text in it. It retains internal
+typed contracts for later writer conversions; it does not delete or rewrite
+existing Task data. Under the active `LegacyOracle` policy, stored condition
+bytes, public projections, offers, failure kinds, Operations text and Attention
+digests remain equal to main `6120c133`, including corruption repair and existing
+Integration/Check refusal outcomes.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
 owner `Edit`, and typed `Restore` alongside Hold/Release and the independently
@@ -6193,6 +6198,18 @@ supersession; its writer conversions remain unit A targets, alongside the hold
 writers. Those conversions must retain the exact legacy interruption reasons,
 failure-kind precedence and assignment guidance across two writes. Integration and check ownership still require their original
 claimed-step seam.
+
+Converted writers still shipping at this checkpoint:
+
+| Writer | Statement | Owns | Carries |
+|---|---|---|---|
+| `TaskService::hold_waiting_task` (owner Hold on a Task with no run) | `Hold { actor, reason, at }` | `Held`, the diagnostic, the interruption; drops failure, queued command, retry timer, dispatch refusal, environment wait, owner wait | entry block, placement denial, daemon-upgrade refusal, Project pause, human decision, plan settlement wait |
+| `TaskService::release_to_dispatch_queue` (owner Release of a waiting hold) | `Release` | clears diagnostic, interruption, failure | everything else, including a recorded retry timer |
+
+The hold's legacy annotation and operator text remain one rendering of the same
+typed fields (`ConditionStatement::hold_operator_text`), byte for byte what the
+annotation held before. Other hold paths, including stopping a running execution
+and releasing a stopped run, still use the mapping.
 
 `StatedCondition` states Parked, Failed or Deferred from caller intent.
 `ConditionPresentation` supplies typed diagnostic, interruption, failure, retry
@@ -6236,10 +6253,13 @@ and the base write outcome intact. Waiting Hold/Release and integration/check
 statements remain in use. Other S caller files and aggregates A–E still need their own
 conversion. Unconverted writers continue to map legacy after their write, so an
 intermediate gate does not silently change their intent. The mapping remains the
-independent per-writer oracle while dual write continues. Comparisons omit
-private ownership/diagnostic references; typed/public causes and material Attention
-inputs must agree immediately and after an ordinary legacy producer writes the
-same Task. The mapping revision remains 7: this additive checkpoint does not
+independent per-writer oracle while dual write continues. Existing Hold/Release
+and Integration/Check statements edit the stored condition as on main; only the
+new statement contracts remove previously projected lifecycle facts first.
+Stated rows compare by their typed condition, as on main. Unstated rows compare
+exact stored bytes, including all legacy evidence copies. Typed/public causes
+and material Attention inputs agree immediately and after an ordinary legacy
+producer writes the same Task. The mapping revision remains 7: this additive checkpoint does not
 schedule a new upgrade walk or re-encode healthy existing Task rows.
 
 **Diagnostic text.** `V202610250745__task_diagnostic_text` adds
@@ -6278,10 +6298,10 @@ newer encoding. While legacy storage is written, corruption is rebuilt from the
 legacy mapping plus durable facts in the same writer transaction or within one
 check sweep, as before this checkpoint. Every statement family uses that fallback
 on corruption; its text is retained without applying an edit over an empty
-condition. Strict comparison excludes diagnostic-text references. Under the active
-LegacyOracle policy, checks compare stated ownership rows with the legacy mapping
-too, so an incomplete conversion cannot make its own divergence authoritative.
-Original bytes are also retained as diagnostic text (base64 for non-UTF-8 bytes).
+condition. Under the active LegacyOracle policy, checks retain main's strict
+comparison: unstated rows compare byte for byte, stated rows by typed value.
+Original bytes are also retained as diagnostic text (base64 for non-UTF-8 bytes),
+without adding diagnostic ids or any other field to the stored condition.
 The dispatcher still resolves corrupt rows from legacy fields until that repair
 lands; it and the check use the same oracle. Each failed recomputation or repair is
 logged without stored text and skipped, so the cursor and revision marker advance
@@ -6298,7 +6318,15 @@ Release and board moves remain covered through their real services.
 A recognizable newer tag, including an unknown typed owner/identity, or an
 unreadable row under a newer recorded mapping revision remains quarantined
 byte for byte. Statements refuse the entire transaction with
-`TaskConditionQuarantined`; the exit is a build that understands that encoding.
+`DbError::TaskConditionQuarantined`, mapped through
+`ServiceError::TaskConditionQuarantined` to HTTP 409
+`task_condition_quarantined`; the legacy annotation and version bump roll back.
+A legacy writer that states nothing still lands with its producer skipped.
+Each completed check pass counts quarantined Tasks and retains the first 20 ids.
+Warnings name the count and ids, without repeating an unchanged set; backfill
+warns the same way. Operator status reports the count and ids. A newer recorded
+mapping revision is neither backfilled nor lowered. The exit is a build that
+understands that encoding.
 
 **Final production-read boundary (Q4).** After all writers/readers close, the
 source guard permits exactly the historical migration Rust post-step backfills

@@ -30,6 +30,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
   unchanged; new native session state uses the journal tables. One-way migration
   V202610240425 adds page layout generations, indexed session lookup and pin
   ranks without rewriting sealed data; missing ranks backfill on the next write.
+- Task diagnostic text store (migration V202610250745): the full text of
+  holds and of unreadable stored conditions is kept per Task, coalesced by
+  content with an occurrence count, up to 1 MiB per entry, and deleted with
+  its Task. Existing Task conditions are unchanged.
 
 ### Changed
 

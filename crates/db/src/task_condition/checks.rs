@@ -152,9 +152,10 @@ impl SqliteDb {
             .clone()
     }
     /// One indexed keyset page of at most [`CONDITION_CHECK_PAGE`] rows. No
-    /// full-table fetch, no workflow write, no event or wake. A failed page
-    /// keeps its cursor for a later supervised tick; a row that cannot be
-    /// recomputed is logged and passed over.
+    /// full-table fetch, no workflow write, no event or wake. A page read
+    /// failure keeps its cursor for a later supervised tick. A row that cannot
+    /// be recomputed or repaired is logged and skipped; the page cursor and
+    /// completed backfill's revision marker still advance.
     pub async fn check_task_conditions(&self, budget: usize) -> Result<ConditionCheckStatus> {
         let (after, limit) = {
             let mut state = self.condition_checks.lock().expect("condition checks");
@@ -291,7 +292,9 @@ impl SqliteDb {
         let corrupt = matches!(classify(read_condition), Stored::Corrupt(_));
         if corrupt {
             let id = recovery::record_raw(&mut tx, task_id, read_condition).await?;
-            condition.evidence_mut().diagnostic_ids.push(id);
+            if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::DurableOwners {
+                condition.evidence_mut().diagnostic_ids.push(id);
+            }
         }
         set_condition(
             &mut tx,
@@ -355,14 +358,15 @@ impl SqliteDb {
             let stored: Vec<u8> = row.try_get(5)?;
             // A newer encoding is counted and left; corruption is recomputed
             // below like any other stale row.
-            if matches!(stored_condition(&mut reader, &stored).await, Stored::Newer) {
+            let classified = stored_condition(&mut reader, &stored).await;
+            if matches!(classified, Stored::Newer) {
                 quarantined.push(id);
                 continue;
             }
             let expected = async {
                 let input = LegacyConditionInput::from_row(row)?;
                 let mut facts = ConditionFacts::load(&mut reader, &id).await?;
-                let stored = match classify(&stored) {
+                let stored = match classified {
                     Stored::Readable(stored) => Some(*stored),
                     Stored::Corrupt(problem) => {
                         if policy == recovery::UnreadablePolicy::DurableOwners {
