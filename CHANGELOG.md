@@ -109,6 +109,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Whether a Project capacity wait is "at capacity" or "waiting on owner" is
+  now recorded as a typed field instead of being read from the message wording.
+  Existing waits keep their classification.
 - A Task blocked by a workflow loop now shows its loop reason on the board
   card and in the Task list, is included by the Blocked filter, and exposes
   `condition.details.interruption` (reason, kind, time) with

@@ -234,10 +234,10 @@ pub(crate) async fn retire_wait(db: &db::SqliteDb, task: &Task) -> Result<bool> 
         ) {
             let slots = crate::task_dispatcher::slots::load_project_slots(db, &project).await?;
             if slots.limit > 0 && slots.active >= slots.limit {
-                crate::deferred_dispatch::record_dispatch_disposition(
+                crate::deferred_dispatch::record_project_capacity_wait(
                     db,
                     task,
-                    "project_capacity",
+                    db::ProjectWait::AtCapacity,
                     "project_at_capacity: waiting for a Project slot",
                 )
                 .await?;

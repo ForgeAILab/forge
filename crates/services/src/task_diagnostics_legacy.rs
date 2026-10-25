@@ -204,11 +204,7 @@ pub fn derive_workflow_health(
         ) {
             // The typed scope decides what the Task waits for; the message
             // is only shown.
-            let (reason, message) = db::capacity_reason(
-                &disposition.capability,
-                disposition.capacity_scope.as_deref(),
-                &disposition.safe_message,
-            );
+            let (reason, message) = disposition.capacity_reason();
             let label = if reason == "project_waiting_on_owner" {
                 "Waiting on Owner"
             } else if reason == "machine_capacity" {
