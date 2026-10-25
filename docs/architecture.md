@@ -6253,8 +6253,8 @@ text. Records are never pruned while the Task lives. Each text entry is capped a
 `… [truncated]` marker; length and digest describe the original source.
 
 `record_task_diagnostic_text_in_tx` shares the caller's transaction. Typed Hold
-and owner-edit statements pass their full source text before bounding it and
-store only diagnostic ids and small presentation in the condition. Superseded
+and owner-edit statements pass their full source text before applying the existing
+presentation limits. Capture does not add references to ordinary statement encodings. Superseded
 text remains independently readable after a clear. The DB-only
 `task_diagnostic_text` / `task_diagnostic_texts` methods support on-demand detail
 reads. Pages order by `(created_at, id)`, use an opaque tuple cursor, fetch
@@ -6263,44 +6263,10 @@ reads do not join the text table. Later writer
 conversions must supply their own full text, and 5b must import existing
 legacy-only messages and saved/superseded text before deleting their storage.
 
-**Whole-record ceiling.** Every condition written through the shared seam is
-at most 32 KiB encoded, including witnesses and collections. Writer-supplied
-presentation text is cut at 1,024 UTF-8 bytes, marker included; recovery guidance
-is appended afterward in the base ordering. The bound covers ordinary producer,
-metadata-folded, strict-setter, backfill and invariant-repair writes. A real
-failure writer receiving a 200,000-byte reason retains its text separately.
-
-The seam first removes legacy debug copies and remeasures. Only if necessary
-it first omits reloadable Child/Operation/Budget witness collections and remeasures,
-keeping public child/dependency lists intact when that fits. If needed, it also
-summarizes large child/dependency identity lists and aggregate-review child lists. Counts and a complete-set digest
-identify the omitted data. Bounded claims reload current durable children and
-dependency rows before an owner edit can rearrange reasons; checks and strict
-setters use those complete sets too. Under LegacyOracle, legacy-backed edits also
-reload complete presentation text before applying their statement, so a following
-Release cannot carry pressure-shortened text into an otherwise small condition. Task detail, list and operator reads reload
-omitted lists and pressure-shortened presentation from the same durable sources,
-so REST, MCP and web label inputs retain the complete public projection. An
-untyped annotation's public diagnostic is materialised separately from action
-diagnostics before its debug copy is stripped. Restoring an overflow marker
-consumes it, so a self-contained committed reply is not hydrated again from newer
-rows while a cascade advances. A set that fits again drops its summary.
-Small dependency lists retain their exact identities. Exact entry/run/step/integration/check identities, every owner identity,
-secondary reasons and Attention material remain in the row. Owner presentation
-text and the current condition's free-text summaries can be shortened further to
-fit. Under total-size pressure this includes the operator JSON document, diagnostic
-hook and entry/environment/placement values; the original field text is captured
-in the diagnostic store and ordinary reads restore the legacy projection. Material,
-dates and authority identities retain their values.
-The collection fingerprint excludes presentation and material, so tightening text
-does not make a bounded row stale. Non-reloadable authority is never silently
-discarded or hashed in place. Size alone never refuses a legacy write; an
-unrepresentably large authority claim is logged while retaining its authority. There are no condition snapshots, segments or indexes in the diagnostic
-table, and editing a condition does not depend on diagnostic text integrity.
-Stripped rows retain a SHA-256 of the five complete legacy source inputs. The
-dispatcher compares that digest to catch missed synchronisation, and the checker
-repairs the digest even when the public projection stays the same. Stripping debug
-copies alone does not mark an otherwise current row stale.
+**Whole-record ceiling.** The whole-record ceiling lands with unit R. This
+checkpoint preserves MAIN's condition encoding, including complete witnesses and
+collections, and its existing per-string presentation limits. Full diagnostic
+text is captured separately without compacting the stored condition.
 
 Operations retains its existing operator-reason document: strings within JSON are
 bounded, the whole document has its existing 16 KiB limit, and valid JSON is never

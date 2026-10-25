@@ -578,43 +578,27 @@ impl SqliteDb {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         id: &str,
     ) -> Result<Option<Task>> {
-        let mut task = sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
+        sqlx::query(&format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?"))
             .bind(id)
             .fetch_optional(&mut **tx)
             .await?
             .map(map_task)
-            .transpose()?;
-        if let Some(task) = &mut task {
-            crate::task_condition::restore_read(tx, &task.id, &mut task.condition).await?;
-        }
-        Ok(task)
+            .transpose()
     }
 
     /// Reads a page of Tasks (soft-deleted included) in one query.
     pub async fn get_tasks_by_ids(&self, ids: &[&str]) -> Result<Vec<Task>> {
         let ids = serde_json::to_string(ids).map_err(|e| DbError::Check(e.to_string()))?;
-        let mut c = self.pool.begin().await?;
-        let rows = sqlx::query(&format!(
+        sqlx::query(&format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE id IN (SELECT value FROM json_each(?))"
         ))
         .bind(ids)
-        .fetch_all(&mut *c)
-        .await?;
-        let tasks = restore_task_rows(&mut c, rows).await?;
-        c.rollback().await?;
-        Ok(tasks)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(map_task)
+        .collect()
     }
-}
-
-async fn restore_task_rows(
-    c: &mut sqlx::SqliteConnection,
-    rows: Vec<SqliteRow>,
-) -> Result<Vec<Task>> {
-    let mut tasks = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
-    for task in &mut tasks {
-        crate::task_condition::restore_read(c, &task.id, &mut task.condition).await?;
-    }
-    Ok(tasks)
 }
 
 fn map_task(row: SqliteRow) -> Result<Task> {

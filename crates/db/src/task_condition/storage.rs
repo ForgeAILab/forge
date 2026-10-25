@@ -1,6 +1,10 @@
 //! Stored encoding, quarantine and version-fenced condition persistence.
 use super::*;
 
+pub(super) fn json_error(error: serde_json::Error) -> DbError {
+    DbError::Check(format!("Task condition encoding: {error}"))
+}
+
 pub fn decode(raw: &str) -> Result<TaskCondition> {
     let condition: TaskCondition = serde_json::from_str(raw)
         .map_err(|e| DbError::Check(format!("invalid Task condition: {e}")))?;
@@ -156,9 +160,6 @@ pub(super) async fn set_condition(
     condition: &str,
     expected_version: Option<i64>,
 ) -> Result<()> {
-    let bounded = payload::prepare(connection, task_id, &decode(condition)?).await?;
-    let encoded = serde_json::to_string(&bounded).map_err(payload::json_error)?;
-    let condition = encoded.as_str();
     let _written =
         sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND (?3 IS NULL OR version=?3) AND condition_json IS NOT ?1")
             .bind(condition)
@@ -422,16 +423,7 @@ impl SqliteDb {
         .await?;
         let owner_park = owner_park.and_then(|raw| serde_json::from_str(&raw).ok());
         let claim = condition.clone();
-        let carried = if condition.evidence().overflow.is_some() {
-            // Only reloadable collections were removed. Re-read their durable rows.
-            let mut facts = ConditionFacts::load(tx, task_id).await?;
-            if facts.collection_dependencies.is_none() {
-                facts.load_collection_dependencies(tx).await?;
-            }
-            Some(facts)
-        } else {
-            ConditionFacts::recover(&claim)
-        };
+        let carried = ConditionFacts::recover(&claim);
         let stated = carried
             .filter(|facts| facts.task_id == task_id)
             .map(|mut facts| {
@@ -450,27 +442,16 @@ impl SqliteDb {
         // the two can only be compared without them.
         let agrees = |facts: ConditionFacts| {
             if condition.evidence().stated && !condition.evidence().ownership.is_empty() {
-                let mut full = claim.clone();
-                collections::restore(&mut full, &facts);
-                return payload::bounded_condition(&facts.apply(recovery::owner_base(&full)))
-                    .typed()
-                    == condition.typed();
+                return facts.apply(recovery::owner_base(&claim)).typed() == condition.typed();
             }
-            let mut expected = facts.condition(&bare);
-            // Private references participate in the encoded-size measurement,
-            // but never in the strict semantic comparison.
-            expected.evidence_mut().diagnostic_ids = condition.evidence().diagnostic_ids.clone();
-            expected.evidence_mut().legacy_input_digest =
-                condition.evidence().legacy_input_digest.clone();
+            let expected = facts.condition(&bare);
             if condition.integration_reason().is_some() || condition.check_witness().is_some() {
-                payload::bounded_condition(&expected).typed() == condition.typed()
+                expected.typed() == condition.typed()
             } else {
-                let mut expected = payload::bounded_condition(&expected);
+                let mut expected = expected;
                 let mut actual = condition.clone();
                 expected.evidence_mut().diagnostic_ids.clear();
                 actual.evidence_mut().diagnostic_ids.clear();
-                expected.evidence_mut().legacy_input_digest = None;
-                actual.evidence_mut().legacy_input_digest = None;
                 expected == actual
             }
         };
@@ -482,7 +463,7 @@ impl SqliteDb {
         set_condition(
             tx,
             task_id,
-            &serde_json::to_string(condition).map_err(payload::json_error)?,
+            &serde_json::to_string(condition).map_err(json_error)?,
             Some(expected_version),
         )
         .await

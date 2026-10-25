@@ -265,9 +265,7 @@ impl TaskBoardRepo for SqliteDb {
                 .bind(&input.task_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        let mut updated_task = map_task(updated_task_row)?;
-        crate::task_condition::restore_read(&mut tx, &updated_task.id, &mut updated_task.condition)
-            .await?;
+        let updated_task = map_task(updated_task_row)?;
         if task.blocked_json != updated_task.blocked_json {
             let interruption_event = CreateDomainEvent::task_interruption_changed(&updated_task);
             DomainEventRepo::append_event_in_tx(self, &mut tx, &interruption_event).await?;

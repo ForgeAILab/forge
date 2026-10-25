@@ -184,12 +184,6 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
             ));
             assert!(db::material_blocker(&row.condition).requires_intervention);
         }
-        let encoded: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-            .bind(&task.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert!(encoded.len() <= db::CONDITION_JSON_LIMIT);
         let texts = db
             .task_diagnostic_texts(&task.id, None, 100)
             .await
@@ -203,4 +197,180 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
     assert!(writer_marks
         .iter()
         .all(|(stated, count)| !stated && *count == 0));
+}
+
+#[tokio::test]
+async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnostic_text() {
+    async fn assert_main_bytes(db: &SqliteDb, task_id: &str, held: bool) {
+        let row = TaskRepo::get_by_id(db, task_id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut connection = db.pool().acquire().await.unwrap();
+        let facts = db::ConditionFacts::load(&mut connection, task_id)
+            .await
+            .unwrap();
+        drop(connection);
+        let mut legacy = db::LegacyConditionInput::from(&row);
+        legacy.facts = Some(facts);
+        // MAIN serializes the legacy mapper directly, with no payload preparation.
+        // The oracle never calls this branch's producer or condition setter.
+        let mut mapped = db::map_legacy_condition(&legacy);
+        if held {
+            // MAIN's Hold omits legacy copies and marks its typed statement.
+            mapped = mapped.typed();
+            let db::TaskCondition::Parked { evidence, .. } = &mut mapped else {
+                panic!("the legacy hold must park");
+            };
+            evidence.stated = true;
+        }
+        let expected = serde_json::to_string(&mapped).unwrap();
+        let stored: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+            .bind(task_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(stored.as_bytes(), expected.as_bytes());
+        assert_eq!(
+            row.condition
+                .evidence()
+                .witnesses
+                .iter()
+                .filter(|witness| matches!(witness, db::ConditionWitness::Child { .. }))
+                .count(),
+            400
+        );
+    }
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let task = seed_task(&db, project, "in_progress".into(), None).await;
+    let at = now_rfc3339();
+    let mut tx = db.pool().begin().await.unwrap();
+    for i in 0..400 {
+        sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,subtask_order,created_at,updated_at) VALUES (?,?,?,'child','todo',?,?,?)")
+            .bind(db::new_uuid_v4()).bind(&task.project_id).bind(&task.id).bind(i).bind(&at).bind(&at)
+            .execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query(
+        "UPDATE task SET metadata_json='{\"coordination_review_pending\":true}' WHERE id=?",
+    )
+    .bind(&task.id)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Full)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_main_bytes(&db, &task.id, false).await;
+    let placement = WorkspacePlacement {
+        id: "placement".into(),
+        workspace_id: "workspace".into(),
+        task_id: task.id.clone(),
+        agent_id: None,
+        owner_kind: db::PlacementOwnerKind::Server,
+        daemon_id: None,
+        runtime_id: None,
+        repo_location_id: "location".into(),
+        execution_daemon_id: None,
+        workspace_handle: None,
+        generation: 1,
+        state: db::PlacementState::Failed,
+        selected_by: db::PlacementSelectedBy::Scheduler,
+        selection_reason: "{}".into(),
+        reserved_until: None,
+        disconnected_at: None,
+        failure_cause: None,
+        version: 1,
+        created_at: at.clone(),
+        updated_at: at.clone(),
+    };
+
+    let id = db::new_uuid_v4();
+    db.enqueue_step(&EnqueueTaskStep {
+        id: id.clone(),
+        task_id: task.id.clone(),
+        kind: "command".into(),
+        payload_json: "{}".into(),
+        causation_step_id: None,
+        causation_key: id.clone(),
+        chain_id: id,
+        chain_position: 1,
+        expected_status: task.status.clone(),
+        expected_version: task.version,
+        expected_epoch: None,
+        lane: "fast".into(),
+        available_at: at,
+    })
+    .await
+    .unwrap();
+    let step = db
+        .claim_step(
+            "byte-parity-test",
+            Some(&task.id),
+            &db::task_writer::lease_deadline(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let reason = "z".repeat(200_000);
+    db::task_writer::in_task_step(
+        step.clone(),
+        annotate_owner_workspace_reset(&db, &placement, &reason),
+    )
+    .await
+    .unwrap();
+    assert_main_bytes(&db, &task.id, false).await;
+    let texts = db.task_diagnostic_texts(&task.id, None, 100).await.unwrap();
+    let text = texts
+        .items
+        .iter()
+        .find(|text| text.source == "diagnostic")
+        .unwrap();
+    assert_eq!(text.text.as_bytes(), reason.as_bytes());
+    assert_eq!(text.byte_length, 200_000);
+    assert_eq!(text.occurrence_count, 1);
+
+    let row = TaskRepo::get_by_id(&db, &task.id, false)
+        .await
+        .unwrap()
+        .unwrap();
+    let at = now_rfc3339();
+    db::task_writer::in_task_step(
+        step,
+        TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &db,
+            &row.id,
+            row.version,
+            Some(db::ConditionStatement::hold_operator_text(
+                "user", &reason, &at,
+            )),
+            Some(
+                serde_json::json!({"kind":"manual_stop", "reason":reason, "created_at":at})
+                    .to_string(),
+            ),
+            None,
+            &at,
+            None,
+            vec![],
+            vec![],
+            Some(db::ConditionStatement::Hold {
+                actor: "user".into(),
+                reason: reason.clone(),
+                at: at.clone(),
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_main_bytes(&db, &task.id, true).await;
+    let texts = db.task_diagnostic_texts(&task.id, None, 100).await.unwrap();
+    let text = texts
+        .items
+        .iter()
+        .find(|text| text.source == "hold")
+        .unwrap();
+    assert_eq!(text.text.as_bytes(), reason.as_bytes());
+    assert_eq!(text.byte_length, 200_000);
+    assert_eq!(text.occurrence_count, 1);
 }

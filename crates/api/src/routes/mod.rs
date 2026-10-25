@@ -362,14 +362,13 @@ async fn latest_diagnostic_rows(
 async fn task_response_inner(
     db: &db::SqliteDb,
     router: &services::workspace_backend::WorkspaceBackendRouter,
-    mut task: Task,
+    task: Task,
     include_actions: bool,
     awaiting_human: bool,
     latest_review: Option<Review>,
     latest_execution: Option<Execution>,
     workflow: &api_types::WorkflowDefinition,
 ) -> ApiResult<TaskResponse> {
-    db.restore_task_read(&mut task).await?;
     let task_role_assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
     let role_assignments = task_role_assignments
         .iter()

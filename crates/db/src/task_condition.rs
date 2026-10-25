@@ -76,15 +76,6 @@ pub struct ConditionEvidence {
     pub diagnostic_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ownership: Vec<ConditionOwnership>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub overflow: Option<ConditionOverflow>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub legacy_debug_omitted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub legacy_input_digest: Option<String>,
-    /// Public fallback only; untyped annotations do not become action diagnostics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_diagnostic: Option<api_types::TaskBlockingAnnotation>,
     /// Authoritative typed reader inputs, captured before evidence truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ConditionRead>,
@@ -332,9 +323,6 @@ impl TaskCondition {
         let mut typed = self.clone();
         let evidence = typed.evidence_mut();
         evidence.stated = false;
-        evidence.legacy_debug_omitted = false;
-        evidence.legacy_input_digest = None;
-        evidence.public_diagnostic = None;
         evidence.diagnostic_ids.clear();
         evidence.ownership.clear();
         evidence.error_annotation = None;
@@ -349,28 +337,10 @@ impl TaskCondition {
     /// condition is compared by what it states, not by the legacy copies it
     /// does not carry.
     pub(crate) fn stored_agrees(stored: &[u8], expected: &Self, encoded: &str) -> bool {
-        let stored_condition = serde_json::from_slice::<Self>(stored).ok();
-        let mut comparison = expected.clone();
-        if let Some(stored) = &stored_condition {
-            comparison.evidence_mut().diagnostic_ids = stored.evidence().diagnostic_ids.clone();
-            comparison.evidence_mut().legacy_input_digest =
-                stored.evidence().legacy_input_digest.clone();
-        }
-        let bounded = payload::bounded_condition(&comparison);
-        if let Some(digest) = &expected.evidence().legacy_input_digest {
-            if !stored_condition.as_ref().is_some_and(|stored| {
-                stored.evidence().legacy_input_digest.as_ref() == Some(digest)
-            }) {
-                return false;
-            }
-        }
         stored == encoded.as_bytes()
-            || stored == encode(&bounded).as_bytes()
-            || stored_condition.is_some_and(|stored| {
-                (stored.evidence().stated
-                    || stored.evidence().legacy_debug_omitted
-                    || !stored.evidence().diagnostic_ids.is_empty())
-                    && stored.typed() == bounded.typed()
+            || serde_json::from_slice::<Self>(stored).is_ok_and(|stored| {
+                (stored.evidence().stated || !stored.evidence().diagnostic_ids.is_empty())
+                    && stored.typed() == expected.typed()
             })
     }
 }
@@ -485,20 +455,6 @@ const LEGACY_SELECT: &str =
     "error_annotation,blocked_json,failed_json,entry_barrier_json,metadata_json,condition_json";
 
 impl LegacyConditionInput {
-    /// Fingerprint of all five source columns, independent of the stored projection.
-    pub fn digest(&self) -> String {
-        diagnostics::digest(
-            &serde_json::to_vec(&(
-                &self.error_annotation,
-                &self.blocked_json,
-                &self.failed_json,
-                &self.entry_barrier_json,
-                &self.metadata_json,
-                &self.non_text,
-            ))
-            .expect("legacy source tuple serializes"),
-        )
-    }
     /// Never fails on a hostile value: a BLOB or invalid UTF-8 is recorded in
     /// `non_text` instead of aborting the read.
     fn from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Self> {
@@ -1191,10 +1147,6 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
     let evidence = ConditionEvidence {
         diagnostic_ids: Vec::new(),
         ownership: Vec::new(),
-        overflow: None,
-        legacy_debug_omitted: false,
-        legacy_input_digest: None,
-        public_diagnostic: None,
         presentation: Some(ConditionRead::import(view)),
         observations,
         witnesses: Vec::new(),
@@ -1332,11 +1284,7 @@ pub use intent::{
     ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
     SavedTaskCondition, StatedCondition,
 };
-mod collections;
-pub(crate) use collections::restore_read;
 mod diagnostic_projection;
-mod payload;
-pub use payload::{ConditionOverflow, CONDITION_JSON_LIMIT};
 mod diagnostics;
 pub use diagnostics::{
     DiagnosticOwner, RecordTaskDiagnosticText, TaskDiagnosticText, TaskDiagnosticTextPage,

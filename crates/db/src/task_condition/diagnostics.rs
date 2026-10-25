@@ -66,7 +66,7 @@ pub(super) async fn record(
 ) -> Result<String> {
     let id = crate::new_uuid_v4();
     let at = crate::now_rfc3339();
-    let owner = serde_json::to_string(input.owner).map_err(payload::json_error)?;
+    let owner = serde_json::to_string(input.owner).map_err(storage::json_error)?;
     let digest = digest(input.text.as_bytes());
     let text = truncate(input.text, DIAGNOSTIC_TEXT_LIMIT);
     Ok(sqlx::query_scalar("INSERT INTO task_diagnostic_text(id,task_id,kind,source,owner_json,text,byte_length,digest,created_at,last_seen) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(task_id,kind,digest) DO UPDATE SET occurrence_count=occurrence_count+1,last_seen=excluded.last_seen RETURNING id")

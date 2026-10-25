@@ -206,7 +206,6 @@ pub(super) async fn record_statement_text(
     c: &mut SqliteConnection,
     task_id: &str,
     statement: &ConditionStatement,
-    condition: &mut TaskCondition,
 ) -> Result<()> {
     let mut texts: Vec<(&str, &str, DiagnosticOwner)> = Vec::new();
     match statement {
@@ -227,7 +226,7 @@ pub(super) async fn record_statement_text(
                     replacement: Some(*replacement.clone()),
                 }),
             };
-            return Box::pin(record_statement_text(c, task_id, &edit, condition)).await;
+            return Box::pin(record_statement_text(c, task_id, &edit)).await;
         }
         ConditionStatement::Edit { edit } => {
             if let Some(replacement) = &edit.replacement {
@@ -288,7 +287,7 @@ pub(super) async fn record_statement_text(
             continue;
         }
         let kind = format!("{source}_reason");
-        let id = diagnostics::record(
+        diagnostics::record(
             c,
             task_id,
             RecordTaskDiagnosticText {
@@ -299,13 +298,6 @@ pub(super) async fn record_statement_text(
             },
         )
         .await?;
-        let ids = &mut condition.evidence_mut().diagnostic_ids;
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-        if ids.len() > 16 {
-            ids.remove(0);
-        }
     }
     Ok(())
 }

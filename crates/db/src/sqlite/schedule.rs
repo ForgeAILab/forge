@@ -149,7 +149,7 @@ impl SqliteDb {
         let parent_ids =
             serde_json::to_string(&parent_ids).map_err(|e| DbError::Check(e.to_string()))?;
         let related = format!("SELECT {TASK_COLUMNS} FROM task WHERE id IN (SELECT value FROM json_each(?)) OR parent_task_id IN (SELECT value FROM json_each(?)) OR parent_task_id IN (SELECT value FROM json_each(?))");
-        let mut family: Vec<Task> = sqlx::query(&related)
+        let family: Vec<Task> = sqlx::query(&related)
             .bind(&parent_ids)
             .bind(&parent_ids)
             .bind(&ids)
@@ -158,12 +158,7 @@ impl SqliteDb {
             .into_iter()
             .map(map_schedule_task)
             .collect::<Result<_>>()?;
-        for task in &mut family {
-            crate::task_condition::restore_read(&mut reader, &task.id, &mut task.condition).await?;
-        }
         for r in &mut reads {
-            crate::task_condition::restore_read(&mut reader, &r.task.id, &mut r.condition).await?;
-            r.task.condition = r.condition.clone();
             r.parent = family
                 .iter()
                 .find(|t| Some(&t.id) == r.task.parent_task_id.as_ref())

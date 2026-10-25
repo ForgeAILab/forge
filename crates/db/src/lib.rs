@@ -38,7 +38,7 @@ pub use task_condition::{
     ConditionDiagnostic, ConditionIdentity, ConditionInterruption, ConditionOwnerEdit,
     ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
     DiagnosticOwner, RecordTaskDiagnosticText, SavedTaskCondition, StatedCondition,
-    TaskDiagnosticText, TaskDiagnosticTextPage, CONDITION_JSON_LIMIT, DIAGNOSTIC_TEXT_LIMIT,
+    TaskDiagnosticText, TaskDiagnosticTextPage, DIAGNOSTIC_TEXT_LIMIT,
 };
 mod task_mutation;
 mod task_step;

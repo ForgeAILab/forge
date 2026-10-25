@@ -292,7 +292,6 @@ impl SavedTaskCondition {
         let mut typed = condition.typed();
         typed.evidence_mut().ownership = condition.evidence().ownership.clone();
         typed.evidence_mut().diagnostic_ids = condition.evidence().diagnostic_ids.clone();
-        typed.evidence_mut().overflow = condition.evidence().overflow.clone();
         Self { condition: typed }
     }
     pub fn condition(&self) -> &TaskCondition {

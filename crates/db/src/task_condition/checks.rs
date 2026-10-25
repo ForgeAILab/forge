@@ -296,7 +296,7 @@ impl SqliteDb {
         set_condition(
             &mut tx,
             task_id,
-            &serde_json::to_string(&condition).map_err(payload::json_error)?,
+            &serde_json::to_string(&condition).map_err(storage::json_error)?,
             Some(read_version),
         )
         .await?;
@@ -334,19 +334,6 @@ impl SqliteDb {
     ) -> Result<Page> {
         self.check_condition_rows_with_policy(select, first, second, recovery::UNREADABLE_POLICY)
             .await
-    }
-    #[cfg(test)]
-    pub(super) async fn check_owned_condition_for_test(&self, id: &str) -> Result<u64> {
-        let select = format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE id=?1 AND ?2");
-        Ok(self
-            .check_condition_rows_with_policy(
-                &select,
-                Some(id),
-                1,
-                recovery::UnreadablePolicy::DurableOwners,
-            )
-            .await?
-            .repaired)
     }
     async fn check_condition_rows_with_policy(
         &self,

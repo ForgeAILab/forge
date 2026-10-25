@@ -214,7 +214,7 @@ pub(super) fn expected_with_policy(
     stored: Option<&TaskCondition>,
     policy: UnreadablePolicy,
 ) -> TaskCondition {
-    let mut expected = match stored {
+    match stored {
         Some(stored) if unreadable(stored) && policy == UnreadablePolicy::DurableOwners => {
             let problem = stored
                 .reasons()
@@ -233,14 +233,8 @@ pub(super) fn expected_with_policy(
             if policy == UnreadablePolicy::DurableOwners
                 && !stored.evidence().ownership.is_empty() =>
         {
-            let mut full = stored.clone();
-            collections::restore(&mut full, facts);
-            facts.apply(owner_base(&full))
+            facts.apply(owner_base(stored))
         }
         _ => facts.condition(input),
-    };
-    if stored.is_some_and(|stored| stored.evidence().legacy_debug_omitted) {
-        expected.evidence_mut().legacy_input_digest = Some(input.digest());
     }
-    expected
 }

@@ -109,160 +109,22 @@ async fn diagnostic_dedup_cap_rollback_and_project_cascade() {
 }
 
 #[tokio::test]
-async fn real_hold_retains_200kb_text_with_bounded_projection() {
+async fn real_hold_retains_200kb_text() {
     let db = db().await;
     task(&db, "long").await;
     let text = "é".repeat(100_000);
     super::statement_tests::hold(&db, "long", &text).await;
     let condition = db.task_condition("long").await.unwrap();
-    let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id='long'")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert!(raw.len() <= CONDITION_JSON_LIMIT, "{}", raw.len());
     assert!(condition.read().interruption.unwrap().reason.len() <= PRESENTATION_TEXT_LIMIT);
-    let id = condition
-        .evidence()
-        .diagnostic_ids
-        .first()
-        .expect("full text reference");
-    let detail = db.task_diagnostic_text("long", id).await.unwrap().unwrap();
+    let texts = db.task_diagnostic_texts("long", None, 100).await.unwrap();
+    let detail = texts
+        .items
+        .iter()
+        .find(|text| text.source == "hold")
+        .unwrap();
     assert_eq!(detail.text, text);
     assert_eq!(detail.byte_length, 200_000);
     assert_eq!(detail.source, "hold");
-}
-
-#[tokio::test]
-async fn whole_record_ceiling_preserves_core_and_collection_identity() {
-    let db = db().await;
-    task(&db, "many").await;
-    let mut condition = TaskCondition::Parked {
-        primary: ParkReason::Children {
-            root_id: "many".into(),
-            remaining: (0..3000).map(|i| format!("child-{i:04}")).collect(),
-        },
-        additional: Vec::new(),
-        resume: ConditionContinuation::AdvanceAggregateReview {
-            child_ids: (0..3000).map(|i| format!("child-{i:04}")).collect(),
-        },
-        since: None,
-        evidence: Default::default(),
-    };
-    condition
-        .evidence_mut()
-        .witnesses
-        .push(ConditionWitness::Entry {
-            task_id: "many".into(),
-            epoch: 0,
-            transition_id: Some("exact-entry".into()),
-            since: AT.into(),
-            initial: false,
-            human_wait: false,
-            review_wait: false,
-            review_failure: false,
-        });
-    condition
-        .evidence_mut()
-        .witnesses
-        .push(ConditionWitness::Execution {
-            execution_id: "exact-execution".into(),
-            role: "coder".into(),
-        });
-    condition
-        .evidence_mut()
-        .witnesses
-        .extend((0..3000).map(|i| ConditionWitness::Child {
-            task_id: format!("child-{i:04}"),
-            status: "in_progress".into(),
-            settled: false,
-        }));
-    condition.evidence_mut().material = Some(MaterialBlocker {
-        requires_intervention: true,
-        interruption: Some(
-            json!({"source":"blocked","reason":"Attention must survive the collection ceiling"}),
-        ),
-    });
-    condition.evidence_mut().ownership.push(ConditionOwnership {
-        owner: ConditionReasonOwner::OwnerConnection,
-        identity: ConditionIdentity::Machine {
-            epoch: 0,
-            daemon_id: "exact-owner-daemon".into(),
-        },
-        reason: Some(ParkReason::OwnerOffline {
-            daemon_id: Some("exact-owner-daemon".into()),
-            started_at: None,
-        }),
-        state: None,
-        material: None,
-    });
-    if let TaskCondition::Parked { additional, .. } = &mut condition {
-        additional.push(ParkReason::OwnerOffline {
-            daemon_id: Some("exact-owner-daemon".into()),
-            started_at: None,
-        });
-        additional.push(ParkReason::Failure {
-            failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-        });
-    }
-    let mut authority = serde_json::to_value(condition.typed()).unwrap();
-    authority["evidence"] = json!({"witnesses": condition.evidence().witnesses});
-    let original = authority.to_string();
-    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    set_condition(&mut tx, "many", &encode(&condition), None)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id='many'")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    assert!(raw.len() <= CONDITION_JSON_LIMIT, "{}", raw.len());
-    let stored = decode(&raw).unwrap();
-    assert_eq!(stored.evidence().ownership, condition.evidence().ownership);
-    assert_eq!(stored.evidence().material, condition.evidence().material);
-    assert_eq!(material_blocker(&stored), material_blocker(&condition));
-    if let (
-        TaskCondition::Parked {
-            additional: actual, ..
-        },
-        TaskCondition::Parked {
-            additional: expected,
-            ..
-        },
-    ) = (&stored, &condition)
-    {
-        assert_eq!(actual, expected, "secondary blockers are never sampled");
-    } else {
-        panic!("ceiling preserves the condition variant");
-    }
-    let overflow = stored
-        .evidence()
-        .overflow
-        .as_ref()
-        .expect("whole-record ceiling enforced");
-    assert_eq!(overflow.digest, diagnostics::digest(original.as_bytes()));
-    assert_eq!(overflow.witness_count, 3002);
-    assert_eq!(
-        stored.evidence().witnesses[0],
-        condition.evidence().witnesses[0]
-    );
-    assert_eq!(
-        stored.evidence().witnesses[1],
-        condition.evidence().witnesses[1]
-    );
-    assert_eq!(overflow.collection_counts["witnesses.children"], 3000);
-    assert_eq!(overflow.collection_counts["primary"], 3000);
-    assert_eq!(overflow.collection_counts["resume"], 3000);
-    assert!(db
-        .task_diagnostic_texts("many", None, 100)
-        .await
-        .unwrap()
-        .items
-        .is_empty());
-    assert!(
-        ConditionFacts::recover(&stored).is_none(),
-        "a sample never masquerades as all facts"
-    );
 }
 
 #[tokio::test]
@@ -490,34 +352,22 @@ async fn real_failure_writer_keeps_200kb_text_outside_condition() {
             )
             .await
             .unwrap();
-        let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-            .bind(&t.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert!(
-            raw.len() <= CONDITION_JSON_LIMIT,
-            "condition bytes: {}",
-            raw.len()
-        );
         assert_eq!(
             row.condition.read().failure_message.unwrap().len(),
             PRESENTATION_TEXT_LIMIT
         );
-        let detail = db
-            .task_diagnostic_text(&t.id, &row.condition.evidence().diagnostic_ids[0])
-            .await
-            .unwrap()
+        let texts = db.task_diagnostic_texts(&t.id, None, 100).await.unwrap();
+        let detail = texts
+            .items
+            .iter()
+            .find(|text| text.source == "diagnostic")
             .unwrap();
         assert_eq!(detail.text, text);
         assert_eq!(detail.byte_length, 200_000);
         let mut connection = db.pool().acquire().await.unwrap();
         let facts = ConditionFacts::load(&mut connection, &t.id).await.unwrap();
         let expected = facts.condition(&LegacyConditionInput::from(&row));
-        assert_eq!(
-            row.condition.typed(),
-            payload::bounded_condition(&expected).typed()
-        );
+        assert_eq!(row.condition.typed(), expected.typed());
     })
     .await;
 }
@@ -665,98 +515,6 @@ async fn inline_cas_and_epoch_rejection_roll_back_condition_legacy_and_text() {
         }
     })
     .await;
-}
-
-#[tokio::test]
-async fn reloadable_witness_digest_preserves_complete_set_and_exact_authority_beyond_one_mib() {
-    let db = db().await;
-    task(&db, "segmented").await;
-    let mut condition = TaskCondition::Parked {
-        primary: ParkReason::Held {
-            actor: "owner".into(),
-        },
-        additional: Vec::new(),
-        resume: ConditionContinuation::Reconcile,
-        since: None,
-        evidence: ConditionEvidence {
-            stated: true,
-            ..Default::default()
-        },
-    };
-    condition.evidence_mut().ownership.push(ConditionOwnership {
-        owner: ConditionReasonOwner::Hold,
-        identity: ConditionIdentity::Marker {
-            epoch: 0,
-            marker_id: "exact-hold".into(),
-        },
-        reason: Some(ParkReason::Held {
-            actor: "owner".into(),
-        }),
-        state: None,
-        material: None,
-    });
-    condition
-        .evidence_mut()
-        .witnesses
-        .push(ConditionWitness::Entry {
-            task_id: "segmented".into(),
-            epoch: 0,
-            transition_id: None,
-            since: AT.into(),
-            initial: false,
-            human_wait: false,
-            review_wait: false,
-            review_failure: false,
-        });
-    condition
-        .evidence_mut()
-        .witnesses
-        .extend((0..12_000).map(|i| ConditionWitness::Child {
-            task_id: format!("child-{i:06}-{}", "x".repeat(64)),
-            status: "in_progress".into(),
-            settled: false,
-        }));
-    assert!(encode(&condition).len() > DIAGNOSTIC_TEXT_LIMIT);
-    let original = encode(&condition);
-    for _ in 0..2 {
-        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        set_condition(&mut tx, "segmented", &original, None)
-            .await
-            .unwrap();
-        let raw: String =
-            sqlx::query_scalar("SELECT condition_json FROM task WHERE id='segmented'")
-                .fetch_one(&mut *tx)
-                .await
-                .unwrap();
-        assert!(raw.len() <= CONDITION_JSON_LIMIT);
-        let stored = decode(&raw).unwrap();
-        assert_eq!(stored.evidence().ownership, condition.evidence().ownership);
-        assert_eq!(
-            stored.evidence().witnesses,
-            condition.evidence().witnesses[..1]
-        );
-        let summary = stored.evidence().overflow.as_ref().unwrap();
-        let mut authority = serde_json::to_value(condition.typed()).unwrap();
-        authority["evidence"] = json!({"witnesses": condition.evidence().witnesses});
-        assert_eq!(
-            summary.digest,
-            diagnostics::digest(authority.to_string().as_bytes())
-        );
-        assert_eq!(summary.witness_count, 12_001);
-        assert_eq!(summary.collection_counts["witnesses.children"], 12_000);
-        assert!(ConditionFacts::recover(&stored).is_none());
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM task_diagnostic_text WHERE task_id='segmented'",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .unwrap();
-        assert_eq!(
-            count, 0,
-            "reloadable sets never create diagnostic condition snapshots"
-        );
-        tx.commit().await.unwrap();
-    }
 }
 
 #[test]
@@ -941,7 +699,7 @@ async fn corrupt_running_review_role_and_integration_owners_self_heal() {
 }
 
 #[tokio::test]
-async fn unicode_attention_material_keeps_its_identity_while_presentation_is_bounded() {
+async fn unicode_attention_material_keeps_its_identity() {
     let db = db().await;
     task(&db, "unicode-material").await;
     let message = "😀".repeat(512);
@@ -977,8 +735,6 @@ async fn unicode_attention_material_keeps_its_identity_while_presentation_is_bou
         material,
         "private Attention digest input retains its historical 512-character bound"
     );
-    assert!(stored.read().failure_message.unwrap().len() <= PRESENTATION_TEXT_LIMIT);
-    assert!(encode(&stored).len() <= CONDITION_JSON_LIMIT);
 }
 
 #[tokio::test]
@@ -1269,7 +1025,6 @@ async fn owned_retry_keeps_its_deadline_across_a_hold_and_records_full_text() {
         matches!(&released, TaskCondition::Deferred { until: Some(until), reason: RetryCause::ExecutionFailure, .. } if until == UNTIL)
     );
     assert_eq!(released.read().retry.unwrap().not_before, UNTIL);
-    assert!(encode(&released).len() <= CONDITION_JSON_LIMIT);
     assert!(db
         .task_diagnostic_texts("timer", None, 100)
         .await
@@ -1309,72 +1064,6 @@ async fn owned_retry_keeps_its_deadline_across_a_hold_and_records_full_text() {
     assert!(matches!(cleared, TaskCondition::Clear { .. }));
     assert!(!cleared.read().retry_recorded);
     assert!(cleared.read().retry.is_none());
-}
-
-#[tokio::test]
-async fn bounded_conditions_do_not_depend_on_diagnostic_text_integrity() {
-    let db = db().await;
-    task(&db, "bounded-hold").await;
-    let mut condition = TaskCondition::Parked {
-        primary: ParkReason::Held {
-            actor: "owner".into(),
-        },
-        additional: vec![],
-        resume: ConditionContinuation::Reconcile,
-        since: None,
-        evidence: ConditionEvidence {
-            stated: true,
-            ..Default::default()
-        },
-    };
-    condition
-        .evidence_mut()
-        .witnesses
-        .extend((0..1000).map(|i| ConditionWitness::Child {
-            task_id: format!("child-{i}"),
-            status: "in_progress".into(),
-            settled: false,
-        }));
-    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    set_condition(&mut tx, "bounded-hold", &encode(&condition), None)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    assert!(db
-        .task_condition("bounded-hold")
-        .await
-        .unwrap()
-        .evidence()
-        .overflow
-        .is_some());
-    // No diagnostic body, segment or index is required to edit this hold.
-    assert!(db
-        .task_diagnostic_texts("bounded-hold", None, 100)
-        .await
-        .unwrap()
-        .items
-        .is_empty());
-    let edited = test_support::set_task_condition(
-        &db,
-        "bounded-hold",
-        park(
-            ConditionReasonOwner::Diagnostic,
-            ParkReason::Failure {
-                failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-            },
-            "new-diagnosis",
-        ),
-    )
-    .await
-    .unwrap();
-    assert!(!recovery::unreadable(&edited));
-    assert!(matches!(
-        edited,
-        TaskCondition::Parked {
-            primary: ParkReason::Held { .. },
-            ..
-        }
-    ));
 }
 
 async fn state_with_policy(

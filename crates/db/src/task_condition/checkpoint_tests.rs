@@ -111,65 +111,6 @@ async fn operations_reason_keeps_base_json_limits_through_writes_reads_and_typed
 }
 
 #[tokio::test]
-async fn stripping_debug_copies_does_not_shrink_authority_or_collections() {
-    let db = db().await;
-    task(&db, "debug-only").await;
-    let witnesses: Vec<_> = (0..100)
-        .map(|i| ConditionWitness::Child {
-            task_id: format!("child-{i}"),
-            status: "todo".into(),
-            settled: false,
-        })
-        .collect();
-    let material = MaterialBlocker {
-        requires_intervention: true,
-        interruption: Some(json!({"source":"blocked","reason":"durable Attention input"})),
-    };
-    let condition = TaskCondition::Parked {
-        primary: ParkReason::Held {
-            actor: "owner".into(),
-        },
-        additional: vec![ParkReason::OwnerOffline {
-            daemon_id: Some("exact-daemon".into()),
-            started_at: None,
-        }],
-        resume: ConditionContinuation::Reconcile,
-        since: None,
-        evidence: ConditionEvidence {
-            error_annotation: Some("d".repeat(20_000)),
-            blocked_json: Some("b".repeat(20_000)),
-            witnesses: witnesses.clone(),
-            material: Some(material.clone()),
-            ..Default::default()
-        },
-    };
-    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    set_condition(&mut tx, "debug-only", &encode(&condition), None)
-        .await
-        .unwrap();
-    tx.commit().await.unwrap();
-    let stored = db.task_condition("debug-only").await.unwrap();
-    assert!(raw(&db, "debug-only").await.len() <= CONDITION_JSON_LIMIT);
-    assert!(stored.evidence().legacy_debug_omitted);
-    assert!(
-        stored.evidence().overflow.is_none(),
-        "stripping debug copies alone fits"
-    );
-    assert_eq!(stored.evidence().witnesses, witnesses);
-    assert_eq!(stored.evidence().material, Some(material));
-    assert_eq!(
-        stored.reasons().collect::<Vec<_>>(),
-        condition.reasons().collect::<Vec<_>>()
-    );
-    assert!(db
-        .task_diagnostic_texts("debug-only", None, 100)
-        .await
-        .unwrap()
-        .items
-        .is_empty());
-}
-
-#[tokio::test]
 async fn scoped_statement_records_one_occurrence_and_restore_applies_once() {
     let db = db().await;
     task(&db, "once").await;
@@ -454,7 +395,7 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         let mut c = db.pool().acquire().await.unwrap();
         let facts = ConditionFacts::load(&mut c, id).await.unwrap();
         let legacy = facts.condition(&LegacyConditionInput::from(&row));
-        let raw = encode(&legacy); // Same legacy mapper and encoding as base, before the new seam's bound.
+        let raw = encode(&legacy); // Same legacy mapper and encoding as MAIN.
         sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
             .bind(&raw)
             .bind(id)
@@ -464,9 +405,6 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         drop(c);
         before.push((id, raw, material_blocker(&legacy), legacy.public()));
     }
-    assert!(before
-        .iter()
-        .any(|(_, raw, _, _)| raw.len() > CONDITION_JSON_LIMIT));
     db.set_setting(MAPPING_REVISION_KEY, "7", &crate::now_rfc3339())
         .await
         .unwrap();
@@ -497,152 +435,6 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
         );
         assert_eq!(condition.public(), public, "{id}: public condition");
     }
-}
-
-async fn dual_written_diagnostic_fixture(db: &SqliteDb, id: &str) -> ConditionPresentation {
-    let annotation =
-        json!({"type":"workspace_reset_required", "blocking_reason":"fixture"}).to_string();
-    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
-        .bind(&annotation)
-        .bind(id)
-        .execute(db.pool())
-        .await
-        .unwrap();
-    ConditionPresentation::from_read(
-        &map_legacy_condition(&LegacyConditionInput {
-            error_annotation: Some(annotation),
-            ..Default::default()
-        })
-        .read(),
-    )
-}
-
-#[tokio::test]
-async fn bounded_owned_row_reloads_durable_children_and_does_not_repair_itself_again() {
-    let db = db().await;
-    task(&db, "root-many").await;
-    for i in 0..240 {
-        let id = format!("child-{i:04}-{}", "x".repeat(64));
-        task(&db, &id).await;
-        sqlx::query("UPDATE task SET parent_task_id='root-many',subtask_order=? WHERE id=?")
-            .bind(i)
-            .bind(id)
-            .execute(db.pool())
-            .await
-            .unwrap();
-    }
-    sqlx::query("UPDATE task SET metadata_json='{\"coordination_review_pending\":true}' WHERE id='root-many'")
-        .execute(db.pool()).await.unwrap();
-    let diagnostic_presentation = dual_written_diagnostic_fixture(&db, "root-many").await;
-    let mut c = db.pool().acquire().await.unwrap();
-    storage::sync_condition(&mut c, "root-many").await.unwrap();
-    drop(c);
-    let owned = test_support::set_task_condition(
-        &db,
-        "root-many",
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Diagnostic,
-                expected: None,
-                replacement: Some(ConditionReplacement {
-                    identity: ConditionIdentity::Entry {
-                        epoch: 0,
-                        transition_id: None,
-                    },
-                    condition: StatedCondition::Parked {
-                        reason: ParkReason::Failure {
-                            failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-                        },
-                        resume: ConditionContinuation::Reconcile,
-                        since: None,
-                        presentation: diagnostic_presentation,
-                    },
-                }),
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(owned.evidence().overflow.is_some());
-    assert!(raw(&db, "root-many").await.len() <= CONDITION_JSON_LIMIT);
-    let remaining = owned
-        .reasons()
-        .find_map(|reason| match reason {
-            ParkReason::Children { remaining, .. } => Some(remaining),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(
-        remaining,
-        &(0..240)
-            .map(|i| format!("child-{i:04}-{}", "x".repeat(64)))
-            .collect::<Vec<_>>(),
-        "public child identities stay complete when dropping witnesses alone fits"
-    );
-    assert_eq!(
-        owned
-            .evidence()
-            .overflow
-            .as_ref()
-            .unwrap()
-            .collection_counts
-            .len(),
-        1
-    );
-
-    for _ in 0..2 {
-        assert_eq!(
-            db.check_task_conditions_of(&["root-many".into()])
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(db.task_condition("root-many").await.unwrap(), owned);
-    }
-    let step = super::tests::claim(&db, "root-many").await;
-    crate::task_writer::in_task_step(step, async {
-        let row = TaskRepo::get_by_id(&db, "root-many", false)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        db.set_condition(
-            &mut tx,
-            "root-many",
-            row.version,
-            &LegacyConditionInput::from(&row),
-            &owned,
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-        sqlx::query("UPDATE task SET deleted_at='2026-01-01' WHERE parent_task_id='root-many'")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        write::with_statement(
-            "root-many",
-            ConditionStatement::Preserve,
-            produce(&mut tx, "root-many", ConditionChange::Full),
-        )
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-    })
-    .await;
-    let smaller = db.task_condition("root-many").await.unwrap();
-    assert!(
-        smaller.evidence().overflow.is_none(),
-        "a fresh complete small set drops its former summary"
-    );
-    assert_eq!(material_blocker(&smaller), material_blocker(&owned));
-    assert_eq!(
-        db.check_task_conditions_of(&["root-many".into()])
-            .await
-            .unwrap(),
-        0
-    );
 }
 
 #[tokio::test]
@@ -708,128 +500,6 @@ async fn corrupt_legacy_blockers_rebuild_with_the_base_condition_and_attention_i
 }
 
 #[tokio::test]
-// This 400-id typed owner exceeds the legacy mapper's 16-id import limit.
-// Its stability assertion exercises the explicit future policy; main must repair it.
-async fn bounded_dependency_identities_are_reloaded_before_an_owner_edit_reorders_reasons() {
-    let db = db().await;
-    task(&db, "dependencies-many").await;
-    let mut ids = Vec::new();
-    for i in 0..400 {
-        let id = format!("dependency-{i:04}-{}", "x".repeat(64));
-        task(&db, &id).await;
-        sqlx::query("INSERT INTO task_dependency(task_id,depends_on_id,created_at) VALUES('dependencies-many',?,'2026-01-01')")
-            .bind(&id).execute(db.pool()).await.unwrap();
-        ids.push(id);
-    }
-    let identity = ConditionIdentity::Marker {
-        epoch: 0,
-        marker_id: "exact-dependencies-owner".into(),
-    };
-    test_support::set_task_condition(
-        &db,
-        "dependencies-many",
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Dependencies,
-                expected: None,
-                replacement: Some(ConditionReplacement {
-                    identity: identity.clone(),
-                    condition: StatedCondition::Parked {
-                        reason: ParkReason::Dependencies {
-                            cancelled: false,
-                            dependency_ids: ids,
-                            source: ConditionSource {
-                                field: LegacyConditionField::MetadataJson,
-                                key: Some("dispatch_disposition".into()),
-                            },
-                        },
-                        resume: ConditionContinuation::Reconcile,
-                        since: None,
-                        presentation: Default::default(),
-                    },
-                }),
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    let updated = test_support::set_task_condition(
-        &db,
-        "dependencies-many",
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Diagnostic,
-                expected: None,
-                replacement: Some(ConditionReplacement {
-                    identity: ConditionIdentity::Entry {
-                        epoch: 0,
-                        transition_id: None,
-                    },
-                    condition: StatedCondition::Parked {
-                        reason: ParkReason::Failure {
-                            failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-                        },
-                        resume: ConditionContinuation::Reconcile,
-                        since: None,
-                        presentation: Default::default(),
-                    },
-                }),
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    assert!(raw(&db, "dependencies-many").await.len() <= CONDITION_JSON_LIMIT);
-    let counts = &updated
-        .evidence()
-        .overflow
-        .as_ref()
-        .unwrap()
-        .collection_counts;
-    assert_eq!(counts.get("additional.0"), Some(&400));
-    let owner = updated
-        .evidence()
-        .ownership
-        .iter()
-        .find(|o| o.owner == ConditionReasonOwner::Dependencies)
-        .unwrap();
-    assert_eq!(owner.identity, identity);
-    for _ in 0..2 {
-        assert_eq!(
-            db.check_owned_condition_for_test("dependencies-many")
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            db.task_condition("dependencies-many").await.unwrap(),
-            updated
-        );
-    }
-    let row = TaskRepo::get_by_id(&db, "dependencies-many", false)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut c = db.pool().acquire().await.unwrap();
-    let facts = ConditionFacts::load(&mut c, &row.id).await.unwrap();
-    drop(c);
-    let mut input = LegacyConditionInput::from(&row);
-    input.facts = Some(facts);
-    let legacy = map_legacy_condition(&input);
-    assert_eq!(
-        db.check_task_conditions_of(std::slice::from_ref(&row.id))
-            .await
-            .unwrap(),
-        1,
-        "the active policy repairs this deliberately non-legacy typed claim"
-    );
-    assert_eq!(
-        db.task_condition(&row.id).await.unwrap().typed(),
-        legacy.typed()
-    );
-}
-
-#[tokio::test]
 async fn implicit_statement_preserves_a_new_unconverted_condition_between_recomputes() {
     let db = std::sync::Arc::new(db().await);
     task(&db, "fresh-scope").await;
@@ -866,8 +536,7 @@ async fn implicit_statement_preserves_a_new_unconverted_condition_between_recomp
 }
 
 #[tokio::test]
-async fn real_hold_with_200kb_of_json_escaped_text_fits_without_changing_operator_json_or_material()
-{
+async fn real_hold_with_200kb_of_json_escaped_text_keeps_operator_json_and_material() {
     let db = db().await;
     task(&db, "escaped-hold").await;
     let reason = "\0".repeat(200_000);
@@ -876,7 +545,6 @@ async fn real_hold_with_200kb_of_json_escaped_text_fits_without_changing_operato
         .await
         .unwrap()
         .unwrap();
-    assert!(raw(&db, "escaped-hold").await.len() <= CONDITION_JSON_LIMIT);
     assert_eq!(
         row.condition.read().operator_reason,
         row.error_annotation

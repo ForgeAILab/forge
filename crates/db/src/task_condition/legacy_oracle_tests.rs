@@ -194,40 +194,6 @@ async fn legacy_check_repairs_divergent_stated_ownership_in_one_sweep() {
 }
 
 #[tokio::test]
-async fn stripped_untyped_annotation_keeps_its_public_diagnostic() {
-    let db = db().await;
-    task(&db, "untyped-large").await;
-    let mut c = db.pool().acquire().await.unwrap();
-    let facts = ConditionFacts::load(&mut c, "untyped-large").await.unwrap();
-    drop(c);
-    let input = LegacyConditionInput {
-        error_annotation: Some(
-            json!({"message":"old untyped annotation", "context":"z".repeat(200_000)}).to_string(),
-        ),
-        blocked_json: Some(json!({"reason":"b".repeat(200_000)}).to_string()),
-        facts: Some(facts),
-        ..Default::default()
-    };
-    let mut full = map_legacy_condition(&input);
-    full.evidence_mut()
-        .witnesses
-        .extend((0..1000).map(|n| ConditionWitness::Child {
-            task_id: format!("child-{n}"),
-            status: "todo".into(),
-            settled: false,
-        }));
-    let bounded = payload::try_bounded_condition(&full).unwrap();
-    assert!(bounded.evidence().legacy_debug_omitted);
-    assert!(full.public().details().diagnostic.is_some());
-    assert_eq!(bounded.public(), full.public());
-    assert_eq!(
-        bounded.read(),
-        full.read(),
-        "a public fallback cannot become an action diagnostic"
-    );
-}
-
-#[tokio::test]
 async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
     let db = db().await;
     task(&db, "maximum-text").await;
@@ -261,9 +227,7 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert!(raw.len() <= CONDITION_JSON_LIMIT, "{}", raw.len());
     let stored = decode(&raw).unwrap();
-    assert!(stored.evidence().legacy_debug_omitted);
     let row = TaskRepo::get_by_id(&db, "maximum-text", false)
         .await
         .unwrap()
@@ -274,38 +238,10 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
     let mut input = LegacyConditionInput::from(&row);
     input.facts = Some(facts);
     let expected = map_legacy_condition(&input);
+    assert_eq!(raw, serde_json::to_string(&expected).unwrap());
     assert_eq!(row.condition.public(), expected.public());
     assert_eq!(row.condition.read(), expected.read());
     assert_eq!(material_blocker(&stored), material_blocker(&expected));
-    let texts = db
-        .task_diagnostic_texts(&row.id, None, 100)
-        .await
-        .unwrap()
-        .items;
-    for kind in [
-        "failure_message",
-        "blocked_message",
-        "exception_message",
-        "diagnostic_reason",
-        "diagnostic_message",
-        "interruption_reason",
-        "retry_reason",
-        "retry_display_reason",
-        "refusal_message",
-        "operator_reason",
-        "diagnostic_hook",
-        "diagnostic_artifact",
-        "entry",
-        "environment",
-        "placement",
-    ] {
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.kind == kind && t.source == "condition_payload"),
-            "{kind}"
-        );
-    }
     let operator = db.blocked_task_operator_rows().await.unwrap();
     // The Operations query includes interrupted or explicitly blocked Tasks.
     assert_eq!(operator.len(), 1);
@@ -333,7 +269,7 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
     assert_eq!(
         released.condition.read(),
         mapped.read(),
-        "a following owner write reloads complete text before editing"
+        "a following owner write preserves MAIN presentation"
     );
     assert_eq!(released.condition.public(), mapped.public());
     assert_eq!(
@@ -345,5 +281,5 @@ async fn maximal_free_text_is_stored_without_refusing_the_legacy_write() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert!(raw.len() <= CONDITION_JSON_LIMIT);
+    assert_eq!(raw, serde_json::to_string(&released.condition).unwrap());
 }

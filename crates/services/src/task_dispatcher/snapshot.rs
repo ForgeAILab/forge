@@ -121,7 +121,7 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
     }
     // A condition its writer stated carries no legacy copy: the same three
     // holds are its typed presentation.
-    if (evidence.stated || evidence.legacy_debug_omitted)
+    if evidence.stated
         && evidence.presentation.as_ref().is_some_and(|read| {
             read.interruption_present || read.hard_failure || (barrier_holds && read.entry_recorded)
         })
@@ -199,15 +199,6 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
             )))
         }
         None => {}
-    }
-    if stored.evidence().legacy_debug_omitted {
-        let input = db::LegacyConditionInput::from(task);
-        return stored
-            .evidence()
-            .legacy_input_digest
-            .as_ref()
-            .filter(|digest| **digest != input.digest())
-            .map(|_| stored.restate_legacy(&input));
     }
     if stored.evidence().stated {
         return None;
@@ -750,7 +741,7 @@ impl TaskDispatcher {
 mod tests {
     use super::*;
     #[test]
-    fn corrupt_rows_use_the_legacy_oracle_and_bounded_rows_are_not_stale() {
+    fn corrupt_rows_use_the_legacy_oracle() {
         let mut task = crate::task_actions::test_support::snapshot(
             "todo",
             Some(api_types::FailureKind::WorkspaceError),
@@ -760,37 +751,10 @@ mod tests {
         let corrupt = db::task_condition::decode_or_unknown("{}");
         let expected = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
         assert_eq!(stale_condition(&corrupt, &task), Some(expected));
-        let mut bounded = task.condition.clone();
-        let TaskCondition::Parked { evidence, .. } = &mut bounded else {
-            panic!("mapped annotation parks");
-        };
-        evidence.error_annotation = None;
-        evidence.blocked_json = None;
-        evidence.failed_json = None;
-        evidence.entry_barrier_json = None;
-        evidence.metadata.clear();
-        evidence.legacy_debug_omitted = true;
-        assert!(stale_condition(&bounded, &task).is_none());
-        assert_eq!(blocking(&bounded, true), blocking(&task.condition, true));
-        let mut display_only = TaskCondition::Clear {
-            evidence: db::ConditionEvidence {
-                legacy_debug_omitted: true,
-                presentation: Some(db::ConditionRead {
-                    interruption_present: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-        };
-        assert!(blocking(&display_only, true));
-        if let TaskCondition::Clear { evidence } = &mut display_only {
-            evidence.legacy_debug_omitted = false;
-        }
-        assert!(!blocking(&display_only, true));
     }
 
     #[tokio::test]
-    async fn stripped_rows_detect_missed_syncs_in_each_legacy_input() {
+    async fn legacy_evidence_detects_missed_syncs_in_each_legacy_input() {
         use db::TaskRepo;
         let db = crate::recovery::test_support::sqlite_db().await;
         let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
@@ -824,7 +788,6 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert!(stored.evidence().legacy_debug_omitted);
         let row = TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()
@@ -839,7 +802,7 @@ mod tests {
         ] {
             sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
                 .bind(if field == "metadata_json" {
-                    serde_json::json!({"coordination_review_pending":true, "unrelated":"changed"}).to_string()
+                    serde_json::json!({"coordination_review_pending":true, "awaiting_human":false}).to_string()
                 } else {
                     serde_json::json!({"kind":"manual_stop","type":"manual_stop","reason":"new hold"}).to_string()
                 })
@@ -862,7 +825,7 @@ mod tests {
                     .await
                     .unwrap(),
                 1,
-                "{field}: repair the source digest too"
+                "{field}: repair the legacy evidence too"
             );
             let repaired = db.task_condition(&task.id).await.unwrap();
             let current = TaskRepo::get_by_id(&db, &task.id, false)

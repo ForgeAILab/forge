@@ -44,15 +44,6 @@ async fn large_root_detail_and_list_restore_all_child_ids() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert!(raw.len() <= db::CONDITION_JSON_LIMIT);
-    let stored = db::task_condition::decode(&raw).unwrap();
-    let counts = &stored
-        .evidence()
-        .overflow
-        .as_ref()
-        .expect("crossed cap")
-        .collection_counts;
-    assert!(counts.contains_key("primary") || counts.contains_key("resume"));
     let row = TaskRepo::get_by_id(db, &root.id, false)
         .await
         .unwrap()
@@ -63,7 +54,6 @@ async fn large_root_detail_and_list_restore_all_child_ids() {
     let mut legacy = db::LegacyConditionInput::from(&row);
     legacy.facts = Some(facts);
     let expected = db::map_legacy_condition(&legacy).public();
-    assert!(serde_json::to_string(&expected).unwrap().len() > db::CONDITION_JSON_LIMIT);
     let detail: TaskResponse = common::empty_request(
         &harness.app,
         Method::GET,
@@ -179,20 +169,6 @@ async fn large_root_detail_and_list_restore_all_child_ids() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
-        .bind(&root.id)
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    let stored = db::task_condition::decode(&raw).unwrap();
-    assert!(raw.len() <= db::CONDITION_JSON_LIMIT);
-    assert!(stored
-        .evidence()
-        .overflow
-        .as_ref()
-        .unwrap()
-        .collection_counts
-        .contains_key("resume"));
     let ready: TaskResponse = common::empty_request(
         &harness.app,
         Method::GET,

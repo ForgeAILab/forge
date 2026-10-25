@@ -174,7 +174,6 @@ impl TaskRepo for SqliteDb {
                 .fetch_one(&mut **transaction)
                 .await?,
         );
-        crate::task_condition::restore_read(transaction, &task.id, &mut task.condition).await?;
         if let Some(parent) = &task.parent_task_id {
             crate::task_condition::produce_children(transaction, parent).await?;
         }
@@ -182,10 +181,7 @@ impl TaskRepo for SqliteDb {
     }
 
     async fn get_by_id(&self, id: &str, include_deleted: bool) -> Result<Option<Task>> {
-        let mut c = self.pool.begin().await?;
-        let task = load_task(&mut c, id, include_deleted).await?;
-        c.rollback().await?;
-        Ok(task)
+        load_task(&self.pool, id, include_deleted).await
     }
 
     async fn get_by_id_in_tx(
@@ -194,14 +190,12 @@ impl TaskRepo for SqliteDb {
         id: &str,
         include_deleted: bool,
     ) -> Result<Option<Task>> {
-        load_task(transaction, id, include_deleted).await
+        load_task(&mut **transaction, id, include_deleted).await
     }
 
     async fn list(&self, query: TaskListQuery) -> Result<Page<Task>> {
-        let mut connection = self.pool.begin().await?;
-        let page = list_page(&mut connection, query).await?;
-        connection.rollback().await?;
-        Ok(page)
+        let mut connection = self.pool.acquire().await?;
+        list_page(&mut connection, query).await
     }
 
     async fn list_by_project_with_metadata_key(
@@ -217,15 +211,12 @@ impl TaskRepo for SqliteDb {
                AND json_type(metadata_json, ?) IS NOT NULL
              ORDER BY created_at ASC, id ASC"
         );
-        let mut c = self.pool.begin().await?;
         let rows = sqlx::query(&sql)
             .bind(project_id)
             .bind(path)
-            .fetch_all(&mut *c)
+            .fetch_all(&self.pool)
             .await?;
-        let tasks = restore_task_rows(&mut c, rows).await?;
-        c.rollback().await?;
-        Ok(tasks)
+        rows.into_iter().map(map_task).collect()
     }
 
     async fn list_by_executing_agent(&self, query: AgentTaskListQuery) -> Result<Page<Task>> {
@@ -248,16 +239,15 @@ impl TaskRepo for SqliteDb {
             where_sql,
             order_clause(&query.page)
         );
-        let mut c = self.pool.begin().await?;
         let rows = sqlx::query(&sql)
             .bind(&query.agent_id)
             .bind(&query.user_id)
             .bind(&query.user_id)
             .bind(limit(&query.page) + 1)
             .bind(offset)
-            .fetch_all(&mut *c)
+            .fetch_all(&self.pool)
             .await?;
-        let items = restore_task_rows(&mut c, rows).await?;
+        let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
         let total = if query.page.include_total {
             let count_sql = format!("SELECT COUNT(*) FROM task WHERE {where_sql}");
             Some(
@@ -265,13 +255,12 @@ impl TaskRepo for SqliteDb {
                     .bind(&query.agent_id)
                     .bind(&query.user_id)
                     .bind(&query.user_id)
-                    .fetch_one(&mut *c)
+                    .fetch_one(&self.pool)
                     .await?,
             )
         } else {
             None
         };
-        c.rollback().await?;
         page_from_items(items, &query.page, offset, total)
     }
 
@@ -279,14 +268,11 @@ impl TaskRepo for SqliteDb {
         let sql = format!(
             "SELECT {TASK_COLUMNS} FROM task WHERE parent_task_id = ? AND deleted_at IS NULL ORDER BY subtask_order ASC, created_at ASC, id ASC"
         );
-        let mut c = self.pool.begin().await?;
         let rows = sqlx::query(&sql)
             .bind(parent_task_id)
-            .fetch_all(&mut *c)
+            .fetch_all(&self.pool)
             .await?;
-        let tasks = restore_task_rows(&mut c, rows).await?;
-        c.rollback().await?;
-        Ok(tasks)
+        rows.into_iter().map(map_task).collect()
     }
 
     async fn next_subtask_order(&self, parent_task_id: &str) -> Result<i64> {
@@ -1334,8 +1320,6 @@ impl TaskRepo for SqliteDb {
                 .fetch_one(&mut *transaction)
                 .await?,
         );
-        crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition)
-            .await?;
         transaction.commit().await?;
         Ok(task)
     }
@@ -1408,8 +1392,6 @@ impl TaskRepo for SqliteDb {
                 .fetch_one(&mut *transaction)
                 .await?,
         );
-        crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition)
-            .await?;
         self.record_mutation_reply_in_tx(&mut transaction, &task)
             .await?;
 

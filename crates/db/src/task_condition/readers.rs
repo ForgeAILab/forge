@@ -247,7 +247,7 @@ impl TaskCondition {
         let stated = evidence
             .presentation
             .as_ref()
-            .filter(|_| evidence.stated || integration_primary || evidence.legacy_debug_omitted);
+            .filter(|_| evidence.stated || integration_primary);
         let failed = read.interruption.is_some()
             && (evidence.failed_json.is_some() || stated.is_some_and(|p| p.hard_failure));
         let blocked = (evidence.blocked_json.is_some()
@@ -268,12 +268,7 @@ impl TaskCondition {
             // typed reading; it stays visible as an unknown diagnostic.
             diagnostic: read.diagnostic.or_else(|| {
                 read.diagnostic_present
-                    .then(|| {
-                        evidence
-                            .public_diagnostic
-                            .clone()
-                            .or_else(|| untyped_diagnostic(evidence.error_annotation.as_deref()?))
-                    })
+                    .then(|| untyped_diagnostic(evidence.error_annotation.as_deref()?))
                     .flatten()
             }),
             interruption: read.interruption,
@@ -806,21 +801,13 @@ pub(super) fn bound_operator_reason(raw: &str) -> String {
 }
 
 /// A presentation with every text in it cut to [`PRESENTATION_TEXT_LIMIT`].
-pub(super) fn bounded_read(mut read: ConditionRead) -> ConditionRead {
-    // Operations reads a bounded JSON document, not a presentation string.
-    let operator = read
-        .operator_reason
-        .take()
-        .map(|raw| bound_operator_reason(&raw));
+pub(super) fn bounded_read(read: ConditionRead) -> ConditionRead {
     let mut value = serde_json::to_value(read).expect("reader projection serializes");
     bound(&mut value);
-    let mut read: ConditionRead =
-        serde_json::from_value(value).expect("bounded projection retains its types");
-    read.operator_reason = operator;
-    read
+    serde_json::from_value(value).expect("bounded projection retains its types")
 }
 
-pub(super) fn bound(value: &mut Value) {
+fn bound(value: &mut Value) {
     match value {
         Value::String(text) => bound_text(text),
         Value::Object(fields) => {
