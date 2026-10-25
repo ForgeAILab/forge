@@ -98,13 +98,19 @@ continue through the roots, and inherent methods remain on their original types.
 Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
 `daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
 
-The same layout applies to these agents and database modules:
+The same layout applies to these agent, API route, and database modules:
 
-| Root | Implementation children |
+| Root | Implementation and test children |
 |---|---|
 | `services-agents/src/provider_authorization.rs` | OAuth protocol helpers and service types stay in the root; the service implementation (constructor, capability registry, browser/device flows and state handling) lives in `provider_authorization/flows.rs`, with tests in `provider_authorization/tests.rs` |
 | `db/src/sqlite/project.rs` | Project repository operations and chat/binding bootstrap stay in the root; authority, settings, ownership, typed projections, primary-milestone writes and owner bootstrap live in `project/queries.rs` (the `WorkflowProjectAuthorityRow` type stays in the root), with public items re-exported through the root |
 | `db/src/sqlite/orchestration/charters.rs` | Charter reads, revisions, and approval records stay in the root; atomic approval application lives in `charters/apply_approval.rs`, re-exported at its original scope |
+| `api/src/routes/project_overview.rs` | The Overview handler, the next-action input type, and the projection row-decoding and error helpers stay in the root; canonical record loading lives in `project_overview/projections.rs`, next-action selection in `project_overview/next_action.rs`, and the existing test modules in `project_overview/{classify_status_tests,next_action_parity_tests}.rs` |
+| `api/src/routes/milestones.rs` | Milestone lifecycle, readiness, release, and shared authorization helpers stay in the root; definition revision routes live in `milestones/definitions.rs`, manual check routes in `milestones/checks.rs`, and authorization timestamp tests in `milestones/tests.rs`; moved handlers are re-exported through the root |
+| `db/src/integration_queue/fencing.rs` | Attempt ownership and effect receipt production code stays in the root; effect, concurrent claim, and takeover tests live in `fencing/{tests,concurrency_tests,takeover_tests}.rs` |
+
+These API and fencing test modules retain their original module prefixes, and
+the route handler paths and router registrations remain unchanged.
 
 ### Dependency flow
 
