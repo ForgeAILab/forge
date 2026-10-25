@@ -173,6 +173,46 @@ fn earlier(deadline: &mut Option<String>, time: Option<DateTime<Utc>>, now: Date
         }
     }
 }
+fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondition> {
+    // A writer stated this condition in the transaction of its write:
+    // it is not a copy of the legacy fields and cannot lag them.
+    let unreadable = stored.reasons().find_map(|reason| match reason {
+        ParkReason::UnknownCondition {
+            source:
+                db::ConditionSource {
+                    field: db::LegacyConditionField::ConditionJson,
+                    ..
+                },
+            problem,
+        } => Some(problem),
+        _ => None,
+    });
+    match unreadable {
+        // A newer build's encoding is quarantined: this build neither
+        // resolves around it nor repairs it.
+        Some(db::UnknownConditionProblem::UnknownKind) => return None,
+        // Corrupt or empty: the legacy fields are intact, so resolve
+        // from them and let the check restate the stored copy.
+        Some(_) => {
+            return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
+                task,
+            )))
+        }
+        None => {}
+    }
+    if stored.evidence().stated {
+        return None;
+    }
+    let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
+    let (stored, fresh) = (stored.evidence(), legacy.evidence());
+    (stored.error_annotation != fresh.error_annotation
+        || stored.blocked_json != fresh.blocked_json
+        || stored.failed_json != fresh.failed_json
+        || stored.entry_barrier_json != fresh.entry_barrier_json
+        || stored.metadata != fresh.metadata
+        || stored.unparsed_metadata != fresh.unparsed_metadata)
+        .then_some(legacy)
+}
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
         &self,
@@ -184,47 +224,7 @@ impl TaskDispatcher {
         // authoritative. When a writer missed its sync the copy is stale but
         // the row read in this snapshot is not: hold exactly where the legacy
         // fields hold, and leave the stored copy to be repaired.
-        let stale = |stored: &TaskCondition, task: &db::Task| {
-            // A writer stated this condition in the transaction of its write:
-            // it is not a copy of the legacy fields and cannot lag them.
-            let unreadable = stored.reasons().find_map(|reason| match reason {
-                ParkReason::UnknownCondition {
-                    source:
-                        db::ConditionSource {
-                            field: db::LegacyConditionField::ConditionJson,
-                            ..
-                        },
-                    problem,
-                } => Some(problem),
-                _ => None,
-            });
-            match unreadable {
-                // A newer build's encoding is quarantined: this build neither
-                // resolves around it nor repairs it.
-                Some(db::UnknownConditionProblem::UnknownKind) => return None,
-                // Corrupt or empty: the legacy fields are intact, so resolve
-                // from them and let the check restate the stored copy.
-                Some(_) => {
-                    return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
-                        task,
-                    )))
-                }
-                None => {}
-            }
-            if stored.evidence().stated {
-                return None;
-            }
-            let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
-            let (stored, fresh) = (stored.evidence(), legacy.evidence());
-            (stored.error_annotation != fresh.error_annotation
-                || stored.blocked_json != fresh.blocked_json
-                || stored.failed_json != fresh.failed_json
-                || stored.entry_barrier_json != fresh.entry_barrier_json
-                || stored.metadata != fresh.metadata
-                || stored.unparsed_metadata != fresh.unparsed_metadata)
-                .then_some(legacy)
-        };
-        let legacy = stale(&r.condition, &r.task);
+        let legacy = stale_condition(&r.condition, &r.task);
         let condition_stale = legacy.is_some();
         if let Some(legacy) = legacy {
             // Every callee handed this Task reads the same condition this
@@ -235,7 +235,7 @@ impl TaskDispatcher {
         // The coordination root gates its children by its condition: a root
         // whose stored copy is stale holds exactly where its fields hold.
         if let Some(parent) = &mut r.parent {
-            if let Some(legacy) = stale(&parent.condition, parent) {
+            if let Some(legacy) = stale_condition(&parent.condition, parent) {
                 parent.condition = legacy;
             }
         }
@@ -740,6 +740,123 @@ impl TaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corrupt_rows_use_the_legacy_oracle() {
+        let mut task = crate::task_actions::test_support::snapshot(
+            "todo",
+            Some(api_types::FailureKind::WorkspaceError),
+        )
+        .task;
+        task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        let corrupt = db::task_condition::decode_or_unknown("{}");
+        let expected = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        assert_eq!(stale_condition(&corrupt, &task), Some(expected));
+    }
+
+    #[tokio::test]
+    async fn legacy_evidence_detects_missed_syncs_in_each_legacy_input() {
+        use db::TaskRepo;
+        let db = crate::recovery::test_support::sqlite_db().await;
+        let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
+        let task =
+            crate::recovery::test_support::seed_task(&db, project, "in_progress".into(), None)
+                .await;
+        let annotation =
+            serde_json::json!({"type":"workspace_error", "blocking_reason":"old"}).to_string();
+        let metadata = serde_json::json!({"coordination_review_pending":true}).to_string();
+        let mut tx = db.pool().begin().await.unwrap();
+        for i in 0..400 {
+            sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,subtask_order,created_at,updated_at) VALUES (?,?,?,'child','todo',?,'2026-10-25','2026-10-25')")
+                .bind(db::new_uuid_v4()).bind(&task.project_id).bind(&task.id).bind(i).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE task SET error_annotation=?,metadata_json=? WHERE id=?")
+            .bind(&annotation)
+            .bind(&metadata)
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let stored = db.task_condition(&task.id).await.unwrap();
+        let base_raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let row = TaskRepo::get_by_id(&db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale_condition(&stored, &row).is_none());
+        for field in [
+            "error_annotation",
+            "blocked_json",
+            "failed_json",
+            "entry_barrier_json",
+            "metadata_json",
+        ] {
+            sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
+                .bind(if field == "metadata_json" {
+                    serde_json::json!({"coordination_review_pending":true, "awaiting_human":false}).to_string()
+                } else {
+                    serde_json::json!({"kind":"manual_stop","type":"manual_stop","reason":"new hold"}).to_string()
+                })
+                .bind(&task.id).execute(db.pool()).await.unwrap();
+            let changed = TaskRepo::get_by_id(&db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let restated =
+                stale_condition(&stored, &changed).unwrap_or_else(|| panic!("missed {field} sync"));
+            assert_eq!(
+                restated.public(),
+                stored
+                    .restate_legacy(&db::LegacyConditionInput::from(&changed))
+                    .public()
+            );
+            assert!(blocking(&restated, true), "{field}");
+            assert_eq!(
+                db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                    .await
+                    .unwrap(),
+                1,
+                "{field}: repair the legacy evidence too"
+            );
+            let repaired = db.task_condition(&task.id).await.unwrap();
+            let current = TaskRepo::get_by_id(&db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                stale_condition(&repaired, &current).is_none(),
+                "{field}: one sweep repairs the missed sync"
+            );
+            sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
+                .bind(if field == "error_annotation" {
+                    Some(&annotation)
+                } else if field == "metadata_json" {
+                    Some(&metadata)
+                } else {
+                    None
+                })
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+                .bind(&base_raw)
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    }
+
     #[test]
     fn integration_restatement_preserves_lineage_and_new_legacy_holds() {
         for condition in crate::task_actions::tests::integration_conditions() {

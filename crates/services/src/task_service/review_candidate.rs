@@ -367,6 +367,26 @@ impl TaskService {
             },
         )
         .await?;
+        if self
+            .db
+            .record_task_diagnostic_text(
+                &task.id,
+                db::RecordTaskDiagnosticText {
+                    kind: "message",
+                    source: "diagnostic",
+                    owner: &db::DiagnosticOwner::Reason {
+                        reason: db::ParkReason::Failure {
+                            failure_kind: api_types::FailureKind::ReviewBlocked,
+                        },
+                    },
+                    text: &message,
+                },
+            )
+            .await
+            .is_err()
+        {
+            tracing::warn!(task_id = %task.id, "Diagnostic text capture failed; the legacy annotation retains it");
+        }
         Ok(MissingReviewCandidate {
             task: parked,
             target: None,
@@ -375,3 +395,6 @@ impl TaskService {
         })
     }
 }
+
+#[cfg(test)]
+mod condition_tests;

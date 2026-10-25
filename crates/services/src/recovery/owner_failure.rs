@@ -289,6 +289,25 @@ pub(super) async fn annotate_owner_workspace_reset(
         },
     )
     .await?;
+    if db
+        .record_task_diagnostic_text(
+            &task.id,
+            db::RecordTaskDiagnosticText {
+                kind: "message",
+                source: "diagnostic",
+                owner: &db::DiagnosticOwner::Reason {
+                    reason: db::ParkReason::Failure {
+                        failure_kind: api_types::FailureKind::WorkspaceResetRequired,
+                    },
+                },
+                text: message,
+            },
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!(task_id = %task.id, "Diagnostic text capture failed; the legacy annotation retains it");
+    }
     tracing::warn!(placement_id = %placement.id, daemon_id = ?placement_execution_daemon_id(placement), message, "workspace owner reset required");
     Ok(())
 }
@@ -361,3 +380,6 @@ pub(super) async fn reconcile_owner_receipts(
         .map_err(map_error)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod condition_tests;

@@ -169,7 +169,11 @@ impl TaskCondition {
                             if quarantined {
                                 "Stored Task condition was written by a newer Forge build and is quarantined; run a build that understands it. Holding or releasing this Task is refused until then"
                             } else {
-                                "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                                if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle {
+                                    "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                                } else {
+                                    "Stored Task condition is unreadable; inspect its saved diagnostic text or state a new owner action"
+                                }
                             }
                             .into(),
                         ),

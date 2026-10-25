@@ -357,3 +357,11 @@ pub struct CreateTransitionLog {
     pub rejection: bool,
     pub created_at: String,
 }
+
+/// Shared write envelope. New aggregate inputs require a statement, including
+/// explicit Preserve or an owner-scoped clear; there is no optional intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conditioned<T> {
+    pub input: T,
+    pub condition: crate::ConditionStatement,
+}

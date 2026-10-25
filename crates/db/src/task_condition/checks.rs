@@ -152,9 +152,10 @@ impl SqliteDb {
             .clone()
     }
     /// One indexed keyset page of at most [`CONDITION_CHECK_PAGE`] rows. No
-    /// full-table fetch, no workflow write, no event or wake. A failed page
-    /// keeps its cursor for a later supervised tick; a row that cannot be
-    /// recomputed is logged and passed over.
+    /// full-table fetch, no workflow write, no event or wake. A page read
+    /// failure keeps its cursor for a later supervised tick. A row that cannot
+    /// be recomputed or repaired is logged and skipped; the page cursor and
+    /// completed backfill's revision marker still advance.
     pub async fn check_task_conditions(&self, budget: usize) -> Result<ConditionCheckStatus> {
         let (after, limit) = {
             let mut state = self.condition_checks.lock().expect("condition checks");
@@ -281,14 +282,29 @@ impl SqliteDb {
         read_condition: &[u8],
         expected: &str,
     ) -> Result<u64> {
-        Ok(sqlx::query("UPDATE task SET condition_json=?1 WHERE id=?2 AND version=?3 AND CAST(condition_json AS BLOB)=?4")
-            .bind(expected)
-            .bind(task_id)
-            .bind(read_version)
-            .bind(read_condition)
-            .execute(self.pool())
-            .await?
-            .rows_affected())
+        let mut tx = crate::begin_immediate(self.pool()).await?;
+        let current: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND version=? AND CAST(condition_json AS BLOB)=?)")
+            .bind(task_id).bind(read_version).bind(read_condition).fetch_one(&mut *tx).await?;
+        if !current {
+            return Ok(0);
+        }
+        let mut condition = decode(expected)?;
+        let corrupt = matches!(classify(read_condition), Stored::Corrupt(_));
+        if corrupt {
+            let id = recovery::record_raw(&mut tx, task_id, read_condition).await?;
+            if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::DurableOwners {
+                condition.evidence_mut().diagnostic_ids.push(id);
+            }
+        }
+        set_condition(
+            &mut tx,
+            task_id,
+            &serde_json::to_string(&condition).map_err(storage::json_error)?,
+            Some(read_version),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(1)
     }
     async fn check_condition_page(&self, after: Option<&str>, limit: usize) -> Result<Page> {
         if limit == 0 {
@@ -319,6 +335,16 @@ impl SqliteDb {
         first: Option<&str>,
         second: i64,
     ) -> Result<Page> {
+        self.check_condition_rows_with_policy(select, first, second, recovery::UNREADABLE_POLICY)
+            .await
+    }
+    async fn check_condition_rows_with_policy(
+        &self,
+        select: &str,
+        first: Option<&str>,
+        second: i64,
+        policy: recovery::UnreadablePolicy,
+    ) -> Result<Page> {
         let mut reader = self.pool().begin().await?;
         let rows = sqlx::query(select)
             .bind(first)
@@ -332,14 +358,36 @@ impl SqliteDb {
             let stored: Vec<u8> = row.try_get(5)?;
             // A newer encoding is counted and left; corruption is recomputed
             // below like any other stale row.
-            if matches!(stored_condition(&mut reader, &stored).await, Stored::Newer) {
+            let classified = stored_condition(&mut reader, &stored).await;
+            if matches!(classified, Stored::Newer) {
                 quarantined.push(id);
                 continue;
             }
             let expected = async {
                 let input = LegacyConditionInput::from_row(row)?;
-                let facts = ConditionFacts::load(&mut reader, &id).await?;
-                Ok::<_, DbError>(facts.condition(&input))
+                let mut facts = ConditionFacts::load(&mut reader, &id).await?;
+                let stored = match classified {
+                    Stored::Readable(stored) => Some(*stored),
+                    Stored::Corrupt(problem) => {
+                        if policy == recovery::UnreadablePolicy::DurableOwners {
+                            recovery::load_owners(&mut reader, &mut facts).await?;
+                            return Ok(recovery::project(&facts, problem, None));
+                        }
+                        None
+                    }
+                    Stored::Newer => unreachable!("quarantine was handled above"),
+                };
+                if policy == recovery::UnreadablePolicy::DurableOwners
+                    && stored.as_ref().is_some_and(recovery::unreadable)
+                {
+                    recovery::load_owners(&mut reader, &mut facts).await?;
+                }
+                Ok::<_, DbError>(recovery::expected_with_policy(
+                    &facts,
+                    &input,
+                    stored.as_ref(),
+                    policy,
+                ))
             }
             .await;
             match expected {
@@ -351,7 +399,7 @@ impl SqliteDb {
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(task_id = %id, %error, "Task condition could not be recomputed; skipped")
+                    tracing::warn!(task_id = %id, error_kind = repair_error_kind(&error), "Task condition could not be recomputed; skipped")
                 }
             }
         }
@@ -359,9 +407,15 @@ impl SqliteDb {
         let mut repaired = 0;
         for (id, version, stored, expected) in stale {
             // A row written since is left to its own producer and the next pass.
-            repaired += self
+            match self
                 .repair_condition(&id, version, &stored, &expected)
-                .await?;
+                .await
+            {
+                Ok(count) => repaired += count,
+                Err(error) => {
+                    tracing::warn!(task_id = %id, error_kind = repair_error_kind(&error), "Task condition could not be repaired; skipped")
+                }
+            }
         }
         Ok(Page {
             checked: rows.len() as u64,
@@ -369,5 +423,14 @@ impl SqliteDb {
             quarantined,
             next: rows.last().map(|row| row.try_get(6)).transpose()?,
         })
+    }
+}
+
+// Error messages may contain stored text or SQL trigger text.
+fn repair_error_kind(error: &DbError) -> &'static str {
+    match error {
+        DbError::Check(_) => "condition",
+        DbError::VersionConflict => "version_conflict",
+        _ => "storage",
     }
 }

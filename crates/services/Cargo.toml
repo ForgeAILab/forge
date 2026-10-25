@@ -8,7 +8,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [features]
-test-support = ["cli-adapters/test-support"]
+test-support = ["cli-adapters/test-support", "db/test-template"]
 
 # The integration targets use the `test-support` fixtures. They name the
 # feature here instead of through a `services = { path = "." }` self

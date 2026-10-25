@@ -34,6 +34,12 @@ pub use task_condition::{
     CONDITION_CHECK_PAGE, EVIDENCE_VALUE_LIMIT, LEAD_INPUT_WAIT, LEGACY_BLOCKING_ANNOTATION_KINDS,
     MAPPING_REVISION, MAPPING_REVISION_KEY,
 };
+pub use task_condition::{
+    ConditionDiagnostic, ConditionIdentity, ConditionInterruption, ConditionOwnerEdit,
+    ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
+    DiagnosticOwner, RecordTaskDiagnosticText, SavedTaskCondition, StatedCondition,
+    TaskDiagnosticText, TaskDiagnosticTextPage, DIAGNOSTIC_TEXT_LIMIT,
+};
 mod task_mutation;
 mod task_step;
 pub mod task_writer;
