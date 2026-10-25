@@ -6182,6 +6182,7 @@ step-failure overlay still sorts the combined object, as it did before. Both
 writers use the repository status-write transaction, which explicitly produces
 `ConditionChange::Entry`; neither goes through the SQL-text classifier.
 
+The parity reference is pinned to main `37309bb9`, including fixes #120–#122.
 Archived-main fixtures cover the legacy columns, cache bytes, public projection,
 offers, failure kind, Operations reason and interruption-event dedupe across a
 subsequent unconverted metadata write and the real queue overlay. Canonical

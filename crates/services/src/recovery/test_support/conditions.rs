@@ -24,7 +24,7 @@ pub(crate) const SHAPES: &[&str] = &[
 ];
 const AT: &str = "2026-10-25T00:00:00Z";
 pub(crate) const ESCAPED_REASON: &str = "é😀\n\"\\\u{7}";
-const MAIN_ORACLE: &str = include_str!("fixtures/conditions-main-9296fb76.jsonl");
+const MAIN_ORACLE: &str = include_str!("fixtures/conditions-main-37309bb9.jsonl");
 
 pub(crate) fn assert_writer_cases(writer: &str, visited: usize) {
     let prefix = format!("{writer}/");
@@ -393,7 +393,7 @@ pub(crate) async fn assert_main_snapshot(
 }
 
 fn assert_expected(actual: &Value) {
-    // Generated only by the identical harness over git archive 9296fb76. The
+    // Generated only by the identical harness over git archive 37309bb9. The
     // checked-in hashes cover bytes, not a mapper run by the code under test.
     let expected = MAIN_ORACLE
         .lines()
