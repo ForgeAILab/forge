@@ -5871,9 +5871,10 @@ column and an expression index on its tagged enum kind. Stages one and two
 established the shadow and dual-write adapters. Stage four makes its typed
 presentation authoritative for public readers: health, human-readiness,
 exceptions, offers/apply, slots, overview, operations, MCP/native/Solo,
-Attention and environment surfaces. Legacy columns and condition metadata are
-still written by the adapters and retained for import, rollback and invariant
-repair until stage five. They are not public-reader inputs. The original
+Attention and environment surfaces. The four condition columns and condition
+metadata remain storage inputs to the single mapper; 3.1 gives their writers
+strict channel types and retains `condition_json` as the cache. They are not
+public-reader inputs. The original
 migration preserves Task versions/timestamps, retained queue intents,
 publication claims and budget receipts, including archived/deleted Tasks and
 malformed historical JSON.
@@ -6172,15 +6173,34 @@ parks, wait/deadline rows, queue receipts, pending cancellations or immutable ev
 
 ### Task condition statements and diagnostic text (3.1, in progress)
 
-3.1 converts writers before removing storage. Writers still write the four
-legacy columns and condition metadata; unconverted aggregates continue to use
-the existing mapper. Column/key removal, the final reader guard and diagnostic
-REST/UI exposure belong to later gates. This checkpoint adds
+3.1 keeps the four condition columns and condition metadata keys as storage.
+Writers construct strict Rust channel values and bind their serialization;
+`map_legacy_condition` remains the single producer, with `condition_json` as its
+cache. Historical and unknown shapes retain the existing lenient mapping.
+The typed-channel spike converts workspace-owner reset and executor failure.
+Reset retains the alphabetical field order of its former `json!` object;
+executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
+step-failure overlay still sorts the combined object, as it did before. Both
+writers use the repository status-write transaction, which explicitly produces
+`ConditionChange::Entry`; neither goes through the SQL-text classifier.
+
+Archived-main fixtures cover the legacy columns, cache bytes, public projection,
+offers, failure kind, Operations reason and interruption-event dedupe across a
+subsequent unconverted metadata write and the real queue overlay. Canonical
+Attention digests are compared for all 96 snapshots, including the 400-child
+root. Each shape's fixture retains one production event worker across all three
+phases and drains bounded batches through the exact snapshot event before
+hashing its stored Attention projection with `canonical_attention_incident_digest`.
+The exact placement-clear fence retains its match against pre-upgrade annotation
+bytes.
+
+The owner-record contracts described below remain scaffolding pending removal;
+this spike does not activate them. This checkpoint adds
 `task_diagnostic_text` and captures full source text in it. It retains internal
 typed contracts for later writer conversions; it does not delete or rewrite
 existing Task data. Under the active `LegacyOracle` policy, stored condition
 bytes, public projections, offers, failure kinds, Operations text and Attention
-digests remain equal to main `6120c133`, including corruption repair and existing
+digests remain equal to main `9296fb76`, including corruption repair and existing
 Integration/Check refusal outcomes.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,

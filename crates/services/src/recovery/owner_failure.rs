@@ -272,9 +272,19 @@ pub(super) async fn annotate_owner_workspace_reset(
     {
         return Ok(());
     }
-    let annotation = json!({"type": api_types::FailureKind::WorkspaceResetRequired,
-        "blocking_reason": "owner_workspace_reset_required", "blocked_by": actor.display(),
-        "blocked_at": now_rfc3339(), "message": message});
+    let annotation = db::task_condition::channels::ErrorAnnotation::WorkspaceResetRequired(
+        db::task_condition::channels::WorkspaceResetAnnotation {
+            blocked_at: now_rfc3339(),
+            blocked_by: actor.display(),
+            blocking_reason: "owner_workspace_reset_required".into(),
+            message: message.into(),
+        },
+    );
+    let annotation = serde_json::to_string(&annotation).map_err(|error| {
+        ServiceError::invalid_operation(format!(
+            "failed to serialize workspace-reset annotation: {error}"
+        ))
+    })?;
     TaskRepo::update_status(
         db,
         UpdateTaskStatus {
@@ -282,7 +292,7 @@ pub(super) async fn annotate_owner_workspace_reset(
             expected_version: task.version,
             status: task.status,
             assignee_id: None,
-            error_annotation: Some(Some(annotation.to_string())),
+            error_annotation: Some(Some(annotation)),
             blocked_json: None,
             failed_json: None,
             updated_at: now_rfc3339(),

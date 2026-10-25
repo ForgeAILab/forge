@@ -1273,6 +1273,7 @@ pub(crate) use storage::{backfill, classify, stored_condition};
 pub use storage::{decode, decode_or_unknown, QUARANTINE_REPORT_LIMIT};
 use storage::{encode, set_condition, Stored};
 
+pub mod channels;
 mod write;
 pub(crate) use write::{fence_statement_version_in_tx, with_statement, with_statement_at_version};
 mod intent;
