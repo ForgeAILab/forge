@@ -1278,8 +1278,9 @@ const RAW_PATH_CALLERS: &[(&str, usize)] = &[
     ("services/src/task_actions.rs", 1),  // 3.2 D
     // Admission-failure cleanup: the path of a workspace this claim just
     // created, captured to remove it. Nothing runs there.
-    // Plus one Task-root anchor (plan stage discard).
-    ("services/src/task_service.rs", 2),
+    ("services/src/task_service.rs", 1),
+    // One Task-root anchor (plan stage discard).
+    ("services/src/task_service/remote_terminal.rs", 1),
     // A terminal is how a person looks into a workspace, a broken one
     // included: it opens in the recorded directory after the terminal
     // service's own path guardrail, as it always has.
