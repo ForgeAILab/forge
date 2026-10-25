@@ -131,7 +131,7 @@ What replaced it:
   cargo test -p services --features test-support --test main attention_service::test_name
   cargo test -p services --features test-support --test '*'   # both targets
   cargo test -p services-agents --features test-support --test main native_chat_tool_exchanges::test_name
-  cargo test -p db --features test-template --test main file_backed_migration::test_name
+  cargo test -p db --features test-template --test main file_backed_migration::<topic>::test_name
   ```
 
 - What Cargo does without the feature (checked at `3cd105cb`): a named target
@@ -542,7 +542,7 @@ artifacts remain enabled to compare cold and warm builds in CI.
 For focused integration work, use the original file stem as a module filter:
 
 ```bash
-cargo test -p db --features test-template --test main file_backed_migration::test_name
+cargo test -p db --features test-template --test main file_backed_migration::<topic>::test_name
 cargo test -p services --features test-support --test main attention_service::test_name
 cargo test -p api --test main happy_path::test_name
 cargo test -p services --features test-support --test project_provisioning_characterization test_name
@@ -550,6 +550,13 @@ cargo test -p services --features test-support --test project_provisioning_chara
 
 The `--features` argument is required for the `services` and `db` integration
 targets; see [Test features and required-features](#test-features-and-required-features).
+
+Large test modules keep their original target and module filter, with one topic
+segment added to individual test paths. File-backed migrations, integration
+activation, V076 orchestration acceptance, session journal runtime, and daemon
+workspace protocol tests use topic files beside a small module root; shared
+fixtures live in each directory's `helpers.rs`. Migration and acceptance fixture
+includes still resolve to the original files.
 
 To prove a consolidation preserves tests, record combined stdout and stderr
 before moving files, repeat after the change, and compare the names. The
