@@ -643,12 +643,12 @@ fn head_table_is_total_and_inside_the_storage_graph() {
     }
     assert_eq!(HEAD_TABLE.len(), S::ALL.len());
 }
-
 #[test]
 fn worker_sources_stay_inside_the_boundary() {
     for (name, source) in [
         ("mod", include_str!("mod.rs")),
         ("driver", include_str!("driver.rs")),
+        ("driver/states", include_str!("driver/states.rs")),
         ("ports", include_str!("ports.rs")),
         ("table", include_str!("table.rs")),
     ] {

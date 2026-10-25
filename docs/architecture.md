@@ -57,11 +57,64 @@ types.
 | `workspace_cleanup.rs` | Existing garbage collection child; scheduler production code remains in the root |
 | `task_actions.rs` | Offer derivation; snapshot loading remains in the root |
 | `task_service/execution/recovery.rs` | Action ownership, queued actions, failure metadata, retry budgets, process continuation, restart, manual review, entry recovery |
+| `usage_projection/ledger_index.rs` | Query, budget, and synchronization operations in `ledger_index/queries.rs`; state and folds remain in the root |
+| `daemon_transport/workspace_client.rs` | Object transfer in `workspace_client/object_transfer.rs`; RPC, receipt, and retry tests in `workspace_client/tests.rs` |
+| `project_artifact_commands.rs` | Command execution in `project_artifact_commands/execution.rs`; validation observation and manifest tests in `project_artifact_commands/tests.rs` |
+| `operating_skills.rs` | Rendering and digest tests in `operating_skills/tests.rs`; doctrine cutover tests in `operating_skills/doctrine_cutover_tests.rs`; protocol strings remain in the root |
+| `project_milestone_commands.rs` | Milestone definition, readiness, and release request execution in `project_milestone_commands/execution.rs` |
+| `terminal_service.rs` | Embedded PTY tasks, output, and cleanup in `terminal_service/embedded.rs`; session and control tests in `terminal_service/tests.rs` |
+| `coordination_service.rs` | Commitment, inbox, action, and policy code stays in the root; tests live in `coordination_service/tests.rs`, alongside the existing test-only `base_policy.rs` oracle |
+| `task_service/execution/ledger.rs` | Pricing admission, frozen selections, and usage-event construction stay in the root; settlement preparation and terminal payloads live in `ledger/settlement.rs`, with tests in `ledger/tests.rs` |
+| `integration_worker/driver.rs` | Head sessions, scheduling, retries, and transfer coordination stay in the root; validation, rebase, check, fast-forward, and reconciliation stages live in `driver/states.rs` |
+| `integration_owner.rs` | Server owner admission, Git effects, object transfer, and receipt validation stay in the root; tests live in `integration_owner/tests.rs` |
 
 Unit tests remain below the same top-level module prefixes, including
 `task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
 assignments. Large test modules use topic children and shared fixtures in their
 test root.
+
+Adapter, review, executor, and transport modules follow the same layout:
+
+| Root | Implementation and test children |
+|---|---|
+| `crates/cli-adapters/src/codex.rs` | Managed home preparation and writable sandbox roots in `codex/managed_home.rs`, with their tests in `codex/managed_home/tests.rs`; adapter and session tests in `codex/tests.rs` |
+| `crates/review/src/contract.rs` | Persisted CI evidence in `contract/ci.rs`, prompt construction in `contract/prompts.rs`, assessment parsing and conformance evaluation in `contract/conformance.rs`, shared tests in `contract/tests.rs` and part tests in `contract/{ci,prompts,conformance}/tests.rs` |
+| `crates/executors/src/gc.rs` | Filesystem mechanics remain in the root; ownership, confinement, eviction, and disk accounting tests live in `gc/tests.rs` |
+| `crates/api-types/src/daemon_transport.rs` | Workspace handles, owner fences, probes, and operation payloads in `daemon_transport/workspace.rs`; transport round-trip tests in `daemon_transport/tests.rs` |
+
+`contract.rs` and `daemon_transport.rs` re-export the public items they moved;
+`codex.rs` and `gc.rs` moved no public items. Tests retain the `codex::`,
+`contract::`, `gc::`, and `daemon_transport::` prefixes.
+
+### Solo and client module layout
+
+Solo and client modules use the same root-and-children layout. Existing imports
+continue through the roots, and inherent methods remain on their original types.
+
+| Root | Implementation and test children |
+|---|---|
+| `forge-solo/src/bootstrap.rs` | Contract types, orchestration, and shared validation stay in the root; `bootstrap/agents.rs` owns registration and candidate selection; `bootstrap/project.rs` owns owner, repository, chat, and binding reconciliation; tests live in `bootstrap/tests.rs` |
+| `forge-solo/src/app.rs` | Presentation and command types stay in the root; `app/reducer.rs` owns state construction, reduction, and navigation; tests live in `app/tests.rs` |
+| `forge-solo/src/ui_bridge.rs` | Controller reduction and input translation stay in the root; `ui_bridge/projection.rs` maps backend snapshots to app state, with public helpers re-exported by the root; tests live in `ui_bridge/tests.rs` |
+| `forge-client/src/daemon_persistence.rs` | Journal types and persistence stay in the root; tests live in `daemon_persistence/tests.rs` |
+| `forge-client/src/daemon_workspace.rs` | Dispatch, registry state, shared validation, and process helpers stay in the root; `daemon_workspace/locations.rs` owns repository verification and provisioning; `daemon_workspace/execution.rs` owns preparation, commands, reads, and diffs; `daemon_workspace/mutations.rs` owns merge, reset, and cleanup; existing children and test modules retain their paths |
+
+Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
+`daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
+
+The same layout applies to these agent, API route, and database modules:
+
+| Root | Implementation and test children |
+|---|---|
+| `services-agents/src/provider_authorization.rs` | OAuth protocol helpers and service types stay in the root; the service implementation (constructor, capability registry, browser/device flows and state handling) lives in `provider_authorization/flows.rs`, with tests in `provider_authorization/tests.rs` |
+| `db/src/sqlite/project.rs` | Project repository operations and chat/binding bootstrap stay in the root; authority, settings, ownership, typed projections, primary-milestone writes and owner bootstrap live in `project/queries.rs` (the `WorkflowProjectAuthorityRow` type stays in the root), with public items re-exported through the root |
+| `db/src/sqlite/orchestration/charters.rs` | Charter reads, revisions, and approval records stay in the root; atomic approval application lives in `charters/apply_approval.rs`, re-exported at its original scope |
+| `api/src/routes/project_overview.rs` | The Overview handler, the next-action input type, and the projection row-decoding and error helpers stay in the root; canonical record loading lives in `project_overview/projections.rs`, next-action selection in `project_overview/next_action.rs`, and the existing test modules in `project_overview/{classify_status_tests,next_action_parity_tests}.rs` |
+| `api/src/routes/milestones.rs` | Milestone lifecycle, readiness, release, and shared authorization helpers stay in the root; definition revision routes live in `milestones/definitions.rs`, manual check routes in `milestones/checks.rs`, and authorization timestamp tests in `milestones/tests.rs`; moved handlers are re-exported through the root |
+| `db/src/integration_queue/fencing.rs` | Attempt ownership and effect receipt production code stays in the root; effect, concurrent claim, and takeover tests live in `fencing/{tests,concurrency_tests,takeover_tests}.rs` |
+
+These API and fencing test modules retain their original module prefixes, and
+the route handler paths and router registrations remain unchanged.
 
 ### Dependency flow
 
