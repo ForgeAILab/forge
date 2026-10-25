@@ -229,7 +229,13 @@ fn normalized(raw: &str, row: &Task) -> String {
         .replace(&row.id, "fixture-task")
         .replace(&row.project_id, "fixture-project");
     for time in timestamps {
-        let placeholder: String = time
+        let without_precision = if let Some((seconds, fraction)) = time.split_once('.') {
+            let timezone = fraction.trim_start_matches(|ch: char| ch.is_ascii_digit());
+            format!("{seconds}.<frac>{timezone}")
+        } else {
+            time.clone()
+        };
+        let placeholder: String = without_precision
             .chars()
             .map(|ch| if ch.is_ascii_digit() { '0' } else { ch })
             .collect();
@@ -410,19 +416,36 @@ async fn timestamp_normalization_preserves_format_and_fields() {
     row.updated_at = "2026-10-25T04:05:06+00:00".into();
     let raw = json!({
         "created_at": row.created_at,
-        "blocked_at": "2026-10-25T07:08:09.123456789Z",
+        "blocked_at": "2026-10-25T07:08:09.123456789+02:30",
         "updated_at": row.updated_at,
         "nested": r#"{"detected_at":"2026-10-25T10:11:12+02:30"}"#,
         "not_before": "2099-01-01T00:00:00Z",
     });
     let expected = json!({
-        "created_at": "0000-00-00T00:00:00.000Z",
-        "blocked_at": "0000-00-00T00:00:00.000000000Z",
+        "created_at": "0000-00-00T00:00:00.<frac>Z",
+        "blocked_at": "0000-00-00T00:00:00.<frac>+00:00",
         "updated_at": "0000-00-00T00:00:00+00:00",
         "nested": r#"{"detected_at":"0000-00-00T00:00:00+00:00"}"#,
         "not_before": "2099-01-01T00:00:00Z",
     });
     assert_eq!(normalized(&raw.to_string(), &row), expected.to_string());
+}
+
+#[tokio::test]
+async fn timestamp_normalization_ignores_platform_fractional_precision() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let row = seed_task(&db, project, "in_progress".into(), None).await;
+    for timezone in ["Z", "+02:30", "-04:00"] {
+        let microseconds = json!({"detected_at": format!("2026-10-25T01:02:03.123456{timezone}")});
+        let nanoseconds =
+            json!({"detected_at": format!("2026-10-25T01:02:03.123456789{timezone}")});
+        assert_eq!(
+            normalized(&microseconds.to_string(), &row),
+            normalized(&nanoseconds.to_string(), &row),
+            "platform clock precision with timezone {timezone}"
+        );
+    }
 }
 
 pub(crate) async fn assert_next_write(

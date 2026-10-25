@@ -6188,6 +6188,10 @@ subsequent unconverted metadata write and the real queue overlay. Canonical
 Attention digests are compared for all 96 snapshots, including the 400-child
 root, using the production Attention projector. The exact placement-clear fence
 retains its match against pre-upgrade annotation bytes.
+The test harness zeros volatile RFC3339 digits and replaces fractional seconds
+with `.<frac>` so microsecond and nanosecond platform clocks compare equally.
+It preserves field locations, separators and timezone syntax; fixed 2099 retry
+deadlines remain exact.
 
 The owner-record contracts described below remain scaffolding pending removal;
 the converted channel writers do not activate them. This checkpoint adds
