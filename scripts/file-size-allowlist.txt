@@ -66,13 +66,3 @@
 5532 crates/services/src/workflow/engine/tests.rs
 3009 crates/services/src/workflow/engine/tests/durable_23b.rs
 2362 crates/services/tests/suite/project_milestone_command.rs
-1082 web/src/api/sse.test.ts
-1153 web/src/components/chat/agent-chat-timeline.tsx
-1442 web/src/components/settings/ProjectHooksSection.tsx
-1352 web/src/features/federation/ProvidersTab.tsx
-1144 web/src/features/product-genesis/ProductGenesisControls.tsx
-1077 web/src/features/project-execution/ProjectExecutionSetupPanel.tsx
-1144 web/src/lib/logs-to-chat.test.ts
-1101 web/src/lib/logs-to-chat.ts
-1279 web/src/pages/MissionControlPage.tsx
-1054 web/src/pages/__tests__/MissionControlPage.test.tsx
