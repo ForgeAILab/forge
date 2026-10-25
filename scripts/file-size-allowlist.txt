@@ -20,13 +20,8 @@
 2189 crates/db/src/task_step.rs
 12529 crates/db/src/tests.rs
 6712 crates/db/tests/suite/file_backed_migration.rs
-2546 crates/forge-client/src/daemon_persistence.rs
-2557 crates/forge-client/src/daemon_workspace.rs
 2035 crates/forge-client/src/daemon_workspace/tests/protocol.rs
-2933 crates/forge-solo/src/app.rs
-2958 crates/forge-solo/src/bootstrap.rs
 2931 crates/forge-solo/src/session.rs
-2281 crates/forge-solo/src/ui_bridge.rs
 3168 crates/mcp-server/src/tests.rs
 2108 crates/services-agents/src/provider_authorization.rs
 4376 crates/services-agents/tests/suite/attention_service.rs
