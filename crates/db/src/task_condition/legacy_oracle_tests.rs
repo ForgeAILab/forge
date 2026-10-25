@@ -266,6 +266,46 @@ async fn coordination_statement_matches_legacy(block: Option<&str>, visible_chil
                 tx.commit().await.unwrap();
                 let actual = db.task_condition("root").await.unwrap();
                 assert_eq!(actual.typed(), expected.typed(), "{statement:?}");
+                if visible_children {
+                    assert_eq!(
+                        actual
+                            .reasons()
+                            .filter(|reason| matches!(reason, ParkReason::Children { .. }))
+                            .collect::<Vec<_>>(),
+                        vec![&ParkReason::Children {
+                            root_id: "root".into(),
+                            remaining: vec!["child".into()],
+                        }],
+                        "{statement:?}"
+                    );
+                    let primary = actual.reasons().next().unwrap();
+                    match block {
+                        Some("manual_stop") => assert!(matches!(primary, ParkReason::Held { .. })),
+                        Some("workspace_error") => {
+                            assert!(matches!(primary, ParkReason::Failure { .. }));
+                        }
+                        None => assert!(matches!(primary, ParkReason::Children { .. })),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    let observation = ParkReason::UnknownCondition {
+                        source: ConditionSource {
+                            field: LegacyConditionField::MetadataJson,
+                            key: Some("coordination_review_pending".into()),
+                        },
+                        problem: UnknownConditionProblem::UnownedEntry,
+                    };
+                    assert_eq!(
+                        actual
+                            .evidence()
+                            .observations
+                            .iter()
+                            .filter(|reason| **reason == observation)
+                            .count(),
+                        1,
+                        "{statement:?}"
+                    );
+                }
                 assert_eq!(actual.public(), expected.public(), "{statement:?}");
                 let raw = raw_condition(&db, "root").await;
                 if let Some(previous) = previous_raw.replace(raw.clone()) {

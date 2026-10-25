@@ -110,7 +110,12 @@ impl Root {
             .unwrap()
     }
 
-    async fn assert_legacy_projection(&self, before: &db::Task) {
+    async fn assert_legacy_projection(
+        &self,
+        before: &db::Task,
+        block: Option<&str>,
+        visible_children: bool,
+    ) {
         let after = self.task().await;
         assert_eq!(after.version, before.version);
         assert_eq!(
@@ -124,6 +129,46 @@ impl Root {
         input.facts = Some(facts);
         let expected = db::map_legacy_condition(&input);
         assert_eq!(after.condition.typed(), expected.typed());
+        if visible_children {
+            assert_eq!(
+                after
+                    .condition
+                    .reasons()
+                    .filter(|reason| matches!(reason, db::ParkReason::Children { .. }))
+                    .collect::<Vec<_>>(),
+                vec![&db::ParkReason::Children {
+                    root_id: "root".into(),
+                    remaining: vec!["child".into()],
+                }]
+            );
+            let primary = after.condition.reasons().next().unwrap();
+            match block {
+                Some("manual_stop") => assert!(matches!(primary, db::ParkReason::Held { .. })),
+                Some("workspace_error") => {
+                    assert!(matches!(primary, db::ParkReason::Failure { .. }))
+                }
+                None => assert!(matches!(primary, db::ParkReason::Children { .. })),
+                _ => unreachable!(),
+            }
+        } else {
+            let observation = db::ParkReason::UnknownCondition {
+                source: db::ConditionSource {
+                    field: db::LegacyConditionField::MetadataJson,
+                    key: Some("coordination_review_pending".into()),
+                },
+                problem: db::UnknownConditionProblem::UnownedEntry,
+            };
+            assert_eq!(
+                after
+                    .condition
+                    .evidence()
+                    .observations
+                    .iter()
+                    .filter(|reason| **reason == observation)
+                    .count(),
+                1
+            );
+        }
         assert_eq!(after.condition.public(), expected.public());
         self.db
             .check_task_condition_invariant(&after)
@@ -158,7 +203,8 @@ async fn integration_restatement(block: Option<&str>, visible_children: bool) {
             .unwrap());
     })
     .await;
-    root.assert_legacy_projection(&before).await;
+    root.assert_legacy_projection(&before, block, visible_children)
+        .await;
 }
 
 async fn check_progress(block: Option<&str>, visible_children: bool) {
@@ -261,7 +307,8 @@ async fn check_progress(block: Option<&str>, visible_children: bool) {
         task.condition.check_wait().unwrap().phase,
         api_types::CheckWaitPhase::Result
     );
-    root.assert_legacy_projection(&before).await;
+    root.assert_legacy_projection(&before, block, visible_children)
+        .await;
 }
 
 #[tokio::test]
