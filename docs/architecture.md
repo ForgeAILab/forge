@@ -47,6 +47,8 @@ types.
 
 | Root under `crates/services/src/` | Implementation children |
 |---|---|
+| `task_service.rs` | Existing Task operation children; remote terminal reports and settlement in `task_service/remote_terminal.rs` |
+| `workflow/engine/mod.rs` | Context, durable steps and hooks stay in the root; the transition implementation is in `workflow/engine/transition.rs`; resolution tests remain in the root |
 | `recovery.rs` | Startup recovery, heartbeat, leases, Task recovery, execution ownership, placement monitoring, owner failure, reconciliation, machine removal |
 | `task_service/workspace.rs` | Admission, claim preparation, workspace persistence, worktree recovery, reset |
 | `attention_service.rs` | Wake sweeping, admission, decisions, responders, projection, user actions, Mission Control |
@@ -8988,6 +8990,12 @@ React + TypeScript + Vite + TanStack Query/Router. Source in `web/src/`. Uses
 `@` path alias → `web/src/`. API client at `web/src/api/client.ts` calls
 `/api/v1/*` endpoints. Types in `web/src/types/generated/api.ts` must match
 `api-types` crate responses.
+
+The hand-maintained `types/generated/api.ts` and `api/hooks.ts` files are barrels
+over domain modules in `types/generated/api/` and `api/hooks/`. Consumers keep
+using the barrel paths, so `vi.mock('@/api/hooks')` still intercepts every hook.
+`pages/ProjectOverviewPage.tsx` composes the sections in `pages/project-overview/`;
+formatting helpers and shared components live alongside those sections.
 
 ## Crate notes
 
