@@ -3,8 +3,6 @@
 # After shrinking/deleting files: python3 scripts/check-file-sizes.py --update
 # Maintainers only: --init recreates the one-time baseline, never to accept growth.
 2187 crates/agent-host/tests/session_journal_runtime.rs
-2447 crates/api/src/routes/milestones.rs
-2977 crates/api/src/routes/project_overview.rs
 8251 crates/api/tests/daemon_workspace_roundtrip.rs
 6814 crates/api/tests/model_workflow.rs
 2012 crates/api/tests/suite/happy_path.rs
@@ -13,7 +11,6 @@
 2494 crates/db/src/budget.rs
 2654 crates/db/src/check_run/tests.rs
 2266 crates/db/src/integration_queue/activation_tests.rs
-2028 crates/db/src/integration_queue/fencing.rs
 2303 crates/db/src/task_condition/tests.rs
 2189 crates/db/src/task_step.rs
 12529 crates/db/src/tests.rs
