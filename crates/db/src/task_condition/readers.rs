@@ -5,6 +5,9 @@ use super::*;
 use api_types::{FailureKind, InterruptionMetadata, TaskAnnotation, TaskBlockingAnnotation};
 use serde_json::Value;
 
+#[cfg(test)]
+mod project_wait_tests;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConditionRetry {
     pub not_before: String,
@@ -13,26 +16,53 @@ pub struct ConditionRetry {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConditionRefusal {
-    pub task_version: i64,
-    pub capability: String,
     pub blocker_digest: String,
-    pub recorded_at: String,
-    pub safe_message: String,
+    pub capability: String,
     /// What a `machine_capacity` wait is for when it is not a run slot
     /// (`disk`). The typed fact every reader decides on; the message is
     /// for people only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_wait: Option<ProjectWait>,
+    pub recorded_at: String,
+    pub safe_message: String,
+    pub task_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectWait {
+    AtCapacity,
+    WaitingOnOwner,
+}
+
+impl ProjectWait {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::AtCapacity => "project_at_capacity",
+            Self::WaitingOnOwner => "project_waiting_on_owner",
+        }
+    }
 }
 impl ConditionRefusal {
+    pub fn project_wait_subcause(&self) -> Option<ProjectWait> {
+        (self.capability == "project_capacity").then(|| {
+            self.project_wait
+                .unwrap_or_else(|| read_pre_upgrade_project_wait(&self.safe_message))
+        })
+    }
+
     /// The wait this refusal is, as the stable reason readers show
     /// (`workflow_health.stale_reason`, placement filter code), and its
     /// message without the reason prefix. Decided by `capability` and
-    /// `capacity_scope`, never by what the message says.
-    pub fn capacity_reason(&self) -> (&str, &str) {
+    /// `capacity_scope`/`project_wait`. Only pre-upgrade rows without
+    /// `project_wait` derive the Project subcause from their saved message.
+    pub fn capacity_reason(&self) -> (&'static str, &str) {
         capacity_reason(
             &self.capability,
             self.capacity_scope.as_deref(),
+            self.project_wait,
             &self.safe_message,
         )
     }
@@ -41,21 +71,29 @@ impl ConditionRefusal {
 pub fn capacity_reason<'a>(
     capability: &str,
     capacity_scope: Option<&str>,
+    project_wait: Option<ProjectWait>,
     safe_message: &'a str,
-) -> (&'a str, &'a str) {
-    let (prefix, message) = match safe_message.split_once(": ") {
-        Some((prefix, message)) => (Some(prefix), message),
-        None => (None, safe_message),
-    };
+) -> (&'static str, &'a str) {
+    let message = safe_message
+        .split_once(": ")
+        .map_or(safe_message, |(_, message)| message);
     let reason = match (capability, capacity_scope) {
         ("machine_capacity", Some(api_types::CAPACITY_SCOPE_DISK)) => "disk_pressure",
         ("machine_capacity", _) => "machine_capacity",
-        // A Project wait has two reasons and no typed scope yet: its
-        // message names which.
-        (_, _) if prefix == Some("project_waiting_on_owner") => "project_waiting_on_owner",
-        _ => "project_at_capacity",
+        _ => project_wait
+            .unwrap_or_else(|| read_pre_upgrade_project_wait(safe_message))
+            .reason(),
     };
     (reason, message)
+}
+
+/// Read the subcause of pre-upgrade rows, which saved only a message prefix.
+/// Keep the original delimiter/prefix rule solely for rows without the typed field.
+fn read_pre_upgrade_project_wait(safe_message: &str) -> ProjectWait {
+    match safe_message.split_once(": ") {
+        Some(("project_waiting_on_owner", _)) => ProjectWait::WaitingOnOwner,
+        _ => ProjectWait::AtCapacity,
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConditionRetryDisplay {

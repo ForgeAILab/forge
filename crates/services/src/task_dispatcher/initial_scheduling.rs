@@ -246,26 +246,26 @@ impl TaskDispatcher {
                 let waiting_message = if slots.limit == 0 {
                     None
                 } else if slots.active >= slots.limit {
-                    Some(format!(
+                    Some((db::ProjectWait::AtCapacity, format!(
                         "project_at_capacity: waiting for a slot ({}/{} active)",
                         slots.active, slots.limit
-                    ))
+                    )))
                 } else if slots.parked >= 2 * slots.limit {
-                    Some(format!(
+                    Some((db::ProjectWait::WaitingOnOwner, format!(
                         "project_waiting_on_owner: {} parked tasks waiting on the owner",
                         slots.parked
-                    ))
+                    )))
                 } else {
                     None
                 };
-                if let Some(message) = waiting_message {
+                if let Some((project_wait, message)) = waiting_message {
                     // Capacity can change without changing this Task's version.
                     // Keep it outside the sticky role capability and re-check on
                     // every tick, writing only when the reason actually changes.
-                    if deferred_dispatch::record_dispatch_disposition(
+                    if deferred_dispatch::record_project_capacity_wait(
                         &self.db,
                         &task,
-                        "project_capacity",
+                        project_wait,
                         &message,
                     )
                     .await?

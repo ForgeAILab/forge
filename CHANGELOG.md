@@ -109,6 +109,9 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- Whether a Project capacity wait is "at capacity" or "waiting on owner" is
+  now recorded as a typed field instead of being read from the message wording.
+  Existing waits keep their classification.
 - A provider failure message that quotes or ends with Forge's "uncommitted
   worktree changes" sentence is no longer mistaken for a native worker that left
   undelivered changes: the runner now reads a typed failure class from the worker

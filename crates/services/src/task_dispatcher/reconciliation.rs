@@ -673,26 +673,32 @@ impl TaskDispatcher {
                         let waiting = if slot.limit == 0 {
                             None
                         } else if slot.active >= slot.limit {
-                            Some(format!(
-                                "project_at_capacity: waiting for a slot ({}/{} active)",
-                                slot.active, slot.limit
+                            Some((
+                                db::ProjectWait::AtCapacity,
+                                format!(
+                                    "project_at_capacity: waiting for a slot ({}/{} active)",
+                                    slot.active, slot.limit
+                                ),
                             ))
                         } else if slot.parked >= 2 * slot.limit {
-                            Some(format!(
+                            Some((
+                                db::ProjectWait::WaitingOnOwner,
+                                format!(
                                 "project_waiting_on_owner: {} parked tasks waiting on the owner",
                                 slot.parked
+                            ),
                             ))
                         } else {
                             None
                         };
-                        if let Some(message) = waiting {
+                        if let Some((subcause, message)) = waiting {
                             // Written once: an unchanged reason is not
                             // recorded again, so a Project at its limit costs
                             // nothing while it waits.
-                            if deferred_dispatch::record_dispatch_disposition(
+                            if deferred_dispatch::record_project_capacity_wait(
                                 &self.db,
                                 &p.read.task,
-                                "project_capacity",
+                                subcause,
                                 &message,
                             )
                             .await?
