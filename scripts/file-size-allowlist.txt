@@ -18,7 +18,7 @@
 2028 crates/db/src/integration_queue/fencing.rs
 2471 crates/db/src/sqlite/orchestration/charters.rs
 2193 crates/db/src/sqlite/project.rs
-2303 crates/db/src/task_condition/tests.rs
+2234 crates/db/src/task_condition/tests.rs
 2189 crates/db/src/task_step.rs
 12529 crates/db/src/tests.rs
 6712 crates/db/tests/suite/file_backed_migration.rs

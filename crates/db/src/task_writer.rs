@@ -2,6 +2,7 @@
 use crate::{
     DbError, EnqueueTaskStep, Result, SqliteDb, TaskMutation, TaskRepo, TaskStep, TaskStepRepo,
 };
+mod condition;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -431,8 +432,12 @@ impl SqliteDb {
             return Ok(());
         };
         let mut value = serde_json::to_value(result).map_err(|e| DbError::Check(e.to_string()))?;
-        let mutation: Value =
+        let payload: Value =
             serde_json::from_str(&step.payload_json).map_err(|e| DbError::Check(e.to_string()))?;
+        let mut mutation = &payload;
+        while let Some(inner) = mutation.get("Conditioned").and_then(|v| v.get("mutation")) {
+            mutation = inner;
+        }
         if mutation.get("TaskMutateMetadata").is_some() && value.is_array() {
             value = value[0].clone();
         }
@@ -473,6 +478,7 @@ impl SqliteDb {
     ) -> Result<()> {
         if let Some(step) = current_task_step() {
             self.fence_hook_in_tx(tx, &step).await?;
+            crate::task_condition::fence_statement_version_in_tx(tx, &step.task_id).await?;
         }
         Ok(())
     }
@@ -536,7 +542,17 @@ impl SqliteDb {
         &self,
         task_id: &str,
         query: &str,
+        arguments: Vec<Value>,
+    ) -> Result<u64> {
+        self.apply_task_sql_intent(task_id, query, arguments, None)
+            .await
+    }
+    pub(crate) async fn apply_task_sql_intent(
+        &self,
+        task_id: &str,
+        query: &str,
         mut arguments: Vec<Value>,
+        change: Option<crate::ConditionChange>,
     ) -> Result<u64> {
         if !owns_task(task_id) {
             return Err(DbError::Check(
@@ -574,7 +590,10 @@ impl SqliteDb {
             .execute(&mut *tx)
             .await?
             .rows_affected();
-        if let Some(change) = crate::task_condition::sql_change(query).filter(|_| result != 0) {
+        if let Some(change) = change
+            .or_else(|| crate::task_condition::sql_change(query))
+            .filter(|_| result != 0)
+        {
             crate::task_condition::produce(&mut tx, task_id, change).await?;
         }
         self.record_mutation_reply_in_tx(&mut tx, &result).await?;
@@ -879,6 +898,7 @@ pub struct TaskQuery {
     query: String,
     arguments: Vec<Value>,
     fence: EffectFence,
+    condition: Option<(crate::ConditionChange, crate::ConditionStatement)>,
 }
 /// Outcome of a Task write. `Queued` is never "applied": the write became its
 /// own step on the Task's queue and may still fail its fence there.
@@ -919,6 +939,7 @@ impl TaskQuery {
             query: query.into(),
             arguments: Vec::new(),
             fence: EffectFence::Entry,
+            condition: None,
         }
     }
     pub fn bind<T: Serialize>(mut self, value: T) -> Self {
@@ -936,21 +957,12 @@ impl TaskQuery {
     /// the caller's lease, or as a mutation step that this call waits for
     /// (bounded; `task_busy` on timeout, `version_conflict` when fenced).
     pub async fn execute(self, _pool: &sqlx::SqlitePool) -> Result<u64> {
-        let result = if owns_task(&self.task_id) {
-            self.db
-                .apply_task_sql(&self.task_id, &self.query, self.arguments)
-                .await?
+        let (db, task_id, mutation) = self.into_mutation();
+        let result = if owns_task(&task_id) {
+            serde_json::from_value(mutation.apply_unrebased(&db).await?)
+                .map_err(|e| DbError::Check(e.to_string()))?
         } else {
-            self.db
-                .run_task_mutation(
-                    &self.task_id,
-                    TaskMutation::Sql {
-                        task_id: self.task_id.clone(),
-                        query: self.query,
-                        arguments: self.arguments,
-                    },
-                )
-                .await?
+            db.run_task_mutation(&task_id, mutation).await?
         };
         Ok(result)
     }
@@ -966,10 +978,15 @@ impl TaskQuery {
                 .execute(&mut **tx)
                 .await?
                 .rows_affected();
-            if let Some(change) =
-                crate::task_condition::sql_change(&self.query).filter(|_| rows != 0)
-            {
-                crate::task_condition::produce(tx, &self.task_id, change).await?;
+            if rows != 0 {
+                condition::produce_in_tx(
+                    &self.db,
+                    tx,
+                    &self.task_id,
+                    &self.query,
+                    self.condition.as_ref(),
+                )
+                .await?;
             }
             return Ok(TaskQueryResult::Applied(rows));
         }
@@ -978,11 +995,7 @@ impl TaskQuery {
             .enqueue_fenced_task_mutation_in_tx(
                 tx,
                 &self.task_id,
-                TaskMutation::Sql {
-                    task_id: self.task_id.clone(),
-                    query: self.query,
-                    arguments: self.arguments,
-                },
+                condition::mutation(&self.task_id, self.query, self.arguments, self.condition),
                 self.fence,
             )
             .await?;
@@ -1012,6 +1025,7 @@ pub struct BulkTaskQuery {
     db: SqliteDb,
     query: String,
     arguments: Vec<Value>,
+    condition: Option<(crate::ConditionChange, crate::ConditionStatement)>,
 }
 impl BulkTaskQuery {
     pub fn new(db: &SqliteDb, query: impl Into<String>) -> Self {
@@ -1019,6 +1033,7 @@ impl BulkTaskQuery {
             db: db.clone(),
             query: query.into(),
             arguments: Vec::new(),
+            condition: None,
         }
     }
     pub fn bind<T: Serialize>(mut self, value: T) -> Self {
@@ -1053,10 +1068,15 @@ impl BulkTaskQuery {
                     .execute(&mut **tx)
                     .await?
                     .rows_affected();
-                if let Some(change) =
-                    crate::task_condition::sql_change(&query).filter(|_| rows != 0)
-                {
-                    crate::task_condition::produce(tx, &task_id, change).await?;
+                if rows != 0 {
+                    condition::produce_in_tx(
+                        &self.db,
+                        tx,
+                        &task_id,
+                        &query,
+                        self.condition.as_ref(),
+                    )
+                    .await?;
                 }
                 result.applied += 1;
             } else {
@@ -1064,11 +1084,7 @@ impl BulkTaskQuery {
                     .enqueue_fenced_task_mutation_in_tx(
                         tx,
                         &task_id,
-                        TaskMutation::Sql {
-                            task_id: task_id.clone(),
-                            query,
-                            arguments,
-                        },
+                        condition::mutation(&task_id, query, arguments, self.condition.clone()),
                         EffectFence::Identity,
                     )
                     .await?;

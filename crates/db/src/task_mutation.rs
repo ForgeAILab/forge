@@ -4,6 +4,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskMutation {
+    StatedSql {
+        task_id: String,
+        query: String,
+        arguments: Vec<Value>,
+        change: ConditionChange,
+        condition: ConditionStatement,
+    },
+    Conditioned {
+        task_id: String,
+        condition: ConditionStatement,
+        mutation: Box<TaskMutation>,
+    },
     ReviewCreateManualPass {
         input: CreateManualReviewPass,
     },
@@ -251,6 +263,7 @@ fn encode<T: Serialize>(value: T) -> Result<Value> {
 impl TaskMutation {
     pub fn expected_task_version(&self) -> Option<i64> {
         match self {
+            Self::Conditioned { mutation, .. } => mutation.expected_task_version(),
             Self::ReviewCreateManualPass { input } => Some(input.expected_task_version),
             Self::ReviewUpdateStatusWithTaskAuthority {
                 expected_task_version,
@@ -384,9 +397,77 @@ impl TaskMutation {
             _ => {}
         }
     }
+    fn condition_target(&self) -> Option<&str> {
+        match self {
+            Self::TaskUpdate { input }
+            | Self::TaskUpdateIfAnnotation { input, .. }
+            | Self::TaskUpdateWithRecoveryMarker { input, .. }
+            | Self::TaskUpdateWithWorkflowAuthority { input, .. }
+            | Self::TaskUpdateWithWorkflowAuthorityAndRecoveryMarker { input, .. } => {
+                Some(&input.id)
+            }
+            Self::TaskUpdateStatus { input }
+            | Self::TaskUpdateStatusForLatestExecution { input, .. }
+            | Self::TaskUpdateStatusWithRecoveryMarker { input, .. } => Some(&input.id),
+            Self::TaskSetErrorAnnotationIfNoRunningExecution { id, .. }
+            | Self::TaskUpdateRecoveryMetadataIfNoRunningExecution { id, .. }
+            | Self::TaskMutateMetadata { id, .. }
+            | Self::TaskMutateMetadataWithChange { id, .. }
+            | Self::TaskMutateMetadataAndBumpVersion { id, .. }
+            | Self::TaskMutateMetadataAndBumpVersionWithProjectAuthority { id, .. }
+            | Self::TaskMutateMetadataAndBumpVersionForLatestExecution { id, .. }
+            | Self::TaskSetEntryBarrier { id, .. }
+            | Self::TaskSetEntryBarrierWithWorkflowAuthority { id, .. }
+            | Self::TaskWakeDispatchForTask { id, .. } => Some(id),
+            Self::TaskRestoreQueuedRecovery { input } => Some(&input.task_id),
+            Self::Sql { task_id, .. } | Self::StatedSql { task_id, .. } => Some(task_id),
+            _ => None,
+        }
+    }
     pub async fn apply(&self, db: &SqliteDb) -> Result<Value> {
+        self.apply_inner(db, true).await
+    }
+    pub(crate) async fn apply_unrebased(&self, db: &SqliteDb) -> Result<Value> {
+        self.apply_inner(db, false).await
+    }
+    async fn apply_inner(&self, db: &SqliteDb, rebase: bool) -> Result<Value> {
+        if let Self::Conditioned {
+            task_id,
+            condition,
+            mutation,
+        } = self
+        {
+            if mutation.condition_target() != Some(task_id.as_str()) {
+                return Err(DbError::Check(
+                    "condition envelope must name the mutation's Task".into(),
+                ));
+            }
+            if condition.owner_stated() {
+                return Err(DbError::Check(
+                    "independent owner requires its claimed-step seam".into(),
+                ));
+            }
+            let expected_version = if rebase && mutation.expected_task_version().is_some() {
+                Some(
+                    sqlx::query_scalar::<_, i64>("SELECT version FROM task WHERE id=?")
+                        .bind(task_id)
+                        .fetch_optional(db.pool())
+                        .await?
+                        .ok_or(DbError::NotFound)?,
+                )
+            } else {
+                mutation.expected_task_version()
+            };
+            return crate::task_condition::with_statement_at_version(
+                task_id,
+                condition.clone(),
+                expected_version,
+                Box::pin(mutation.apply_inner(db, rebase)),
+            )
+            .await;
+        }
         let mut mutation = self.clone();
-        if let Some(step) = crate::task_writer::current_task_step() {
+        if let Some(step) = crate::task_writer::current_task_step().filter(|_| rebase) {
             let version: i64 = sqlx::query_scalar("SELECT version FROM task WHERE id=?")
                 .bind(&step.task_id)
                 .fetch_one(db.pool())
@@ -394,6 +475,7 @@ impl TaskMutation {
             mutation.rebase_task_version(version);
         }
         match mutation {
+            Self::Conditioned { .. } => unreachable!("condition envelope unwrapped above"),
             Self::ReviewCreateManualPass { input } => encode(
                 Box::pin(ReviewRepo::create_manual_pass_with_task_authority(
                     db, input,
@@ -558,6 +640,32 @@ impl TaskMutation {
                 ))
                 .await?,
             ),
+            Self::StatedSql {
+                task_id,
+                query,
+                arguments,
+                change,
+                condition,
+            } => {
+                if condition.owner_stated() {
+                    return Err(DbError::Check(
+                        "independent owner requires its claimed-step seam".into(),
+                    ));
+                }
+                encode(
+                    crate::task_condition::with_statement(
+                        &task_id,
+                        condition,
+                        Box::pin(db.apply_task_sql_intent(
+                            &task_id,
+                            &query,
+                            arguments,
+                            Some(change),
+                        )),
+                    )
+                    .await?,
+                )
+            }
             Self::Sql {
                 task_id,
                 query,

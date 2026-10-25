@@ -121,7 +121,7 @@ fn blocking(c: &TaskCondition, barrier_holds: bool) -> bool {
     }
     // A condition its writer stated carries no legacy copy: the same three
     // holds are its typed presentation.
-    if evidence.stated
+    if (evidence.stated || evidence.legacy_debug_omitted)
         && evidence.presentation.as_ref().is_some_and(|read| {
             read.interruption_present || read.hard_failure || (barrier_holds && read.entry_recorded)
         })
@@ -173,6 +173,46 @@ fn earlier(deadline: &mut Option<String>, time: Option<DateTime<Utc>>, now: Date
         }
     }
 }
+fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondition> {
+    // A writer stated this condition in the transaction of its write:
+    // it is not a copy of the legacy fields and cannot lag them.
+    let unreadable = stored.reasons().find_map(|reason| match reason {
+        ParkReason::UnknownCondition {
+            source:
+                db::ConditionSource {
+                    field: db::LegacyConditionField::ConditionJson,
+                    ..
+                },
+            problem,
+        } => Some(problem),
+        _ => None,
+    });
+    match unreadable {
+        // A newer build's encoding is quarantined: this build neither
+        // resolves around it nor repairs it.
+        Some(db::UnknownConditionProblem::UnknownKind) => return None,
+        // Corrupt or empty: the legacy fields are intact, so resolve
+        // from them and let the check restate the stored copy.
+        Some(_) => {
+            return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
+                task,
+            )))
+        }
+        None => {}
+    }
+    if stored.evidence().stated || stored.evidence().legacy_debug_omitted {
+        return None;
+    }
+    let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
+    let (stored, fresh) = (stored.evidence(), legacy.evidence());
+    (stored.error_annotation != fresh.error_annotation
+        || stored.blocked_json != fresh.blocked_json
+        || stored.failed_json != fresh.failed_json
+        || stored.entry_barrier_json != fresh.entry_barrier_json
+        || stored.metadata != fresh.metadata
+        || stored.unparsed_metadata != fresh.unparsed_metadata)
+        .then_some(legacy)
+}
 impl TaskDispatcher {
     pub(super) fn prepare_schedule(
         &self,
@@ -184,47 +224,7 @@ impl TaskDispatcher {
         // authoritative. When a writer missed its sync the copy is stale but
         // the row read in this snapshot is not: hold exactly where the legacy
         // fields hold, and leave the stored copy to be repaired.
-        let stale = |stored: &TaskCondition, task: &db::Task| {
-            // A writer stated this condition in the transaction of its write:
-            // it is not a copy of the legacy fields and cannot lag them.
-            let unreadable = stored.reasons().find_map(|reason| match reason {
-                ParkReason::UnknownCondition {
-                    source:
-                        db::ConditionSource {
-                            field: db::LegacyConditionField::ConditionJson,
-                            ..
-                        },
-                    problem,
-                } => Some(problem),
-                _ => None,
-            });
-            match unreadable {
-                // A newer build's encoding is quarantined: this build neither
-                // resolves around it nor repairs it.
-                Some(db::UnknownConditionProblem::UnknownKind) => return None,
-                // Corrupt or empty: the legacy fields are intact, so resolve
-                // from them and let the check restate the stored copy.
-                Some(_) => {
-                    return Some(db::map_legacy_condition(&db::LegacyConditionInput::from(
-                        task,
-                    )))
-                }
-                None => {}
-            }
-            if stored.evidence().stated {
-                return None;
-            }
-            let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
-            let (stored, fresh) = (stored.evidence(), legacy.evidence());
-            (stored.error_annotation != fresh.error_annotation
-                || stored.blocked_json != fresh.blocked_json
-                || stored.failed_json != fresh.failed_json
-                || stored.entry_barrier_json != fresh.entry_barrier_json
-                || stored.metadata != fresh.metadata
-                || stored.unparsed_metadata != fresh.unparsed_metadata)
-                .then_some(legacy)
-        };
-        let legacy = stale(&r.condition, &r.task);
+        let legacy = stale_condition(&r.condition, &r.task);
         let condition_stale = legacy.is_some();
         if let Some(legacy) = legacy {
             // Every callee handed this Task reads the same condition this
@@ -235,7 +235,7 @@ impl TaskDispatcher {
         // The coordination root gates its children by its condition: a root
         // whose stored copy is stale holds exactly where its fields hold.
         if let Some(parent) = &mut r.parent {
-            if let Some(legacy) = stale(&parent.condition, parent) {
+            if let Some(legacy) = stale_condition(&parent.condition, parent) {
                 parent.condition = legacy;
             }
         }
@@ -740,6 +740,46 @@ impl TaskDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn corrupt_rows_use_the_legacy_oracle_and_bounded_rows_are_not_stale() {
+        let mut task = crate::task_actions::test_support::snapshot(
+            "todo",
+            Some(api_types::FailureKind::WorkspaceError),
+        )
+        .task;
+        task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        let corrupt = db::task_condition::decode_or_unknown("{}");
+        let expected = db::map_legacy_condition(&db::LegacyConditionInput::from(&task));
+        assert_eq!(stale_condition(&corrupt, &task), Some(expected));
+        let mut bounded = task.condition.clone();
+        let TaskCondition::Parked { evidence, .. } = &mut bounded else {
+            panic!("mapped annotation parks");
+        };
+        evidence.error_annotation = None;
+        evidence.blocked_json = None;
+        evidence.failed_json = None;
+        evidence.entry_barrier_json = None;
+        evidence.metadata.clear();
+        evidence.legacy_debug_omitted = true;
+        assert!(stale_condition(&bounded, &task).is_none());
+        assert_eq!(blocking(&bounded, true), blocking(&task.condition, true));
+        let mut display_only = TaskCondition::Clear {
+            evidence: db::ConditionEvidence {
+                legacy_debug_omitted: true,
+                presentation: Some(db::ConditionRead {
+                    interruption_present: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        };
+        assert!(blocking(&display_only, true));
+        if let TaskCondition::Clear { evidence } = &mut display_only {
+            evidence.legacy_debug_omitted = false;
+        }
+        assert!(!blocking(&display_only, true));
+    }
+
     #[test]
     fn integration_restatement_preserves_lineage_and_new_legacy_holds() {
         for condition in crate::task_actions::tests::integration_conditions() {

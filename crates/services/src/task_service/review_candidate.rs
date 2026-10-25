@@ -340,33 +340,75 @@ impl TaskService {
         }
         let now = now_rfc3339();
         let message = format!("{reason}; send back to add work, or cancel the Task");
-        let parked = TaskRepo::update(
-            &*self.db,
-            UpdateTask {
-                id: task.id.clone(),
-                expected_version: task.version,
-                title: None,
-                description: None,
-                priority: None,
-                merge_config: None,
-                plan: None,
-                error_annotation: Some(Some(
-                    json!({"type":api_types::FailureKind::ReviewBlocked,
+        let condition = db::ConditionStatement::ReplaceDiagnostic {
+            replacement: Box::new(db::ConditionReplacement {
+                identity: self
+                    .db
+                    .task_condition_entry_identity(&task.id, task.version)
+                    .await?,
+                condition: db::StatedCondition::Parked {
+                    reason: db::ParkReason::Failure {
+                        failure_kind: api_types::FailureKind::ReviewBlocked,
+                    },
+                    resume: db::ConditionContinuation::Reconcile,
+                    since: Some(now.clone()),
+                    presentation: db::ConditionPresentation {
+                        diagnostic: Some(db::ConditionDiagnostic {
+                            kind: api_types::FailureKind::ReviewBlocked,
+                            blocking_reason: MISSING_REVIEW_CANDIDATE.into(),
+                            minimal_operator: true,
+                            message: Some(message.clone()),
+                            actor: None,
+                            at: Some(now.clone()),
+                            execution_id: None,
+                        }),
+                        interruption: Some(db::ConditionInterruption {
+                            kind: api_types::FailureKind::ReviewBlocked,
+                            reason: reason.clone(),
+                            at: now.clone(),
+                            source: None,
+                            execution_id: None,
+                        }),
+                        ..Default::default()
+                    },
+                },
+            }),
+            preserve_interruption: false,
+        };
+        let parked = self
+            .db
+            .apply_conditioned_task_mutation(
+                &task.id,
+                db::Conditioned {
+                    input: db::TaskMutation::TaskUpdate {
+                        input: UpdateTask {
+                            id: task.id.clone(),
+                            expected_version: task.version,
+                            title: None,
+                            description: None,
+                            priority: None,
+                            merge_config: None,
+                            plan: None,
+                            error_annotation: Some(Some(
+                                json!({"type":api_types::FailureKind::ReviewBlocked,
                 "blocking_reason":MISSING_REVIEW_CANDIDATE,"message":message,"blocked_at":now})
-                    .to_string(),
-                )),
-                blocked_json: Some(Some(
-                    json!({"kind":api_types::FailureKind::ReviewBlocked,
+                                .to_string(),
+                            )),
+                            blocked_json: Some(Some(
+                                json!({"kind":api_types::FailureKind::ReviewBlocked,
                 "reason":reason,"created_at":now,"execution_id":null})
-                    .to_string(),
-                )),
-                failed_json: Some(None),
-                task_state_config: None,
-                parent_task_id: None,
-                updated_at: now,
-            },
-        )
-        .await?;
+                                .to_string(),
+                            )),
+                            failed_json: Some(None),
+                            task_state_config: None,
+                            parent_task_id: None,
+                            updated_at: now,
+                        },
+                    },
+                    condition,
+                },
+            )
+            .await?;
         Ok(MissingReviewCandidate {
             task: parked,
             target: None,
@@ -375,3 +417,6 @@ impl TaskService {
         })
     }
 }
+
+#[cfg(test)]
+mod condition_tests;

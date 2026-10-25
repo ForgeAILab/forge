@@ -1,6 +1,7 @@
 //! Task snapshot fixtures shared with dependent crates.
 
 use super::*;
+pub use db::task_condition::test_support::set_task_condition;
 use serde_json::json;
 
 pub fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {

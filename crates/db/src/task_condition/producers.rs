@@ -7,7 +7,8 @@ use super::*;
 /// The fact family a write can change. Every other family is carried from the
 /// stored condition, so a budget charge reads no execution, a status write no
 /// ledger, and a Task with neither parent nor children no other Task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ConditionChange {
     /// The five legacy columns only.
     Legacy,
@@ -56,7 +57,29 @@ pub(crate) async fn derive(
     metadata: Option<Option<&str>>,
     stated: Option<&ConditionStatement>,
 ) -> Result<Option<Produced>> {
+    derive_with_policy(
+        c,
+        task_id,
+        change,
+        metadata,
+        stated,
+        recovery::UNREADABLE_POLICY,
+    )
+    .await
+}
+
+pub(super) async fn derive_with_policy(
+    c: &mut SqliteConnection,
+    task_id: &str,
+    change: ConditionChange,
+    metadata: Option<Option<&str>>,
+    stated: Option<&ConditionStatement>,
+    policy: recovery::UnreadablePolicy,
+) -> Result<Option<Produced>> {
     use ConditionChange as Change;
+    let explicit = stated.is_some();
+    let scoped = write::current_statement(task_id);
+    let stated = stated.or(scoped.as_ref());
     let families = match change {
         Change::Full | Change::Entry | Change::Human => Families::ENTRY,
         Change::Hooks => Families::HOOKS,
@@ -66,11 +89,27 @@ pub(crate) async fn derive(
     let Some(mut snapshot) = Snapshot::read(c, task_id, families).await? else {
         return Ok(None);
     };
-    let stored = match stored_condition(c, &snapshot.stored).await {
+    if let Some(ConditionStatement::Restore {
+        expected_epoch,
+        expected_condition_digest,
+        ..
+    }) = stated
+    {
+        if *expected_epoch != snapshot.epoch
+            || *expected_condition_digest != diagnostics::digest(&snapshot.stored)
+        {
+            return Err(DbError::VersionConflict);
+        }
+    }
+    let mut corruption = None;
+    let mut stored = match stored_condition(c, &snapshot.stored).await {
         Stored::Readable(stored) => Some(*stored),
         // Corrupt or empty: nothing can be carried from it. The mapping and
         // the durable facts restate the row below, statement or not.
-        Stored::Corrupt(_) => None,
+        Stored::Corrupt(problem) => {
+            corruption = Some(problem);
+            None
+        }
         // A newer build's encoding is never guessed at or overwritten. A
         // statement over it is refused whole, so its writer's transaction
         // (the legacy fields and the version bump) rolls back with it. A
@@ -93,12 +132,79 @@ pub(crate) async fn derive(
             .non_text
             .retain(|field| *field != LegacyConditionField::MetadataJson);
     }
-    // A writer that states its condition edits the stored one. Only a stored
-    // condition that is corrupt falls back to the mapping.
+    let mut carried = (!explicit)
+        .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
+        .flatten();
+    let mut preloaded = None;
+    // Restore durable identity sets before an edit changes their reason positions.
+    if stored
+        .as_ref()
+        .is_some_and(|c| c.evidence().overflow.is_some())
+        || carried
+            .as_ref()
+            .is_some_and(|c| c.evidence().overflow.is_some())
+    {
+        if families != Families::ENTRY {
+            let Some(mut full) = Snapshot::read(c, task_id, Families::ENTRY).await? else {
+                return Ok(None);
+            };
+            full.input = std::mem::take(&mut snapshot.input);
+            snapshot = full;
+        }
+        let mut facts = ConditionFacts::load_all(c, &snapshot).await?;
+        if facts.collection_dependencies.is_none() {
+            facts.load_collection_dependencies(c).await?;
+        }
+        if let Some(stored) = &mut stored {
+            collections::restore(stored, &facts);
+        }
+        if let Some(carried) = &mut carried {
+            collections::restore(carried, &facts);
+        }
+        preloaded = Some(facts);
+    }
+    // Statements edit typed owners; lifecycle facts are laid over the result.
     let statement = stated;
-    let stated = statement.and_then(|statement| Some(statement.apply(stored.as_ref()?)));
+    let empty = TaskCondition::default();
+    let stored_base = carried.as_ref().or(stored.as_ref());
+    let refreshed_base = stored_base
+        .filter(|_| statement.is_some())
+        .map(recovery::owner_base);
+    let base = refreshed_base.as_ref().or(stored_base).unwrap_or(&empty);
+    let stated = match (statement, Some(base)) {
+        (Some(ConditionStatement::Edit { edit }), Some(stored)) => {
+            Some(edit.apply_at_epoch(stored, Some(snapshot.epoch))?)
+        }
+        (
+            Some(ConditionStatement::ReplaceDiagnostic {
+                replacement,
+                preserve_interruption,
+            }),
+            Some(stored),
+        ) => Some(diagnostic_projection::apply(
+            stored,
+            replacement,
+            *preserve_interruption,
+        )?),
+        (Some(statement), Some(stored)) => Some(statement.apply(stored)),
+        _ => None,
+    };
     let from_statement = stated.is_some();
-    let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
+    let stated = if corruption.is_some()
+        && policy == recovery::UnreadablePolicy::LegacyOracle
+        && matches!(statement, Some(ConditionStatement::Preserve))
+    {
+        None
+    } else {
+        stated
+    };
+    let mapped = stated.unwrap_or_else(|| {
+        if corruption.is_some() && policy == recovery::UnreadablePolicy::DurableOwners {
+            TaskCondition::default()
+        } else {
+            map_view(&snapshot.input.view())
+        }
+    });
     let exhausted = mapped.budget_exhausted();
     if change == Change::Budget && !exhausted {
         // Only an exhausted condition witnesses the ledger.
@@ -110,37 +216,63 @@ pub(crate) async fn derive(
         // A status epoch the stored condition never saw: nothing is carried.
         .filter(|prior| change == Change::Entry || prior.epoch == snapshot.epoch);
     let pending = snapshot.children_pending();
-    let mut facts = match prior {
-        Some(mut facts) => {
-            snapshot.refresh(c, &mut facts).await?;
-            if change == Change::Operations {
-                facts.load_operations(c).await?;
+    let mut facts = if let Some(facts) = preloaded {
+        facts
+    } else {
+        match prior {
+            Some(mut facts) => {
+                snapshot.refresh(c, &mut facts).await?;
+                if change == Change::Operations {
+                    facts.load_operations(c).await?;
+                }
+                if !exhausted {
+                    facts.budgets.clear();
+                } else if change == Change::Budget || facts.budgets.is_empty() {
+                    facts.load_budgets(c).await?;
+                }
+                facts.children_pending = pending;
+                if !pending {
+                    facts.children.clear();
+                } else if change == Change::Children || facts.children.is_empty() {
+                    facts.load_children(c, &snapshot.project).await?;
+                }
+                facts
             }
-            if !exhausted {
-                facts.budgets.clear();
-            } else if change == Change::Budget || facts.budgets.is_empty() {
-                facts.load_budgets(c).await?;
+            None => {
+                // The stored condition carries nothing usable: recompute it all.
+                if families != Families::ENTRY {
+                    let Some(mut full) = Snapshot::read(c, task_id, Families::ENTRY).await? else {
+                        return Ok(None);
+                    };
+                    full.input = std::mem::take(&mut snapshot.input);
+                    snapshot = full;
+                }
+                ConditionFacts::load_all(c, &snapshot).await?
             }
-            facts.children_pending = pending;
-            if !pending {
-                facts.children.clear();
-            } else if change == Change::Children || facts.children.is_empty() {
-                facts.load_children(c, &snapshot.project).await?;
-            }
-            facts
-        }
-        None => {
-            // The stored condition carries nothing usable: recompute it all.
-            if families != Families::ENTRY {
-                let Some(mut full) = Snapshot::read(c, task_id, Families::ENTRY).await? else {
-                    return Ok(None);
-                };
-                full.input = std::mem::take(&mut snapshot.input);
-                snapshot = full;
-            }
-            ConditionFacts::load_all(c, &snapshot).await?
         }
     };
+    if mapped.evidence().overflow.is_some() && facts.collection_dependencies.is_none() {
+        facts.load_collection_dependencies(c).await?;
+    }
+    if policy == recovery::UnreadablePolicy::DurableOwners
+        && (corruption.is_some() || stored.as_ref().is_some_and(recovery::unreadable))
+    {
+        recovery::load_owners(c, &mut facts).await?;
+    }
+    if let Some(ConditionStatement::ReplaceDiagnostic { replacement, .. }) = statement {
+        if replacement.identity.epoch() != snapshot.epoch {
+            return Err(DbError::VersionConflict);
+        }
+    }
+    if let Some(ConditionStatement::Edit { edit }) = statement {
+        if edit
+            .replacement
+            .as_ref()
+            .is_some_and(|r| r.identity.epoch() != snapshot.epoch)
+        {
+            return Err(DbError::VersionConflict);
+        }
+    }
     if let Some(statement) = statement {
         match statement {
             ConditionStatement::Integration { reason } => {
@@ -210,7 +342,18 @@ pub(crate) async fn derive(
     }
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let condition = if (facts.initial && !from_statement)
+    let condition = if policy == recovery::UnreadablePolicy::DurableOwners
+        && matches!(statement, None | Some(ConditionStatement::Preserve))
+        && (corruption.is_some() || stored.as_ref().is_some_and(recovery::unreadable))
+    {
+        recovery::project(
+            &facts,
+            corruption
+                .clone()
+                .unwrap_or(UnknownConditionProblem::InvalidShape),
+            stored.as_ref(),
+        )
+    } else if (facts.initial && !from_statement)
         || matches!(
             statement,
             Some(
@@ -218,7 +361,8 @@ pub(crate) async fn derive(
                     | ConditionStatement::IntegrationHandedOff { .. }
                     | ConditionStatement::CheckCleared { .. }
             )
-        ) {
+        )
+    {
         // Clearing or handing off integration restores the other owners' current mapping,
         // including a Deferred timer whose continuation integration stood over.
         facts.condition_of(&snapshot.input.view())
@@ -227,7 +371,19 @@ pub(crate) async fn derive(
     };
     integration::validate(&condition)?;
     check::validate(&condition)?;
-    let encoded = encode(&condition);
+    let mut condition = condition;
+    if corruption.is_some() {
+        let id = recovery::record_raw(c, task_id, &snapshot.stored).await?;
+        condition.evidence_mut().diagnostic_ids.push(id);
+    }
+    if let Some(statement) = statement {
+        write::record_statement_text(c, task_id, statement, &mut condition).await?;
+    }
+    let condition = payload::prepare(c, task_id, &condition).await?;
+    if !explicit && scoped.is_some() {
+        write::mark_statement_applied(task_id, &condition, &snapshot.stored, snapshot.version);
+    }
+    let encoded = serde_json::to_string(&condition).map_err(payload::json_error)?;
     Ok(Some(Produced {
         version: snapshot.version,
         changed: encoded.as_bytes() != snapshot.stored,

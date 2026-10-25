@@ -286,6 +286,8 @@ pub struct ConditionFacts {
     pub children_pending: bool,
     /// `(id, status, settled)` in sequence order, while the flag is pending.
     pub children: Vec<(String, String, bool)>,
+    /// Complete dependency identities, loaded only when a bounded row needs them.
+    pub collection_dependencies: Option<Vec<(String, String)>>,
     /// The check a status entry waits on, and that entry's epoch. It is a
     /// wait only while that entry is still the Task's.
     pub check: Option<(CheckWait, i64)>,
@@ -606,7 +608,21 @@ impl ConditionFacts {
         if facts.children_pending {
             facts.load_children(c, &snapshot.project).await?;
         }
+        if stored
+            .as_ref()
+            .is_some_and(|c| c.evidence().overflow.is_some())
+        {
+            facts.load_collection_dependencies(c).await?;
+        }
         Ok(facts)
+    }
+    pub(super) async fn load_collection_dependencies(
+        &mut self,
+        c: &mut SqliteConnection,
+    ) -> Result<()> {
+        self.collection_dependencies = Some(sqlx::query_as("SELECT t.id,t.status FROM task_dependency d JOIN task t ON t.id=d.depends_on_id WHERE d.task_id=? ORDER BY d.created_at,t.id")
+            .bind(&self.task_id).fetch_all(c).await?);
+        Ok(())
     }
     pub(super) async fn load_budgets(&mut self, c: &mut SqliteConnection) -> Result<()> {
         self.budgets = sqlx::query_as(
@@ -660,6 +676,9 @@ impl ConditionFacts {
     /// producer of this revision wrote (column default, older encoding).
     pub(super) fn recover(condition: &TaskCondition) -> Option<Self> {
         let evidence = condition.evidence();
+        if evidence.overflow.is_some() {
+            return None;
+        }
         Self::carried(
             match condition {
                 TaskCondition::Settled { outcome, .. } => Some(outcome.clone()),
@@ -681,8 +700,13 @@ impl ConditionFacts {
         struct StoredEvidence {
             #[serde(default)]
             witnesses: Vec<ConditionWitness>,
+            #[serde(default)]
+            overflow: Option<ConditionOverflow>,
         }
         let stored: Stored = serde_json::from_slice(stored).ok()?;
+        if stored.evidence.overflow.is_some() {
+            return None;
+        }
         Self::carried(stored.outcome, &stored.evidence.witnesses)
     }
     fn carried(terminal: Option<TerminalOutcome>, witnesses: &[ConditionWitness]) -> Option<Self> {
@@ -868,6 +892,7 @@ impl ConditionFacts {
             .map(|(wait, _)| wait)
     }
     fn apply_lifecycle(&self, mut condition: TaskCondition) -> TaskCondition {
+        collections::restore(&mut condition, self);
         let exhausted = condition.budget_exhausted();
         let children = self.children_pending && !self.children.is_empty();
         {
@@ -1011,7 +1036,33 @@ impl Snapshot {
     /// Failure recovery launches the assigned implementation role. Human work
     /// without a failure keeps its ordinary presentation and incurs no read.
     async fn missing_recovery_role(&self, c: &mut SqliteConnection) -> Result<Option<String>> {
-        let mapped = map_view(&self.input.view());
+        let stored = write::applied_condition(&self.id, &self.stored, self.version).or_else(|| {
+            std::str::from_utf8(&self.stored)
+                .ok()
+                .and_then(|s| decode(s).ok())
+        });
+        let mapped = match (write::current_statement(&self.id), stored) {
+            (Some(ConditionStatement::Edit { edit }), Some(stored)) => {
+                edit.apply_at_epoch(&stored, Some(self.epoch))?
+            }
+            (
+                Some(ConditionStatement::ReplaceDiagnostic {
+                    replacement,
+                    preserve_interruption,
+                }),
+                Some(stored),
+            ) => diagnostic_projection::apply(&stored, &replacement, preserve_interruption)?,
+            (
+                Some(ConditionStatement::Preserve | ConditionStatement::Restore { .. }),
+                Some(stored),
+            ) => stored,
+            _ if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle => {
+                map_view(&self.input.view())
+            }
+            (_, Some(stored)) if recovery::unreadable(&stored) => return Ok(None),
+            (_, None) => return Ok(None),
+            _ => map_view(&self.input.view()),
+        };
         if !matches!(
             mapped,
             TaskCondition::Parked {

@@ -169,7 +169,11 @@ impl TaskCondition {
                             if quarantined {
                                 "Stored Task condition was written by a newer Forge build and is quarantined; run a build that understands it. Holding or releasing this Task is refused until then"
                             } else {
-                                "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                                if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::LegacyOracle {
+                                    "Stored Task condition is unreadable; the next write or invariant check restates it from the Task's fields"
+                                } else {
+                                    "Stored Task condition is unreadable; inspect its saved diagnostic text or state a new owner action"
+                                }
                             }
                             .into(),
                         ),
@@ -243,7 +247,7 @@ impl TaskCondition {
         let stated = evidence
             .presentation
             .as_ref()
-            .filter(|_| evidence.stated || integration_primary);
+            .filter(|_| evidence.stated || integration_primary || evidence.legacy_debug_omitted);
         let failed = read.interruption.is_some()
             && (evidence.failed_json.is_some() || stated.is_some_and(|p| p.hard_failure));
         let blocked = (evidence.blocked_json.is_some()
@@ -797,13 +801,21 @@ pub(super) fn bound_operator_reason(raw: &str) -> String {
 }
 
 /// A presentation with every text in it cut to [`PRESENTATION_TEXT_LIMIT`].
-pub(super) fn bounded_read(read: ConditionRead) -> ConditionRead {
+pub(super) fn bounded_read(mut read: ConditionRead) -> ConditionRead {
+    // Operations reads a bounded JSON document, not a presentation string.
+    let operator = read
+        .operator_reason
+        .take()
+        .map(|raw| bound_operator_reason(&raw));
     let mut value = serde_json::to_value(read).expect("reader projection serializes");
     bound(&mut value);
-    serde_json::from_value(value).expect("bounded projection retains its types")
+    let mut read: ConditionRead =
+        serde_json::from_value(value).expect("bounded projection retains its types");
+    read.operator_reason = operator;
+    read
 }
 
-fn bound(value: &mut Value) {
+pub(super) fn bound(value: &mut Value) {
     match value {
         Value::String(text) => bound_text(text),
         Value::Object(fields) => {

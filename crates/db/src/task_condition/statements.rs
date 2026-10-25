@@ -14,16 +14,39 @@ use api_types::{FailureKind, InterruptionMetadata, TaskBlockingAnnotation};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "statement", rename_all = "snake_case")]
 pub enum ConditionStatement {
+    /// Explicit no-op on owned reasons; durable lifecycle facts still refresh.
+    Preserve,
+    Edit {
+        edit: Box<ConditionOwnerEdit>,
+    },
+    /// Replace the diagnostic slot with the same supersession as its legacy write.
+    /// An annotation-only writer leaves the existing interruption intact.
+    ReplaceDiagnostic {
+        replacement: Box<ConditionReplacement>,
+        preserve_interruption: bool,
+    },
+    /// Rollback under the enclosing command's unchanged-version/admission fences.
+    Restore {
+        saved: Box<SavedTaskCondition>,
+        expected_epoch: i64,
+        expected_condition_digest: String,
+    },
     /// Replace only integration's reason, preserving every other owner.
     /// Fenced on the attempt: the owning attempt restates freely; another
     /// attempt is refused unless none owns the row (never stated, cleared,
     /// or handed off to a role).
-    Integration { reason: IntegrationReason },
+    Integration {
+        reason: IntegrationReason,
+    },
     /// The Task step has sent repair/review back to its configured role.
     /// Retain lineage while allowing ordinary role admission and recovery.
-    IntegrationHandedOff { attempt_id: IntegrationAttemptId },
+    IntegrationHandedOff {
+        attempt_id: IntegrationAttemptId,
+    },
     /// Clear only the named attempt; a stale consumer cannot clear a successor.
-    IntegrationCleared { attempt_id: IntegrationAttemptId },
+    IntegrationCleared {
+        attempt_id: IntegrationAttemptId,
+    },
     /// The owner holds a Task that no execution is running for. The hold
     /// replaces the Task's diagnostic, interruption and failure, and drops
     /// its queued command, retry timer, dispatch refusal, environment wait
@@ -39,10 +62,15 @@ pub enum ConditionStatement {
     // --- durable check runner (plan 3.3 stage D) ---
     /// The Task's current status entry (`epoch`) waits on this check.
     /// Replaces only the check runner's reason, preserving every other owner.
-    Check { wait: CheckWait, epoch: i64 },
+    Check {
+        wait: CheckWait,
+        epoch: i64,
+    },
     /// The named consumer's wait is over (its result was applied, or it is
     /// no longer the one in charge). Another consumer's wait is left alone.
-    CheckCleared { consumer_id: String },
+    CheckCleared {
+        consumer_id: String,
+    },
 }
 
 impl ConditionStatement {
@@ -160,8 +188,20 @@ impl ConditionStatement {
     /// The condition after this statement, before the durable facts (entry,
     /// hooks, execution, children, cancellations) are laid over it.
     pub(super) fn apply(&self, stored: &TaskCondition) -> TaskCondition {
+        if matches!(self, Self::Preserve) {
+            let mut carried = recovery::owner_base(stored);
+            carried.evidence_mut().stated = true;
+            return carried;
+        }
+        if let Self::Restore { saved, .. } = self {
+            let mut restored = saved.condition().clone();
+            restored.evidence_mut().stated = true;
+            return restored;
+        }
         if self.owner_stated() {
             let mut stated = stored.typed();
+            stated.evidence_mut().ownership = stored.evidence().ownership.clone();
+            stated.evidence_mut().diagnostic_ids = stored.evidence().diagnostic_ids.clone();
             stated.evidence_mut().stated = true;
             return stated;
         }
@@ -219,7 +259,11 @@ impl ConditionStatement {
 
         let material;
         match self {
-            Self::Integration { .. }
+            Self::Preserve
+            | Self::Edit { .. }
+            | Self::ReplaceDiagnostic { .. }
+            | Self::Restore { .. }
+            | Self::Integration { .. }
             | Self::IntegrationHandedOff { .. }
             | Self::IntegrationCleared { .. }
             | Self::Check { .. }
