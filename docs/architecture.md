@@ -6180,8 +6180,16 @@ REST/UI exposure belong to later gates. This checkpoint adds
 typed contracts for later writer conversions; it does not delete or rewrite
 existing Task data. Under the active `LegacyOracle` policy, stored condition
 bytes, public projections, offers, failure kinds, Operations text and Attention
-digests remain equal to main `6120c133`, including corruption repair and existing
-Integration/Check refusal outcomes.
+digests retain main `6120c133` behavior, including corruption repair, except for
+duplicate lifecycle facts on coordination roots. Integration/Check statements
+now accept coordination roots whose stored condition already carries the current
+`Children` reason or the `coordination_review_pending` observation for a root
+without visible children.
+The facts overlay adds each identical reason or observation only once, including
+a `Children` reason already used as the primary park. The resulting stored typed
+condition and public projection agree with the legacy mapping of the same columns
+and facts. The strict witness check is unchanged; holds and failures remain in
+place.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
 owner `Edit`, and typed `Restore` alongside Hold/Release and the independently
