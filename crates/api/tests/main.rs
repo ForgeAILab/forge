@@ -275,3 +275,6 @@ mod workflow_templates;
 
 #[path = "suite/project_authorization.rs"]
 mod project_authorization;
+
+#[path = "suite/large_root_condition.rs"]
+mod large_root_condition;

@@ -184,7 +184,7 @@ pub fn caller_for(
 /// this bounded row projection and the pure function above.
 pub async fn load_snapshot(
     db: &db::SqliteDb,
-    task: Task,
+    mut task: Task,
     workflow: WorkflowDefinition,
     actor: &Actor,
     connections: Option<&crate::daemon_transport::DaemonConnectionRegistry>,
@@ -193,6 +193,7 @@ pub async fn load_snapshot(
         ExecutionRepo, ProjectAgentBindingRepo, ReviewRepo, TaskDependencyRepo,
         TaskRoleAssignmentRepo, TransitionLogRepo,
     };
+    db.restore_task_read(&mut task).await?;
     let mut assignments = TaskRoleAssignmentRepo::list_by_task(db, &task.id).await?;
     if let Some(role) = workflow
         .states

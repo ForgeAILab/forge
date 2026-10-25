@@ -272,58 +272,42 @@ pub(super) async fn annotate_owner_workspace_reset(
     {
         return Ok(());
     }
-    let at = now_rfc3339();
-    let diagnostic = db::ConditionDiagnostic {
-        kind: api_types::FailureKind::WorkspaceResetRequired,
-        blocking_reason: "owner_workspace_reset_required".into(),
-        minimal_operator: true,
-        actor: Some(actor.display()),
-        at: Some(at.clone()),
-        execution_id: None,
-        message: Some(message.to_owned()),
-    };
-    let condition = db::ConditionStatement::ReplaceDiagnostic {
-        replacement: Box::new(db::ConditionReplacement {
-            identity: db
-                .task_condition_entry_identity(&task.id, task.version)
-                .await?,
-            condition: db::StatedCondition::Parked {
-                reason: db::ParkReason::Failure {
-                    failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-                },
-                resume: db::ConditionContinuation::Reconcile,
-                since: Some(at.clone()),
-                presentation: db::ConditionPresentation {
-                    diagnostic: Some(diagnostic),
-                    ..Default::default()
-                },
-            },
-        }),
-        preserve_interruption: true,
-    };
     let annotation = json!({"type": api_types::FailureKind::WorkspaceResetRequired,
         "blocking_reason": "owner_workspace_reset_required", "blocked_by": actor.display(),
-        "blocked_at": at, "message": message});
-    let _: Task = db
-        .apply_conditioned_task_mutation(
+        "blocked_at": now_rfc3339(), "message": message});
+    TaskRepo::update_status(
+        db,
+        UpdateTaskStatus {
+            id: task.id.clone(),
+            expected_version: task.version,
+            status: task.status,
+            assignee_id: None,
+            error_annotation: Some(Some(annotation.to_string())),
+            blocked_json: None,
+            failed_json: None,
+            updated_at: now_rfc3339(),
+        },
+    )
+    .await?;
+    if db
+        .record_task_diagnostic_text(
             &task.id,
-            db::Conditioned {
-                input: db::TaskMutation::TaskUpdateStatus {
-                    input: UpdateTaskStatus {
-                        id: task.id.clone(),
-                        expected_version: task.version,
-                        status: task.status.clone(),
-                        assignee_id: None,
-                        error_annotation: Some(Some(annotation.to_string())),
-                        blocked_json: None,
-                        failed_json: None,
-                        updated_at: now_rfc3339(),
+            db::RecordTaskDiagnosticText {
+                kind: "message",
+                source: "diagnostic",
+                owner: &db::DiagnosticOwner::Reason {
+                    reason: db::ParkReason::Failure {
+                        failure_kind: api_types::FailureKind::WorkspaceResetRequired,
                     },
                 },
-                condition,
+                text: message,
             },
         )
-        .await?;
+        .await
+        .is_err()
+    {
+        tracing::warn!(task_id = %task.id, "Diagnostic text capture failed; the legacy annotation retains it");
+    }
     tracing::warn!(placement_id = %placement.id, daemon_id = ?placement_execution_daemon_id(placement), message, "workspace owner reset required");
     Ok(())
 }

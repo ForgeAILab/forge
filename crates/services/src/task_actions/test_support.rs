@@ -32,3 +32,45 @@ pub fn snapshot(state: &str, kind: Option<FailureKind>) -> TaskSnapshot {
         entry_hooks_running: false,
     }
 }
+
+#[cfg(test)]
+pub(crate) async fn assert_legacy_offers(
+    db: &db::SqliteDb,
+    task: &Task,
+    mapped: &db::TaskCondition,
+) {
+    let project = db::ProjectRepo::get_by_id(db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let actor = Actor::user(api_types::UserActionSource::Api);
+    let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+        task,
+        &project.workflow_definition,
+        &actor,
+    );
+    let actual = load_snapshot(db, task.clone(), workflow.clone(), &actor, None)
+        .await
+        .unwrap();
+    let mut legacy = task.clone();
+    legacy.condition = mapped.clone();
+    let expected = load_snapshot(db, legacy.clone(), workflow, &actor, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        task.condition.read().failure_kind,
+        legacy_task_condition(&legacy)
+    );
+    assert!(
+        !available_actions(&actual).is_empty(),
+        "real offers path must be exercised"
+    );
+    assert_eq!(
+        serde_json::to_value(available_actions(&actual)).unwrap(),
+        serde_json::to_value(available_actions(&expected)).unwrap()
+    );
+    assert_eq!(
+        db::CreateDomainEvent::task_interruption_changed(task).dedupe_key,
+        db::CreateDomainEvent::task_interruption_changed(&legacy).dedupe_key
+    );
+}

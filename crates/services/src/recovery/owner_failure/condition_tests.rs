@@ -1,3 +1,4 @@
+// Unit A conversion target: keep this real-writer, two-write legacy oracle active.
 use super::*;
 use crate::recovery::test_support::{seed_project_repo, seed_task, sqlite_db};
 use db::{EnqueueTaskStep, TaskStepRepo};
@@ -6,12 +7,32 @@ use db::{EnqueueTaskStep, TaskStepRepo};
 async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
     let db = sqlite_db().await;
     let (project, _) = seed_project_repo(&db).await;
-    for (message, held) in [
-        ("owner reset details".to_owned(), None),
-        ("z".repeat(200_000), None),
-        ("late owner reset".to_owned(), Some(true)),
-        ("annotation-only owner reset".to_owned(), Some(false)),
-        ("reset with other owners".to_owned(), None),
+    let mut writer_marks = Vec::new();
+    for (message, held, blocked_kind) in [
+        ("owner reset details".to_owned(), None, None),
+        ("z".repeat(200_000), None, None),
+        ("late owner reset".to_owned(), Some(true), None),
+        ("annotation-only owner reset".to_owned(), Some(false), None),
+        ("reset with other owners".to_owned(), None, None),
+        (
+            "retry exhausted reset".into(),
+            None,
+            Some("retry_exhausted"),
+        ),
+        (
+            "review exhausted reset".into(),
+            None,
+            Some("review_budget_exhausted"),
+        ),
+        (
+            "merge exhausted reset".into(),
+            None,
+            Some("merge_fix_budget_exhausted"),
+        ),
+        ("gate failed reset".into(), None, Some("review_gate_failed")),
+        ("timeout reset".into(), None, Some("agent_timeout")),
+        ("loop reset".into(), None, Some("workflow_loop")),
+        ("deferred reset".into(), None, Some("deferred")),
     ] {
         let task = seed_task(&db, project.clone(), "in_progress".into(), None).await;
         let at = now_rfc3339();
@@ -79,14 +100,35 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
                     db::TaskMetadataMutation::Set { key: "queued_recovery".into(), value: serde_json::json!({"id":"queued-owner-command"}) },
                 ], &at).await.unwrap();
             }
+            if let Some(kind) = blocked_kind {
+                let mut tx = db.pool().begin().await.unwrap();
+                if kind == "deferred" {
+                    sqlx::query("UPDATE task SET metadata_json=? WHERE id=?")
+                        .bind(serde_json::json!({"deferred_dispatch":{"not_before":"2099-01-01T00:00:00Z", "reason":"retry later", "target_state":"in_progress"}}).to_string())
+                        .bind(&task.id).execute(&mut *tx).await.unwrap();
+                } else {
+                    let blocked = if kind == "workflow_loop" {
+                        serde_json::json!({"reason":"loop detected", "blocked_at":at, "source":"workflow_loop"})
+                    } else {
+                        serde_json::json!({"kind":kind, "reason":"interrupted", "created_at":at, "source":"replan"})
+                    };
+                    sqlx::query("UPDATE task SET blocked_json=? WHERE id=?")
+                        .bind(blocked.to_string()).bind(&task.id).execute(&mut *tx).await.unwrap();
+                }
+                db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Legacy).await.unwrap();
+                tx.commit().await.unwrap();
+            }
             annotate_owner_workspace_reset(&db, &placement, &message).await.unwrap();
         }).await;
         let row = TaskRepo::get_by_id(&db, &task.id, false)
             .await
             .unwrap()
             .unwrap();
-        assert!(row.condition.evidence().stated);
-        assert!(!row.condition.evidence().ownership.is_empty());
+
+        writer_marks.push((
+            row.condition.evidence().stated,
+            row.condition.evidence().ownership.len(),
+        ));
         let mut connection = db.pool().acquire().await.unwrap();
         let facts = db::ConditionFacts::load(&mut connection, &task.id)
             .await
@@ -114,12 +156,14 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
         );
         assert_eq!(row.condition.typed(), mapped.typed());
         assert_eq!(row.condition.public(), mapped.public());
+        crate::task_actions::test_support::assert_legacy_offers(&db, &row, &mapped).await;
         assert_eq!(
             db::material_blocker(&row.condition),
             db::material_blocker(&mapped)
         );
         assert_eq!(after.condition.typed(), mapped.typed());
         assert_eq!(after.condition.public(), mapped.public());
+        crate::task_actions::test_support::assert_legacy_offers(&db, &after, &mapped).await;
         assert_eq!(
             db::material_blocker(&after.condition),
             db::material_blocker(&mapped)
@@ -155,4 +199,8 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
             .iter()
             .any(|d| d.text == message && d.source == "diagnostic"));
     }
+    // The unit-A target currently runs the base writer; no typed ownership is introduced.
+    assert!(writer_marks
+        .iter()
+        .all(|(stated, count)| !stated && *count == 0));
 }

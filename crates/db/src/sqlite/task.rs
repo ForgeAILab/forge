@@ -210,21 +210,26 @@ pub(super) async fn effective_execution_assignment_in_tx(
     .await?)
 }
 
-async fn load_task<'e, E>(executor: E, id: &str, include_deleted: bool) -> Result<Option<Task>>
-where
-    E: sqlx::Executor<'e, Database = Sqlite>,
-{
+async fn load_task(
+    connection: &mut sqlx::SqliteConnection,
+    id: &str,
+    include_deleted: bool,
+) -> Result<Option<Task>> {
     let sql = if include_deleted {
         format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ?")
     } else {
         format!("SELECT {TASK_COLUMNS} FROM task WHERE id = ? AND deleted_at IS NULL")
     };
-    sqlx::query(&sql)
+    let mut task = sqlx::query(&sql)
         .bind(id)
-        .fetch_optional(executor)
+        .fetch_optional(&mut *connection)
         .await?
         .map(map_task)
-        .transpose()
+        .transpose()?;
+    if let Some(task) = &mut task {
+        crate::task_condition::restore_read(connection, &task.id, &mut task.condition).await?;
+    }
+    Ok(task)
 }
 
 async fn check_project_workflow_authority_in_tx(
@@ -735,6 +740,8 @@ async fn update_task_inner(
                 .fetch_one(&mut *transaction)
                 .await?,
         );
+        crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition)
+            .await?;
         for parent in [&previous_parent, &task.parent_task_id]
             .into_iter()
             .flatten()
@@ -750,6 +757,8 @@ async fn update_task_inner(
                 .fetch_one(&mut *transaction)
                 .await?,
         );
+        crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition)
+            .await?;
     }
     if interruption_fields_changed(
         &previous_error_annotation,
@@ -991,6 +1000,7 @@ async fn set_error_annotation_if_no_running_execution_inner(
             .fetch_one(&mut *transaction)
             .await?,
     );
+    crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition).await?;
     if previous_error_annotation != task.error_annotation {
         append_task_interruption_event(db, &mut transaction, &task).await?;
     }
@@ -1115,6 +1125,7 @@ async fn update_recovery_metadata_inner(
             .fetch_one(&mut *transaction)
             .await?,
     );
+    crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition).await?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -1238,6 +1249,7 @@ async fn update_task_status_inner(
             .fetch_one(&mut *transaction)
             .await?,
     );
+    crate::task_condition::restore_read(&mut transaction, &task.id, &mut task.condition).await?;
     if interruption_fields_changed(
         &previous_error_annotation,
         &previous_blocked_json,
@@ -1400,7 +1412,10 @@ pub(super) async fn list_page(
         .bind(offset)
         .fetch_all(&mut *connection)
         .await?;
-    let items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
+    let mut items = rows.into_iter().map(map_task).collect::<Result<Vec<_>>>()?;
+    for task in &mut items {
+        crate::task_condition::restore_read(connection, &task.id, &mut task.condition).await?;
+    }
     let total = if query.page.include_total {
         let count_sql = format!("SELECT COUNT(*) FROM task WHERE {}", where_sql);
         let mut q = sqlx::query_scalar::<_, i64>(&count_sql).bind(&query.project_id);

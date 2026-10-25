@@ -30,6 +30,7 @@ impl SqliteDb {
     pub async fn tasks_with_exhausted_infrastructure_checks(
         &self,
     ) -> crate::Result<Vec<TaskOperatorConditionRow>> {
+        let mut c = self.pool.begin().await?;
         let rows = sqlx::query(
             "SELECT id, title, condition_json, updated_at FROM task
              WHERE condition_json LIKE '%infrastructure_exhausted%'
@@ -37,18 +38,24 @@ impl SqliteDb {
                AND status NOT IN ('done', 'cancelled')
              ORDER BY updated_at DESC, id ASC LIMIT 50",
         )
-        .fetch_all(self.pool())
+        .fetch_all(&mut *c)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(TaskOperatorConditionRow {
-                    id: row.try_get("id")?,
-                    title: row.try_get("title")?,
-                    condition_json: row.try_get("condition_json")?,
-                    updated_at: row.try_get("updated_at")?,
-                })
-            })
-            .collect()
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let mut condition =
+                crate::task_condition::decode_or_unknown(row.try_get("condition_json")?);
+            crate::task_condition::restore_read(&mut c, &id, &mut condition).await?;
+            result.push(TaskOperatorConditionRow {
+                id: row.try_get("id")?,
+                title: row.try_get("title")?,
+                condition_json: serde_json::to_string(&condition)
+                    .map_err(|e| DbError::Check(e.to_string()))?,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+        c.rollback().await?;
+        Ok(result)
     }
 }
 
@@ -70,6 +77,7 @@ pub struct BlockedTaskOperatorRow {
 
 impl SqliteDb {
     pub async fn blocked_task_operator_rows(&self) -> crate::Result<Vec<BlockedTaskOperatorRow>> {
+        let mut c = self.pool.begin().await?;
         let rows = sqlx::query("SELECT id, title, condition_json, updated_at
              FROM task
              WHERE (status = 'blocked' OR json_extract(condition_json,'$.evidence.presentation.interruption_present') = 1)
@@ -77,17 +85,23 @@ impl SqliteDb {
                AND archived_at IS NULL
                AND status NOT IN ('done', 'cancelled')
              ORDER BY updated_at DESC, id ASC")
-.fetch_all(self.pool()).await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(BlockedTaskOperatorRow {
-                    id: row.try_get("id")?,
-                    title: row.try_get("title")?,
-                    condition_json: row.try_get("condition_json")?,
-                    updated_at: row.try_get("updated_at")?,
-                })
-            })
-            .collect()
+.fetch_all(&mut *c).await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let mut condition =
+                crate::task_condition::decode_or_unknown(row.try_get("condition_json")?);
+            crate::task_condition::restore_read(&mut c, &id, &mut condition).await?;
+            result.push(BlockedTaskOperatorRow {
+                id: row.try_get("id")?,
+                title: row.try_get("title")?,
+                condition_json: serde_json::to_string(&condition)
+                    .map_err(|e| DbError::Check(e.to_string()))?,
+                updated_at: row.try_get("updated_at")?,
+            });
+        }
+        c.rollback().await?;
+        Ok(result)
     }
 }
 
@@ -104,6 +118,7 @@ pub struct TaskOperatorRetryRow {
 
 impl SqliteDb {
     pub async fn task_operator_retry_rows(&self) -> crate::Result<Vec<TaskOperatorRetryRow>> {
+        let mut c = self.pool.begin().await?;
         let rows = sqlx::query("SELECT
                 t.id AS task_id,
                 t.title,
@@ -128,20 +143,26 @@ impl SqliteDb {
              GROUP BY t.id, t.title, t.status, t.condition_json
              HAVING COUNT(tl.id) >= 1 OR json_extract(t.condition_json,'$.evidence.presentation.retry_display.reason') IS NOT NULL OR execution_spent > 0
              ORDER BY attempt_count DESC, t.updated_at DESC, t.id ASC")
-.fetch_all(self.pool()).await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(TaskOperatorRetryRow {
-                    task_id: row.try_get("task_id")?,
-                    title: row.try_get("title")?,
-                    status: row.try_get("status")?,
-                    condition_json: row.try_get("condition_json")?,
-                    attempt_count: row.try_get("attempt_count")?,
-                    execution_spent: row.try_get("execution_spent")?,
-                    last_error: row.try_get("last_error")?,
-                })
-            })
-            .collect()
+.fetch_all(&mut *c).await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.try_get("task_id")?;
+            let mut condition =
+                crate::task_condition::decode_or_unknown(row.try_get("condition_json")?);
+            crate::task_condition::restore_read(&mut c, &id, &mut condition).await?;
+            result.push(TaskOperatorRetryRow {
+                task_id: row.try_get("task_id")?,
+                title: row.try_get("title")?,
+                status: row.try_get("status")?,
+                condition_json: serde_json::to_string(&condition)
+                    .map_err(|e| DbError::Check(e.to_string()))?,
+                attempt_count: row.try_get("attempt_count")?,
+                execution_spent: row.try_get("execution_spent")?,
+                last_error: row.try_get("last_error")?,
+            });
+        }
+        c.rollback().await?;
+        Ok(result)
     }
 }
 

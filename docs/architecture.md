@@ -6188,10 +6188,10 @@ belong to the current epoch. A mismatching expected identity refuses the write;
 a clear removes only that owner's reasons and retains other owners. Owner
 records retain typed presentation and material-blocker projections, so clearing
 a primary reason reveals the remaining owner's diagnosis. The owner-edit contract
-can preserve a foreign hold, but the two converted diagnostic-slot writers use
-`ReplaceDiagnostic`: they retain the supersession of their legacy annotation and
-interruption writes. Global hold protection belongs to unit A, after it converts
-the hold writers. Integration and check ownership still require their original
+can preserve a foreign hold. `ReplaceDiagnostic` describes diagnostic-slot
+supersession; its writer conversions remain unit A targets, alongside the hold
+writers. Those conversions must retain the exact legacy interruption reasons,
+failure-kind precedence and assignment guidance across two writes. Integration and check ownership still require their original
 claimed-step seam.
 
 `StatedCondition` states Parked, Failed or Deferred from caller intent.
@@ -6227,9 +6227,13 @@ callers exposed by the compiler. Historical Sql, update, queued rollback and Tas
 receipt encodings remain decodable and replayable; their retained legacy SQL and
 archive import need deliberate translation before 5b drops storage.
 
-Converted S writers here are the workspace-owner reset annotation and missing
-review-candidate park. Waiting Hold/Release and integration/check statements
-remain in use. Other S caller files and aggregates A–E still need their own
+The workspace-owner reset annotation and missing review-candidate park retain
+their base repository writes. Their active two-write equivalence tests are unit A
+conversion targets, including retry/budget exhaustion, historical timeout, kind-less
+workflow loops and Deferred retries. They capture new diagnostic text after the
+legacy commit on a best-effort basis; capture failure leaves the full legacy text
+and the base write outcome intact. Waiting Hold/Release and integration/check
+statements remain in use. Other S caller files and aggregates A–E still need their own
 conversion. Unconverted writers continue to map legacy after their write, so an
 intermediate gate does not silently change their intent. The mapping remains the
 independent per-writer oracle while dual write continues. Comparisons omit
@@ -6272,18 +6276,31 @@ keeping public child/dependency lists intact when that fits. If needed, it also
 summarizes large child/dependency identity lists and aggregate-review child lists. Counts and a complete-set digest
 identify the omitted data. Bounded claims reload current durable children and
 dependency rows before an owner edit can rearrange reasons; checks and strict
-setters use those complete sets too. A set that fits again drops its summary.
+setters use those complete sets too. Under LegacyOracle, legacy-backed edits also
+reload complete presentation text before applying their statement, so a following
+Release cannot carry pressure-shortened text into an otherwise small condition. Task detail, list and operator reads reload
+omitted lists and pressure-shortened presentation from the same durable sources,
+so REST, MCP and web label inputs retain the complete public projection. An
+untyped annotation's public diagnostic is materialised separately from action
+diagnostics before its debug copy is stripped. Restoring an overflow marker
+consumes it, so a self-contained committed reply is not hydrated again from newer
+rows while a cascade advances. A set that fits again drops its summary.
 Small dependency lists retain their exact identities. Exact entry/run/step/integration/check identities, every owner identity,
 secondary reasons and Attention material remain in the row. Owner presentation
 text and the current condition's free-text summaries can be shortened further to
-fit; operator JSON, material, dates and authority identities retain their values.
+fit. Under total-size pressure this includes the operator JSON document, diagnostic
+hook and entry/environment/placement values; the original field text is captured
+in the diagnostic store and ordinary reads restore the legacy projection. Material,
+dates and authority identities retain their values.
 The collection fingerprint excludes presentation and material, so tightening text
 does not make a bounded row stale. Non-reloadable authority is never silently
-discarded or hashed in place. A claim whose authority alone exceeds the ceiling is
-refused. There are no condition snapshots, segments or indexes in the diagnostic
+discarded or hashed in place. Size alone never refuses a legacy write; an
+unrepresentably large authority claim is logged while retaining its authority. There are no condition snapshots, segments or indexes in the diagnostic
 table, and editing a condition does not depend on diagnostic text integrity.
-The dispatcher recognizes bounded projections and does not repeatedly mark them
-stale merely because their debug copies were omitted.
+Stripped rows retain a SHA-256 of the five complete legacy source inputs. The
+dispatcher compares that digest to catch missed synchronisation, and the checker
+repairs the digest even when the public projection stays the same. Stripping debug
+copies alone does not mark an otherwise current row stale.
 
 Operations retains its existing operator-reason document: strings within JSON are
 bounded, the whole document has its existing 16 KiB limit, and valid JSON is never
@@ -6292,7 +6309,12 @@ encoded document. Normal reads retain the base projection ordering and limits.
 
 **Unreadable condition.** Corrupt/empty storage is distinct from a recognizable
 newer encoding. While legacy storage is written, corruption is rebuilt from the
-legacy mapping plus durable facts within one check sweep, as before this checkpoint.
+legacy mapping plus durable facts in the same writer transaction or within one
+check sweep, as before this checkpoint. Every statement family uses that fallback
+on corruption; its text is retained without applying an edit over an empty
+condition. Strict comparison excludes diagnostic-text references. Under the active
+LegacyOracle policy, checks compare stated ownership rows with the legacy mapping
+too, so an incomplete conversion cannot make its own divergence authoritative.
 Original bytes are also retained as diagnostic text (base64 for non-UTF-8 bytes).
 The dispatcher still resolves corrupt rows from legacy fields until that repair
 lands; it and the check use the same oracle. Each failed recomputation or repair is

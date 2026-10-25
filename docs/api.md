@@ -7381,3 +7381,8 @@ Project @22. Historical revisions and frozen rendering remain unchanged. New
 revisions include their override text in their content digest. Project Agents
 copy Task calls from `action_schema`, and Task worklog/evidence `action` is
 optional. Use a new `correlation_id` for each distinct worklog entry.
+
+Task condition projections restore complete child/dependency identity lists and
+aggregate-review child IDs from durable rows when the private stored condition uses
+count/fingerprint summaries. List and detail responses retain the same condition
+shape and complete lists, including large coordination roots.

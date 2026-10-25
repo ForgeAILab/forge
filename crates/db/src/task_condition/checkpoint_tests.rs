@@ -499,6 +499,24 @@ async fn additive_upgrade_and_revision_seven_preserve_existing_condition_bytes_a
     }
 }
 
+async fn dual_written_diagnostic_fixture(db: &SqliteDb, id: &str) -> ConditionPresentation {
+    let annotation =
+        json!({"type":"workspace_reset_required", "blocking_reason":"fixture"}).to_string();
+    sqlx::query("UPDATE task SET error_annotation=? WHERE id=?")
+        .bind(&annotation)
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    ConditionPresentation::from_read(
+        &map_legacy_condition(&LegacyConditionInput {
+            error_annotation: Some(annotation),
+            ..Default::default()
+        })
+        .read(),
+    )
+}
+
 #[tokio::test]
 async fn bounded_owned_row_reloads_durable_children_and_does_not_repair_itself_again() {
     let db = db().await;
@@ -515,6 +533,7 @@ async fn bounded_owned_row_reloads_durable_children_and_does_not_repair_itself_a
     }
     sqlx::query("UPDATE task SET metadata_json='{\"coordination_review_pending\":true}' WHERE id='root-many'")
         .execute(db.pool()).await.unwrap();
+    let diagnostic_presentation = dual_written_diagnostic_fixture(&db, "root-many").await;
     let mut c = db.pool().acquire().await.unwrap();
     storage::sync_condition(&mut c, "root-many").await.unwrap();
     drop(c);
@@ -536,7 +555,7 @@ async fn bounded_owned_row_reloads_durable_children_and_does_not_repair_itself_a
                         },
                         resume: ConditionContinuation::Reconcile,
                         since: None,
-                        presentation: Default::default(),
+                        presentation: diagnostic_presentation,
                     },
                 }),
             }),
@@ -689,6 +708,8 @@ async fn corrupt_legacy_blockers_rebuild_with_the_base_condition_and_attention_i
 }
 
 #[tokio::test]
+// This 400-id typed owner exceeds the legacy mapper's 16-id import limit.
+// Its stability assertion exercises the explicit future policy; main must repair it.
 async fn bounded_dependency_identities_are_reloaded_before_an_owner_edit_reorders_reasons() {
     let db = db().await;
     task(&db, "dependencies-many").await;
@@ -775,7 +796,7 @@ async fn bounded_dependency_identities_are_reloaded_before_an_owner_edit_reorder
     assert_eq!(owner.identity, identity);
     for _ in 0..2 {
         assert_eq!(
-            db.check_task_conditions_of(&["dependencies-many".into()])
+            db.check_owned_condition_for_test("dependencies-many")
                 .await
                 .unwrap(),
             0
@@ -785,6 +806,27 @@ async fn bounded_dependency_identities_are_reloaded_before_an_owner_edit_reorder
             updated
         );
     }
+    let row = TaskRepo::get_by_id(&db, "dependencies-many", false)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut c = db.pool().acquire().await.unwrap();
+    let facts = ConditionFacts::load(&mut c, &row.id).await.unwrap();
+    drop(c);
+    let mut input = LegacyConditionInput::from(&row);
+    input.facts = Some(facts);
+    let legacy = map_legacy_condition(&input);
+    assert_eq!(
+        db.check_task_conditions_of(std::slice::from_ref(&row.id))
+            .await
+            .unwrap(),
+        1,
+        "the active policy repairs this deliberately non-legacy typed claim"
+    );
+    assert_eq!(
+        db.task_condition(&row.id).await.unwrap().typed(),
+        legacy.typed()
+    );
 }
 
 #[tokio::test]

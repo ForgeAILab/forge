@@ -332,6 +332,29 @@ impl SqliteDb {
         first: Option<&str>,
         second: i64,
     ) -> Result<Page> {
+        self.check_condition_rows_with_policy(select, first, second, recovery::UNREADABLE_POLICY)
+            .await
+    }
+    #[cfg(test)]
+    pub(super) async fn check_owned_condition_for_test(&self, id: &str) -> Result<u64> {
+        let select = format!("SELECT {LEGACY_SELECT},id,version FROM task WHERE id=?1 AND ?2");
+        Ok(self
+            .check_condition_rows_with_policy(
+                &select,
+                Some(id),
+                1,
+                recovery::UnreadablePolicy::DurableOwners,
+            )
+            .await?
+            .repaired)
+    }
+    async fn check_condition_rows_with_policy(
+        &self,
+        select: &str,
+        first: Option<&str>,
+        second: i64,
+        policy: recovery::UnreadablePolicy,
+    ) -> Result<Page> {
         let mut reader = self.pool().begin().await?;
         let rows = sqlx::query(select)
             .bind(first)
@@ -355,8 +378,7 @@ impl SqliteDb {
                 let stored = match classify(&stored) {
                     Stored::Readable(stored) => Some(*stored),
                     Stored::Corrupt(problem) => {
-                        if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::DurableOwners
-                        {
+                        if policy == recovery::UnreadablePolicy::DurableOwners {
                             recovery::load_owners(&mut reader, &mut facts).await?;
                             return Ok(recovery::project(&facts, problem, None));
                         }
@@ -364,12 +386,17 @@ impl SqliteDb {
                     }
                     Stored::Newer => unreachable!("quarantine was handled above"),
                 };
-                if recovery::UNREADABLE_POLICY == recovery::UnreadablePolicy::DurableOwners
+                if policy == recovery::UnreadablePolicy::DurableOwners
                     && stored.as_ref().is_some_and(recovery::unreadable)
                 {
                     recovery::load_owners(&mut reader, &mut facts).await?;
                 }
-                Ok::<_, DbError>(recovery::expected(&facts, &input, stored.as_ref()))
+                Ok::<_, DbError>(recovery::expected_with_policy(
+                    &facts,
+                    &input,
+                    stored.as_ref(),
+                    policy,
+                ))
             }
             .await;
             match expected {

@@ -93,6 +93,19 @@ fn from_row(row: sqlx::sqlite::SqliteRow) -> Result<TaskDiagnosticText> {
 }
 
 impl SqliteDb {
+    /// Capture text independently after a legacy writer has committed. Its caller
+    /// may leave capture for later when the full legacy text is still durable.
+    pub async fn record_task_diagnostic_text(
+        &self,
+        input_task_id: &str,
+        input: RecordTaskDiagnosticText<'_>,
+    ) -> Result<String> {
+        let mut tx = self.pool().begin().await?;
+        let id = record(&mut tx, input_task_id, input).await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// Shares the caller's transaction: failure of the Task write rolls back its text too.
     pub async fn record_task_diagnostic_text_in_tx(
         &self,

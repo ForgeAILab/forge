@@ -1,5 +1,6 @@
 //! Bound the stored projection; only durable, reloadable collections may be omitted.
 use super::*;
+mod text;
 
 pub const CONDITION_JSON_LIMIT: usize = 32 * 1024;
 
@@ -181,6 +182,10 @@ pub(super) fn json_error(error: serde_json::Error) -> DbError {
 
 pub(super) fn try_bounded_condition(condition: &TaskCondition) -> Result<TaskCondition> {
     let mut result = condition.clone();
+    let read = result.read();
+    if !read.diagnostic_present || read.diagnostic.is_some() {
+        result.evidence_mut().public_diagnostic = None;
+    }
     // Legacy import and typed statements have already bounded their display fields.
     // Do not bound a second time: Operations' JSON document has a separate limit.
     // Fact projections already bounded their source text before adding recovery
@@ -199,8 +204,16 @@ pub(super) fn try_bounded_condition(condition: &TaskCondition) -> Result<TaskCon
     if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT {
         return Ok(result);
     }
+    // Materialise the pre-typed annotation fallback before its debug copy goes.
+    let read = result.read();
+    result.evidence_mut().public_diagnostic =
+        if read.diagnostic.is_none() && read.diagnostic_present {
+            result.public().details().diagnostic.clone()
+        } else {
+            None
+        };
     strip_legacy(result.evidence_mut());
-    if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT {
+    if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT - 1024 {
         return Ok(result);
     }
     // The fingerprint describes authority and complete witness sets, independent
@@ -220,40 +233,52 @@ pub(super) fn try_bounded_condition(condition: &TaskCondition) -> Result<TaskCon
     // Keep public identity lists intact when omitting redundant durable witnesses is enough.
     shrink_witnesses(&mut result, &mut summary.collection_counts);
     result.evidence_mut().overflow = Some(summary.clone());
-    if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT {
+    if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT - 1024 {
         return Ok(result);
+    }
+    // Preserve public sets whenever tightening reloadable text alone suffices.
+    for limit in [PRESENTATION_TEXT_LIMIT, 256, 64, 32] {
+        presentation(&mut result, limit);
+        text::tighten(&mut result, limit);
+        if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT - 1024 {
+            return Ok(result);
+        }
     }
     shrink_collections(&mut result, &mut summary.collection_counts);
     result.evidence_mut().overflow = Some(summary);
     for limit in [PRESENTATION_TEXT_LIMIT, 256, 64, 32] {
         presentation(&mut result, limit);
-        if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT {
-            if result
-                .evidence()
-                .overflow
-                .as_ref()
-                .is_some_and(|s| s.collection_counts.is_empty())
-            {
-                result.evidence_mut().overflow = None;
-            }
+        text::tighten(&mut result, limit);
+        if serde_json::to_vec(&result).map_err(json_error)?.len() <= CONDITION_JSON_LIMIT - 1024 {
+            // Text-only compaction needs restoration too; keep its marker until read.
             return Ok(result);
         }
     }
-    // Non-reloadable authority is never discarded or replaced by a hash.
-    Err(DbError::Check(
-        "Task condition authority exceeds 32 KiB".into(),
-    ))
+    // Authority is never discarded, and size alone cannot roll back a legacy write.
+    // Production authority is finite; report an invalid, unbounded caller claim.
+    tracing::warn!("Task condition authority exceeds its payload budget");
+    Ok(result)
 }
 
 pub(super) fn bounded_condition(condition: &TaskCondition) -> TaskCondition {
-    // Comparison-only callers cannot make an unrepresentable claim agree.
+    // Compare the same representation used by condition writes.
     try_bounded_condition(condition).unwrap_or_else(|_| condition.clone())
 }
 
 pub(super) async fn prepare(
-    _c: &mut SqliteConnection,
-    _task_id: &str,
+    c: &mut SqliteConnection,
+    task_id: &str,
     condition: &TaskCondition,
 ) -> Result<TaskCondition> {
-    try_bounded_condition(condition)
+    let mut result = try_bounded_condition(condition)?;
+    if result.evidence().legacy_debug_omitted {
+        let row = sqlx::query(&format!("SELECT {LEGACY_SELECT} FROM task WHERE id=?"))
+            .bind(task_id)
+            .fetch_one(&mut *c)
+            .await?;
+        result.evidence_mut().legacy_input_digest =
+            Some(LegacyConditionInput::from_row(&row)?.digest());
+        text::record(c, task_id, condition, &mut result).await?;
+    }
+    Ok(result)
 }

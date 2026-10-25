@@ -268,7 +268,12 @@ impl TaskCondition {
             // typed reading; it stays visible as an unknown diagnostic.
             diagnostic: read.diagnostic.or_else(|| {
                 read.diagnostic_present
-                    .then(|| untyped_diagnostic(evidence.error_annotation.as_deref()?))
+                    .then(|| {
+                        evidence
+                            .public_diagnostic
+                            .clone()
+                            .or_else(|| untyped_diagnostic(evidence.error_annotation.as_deref()?))
+                    })
                     .flatten()
             }),
             interruption: read.interruption,

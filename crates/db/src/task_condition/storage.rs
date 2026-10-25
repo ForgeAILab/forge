@@ -456,11 +456,22 @@ impl SqliteDb {
                     .typed()
                     == condition.typed();
             }
-            let expected = facts.condition(&bare);
+            let mut expected = facts.condition(&bare);
+            // Private references participate in the encoded-size measurement,
+            // but never in the strict semantic comparison.
+            expected.evidence_mut().diagnostic_ids = condition.evidence().diagnostic_ids.clone();
+            expected.evidence_mut().legacy_input_digest =
+                condition.evidence().legacy_input_digest.clone();
             if condition.integration_reason().is_some() || condition.check_witness().is_some() {
                 payload::bounded_condition(&expected).typed() == condition.typed()
             } else {
-                payload::bounded_condition(&expected) == *condition
+                let mut expected = payload::bounded_condition(&expected);
+                let mut actual = condition.clone();
+                expected.evidence_mut().diagnostic_ids.clear();
+                actual.evidence_mut().diagnostic_ids.clear();
+                expected.evidence_mut().legacy_input_digest = None;
+                actual.evidence_mut().legacy_input_digest = None;
+                expected == actual
             }
         };
         if !stated.is_some_and(agrees) {

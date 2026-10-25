@@ -154,3 +154,71 @@ pub(super) fn restore(condition: &mut TaskCondition, facts: &ConditionFacts) {
     // Witnesses are replaced by apply_lifecycle from these same complete facts.
     e.overflow = None;
 }
+
+/// A legacy-backed writer edits complete reader inputs, not pressure-shortened text.
+pub(super) fn restore_writer_read(
+    condition: &mut TaskCondition,
+    facts: &ConditionFacts,
+    input: &LegacyConditionInput,
+) {
+    let mapped = (condition.evidence().overflow.is_some()
+        && condition.evidence().legacy_debug_omitted
+        && condition.evidence().ownership.is_empty())
+    .then(|| facts.condition(input));
+    restore(condition, facts);
+    if let Some(mapped) = mapped {
+        let read = mapped.read();
+        condition.evidence_mut().public_diagnostic =
+            if read.diagnostic.is_none() && read.diagnostic_present {
+                mapped.public().details().diagnostic.clone()
+            } else {
+                None
+            };
+        condition.evidence_mut().presentation = Some(read);
+    }
+}
+
+/// Public reads restore reloadable sets and pressure-shortened presentation in
+/// the same database snapshot. Nothing is written and diagnostic text is not read.
+pub(crate) async fn restore_read(
+    c: &mut SqliteConnection,
+    task_id: &str,
+    condition: &mut TaskCondition,
+) -> Result<()> {
+    if condition.evidence().overflow.is_none() {
+        return Ok(());
+    }
+    let snapshot = facts::Snapshot::read(c, task_id, facts::Families::ENTRY)
+        .await?
+        .ok_or(DbError::NotFound)?;
+    let mut facts = ConditionFacts::load_all(c, &snapshot).await?;
+    facts.load_collection_dependencies(c).await?;
+    let mapped = facts.condition(&snapshot.input);
+    restore(condition, &facts);
+    condition.evidence_mut().witnesses = mapped.evidence().witnesses.clone();
+    if condition.evidence().legacy_debug_omitted {
+        // All writers still dual-write these inputs under LegacyOracle.
+        let read = mapped.read();
+        condition.evidence_mut().public_diagnostic =
+            if read.diagnostic.is_none() && read.diagnostic_present {
+                mapped.public().details().diagnostic.clone()
+            } else {
+                None
+            };
+        condition.evidence_mut().presentation = Some(read);
+    }
+    Ok(())
+}
+
+impl SqliteDb {
+    /// Restore the public condition of a committed writer reply without
+    /// replacing the Task's status, version or other captured fields.
+    pub async fn restore_task_read(&self, task: &mut Task) -> Result<()> {
+        if task.condition.evidence().overflow.is_some() {
+            let mut c = self.pool().begin().await?;
+            restore_read(&mut c, &task.id, &mut task.condition).await?;
+            c.rollback().await?;
+        }
+        Ok(())
+    }
+}

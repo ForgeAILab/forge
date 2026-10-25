@@ -156,10 +156,18 @@ pub(super) async fn derive_with_policy(
             facts.load_collection_dependencies(c).await?;
         }
         if let Some(stored) = &mut stored {
-            collections::restore(stored, &facts);
+            if policy == recovery::UnreadablePolicy::LegacyOracle {
+                collections::restore_writer_read(stored, &facts, &snapshot.input);
+            } else {
+                collections::restore(stored, &facts);
+            }
         }
         if let Some(carried) = &mut carried {
-            collections::restore(carried, &facts);
+            if policy == recovery::UnreadablePolicy::LegacyOracle {
+                collections::restore_writer_read(carried, &facts, &snapshot.input);
+            } else {
+                collections::restore(carried, &facts);
+            }
         }
         preloaded = Some(facts);
     }
@@ -171,33 +179,23 @@ pub(super) async fn derive_with_policy(
         .filter(|_| statement.is_some())
         .map(recovery::owner_base);
     let base = refreshed_base.as_ref().or(stored_base).unwrap_or(&empty);
-    let stated = match (statement, Some(base)) {
-        (Some(ConditionStatement::Edit { edit }), Some(stored)) => {
-            Some(edit.apply_at_epoch(stored, Some(snapshot.epoch))?)
+    let stated = match statement {
+        _ if corruption.is_some() && policy == recovery::UnreadablePolicy::LegacyOracle => None,
+        Some(ConditionStatement::Edit { edit }) => {
+            Some(edit.apply_at_epoch(base, Some(snapshot.epoch))?)
         }
-        (
-            Some(ConditionStatement::ReplaceDiagnostic {
-                replacement,
-                preserve_interruption,
-            }),
-            Some(stored),
-        ) => Some(diagnostic_projection::apply(
-            stored,
+        Some(ConditionStatement::ReplaceDiagnostic {
+            replacement,
+            preserve_interruption,
+        }) => Some(diagnostic_projection::apply(
+            base,
             replacement,
             *preserve_interruption,
         )?),
-        (Some(statement), Some(stored)) => Some(statement.apply(stored)),
+        Some(statement) => Some(statement.apply(base)),
         _ => None,
     };
     let from_statement = stated.is_some();
-    let stated = if corruption.is_some()
-        && policy == recovery::UnreadablePolicy::LegacyOracle
-        && matches!(statement, Some(ConditionStatement::Preserve))
-    {
-        None
-    } else {
-        stated
-    };
     let mapped = stated.unwrap_or_else(|| {
         if corruption.is_some() && policy == recovery::UnreadablePolicy::DurableOwners {
             TaskCondition::default()
@@ -379,7 +377,10 @@ pub(super) async fn derive_with_policy(
     if let Some(statement) = statement {
         write::record_statement_text(c, task_id, statement, &mut condition).await?;
     }
-    let condition = payload::prepare(c, task_id, &condition).await?;
+    let mut condition = payload::prepare(c, task_id, &condition).await?;
+    if condition.evidence().legacy_debug_omitted {
+        condition.evidence_mut().legacy_input_digest = Some(snapshot.input.digest());
+    }
     if !explicit && scoped.is_some() {
         write::mark_statement_applied(task_id, &condition, &snapshot.stored, snapshot.version);
     }

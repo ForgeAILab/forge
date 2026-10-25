@@ -200,7 +200,16 @@ fn stale_condition(stored: &TaskCondition, task: &db::Task) -> Option<TaskCondit
         }
         None => {}
     }
-    if stored.evidence().stated || stored.evidence().legacy_debug_omitted {
+    if stored.evidence().legacy_debug_omitted {
+        let input = db::LegacyConditionInput::from(task);
+        return stored
+            .evidence()
+            .legacy_input_digest
+            .as_ref()
+            .filter(|digest| **digest != input.digest())
+            .map(|_| stored.restate_legacy(&input));
+    }
+    if stored.evidence().stated {
         return None;
     }
     let legacy = stored.restate_legacy(&db::LegacyConditionInput::from(task));
@@ -778,6 +787,111 @@ mod tests {
             evidence.legacy_debug_omitted = false;
         }
         assert!(!blocking(&display_only, true));
+    }
+
+    #[tokio::test]
+    async fn stripped_rows_detect_missed_syncs_in_each_legacy_input() {
+        use db::TaskRepo;
+        let db = crate::recovery::test_support::sqlite_db().await;
+        let (project, _) = crate::recovery::test_support::seed_project_repo(&db).await;
+        let task =
+            crate::recovery::test_support::seed_task(&db, project, "in_progress".into(), None)
+                .await;
+        let annotation =
+            serde_json::json!({"type":"workspace_error", "blocking_reason":"old"}).to_string();
+        let metadata = serde_json::json!({"coordination_review_pending":true}).to_string();
+        let mut tx = db.pool().begin().await.unwrap();
+        for i in 0..400 {
+            sqlx::query("INSERT INTO task(id,project_id,parent_task_id,title,status,subtask_order,created_at,updated_at) VALUES (?,?,?,'child','todo',?,'2026-10-25','2026-10-25')")
+                .bind(db::new_uuid_v4()).bind(&task.project_id).bind(&task.id).bind(i).execute(&mut *tx).await.unwrap();
+        }
+        sqlx::query("UPDATE task SET error_annotation=?,metadata_json=? WHERE id=?")
+            .bind(&annotation)
+            .bind(&metadata)
+            .bind(&task.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let mut tx = db.pool().begin().await.unwrap();
+        db.produce_condition_in_tx(&mut tx, &task.id, db::ConditionChange::Full)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let stored = db.task_condition(&task.id).await.unwrap();
+        let base_raw: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
+            .bind(&task.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert!(stored.evidence().legacy_debug_omitted);
+        let row = TaskRepo::get_by_id(&db, &task.id, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stale_condition(&stored, &row).is_none());
+        for field in [
+            "error_annotation",
+            "blocked_json",
+            "failed_json",
+            "entry_barrier_json",
+            "metadata_json",
+        ] {
+            sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
+                .bind(if field == "metadata_json" {
+                    serde_json::json!({"coordination_review_pending":true, "unrelated":"changed"}).to_string()
+                } else {
+                    serde_json::json!({"kind":"manual_stop","type":"manual_stop","reason":"new hold"}).to_string()
+                })
+                .bind(&task.id).execute(db.pool()).await.unwrap();
+            let changed = TaskRepo::get_by_id(&db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            let restated =
+                stale_condition(&stored, &changed).unwrap_or_else(|| panic!("missed {field} sync"));
+            assert_eq!(
+                restated.public(),
+                stored
+                    .restate_legacy(&db::LegacyConditionInput::from(&changed))
+                    .public()
+            );
+            assert!(blocking(&restated, true), "{field}");
+            assert_eq!(
+                db.check_task_conditions_of(std::slice::from_ref(&task.id))
+                    .await
+                    .unwrap(),
+                1,
+                "{field}: repair the source digest too"
+            );
+            let repaired = db.task_condition(&task.id).await.unwrap();
+            let current = TaskRepo::get_by_id(&db, &task.id, false)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                stale_condition(&repaired, &current).is_none(),
+                "{field}: one sweep repairs the missed sync"
+            );
+            sqlx::query(&format!("UPDATE task SET {field}=? WHERE id=?"))
+                .bind(if field == "error_annotation" {
+                    Some(&annotation)
+                } else if field == "metadata_json" {
+                    Some(&metadata)
+                } else {
+                    None
+                })
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE task SET condition_json=? WHERE id=?")
+                .bind(&base_raw)
+                .bind(&task.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
     }
 
     #[test]

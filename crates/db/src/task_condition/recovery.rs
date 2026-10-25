@@ -205,10 +205,17 @@ pub(super) fn expected(
     input: &LegacyConditionInput,
     stored: Option<&TaskCondition>,
 ) -> TaskCondition {
-    match stored {
-        Some(stored)
-            if unreadable(stored) && UNREADABLE_POLICY == UnreadablePolicy::DurableOwners =>
-        {
+    expected_with_policy(facts, input, stored, UNREADABLE_POLICY)
+}
+
+pub(super) fn expected_with_policy(
+    facts: &ConditionFacts,
+    input: &LegacyConditionInput,
+    stored: Option<&TaskCondition>,
+    policy: UnreadablePolicy,
+) -> TaskCondition {
+    let mut expected = match stored {
+        Some(stored) if unreadable(stored) && policy == UnreadablePolicy::DurableOwners => {
             let problem = stored
                 .reasons()
                 .find_map(|r| match r {
@@ -222,11 +229,18 @@ pub(super) fn expected(
                 .unwrap_or(UnknownConditionProblem::InvalidShape);
             project(facts, problem, Some(stored))
         }
-        Some(stored) if !stored.evidence().ownership.is_empty() => {
+        Some(stored)
+            if policy == UnreadablePolicy::DurableOwners
+                && !stored.evidence().ownership.is_empty() =>
+        {
             let mut full = stored.clone();
             collections::restore(&mut full, facts);
             facts.apply(owner_base(&full))
         }
         _ => facts.condition(input),
+    };
+    if stored.is_some_and(|stored| stored.evidence().legacy_debug_omitted) {
+        expected.evidence_mut().legacy_input_digest = Some(input.digest());
     }
+    expected
 }
