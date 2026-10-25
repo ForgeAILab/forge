@@ -378,6 +378,7 @@ async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnosti
 #[tokio::test]
 async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
     use crate::recovery::test_support::conditions::*;
+    let mut visited = 0;
     for shape in SHAPES {
         let db = sqlite_db().await;
         let projector = attention_projector(&db);
@@ -387,7 +388,11 @@ async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
         db::task_writer::in_task_step(step.clone(), async {
             seed_shape(&db, &task, shape).await;
             let before = read(&db, &task.id).await;
-            let message = if *shape == "long_reason" { "z".repeat(200_000) } else { format!("owner reset: {shape}") };
+            let message = match *shape {
+                "long_reason" => "z".repeat(200_000),
+                "clear" => ESCAPED_REASON.into(),
+                _ => format!("owner reset: {shape}"),
+            };
             annotate_owner_workspace_reset(&db, &placement(&before), &message).await.unwrap();
             let row = read(&db, &task.id).await;
             // Independent main writer literal, including alphabetical key order.
@@ -399,5 +404,7 @@ async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
             assert_main_snapshot(&db, &projector, &row, "reset", shape, "first").await;
             assert_next_write(&db, &projector, &row, "reset", shape, &step).await;
         }).await;
+        visited += 3;
     }
+    assert_writer_cases("reset", visited);
 }

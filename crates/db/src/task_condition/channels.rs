@@ -5,15 +5,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 /// The tag is closed on new writes. Serialization retains the original
 /// writer's field order rather than serde's default tag-first ordering.
+// Later conversions need variants per writer shape and decoding by field set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorAnnotation {
     WorkspaceResetRequired(WorkspaceResetAnnotation),
     ExecutorFailed(ExecutorFailureAnnotation),
-    WorkflowLoop(StepFailureAnnotation),
-    CascadeFailed(StepFailureAnnotation),
-    WorkspaceError(StepFailureAnnotation),
-    MergeConflict(StepFailureAnnotation),
-    CiFailed(StepFailureAnnotation),
     WithStepFailure {
         annotation: Box<ErrorAnnotation>,
         overlay: StepFailureOverlay,
@@ -25,11 +21,6 @@ pub enum ErrorAnnotation {
 enum AnnotationWire {
     WorkspaceResetRequired(WorkspaceResetAnnotation),
     ExecutorFailed(ExecutorFailureAnnotation),
-    WorkflowLoop(StepFailureAnnotation),
-    CascadeFailed(StepFailureAnnotation),
-    WorkspaceError(StepFailureAnnotation),
-    MergeConflict(StepFailureAnnotation),
-    CiFailed(StepFailureAnnotation),
 }
 
 impl<'de> Deserialize<'de> for ErrorAnnotation {
@@ -59,11 +50,6 @@ impl<'de> Deserialize<'de> for ErrorAnnotation {
         let annotation = match wire {
             AnnotationWire::WorkspaceResetRequired(value) => Self::WorkspaceResetRequired(value),
             AnnotationWire::ExecutorFailed(value) => Self::ExecutorFailed(value),
-            AnnotationWire::WorkflowLoop(value) => Self::WorkflowLoop(value),
-            AnnotationWire::CascadeFailed(value) => Self::CascadeFailed(value),
-            AnnotationWire::WorkspaceError(value) => Self::WorkspaceError(value),
-            AnnotationWire::MergeConflict(value) => Self::MergeConflict(value),
-            AnnotationWire::CiFailed(value) => Self::CiFailed(value),
         };
         Ok(match overlay {
             Some(overlay) => Self::WithStepFailure {
@@ -110,28 +96,6 @@ impl Serialize for ErrorAnnotation {
                 fields.serialize_entry("artifact", &value.artifact)?;
                 fields.serialize_entry("message", &value.message)?;
             }
-            Self::WorkflowLoop(value)
-            | Self::CascadeFailed(value)
-            | Self::WorkspaceError(value)
-            | Self::MergeConflict(value)
-            | Self::CiFailed(value) => {
-                if let Some(reason) = &value.blocking_reason {
-                    fields.serialize_entry("blocking_reason", reason)?;
-                }
-                fields.serialize_entry("detected_at", &value.detected_at)?;
-                fields.serialize_entry("message", &value.message)?;
-                fields.serialize_entry("state", &value.state)?;
-                fields.serialize_entry("task_step_id", &value.task_step_id)?;
-                let tag = match self {
-                    Self::WorkflowLoop(_) => "workflow_loop",
-                    Self::CascadeFailed(_) => "cascade_failed",
-                    Self::WorkspaceError(_) => "workspace_error",
-                    Self::MergeConflict(_) => "merge_conflict",
-                    Self::CiFailed(_) => "ci_failed",
-                    _ => unreachable!(),
-                };
-                fields.serialize_entry("type", tag)?;
-            }
         }
         fields.end()
     }
@@ -163,21 +127,6 @@ pub struct ExecutorFailureAnnotation {
     pub blocked_execution_id: Option<String>,
     pub artifact: Option<AnnotationArtifact>,
     pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StepFailureAnnotation {
-    #[serde(
-        default,
-        deserialize_with = "present",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub blocking_reason: Option<Option<String>>,
-    pub detected_at: String,
-    pub message: Option<String>,
-    pub state: String,
-    pub task_step_id: String,
 }
 
 /// The queue historically parses an annotation into Value before adding these

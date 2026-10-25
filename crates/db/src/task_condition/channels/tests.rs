@@ -60,22 +60,3 @@ fn kindless_loop_and_typed_superseded_channels_roundtrip() {
         assert_eq!(serde_json::to_string(&interruption).unwrap(), raw);
     }
 }
-
-#[test]
-fn native_step_failure_and_common_overlays_keep_sorted_main_bytes() {
-    for tag in ["workflow_loop", "cascade_failed", "workspace_error"] {
-        let raw = format!(
-            r#"{{"blocking_reason":null,"detected_at":"at","message":null,"state":"in_progress","task_step_id":"step","type":"{tag}"}}"#
-        );
-        let value: ErrorAnnotation = serde_json::from_str(&raw).unwrap();
-        assert_eq!(serde_json::to_string(&value).unwrap(), raw);
-        let merged = value
-            .with_step_failure(StepFailureOverlay {
-                task_step_error: Some("failed".into()),
-                task_step_id: "later-step".into(),
-            })
-            .unwrap();
-        let decoded: ErrorAnnotation = serde_json::from_str(&merged).unwrap();
-        assert_eq!(serde_json::to_string(&decoded).unwrap(), merged);
-    }
-}

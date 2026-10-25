@@ -3,6 +3,7 @@ use crate::recovery::test_support::{conditions::*, seed_project_repo, seed_task,
 
 #[tokio::test]
 async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second_write() {
+    let mut visited = 0;
     for shape in SHAPES {
         let db = Arc::new(sqlite_db().await);
         let projector = attention_projector(&db);
@@ -25,13 +26,13 @@ async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second
                 agent_message_id: None,
                 last_activity_at: None,
                 summary: None,
-                logs_path: Some("execution.jsonl".into()),
+                logs_path: (*shape != "clear").then(|| "execution.jsonl".into()),
                 before_sha: None,
                 after_sha: None,
-                error: Some(if *shape == "long_reason" {
-                    "z".repeat(200_000)
-                } else {
-                    format!("executor failure: {shape}")
+                error: Some(match *shape {
+                    "long_reason" => "z".repeat(200_000),
+                    "clear" => ESCAPED_REASON.into(),
+                    _ => format!("executor failure: {shape}"),
                 }),
                 executor_config_snapshot_json: None,
                 workspace_id: None,
@@ -56,5 +57,7 @@ async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second
             assert_next_write(&db, &projector, &row, "executor", shape, &step).await;
         })
         .await;
+        visited += 3;
     }
+    assert_writer_cases("executor", visited);
 }

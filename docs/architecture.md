@@ -6153,7 +6153,7 @@ raw import evidence, metadata and witnesses. Named health, exception, human wait
 and offers stay. Entry owners show `Entering`; observer parks show `Needs Owner`.
 Failed Review history after a newer entry or live continuation is not a current
 exception. An undecodable stored condition returns a typed unknown diagnosis: corrupt or empty values are restated from the legacy columns, a recognisably newer encoding is quarantined (see "Undecodable stored condition"); private historical Task receipts import their condition at the archive boundary. Normalized diagnostic strings are bounded to 1,024 bytes and arrays to
-16 entries; legacy storage retains full originals during this stage.
+16 entries; condition storage retains full originals.
 
 `task.interruption_changed` retains its type and carries `condition` plus the typed
 `material_blocker`. The old payload decodes only in `DomainEvent::task_material_blocker`
@@ -6164,20 +6164,18 @@ Held, entry-owned, in-flight, capacity and retry-timer conditions are not autono
 repair incidents. Admitted `OwnerOffline` retains an active slot; `ReviewNeedsOwner`
 retains a parked slot. No scheduler decision or sweep policy changes.
 
-Stage five must retain this typed presentation/material identity while deleting
-legacy columns and migrated keys and replacing import/dual-write adapters. Full
-legacy originals that exceed the presentation bounds must be preserved at an
-archive boundary before storage removal. Drop/recreate the Task-related triggers
-and indexes around any Task table rebuild; do not lose scheduler dirty generations,
-parks, wait/deadline rows, queue receipts, pending cancellations or immutable events.
+The four condition columns remain condition storage as writers convert to typed
+channel values. `map_legacy_condition` remains the single producer of the
+`condition_json` cache, preserving typed presentation and material identity.
+Storage retains full originals beyond the presentation bounds.
 
 ### Task condition statements and diagnostic text (3.1, in progress)
 
 3.1 keeps the four condition columns and condition metadata keys as storage.
-Writers construct strict Rust channel values and bind their serialization;
+Converted writers construct strict Rust channel values and bind their serialization;
 `map_legacy_condition` remains the single producer, with `condition_json` as its
 cache. Historical and unknown shapes retain the existing lenient mapping.
-The typed-channel spike converts workspace-owner reset and executor failure.
+The converted writers are workspace-owner reset and executor failure.
 Reset retains the alphabetical field order of its former `json!` object;
 executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
 step-failure overlay still sorts the combined object, as it did before. Both
@@ -6188,19 +6186,16 @@ Archived-main fixtures cover the legacy columns, cache bytes, public projection,
 offers, failure kind, Operations reason and interruption-event dedupe across a
 subsequent unconverted metadata write and the real queue overlay. Canonical
 Attention digests are compared for all 96 snapshots, including the 400-child
-root. Each shape's fixture retains one production event worker across all three
-phases and drains bounded batches through the exact snapshot event before
-hashing its stored Attention projection with `canonical_attention_incident_digest`.
-The exact placement-clear fence retains its match against pre-upgrade annotation
-bytes.
+root, using the production Attention projector. The exact placement-clear fence
+retains its match against pre-upgrade annotation bytes.
 
 The owner-record contracts described below remain scaffolding pending removal;
-this spike does not activate them. This checkpoint adds
+the converted channel writers do not activate them. This checkpoint adds
 `task_diagnostic_text` and captures full source text in it. It retains internal
 typed contracts for later writer conversions; it does not delete or rewrite
 existing Task data. Under the active `LegacyOracle` policy, stored condition
 bytes, public projections, offers, failure kinds, Operations text and Attention
-digests remain equal to main `9296fb76`, including corruption repair and existing
+digests remain equal to main `6120c133`, including corruption repair and existing
 Integration/Check refusal outcomes.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
@@ -6261,8 +6256,9 @@ Native aggregate signatures such as `UpdateTask`, `UpdateTaskStatus`, metadata,
 entry, placement and operator methods have not all switched at this checkpoint.
 Each aggregate's gate must require the typed envelope/parameter and update all
 callers exposed by the compiler. Historical Sql, update, queued rollback and Task
-receipt encodings remain decodable and replayable; their retained legacy SQL and
-archive import need deliberate translation before 5b drops storage.
+receipt encodings remain decodable and replayable. Writers are being converted
+to typed channel values in the retained condition columns; `map_legacy_condition`
+remains the producer of `condition_json`.
 
 The workspace-owner reset annotation and missing review-candidate park retain
 their base repository writes. Their active two-write equivalence tests are unit A
@@ -6299,9 +6295,9 @@ text remains independently readable after a clear. The DB-only
 `task_diagnostic_text` / `task_diagnostic_texts` methods support on-demand detail
 reads. Pages order by `(created_at, id)`, use an opaque tuple cursor, fetch
 `limit + 1`, and return `items`, `next_cursor` and `has_more`. Ordinary Task/list/board
-reads do not join the text table. Later writer
-conversions must supply their own full text, and 5b must import existing
-legacy-only messages and saved/superseded text before deleting their storage.
+reads do not join the text table. Later writer conversions must supply their own
+full text. Existing messages and saved/superseded text remain in condition storage;
+`map_legacy_condition` continues to produce `condition_json` from the channels.
 
 **Whole-record ceiling.** The whole-record ceiling lands with unit R. This
 checkpoint preserves MAIN's condition encoding, including complete witnesses and
@@ -6863,7 +6859,7 @@ in for a removed assignment. A parked implementation failure names the missing
 coder/worker assignment; assignment remains the ordinary role API and Cancel
 remains available. Retry is offered again when an assigned Agent can take it.
 
-Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. Legacy annotation, blocked, failed and entry-barrier columns remain private dual-write storage until stage five.
+Annotations record conditions and evidence, never an action allowlist. Old JSON `recovery_actions` keys are ignored, including unknown historical strings. Historical queued commands are translated at the stored-data boundary from current snapshot facts; their original payload is retained. A superseded or unrepresentable intent restores its condition for an explicit new command. No schema migration is required. The annotation, blocked, failed and entry-barrier columns remain private condition storage. Writers are being converted to typed channel values; `map_legacy_condition` remains the producer of `condition_json`.
 
 Recovery commits a queued intent with the saved condition. The dispatcher consumes it through normal admission and waits quietly for capacity, a paused Project/Agent or a reachable workspace owner. Permanent refusals and malformed/stale intents remove the marker and atomically restore the condition with the error, fenced by Task version and marker identity. Fresh retries use the role prompt and review-bound admission; send-back continuations use the review-fix prompt. Restart applies its reset immediately and retains its restart/unblocked events. A shared in-process wake resumes the existing loop after command commits and terminal executions. Gate decisions still transition through the workflow engine; their worker dispatch is deferred and queued, preserving the worker thread on send-back. No new polling worker is introduced. Session launches remain separate Task-adjacent operations. `hold` parks workflow Task work. `release` is the owner's decision on the run the hold stopped: when no Agent can take the Task at that moment (the Agent or the Project is paused) the release clears the hold and marks that stopped run resumable (`resume_policy = auto`), so the dispatcher starts the role again as soon as the Agent is available instead of treating the stopped run as one that still needs a decision. Only that run is marked: the Task's latest non-interactive run, and only when the user stopped it (`cancelled` with `stop_reason = user_cancelled`). A run that failed or was stopped for any other reason (executor failure, timeout, stall, lost machine) keeps `resume_policy = manual` and its own recovery, and the mark is undone when the release loses its version race. Stopping a specific execution or side session uses the execution `/stop` resource, including when both run together.
 
@@ -8192,7 +8188,7 @@ these changes nothing and spends no budget.
 `on_enter` of an `active` state and the task has no running execution, the
 engine does not leave the task there looking in-flight. It records the
 dispatch error as the Task's diagnostic (`condition.details.diagnostic`, type
-`dispatch_failed`; stored in `error_annotation` until stage 5) and
+`dispatch_failed`; stored in the retained `error_annotation` channel) and
 cascades the task back to the workflow's initial state, skipping the active
 state's exit guards (the `restart` allowance). Both the failed hook
 and the rollback transition land in `transition_log`. The task dispatcher
@@ -9925,12 +9921,10 @@ load test with a machine cap and a Project limit, failed-Review recovery and
 wakes. The only differences accepted are the fixture's `@`-lines, each naming
 one of the three allowed changes.
 
-**Stage five.** SQLite drops a table's triggers and indexes with the table,
-and refuses to drop a column an index or trigger names. Any `task` column drop
-or table rebuild must first drop the `task_schedule_*` triggers on `task` and
-the partial index `idx_task_schedule_open` (which reads `condition_json`), and
-recreate them afterwards. The same holds for the triggers on every other
-table the scheduler watches.
+**Condition storage.** The four condition columns remain storage as their writers
+convert to typed channel values; `map_legacy_condition` remains the producer of
+`condition_json`. Any Task table rebuild must preserve scheduler triggers and
+indexes, dirty generations, parks and waits, queue receipts and immutable events.
 
 Stage four must compose these owner results into the public condition DTO and
 switch all projections together, replace the visible park annotation with the

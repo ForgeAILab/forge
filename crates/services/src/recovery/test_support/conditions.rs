@@ -23,6 +23,20 @@ pub(crate) const SHAPES: &[&str] = &[
     "coordination_root",
 ];
 const AT: &str = "2026-10-25T00:00:00Z";
+pub(crate) const ESCAPED_REASON: &str = "é😀\n\"\\\u{7}";
+const MAIN_ORACLE: &str = include_str!("fixtures/conditions-main-9296fb76.jsonl");
+
+pub(crate) fn assert_writer_cases(writer: &str, visited: usize) {
+    let prefix = format!("{writer}/");
+    let expected = MAIN_ORACLE
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|record| record["case"].as_str().unwrap().starts_with(&prefix))
+        .count();
+    assert_eq!(expected, 48, "main oracle case count for {writer}");
+    assert_eq!(visited, expected, "visited case count for {writer}");
+}
+
 pub(crate) async fn read(db: &SqliteDb, id: &str) -> Task {
     TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap()
 }
@@ -215,7 +229,11 @@ fn normalized(raw: &str, row: &Task) -> String {
         .replace(&row.id, "fixture-task")
         .replace(&row.project_id, "fixture-project");
     for time in timestamps {
-        output = output.replace(&time, AT);
+        let placeholder: String = time
+            .chars()
+            .map(|ch| if ch.is_ascii_digit() { '0' } else { ch })
+            .collect();
+        output = output.replace(&time, &placeholder);
     }
     output
 }
@@ -371,33 +389,40 @@ pub(crate) async fn assert_main_snapshot(
 fn assert_expected(actual: &Value) {
     // Generated only by the identical harness over git archive 9296fb76. The
     // checked-in hashes cover bytes, not a mapper run by the code under test.
-    let expected = include_str!("conditions-main.jsonl")
+    let expected = MAIN_ORACLE
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|record| record["case"] == actual["case"])
         .expect("main oracle contains this case");
-    let mut legacy = actual.clone();
-    legacy["fields"]
-        .as_object_mut()
-        .unwrap()
-        .remove("attention_incident_digest");
     assert_eq!(
-        legacy, expected,
-        "main byte/projection parity: {}",
+        *actual, expected,
+        "main byte/projection and canonical Attention parity: {}",
         actual["case"]
     );
-    // The persistent production projector reaches each snapshot event before
-    // comparing the canonical digest, including the 400-child root.
-    let attention = include_str!("conditions-attention-main.jsonl")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .find(|record| record["case"] == actual["case"])
-        .expect("main Attention oracle contains this case");
-    assert_eq!(
-        *actual, attention,
-        "main canonical Attention digest: {}",
-        actual["case"]
-    );
+}
+
+#[tokio::test]
+async fn timestamp_normalization_preserves_format_and_fields() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
+    row.created_at = "2026-10-25T01:02:03.456Z".into();
+    row.updated_at = "2026-10-25T04:05:06+00:00".into();
+    let raw = json!({
+        "created_at": row.created_at,
+        "blocked_at": "2026-10-25T07:08:09.123456789Z",
+        "updated_at": row.updated_at,
+        "nested": r#"{"detected_at":"2026-10-25T10:11:12+02:30"}"#,
+        "not_before": "2099-01-01T00:00:00Z",
+    });
+    let expected = json!({
+        "created_at": "0000-00-00T00:00:00.000Z",
+        "blocked_at": "0000-00-00T00:00:00.000000000Z",
+        "updated_at": "0000-00-00T00:00:00+00:00",
+        "nested": r#"{"detected_at":"0000-00-00T00:00:00+00:00"}"#,
+        "not_before": "2099-01-01T00:00:00Z",
+    });
+    assert_eq!(normalized(&raw.to_string(), &row), expected.to_string());
 }
 
 pub(crate) async fn assert_next_write(
