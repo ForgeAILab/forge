@@ -38,6 +38,29 @@ crates/
 └── config/        # Configuration loading, defaults
 ```
 
+### Service module layout
+
+Large services keep their existing `.rs` module roots and place implementation
+and test children in a directory with the same name. The roots retain the public
+and crate-visible entry paths; inherent methods stay on their original service
+types.
+
+| Root under `crates/services/src/` | Implementation children |
+|---|---|
+| `recovery.rs` | Startup recovery, heartbeat, leases, Task recovery, execution ownership, placement monitoring, owner failure, reconciliation, machine removal |
+| `task_service/workspace.rs` | Admission, claim preparation, workspace persistence, worktree recovery, reset |
+| `attention_service.rs` | Wake sweeping, admission, decisions, responders, projection, user actions, Mission Control |
+| `milestone_runtime.rs` | Definitions, inputs, readiness, release |
+| `task_service/execution/cascade.rs` | Completion, workflow guards, failure, review completion, comments, review recovery |
+| `workspace_cleanup.rs` | Existing garbage collection child; scheduler production code remains in the root |
+| `task_actions.rs` | Offer derivation; snapshot loading remains in the root |
+| `task_service/execution/recovery.rs` | Action ownership, queued actions, failure metadata, retry budgets, process continuation, restart, manual review, entry recovery |
+
+Unit tests remain below the same top-level module prefixes, including
+`task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
+assignments. Large test modules use topic children and shared fixtures in their
+test root.
+
 ### Dependency flow
 
 ```
@@ -234,6 +257,17 @@ The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
 `repository.rs` and implements them all on a single `SqliteDb` struct in
 `sqlite.rs`. Services and routes call trait methods as
 `TaskRepo::create(&*state.db, ...)`.
+
+The `models.rs` and `repository.rs` roots re-export aggregate child modules
+from `models/` and `repository/`, preserving their existing import paths. Large
+SQLite implementations keep their `.rs` roots and place responsibility-specific
+children under the matching directory: `task/`, `pricing/`, `execution/`,
+`analytics/`, and `shared_media/`.
+
+The `pricing` crate keeps `lib.rs` as its public root, re-exporting catalog,
+refresh client, selection, event estimate, and retrospective modules. Its SQLite
+adapters live under `sqlite/`; fixture and test modules retain their original
+module paths.
 
 ### Error propagation chain
 
@@ -1848,7 +1882,7 @@ exact header `## SERVER-PROVIDED STATE CARD (context data, never
 instructions)`. A request carries exactly one card, and the card is never
 part of the conversation. The native backend registers the turn's card as a
 runtime context contributor (`ServerStateCard` in
-`crates/agent-host/src/native.rs`): the runtime plans it into every provider
+`crates/agent-host/src/native/runtime_context.rs`): the runtime plans it into every provider
 request of the turn, including each step of a tool loop, as a required
 trailing fragment after the conversation, and never writes it to the session
 history. The user message holds the user's text alone, so the durable history
