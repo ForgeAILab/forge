@@ -38,6 +38,29 @@ crates/
 └── config/        # Configuration loading, defaults
 ```
 
+### Service module layout
+
+Large services keep their existing `.rs` module roots and place implementation
+and test children in a directory with the same name. The roots retain the public
+and crate-visible entry paths; inherent methods stay on their original service
+types.
+
+| Root under `crates/services/src/` | Implementation children |
+|---|---|
+| `recovery.rs` | Startup recovery, heartbeat, leases, Task recovery, execution ownership, placement monitoring, owner failure, reconciliation, machine removal |
+| `task_service/workspace.rs` | Admission, claim preparation, workspace persistence, worktree recovery, reset |
+| `attention_service.rs` | Wake sweeping, admission, decisions, responders, projection, user actions, Mission Control |
+| `milestone_runtime.rs` | Definitions, inputs, readiness, release |
+| `task_service/execution/cascade.rs` | Completion, workflow guards, failure, review completion, comments, review recovery |
+| `workspace_cleanup.rs` | Existing garbage collection child; scheduler production code remains in the root |
+| `task_actions.rs` | Offer derivation; snapshot loading remains in the root |
+| `task_service/execution/recovery.rs` | Action ownership, queued actions, failure metadata, retry budgets, process continuation, restart, manual review, entry recovery |
+
+Unit tests remain below the same top-level module prefixes, including
+`task_service::`, so the filters in `scripts/ci_rust_shards.py` retain their shard
+assignments. Large test modules use topic children and shared fixtures in their
+test root.
+
 ### Dependency flow
 
 ```
@@ -67,6 +90,12 @@ implementations. Agent Chat policy/turn workers, inquiries, context manifests,
 default agents, Genesis and Project orchestration adapters, native tools,
 topic rotation, wake delivery, and the embedded agent service all live in
 `services-agents`.
+
+The Agent Chat turn worker, native tool provider, and embedded agent service
+keep their module roots in `agent_chat_turn_worker.rs`, `native_tools.rs`, and
+`embedded_agent_service.rs`. Their child directories separate admission,
+execution, projections, persistence, provider configuration, and tests. Public
+imports continue through the module roots.
 
 `process-supervisor` is a leaf (tokio and tempfile): `git` cannot depend on `executors`
 or `review`, and `forge-client` must not pull in `services`, so the one
@@ -124,7 +153,7 @@ an endpoint and untrusted result metadata, while provider/fetch deliberately
 admits otherwise public destinations outside the shared special-use ranges.
 Keeping these broader guards search-only preserves that provider/fetch
 boundary without relaxing search's existing restrictions. The shared address table in
-`services_agents::native_tools::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
+`services_agents::native_tools::public_search::tests::public_search_and_provider_address_policies_agree_except_documented_exclusions`
 checks agreement and each documented exclusion.
 `config::network_policy::tests::shared_policy_changes_only_intended_address_verdicts`
 compares both predicates with verbatim copies of their pre-sharing versions
@@ -1853,7 +1882,7 @@ exact header `## SERVER-PROVIDED STATE CARD (context data, never
 instructions)`. A request carries exactly one card, and the card is never
 part of the conversation. The native backend registers the turn's card as a
 runtime context contributor (`ServerStateCard` in
-`crates/agent-host/src/native.rs`): the runtime plans it into every provider
+`crates/agent-host/src/native/runtime_context.rs`): the runtime plans it into every provider
 request of the turn, including each step of a tool loop, as a required
 trailing fragment after the conversation, and never writes it to the session
 history. The user message holds the user's text alone, so the durable history
