@@ -1318,6 +1318,8 @@ mod integration_tests;
 #[cfg(test)]
 mod legacy_oracle_tests;
 #[cfg(test)]
+mod ownership_followup_tests;
+#[cfg(test)]
 mod producer_tests;
 #[cfg(test)]
 mod stage2_tests;

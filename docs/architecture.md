@@ -6259,11 +6259,18 @@ all four exhaustion kinds, historical timeout, kind-less workflow loops, Deferre
 retries, 200 KB text and 400-child coordination roots. They capture new diagnostic
 text after the legacy commit on a best-effort basis; capture failure leaves the full
 legacy text and the base write outcome intact. Other S caller files and aggregates
-A–E still need their own conversion. The next unconverted write that runs a
+A–E still need their own conversion. The next unconverted mapped write that runs a
 condition producer stores the full legacy mapping, including its legacy evidence
 copies, with `stated = false` and empty ownership, exactly as after Hold/Release.
 Unrelated metadata changes skip the producer and retain the stated row, also as
-on main. A mapped write does not carry ownership forward. Clearing the writer's legacy columns leaves other columns and queued
+on main. A mapped write drops ownership, while `Integration` and `Check`
+statements carry stored ownership into their typed edits; `IntegrationHandedOff`,
+`IntegrationCleared` and `CheckCleared` rebuild the legacy mapping.
+As with Hold/Release, the dispatcher and hierarchy trust stated rows, so a legacy
+column changed outside a condition producer is corrected by the background
+condition check within the 120-second sweep interval (`SWEEP_PERIOD` in
+`task_dispatcher/reconciliation.rs`).
+Clearing the writer's legacy columns leaves other columns and queued
 intent intact; the mapping determines the surviving blockers and continuation. The mapping remains the
 independent per-writer oracle while dual write continues. Existing Hold/Release
 and Integration/Check statements edit the stored condition as on main.
