@@ -63,6 +63,35 @@ Unit tests remain below the same top-level module prefixes, including
 assignments. Large test modules use topic children and shared fixtures in their
 test root.
 
+Adapter, review, executor, and transport modules follow the same layout:
+
+| Root | Implementation and test children |
+|---|---|
+| `crates/cli-adapters/src/codex.rs` | Managed home preparation and writable sandbox roots in `codex/managed_home.rs`, with their tests in `codex/managed_home/tests.rs`; adapter and session tests in `codex/tests.rs` |
+| `crates/review/src/contract.rs` | Persisted CI evidence in `contract/ci.rs`, prompt construction in `contract/prompts.rs`, assessment parsing and conformance evaluation in `contract/conformance.rs`, shared tests in `contract/tests.rs` and part tests in `contract/{ci,prompts,conformance}/tests.rs` |
+| `crates/executors/src/gc.rs` | Filesystem mechanics remain in the root; ownership, confinement, eviction, and disk accounting tests live in `gc/tests.rs` |
+| `crates/api-types/src/daemon_transport.rs` | Workspace handles, owner fences, probes, and operation payloads in `daemon_transport/workspace.rs`; transport round-trip tests in `daemon_transport/tests.rs` |
+
+`contract.rs` and `daemon_transport.rs` re-export the public items they moved;
+`codex.rs` and `gc.rs` moved no public items. Tests retain the `codex::`,
+`contract::`, `gc::`, and `daemon_transport::` prefixes.
+
+### Solo and client module layout
+
+Solo and client modules use the same root-and-children layout. Existing imports
+continue through the roots, and inherent methods remain on their original types.
+
+| Root | Implementation and test children |
+|---|---|
+| `forge-solo/src/bootstrap.rs` | Contract types, orchestration, and shared validation stay in the root; `bootstrap/agents.rs` owns registration and candidate selection; `bootstrap/project.rs` owns owner, repository, chat, and binding reconciliation; tests live in `bootstrap/tests.rs` |
+| `forge-solo/src/app.rs` | Presentation and command types stay in the root; `app/reducer.rs` owns state construction, reduction, and navigation; tests live in `app/tests.rs` |
+| `forge-solo/src/ui_bridge.rs` | Controller reduction and input translation stay in the root; `ui_bridge/projection.rs` maps backend snapshots to app state, with public helpers re-exported by the root; tests live in `ui_bridge/tests.rs` |
+| `forge-client/src/daemon_persistence.rs` | Journal types and persistence stay in the root; tests live in `daemon_persistence/tests.rs` |
+| `forge-client/src/daemon_workspace.rs` | Dispatch, registry state, shared validation, and process helpers stay in the root; `daemon_workspace/locations.rs` owns repository verification and provisioning; `daemon_workspace/execution.rs` owns preparation, commands, reads, and diffs; `daemon_workspace/mutations.rs` owns merge, reset, and cleanup; existing children and test modules retain their paths |
+
+Tests retain the `bootstrap::tests::`, `app::tests::`, `ui_bridge::tests::`,
+`daemon_persistence::tests::`, and `daemon_workspace::tests::` prefixes.
+
 The same layout applies to these agents and database modules:
 
 | Root | Implementation children |
