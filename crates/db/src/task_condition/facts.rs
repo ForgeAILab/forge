@@ -899,11 +899,14 @@ impl ConditionFacts {
             if self.children_pending && !children {
                 // Legacy dispatches a flagged root without visible children as
                 // an ordinary Task. Keep the diagnosis; do not park.
-                evidence.observations.push(unknown(
+                let observation = unknown(
                     &LegacyConditionField::MetadataJson,
                     Some("coordination_review_pending"),
                     UnknownConditionProblem::UnownedEntry,
-                ));
+                );
+                if !evidence.observations.contains(&observation) {
+                    evidence.observations.push(observation);
+                }
             }
         }
         if let Some(outcome) = &self.terminal {
@@ -927,8 +930,16 @@ impl ConditionFacts {
             let already_remote = condition
                 .reasons()
                 .any(|reason| matches!(reason, ParkReason::RemoteCancelPending { .. }));
-            let (TaskCondition::Parked { additional, .. }
-            | TaskCondition::Failed { additional, .. }) = &mut condition
+            let (TaskCondition::Parked {
+                primary,
+                additional,
+                ..
+            }
+            | TaskCondition::Failed {
+                failure: primary,
+                additional,
+                ..
+            }) = &mut condition
             else {
                 unreachable!("a blocked condition is parked or failed")
             };
@@ -938,10 +949,13 @@ impl ConditionFacts {
             if children {
                 let remaining = remaining();
                 if !remaining.is_empty() {
-                    additional.push(ParkReason::Children {
+                    let reason = ParkReason::Children {
                         root_id: self.task_id.clone(),
                         remaining,
-                    });
+                    };
+                    if *primary != reason && !additional.contains(&reason) {
+                        additional.push(reason);
+                    }
                 }
             }
             return condition;

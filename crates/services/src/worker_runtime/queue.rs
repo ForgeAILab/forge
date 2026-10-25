@@ -1935,3 +1935,6 @@ pub(crate) fn cascade_actor() -> Actor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod workflow_loop_tests;

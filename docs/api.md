@@ -3766,6 +3766,13 @@ most 1,024 bytes: a longer text is cut on a character boundary and ends with
 the marker `… [truncated]`, which counts toward the 1,024 bytes. Arrays are cut
 to 16 entries. The Operations `blocked_reason` stays valid JSON when the stored
 annotation is JSON, with each text inside it bounded the same way.
+Workflow-loop blocks expose `details.interruption` with kind `workflow_loop`,
+the loop reason, and `created_at` equal to the stored `blocked_at`. The reader
+derives the public kind from `source: "workflow_loop"`. This read does
+not rewrite the stored block or condition and leaves event/Attention material
+unchanged. Reading a loop block therefore does not create a new incident or wake.
+Failure classification, recovery action offers, and `condition.since` are unchanged.
+
 Legacy columns retain the complete original data during dual-write.
 `awaiting_human`, `workflow_health`, `workflow_exception` and offers retain their
 names. The first now agrees between list and detail; entry ownership and waits
