@@ -30,7 +30,6 @@
 2858 crates/services/src/task_service/execution/runner.rs
 2113 crates/services/src/task_service/governance.rs
 10367 crates/services/src/task_service/tests/service_tests/cases/executions.rs
-2001 crates/services/src/worker_runtime/queue/tests.rs
 4897 crates/services/src/workflow/actions/tests.rs
 2227 crates/services/src/workflow/dispatch/tests.rs
 5532 crates/services/src/workflow/engine/tests.rs

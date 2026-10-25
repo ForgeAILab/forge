@@ -720,7 +720,7 @@ fn interruption_reasons(
             out.push((base + 4, ParkReason::Failure { failure_kind }));
         }
     } else if is(fields, "source", "workflow_loop") {
-        // The loop writer omits `kind` and identifies itself by `source`.
+        // Pre-upgrade loop blocks identify themselves only by `source`.
         out.push((
             base + 5,
             ParkReason::Failure {
@@ -782,6 +782,30 @@ pub(crate) fn map_view_from(initial: bool, view: &LegacyView<'_>) -> TaskConditi
 }
 
 pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
+    // The loop writer's public kind/time repeat its source/blocked_at. Keep
+    // them out of the typed mapping and incident material, while retaining
+    // the full document for the public reader.
+    let loop_mapping = view.blocked_json.and_then(|raw| {
+        let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let fields = value.as_object_mut()?;
+        if fields.get("source")?.as_str()? != "workflow_loop"
+            || fields.get("kind")?.as_str()? != "workflow_loop"
+            || fields.get("created_at")?.as_str()? != fields.get("blocked_at")?.as_str()?
+        {
+            return None;
+        }
+        fields.remove("kind");
+        fields.remove("created_at");
+        Some(value.to_string())
+    });
+    if let Some(blocked) = loop_mapping {
+        let mut condition = map_view(&LegacyView {
+            blocked_json: Some(&blocked),
+            ..*view
+        });
+        condition.evidence_mut().blocked_json = view.blocked_json.map(bounded);
+        return condition;
+    }
     use LegacyConditionField as Field;
     use UnknownConditionProblem as Problem;
     let non_text = |field: Field| view.non_text.contains(&field);
@@ -1348,3 +1372,6 @@ pub use readers::{
     capacity_reason, ConditionRead, ConditionRefusal, ConditionRetry, PRESENTATION_TEXT_LIMIT,
     PRESENTATION_TRUNCATION_MARKER,
 };
+
+#[cfg(test)]
+mod workflow_loop_tests;

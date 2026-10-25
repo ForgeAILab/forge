@@ -1800,7 +1800,7 @@ impl TaskStepWorker {
             }
         }
         let blocked = (status == "parked").then(|| {
-            serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop"})
+            serde_json::json!({"reason":error, "blocked_at":now, "source":"workflow_loop", "kind":api_types::FailureKind::WorkflowLoop, "created_at":now})
                 .to_string()
         });
         let written = self
@@ -1935,3 +1935,6 @@ pub(crate) fn cascade_actor() -> Actor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod workflow_loop_tests;

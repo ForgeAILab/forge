@@ -683,3 +683,27 @@ fn entry_barrier_and_flow_parks_offer_one_apply_reason_per_verb() {
         .iter()
         .any(|offer| offer.reason == "review_needs_owner"));
 }
+
+#[test]
+fn pre_upgrade_and_current_workflow_loop_keep_failure_kind_and_offers() {
+    let mut old = snapshot("todo", Some(FailureKind::WorkflowLoop));
+    old.task.blocked_json = Some(
+        r#"{"reason":"loop","blocked_at":"2026-10-01T00:00:00Z","source":"workflow_loop"}"#.into(),
+    );
+    old.task.condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&old.task));
+    let offers = available_actions(&old);
+    assert_eq!(
+        offers,
+        legacy::available_actions(&legacy::TaskSnapshot::from(&old))
+    );
+    assert_eq!(old.condition(), Some(FailureKind::WorkflowLoop));
+    assert!(offers
+        .iter()
+        .any(|offer| matches!(offer.action, TaskAction::Restart { .. })));
+    let mut current = old.clone();
+    current.task.blocked_json = Some(json!({"reason":"loop","blocked_at":"2026-10-01T00:00:00Z","created_at":"2026-10-01T00:00:00Z","kind":"workflow_loop","source":"workflow_loop"}).to_string());
+    current.task.condition =
+        db::map_legacy_condition(&db::LegacyConditionInput::from(&current.task));
+    assert_eq!(current.condition(), old.condition());
+    assert_eq!(available_actions(&current), offers);
+}
