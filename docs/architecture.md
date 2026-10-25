@@ -258,6 +258,17 @@ The `db` crate defines async traits (`TaskRepo`, `AgentRepo`, …) in
 `sqlite.rs`. Services and routes call trait methods as
 `TaskRepo::create(&*state.db, ...)`.
 
+The `models.rs` and `repository.rs` roots re-export aggregate child modules
+from `models/` and `repository/`, preserving their existing import paths. Large
+SQLite implementations keep their `.rs` roots and place responsibility-specific
+children under the matching directory: `task/`, `pricing/`, `execution/`,
+`analytics/`, and `shared_media/`.
+
+The `pricing` crate keeps `lib.rs` as its public root, re-exporting catalog,
+refresh client, selection, event estimate, and retrospective modules. Its SQLite
+adapters live under `sqlite/`; fixture and test modules retain their original
+module paths.
+
 ### Error propagation chain
 
 `DbError` (db) → `ServiceError` (services) → `ApiError` (api). The api crate's
