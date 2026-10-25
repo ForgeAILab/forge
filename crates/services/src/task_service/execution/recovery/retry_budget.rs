@@ -28,7 +28,7 @@ impl TaskService {
             }
             _ => {}
         }
-        let candidate = super::super::latest_executor_execution_for_task(&self.db, task)
+        let candidate = crate::task_service::latest_executor_execution_for_task(&self.db, task)
             .await?
             .ok_or_else(|| {
                 ServiceError::invalid_operation(

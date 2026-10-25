@@ -1,4 +1,4 @@
-//! Disk pressure cases.
+//! Claims that wait on disk pressure instead of failing the Task.
 
 use super::*;
 

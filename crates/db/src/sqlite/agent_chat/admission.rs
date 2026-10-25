@@ -1,6 +1,7 @@
 //! Agent Chat admission validation and provenance digests.
 
 use super::*;
+use sha2::{Digest, Sha256};
 
 pub(super) fn turn_admission_semantics_match(
     input: &CreateAgentChatTurnJob,
@@ -300,6 +301,19 @@ pub(crate) fn admission_policy_digest(value: &str) -> Result<String> {
     Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
 }
 
+/// Compute the same schema-versioned digest used by the services admission
+/// resolver for a pre-canonicalized JSON value.  The Genesis composite lives
+/// in `db`, so it uses this helper rather than importing service-layer types.
+fn admission_digest_for_json(value: &serde_json::Value) -> Result<String> {
+    let envelope = serde_json::json!({
+        "schema_version": "forge.agent-turn-admission/v1",
+        "value": value,
+    });
+    let canonical = serde_json::to_string(&canonicalize_admission_json(&envelope))
+        .map_err(|_| DbError::Check("Agent Chat admission JSON is invalid".to_owned()))?;
+    Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
+}
+
 pub(crate) fn handoff_content_digest_for_admission(
     content: &str,
     source_revisions_json: &str,
@@ -378,6 +392,24 @@ pub(crate) async fn validate_agent_chat_turn_job_id(
         updated_at: turn.updated_at,
     };
     validate_agent_chat_turn_admission(transaction, &input).await
+}
+
+fn canonicalize_admission_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(values) => {
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort_unstable();
+            let mut result = serde_json::Map::new();
+            for key in keys {
+                result.insert(key.clone(), canonicalize_admission_json(&values[key]));
+            }
+            serde_json::Value::Object(result)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_admission_json).collect())
+        }
+        scalar => scalar.clone(),
+    }
 }
 
 #[derive(Debug, Deserialize)]

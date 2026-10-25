@@ -6,6 +6,7 @@ use crate::{AgentExecutionStats, StartUsageInvocation};
 use std::collections::HashSet;
 
 mod repository;
+mod terminal_ledger;
 
 async fn execution_in_tx(
     transaction: &mut Transaction<'_, Sqlite>,

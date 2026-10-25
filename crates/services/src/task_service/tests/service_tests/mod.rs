@@ -136,8 +136,9 @@ impl TaskExecutor for UncommittedWorktreeFailureExecutor {
                 .await
                 .ok(),
             agent_session_id: Some("native-task-session".to_owned()),
+            failure_class: Some(executors::ExecutionFailureClass::UncommittedWorktree),
             error: Some(
-                ExecutorError::Other(
+                ExecutorError::UncommittedWorktree(
                     crate::task_service::execution::UNCOMMITTED_WORKTREE_FAILURE.to_owned(),
                 )
                 .to_string(),

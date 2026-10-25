@@ -1,4 +1,4 @@
-//! Heartbeat recovery cases.
+//! Heartbeat timeouts, live progress warnings and role-aware execution recovery.
 
 use super::*;
 

@@ -66,7 +66,7 @@ impl TaskService {
         reason: Option<String>,
     ) -> Result<Task> {
         let reason = optional_recovery_reason(reason, "retry");
-        super::ensure_plan_publication_transition_authority(&task, None)?;
+        crate::task_service::execution::ensure_plan_publication_transition_authority(&task, None)?;
         let cleared = self.clear_blocking_metadata(&task.id).await?;
         let project = ProjectRepo::get_by_id(&*self.db, &cleared.project_id)
             .await?
@@ -256,7 +256,7 @@ impl TaskService {
         task: Task,
         reason: Option<String>,
     ) -> Result<Task> {
-        let workspace = super::super::workspace::prepare_workspace(
+        let workspace = crate::task_service::workspace::prepare_workspace(
             &self.db,
             &self.workspace_root,
             &task,

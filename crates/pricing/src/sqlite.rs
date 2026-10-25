@@ -8,6 +8,9 @@
 //! the transaction and therefore leaves the previous last-known-good state
 //! untouched.
 
+mod catalog;
+mod retrospective;
+
 use std::{sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
@@ -832,9 +835,6 @@ async fn snapshot_from_db(snapshot: db::PricingCatalogSnapshot) -> Result<Catalo
         created_at: system_time(&snapshot.created_at)?,
     })
 }
-
-mod catalog;
-mod retrospective;
 
 fn catalog_state_name(state: CatalogState) -> &'static str {
     match state {

@@ -48,7 +48,11 @@ impl TaskService {
             return Ok(());
         }
         // The current-run fence (see `annotate_executor_failure_block_with_retry`).
-        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
+        if !crate::task_service::execution::execution_belongs_to_current_state_entry(
+            &self.db, &task, execution,
+        )
+        .await?
+        {
             return Ok(());
         }
         let usage_limited = attempts.as_array().is_some_and(|attempts| {
@@ -152,7 +156,7 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
-            super::latest_execution_authority(execution, project.version),
+            crate::task_service::execution::latest_execution_authority(execution, project.version),
         )
         .await?
         else {
@@ -203,7 +207,11 @@ impl TaskService {
     ) -> Result<()> {
         // Lease contention never spends the execution retry budget; only the
         // dispatch path parks it, once its re-dispatch bound is spent.
-        if allow_retry && super::guards::is_workspace_lease_pre_dispatch_failure(execution) {
+        if allow_retry
+            && crate::task_service::execution::guards::is_workspace_lease_pre_dispatch_failure(
+                execution,
+            )
+        {
             return Ok(());
         }
         let task = TaskRepo::get_by_id(&*self.db, &execution.task_id, false)
@@ -243,7 +251,11 @@ impl TaskService {
         if !execution_still_owns_current_role {
             return Ok(());
         }
-        if !super::execution_belongs_to_current_state_entry(&self.db, &task, execution).await? {
+        if !crate::task_service::execution::execution_belongs_to_current_state_entry(
+            &self.db, &task, execution,
+        )
+        .await?
+        {
             return Ok(());
         }
         if task_blocked_by_execution(&task, &execution.id) {
@@ -327,7 +339,7 @@ impl TaskService {
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
-            super::latest_execution_authority(execution, project.version),
+            crate::task_service::execution::latest_execution_authority(execution, project.version),
         )
         .await?
         else {
@@ -463,7 +475,7 @@ impl TaskService {
         if !crate::deferred_dispatch::set_with_mutations_for_latest_execution(
             &self.db,
             task,
-            super::latest_execution_authority(execution, project_version),
+            crate::task_service::execution::latest_execution_authority(execution, project_version),
             &task.status,
             &next_dispatch_at.to_rfc3339(),
             &reason,
@@ -546,7 +558,10 @@ impl TaskService {
                 &*self.db,
                 &task.id,
                 task.version,
-                super::latest_execution_authority(execution, project_version),
+                crate::task_service::execution::latest_execution_authority(
+                    execution,
+                    project_version,
+                ),
                 Vec::new(),
                 &now_rfc3339(),
             )

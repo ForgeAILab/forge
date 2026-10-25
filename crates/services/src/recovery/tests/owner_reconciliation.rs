@@ -1,4 +1,4 @@
-//! Owner reconciliation recovery cases.
+//! Disconnected daemon suspension, terminal replay and owner capability fencing.
 
 use super::*;
 

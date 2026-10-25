@@ -1,4 +1,4 @@
-//! Scheduling cases.
+//! Cleanup scheduling, tick batching and backoff.
 
 use super::*;
 

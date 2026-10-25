@@ -38,7 +38,7 @@
 //! and `crates/services/src/domain_event_broadcast.rs`'s own unit test
 //! already exercise those end-to-end). Task/review and baseline/reconciliation
 //! commands write through the identical `append_event_in_tx` path from
-//! `crates/db/src/sqlite/{task,execution,review,task_adaptive}.rs`, owned by
+//! `crates/db/src/sqlite/{task,execution/{repository,terminal_ledger},review,task_adaptive}.rs`, owned by
 //! another agent's in-flight files in this change; they are covered by the
 //! same generic consumer and are audited here structurally (the "task"
 //! scope case in `domain_event_broadcast_audit`) rather than end-to-end.

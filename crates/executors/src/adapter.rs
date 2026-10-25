@@ -660,7 +660,10 @@ impl TaskExecutor for FallbackExecutor {
                         });
                         if was_cancelled {
                             result.status = crate::ExecutionOutcome::Cancelled;
-                        } else if result.status == crate::ExecutionOutcome::Failed {
+                        } else if result.status == crate::ExecutionOutcome::Failed
+                            && result.failure_class
+                                != Some(crate::ExecutionFailureClass::UncommittedWorktree)
+                        {
                             result.failure_class = Some(crate::ExecutionFailureClass::TaskFailed);
                         }
                         let reports = normalize_candidate_reports(
@@ -1144,6 +1147,7 @@ mod tests {
             usage_output_tokens: i64,
         },
         FailTask,
+        FailDelivery,
         Exhausted {
             retry_after_ms: u64,
             usage_output_tokens: i64,
@@ -1219,6 +1223,12 @@ mod tests {
                 ScriptedBehavior::FailTask => Ok(ExecutionResult {
                     status: ExecutionOutcome::Failed,
                     error: Some("tests failed".to_owned()),
+                    ..Default::default()
+                }),
+                ScriptedBehavior::FailDelivery => Ok(ExecutionResult {
+                    status: ExecutionOutcome::Failed,
+                    error: Some("worker output was not committed".to_owned()),
+                    failure_class: Some(crate::ExecutionFailureClass::UncommittedWorktree),
                     ..Default::default()
                 }),
                 ScriptedBehavior::Exhausted {
@@ -1381,6 +1391,34 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(admission_calls.load(Ordering::SeqCst), 1);
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_keeps_its_typed_marker_without_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (executor, calls) = fallback_executor(&[
+            ("acct-1", ScriptedBehavior::FailDelivery),
+            (
+                "acct-2",
+                ScriptedBehavior::Complete {
+                    usage_output_tokens: 5,
+                },
+            ),
+        ]);
+        let result = executor
+            .execute(routed_ctx("exec-delivery", dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(result.status, ExecutionOutcome::Failed);
+        assert_eq!(
+            result.failure_class,
+            Some(crate::ExecutionFailureClass::UncommittedWorktree)
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some("worker output was not committed")
+        );
+        assert_eq!(*calls.lock().unwrap(), vec!["acct-1"]);
     }
 
     #[tokio::test]

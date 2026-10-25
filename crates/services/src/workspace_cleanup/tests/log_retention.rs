@@ -1,4 +1,4 @@
-//! Log retention cases.
+//! Terminal Task log retention.
 
 use super::*;
 

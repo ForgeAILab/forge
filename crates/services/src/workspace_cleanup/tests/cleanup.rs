@@ -1,4 +1,4 @@
-//! Cleanup cases.
+//! Terminal cleanup, failure persistence and backfill sweeps.
 
 use super::*;
 

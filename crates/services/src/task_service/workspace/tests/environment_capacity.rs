@@ -1,4 +1,4 @@
-//! Environment capacity cases.
+//! Machine capacity prechecks, last-slot races and environment readiness.
 
 use super::*;
 

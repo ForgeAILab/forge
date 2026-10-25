@@ -27,8 +27,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use tokio::sync::Mutex;
 
-const OAUTH_REFRESH_SKEW_MS: u64 = 30_000;
-const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
 const SESSION_STATE_MAGIC: &[u8] = b"FORGE-SESSION\0";
 const SESSION_STATE_FORMAT: u8 = 1;
 
@@ -65,15 +63,6 @@ fn decode_checkpoint(session: &SessionId, bytes: &[u8]) -> Result<TurnCheckpoint
     })
 }
 
-/// Logs a swallowed sqlx error before mapping it to the given fallback.
-/// Mirrors the diagnosability fix in `lcm.rs`: a bare `.map_err(|_| ...)`
-/// discarded the cause, making a SQLite busy/busy-snapshot failure
-/// indistinguishable from any other store error in the logs.
-fn log_store_error<E>(error: impl std::fmt::Display, fallback: E) -> E {
-    tracing::warn!(error = %error, "protected store operation failed");
-    fallback
-}
-
 pub(crate) fn protected_database_error(error: impl Into<db::DbError>) -> RuntimeError {
     let error = error.into();
     let failure = RuntimeError::internal("protected persistence database operation failed");
@@ -92,8 +81,6 @@ mod session_persistence;
 pub use provider_credentials::{
     CreateOAuthCredential, CredentialRevocationOutcome, OAuthCredentialBundle,
 };
-#[cfg(test)]
-use scope_binding::{intersect_permissions, scope_permission_set};
 
 #[derive(Clone)]
 pub struct SqliteProviderCredentialSource {

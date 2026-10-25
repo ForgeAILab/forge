@@ -1,4 +1,4 @@
-//! Workspace leases recovery cases.
+//! Workspace lease renewal, expiry and disconnect ordering.
 
 use super::*;
 

@@ -786,6 +786,9 @@ pub fn stable_report_id(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionFailureClass {
     TaskFailed,
+    /// A native worker left authored changes without advancing HEAD.
+    /// Carries the normal Task failure policy plus a corrective delivery prompt.
+    UncommittedWorktree,
     ExecutorUnavailable,
 }
 
@@ -872,6 +875,10 @@ pub enum ExecutorError {
         reason: String,
         usage_reports: Vec<UsageReport>,
     },
+
+    /// Host-verified delivery failure, never inferred from provider wording.
+    #[error("executor error: {0}")]
+    UncommittedWorktree(String),
 
     #[error("executor error: {0}")]
     Other(String),

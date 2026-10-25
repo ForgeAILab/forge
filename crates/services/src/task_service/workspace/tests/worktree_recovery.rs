@@ -1,4 +1,4 @@
-//! Worktree recovery cases.
+//! Missing or damaged worktree recovery that preserves Task branches and transient failures.
 
 use super::*;
 

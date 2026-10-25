@@ -2,6 +2,19 @@
 
 use super::*;
 
+const OAUTH_REFRESH_SKEW_MS: u64 = 30_000;
+
+const MAX_PROVIDER_CREDENTIAL_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Logs a swallowed sqlx error before mapping it to the given fallback.
+/// Mirrors the diagnosability fix in `lcm.rs`: a bare `.map_err(|_| ...)`
+/// discarded the cause, making a SQLite busy/busy-snapshot failure
+/// indistinguishable from any other store error in the logs.
+fn log_store_error<E>(error: impl std::fmt::Display, fallback: E) -> E {
+    tracing::warn!(error = %error, "protected store operation failed");
+    fallback
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialRevocationOutcome {
     NotSupported,

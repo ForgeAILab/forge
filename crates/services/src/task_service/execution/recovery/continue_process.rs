@@ -100,7 +100,7 @@ impl TaskService {
         actor: &api_types::Actor,
         bridge: api_types::TransitionBridge,
     ) -> Result<Task> {
-        super::ensure_plan_publication_transition_authority(task, None)?;
+        crate::task_service::execution::ensure_plan_publication_transition_authority(task, None)?;
         let project = ProjectRepo::get_by_id(&*self.db, &task.project_id)
             .await?
             .ok_or_else(|| ServiceError::not_found("project", task.project_id.clone()))?;

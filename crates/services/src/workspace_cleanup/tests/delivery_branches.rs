@@ -1,4 +1,4 @@
-//! Delivery branches cases.
+//! Task branch deletion only after Git proves delivery.
 
 use super::*;
 
