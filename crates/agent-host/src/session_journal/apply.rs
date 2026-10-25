@@ -115,7 +115,7 @@ impl ForgeJournalStorage {
             .map_err(database_error)?;
             let locked = Instant::now();
             let staged = async {
-                let work = match max_units {
+                let mut work = match max_units {
                     Some(max_units) => Some(
                         self.collection_work(
                             &mut tx,
@@ -130,7 +130,7 @@ impl ForgeJournalStorage {
                     None => None,
                 };
                 let (next, receipt, staged) = self
-                    .apply_on(&mut tx, &scope, &write, work.as_ref())
+                    .apply_on(&mut tx, &scope, &write, work.as_mut())
                     .await?;
                 let units = work
                     .as_ref()
@@ -218,7 +218,7 @@ impl ForgeJournalStorage {
         conn: &mut SqliteConnection,
         scope: &Scope,
         write: &JournalWrite,
-        work: Option<&super::collection::CollectionWork>,
+        mut work: Option<&mut super::collection::CollectionWork>,
     ) -> Result<(Arc<ScopeDirectory>, JournalApplyReceipt, Staged), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("apply.apply_on", 0);
@@ -234,7 +234,8 @@ impl ForgeJournalStorage {
             return Err(conflict());
         }
         let owner = self.mapping(conn, scope).await?;
-        if self.load_on(conn, &scope.0, &scope.1).await?.is_none() {
+        let previous = self.load_on(conn, &scope.0, &scope.1).await?;
+        if previous.is_none() {
             // FK anchor for staged membership/pins. Its zero fence is replaced
             // at the Head step; no reservation is visible before COMMIT.
             self.insert_record(
@@ -311,7 +312,11 @@ impl ForgeJournalStorage {
             }
         }
         let mut record = write.record.clone();
-        if work.is_some_and(|w| w.more) {
+        // Physical collection work can outlive the engine's logical dirty flag.
+        if work.as_ref().is_some_and(|w| w.more)
+            || (write.kind != JournalWriteKind::Collect
+                && previous.as_ref().is_some_and(|r| r.collection_dirty))
+        {
             record.collection_dirty = true;
         }
         self.replace_record(conn, scope, &owner, &record, write.expect)
@@ -322,8 +327,15 @@ impl ForgeJournalStorage {
                 .await?;
         }
         if let Some(floor) = write.prune_operations_before {
-            self.prune_operations(conn, scope, &owner, floor, write.record.writer_epoch)
-                .await?;
+            self.prune_operations(
+                conn,
+                scope,
+                &owner,
+                floor,
+                write.record.writer_epoch,
+                work.as_ref().and_then(|w| w.operations.as_ref()),
+            )
+            .await?;
         }
         fail(write, JournalCommitFailurePoint::AfterIdempotency)?;
         // Reuse every previously read index; only the final new pack indexes
@@ -331,6 +343,10 @@ impl ForgeJournalStorage {
         let mut final_views = self
             .directory_from(conn, scope, false, Some(directory(&views)))
             .await?;
+        let (allowed, bodies) = match work.as_mut() {
+            Some(work) => (Some(&work.packs), Some(&mut work.bodies)),
+            None => (None, None),
+        };
         let (receipt, purged) = self
             .release_objects(
                 conn,
@@ -341,12 +357,17 @@ impl ForgeJournalStorage {
                 matches!(write.kind, JournalWriteKind::Collect)
                     && write.record.retirement.is_some(),
                 &mut staged,
-                work.map(|w| &w.packs),
+                allowed,
+                bodies,
             )
             .await?;
         let collect = matches!(write.kind, JournalWriteKind::Collect);
         if collect {
-            self.collection_repack(conn, scope, &purged, &mut staged, work.map(|w| &w.packs))
+            let (allowed, bodies) = match work.as_mut() {
+                Some(work) => (Some(&work.packs), Some(&mut work.bodies)),
+                None => (None, None),
+            };
+            self.collection_repack(conn, scope, &purged, &mut staged, allowed, bodies)
                 .await?;
         }
         // Released bits live only in SQL. Without a purge (every removed pack

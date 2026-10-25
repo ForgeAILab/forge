@@ -5,7 +5,8 @@ use super::{
     diagnostics::unreadable,
     seal::role,
     storage::{
-        ForgeJournalStorage, PackView, Staged, ambiguous_database_error, bit, database_error,
+        DecodedBodies, ForgeJournalStorage, PackView, Staged, ambiguous_database_error, bit,
+        database_error,
     },
 };
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
@@ -65,6 +66,7 @@ impl ForgeJournalStorage {
         scope: &Scope,
         selected: &[PackView],
         staged: &mut Staged,
+        decoded: Option<&mut DecodedBodies>,
     ) -> Result<Vec<i64>, RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("maintenance.merge_packs", 0);
@@ -76,7 +78,12 @@ impl ForgeJournalStorage {
             return Err(corrupt());
         }
         let wanted = selected.iter().map(|v| v.index.key.id).collect();
-        let bodies = self.bodies(conn, selected, &wanted, false).await?;
+        let bodies = if let Some(decoded) = decoded {
+            self.collection_bodies(conn, selected, &wanted, decoded, staged)
+                .await?
+        } else {
+            self.bodies(conn, selected, &wanted, false).await?
+        };
         // Which domains hold each moved body, from each domain's own bits.
         let mut domains = Vec::<JournalDomain>::new();
         let mut holders = HashMap::<JournalObjectId, Vec<usize>>::new();
@@ -154,6 +161,7 @@ impl ForgeJournalStorage {
         purged: &BTreeSet<i64>,
         staged: &mut Staged,
         allowed: Option<&BTreeSet<i64>>,
+        decoded: Option<&mut DecodedBodies>,
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer("maintenance.collection_repack", 0);
@@ -174,7 +182,8 @@ impl ForgeJournalStorage {
         if selected.len() > 1 {
             let bytes: usize = selected.iter().map(|v| v.index.key.retained).sum();
             let packs = selected.len();
-            self.merge_packs(conn, scope, &selected, staged).await?;
+            self.merge_packs(conn, scope, &selected, staged, decoded)
+                .await?;
             tracing::debug!(target:"forge_session_journal",kind="collection_repack",rewritten_packs=packs,rewritten_bytes=bytes,"journal maintenance");
         }
         Ok(())
@@ -234,7 +243,7 @@ impl ForgeJournalStorage {
                 };
                 rewritten_bytes += pair.iter().map(|v| v.index.key.retained).sum::<usize>();
                 rewritten_packs += 2;
-                self.merge_packs(&mut tx, &scope, &pair, &mut staged)
+                self.merge_packs(&mut tx, &scope, &pair, &mut staged, None)
                     .await?;
                 views = self.directory(&mut tx, &scope, false).await?;
             }
@@ -322,7 +331,7 @@ impl ForgeJournalStorage {
                     }
                     if selected.len() > 1 {
                         count = selected.len();
-                        self.merge_packs(&mut tx, &scope, &selected, &mut staged)
+                        self.merge_packs(&mut tx, &scope, &selected, &mut staged, None)
                             .await?;
                     } else {
                         bytes = 0;

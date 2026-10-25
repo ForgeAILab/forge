@@ -2,8 +2,9 @@
 use super::{
     cache::Scope,
     codec, conflict, corrupt,
+    operations::OperationPrune,
     seal::role,
-    storage::{ForgeJournalStorage, database_error, prefix},
+    storage::{DecodedBodies, ForgeJournalStorage, Staged, database_error, prefix},
     wire,
 };
 use agent_runtime::core::{error::RuntimeError, ids::SessionId, journal::*};
@@ -21,6 +22,8 @@ pub(super) struct CollectionWork {
     pub units: u32,
     pub operation_units: u32,
     pub more: bool,
+    pub bodies: DecodedBodies,
+    pub operations: Option<OperationPrune>,
 }
 
 impl ForgeJournalStorage {
@@ -290,6 +293,10 @@ impl ForgeJournalStorage {
         {
             return Err(conflict());
         }
+        let cap = plan.max_units.min(LIMITS.max_apply_units) as usize;
+        if cap == 0 {
+            return Ok(None);
+        }
         if self
             .load_on(conn, &w.domain, &w.session)
             .await?
@@ -311,7 +318,10 @@ impl ForgeJournalStorage {
             })
             .map(|v| v.index.key.id)
             .collect();
-        let bodies = self.bodies(conn, &views, &wanted, false).await?;
+        let mut decoded = DecodedBodies::new();
+        let bodies = self
+            .collection_bodies(conn, &views, &wanted, &mut decoded, &Staged::default())
+            .await?;
         let mut packs = BTreeSet::new();
         for view in &mut views {
             if let Some(objects) = bodies.get(&view.index.key.id) {
@@ -323,22 +333,29 @@ impl ForgeJournalStorage {
                 }
             }
         }
-        let operation_units = self
-            .prune_operation_units(
+        let mut operations = self
+            .prepare_operation_prune(
                 conn,
                 &scope,
                 w.prune_operations_before,
                 w.record.writer_epoch,
             )
             .await?;
-        let cap = plan.max_units.min(LIMITS.max_apply_units) as usize;
-        if packs.len() + operation_units as usize > cap {
+        if packs.len() > cap {
             return Ok(None);
         }
-        let mut room = cap - packs.len() - operation_units as usize;
+        let mut room = cap - packs.len();
+        let mut more = false;
+        if let Some(operations) = &mut operations {
+            if operations.tiers.len() > room {
+                more = true;
+                operations.tiers = operations.tiers.iter().take(room).copied().collect();
+            }
+            room -= operations.tiers.len();
+        }
+        let operation_units = operations.as_ref().map_or(0, |p| p.tiers.len() as u32);
         let forced =
             w.record.retirement.is_some() || views.iter().all(|v| v.bitmap.iter().all(|b| *b == 0));
-        let mut more = false;
         if forced {
             for view in &views {
                 if !view.fully_live() && !packs.contains(&view.index.key.id) {
@@ -370,6 +387,8 @@ impl ForgeJournalStorage {
             packs,
             operation_units,
             more,
+            bodies: decoded,
+            operations,
         }))
     }
 }

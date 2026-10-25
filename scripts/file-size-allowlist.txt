@@ -3,7 +3,6 @@
 # After shrinking/deleting files: python3 scripts/check-file-sizes.py --update
 # Maintainers only: --init recreates the one-time baseline, never to accept growth.
 2187 crates/agent-host/tests/session_journal_runtime.rs
-4604 crates/agent-host/tests/session_journal_storage.rs
 2185 crates/api-types/src/daemon_transport.rs
 2786 crates/api-types/src/project_orchestration.rs
 2447 crates/api/src/routes/milestones.rs

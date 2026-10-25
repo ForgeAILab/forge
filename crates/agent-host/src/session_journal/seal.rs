@@ -10,6 +10,9 @@ use sha2_journal::Sha256;
 
 use super::corrupt;
 
+#[cfg(feature = "test-support")]
+type DecryptCounts = std::collections::BTreeMap<(u8, SessionId, Vec<u8>), u64>;
+
 pub(super) const FORMAT: i64 = 1;
 const ENVELOPE: &[u8] = b"FORGE-JOURNAL\0\x01";
 
@@ -57,6 +60,8 @@ pub(super) struct Keys {
     cipher: XChaCha20Poly1305,
     lookup: Hmac<Sha256>,
     pub revision: i64,
+    #[cfg(feature = "test-support")]
+    pub decrypts: std::sync::Arc<std::sync::Mutex<DecryptCounts>>,
 }
 
 pub(super) struct Sealed {
@@ -94,6 +99,8 @@ impl Keys {
             cipher: XChaCha20Poly1305::new((&aead).into()),
             lookup: <Hmac<Sha256> as Mac>::new_from_slice(&lookup).map_err(|_| corrupt())?,
             revision,
+            #[cfg(feature = "test-support")]
+            decrypts: Default::default(),
         })
     }
 
@@ -151,6 +158,20 @@ impl Keys {
         max: usize,
     ) -> Result<Vec<u8>, RuntimeError> {
         #[cfg(feature = "test-support")]
+        {
+            let key = (
+                binding.unit as u8,
+                binding.session.clone(),
+                binding.row.to_vec(),
+            );
+            *self
+                .decrypts
+                .lock()
+                .map_err(|_| corrupt())?
+                .entry(key)
+                .or_default() += 1;
+        }
+        #[cfg(feature = "test-support")]
         let _profile = crate::session_journal::profile::timer(
             format!("aead.open.{}", binding.unit as u8),
             payload.len(),
@@ -193,6 +214,33 @@ impl Keys {
         let mut mac = self.lookup.clone();
         mac.update(&context);
         mac.finalize().into_bytes().to_vec()
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl super::ForgeJournalStorage {
+    pub fn reset_decrypt_counts_for_test(&self) {
+        self.keys.decrypts.lock().unwrap().clear();
+    }
+
+    pub fn decrypt_count_for_test(&self, session: &SessionId, unit: super::TestSealedUnit) -> u64 {
+        use super::TestSealedUnit;
+        let (unit, row) = match unit {
+            TestSealedUnit::PackIndex(id) => (Unit::PackIndex, id),
+            TestSealedUnit::PackBody(id) | TestSealedUnit::PackBodyCanonical(id) => {
+                (Unit::PackBody, id)
+            }
+            TestSealedUnit::Operations(tier) | TestSealedUnit::OperationsFrame(tier) => {
+                (Unit::Operations, tier)
+            }
+        };
+        self.keys
+            .decrypts
+            .lock()
+            .unwrap()
+            .get(&(unit as u8, session.clone(), row.to_be_bytes().to_vec()))
+            .copied()
+            .unwrap_or(0)
     }
 }
 

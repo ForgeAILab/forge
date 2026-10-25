@@ -1631,6 +1631,267 @@ async fn debug_bytes_are_sampled_only_once_per_pass() {
 }
 
 #[tokio::test]
+async fn protected_backlog_yields_and_resumes_across_passes() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    use tracing::instrument::WithSubscriber;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    let sid = SessionId::new("phase-budget-backlog");
+    publish(&f, store.clone(), sid.as_str()).await;
+    let raw = store.journals().storage();
+    raw.set_repacking(false);
+    let protected = JournalDomain {
+        storage_id: store.journals().protected().storage_id(),
+        role: JournalRole::Protected,
+    };
+    let ordinary = JournalDomain {
+        storage_id: store.journals().ordinary().storage_id(),
+        role: JournalRole::Ordinary,
+    };
+    let mut record = raw.load(&protected, &sid).await.unwrap().unwrap();
+    let expect = record.fence();
+    record.generation += 1;
+    record.collection_dirty = true;
+    let mut objects: Vec<_> = (0..80).map(|n| body(&format!("backlog-{n}"))).collect();
+    objects.sort_by(|a, b| a.id.cmp(&b.id));
+    raw.apply(JournalWrite {
+        domain: protected.clone(),
+        session: sid.clone(),
+        kind: JournalWriteKind::Commit,
+        expect,
+        record,
+        objects: JournalObjectBatch { objects },
+        operation: None,
+        pins: vec![],
+        catalog: vec![],
+        release: vec![],
+        prune_operations_before: None,
+        inject: None,
+    })
+    .await
+    .unwrap();
+    update(
+        &f,
+        sid.as_str(),
+        "journal-scope",
+        "journal-profile",
+        "replaced",
+        "c",
+    )
+    .await;
+    bulk_orphans(&db, 1, 32).await;
+    let policy = SessionJournalRetention::new(db.clone(), &store).with_collection_budget_for_test(
+        JournalGcBudget {
+            max_work_units: 1,
+            max_unit_items: 1,
+            ..Default::default()
+        },
+    );
+    let mut cursor = RetentionCursor::protected_for_test();
+    let events = forge_agent_host::test_support::JournalEvents {
+        debug: true,
+        ..Default::default()
+    };
+    let ordinary_before = raw.session_record_loads_for_test(&ordinary, &sid);
+    let first = policy
+        .maintain_once(&mut cursor)
+        .with_subscriber(events.clone())
+        .await
+        .unwrap();
+    let protected_calls = events
+        .rows
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, fields)| {
+            fields.get("role").is_some_and(|role| role == "Protected")
+                && fields.contains_key("work_units")
+        })
+        .count();
+    let ordinary_calls = events
+        .rows
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, fields)| {
+            fields.get("role").is_some_and(|role| role == "Ordinary")
+                && fields.contains_key("work_units")
+        })
+        .count();
+    eprintln!(
+        "first pass: {first:?}; protected_calls={protected_calls}; ordinary_calls={ordinary_calls}; ordinary_loads={}",
+        raw.session_record_loads_for_test(&ordinary, &sid) - ordinary_before
+    );
+    assert_eq!(
+        first.retired_domains, 2,
+        "retirement runs despite the backlog"
+    );
+    assert_eq!(first.deleted_packs, 1, "orphan drain runs in the same pass");
+    assert!(
+        ordinary_calls > 0,
+        "ordinary collection runs in the same pass"
+    );
+    assert!(
+        raw.session_record_loads_for_test(&ordinary, &sid) > ordinary_before,
+        "ordinary collection must run before the protected backlog finishes"
+    );
+    assert_eq!(protected_calls, 16, "protected has its own per-pass limit");
+    assert!(
+        first.collection_calls > 16 && first.collection_calls <= 32,
+        "{first:?}"
+    );
+    let mut calls = first.collection_calls;
+    let mut protected_total = protected_calls;
+    for pass in 0..30 {
+        let dirty: bool = sqlx::query_scalar("SELECT collection_dirty FROM agent_session_journal_session WHERE runtime_session_id=? AND role='protected'")
+            .bind(sid.as_str()).fetch_one(db.pool()).await.unwrap();
+        if !dirty {
+            assert!(
+                protected_total > 32,
+                "protected alone needs more than 32 calls"
+            );
+            assert!(
+                calls > 32,
+                "the protected backlog needs more than one old pass"
+            );
+            assert!(raw.members(&protected, &sid).await.unwrap().is_empty());
+            return;
+        }
+        assert!(
+            pass < 29,
+            "saved protected progress must finish, without restarting each pass"
+        );
+        events.rows.lock().unwrap().clear();
+        let report = policy
+            .maintain_once(&mut cursor)
+            .with_subscriber(events.clone())
+            .await
+            .unwrap();
+        let protected_calls = events
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, fields)| {
+                fields.get("role").is_some_and(|role| role == "Protected")
+                    && fields.contains_key("work_units")
+            })
+            .count();
+        assert!(protected_calls <= 16);
+        protected_total += protected_calls;
+        assert!(report.collection_calls <= 32, "{report:?}");
+        calls += report.collection_calls;
+    }
+}
+
+#[tokio::test]
+async fn unused_protected_calls_flow_to_ordinary_without_skipping_drain() {
+    use services_agents::session_journal_retention::RetentionCursor;
+    use tracing::instrument::WithSubscriber;
+    let f = FileDb::new().await.unwrap();
+    let db = f.database();
+    let store = Arc::new(SqliteProtectedRuntimeStore::new(db.clone(), [7; 32], 1));
+    let sid = SessionId::new("ordinary-call-backlog");
+    publish(&f, store.clone(), sid.as_str()).await;
+    update(
+        &f,
+        sid.as_str(),
+        "journal-scope",
+        "journal-profile",
+        "ready",
+        "c",
+    )
+    .await;
+    let raw = store.journals().storage();
+    raw.set_repacking(false);
+    let protected = store.journals().protected();
+    for call in 0..100 {
+        let gc = protected
+            .collect(JournalGcRequest {
+                storage_id: protected.storage_id(),
+                expected_root_epoch: protected.root_epoch().unwrap(),
+                max_objects: 20_000,
+                work_budget: Default::default(),
+            })
+            .await
+            .unwrap();
+        if !gc.has_more {
+            break;
+        }
+        assert!(call < 99);
+    }
+    let ordinary = JournalDomain {
+        storage_id: store.journals().ordinary().storage_id(),
+        role: JournalRole::Ordinary,
+    };
+    let mut record = raw.load(&ordinary, &sid).await.unwrap().unwrap();
+    let expect = record.fence();
+    record.generation += 1;
+    record.collection_dirty = true;
+    let mut objects: Vec<_> = (0..80)
+        .map(|n| body(&format!("ordinary-backlog-{n}")))
+        .collect();
+    objects.sort_by(|a, b| a.id.cmp(&b.id));
+    raw.apply(JournalWrite {
+        domain: ordinary,
+        session: sid,
+        kind: JournalWriteKind::Commit,
+        expect,
+        record,
+        objects: JournalObjectBatch { objects },
+        operation: None,
+        pins: vec![],
+        catalog: vec![],
+        release: vec![],
+        prune_operations_before: None,
+        inject: None,
+    })
+    .await
+    .unwrap();
+    bulk_orphans(&db, 1, 32).await;
+    let policy =
+        SessionJournalRetention::new(db, &store).with_collection_budget_for_test(JournalGcBudget {
+            max_work_units: 1,
+            max_unit_items: 1,
+            ..Default::default()
+        });
+    let events = forge_agent_host::test_support::JournalEvents {
+        debug: true,
+        ..Default::default()
+    };
+    let report = policy
+        .maintain_once(&mut RetentionCursor::default())
+        .with_subscriber(events.clone())
+        .await
+        .unwrap();
+    let count = |role: &str| {
+        events
+            .rows
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, fields)| {
+                fields.get("role").is_some_and(|value| value == role)
+                    && fields.contains_key("work_units")
+            })
+            .count()
+    };
+    assert_eq!(count("Protected"), 1);
+    assert_eq!(
+        count("Ordinary"),
+        31,
+        "ordinary receives unused protected calls"
+    );
+    assert_eq!(report.collection_calls, 32);
+    assert_eq!(report.retired_domains, 0);
+    assert_eq!(
+        report.deleted_packs, 1,
+        "drain runs even at the total call cap"
+    );
+}
+
+#[tokio::test]
 async fn retirement_errors_do_not_starve_collection_or_orphans_and_warn_once_per_cause() {
     use services_agents::session_journal_retention::RetentionCursor;
     use tracing::instrument::WithSubscriber;
