@@ -109,6 +109,10 @@ Forge follows Semantic Versioning. During the `0.x` public beta period, APIs and
 
 ### Fixed
 
+- An Integration or Check step on a coordination root no longer fails with
+  "Task condition differs from its legacy and owner witnesses" when the root
+  is held or failed with unfinished subtasks, or is flagged for review with no
+  visible subtasks; the condition no longer lists the same Children reason twice.
 - A provider failure message that quotes or ends with Forge's "uncommitted
   worktree changes" sentence is no longer mistaken for a native worker that left
   undelivered changes: the runner now reads a typed failure class from the worker

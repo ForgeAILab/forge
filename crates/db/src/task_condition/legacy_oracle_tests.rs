@@ -209,32 +209,7 @@ async fn once_corrupt_legacy_copy_is_repaired_on_first_targeted_check() {
     assert_eq!(db.check_task_conditions_of(&ids).await.unwrap(), 0);
 }
 
-// Independent oracle for 6120c133's derive + strict seam: edit the stored
-// condition directly, overlay facts, and compare with the legacy/fact mapping.
-// It deliberately does not use derive, owner_base, or the production setter.
-async fn main_statement_outcome(
-    db: &SqliteDb,
-    id: &str,
-    statement: &ConditionStatement,
-) -> std::result::Result<(), String> {
-    let row = TaskRepo::get_by_id(db, id, false).await.unwrap().unwrap();
-    let mut c = db.pool().acquire().await.unwrap();
-    let mut facts = ConditionFacts::load(&mut c, id).await.unwrap();
-    match statement {
-        ConditionStatement::Integration { reason } => facts.integration = Some(reason.clone()),
-        ConditionStatement::Check { wait, epoch } => facts.check = Some((wait.clone(), *epoch)),
-        _ => panic!("oracle expects Integration or Check"),
-    }
-    let candidate = facts.apply(statement.apply(&row.condition));
-    let expected = facts.condition(&LegacyConditionInput::from(&row));
-    if candidate.typed() == expected.typed() {
-        Ok(())
-    } else {
-        Err("Task condition differs from its legacy and owner witnesses".into())
-    }
-}
-
-async fn coordination_statement_parity(block: Option<&str>, visible_children: bool) {
+async fn coordination_statement_matches_legacy(block: Option<&str>, visible_children: bool) {
     for integration in [false, true] {
         let db = db().await;
         task(&db, "root").await;
@@ -250,7 +225,10 @@ async fn coordination_statement_parity(block: Option<&str>, visible_children: bo
         db.sync_condition_in_tx(&mut tx, "root").await.unwrap();
         tx.commit().await.unwrap();
         let step = claim(&db, "root").await;
-        let raw_before = raw_condition(&db, "root").await;
+        let before = TaskRepo::get_by_id(&db, "root", false)
+            .await
+            .unwrap()
+            .unwrap();
         let statement = if integration {
             ConditionStatement::Integration {
                 reason: IntegrationReason::Waiting {
@@ -267,50 +245,65 @@ async fn coordination_statement_parity(block: Option<&str>, visible_children: bo
                 epoch: 0,
             }
         };
-        let expected = main_statement_outcome(&db, "root", &statement).await;
-        assert_eq!(
-            expected,
-            Err("Task condition differs from its legacy and owner witnesses".into()),
-            "fixture must reach MAIN's strict refusal"
-        );
+        let mut c = db.pool().acquire().await.unwrap();
+        let mut facts = ConditionFacts::load(&mut c, "root").await.unwrap();
+        drop(c);
+        match &statement {
+            ConditionStatement::Integration { reason } => facts.integration = Some(reason.clone()),
+            ConditionStatement::Check { wait, epoch } => facts.check = Some((wait.clone(), *epoch)),
+            _ => unreachable!(),
+        }
+        let mut input = LegacyConditionInput::from(&before);
+        input.facts = Some(facts);
+        let expected = map_legacy_condition(&input);
         crate::task_writer::in_task_step(step, async {
-            let mut tx = db.pool().begin().await.unwrap();
-            let actual = db
-                .state_integration_condition_in_tx(&mut tx, "root", &statement)
-                .await;
-            let actual = match actual {
-                Ok(()) => Ok(()),
-                Err(DbError::Check(message)) => Err(message),
-                Err(error) => panic!("unexpected error: {error:?}"),
-            };
-            assert_eq!(actual, expected, "{statement:?}");
-            assert_eq!(
-                sqlx::query_scalar::<_, String>("SELECT condition_json FROM task WHERE id='root'")
-                    .fetch_one(&mut *tx)
+            let mut previous_raw = None;
+            for _ in 0..2 {
+                let mut tx = db.pool().begin().await.unwrap();
+                db.state_integration_condition_in_tx(&mut tx, "root", &statement)
                     .await
-                    .unwrap(),
-                raw_before
-            );
-            tx.rollback().await.unwrap();
+                    .unwrap_or_else(|error| panic!("{statement:?}: {error:?}"));
+                tx.commit().await.unwrap();
+                let actual = db.task_condition("root").await.unwrap();
+                assert_eq!(actual.typed(), expected.typed(), "{statement:?}");
+                assert_eq!(actual.public(), expected.public(), "{statement:?}");
+                let raw = raw_condition(&db, "root").await;
+                if let Some(previous) = previous_raw.replace(raw.clone()) {
+                    assert_eq!(raw, previous, "repeated {statement:?} must be idempotent");
+                }
+                let after = TaskRepo::get_by_id(&db, "root", false)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.version, before.version);
+                assert_eq!(
+                    LegacyConditionInput::from(&after),
+                    LegacyConditionInput::from(&before)
+                );
+            }
         })
         .await;
-        assert_eq!(raw_condition(&db, "root").await, raw_before);
     }
 }
 
 #[tokio::test]
-async fn integration_and_check_match_main_on_held_root_with_children() {
-    coordination_statement_parity(Some("manual_stop"), true).await;
+async fn integration_and_check_match_legacy_on_held_root_with_children() {
+    coordination_statement_matches_legacy(Some("manual_stop"), true).await;
 }
 
 #[tokio::test]
-async fn integration_and_check_match_main_on_failed_root_with_children() {
-    coordination_statement_parity(Some("workspace_error"), true).await;
+async fn integration_and_check_match_legacy_on_failed_root_with_children() {
+    coordination_statement_matches_legacy(Some("workspace_error"), true).await;
 }
 
 #[tokio::test]
-async fn integration_and_check_match_main_on_flagged_root_without_children() {
-    coordination_statement_parity(None, false).await;
+async fn integration_and_check_match_legacy_on_flagged_root_without_children() {
+    coordination_statement_matches_legacy(None, false).await;
+}
+
+#[tokio::test]
+async fn integration_and_check_match_legacy_on_unblocked_root_with_children() {
+    coordination_statement_matches_legacy(None, true).await;
 }
 
 #[tokio::test]
