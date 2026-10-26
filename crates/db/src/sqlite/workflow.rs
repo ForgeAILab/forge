@@ -756,6 +756,7 @@ impl SqliteDb {
             self,
             task_id,
             "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
+            crate::ConditionChange::Human,
         )
         .bind(task_id)
         .bind(role_name)

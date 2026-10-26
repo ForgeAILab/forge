@@ -10,6 +10,8 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConditionChange {
+    /// Content-only SQL: skip the condition producer, including cache repair.
+    None,
     /// The five legacy columns only.
     Legacy,
     /// Review or assignment changed the current human decision/work boundary.
@@ -31,7 +33,7 @@ pub enum ConditionChange {
     Operations,
     /// The Task's visible children, their order or their settledness.
     Children,
-    /// Everything: the mapping fallback for a writer with no narrower claim.
+    /// Everything: an explicit full reload, including released SQL without stored intent.
     Full,
 }
 
@@ -58,6 +60,9 @@ pub(crate) async fn derive(
     stated: Option<&ConditionStatement>,
 ) -> Result<Option<Produced>> {
     use ConditionChange as Change;
+    if change == Change::None {
+        return Ok(None);
+    }
     let explicit = stated.is_some();
     let scoped = write::current_statement(task_id);
     let stated = stated.or(scoped.as_ref());
@@ -320,9 +325,8 @@ pub(crate) async fn produce_children(c: &mut SqliteConnection, parent_id: &str) 
 }
 
 /// The Project's workflow was replaced. A Task's terminal classification and a
-/// child's settledness read it, so restate exactly the Tasks whose status
-/// classifies differently under the new definition, and every root that is
-/// waiting on its children.
+/// child's settledness read it, so restate every Task in the Project and
+/// refresh `Children` for flagged coordination roots.
 pub(crate) async fn workflow_changed(
     c: &mut SqliteConnection,
     project_id: &str,
@@ -413,52 +417,5 @@ pub(crate) async fn produce_best_effort(
 ) {
     if let Err(error) = produce(c, task_id, change).await {
         tracing::warn!(task_id, ?change, %error, "Task condition not updated; the invariant check repairs it");
-    }
-}
-
-/// The family a Task SQL statement can change, so the queue adapters skip the
-/// seam for writes that cannot change a condition.
-pub(crate) fn sql_change(query: &str) -> Option<ConditionChange> {
-    let lower = query.to_ascii_lowercase();
-    // A role or Review row moves the human decision/work boundary whatever
-    // columns it names.
-    let statement = lower.trim_start();
-    if ["task_role_assignment", "review"].iter().any(|table| {
-        [
-            "update ",
-            "delete from ",
-            "insert into ",
-            "insert or replace into ",
-        ]
-        .iter()
-        .any(|verb| {
-            statement
-                .strip_prefix(verb)
-                .and_then(|rest| rest.trim_start().strip_prefix(table))
-                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
-        })
-    }) {
-        return Some(ConditionChange::Human);
-    }
-    let assignments = lower.split(" where ").next().unwrap_or(&lower);
-    let assigns = |columns: &[&str]| columns.iter().any(|column| assignments.contains(column));
-    if assigns(&[
-        "status",
-        "status_epoch",
-        "parent_task_id",
-        "deleted_at",
-        "subtask_order",
-    ]) {
-        Some(ConditionChange::Entry)
-    } else if assigns(&[
-        "error_annotation",
-        "blocked_json",
-        "failed_json",
-        "entry_barrier_json",
-        "metadata_json",
-    ]) {
-        Some(ConditionChange::Legacy)
-    } else {
-        None
     }
 }

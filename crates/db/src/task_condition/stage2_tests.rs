@@ -465,7 +465,7 @@ async fn ledger_and_remote_cancel_producers_refresh_durable_witnesses() {
     let step = claim(&db, &t.id).await;
     crate::task_writer::in_task_step(step.clone(), async {
         let now = crate::now_rfc3339();
-        crate::task_writer::TaskQuery::new(&db, &t.id, "UPDATE task SET blocked_json=? WHERE id=?")
+        crate::task_writer::TaskQuery::new(&db, &t.id, "UPDATE task SET blocked_json=? WHERE id=?", crate::ConditionChange::Legacy)
             .bind(json!({"kind":"retry_exhausted"}).to_string()).bind(&t.id)
             .execute(db.pool()).await.unwrap();
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
@@ -481,7 +481,7 @@ async fn ledger_and_remote_cancel_producers_refresh_durable_witnesses() {
         sqlx::query("INSERT INTO workspace_placement(id,workspace_id,task_id,owner_kind,repo_location_id,workspace_handle,state,selected_by,selection_reason,created_at,updated_at) VALUES('placement','removed-workspace',?,'server','receipt-location','handle','ready','backfill','{}',?,?)").bind(&t.id).bind(&now).bind(&now).execute(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO task_remote_operation(operation_id,step_id,workspace_id,placement_id,daemon_id,runtime_id,generation,expected_epoch,state,created_at) VALUES('receipt-op',?,'removed-workspace','placement','owner','runtime',1,0,'running',?)")
             .bind(&step.id).bind(&now).execute(db.pool()).await.unwrap();
-        crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET blocked_json=NULL WHERE id=?").bind(&t.id).execute(db.pool()).await.unwrap();
+        crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET blocked_json=NULL WHERE id=?", crate::ConditionChange::Legacy).bind(&t.id).execute(db.pool()).await.unwrap();
         let operation = db.running_remote_task_operations(&step.id).await.unwrap().remove(0);
         db.mark_pending_remote_cancel(&operation).await.unwrap();
         assert!(db.task_condition(&t.id).await.unwrap().evidence().witnesses.iter().any(|w| matches!(w, ConditionWitness::Operation { operation_id, .. } if operation_id == "receipt-op")));
