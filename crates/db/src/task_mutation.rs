@@ -95,6 +95,8 @@ pub enum TaskMutation {
         task_id: String,
         query: String,
         arguments: Vec<serde_json::Value>,
+        #[serde(default = "decode_released_sql_change")]
+        change: ConditionChange,
     },
     TaskUpdate {
         input: UpdateTask,
@@ -656,12 +658,7 @@ impl TaskMutation {
                     crate::task_condition::with_statement(
                         &task_id,
                         condition,
-                        Box::pin(db.apply_task_sql_intent(
-                            &task_id,
-                            &query,
-                            arguments,
-                            Some(change),
-                        )),
+                        Box::pin(db.apply_task_sql(&task_id, &query, arguments, change)),
                     )
                     .await?,
                 )
@@ -670,7 +667,8 @@ impl TaskMutation {
                 task_id,
                 query,
                 arguments,
-            } => encode(Box::pin(db.apply_task_sql(&task_id, &query, arguments)).await?),
+                change,
+            } => encode(Box::pin(db.apply_task_sql(&task_id, &query, arguments, change)).await?),
             Self::TaskUpdate { input } => encode(Box::pin(TaskRepo::update(db, input)).await?),
             Self::TaskUpdateIfAnnotation {
                 mut input,
@@ -1022,4 +1020,14 @@ impl TaskMutation {
             ),
         }
     }
+}
+
+/// Released `Sql` payloads did not store reload intent. Decode their missing
+/// field as a full fact reload, without inspecting SQL. A consistent cache
+/// retains main's bytes and side effects. An inconsistent (corrupt or stale)
+/// cache is rewritten during replay to the state main replay followed by its
+/// background condition check reaches (including diagnostics and revisions);
+/// only repair timing changes.
+fn decode_released_sql_change() -> ConditionChange {
+    ConditionChange::Full
 }

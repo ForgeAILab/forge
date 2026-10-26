@@ -1335,6 +1335,7 @@ mod tests {
                 &mut tx,
                 "restart-task",
                 db::TaskMutation::Sql {
+                    change: db::ConditionChange::None,
                     task_id: "restart-task".into(),
                     query: "UPDATE task SET title='recovered' WHERE id='restart-task'".into(),
                     arguments: vec![],
@@ -1365,6 +1366,7 @@ mod tests {
                 &runtime.db,
                 "restart-task",
                 "UPDATE task SET title='first write' WHERE id='restart-task'",
+                db::ConditionChange::None,
             )
             .execute(runtime.db.pool()),
         )

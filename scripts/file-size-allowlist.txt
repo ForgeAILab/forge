@@ -8,8 +8,7 @@
 2672 crates/api/tests/suite/manual_review_and_comments.rs
 2494 crates/db/src/budget.rs
 2654 crates/db/src/check_run/tests.rs
-2234 crates/db/src/task_condition/tests.rs
-2189 crates/db/src/task_step.rs
+2193 crates/db/src/task_condition/tests.rs
 12529 crates/db/src/tests.rs
 2931 crates/forge-solo/src/session.rs
 3168 crates/mcp-server/src/tests.rs
@@ -32,5 +31,5 @@
 10367 crates/services/src/task_service/tests/service_tests/cases/executions.rs
 4897 crates/services/src/workflow/actions/tests.rs
 2227 crates/services/src/workflow/dispatch/tests.rs
-5532 crates/services/src/workflow/engine/tests.rs
-3009 crates/services/src/workflow/engine/tests/durable_23b.rs
+5427 crates/services/src/workflow/engine/tests.rs
+2938 crates/services/src/workflow/engine/tests/durable_23b.rs

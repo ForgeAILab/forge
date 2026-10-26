@@ -779,6 +779,7 @@ async fn queued_dispatcher_claim_racing_owner_cancel_cannot_start_cancelled_task
         task_id: task.id.clone(),
         kind: "mutation".into(),
         payload_json: serde_json::to_string(&db::TaskMutation::Sql {
+            change: db::ConditionChange::None,
             task_id: task.id.clone(),
             query: "UPDATE task SET updated_at=updated_at WHERE id=?".into(),
             arguments: vec![json!(task.id)],

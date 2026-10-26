@@ -1292,7 +1292,7 @@ pub use facts::{material_blocker, ConditionFacts, ConditionWitness, MaterialBloc
 pub use producers::ConditionChange;
 pub(crate) use producers::{
     execution_joined_workspace, metadata_condition, produce, produce_best_effort, produce_children,
-    sql_change, state, workflow_changed,
+    state, workflow_changed,
 };
 pub use statements::ConditionStatement;
 #[cfg(test)]
@@ -1309,6 +1309,10 @@ mod integration_tests;
 mod legacy_oracle_tests;
 #[cfg(test)]
 mod producer_tests;
+#[cfg(all(test, feature = "test-template"))]
+mod sql_family_tests;
+#[cfg(all(test, feature = "test-template"))]
+mod sql_replay_tests;
 #[cfg(test)]
 mod stage2_tests;
 #[cfg(test)]

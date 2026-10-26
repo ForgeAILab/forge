@@ -232,7 +232,7 @@ impl SqliteDb {
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
         crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation = ?, updated_at = ?, version = version + 1 WHERE id = ? AND version = ?
             AND deleted_at IS NULL AND failed_json IS NULL AND status NOT IN (SELECT value FROM json_each(?))
-            AND (error_annotation IS NULL OR (json_valid(error_annotation) AND json_extract(error_annotation, '$.blocking_reason') IN ('owner_disconnected_timeout', 'owner_lost_execution')))")
+            AND (error_annotation IS NULL OR (json_valid(error_annotation) AND json_extract(error_annotation, '$.blocking_reason') IN ('owner_disconnected_timeout', 'owner_lost_execution')))", crate::ConditionChange::Legacy)
 .bind(input.annotation)
 .bind(input.updated_at)
 .bind(input.task_id)
@@ -257,7 +257,7 @@ impl SqliteDb {
         WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
         AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
              OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
-             OR json_type(metadata_json, '$.owner_wait') IS NOT NULL)")
+             OR json_type(metadata_json, '$.owner_wait') IS NOT NULL)", crate::ConditionChange::Legacy)
 .bind(updated_at)
 .bind(task_id)
 .bind(parent_task_id)
@@ -309,7 +309,7 @@ impl SqliteDb {
         entry_barrier_json = entry_barrier_json,
         error_annotation = json_set(error_annotation, '$.blocking_reason', 'review_ci_infrastructure'),
         version = version + 1, updated_at = ? WHERE (id = ? OR parent_task_id = ?) AND deleted_at IS NULL
-        AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'")
+        AND entry_barrier_json IS NOT NULL AND json_extract(error_annotation, '$.blocking_reason') = 'review_ci_infrastructure_exhausted'", crate::ConditionChange::Legacy)
 .bind(updated_at)
 .bind(task_id)
 .bind(parent_task_id)
@@ -333,7 +333,7 @@ impl SqliteDb {
         target_id: &str,
         input: ClearRemovedMachineCancelAnnotationInput<'_>,
     ) -> crate::Result<u64> {
-        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))")
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=NULL, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END, version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL AND json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' AND NOT EXISTS(SELECT 1 FROM pending_remote_cancel c LEFT JOIN workspace w ON w.id=c.workspace_id LEFT JOIN task_step s ON s.id=c.step_id WHERE w.task_id=? OR s.task_id=? OR EXISTS(SELECT 1 FROM execution e WHERE e.task_id=? AND e.workspace_id=c.workspace_id))", crate::ConditionChange::Legacy)
 .bind(input.updated_at)
 .bind(input.task_id)
 .bind(input.workspace_task_id)
@@ -354,7 +354,7 @@ impl SqliteDb {
         task_id: &str,
         previous_annotation: &str,
     ) -> crate::Result<u64> {
-        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?")
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET error_annotation=?,version=version+1,updated_at=? WHERE id=? AND error_annotation=?", crate::ConditionChange::Legacy)
 .bind(annotation)
 .bind(updated_at)
 .bind(task_id)
@@ -374,7 +374,7 @@ impl SqliteDb {
         task_id: &str,
         daemon_id: &str,
     ) -> crate::Result<u64> {
-        crate::task_writer::TaskQuery::new(self, target_id, format!("UPDATE task SET metadata_json=json_remove(metadata_json,'$.{key}','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.{owner}')=?"))
+        crate::task_writer::TaskQuery::new(self, target_id, format!("UPDATE task SET metadata_json=json_remove(metadata_json,'$.{key}','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.{owner}')=?"), crate::ConditionChange::Legacy)
 .bind(task_id)
 .bind(daemon_id)
 .identity_fenced()
@@ -391,7 +391,7 @@ impl SqliteDb {
         updated_at: String,
         task_id: &str,
     ) -> crate::Result<u64> {
-        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json=json_remove(metadata_json,?,'$.deferred_dispatch','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND json_valid(metadata_json)")
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json=json_remove(metadata_json,?,'$.deferred_dispatch','$.dispatch_disposition'),version=version+1,updated_at=? WHERE id=? AND json_valid(metadata_json)", crate::ConditionChange::Legacy)
 .bind(metadata_path)
 .bind(updated_at)
 .bind(task_id)
@@ -422,7 +422,7 @@ impl SqliteDb {
          WHERE id=? AND deleted_at IS NULL AND failed_json IS NULL
            AND status NOT IN (SELECT value FROM json_each(?))
            AND (error_annotation IS NULL OR (json_valid(error_annotation)
-                AND json_extract(error_annotation,'$.blocking_reason') IN (SELECT value FROM json_each(?))))")
+                AND json_extract(error_annotation,'$.blocking_reason') IN (SELECT value FROM json_each(?))))", crate::ConditionChange::Legacy)
 .bind(input.annotation)
 .bind(input.updated_at)
 .bind(input.task_id)
@@ -458,7 +458,7 @@ impl SqliteDb {
             json_remove(COALESCE(metadata_json, '{}'), '$.deferred_dispatch') ELSE
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
             error_annotation = COALESCE(?, error_annotation),
-            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ? AND status = ?")
+            blocked_json = COALESCE(?, blocked_json), updated_at = ?, version = version + ? WHERE id = ? AND version = ? AND status = ?", crate::ConditionChange::Legacy)
 .bind(input.deferral)
 .bind(input.deferral_value)
 .bind(input.annotation)
@@ -483,7 +483,7 @@ impl SqliteDb {
         task_id: &str,
         expected_status: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ? AND status = ?")
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.owner_wait', json(?)) WHERE id = ? AND status = ?", crate::ConditionChange::Legacy)
 .bind(owner_wait)
 .bind(task_id)
 .bind(expected_status)
@@ -501,7 +501,7 @@ impl SqliteDb {
         task_id: &str,
         expected_version: i64,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?")
+        crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.deferred_dispatch') WHERE id = ? AND version = ?", crate::ConditionChange::Legacy)
 .bind(task_id)
 .bind(expected_version)
 .execute_in_tx(transaction)
@@ -518,7 +518,7 @@ impl SqliteDb {
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
         crate::task_writer::TaskQuery::new(self, target_id, "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait', '$.environment_wait', '$.deferred_dispatch')
             WHERE id = ? AND (json_type(metadata_json, '$.owner_wait') IS NOT NULL
-            OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)")
+            OR json_type(metadata_json, '$.environment_wait') IS NOT NULL)", crate::ConditionChange::Legacy)
 .bind(task_id)
 .execute_in_tx(transaction)
 .await

@@ -72,6 +72,7 @@ async fn undecodable_stored_condition(db: &SqliteDb, id: &str, undecodable: &str
             db,
             &t.id,
             "UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait') WHERE id=?",
+            crate::ConditionChange::Legacy,
         )
         .bind(&t.id)
         .execute(db.pool())
