@@ -66,7 +66,10 @@ async fn missing_candidate_real_writer_equals_legacy_oracle() {
 
         writer_marks.push((
             row.condition.evidence().stated,
-            row.condition.evidence().ownership.len(),
+            serde_json::to_value(row.condition.evidence())
+                .unwrap()
+                .get("ownership")
+                .map_or(0, |owners| owners.as_array().unwrap().len()),
         ));
         let mut connection = db.pool().acquire().await.unwrap();
         let facts = db::ConditionFacts::load(&mut connection, &task.id)
@@ -254,28 +257,24 @@ async fn healthy_service_retry_hold_release_and_board_move_never_park_unreadable
         Some(agent_id.clone()),
     )
     .await;
-    db::task_condition::test_support::set_task_condition(
-        &db,
-        &retry_task.id,
-        db::ConditionStatement::Edit {
-            edit: Box::new(db::ConditionOwnerEdit {
-                owner: db::ConditionReasonOwner::Diagnostic,
-                expected: None,
-                replacement: Some(db::ConditionReplacement {
-                    identity: db::ConditionIdentity::Entry {
-                        epoch: 0,
-                        transition_id: None,
-                    },
-                    condition: db::StatedCondition::Parked {
-                        reason: db::ParkReason::Failure {
-                            failure_kind: api_types::FailureKind::ExecutorFailed,
-                        },
-                        resume: db::ConditionContinuation::Reconcile,
-                        since: None,
-                        presentation: Default::default(),
-                    },
-                }),
-            }),
+    TaskRepo::update_status(
+        &*db,
+        db::UpdateTaskStatus {
+            id: retry_task.id.clone(),
+            expected_version: retry_task.version,
+            status: retry_task.status.clone(),
+            assignee_id: None,
+            error_annotation: None,
+            blocked_json: Some(Some(
+                serde_json::json!({
+                    "kind": "executor_failed",
+                    "reason": "retry fixture",
+                    "created_at": now_rfc3339(),
+                })
+                .to_string(),
+            )),
+            failed_json: None,
+            updated_at: now_rfc3339(),
         },
     )
     .await

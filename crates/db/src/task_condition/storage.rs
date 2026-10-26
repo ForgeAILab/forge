@@ -58,13 +58,7 @@ fn newer_encoding(value: &serde_json::Value) -> bool {
             .unwrap_or_default()
     }
     let evidence = value.get("evidence");
-    list(evidence.and_then(|e| e.get("ownership")))
-        .iter()
-        .any(|v| {
-            serde_json::from_value::<ConditionOwnership>(v.clone())
-                .is_err_and(|e| e.to_string().starts_with("unknown variant"))
-        })
-        || unknown_reason(value.get("primary"))
+    unknown_reason(value.get("primary"))
         || unknown_reason(value.get("failure"))
         || unknown_tag::<ConditionContinuation>(value.get("resume"))
         || list(value.get("additional"))
@@ -446,9 +440,6 @@ impl SqliteDb {
         // mark and none of the legacy copies the recomputation carries, and
         // the two can only be compared without them.
         let agrees = |facts: ConditionFacts| {
-            if condition.evidence().stated && !condition.evidence().ownership.is_empty() {
-                return facts.apply(recovery::owner_base(&claim)).typed() == condition.typed();
-            }
             let expected = facts.condition(&bare);
             if condition.integration_reason().is_some() || condition.check_witness().is_some() {
                 expected.typed() == condition.typed()
@@ -559,9 +550,7 @@ impl SqliteDb {
             .await?;
         decode(&actual)?;
         let facts = ConditionFacts::load(&mut connection, &task.id).await?;
-        let stored = decode(&actual).ok();
-        let expected =
-            recovery::expected(&facts, &LegacyConditionInput::from(task), stored.as_ref());
+        let expected = facts.condition(&LegacyConditionInput::from(task));
         if !TaskCondition::stored_agrees(actual.as_bytes(), &expected, &encode(&expected)) {
             return Err(DbError::Check(format!(
                 "Task condition invariant failed for {}",
@@ -582,15 +571,7 @@ impl SqliteDb {
         for row in &rows {
             let id: String = row.try_get(6)?;
             let facts = ConditionFacts::load(&mut connection, &id).await?;
-            let stored: Vec<u8> = row.try_get(5)?;
-            let stored = std::str::from_utf8(&stored)
-                .ok()
-                .and_then(|s| decode(s).ok());
-            let expected = recovery::expected(
-                &facts,
-                &LegacyConditionInput::from_row(row)?,
-                stored.as_ref(),
-            );
+            let expected = facts.condition(&LegacyConditionInput::from_row(row)?);
             if !TaskCondition::stored_agrees(
                 &row.try_get::<Vec<u8>, _>(5)?,
                 &expected,

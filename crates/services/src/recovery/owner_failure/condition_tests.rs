@@ -127,7 +127,10 @@ async fn owner_reset_real_writer_equals_legacy_oracle_and_retains_long_text() {
 
         writer_marks.push((
             row.condition.evidence().stated,
-            row.condition.evidence().ownership.len(),
+            serde_json::to_value(row.condition.evidence())
+                .unwrap()
+                .get("ownership")
+                .map_or(0, |owners| owners.as_array().unwrap().len()),
         ));
         let mut connection = db.pool().acquire().await.unwrap();
         let facts = db::ConditionFacts::load(&mut connection, &task.id)

@@ -16,37 +16,16 @@ use api_types::{FailureKind, InterruptionMetadata, TaskBlockingAnnotation};
 pub enum ConditionStatement {
     /// Explicit no-op on owned reasons; durable lifecycle facts still refresh.
     Preserve,
-    Edit {
-        edit: Box<ConditionOwnerEdit>,
-    },
-    /// Replace the diagnostic slot with the same supersession as its legacy write.
-    /// An annotation-only writer leaves the existing interruption intact.
-    ReplaceDiagnostic {
-        replacement: Box<ConditionReplacement>,
-        preserve_interruption: bool,
-    },
-    /// Rollback under the enclosing command's unchanged-version/admission fences.
-    Restore {
-        saved: Box<SavedTaskCondition>,
-        expected_epoch: i64,
-        expected_condition_digest: String,
-    },
     /// Replace only integration's reason, preserving every other owner.
     /// Fenced on the attempt: the owning attempt restates freely; another
     /// attempt is refused unless none owns the row (never stated, cleared,
     /// or handed off to a role).
-    Integration {
-        reason: IntegrationReason,
-    },
+    Integration { reason: IntegrationReason },
     /// The Task step has sent repair/review back to its configured role.
     /// Retain lineage while allowing ordinary role admission and recovery.
-    IntegrationHandedOff {
-        attempt_id: IntegrationAttemptId,
-    },
+    IntegrationHandedOff { attempt_id: IntegrationAttemptId },
     /// Clear only the named attempt; a stale consumer cannot clear a successor.
-    IntegrationCleared {
-        attempt_id: IntegrationAttemptId,
-    },
+    IntegrationCleared { attempt_id: IntegrationAttemptId },
     /// The owner holds a Task that no execution is running for. The hold
     /// replaces the Task's diagnostic, interruption and failure, and drops
     /// its queued command, retry timer, dispatch refusal, environment wait
@@ -62,15 +41,10 @@ pub enum ConditionStatement {
     // --- durable check runner (plan 3.3 stage D) ---
     /// The Task's current status entry (`epoch`) waits on this check.
     /// Replaces only the check runner's reason, preserving every other owner.
-    Check {
-        wait: CheckWait,
-        epoch: i64,
-    },
+    Check { wait: CheckWait, epoch: i64 },
     /// The named consumer's wait is over (its result was applied, or it is
     /// no longer the one in charge). Another consumer's wait is left alone.
-    CheckCleared {
-        consumer_id: String,
-    },
+    CheckCleared { consumer_id: String },
 }
 
 impl ConditionStatement {
@@ -189,18 +163,61 @@ impl ConditionStatement {
     /// hooks, execution, children, cancellations) are laid over it.
     pub(super) fn apply(&self, stored: &TaskCondition) -> TaskCondition {
         if matches!(self, Self::Preserve) {
-            let mut carried = recovery::owner_base(stored);
-            carried.evidence_mut().stated = true;
-            return carried;
-        }
-        if let Self::Restore { saved, .. } = self {
-            let mut restored = saved.condition().clone();
-            restored.evidence_mut().stated = true;
-            return restored;
+            let mut evidence = stored.evidence().clone();
+            evidence.error_annotation = None;
+            evidence.blocked_json = None;
+            evidence.failed_json = None;
+            evidence.entry_barrier_json = None;
+            evidence.metadata.clear();
+            evidence.unparsed_metadata = None;
+            evidence.stated = true;
+            evidence.observations.retain(|r| !matches!(r,
+                ParkReason::UnknownCondition { source, problem: UnknownConditionProblem::UnownedEntry }
+                    if source.field == LegacyConditionField::MetadataJson && source.key.as_deref() == Some("coordination_review_pending")));
+
+            let mut reasons: Vec<_> = stored
+                .reasons()
+                .filter(|r| {
+                    !matches!(r, ParkReason::Children { .. })
+                        && !matches!(r, ParkReason::RemoteCancelPending { source }
+                            if source.field == LegacyConditionField::PendingRemoteCancel)
+                })
+                .cloned()
+                .collect();
+            return match stored {
+                TaskCondition::Parked { resume, since, .. }
+                | TaskCondition::Failed { resume, since, .. }
+                    if !reasons.is_empty() =>
+                {
+                    let primary = reasons.remove(0);
+                    if matches!(stored, TaskCondition::Failed { .. }) {
+                        TaskCondition::Failed {
+                            failure: primary,
+                            additional: reasons,
+                            resume: resume.clone(),
+                            since: since.clone(),
+                            evidence,
+                        }
+                    } else {
+                        TaskCondition::Parked {
+                            primary,
+                            additional: reasons,
+                            resume: resume.clone(),
+                            since: since.clone(),
+                            evidence,
+                        }
+                    }
+                }
+                TaskCondition::Deferred { .. } => {
+                    let mut carried = stored.clone();
+                    *carried.evidence_mut() = evidence;
+                    carried
+                }
+                _ => TaskCondition::Clear { evidence },
+            };
         }
         if self.owner_stated() {
             let mut stated = stored.typed();
-            stated.evidence_mut().ownership = stored.evidence().ownership.clone();
             stated.evidence_mut().diagnostic_ids = stored.evidence().diagnostic_ids.clone();
             stated.evidence_mut().stated = true;
             return stated;
@@ -260,9 +277,6 @@ impl ConditionStatement {
         let material;
         match self {
             Self::Preserve
-            | Self::Edit { .. }
-            | Self::ReplaceDiagnostic { .. }
-            | Self::Restore { .. }
             | Self::Integration { .. }
             | Self::IntegrationHandedOff { .. }
             | Self::IntegrationCleared { .. }

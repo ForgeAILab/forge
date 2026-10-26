@@ -35,10 +35,8 @@ pub use task_condition::{
     MAPPING_REVISION, MAPPING_REVISION_KEY,
 };
 pub use task_condition::{
-    ConditionDiagnostic, ConditionIdentity, ConditionInterruption, ConditionOwnerEdit,
-    ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
-    DiagnosticOwner, RecordTaskDiagnosticText, SavedTaskCondition, StatedCondition,
-    TaskDiagnosticText, TaskDiagnosticTextPage, DIAGNOSTIC_TEXT_LIMIT,
+    DiagnosticOwner, RecordTaskDiagnosticText, TaskDiagnosticText, TaskDiagnosticTextPage,
+    DIAGNOSTIC_TEXT_LIMIT,
 };
 mod task_mutation;
 mod task_step;

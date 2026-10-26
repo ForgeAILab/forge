@@ -6172,13 +6172,10 @@ parks, wait/deadline rows, queue receipts, pending cancellations or immutable ev
 
 ### Task condition statements and diagnostic text (3.1, in progress)
 
-3.1 converts writers before removing storage. Writers still write the four
-legacy columns and condition metadata; unconverted aggregates continue to use
-the existing mapper. Column/key removal, the final reader guard and diagnostic
-REST/UI exposure belong to later gates. This checkpoint adds
-`task_diagnostic_text` and captures full source text in it. It retains internal
-typed contracts for later writer conversions; it does not delete or rewrite
-existing Task data. Under the active `LegacyOracle` policy, stored condition
+3.1 keeps the four condition columns as storage and converts their writers to
+typed values in place. `map_legacy_condition` remains the producer of the cached
+`condition_json`. This checkpoint retains `task_diagnostic_text` and full source
+text capture without deleting or rewriting existing Task data. Stored condition
 bytes, public projections, offers, failure kinds, Operations text and Attention
 digests retain main `6120c133` behavior, including corruption repair, except for
 duplicate lifecycle facts on coordination roots. Integration/Check statements
@@ -6192,20 +6189,12 @@ and facts. The strict witness check is unchanged; holds and failures remain in
 place.
 
 **Typed write contract.** `ConditionStatement` includes explicit `Preserve`,
-owner `Edit`, and typed `Restore` alongside Hold/Release and the independently
-owned integration/check statements. An edit names a `ConditionReasonOwner`, an
-optional expected `ConditionIdentity`, and either an explicit owned clear or a
-`ConditionReplacement`. Identities name an entry epoch and its entry, execution,
-step, Review, budget window, marker, machine or operation/generation. Replacement identity must
-belong to the current epoch. A mismatching expected identity refuses the write;
-a clear removes only that owner's reasons and retains other owners. Owner
-records retain typed presentation and material-blocker projections, so clearing
-a primary reason reveals the remaining owner's diagnosis. The owner-edit contract
-can preserve a foreign hold. `ReplaceDiagnostic` describes diagnostic-slot
-supersession; its writer conversions remain unit A targets, alongside the hold
-writers. Those conversions must retain the exact legacy interruption reasons,
-failure-kind precedence and assignment guidance across two writes. Integration and check ownership still require their original
-claimed-step seam.
+Hold/Release and the independently owned integration/check statements.
+Integration and check ownership still require their original claimed-step seam.
+The unused owner records, identity/edit/replacement/restore contracts and second
+owner composer have been removed. No tagged release contained these contracts or
+could queue their statement kinds; released mutation payloads retain their
+existing decoders and replay paths.
 
 Converted writers still shipping at this checkpoint:
 
@@ -6219,20 +6208,11 @@ typed fields (`ConditionStatement::hold_operator_text`), byte for byte what the
 annotation held before. Other hold paths, including stopping a running execution
 and releasing a stopped run, still use the mapping.
 
-`StatedCondition` states Parked, Failed or Deferred from caller intent.
-`ConditionPresentation` supplies typed diagnostic, interruption, failure, retry
-and refusal fields. The seam does not parse the legacy fields just written to
-infer an edit. `SavedTaskCondition` captures typed rollback state and diagnostic
-references, without the legacy evidence copies, for storage in the owning
-command/checkpoint. Rollback is outside `condition_json`; its caller must retain
-its command, unchanged-version, assignment, admission and epoch fences. A Restore
-also requires the current epoch and the exact stored-condition SHA-256, so a
-same-version owner edit cannot be overwritten by a late rollback. A scoped
-statement applies once per Task mutation; subsequent recomputations preserve its
-result rather than recording another text occurrence or repeating Restore's fence.
+A scoped statement applies once per Task mutation; subsequent recomputations
+preserve its result rather than recording another text occurrence. Preserve
+removes previously projected lifecycle facts before applying the current facts.
 A pending recompute cache is fenced by the exact input version and condition digest;
 a newer stored condition is preserved instead of being overwritten by that cache.
-Lifted legacy owners use a witnessed or current entry epoch; no epoch is invented.
 
 `Conditioned<T>` requires a condition with the write input. The durable
 `TaskMutation::Conditioned` envelope keeps it with the mutation, and
@@ -6262,8 +6242,7 @@ statements remain in use. Other S caller files and aggregates A–E still need t
 conversion. Unconverted writers continue to map legacy after their write, so an
 intermediate gate does not silently change their intent. The mapping remains the
 independent per-writer oracle while dual write continues. Existing Hold/Release
-and Integration/Check statements edit the stored condition as on main; only the
-new statement contracts remove previously projected lifecycle facts first.
+and Integration/Check statements edit the stored condition as on main.
 Stated rows compare by their typed condition, as on main. Unstated rows compare
 exact stored bytes, including all legacy evidence copies. Typed/public causes
 and material Attention inputs agree immediately and after an ordinary legacy
@@ -6281,8 +6260,8 @@ text. Records are never pruned while the Task lives. Each text entry is capped a
 `… [truncated]` marker; length and digest describe the original source.
 
 `record_task_diagnostic_text_in_tx` shares the caller's transaction. Typed Hold
-and owner-edit statements pass their full source text before applying the existing
-presentation limits. Capture does not add references to ordinary statement encodings. Superseded
+statements pass their full source text before applying the existing presentation
+limits. Capture does not add references to ordinary statement encodings. Superseded
 text remains independently readable after a clear. The DB-only
 `task_diagnostic_text` / `task_diagnostic_texts` methods support on-demand detail
 reads. Pages order by `(created_at, id)`, use an opaque tuple cursor, fetch
@@ -6306,7 +6285,7 @@ newer encoding. While legacy storage is written, corruption is rebuilt from the
 legacy mapping plus durable facts in the same writer transaction or within one
 check sweep, as before this checkpoint. Every statement family uses that fallback
 on corruption; its text is retained without applying an edit over an empty
-condition. Under the active LegacyOracle policy, checks retain main's strict
+condition. Checks retain main's strict
 comparison: unstated rows compare byte for byte, stated rows by typed value.
 Original bytes are also retained as diagnostic text (base64 for non-UTF-8 bytes),
 without adding diagnostic ids or any other field to the stored condition.
@@ -6315,17 +6294,8 @@ lands; it and the check use the same oracle. Each failed recomputation or repair
 logged without stored text and skipped, so the cursor and revision marker advance
 past a bad row.
 
-The internal `UnreadablePolicy::DurableOwners` machinery is dormant. Unit R must
-select it in code in the same gate that removes the dispatcher's legacy resolve.
-In that policy, running executions, exact entry steps, Review/human roles and
-integration identities can decide recovery; otherwise the Task parks on typed
-`UnknownCondition(ConditionJson)`. This policy is tested explicitly, rather than
-changing main's corruption semantics during dual write. Healthy Retry, Hold,
-Release and board moves remain covered through their real services.
-
-A recognizable newer tag, including an unknown typed owner/identity, or an
-unreadable row under a newer recorded mapping revision remains quarantined
-byte for byte. Statements refuse the entire transaction with
+A recognizable newer tag or an unreadable row under a newer recorded mapping
+revision remains quarantined byte for byte. Statements refuse the entire transaction with
 `DbError::TaskConditionQuarantined`, mapped through
 `ServiceError::TaskConditionQuarantined` to HTTP 409
 `task_condition_quarantined`; the legacy annotation and version bump roll back.
