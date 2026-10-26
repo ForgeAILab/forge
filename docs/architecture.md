@@ -6270,9 +6270,9 @@ reads do not join the text table. Later writer
 conversions must supply their own full text, and 5b must import existing
 legacy-only messages and saved/superseded text before deleting their storage.
 
-**Whole-record ceiling.** The whole-record ceiling lands with unit R. This
-checkpoint preserves MAIN's condition encoding, including complete witnesses and
-collections, and its existing per-string presentation limits. Full diagnostic
+**Whole-record ceiling.** There is no whole-record size ceiling on
+`condition_json` yet. The stored condition keeps complete witnesses and
+collections and the existing per-string presentation limits. Full diagnostic
 text is captured separately without compacting the stored condition.
 
 Operations retains its existing operator-reason document: strings within JSON are
