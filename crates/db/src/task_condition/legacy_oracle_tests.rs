@@ -7,20 +7,6 @@ use serde_json::json;
 async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
     let db = db().await;
     let at = "2026-10-25T00:00:00Z";
-    let replacement = ConditionReplacement {
-        identity: ConditionIdentity::Entry {
-            epoch: 0,
-            transition_id: None,
-        },
-        condition: StatedCondition::Parked {
-            reason: ParkReason::Failure {
-                failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-            },
-            resume: ConditionContinuation::Reconcile,
-            since: None,
-            presentation: ConditionPresentation::default(),
-        },
-    };
     let statements = vec![
         ConditionStatement::Hold {
             actor: "user".into(),
@@ -29,22 +15,6 @@ async fn corrupt_statements_keep_legacy_reasons_and_base_write_outcomes() {
         },
         ConditionStatement::Preserve,
         ConditionStatement::Release,
-        ConditionStatement::Restore {
-            saved: Box::new(SavedTaskCondition::capture(&TaskCondition::default())),
-            expected_epoch: 0,
-            expected_condition_digest: diagnostics::digest(b"{}"),
-        },
-        ConditionStatement::ReplaceDiagnostic {
-            replacement: Box::new(replacement.clone()),
-            preserve_interruption: true,
-        },
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Diagnostic,
-                expected: None,
-                replacement: Some(replacement),
-            }),
-        },
         ConditionStatement::Integration {
             reason: IntegrationReason::Waiting {
                 attempt_id: IntegrationAttemptId::new("attempt"),
@@ -344,54 +314,6 @@ async fn integration_and_check_match_legacy_on_flagged_root_without_children() {
 #[tokio::test]
 async fn integration_and_check_match_legacy_on_unblocked_root_with_children() {
     coordination_statement_matches_legacy(None, true).await;
-}
-
-#[tokio::test]
-async fn legacy_check_repairs_divergent_stated_ownership_in_one_sweep() {
-    let db = db().await;
-    task(&db, "stated-divergence").await;
-    let row = TaskRepo::get_by_id(&db, "stated-divergence", false)
-        .await
-        .unwrap()
-        .unwrap();
-    let mut c = db.pool().acquire().await.unwrap();
-    let facts = ConditionFacts::load(&mut c, &row.id).await.unwrap();
-    drop(c);
-    let mut input = LegacyConditionInput::from(&row);
-    input.facts = Some(facts);
-    let expected = map_legacy_condition(&input);
-    let statement = ConditionStatement::Edit {
-        edit: Box::new(ConditionOwnerEdit {
-            owner: ConditionReasonOwner::Diagnostic,
-            expected: None,
-            replacement: Some(ConditionReplacement {
-                identity: ConditionIdentity::Entry {
-                    epoch: 0,
-                    transition_id: None,
-                },
-                condition: StatedCondition::Parked {
-                    reason: ParkReason::Failure {
-                        failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-                    },
-                    resume: ConditionContinuation::Reconcile,
-                    since: None,
-                    presentation: Default::default(),
-                },
-            }),
-        }),
-    };
-    super::test_support::set_task_condition(&db, &row.id, statement)
-        .await
-        .unwrap();
-    let report = db
-        .check_task_conditions_of(std::slice::from_ref(&row.id))
-        .await
-        .unwrap();
-    assert_eq!(report, 1);
-    assert_eq!(
-        db.task_condition(&row.id).await.unwrap().typed(),
-        expected.typed()
-    );
 }
 
 #[tokio::test]

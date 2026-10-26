@@ -74,8 +74,6 @@ pub struct ConditionEvidence {
     pub observations: Vec<ParkReason>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ownership: Vec<ConditionOwnership>,
     /// Authoritative typed reader inputs, captured before evidence truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<ConditionRead>,
@@ -324,7 +322,6 @@ impl TaskCondition {
         let evidence = typed.evidence_mut();
         evidence.stated = false;
         evidence.diagnostic_ids.clear();
-        evidence.ownership.clear();
         evidence.error_annotation = None;
         evidence.blocked_json = None;
         evidence.failed_json = None;
@@ -1144,7 +1141,6 @@ pub(crate) fn map_view(view: &LegacyView<'_>) -> TaskCondition {
 
     let evidence = ConditionEvidence {
         diagnostic_ids: Vec::new(),
-        ownership: Vec::new(),
         presentation: Some(ConditionRead::import(view)),
         observations,
         witnesses: Vec::new(),
@@ -1276,14 +1272,6 @@ use storage::{encode, set_condition, Stored};
 pub mod channels;
 mod write;
 pub(crate) use write::{fence_statement_version_in_tx, with_statement, with_statement_at_version};
-mod intent;
-mod owner_projection;
-pub use intent::{
-    ConditionDiagnostic, ConditionIdentity, ConditionInterruption, ConditionOwnerEdit,
-    ConditionOwnership, ConditionPresentation, ConditionReasonOwner, ConditionReplacement,
-    SavedTaskCondition, StatedCondition,
-};
-mod diagnostic_projection;
 mod diagnostics;
 pub use diagnostics::{
     DiagnosticOwner, RecordTaskDiagnosticText, TaskDiagnosticText, TaskDiagnosticTextPage,

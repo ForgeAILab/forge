@@ -136,25 +136,6 @@ pub(crate) async fn fence_statement_version_in_tx(
 }
 
 impl SqliteDb {
-    /// Identity read under the caller's Task CAS, without any legacy input.
-    pub async fn task_condition_entry_identity(
-        &self,
-        task_id: &str,
-        expected_version: i64,
-    ) -> Result<ConditionIdentity> {
-        let epoch: i64 =
-            sqlx::query_scalar("SELECT status_epoch FROM task WHERE id=? AND version=?")
-                .bind(task_id)
-                .bind(expected_version)
-                .fetch_optional(self.pool())
-                .await?
-                .ok_or(DbError::VersionConflict)?;
-        Ok(ConditionIdentity::Entry {
-            epoch,
-            transition_id: None,
-        })
-    }
-
     /// The statement and mutation share the existing writer's transaction and
     /// fences. When queued, both are durable in the same TaskMutation payload.
     pub async fn apply_conditioned_task_mutation<T: serde::de::DeserializeOwned>(
@@ -208,8 +189,8 @@ pub(super) async fn record_statement_text(
     statement: &ConditionStatement,
 ) -> Result<()> {
     let mut texts: Vec<(&str, &str, DiagnosticOwner)> = Vec::new();
-    match statement {
-        ConditionStatement::Hold { actor, reason, .. } => texts.push((
+    if let ConditionStatement::Hold { actor, reason, .. } = statement {
+        texts.push((
             "hold",
             reason,
             DiagnosticOwner::Reason {
@@ -217,69 +198,7 @@ pub(super) async fn record_statement_text(
                     actor: actor.clone(),
                 },
             },
-        )),
-        ConditionStatement::ReplaceDiagnostic { replacement, .. } => {
-            let edit = ConditionStatement::Edit {
-                edit: Box::new(ConditionOwnerEdit {
-                    owner: ConditionReasonOwner::Diagnostic,
-                    expected: None,
-                    replacement: Some(*replacement.clone()),
-                }),
-            };
-            return Box::pin(record_statement_text(c, task_id, &edit)).await;
-        }
-        ConditionStatement::Edit { edit } => {
-            if let Some(replacement) = &edit.replacement {
-                let presentation = match &replacement.condition {
-                    StatedCondition::Parked { presentation, .. }
-                    | StatedCondition::Failed { presentation, .. }
-                    | StatedCondition::Deferred { presentation, .. } => presentation,
-                };
-                let reason = match &replacement.condition {
-                    StatedCondition::Parked { reason, .. }
-                    | StatedCondition::Failed { reason, .. } => Some(reason.clone()),
-                    _ => None,
-                };
-                let owner = reason
-                    .map(|reason| DiagnosticOwner::Reason { reason })
-                    .unwrap_or(DiagnosticOwner::StoredCondition);
-                let source = match edit.owner {
-                    ConditionReasonOwner::Hold => "hold",
-                    ConditionReasonOwner::Diagnostic => "diagnostic",
-                    ConditionReasonOwner::Budget { .. } => "budget",
-                    ConditionReasonOwner::Entry => "entry",
-                    ConditionReasonOwner::Human => "human",
-                    ConditionReasonOwner::Retry => "retry",
-                    ConditionReasonOwner::Dispatch => "dispatch",
-                    ConditionReasonOwner::Placement => "placement",
-                    ConditionReasonOwner::Environment => "environment",
-                    ConditionReasonOwner::OwnerConnection => "owner_connection",
-                    ConditionReasonOwner::PlanTransport => "plan_transport",
-                    ConditionReasonOwner::Dependencies => "dependencies",
-                    ConditionReasonOwner::Coordination => "coordination",
-                    ConditionReasonOwner::ProjectPause => "project_pause",
-                };
-                if let Some(d) = &presentation.diagnostic {
-                    texts.push((source, &d.blocking_reason, owner.clone()));
-                    if let Some(message) = &d.message {
-                        texts.push((source, message, owner.clone()));
-                    }
-                }
-                if let Some(i) = &presentation.interruption {
-                    texts.push((source, &i.reason, owner.clone()));
-                }
-                if let Some(retry) = &presentation.retry {
-                    texts.push((source, &retry.reason, owner.clone()));
-                }
-                if let Some(refusal) = &presentation.refusal {
-                    texts.push((source, &refusal.safe_message, owner.clone()));
-                }
-                if let Some(failure) = &presentation.failure_message {
-                    texts.push((source, failure, owner));
-                }
-            }
-        }
-        _ => {}
+        ));
     }
     let mut seen = std::collections::BTreeSet::new();
     for (source, text, owner) in texts {
