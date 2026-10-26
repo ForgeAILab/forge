@@ -6,6 +6,7 @@ async fn typed_executor_failure_matches_archived_main_for_every_shape_and_second
     let mut visited = 0;
     for shape in SHAPES {
         let db = Arc::new(sqlite_db().await);
+        let _clock = freeze_clock();
         let projector = attention_projector(&db);
         let (project, _) = seed_project_repo(&db).await;
         let task = seed_task(&db, project, "in_progress".into(), None).await;

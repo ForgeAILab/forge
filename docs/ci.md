@@ -95,6 +95,29 @@ own feature is the exception: only `api` dev-depends on
 that feature itself. Agent-host likewise explicitly enables its own
 `test-support` feature for the session-journal integration target.
 
+### Archived condition parity oracle
+
+The two condition writer tests compare 16 shapes at the first write, a metadata
+write, and the queue merge against `conditions-main-37309bb9.jsonl` (96 cases).
+Each case initializes its SQLite schema before holding a
+`db::test_clock::freeze` guard from before seeding through the last projection.
+This keeps shared migration-template initialization outside the override. The
+guard is available only with `db/test-template`, forwarded
+by `services/test-support`; it affects `now_rfc3339()` on that thread and restores
+the previous clock on drop. The harness asserts a current-thread Tokio runtime.
+The sequence starts at `2026-10-25T00:00:00.123456+00:00`, advances one microsecond
+per call, and always uses six fractional digits and the production UTC offset
+spelling (`+00:00`), including at whole milliseconds and seconds.
+
+The archived-main generator uses the same clock and harness. Fingerprints cover
+exact bytes after replacing random Task and Project IDs. Timestamps, long-reason
+padding, and recorded truncation lengths are preserved. This catches differences
+caused by production byte limits after timestamps have been embedded in text.
+The claim fixture uses the Task creation time for availability and a fixed
+future lease, avoiding a real-time deadline and mixed RFC3339 text ordering.
+SQL trigger timestamps remain outside these compared fields; they are not
+rewritten by the harness. Production builds keep the wall clock unchanged.
+
 ### Test features and required-features
 
 `forge-agent-host`, `services` and `db` do not dev-depend on themselves.

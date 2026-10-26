@@ -55,14 +55,14 @@ pub(crate) async fn claim(db: &SqliteDb, task: &Task) -> TaskStep {
         expected_version: task.version,
         expected_epoch: None,
         lane: "fast".into(),
-        available_at: AT.into(),
+        available_at: task.created_at.clone(),
     })
     .await
     .unwrap();
     db.claim_step(
         "condition-acceptance",
         Some(&task.id),
-        &db::task_writer::lease_deadline(),
+        "2099-01-01T00:00:00+00:00",
     )
     .await
     .unwrap()
@@ -201,104 +201,18 @@ pub(crate) async fn seed_shape(db: &SqliteDb, task: &Task, shape: &str) {
     tx.commit().await.unwrap();
 }
 
-fn normalized(raw: &str, row: &Task) -> String {
-    fn times(value: &Value, found: &mut Vec<String>) {
-        match value {
-            Value::String(text) => {
-                if chrono::DateTime::parse_from_rfc3339(text).is_ok() && !text.starts_with("2099-")
-                {
-                    found.push(text.clone());
-                } else if let Ok(nested) = serde_json::from_str::<Value>(text) {
-                    if nested.is_object() || nested.is_array() {
-                        times(&nested, found);
-                    }
-                }
-            }
-            Value::Object(fields) => fields.values().for_each(|value| times(value, found)),
-            Value::Array(values) => values.iter().for_each(|value| times(value, found)),
-            _ => {}
-        }
-    }
-    let originals = [
-        row.error_annotation.as_deref(),
-        row.blocked_json.as_deref(),
-        row.failed_json.as_deref(),
-        row.entry_barrier_json.as_deref(),
-        row.metadata_json.as_deref(),
-    ];
-    let mut timestamps = vec![row.created_at.clone(), row.updated_at.clone()];
-    for text in std::iter::once(raw).chain(originals.iter().copied().flatten()) {
-        if let Ok(value) = serde_json::from_str(text) {
-            times(&value, &mut timestamps);
-        }
-    }
-    timestamps.sort_by_key(|time| std::cmp::Reverse(time.len()));
-    timestamps.dedup();
-    let mut output = raw
-        .replace(&row.id, "fixture-task")
-        .replace(&row.project_id, "fixture-project");
-    let mut sources: Vec<_> = originals
-        .into_iter()
-        .flatten()
-        .filter(|source| source.len() > db::task_condition::EVIDENCE_VALUE_LIMIT)
-        .map(|source| (source.len(), source.to_owned()))
-        .collect();
-    for time in timestamps {
-        let without_precision = if let Some((seconds, fraction)) = time.split_once('.') {
-            let timezone = fraction.trim_start_matches(|ch: char| ch.is_ascii_digit());
-            format!("{seconds}.<frac>{timezone}")
-        } else {
-            time.clone()
-        };
-        let placeholder: String = without_precision
-            .chars()
-            .map(|ch| if ch.is_ascii_digit() { '0' } else { ch })
-            .collect();
-        output = output.replace(&time, &placeholder);
-        for (_, source) in &mut sources {
-            *source = source.replace(&time, &placeholder);
-        }
-    }
-    // Evidence also records the original document's byte length. Preserve that
-    // count with only the clock-width delta removed, before collapsing filler.
-    for (original_length, source) in sources {
-        output = output.replace(
-            &format!("…[truncated; {original_length} bytes]"),
-            &format!("…[truncated; {} bytes]", source.len()),
-        );
-    }
-    collapse_long_reason_filler(&output)
+pub(crate) fn freeze_clock() -> db::test_clock::Guard {
+    assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread,
+        "the parity clock must stay on its test thread"
+    );
+    db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap())
 }
 
-fn collapse_long_reason_filler(raw: &str) -> String {
-    // Only the hold's `h` and the writers' `z` are fixture padding. Clock
-    // precision changes how much survives a cut made after an embedded time.
-    let bytes = raw.as_bytes();
-    let mut output = String::with_capacity(raw.len());
-    let mut copied = 0;
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        let filler = bytes[cursor];
-        if !matches!(filler, b'h' | b'z') {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        while cursor < bytes.len() && bytes[cursor] == filler {
-            cursor += 1;
-        }
-        if cursor - start >= 64 {
-            output.push_str(&raw[copied..start]);
-            output.push_str(if filler == b'h' {
-                "<long-reason:h>"
-            } else {
-                "<long-reason:z>"
-            });
-            copied = cursor;
-        }
-    }
-    output.push_str(&raw[copied..]);
-    output
+fn normalize_ids(raw: &str, row: &Task) -> String {
+    raw.replace(&row.id, "fixture-task")
+        .replace(&row.project_id, "fixture-project")
 }
 
 fn fingerprint(raw: &str) -> Value {
@@ -378,7 +292,7 @@ async fn attention_incident_digest(
         .scope_id
         .replace(&row.project_id, "fixture-project")
         .replace(&row.id, "fixture-task");
-    attention.details_json = normalized(&attention.details_json, row);
+    attention.details_json = normalize_ids(&attention.details_json, row);
     Some(db::canonical_attention_incident_digest(&attention))
 }
 
@@ -415,7 +329,7 @@ pub(crate) async fn assert_main_snapshot(
         .unwrap();
     let mut canonical = row.clone();
     canonical.id = "fixture-task".into();
-    canonical.condition = serde_json::from_str(&normalized(&condition, row)).unwrap();
+    canonical.condition = serde_json::from_str(&normalize_ids(&condition, row)).unwrap();
     let offers = crate::task_actions::test_support::condition_offers(db, row).await;
     let event = db::CreateDomainEvent::task_interruption_changed(&canonical);
     let attention_incident_digest = attention_incident_digest(db, projector, row, phase).await;
@@ -441,7 +355,7 @@ pub(crate) async fn assert_main_snapshot(
         .map(|(key, value)| {
             (
                 key.clone(),
-                fingerprint(&normalized(&value.to_string(), row)),
+                fingerprint(&normalize_ids(&value.to_string(), row)),
             )
         })
         .collect();
@@ -462,132 +376,6 @@ fn assert_expected(actual: &Value) {
         "main byte/projection and canonical Attention parity: {}",
         actual["case"]
     );
-}
-
-#[tokio::test]
-async fn timestamp_normalization_preserves_format_and_fields() {
-    let db = sqlite_db().await;
-    let (project, _) = seed_project_repo(&db).await;
-    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
-    row.created_at = "2026-10-25T01:02:03.456Z".into();
-    row.updated_at = "2026-10-25T04:05:06+00:00".into();
-    let raw = json!({
-        "created_at": row.created_at,
-        "blocked_at": "2026-10-25T07:08:09.123456789+02:30",
-        "updated_at": row.updated_at,
-        "nested": r#"{"detected_at":"2026-10-25T10:11:12+02:30"}"#,
-        "not_before": "2099-01-01T00:00:00Z",
-    });
-    let expected = json!({
-        "created_at": "0000-00-00T00:00:00.<frac>Z",
-        "blocked_at": "0000-00-00T00:00:00.<frac>+00:00",
-        "updated_at": "0000-00-00T00:00:00+00:00",
-        "nested": r#"{"detected_at":"0000-00-00T00:00:00+00:00"}"#,
-        "not_before": "2099-01-01T00:00:00Z",
-    });
-    assert_eq!(normalized(&raw.to_string(), &row), expected.to_string());
-}
-
-#[tokio::test]
-async fn timestamp_normalization_ignores_platform_fractional_precision() {
-    let db = sqlite_db().await;
-    let (project, _) = seed_project_repo(&db).await;
-    let row = seed_task(&db, project, "in_progress".into(), None).await;
-    for timezone in ["Z", "+02:30", "-04:00"] {
-        let microseconds = json!({"detected_at": format!("2026-10-25T01:02:03.123456{timezone}")});
-        let nanoseconds =
-            json!({"detected_at": format!("2026-10-25T01:02:03.123456789{timezone}")});
-        assert_eq!(
-            normalized(&microseconds.to_string(), &row),
-            normalized(&nanoseconds.to_string(), &row),
-            "platform clock precision with timezone {timezone}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn timestamp_normalization_ignores_fraction_width_before_byte_cut() {
-    let db = sqlite_db().await;
-    let (project, _) = seed_project_repo(&db).await;
-    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
-    row.created_at = "2026-10-25T01:02:03.123456+00:00".into();
-    row.updated_at = "2026-10-25T01:02:03.123456789+00:00".into();
-    for filler in ['h', 'z'] {
-        for limit in [1024, 16 * 1024] {
-            let cut = |time: &str| {
-                let mut text = format!(
-                    "prefix:{time}:{time}:{}",
-                    filler.to_string().repeat(200_000)
-                );
-                text.truncate(limit);
-                text.push_str("… [truncated]:suffix");
-                json!({"operator_reason": text}).to_string()
-            };
-            let microseconds = cut(&row.created_at);
-            let nanoseconds = cut(&row.updated_at);
-            let expected = json!({"operator_reason": format!(
-                "prefix:0000-00-00T00:00:00.<frac>+00:00:0000-00-00T00:00:00.<frac>+00:00:<long-reason:{filler}>… [truncated]:suffix"
-            )});
-            assert_eq!(
-                normalized(&microseconds, &row),
-                normalized(&nanoseconds, &row),
-                "fraction width before {limit}-byte cut of {filler} filler"
-            );
-            assert_eq!(normalized(&microseconds, &row), expected.to_string());
-        }
-    }
-}
-
-#[tokio::test]
-async fn long_reason_normalization_preserves_run_boundaries_and_other_text() {
-    let db = sqlite_db().await;
-    let (project, _) = seed_project_repo(&db).await;
-    let row = seed_task(&db, project, "in_progress".into(), None).await;
-    let raw = format!(
-        "é😀prefix:{}:{}:middle:{}:{}:{}:suffix",
-        "h".repeat(63),
-        "h".repeat(64),
-        "z".repeat(63),
-        "z".repeat(200_000),
-        "x".repeat(64),
-    );
-    let expected = format!(
-        "é😀prefix:{}:<long-reason:h>:middle:{}:<long-reason:z>:{}:suffix",
-        "h".repeat(63),
-        "z".repeat(63),
-        "x".repeat(64),
-    );
-    assert_eq!(normalized(&raw, &row), expected);
-    assert_eq!(normalized(&expected, &row), expected);
-}
-
-#[tokio::test]
-async fn stored_evidence_normalization_ignores_timestamp_fraction_width() {
-    let db = sqlite_db().await;
-    let (project, _) = seed_project_repo(&db).await;
-    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
-    row.created_at = "2026-10-25T01:02:03.123456+00:00".into();
-    row.updated_at = "2026-10-25T01:02:03.123456789+00:00".into();
-    let mut projections = Vec::new();
-    for time in [&row.created_at, &row.updated_at] {
-        let mut snapshot = row.clone();
-        snapshot.error_annotation = Some(
-            json!({
-                "type": "workspace_reset_required",
-                "blocked_at": time,
-                "blocking_reason": "owner_workspace_reset_required",
-                "message": "z".repeat(200_000),
-            })
-            .to_string(),
-        );
-        let condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&snapshot));
-        let projection = normalized(&serde_json::to_string(&condition).unwrap(), &snapshot);
-        let source = snapshot.error_annotation.as_ref().unwrap();
-        let normalized_source = source.replace(time, "0000-00-00T00:00:00.<frac>+00:00");
-        assert!(projection.contains(&format!("…[truncated; {} bytes]", normalized_source.len())));
-        projections.push(projection);
-    }
-    assert_eq!(projections[0], projections[1]);
 }
 
 pub(crate) async fn assert_next_write(
