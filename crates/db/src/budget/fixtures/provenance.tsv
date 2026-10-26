@@ -1,0 +1,3 @@
+case	baseline	main_writer	producer
+review-entry-budget/first	9460941117b4e326c5f090c0e8f48b8f8d142c25	crates/db/src/budget.rs:1338	archived production writer; identical harness with emission only; original raw bytes unchanged
+review-entry-budget/following-unconverted-write	9460941117b4e326c5f090c0e8f48b8f8d142c25	crates/db/src/budget.rs:1338;crates/db/src/sqlite/task/repository.rs:705	archived production writer; identical harness with emission only; original raw bytes unchanged

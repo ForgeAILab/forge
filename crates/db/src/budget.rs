@@ -1,4 +1,5 @@
 //! Task budget policy and transactional accounting. Counts never come from audit prose.
+use crate::task_condition::channels as channel;
 use crate::{DbError, Result, Review, ReviewStatus, SqliteDb, Task};
 use api_types::{CanonicalPhase, GateConfig, StateDefinition, StateKind, WorkflowDefinition};
 use serde::{Deserialize, Serialize};
@@ -1271,7 +1272,6 @@ pub async fn grant_review_progress(
     tx.commit().await?;
     Ok(granted)
 }
-
 /// A failed review-entry hook with no failed Review consumes one Review
 /// attempt, owner-entered or not, exactly as base counted the bounce; only an
 /// entry the owner asked for as a review re-run
@@ -1331,20 +1331,19 @@ pub async fn failed_review_entry(
     tx.commit().await?;
     Ok((updated, allowed))
 }
-
 /// The entry barrier that parks a Task whose review entry budget ran out. The
 /// reset-and-retry offers key on its `blocking_reason`.
 pub fn exhausted_review_barrier(state: &str, started_at: &str) -> String {
-    serde_json::json!({
-        "state": state,
-        "status": "blocked",
-        "started_at": started_at,
-        "updated_at": crate::now_rfc3339(),
-        "blocking_reason": "review retry budget exhausted",
+    serde_json::to_string(&channel::EntryBarrier {
+        state: state.into(),
+        status: channel::BarrierStatus::Blocked,
+        started_at: Some(Some(started_at.into())),
+        updated_at: Some(Some(crate::now_rfc3339())),
+        blocking_reason: Some(Some("review retry budget exhausted".into())),
+        interrupted_at: None,
     })
-    .to_string()
+    .expect("entry barrier serializes")
 }
-
 /// A pre-upgrade verdict, or a crash between verdict persistence and disposition,
 /// is settled exactly once using the same charge point as a live verdict.
 pub async fn reconcile_failed_review(db: &SqliteDb, task: &Task, review: &Review) -> Result<()> {
@@ -1383,7 +1382,6 @@ pub async fn reconcile_failed_review(db: &SqliteDb, task: &Task, review: &Review
     tx.commit().await?;
     Ok(())
 }
-
 pub async fn matches_spent(
     tx: &mut Transaction<'_, Sqlite>,
     task: &str,
@@ -2492,3 +2490,5 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+mod condition_tests;

@@ -1,6 +1,7 @@
 use super::*;
 use crate::task_actions::{available_actions, TaskSnapshot};
 use api_types::{Offer, TaskAction, WorkflowTrigger};
+use db::task_condition::channels as channel;
 use operation_registry::task_proposals::action_parameters_allowed;
 
 tokio::task_local! { pub(crate) static TASK_ACTION_COMMAND: (); pub(crate) static TASK_ACTION_ACTOR: Actor; }
@@ -228,11 +229,37 @@ impl TaskService {
             let message = format!(
                 "Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."
             );
-            let parked=TaskRepo::update(&*self.db,db::UpdateTask {
-                id:queued.id.clone(),expected_version:queued.version,title:None,description:None,priority:None,merge_config:None,plan:None,
-                error_annotation:Some(Some(json!({"type":api_types::FailureKind::WorkspaceResetRequired,"blocking_reason":"pending_remote_cancel","blocked_by":format!("machine:{machines}"),"message":message}).to_string())),
-                blocked_json:None,failed_json:None,task_state_config:None,parent_task_id:None,updated_at:now_rfc3339(),
-            }).await?;
+            let parked = TaskRepo::update(
+                &*self.db,
+                db::UpdateTask {
+                    id: queued.id.clone(),
+                    expected_version: queued.version,
+                    title: None,
+                    description: None,
+                    priority: None,
+                    merge_config: None,
+                    plan: None,
+                    error_annotation: Some(Some(
+                        serde_json::to_string(&channel::ErrorAnnotation::new(
+                            channel::AnnotationShape::RemoteCancel(
+                                channel::RemoteCancelAnnotation {
+                                    kind: api_types::FailureKind::WorkspaceResetRequired,
+                                    blocking_reason: "pending_remote_cancel".into(),
+                                    blocked_by: format!("machine:{machines}"),
+                                    message,
+                                },
+                            ),
+                        ))
+                        .expect("remote cancel annotation serializes"),
+                    )),
+                    blocked_json: None,
+                    failed_json: None,
+                    task_state_config: None,
+                    parent_task_id: None,
+                    updated_at: now_rfc3339(),
+                },
+            )
+            .await?;
             return Ok(TaskActionResult {
                 task: parked,
                 action,
@@ -846,7 +873,13 @@ impl TaskService {
                 .hold_under_dependency_block(
                     &dropped,
                     db::ConditionStatement::hold_operator_text("user", reason, &now),
-                    json!({"kind":"manual_stop", "reason":reason, "created_at":now}).to_string(),
+                    serde_json::to_string(&channel::Interruption {
+                        kind: Some(Some(api_types::FailureKind::ManualStop.into())),
+                        reason: Some(reason.into()),
+                        created_at: Some(Some(now.clone())),
+                        ..Default::default()
+                    })
+                    .expect("hold interruption serializes"),
                 )
                 .await?
             {
@@ -864,7 +897,15 @@ impl TaskService {
             Some(db::ConditionStatement::hold_operator_text(
                 "user", reason, &now,
             )),
-            Some(json!({"kind":"manual_stop", "reason":reason, "created_at":now}).to_string()),
+            Some(
+                serde_json::to_string(&channel::Interruption {
+                    kind: Some(Some(api_types::FailureKind::ManualStop.into())),
+                    reason: Some(reason.into()),
+                    created_at: Some(Some(now.clone())),
+                    ..Default::default()
+                })
+                .expect("hold interruption serializes"),
+            ),
             None,
             &now,
             None,
@@ -1328,6 +1369,27 @@ impl TaskService {
                             serde_json::from_value::<api_types::FailureKind>(kind).ok()
                         })
                         .unwrap_or(api_types::FailureKind::ExecutorFailed);
+                    if kind != api_types::FailureKind::Unknown
+                        && serde_json::from_value::<channel::Interruption>(failure.clone()).is_ok()
+                    {
+                        return serde_json::to_string(&channel::ErrorAnnotation::new(
+                            channel::AnnotationShape::Blocking(channel::BlockingAnnotation {
+                                kind,
+                                blocking_reason: failure
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("failed Task")
+                                    .into(),
+                                blocked_by: None,
+                                blocked_at: None,
+                                blocked_execution_id: None,
+                                artifact: None,
+                                message: None,
+                                hook: None,
+                            }),
+                        ))
+                        .ok();
+                    }
                     serde_json::to_string(&api_types::TaskBlockingAnnotation {
                         annotation_type: kind,
                         blocking_reason: failure
@@ -1392,10 +1454,36 @@ impl TaskService {
         };
         let now = now_rfc3339();
         let repository_roles = Self::workflow_execution_roles(snapshot);
-        let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(&*self.db, &task.id, task.version, None, None, None, &now, None, repository_roles, vec![
-            db::TaskMetadataMutation::Set { key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(), value: serde_json::to_value(&queued).map_err(|error| ServiceError::invalid_operation(error.to_string()))? },
-            db::TaskMetadataMutation::Set { key: "deferred_dispatch".to_owned(), value: json!({ "not_before": now, "reason": "task action queued", "target_state": task.status }) },
-        ], None).await?;
+        let updated = TaskRepo::update_recovery_metadata_if_no_running_execution(
+            &*self.db,
+            &task.id,
+            task.version,
+            None,
+            None,
+            None,
+            &now,
+            None,
+            repository_roles,
+            vec![
+                db::TaskMetadataMutation::Set {
+                    key: crate::deferred_dispatch::QUEUED_RECOVERY_KEY.to_owned(),
+                    value: serde_json::to_value(&queued)
+                        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?,
+                },
+                db::TaskMetadataMutation::Set {
+                    key: "deferred_dispatch".to_owned(),
+                    value: serde_json::to_value(channel::DeferredDispatch {
+                        kind: None,
+                        not_before: now.clone(),
+                        reason: "task action queued".into(),
+                        target_state: task.status.clone(),
+                    })
+                    .expect("queued deferral serializes"),
+                },
+            ],
+            None,
+        )
+        .await?;
         let updated = if let Some(wait) = machine_wait {
             crate::deferred_dispatch::record_capacity_wait(&self.db, &updated, wait).await?;
             TaskRepo::get_by_id(&*self.db, &updated.id, false)
@@ -1790,3 +1878,6 @@ mod parameter_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod condition_tests;

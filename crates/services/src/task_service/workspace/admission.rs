@@ -1,6 +1,7 @@
 //! Workspace selection, capacity waits, and reservations.
 
 use super::*;
+use db::task_condition::channels as channel;
 
 impl TaskService {
     pub(crate) fn environment_daemon_connections(
@@ -203,23 +204,33 @@ impl TaskService {
                 .to_std()
                 .is_ok_and(|elapsed| elapsed >= self.workspace_max_disconnect);
         let owner_wait = daemon_id.as_ref().map(|daemon_id| {
-            json!({
-                "started_at": started_at.to_rfc3339(), "daemon_id": daemon_id,
+            serde_json::to_string(&channel::OwnerWait {
+                started_at: started_at.to_rfc3339(),
+                daemon_id: daemon_id.clone(),
+                plan_execution_id: None,
             })
-            .to_string()
+            .expect("owner wait serializes")
         });
         let deferral = (!expired).then(|| {
-            json!({
-                "target_state": task.status, "reason": reason,
-                "not_before": (now + chrono::Duration::seconds(30)).to_rfc3339(),
+            serde_json::to_string(&channel::DeferredDispatch {
+                target_state: task.status.clone(),
+                reason: reason.clone(),
+                kind: None,
+                not_before: (now + chrono::Duration::seconds(30)).to_rfc3339(),
             })
-            .to_string()
+            .expect("admission deferral serializes")
         });
         let annotation = expired.then(|| {
-            json!({"type": "recovery_required", "blocking_reason": "owner_disconnected_timeout",
-            "message": reason, "blocked_at": now.to_rfc3339(), "blocked_by": "system:workflow",
-})
-            .to_string()
+            serde_json::to_string(&channel::ErrorAnnotation::new(
+                channel::AnnotationShape::TimedBlock(channel::TimedBlockAnnotation {
+                    kind: api_types::FailureKind::RecoveryRequired,
+                    blocking_reason: "owner_disconnected_timeout".into(),
+                    message: reason.clone(),
+                    blocked_at: now.to_rfc3339(),
+                    blocked_by: "system:workflow".into(),
+                }),
+            ))
+            .expect("admission annotation serializes")
         });
         let unchanged_reason = !expired
             && crate::deferred_dispatch::pending_until(task).is_some_and(|pending| {
@@ -231,9 +242,14 @@ impl TaskService {
                 .and_then(|wait| wait["daemon_id"].as_str())
                 == daemon_id.as_deref();
         let blocked = expired.then(|| {
-            json!({"reason": reason, "created_at": now.to_rfc3339(),
-            "kind": api_types::FailureKind::RecoveryRequired, "execution_id": null})
-            .to_string()
+            serde_json::to_string(&channel::Interruption {
+                reason: Some(reason.clone()),
+                created_at: Some(Some(now.to_rfc3339())),
+                kind: Some(Some(api_types::FailureKind::RecoveryRequired.into())),
+                execution_id: Some(None),
+                ..Default::default()
+            })
+            .expect("admission interruption serializes")
         });
         let mut tx = db::begin_immediate(self.db.pool()).await?;
         let result = self

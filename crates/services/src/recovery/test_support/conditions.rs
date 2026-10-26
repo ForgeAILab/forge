@@ -210,12 +210,13 @@ pub(crate) fn freeze_clock() -> db::test_clock::Guard {
     db::test_clock::freeze("2026-10-25T00:00:00.123456+00:00".parse().unwrap())
 }
 
-fn normalize_ids(raw: &str, row: &Task) -> String {
-    raw.replace(&row.id, "fixture-task")
-        .replace(&row.project_id, "fixture-project")
+pub(crate) fn normalize_ids(raw: &str, replacements: &[(String, String)]) -> String {
+    replacements
+        .iter()
+        .fold(raw.to_owned(), |raw, (from, to)| raw.replace(from, to))
 }
 
-fn fingerprint(raw: &str) -> Value {
+pub(crate) fn fingerprint(raw: &str) -> Value {
     json!({"bytes":raw.len(), "sha256":Sha256::digest(raw.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()})
 }
 
@@ -231,11 +232,12 @@ pub(crate) fn attention_projector(db: &SqliteDb) -> AttentionProjector {
     AttentionProjector::new(db, std::sync::Arc::new(service))
 }
 
-async fn attention_incident_digest(
+pub(crate) async fn attention_incident_digest(
     db: &SqliteDb,
     projector: &AttentionProjector,
     row: &Task,
     phase: &str,
+    replacements: &[(String, String)],
 ) -> Option<String> {
     projector.run_once(100).await.unwrap();
     let mut event = db::CreateDomainEvent::task_interruption_changed(row);
@@ -292,7 +294,7 @@ async fn attention_incident_digest(
         .scope_id
         .replace(&row.project_id, "fixture-project")
         .replace(&row.id, "fixture-task");
-    attention.details_json = normalize_ids(&attention.details_json, row);
+    attention.details_json = normalize_ids(&attention.details_json, replacements);
     Some(db::canonical_attention_incident_digest(&attention))
 }
 
@@ -327,12 +329,17 @@ pub(crate) async fn assert_main_snapshot(
         .fetch_one(db.pool())
         .await
         .unwrap();
+    let replacements = [
+        (row.id.clone(), "fixture-task".into()),
+        (row.project_id.clone(), "fixture-project".into()),
+    ];
     let mut canonical = row.clone();
     canonical.id = "fixture-task".into();
-    canonical.condition = serde_json::from_str(&normalize_ids(&condition, row)).unwrap();
+    canonical.condition = serde_json::from_str(&normalize_ids(&condition, &replacements)).unwrap();
     let offers = crate::task_actions::test_support::condition_offers(db, row).await;
     let event = db::CreateDomainEvent::task_interruption_changed(&canonical);
-    let attention_incident_digest = attention_incident_digest(db, projector, row, phase).await;
+    let attention_incident_digest =
+        attention_incident_digest(db, projector, row, phase, &replacements).await;
     let fields = json!({
         "error_annotation":row.error_annotation,
         "blocked_json":row.blocked_json,
@@ -355,7 +362,7 @@ pub(crate) async fn assert_main_snapshot(
         .map(|(key, value)| {
             (
                 key.clone(),
-                fingerprint(&normalize_ids(&value.to_string(), row)),
+                fingerprint(&normalize_ids(&value.to_string(), &replacements)),
             )
         })
         .collect();

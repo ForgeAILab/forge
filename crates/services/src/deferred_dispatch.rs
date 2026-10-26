@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
+use db::task_condition::channels as channel;
 use db::{
     now_rfc3339, ConditionRefusal, ProjectWait, Task, TaskMetadata, TaskMetadataMutation, TaskRepo,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::{Result, ServiceError};
@@ -114,11 +114,13 @@ pub(crate) async fn set_with_mutations(
 ) -> Result<()> {
     mutations.push(TaskMetadataMutation::Set {
         key: METADATA_KEY.to_owned(),
-        value: json!({
-            "not_before": not_before,
-            "reason": reason,
-            "target_state": target_state,
-        }),
+        value: serde_json::to_value(channel::DeferredDispatch {
+            kind: None,
+            not_before: not_before.into(),
+            reason: reason.into(),
+            target_state: target_state.into(),
+        })
+        .expect("deferred dispatch serializes"),
     });
     TaskRepo::mutate_metadata(db, &task.id, Some(task.version), mutations, &now_rfc3339()).await?;
     Ok(())
@@ -135,11 +137,13 @@ pub(crate) async fn set_with_mutations_for_latest_execution(
 ) -> Result<bool> {
     mutations.push(TaskMetadataMutation::Set {
         key: METADATA_KEY.to_owned(),
-        value: json!({
-            "not_before": not_before,
-            "reason": reason,
-            "target_state": target_state,
-        }),
+        value: serde_json::to_value(channel::DeferredDispatch {
+            kind: None,
+            not_before: not_before.into(),
+            reason: reason.into(),
+            target_state: target_state.into(),
+        })
+        .expect("deferred dispatch serializes"),
     });
     Ok(
         TaskRepo::mutate_metadata_and_bump_version_for_latest_execution(
@@ -207,7 +211,10 @@ pub(crate) async fn defer_integration_for_pause(db: &db::SqliteDb, task: &Task) 
         .extra
         .get(PAUSED_INTEGRATION_GENERATION_KEY)
         .cloned()
-        .unwrap_or_else(|| json!(0));
+        .unwrap_or_else(|| {
+            serde_json::to_value(channel::ConditionMetadataValue::PausedIntegrationGeneration(0))
+                .expect("generation serializes")
+        });
     if generation.as_i64().is_none() {
         return Err(ServiceError::invalid_operation(format!(
             "invalid paused-integration generation for {}",
@@ -230,10 +237,11 @@ pub(crate) async fn defer_integration_for_pause(db: &db::SqliteDb, task: &Task) 
                 expected: generation,
                 mutations: vec![TaskMetadataMutation::SetIfAbsent {
                     key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
-                    value: json!({
-                        "state": task.status.clone(),
-                        "deferred_at": now_rfc3339(),
-                    }),
+                    value: serde_json::to_value(channel::PausedIntegration {
+                        state: task.status.clone(),
+                        deferred_at: now_rfc3339(),
+                    })
+                    .expect("paused integration serializes"),
                 }],
             },
         ],
@@ -270,7 +278,10 @@ pub(crate) async fn refresh_paused_integration_for_pause(
         .extra
         .get(PAUSED_INTEGRATION_GENERATION_KEY)
         .cloned()
-        .unwrap_or_else(|| json!(0));
+        .unwrap_or_else(|| {
+            serde_json::to_value(channel::ConditionMetadataValue::PausedIntegrationGeneration(0))
+                .expect("generation serializes")
+        });
     if generation.as_i64().is_none() {
         return Err(ServiceError::invalid_operation(format!(
             "invalid paused-integration generation for {}",
@@ -295,10 +306,11 @@ pub(crate) async fn refresh_paused_integration_for_pause(
                 mutations: vec![TaskMetadataMutation::SetIf {
                     key: PAUSED_INTEGRATION_METADATA_KEY.to_owned(),
                     expected,
-                    value: json!({
-                        "state": task.status.clone(),
-                        "deferred_at": now_rfc3339(),
-                    }),
+                    value: serde_json::to_value(channel::PausedIntegration {
+                        state: task.status.clone(),
+                        deferred_at: now_rfc3339(),
+                    })
+                    .expect("paused integration serializes"),
                 }],
             },
         ],
@@ -559,22 +571,17 @@ async fn record_disposition(
     {
         return Ok(false);
     }
-    let mut value = json!({
-        "task_version": task.version,
-        "capability": capability,
-        "blocker_digest": blocker_digest,
-        "recorded_at": now_rfc3339(),
-        "safe_message": safe_message,
-    });
-    if !dependency_ids.is_empty() {
-        value["dependency_ids"] = json!(dependency_ids);
-    }
-    if let Some(scope) = capacity_scope {
-        value["capacity_scope"] = json!(scope);
-    }
-    if let Some(wait) = project_wait {
-        value["project_wait"] = json!(wait);
-    }
+    let value = serde_json::to_value(channel::DispatchDisposition {
+        task_version: task.version,
+        capability: capability.into(),
+        blocker_digest,
+        recorded_at: now_rfc3339(),
+        safe_message,
+        dependency_ids: (!dependency_ids.is_empty()).then(|| dependency_ids.to_vec()),
+        capacity_scope: capacity_scope.map(str::to_owned),
+        project_wait,
+    })
+    .expect("dispatch disposition serializes");
     let mutation = match metadata.extra.get(DISPOSITION_METADATA_KEY) {
         Some(expected) => TaskMetadataMutation::SetIf {
             key: DISPOSITION_METADATA_KEY.to_owned(),

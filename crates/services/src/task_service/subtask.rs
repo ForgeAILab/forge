@@ -1,4 +1,5 @@
 use super::*;
+use db::task_condition::channels as channel;
 
 const COORDINATION_REVIEW_PENDING_KEY: &str = "coordination_review_pending";
 
@@ -388,11 +389,19 @@ async fn update_coordination_review_pending(
                     mutations: vec![
                         db::TaskMetadataMutation::Set {
                             key: COORDINATION_REVIEW_PENDING_KEY.into(),
-                            value: Value::Bool(true),
+                            value: serde_json::to_value(
+                                channel::ConditionMetadataValue::CoordinationReviewPending(true),
+                            )
+                            .expect("coordination flag serializes"),
                         },
                         db::TaskMetadataMutation::Set {
                             key: "coordination_review_pending_id".into(),
-                            value: Value::String(new_uuid_v4()),
+                            value: serde_json::to_value(
+                                channel::ConditionMetadataValue::CoordinationReviewPendingId(
+                                    new_uuid_v4(),
+                                ),
+                            )
+                            .expect("coordination identity serializes"),
                         },
                     ],
                 },
@@ -410,11 +419,17 @@ async fn update_coordination_review_pending(
             vec![
                 db::TaskMetadataMutation::Set {
                     key: COORDINATION_REVIEW_PENDING_KEY.to_owned(),
-                    value: Value::Bool(true),
+                    value: serde_json::to_value(
+                        channel::ConditionMetadataValue::CoordinationReviewPending(true),
+                    )
+                    .expect("coordination flag serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "coordination_review_pending_id".to_owned(),
-                    value: Value::String(new_uuid_v4()),
+                    value: serde_json::to_value(
+                        channel::ConditionMetadataValue::CoordinationReviewPendingId(new_uuid_v4()),
+                    )
+                    .expect("coordination identity serializes"),
                 },
             ],
             &now_rfc3339(),
@@ -452,3 +467,6 @@ async fn update_coordination_review_pending(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod condition_tests;
