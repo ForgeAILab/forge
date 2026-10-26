@@ -330,6 +330,7 @@ pub(crate) async fn wake_dispatch_for_project_in_tx(
                json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
                OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL
            )",
+        crate::ConditionChange::Legacy,
     )
     .bind(updated_at)
     .bind(project_id)

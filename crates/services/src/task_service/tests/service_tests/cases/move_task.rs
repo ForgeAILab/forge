@@ -273,6 +273,7 @@ async fn queued_board_move_is_fenced_like_transition() {
             db.enqueue_task_mutation(
                 &task_id,
                 db::TaskMutation::Sql {
+                    change: db::ConditionChange::Entry,
                     task_id: task_id.clone(),
                     query: "UPDATE task SET status='backlog',version=version+1 WHERE id=?".into(),
                     arguments: vec![serde_json::json!(task_id)],

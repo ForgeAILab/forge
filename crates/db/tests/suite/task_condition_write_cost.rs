@@ -169,12 +169,12 @@ async fn measure_task_write_cost() {
             let condition = t.elapsed() / n;
             let t = Instant::now();
             for i in 0..n {
-                db::task_writer::TaskQuery::new(&db, "b0", "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch.reason',?) WHERE id=?").bind(i.to_string()).bind("b0").execute(db.pool()).await.unwrap();
+                db::task_writer::TaskQuery::new(&db, "b0", "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch.reason',?) WHERE id=?", db::ConditionChange::Legacy).bind(i.to_string()).bind("b0").execute(db.pool()).await.unwrap();
             }
             let sql_computed = t.elapsed() / n;
             let t = Instant::now();
             for i in 0..n {
-                db::task_writer::TaskQuery::new(&db, "b0", "UPDATE task SET updated_at=? WHERE id=?").bind(i.to_string()).bind("b0").execute(db.pool()).await.unwrap();
+                db::task_writer::TaskQuery::new(&db, "b0", "UPDATE task SET updated_at=? WHERE id=?", db::ConditionChange::None).bind(i.to_string()).bind("b0").execute(db.pool()).await.unwrap();
             }
             let non_legacy = t.elapsed() / n;
             println!("MEASURE seam[{round}] mutate_metadata(unrelated key)={unrelated:?} mutate_metadata(condition key)={condition:?} TaskQuery(sql-computed metadata)={sql_computed:?} TaskQuery(non-legacy)={non_legacy:?}");

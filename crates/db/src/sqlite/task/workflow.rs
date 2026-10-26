@@ -498,7 +498,7 @@ impl SqliteDb {
                        AND (review_passed_at IS NOT NULL
                             OR (json_valid(COALESCE(metadata_json, '{}'))
                                 AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))").bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(transaction).await
+                                     OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))", crate::ConditionChange::Legacy).bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(transaction).await
     }
 }
 
@@ -527,6 +527,7 @@ impl SqliteDb {
             json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?)) END,
             updated_at = ?, version = version + 1
             WHERE id = ? AND version = ? AND status = ? AND deleted_at IS NULL",
+            crate::ConditionChange::Legacy,
         )
         .bind(input.entry_barrier_json)
         .bind(input.error_annotation)
@@ -550,7 +551,7 @@ impl SqliteDb {
         task_id: &str,
         expected_annotation: &Option<String>,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL").bind(updated_at).bind(task_id).bind(expected_annotation).execute_in_tx(transaction).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET error_annotation=NULL,version=version+1,updated_at=? WHERE id=? AND error_annotation IS ? AND deleted_at IS NULL", crate::ConditionChange::Legacy).bind(updated_at).bind(task_id).bind(expected_annotation).execute_in_tx(transaction).await
     }
 }
 
@@ -568,6 +569,7 @@ impl SqliteDb {
             owner_task_id,
             "UPDATE task SET metadata_json = ?, version = version + 1
                  WHERE id = ? AND version = ?",
+            crate::ConditionChange::Legacy,
         )
         .bind(metadata_json)
         .bind(task_id)
@@ -590,6 +592,7 @@ impl SqliteDb {
             task_id,
             "UPDATE task SET error_annotation = NULL, blocked_json = NULL,
                  updated_at = ?, version = version + 1 WHERE id = ? AND version = ?",
+            crate::ConditionChange::Legacy,
         )
         .bind(updated_at)
         .bind(task_id)
@@ -619,6 +622,6 @@ impl SqliteDb {
             version = version + 1, updated_at = ?
          WHERE id = ? AND deleted_at IS NULL AND version = ?
             AND metadata_json IS ? AND error_annotation IS ?
-            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?").bind(input.clear_annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).bind(input.error_annotation).bind(input.refusal_code).execute(self.pool()).await
+            AND json_extract(metadata_json, '$.daemon_upgrade_refusal.code') = ?", crate::ConditionChange::Legacy).bind(input.clear_annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).bind(input.error_annotation).bind(input.refusal_code).execute(self.pool()).await
     }
 }

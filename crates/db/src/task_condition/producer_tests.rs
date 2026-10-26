@@ -1042,7 +1042,7 @@ async fn role_assignment_sql_writers_restate_the_human_boundary() {
         let step = claim(&db, &t.id).await;
         crate::task_writer::in_task_step(step.clone(), async {
             let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-            let applied = crate::task_writer::TaskQuery::new(&db, &t.id, sql)
+            let applied = crate::task_writer::TaskQuery::new(&db, &t.id, sql, crate::ConditionChange::Human)
                 .bind(&t.id)
                 .bind("planner")
                 .identity_fenced()

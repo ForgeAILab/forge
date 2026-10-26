@@ -907,11 +907,11 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
                 "metadata_bump"=>{TaskRepo::mutate_metadata_and_bump_version(&db,&t.id,t.version,vec![TaskMetadataMutation::Set{key:"awaiting_human".into(),value:json!(true)}],&crate::now_rfc3339()).await.unwrap();},
                 "wake"=>{TaskRepo::mutate_metadata(&db,&t.id,Some(t.version),vec![TaskMetadataMutation::Set{key:"dispatch_disposition".into(),value:json!({"capability":"coder"})}],&crate::now_rfc3339()).await.unwrap();assert!(db.task_condition(&t.id).await.unwrap().is_blocked());TaskRepo::wake_dispatch_for_task(&db,&t.id,&crate::now_rfc3339()).await.unwrap();},
                 "wake_project"=>{TaskRepo::mutate_metadata(&db,&t.id,Some(t.version),vec![TaskMetadataMutation::Set{key:"dispatch_disposition".into(),value:json!({"capability":"coder"})}],&crate::now_rfc3339()).await.unwrap();TaskRepo::wake_dispatch_for_project(&db,"p",&crate::now_rfc3339()).await.unwrap();},
-                "task_query"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET blocked_json=? WHERE id=?").bind(json!({"kind":"executor_failed"}).to_string()).bind(&t.id).execute(db.pool()).await.unwrap();},
-                "task_query_tx"=>{let mut tx=crate::begin_immediate(db.pool()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=? WHERE id=?").bind(json!({"type":"manual_stop"}).to_string()).bind(&t.id).execute_in_tx(&mut tx).await.unwrap().require_applied().unwrap();tx.commit().await.unwrap();},
+                "task_query"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET blocked_json=? WHERE id=?", crate::ConditionChange::Legacy).bind(json!({"kind":"executor_failed"}).to_string()).bind(&t.id).execute(db.pool()).await.unwrap();},
+                "task_query_tx"=>{let mut tx=crate::begin_immediate(db.pool()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=? WHERE id=?", crate::ConditionChange::Legacy).bind(json!({"type":"manual_stop"}).to_string()).bind(&t.id).execute_in_tx(&mut tx).await.unwrap().require_applied().unwrap();tx.commit().await.unwrap();},
                 // Placement/environment/reconnect shape: the value exists only in SQL.
-                "task_query_sql_computed"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.environment_wait',json(?),'$.deferred_dispatch.reason',?) WHERE id=?").bind(json!({"kind":"environment_not_ready"}).to_string()).bind("environment_not_ready: server").bind(&t.id).execute(db.pool()).await.unwrap();},
-                "bulk_query"=>{let mut tx=crate::begin_immediate(db.pool()).await.unwrap();crate::task_writer::BulkTaskQuery::new(&db,"UPDATE task SET error_annotation=? WHERE id=?").bind(json!({"type":"dispatch_failed"}).to_string()).bind(&t.id).execute_in_tx(&mut tx).await.unwrap();tx.commit().await.unwrap();},
+                "task_query_sql_computed"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.environment_wait',json(?),'$.deferred_dispatch.reason',?) WHERE id=?", crate::ConditionChange::Legacy).bind(json!({"kind":"environment_not_ready"}).to_string()).bind("environment_not_ready: server").bind(&t.id).execute(db.pool()).await.unwrap();},
+                "bulk_query"=>{let mut tx=crate::begin_immediate(db.pool()).await.unwrap();crate::task_writer::BulkTaskQuery::new(&db,"UPDATE task SET error_annotation=? WHERE id=?", crate::ConditionChange::Legacy).bind(json!({"type":"dispatch_failed"}).to_string()).bind(&t.id).execute_in_tx(&mut tx).await.unwrap();tx.commit().await.unwrap();},
                 // Queue settlement, lifecycle and transition writers in services
                 // run raw SQL and then call the public seam in the same transaction.
                 "direct_sql_seam"=>{let before:(i64,String)=sqlx::query_as("SELECT version,updated_at FROM task WHERE id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();
@@ -920,9 +920,9 @@ async fn each_writer_family_keeps_condition_invariant_and_legacy_observability()
                     db.sync_condition_in_tx(&mut tx,&t.id).await.unwrap();tx.commit().await.unwrap();
                     let after:(i64,String)=sqlx::query_as("SELECT version,updated_at FROM task WHERE id=?").bind(&t.id).fetch_one(db.pool()).await.unwrap();assert_eq!(before,after);
                 },
-                "removed_machine_cancel_clear"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=NULL,metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch','$.dispatch_disposition') ELSE metadata_json END,version=version+1 WHERE id=?").bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
-                "removed_machine_owner_wait_clear"=>{TaskRepo::mutate_metadata(&db,&t.id,None,vec![TaskMetadataMutation::Set{key:"owner_wait".into(),value:json!({"daemon_id":"removed"})}],&crate::now_rfc3339()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.owner_wait.daemon_id')=?").bind(&t.id).bind("removed").identity_fenced().execute(db.pool()).await.unwrap();},
-                "removed_machine_annotation"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=?,version=version+1 WHERE id=?").bind(json!({"type":"recovery_required","blocking_reason":"machine_removed","blocked_by":"removed"}).to_string()).bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
+                "removed_machine_cancel_clear"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=NULL,metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.deferred_dispatch','$.dispatch_disposition') ELSE metadata_json END,version=version+1 WHERE id=?", crate::ConditionChange::Legacy).bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
+                "removed_machine_owner_wait_clear"=>{TaskRepo::mutate_metadata(&db,&t.id,None,vec![TaskMetadataMutation::Set{key:"owner_wait".into(),value:json!({"daemon_id":"removed"})}],&crate::now_rfc3339()).await.unwrap();crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.owner_wait','$.deferred_dispatch','$.dispatch_disposition') WHERE id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.owner_wait.daemon_id')=?", crate::ConditionChange::Legacy).bind(&t.id).bind("removed").identity_fenced().execute(db.pool()).await.unwrap();},
+                "removed_machine_annotation"=>{crate::task_writer::TaskQuery::new(&db,&t.id,"UPDATE task SET error_annotation=?,version=version+1 WHERE id=?", crate::ConditionChange::Legacy).bind(json!({"type":"recovery_required","blocking_reason":"machine_removed","blocked_by":"removed"}).to_string()).bind(&t.id).identity_fenced().execute(db.pool()).await.unwrap();},
                 // An owner command preempts and supersedes the pending entry hooks step.
                 "preempt_supersede"=>{
                     let hook=enqueue(&db,&t.id,"hooks","todo","{}").await;
@@ -1142,6 +1142,7 @@ async fn queued_task_and_bulk_effects_write_condition_only_when_their_lease_appl
             &db,
             &child.id,
             "UPDATE task SET error_annotation=? WHERE id=?",
+            crate::ConditionChange::Legacy,
         )
         .bind(json!({"type":"manual_stop"}).to_string())
         .bind(&child.id)
@@ -1156,6 +1157,7 @@ async fn queued_task_and_bulk_effects_write_condition_only_when_their_lease_appl
         let counts = crate::task_writer::BulkTaskQuery::new(
             &db,
             "UPDATE task SET metadata_json=? WHERE id IN (?,?)",
+            crate::ConditionChange::Legacy,
         )
         .bind(json!({"owner_wait":{"daemon_id":"d"}}).to_string())
         .bind(&root.id)
@@ -2058,49 +2060,6 @@ async fn evidence_is_bounded_and_large_unrelated_fields_are_not_copied() {
         .await
         .unwrap();
     assert!(length < 2 * EVIDENCE_VALUE_LIMIT as i64, "{length}");
-}
-
-/// B1: the queue adapters skip the seam for SQL that cannot change a legacy
-/// condition column.
-#[test]
-fn seam_is_skipped_for_sql_that_cannot_change_a_condition() {
-    assert_eq!(
-        sql_change(
-            "UPDATE task SET status='done',version=version+1 WHERE id=? AND blocked_json IS NULL"
-        ),
-        Some(ConditionChange::Entry)
-    );
-    assert_eq!(
-        sql_change("UPDATE task SET title=? WHERE id=? AND blocked_json IS NULL"),
-        None
-    );
-    assert_eq!(
-        sql_change(
-            "UPDATE task SET metadata_json = json_remove(metadata_json, '$.owner_wait') WHERE id = ?"
-        ),
-        Some(ConditionChange::Legacy)
-    );
-    assert_eq!(
-        sql_change("UPDATE task\n SET error_annotation=NULL\n WHERE id=?"),
-        Some(ConditionChange::Legacy)
-    );
-    // The statements the services queue for role rows, as they write them.
-    for role_write in [
-        "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?",
-        "DELETE FROM task_role_assignment WHERE task_id = ? AND role_name = ?",
-        "DELETE FROM review WHERE id = ? AND status = 'running'",
-    ] {
-        assert_eq!(sql_change(role_write), Some(ConditionChange::Human), "{role_write}");
-    }
-    // A Task statement that only reads the role table keeps its own family.
-    assert_eq!(
-        sql_change("UPDATE task SET title=? WHERE id IN (SELECT task_id FROM task_role_assignment WHERE assignee_id=?)"),
-        None
-    );
-    assert_eq!(
-        sql_change("UPDATE review_requirement SET x=? WHERE id=?"),
-        None
-    );
 }
 
 /// Port of `audit_backfill_timing_5k` (measurement, not a correctness check).

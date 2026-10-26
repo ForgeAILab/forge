@@ -165,7 +165,7 @@ impl SqliteDb {
                    AND (review_passed_at IS NOT NULL
                         OR (json_valid(COALESCE(metadata_json, '{}'))
                             AND (json_type(metadata_json, '$.dispatch_disposition') IS NOT NULL
-                                 OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))").bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(tx).await
+                                 OR json_type(metadata_json, '$.deferred_dispatch') IS NOT NULL)))", crate::ConditionChange::Legacy).bind(updated_at).bind(task_id).identity_fenced().execute_in_tx(tx).await
     }
 }
 
@@ -177,7 +177,7 @@ impl SqliteDb {
         updated_at: String,
         agent_id: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET assignee_id=NULL,updated_at=? WHERE id=? AND assignee_type='agent' AND assignee_id=?", crate::ConditionChange::None).bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
     }
 }
 
@@ -189,7 +189,7 @@ impl SqliteDb {
         updated_at: String,
         agent_id: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND assignee_type='agent' AND assignee_id=?", crate::ConditionChange::Human).bind(updated_at).bind(task_id).bind(agent_id).identity_fenced().execute_in_tx(tx).await
     }
 }
 
@@ -201,7 +201,7 @@ impl SqliteDb {
         role_name: &str,
         agent_id: &str,
     ) -> crate::Result<u64> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND role_name=? AND assignee_type='agent' AND assignee_id=?").bind(updated_at).bind(task_id).bind(role_name).bind(agent_id).identity_fenced().execute(self.pool()).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task_role_assignment SET assignee_id=NULL,updated_at=? WHERE task_id=? AND role_name=? AND assignee_type='agent' AND assignee_id=?", crate::ConditionChange::Human).bind(updated_at).bind(task_id).bind(role_name).bind(agent_id).identity_fenced().execute(self.pool()).await
     }
 }
 
@@ -234,7 +234,7 @@ impl SqliteDb {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         task_id: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL").bind(task_id).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json = json_remove(CASE WHEN json_extract(metadata_json, '$.deferred_dispatch.kind') = 'environment_not_ready' THEN json_remove(metadata_json, '$.deferred_dispatch') ELSE metadata_json END, '$.environment_wait') WHERE id = ? AND json_valid(metadata_json) AND json_type(metadata_json, '$.environment_wait') IS NOT NULL", crate::ConditionChange::Legacy).bind(task_id).identity_fenced().execute_in_tx(tx).await
     }
 }
 

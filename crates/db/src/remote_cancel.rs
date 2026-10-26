@@ -219,6 +219,7 @@ impl SqliteDb {
             {
                 // Clears only its own marker: identity-fenced, never dropped.
                 self.enqueue_fenced_task_mutation_in_tx(&mut tx,&task_id,crate::TaskMutation::Sql {
+                    change: crate::ConditionChange::Legacy,
                     task_id:task_id.clone(),
                     query:"UPDATE task SET error_annotation=CASE WHEN json_valid(error_annotation) AND json_extract(error_annotation,'$.blocking_reason')='pending_remote_cancel' THEN NULL ELSE error_annotation END, metadata_json=CASE WHEN json_valid(metadata_json) THEN json_remove(metadata_json,'$.dispatch_disposition','$.deferred_dispatch') ELSE metadata_json END,version=version+1,updated_at=? WHERE id=? AND deleted_at IS NULL".to_owned(),
                     arguments:vec![serde_json::json!(now_rfc3339()),serde_json::json!(task_id)],

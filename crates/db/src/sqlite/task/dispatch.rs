@@ -201,7 +201,7 @@ impl SqliteDb {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         input: RepositoryProvisionTaskWaitInput<'_>,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?")
+        crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(metadata_json,'$.deferred_dispatch.reason',?) WHERE id=? AND version=? AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND COALESCE((SELECT version FROM project_machine_readiness WHERE project_id=? AND owner_kind='daemon' AND daemon_id=? AND runtime_id=?),-1)=?", crate::ConditionChange::Legacy)
 .bind(input.reason).bind(input.task_id).bind(input.version).bind(input.machine_json).bind(input.project_id).bind(input.daemon_id).bind(input.runtime_id).bind(input.readiness_version).identity_fenced().execute_in_tx(tx).await
     }
 }
@@ -316,7 +316,7 @@ impl SqliteDb {
         input: ClearPlacementDispatchRefusalInput<'_>,
     ) -> crate::Result<u64> {
         crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET error_annotation=CASE WHEN error_annotation=? THEN NULL ELSE error_annotation END,
-            metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind') IN ('environment_unverified','provision_failed') THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?").bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).execute(self.pool()).await
+            metadata_json=CASE WHEN json_extract(metadata_json,'$.environment_wait.kind') IN ('environment_unverified','provision_failed') THEN json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition','$.environment_wait') ELSE json_remove(metadata_json,'$.placement_refusal','$.dispatch_disposition') END,version=version+1,updated_at=? WHERE id=? AND version=? AND metadata_json IS ?", crate::ConditionChange::Legacy).bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).bind(input.metadata_json).execute(self.pool()).await
     }
 }
 
@@ -336,7 +336,7 @@ impl SqliteDb {
         input: RecordPlacementDispatchRefusalInput<'_>,
     ) -> crate::Result<u64> {
         crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation,'$.type')='dispatch_failed' THEN ? ELSE error_annotation END,
-            metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?").bind(input.annotation).bind(input.environment_wait).bind(input.marker).bind(input.wait_json).bind(input.marker_copy).bind(input.updated_at).bind(input.task_id).bind(input.version).execute(self.pool()).await
+            metadata_json=CASE WHEN ? THEN json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?),'$.environment_wait',json(?)) ELSE json_set(COALESCE(metadata_json,'{}'),'$.placement_refusal',json(?)) END,version=version+1,updated_at=? WHERE id=? AND version=?", crate::ConditionChange::Legacy).bind(input.annotation).bind(input.environment_wait).bind(input.marker).bind(input.wait_json).bind(input.marker_copy).bind(input.updated_at).bind(input.task_id).bind(input.version).execute(self.pool()).await
     }
 }
 
@@ -361,7 +361,7 @@ impl SqliteDb {
         metadata_json=CASE WHEN json_extract(metadata_json, '$.owner_wait.plan_execution_id')=?
           THEN json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch', '$.owner_wait')
           ELSE json_remove(metadata_json, '$.plan_settlement_wait', '$.deferred_dispatch') END,
-        version=version+1,updated_at=? WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=? AND version=?").bind(execution_id).bind(execution_id).bind(updated_at).bind(execution_id).bind(version).execute(self.pool()).await
+        version=version+1,updated_at=? WHERE json_extract(metadata_json, '$.plan_settlement_wait.execution_id')=? AND version=?", crate::ConditionChange::Legacy).bind(execution_id).bind(execution_id).bind(updated_at).bind(execution_id).bind(version).execute(self.pool()).await
     }
 }
 
@@ -372,7 +372,7 @@ impl SqliteDb {
         task_id: &str,
         owner_wait_json: String,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?").bind(owner_wait_json).bind(task_id).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self, task_id, "UPDATE task SET metadata_json=json_set(metadata_json, '$.owner_wait', json(?)) WHERE id=?", crate::ConditionChange::Legacy).bind(owner_wait_json).bind(task_id).identity_fenced().execute_in_tx(tx).await
     }
 }
 
@@ -393,7 +393,7 @@ impl SqliteDb {
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
         crate::task_writer::TaskQuery::new(self, input.task_id, "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json, '{}'), '$.plan_settlement_wait', json(?), '$.deferred_dispatch', json(?)),
         error_annotation=CASE WHEN error_annotation IS NULL OR json_extract(error_annotation, '$.type')='plan_settlement_wait' THEN ? ELSE error_annotation END,
-        version=version+1, updated_at=? WHERE id=? AND version=?").bind(input.marker).bind(input.disposition).bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).identity_fenced().execute_in_tx(tx).await
+        version=version+1, updated_at=? WHERE id=? AND version=?", crate::ConditionChange::Legacy).bind(input.marker).bind(input.disposition).bind(input.annotation).bind(input.updated_at).bind(input.task_id).bind(input.version).identity_fenced().execute_in_tx(tx).await
     }
 }
 

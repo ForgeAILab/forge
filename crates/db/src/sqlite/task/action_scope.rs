@@ -207,7 +207,7 @@ impl SqliteDb {
         project_id: &str,
         machine_json: String,
     ) -> crate::Result<crate::task_writer::BulkTaskQueryResult> {
-        crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'").bind(error).bind(error).bind(project_id).bind(machine_json).execute_in_tx(tx).await
+        crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_set(metadata_json,'$.environment_wait.last_error',?,'$.deferred_dispatch.reason',COALESCE(json_extract(metadata_json,'$.deferred_dispatch.reason'),'environment_probe_pending') || '; last failure: ' || ?) WHERE project_id=? AND json_valid(metadata_json) AND json_extract(metadata_json,'$.environment_wait.machine')=json(?) AND json_extract(metadata_json,'$.environment_wait.kind')='environment_probe_pending'", crate::ConditionChange::Legacy).bind(error).bind(error).bind(project_id).bind(machine_json).execute_in_tx(tx).await
     }
 }
 
@@ -221,7 +221,7 @@ impl SqliteDb {
         expected_version: i64,
         expected_status: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self,task_id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ? AND status = ?").bind(marker_json).bind(wait_json).bind(task_id).bind(expected_version).bind(expected_status).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self,task_id,"UPDATE task SET metadata_json = json_set(COALESCE(metadata_json, '{}'), '$.deferred_dispatch', json(?), '$.environment_wait', json(?)) WHERE id = ? AND version = ? AND status = ?", crate::ConditionChange::Legacy).bind(marker_json).bind(wait_json).bind(task_id).bind(expected_version).bind(expected_status).identity_fenced().execute_in_tx(tx).await
     }
 }
 
@@ -235,7 +235,7 @@ impl SqliteDb {
         expected_version: i64,
         expected_status: &str,
     ) -> crate::Result<crate::task_writer::TaskQueryResult> {
-        crate::task_writer::TaskQuery::new(self,task_id,"UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ? AND status = ?").bind(marker_json).bind(wait_json).bind(task_id).bind(expected_version).bind(expected_status).identity_fenced().execute_in_tx(tx).await
+        crate::task_writer::TaskQuery::new(self,task_id,"UPDATE task SET metadata_json = json_set(json_remove(COALESCE(metadata_json, '{}'), '$.owner_wait'), '$.environment_wait', json(?), '$.deferred_dispatch', json(?)) WHERE id = ? AND version = ? AND status = ?", crate::ConditionChange::Legacy).bind(marker_json).bind(wait_json).bind(task_id).bind(expected_version).bind(expected_status).identity_fenced().execute_in_tx(tx).await
     }
 }
 

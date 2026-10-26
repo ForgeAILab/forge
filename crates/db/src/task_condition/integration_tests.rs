@@ -978,6 +978,7 @@ async fn each_producer_states_its_own_fact_beside_the_integration_reason() {
                 &db,
                 &id,
                 "UPDATE task SET blocked_json=? WHERE id=?",
+                crate::ConditionChange::Legacy,
             )
             .bind(json!({"kind":"retry_exhausted"}).to_string())
             .bind(&id)

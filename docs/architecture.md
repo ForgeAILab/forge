@@ -6004,7 +6004,7 @@ parsed once per distinct definition text, not per write.
 |---|---|---|
 | The six metadata mutators (condition keys only) | `Legacy`, folded into the metadata `UPDATE` | nothing |
 | Repository update, annotation, recovery metadata, entry barrier setters, Review entry budget, create-time metadata, lifecycle hook annotation, queue settlement and loop park, reconnect barrier reset | `Legacy` | nothing |
-| `TaskQuery`, `BulkTaskQuery`, queued `TaskMutation::Sql` | `Legacy` or `Entry`, from the columns the statement assigns; none for a statement that assigns no mapped column | per change |
+| `TaskQuery`, `BulkTaskQuery`, queued `TaskMutation::Sql` | Required explicit `Legacy`, `Entry`, `Human`, or `None`, supplied by the writer independently of its optional statement | per change; `None` skips the producer |
 | Status CAS (repository, claim, board move, workflow engine), transition and recovery-marker insert, reparent | `Entry` | entry receipt, hooks step, the running execution, the workflow text, whether the parent waits on children |
 | Hooks step enqueue, owner preempt that superseded a step, hooks step finish | `Hooks` | the entry's hooks step |
 | Running execution admitted, execution terminal result (both paths), config snapshot update | `Execution` | the running execution |
@@ -6012,7 +6012,7 @@ parsed once per distinct definition text, not per write.
 | Ledger charge, window reset | `Budget` | the ledger, only when the condition is exhausted |
 | Remote-cancel marker and acknowledgement, machine removal, workspace deletion | `Operations`, for every Task the workspace fences | the cancellations fencing the Task |
 | Child creation, soft deletion, reparent, both subtask reorder writers | `Children` on the parent | the parent's children, only when its flag is set |
-| Project workflow edit | `Entry` for Tasks whose status classifies differently under the new definition, `Children` for flagged roots | per change |
+| Project workflow edit | `Entry` for every Task in the Project; each child refreshes its watching parent through `Children` | per change |
 | Task insert, `sync_condition_in_tx`, backfill, invariant check | `Full` | everything |
 
 A producer that finds a status epoch the stored condition never saw recomputes
@@ -6184,7 +6184,8 @@ Reset retains the alphabetical field order of its former `json!` object;
 executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
 step-failure overlay still sorts the combined object, as it did before. Both
 writers use the repository status-write transaction, which explicitly produces
-`ConditionChange::Entry`; neither goes through the SQL-text classifier.
+`ConditionChange::Entry`. SQL adapters also require an explicit change; SQL text
+is never classified to select a condition reload.
 
 The parity reference is pinned to main `37309bb9`, including fixes #120–#122.
 Archived-main fixtures cover the legacy columns, cache bytes, public projection,
@@ -6215,8 +6216,8 @@ Hold/Release and the independently owned integration/check statements.
 Integration and check ownership still require their original claimed-step seam.
 The unused owner records, identity/edit/replacement/restore contracts and second
 owner composer have been removed. No tagged release contained these contracts or
-could queue their statement kinds; released mutation payloads retain their
-existing decoders and replay paths.
+could queue their statement kinds. Released mutation payloads remain decodable
+and replayable under the missing-change rule below.
 
 Converted writers still shipping at this checkpoint:
 
@@ -6239,8 +6240,30 @@ a newer stored condition is preserved instead of being overwritten by that cache
 `Conditioned<T>` requires a condition with the write input. The durable
 `TaskMutation::Conditioned` envelope keeps it with the mutation, and
 `TaskMutation::StatedSql` keeps explicit fact-family and statement inputs with
-SQL and binds. `TaskQuery::stated` and `BulkTaskQuery::stated` require these
-inputs; stated SQL does not use SQL-text classification as semantic authority.
+SQL and binds. Every `TaskQuery` and `BulkTaskQuery` constructor requires and
+stores a `ConditionChange`, separately from its optional `ConditionStatement`.
+`TaskQuery::stated` and `BulkTaskQuery::stated` require both. New `Sql` mutations
+require a `change` field as well; `ConditionChange::None` explicitly skips the
+producer for content-only SQL, including any repair of an already corrupt cache.
+The adapters carry the value unchanged through direct writes, bulk splitting
+and durable replay. There is no SQL-text classifier. The redundant Project-wide
+metadata substring scan is removed: a Project workflow edit already restates
+every Task; a
+child refreshes its watching parent through the normal `Children` producer.
+
+`task_mutation::decode_released_sql_change` handles the missing `change` field
+in released `TaskMutation::Sql` payloads by returning `Full`, reloading every fact
+family without inspecting SQL. On a healthy row, replay retains main
+`13bc2ae1` cache bytes, Task version, list revision, scheduler dirty generation,
+events and diagnostics. On a recoverably corrupt row, replay repairs the cache
+earlier: its end state equals main replay followed by
+`check_task_conditions_of`. The same mapped cache, raw-text diagnostic row,
+list revision and scheduler dirty generation result; repair adds one diagnostic
+occurrence, one list revision and one dirty generation. This earlier repair is
+an accepted change in timing. Newer encodings retain the existing quarantine
+rule. The archived-main SQL fixture covers all former classifier families and
+literal released content, assignee-clear and blocked payloads on healthy and
+corrupt rows.
 The common adapter carries the statement to the writer's existing transaction.
 Its version fence runs inside that transaction before the write. Inline edits
 retain their expected version; queued edits retain the existing accepted-command

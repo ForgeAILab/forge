@@ -565,7 +565,7 @@ impl ProjectRepo for SqliteDb {
                     .await?;
                 sqlx::query("UPDATE attention_projection SET status = 'resolved', resolved_at = ?, updated_at = ?, version = version + 1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id = ?)")
                     .bind(&project.updated_at).bind(&project.updated_at).bind(&project.id).execute(&mut *transaction).await?;
-                crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)")
+                crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json = json_remove(metadata_json, '$.environment_wait') WHERE project_id = ? AND json_valid(metadata_json)", crate::ConditionChange::Legacy)
                     .bind(&project.id).execute_in_tx(&mut transaction).await?;
             } else if digest_changed || after.is_none() {
                 sqlx::query("UPDATE project_machine_readiness SET status = 'unknown', checks_digest = ?, failing_checks_json = '[]', check_results_json = '[]', output_tail = '', checked_at = NULL, next_check_at = NULL, version = version + 1 WHERE project_id = ?")
@@ -806,7 +806,7 @@ impl ProjectRepo for SqliteDb {
             // earlier capacity/environment wait in the same writer transaction.
             sqlx::query("UPDATE attention_projection SET status='resolved', resolved_at=?, updated_at=?, version=version+1 WHERE status <> 'resolved' AND dedupe_key IN (SELECT 'task-environment-wait:' || id FROM task WHERE project_id=?)")
                 .bind(&updated_at).bind(&updated_at).bind(id).execute(&mut *transaction).await?;
-            crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL")
+            crate::task_writer::BulkTaskQuery::new(self,"UPDATE task SET metadata_json=json_remove(metadata_json,'$.environment_wait') WHERE project_id=? AND json_valid(metadata_json) AND json_type(metadata_json,'$.environment_wait') IS NOT NULL", crate::ConditionChange::Legacy)
                 .bind(id).execute_in_tx(&mut transaction).await?;
             wake_dispatch_for_project_in_tx(self, &mut transaction, id, &updated_at).await?;
         }

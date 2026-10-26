@@ -542,17 +542,8 @@ impl SqliteDb {
         &self,
         task_id: &str,
         query: &str,
-        arguments: Vec<Value>,
-    ) -> Result<u64> {
-        self.apply_task_sql_intent(task_id, query, arguments, None)
-            .await
-    }
-    pub(crate) async fn apply_task_sql_intent(
-        &self,
-        task_id: &str,
-        query: &str,
         mut arguments: Vec<Value>,
-        change: Option<crate::ConditionChange>,
+        change: crate::ConditionChange,
     ) -> Result<u64> {
         if !owns_task(task_id) {
             return Err(DbError::Check(
@@ -590,10 +581,7 @@ impl SqliteDb {
             .execute(&mut *tx)
             .await?
             .rows_affected();
-        if let Some(change) = change
-            .or_else(|| crate::task_condition::sql_change(query))
-            .filter(|_| result != 0)
-        {
+        if result != 0 {
             crate::task_condition::produce(&mut tx, task_id, change).await?;
         }
         self.record_mutation_reply_in_tx(&mut tx, &result).await?;
@@ -898,7 +886,8 @@ pub struct TaskQuery {
     query: String,
     arguments: Vec<Value>,
     fence: EffectFence,
-    condition: Option<(crate::ConditionChange, crate::ConditionStatement)>,
+    change: crate::ConditionChange,
+    condition: Option<crate::ConditionStatement>,
 }
 /// Outcome of a Task write. `Queued` is never "applied": the write became its
 /// own step on the Task's queue and may still fail its fence there.
@@ -932,13 +921,19 @@ impl TaskQueryResult {
     }
 }
 impl TaskQuery {
-    pub fn new(db: &SqliteDb, task_id: &str, query: impl Into<String>) -> Self {
+    pub fn new(
+        db: &SqliteDb,
+        task_id: &str,
+        query: impl Into<String>,
+        change: crate::ConditionChange,
+    ) -> Self {
         Self {
             db: db.clone(),
             task_id: task_id.to_owned(),
             query: query.into(),
             arguments: Vec::new(),
             fence: EffectFence::Entry,
+            change,
             condition: None,
         }
     }
@@ -983,7 +978,7 @@ impl TaskQuery {
                     &self.db,
                     tx,
                     &self.task_id,
-                    &self.query,
+                    self.change,
                     self.condition.as_ref(),
                 )
                 .await?;
@@ -995,7 +990,13 @@ impl TaskQuery {
             .enqueue_fenced_task_mutation_in_tx(
                 tx,
                 &self.task_id,
-                condition::mutation(&self.task_id, self.query, self.arguments, self.condition),
+                condition::mutation(
+                    &self.task_id,
+                    self.query,
+                    self.arguments,
+                    self.change,
+                    self.condition,
+                ),
                 self.fence,
             )
             .await?;
@@ -1025,14 +1026,16 @@ pub struct BulkTaskQuery {
     db: SqliteDb,
     query: String,
     arguments: Vec<Value>,
-    condition: Option<(crate::ConditionChange, crate::ConditionStatement)>,
+    change: crate::ConditionChange,
+    condition: Option<crate::ConditionStatement>,
 }
 impl BulkTaskQuery {
-    pub fn new(db: &SqliteDb, query: impl Into<String>) -> Self {
+    pub fn new(db: &SqliteDb, query: impl Into<String>, change: crate::ConditionChange) -> Self {
         Self {
             db: db.clone(),
             query: query.into(),
             arguments: Vec::new(),
+            change,
             condition: None,
         }
     }
@@ -1073,7 +1076,7 @@ impl BulkTaskQuery {
                         &self.db,
                         tx,
                         &task_id,
-                        &query,
+                        self.change,
                         self.condition.as_ref(),
                     )
                     .await?;
@@ -1084,7 +1087,13 @@ impl BulkTaskQuery {
                     .enqueue_fenced_task_mutation_in_tx(
                         tx,
                         &task_id,
-                        condition::mutation(&task_id, query, arguments, self.condition.clone()),
+                        condition::mutation(
+                            &task_id,
+                            query,
+                            arguments,
+                            self.change,
+                            self.condition.clone(),
+                        ),
                         EffectFence::Identity,
                     )
                     .await?;
@@ -1565,6 +1574,7 @@ mod tests {
         db.enqueue_task_mutation(
             "t",
             TaskMutation::Sql {
+                change: crate::ConditionChange::None,
                 task_id: "t".into(),
                 query: "UPDATE task SET title='edited',version=version+1 WHERE id=?".into(),
                 arguments: vec![serde_json::json!("t")],
@@ -1623,10 +1633,11 @@ mod tests {
     #[tokio::test]
     async fn queued_sql_effect_rebases_content_version_and_rejects_a_released_owner() {
         let db = fixture().await;
-        for (query, arguments) in [
+        for (query, arguments, change) in [
             (
                 "UPDATE task SET title='edited',version=version+1 WHERE id=?",
                 vec![serde_json::json!("t")],
+                crate::ConditionChange::None,
             ),
             (
                 "UPDATE task SET error_annotation=?,version=version+1 WHERE id=? AND version = ?",
@@ -1635,6 +1646,7 @@ mod tests {
                     serde_json::json!("t"),
                     serde_json::json!(1),
                 ],
+                crate::ConditionChange::Legacy,
             ),
         ] {
             db.enqueue_task_mutation(
@@ -1643,6 +1655,7 @@ mod tests {
                     task_id: "t".into(),
                     query: query.into(),
                     arguments,
+                    change,
                 },
             )
             .await
@@ -1671,6 +1684,7 @@ mod tests {
                 "t",
                 "UPDATE task SET error_annotation=NULL WHERE id=?",
                 vec![serde_json::json!("t")],
+                crate::ConditionChange::Legacy,
             ),
         )
         .await;
@@ -1747,7 +1761,7 @@ mod tests {
         let deferral = TaskQuery::new(
             &db,
             "t",
-            "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch','entry') WHERE id=?",
+            "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.deferred_dispatch','entry') WHERE id=?", crate::ConditionChange::Legacy,
         )
         .bind("t")
         .execute_in_tx(&mut tx)
@@ -1756,7 +1770,7 @@ mod tests {
         let wake = TaskQuery::new(
             &db,
             "t",
-            "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.woken',1) WHERE id=?",
+            "UPDATE task SET metadata_json=json_set(COALESCE(metadata_json,'{}'),'$.woken',1) WHERE id=?", crate::ConditionChange::Legacy,
         )
         .bind("t")
         .identity_fenced()
@@ -1794,15 +1808,21 @@ mod tests {
         );
         // A preempting Cancel supersedes pending entry-fenced work only.
         let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-        let _ = TaskQuery::new(&db, "t", "UPDATE task SET title='entry' WHERE id=?")
-            .bind("t")
-            .execute_in_tx(&mut tx)
-            .await
-            .unwrap();
+        let _ = TaskQuery::new(
+            &db,
+            "t",
+            "UPDATE task SET title='entry' WHERE id=?",
+            crate::ConditionChange::None,
+        )
+        .bind("t")
+        .execute_in_tx(&mut tx)
+        .await
+        .unwrap();
         let _ = TaskQuery::new(
             &db,
             "t",
             "UPDATE task SET description='identity' WHERE id=?",
+            crate::ConditionChange::None,
         )
         .bind("t")
         .identity_fenced()
