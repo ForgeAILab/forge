@@ -1023,10 +1023,11 @@ impl TaskMutation {
 }
 
 /// Released `Sql` payloads did not store reload intent. Decode their missing
-/// field as a full fact reload, without inspecting SQL. Healthy caches retain
-/// main's bytes and side effects. Recoverably corrupt caches are repaired here
-/// to the same end state (including diagnostics and revisions) as main replay
-/// followed by its background condition check; only repair timing changes.
+/// field as a full fact reload, without inspecting SQL. A consistent cache
+/// retains main's bytes and side effects. An inconsistent (corrupt or stale)
+/// cache is rewritten during replay to the state main replay followed by its
+/// background condition check reaches (including diagnostics and revisions);
+/// only repair timing changes.
 fn decode_released_sql_change() -> ConditionChange {
     ConditionChange::Full
 }

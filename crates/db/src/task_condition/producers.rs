@@ -325,8 +325,8 @@ pub(crate) async fn produce_children(c: &mut SqliteConnection, parent_id: &str) 
 }
 
 /// The Project's workflow was replaced. A Task's terminal classification and a
-/// child's settledness read it, so restate every Task in the Project. Each
-/// child refreshes its watching parent through the ordinary relationship seam.
+/// child's settledness read it, so restate every Task in the Project and
+/// refresh `Children` for flagged coordination roots.
 pub(crate) async fn workflow_changed(
     c: &mut SqliteConnection,
     project_id: &str,
@@ -361,6 +361,13 @@ pub(crate) async fn workflow_changed(
         for task_id in &tasks {
             produce(c, task_id, ConditionChange::Entry).await?;
         }
+    }
+    let waiting: Vec<String> = sqlx::query_scalar("SELECT id FROM task WHERE project_id=? AND instr(COALESCE(metadata_json,''),'coordination_review_pending')>0")
+        .bind(project_id)
+        .fetch_all(&mut *c)
+        .await?;
+    for task_id in &waiting {
+        produce_children(c, task_id).await?;
     }
     Ok(())
 }

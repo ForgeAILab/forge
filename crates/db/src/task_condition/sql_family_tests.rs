@@ -178,7 +178,7 @@ async fn explicit_human_matches_main() {
 }
 
 #[tokio::test]
-async fn workflow_edit_matches_main_without_metadata_scan() {
+async fn workflow_edit_matches_main() {
     use crate::ProjectRepo;
     let _clock = clock();
     let db = db().await;
@@ -219,4 +219,72 @@ async fn workflow_edit_matches_main_without_metadata_scan() {
         db.task_condition_violations().await.unwrap(),
         Vec::<String>::new()
     );
+}
+
+async fn workflow_edit_without_child_refresh(case: &str, child_project: &str, quarantine: bool) {
+    use crate::ProjectRepo;
+    let _clock = clock();
+    let db = db().await;
+    sqlx::query("INSERT INTO project(id,name,created_at,updated_at) VALUES('q','Other','2026-10-25T00:00:00Z','2026-10-25T00:00:00Z')")
+        .execute(db.pool()).await.unwrap();
+    task(&db, "root").await;
+    task(&db, "child").await;
+    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
+    sqlx::query(
+        "UPDATE task SET metadata_json='{\"coordination_review_pending\":true}' WHERE id='root'",
+    )
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE task SET parent_task_id='root',status='released',project_id=? WHERE id='child'",
+    )
+    .bind(child_project)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    db.sync_condition_in_tx(&mut tx, "child").await.unwrap();
+    db.sync_condition_in_tx(&mut tx, "root").await.unwrap();
+    if quarantine {
+        // A newer encoding skips the child's producer before it can notify the root.
+        sqlx::query(
+            "UPDATE task SET condition_json='{\"kind\":\"nope\",\"evidence\":{}}' WHERE id='child'",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    assert!(db.task_condition("root").await.unwrap().is_blocked());
+    let project = ProjectRepo::get_by_id(&db, "p").await.unwrap().unwrap();
+    ProjectRepo::update_workflow(
+        &db,
+        "p",
+        &json!({"states":[{"name":"todo","kind":"initial"},{"name":"released","kind":"terminal"}]})
+            .to_string(),
+        None,
+        project.version,
+        &crate::now_rfc3339(),
+    )
+    .await
+    .unwrap();
+    // Compare persisted bytes, child witnesses and list revisions before any check repairs them.
+    for id in ["root", "child"] {
+        assert_main(&format!("workflow-{case}-{id}"), stored(&db, id).await);
+    }
+    assert_eq!(
+        db.task_condition_violations().await.unwrap(),
+        if quarantine { vec!["child"] } else { vec![] }
+    );
+}
+
+#[tokio::test]
+async fn workflow_edit_with_only_quarantined_children_matches_main() {
+    workflow_edit_without_child_refresh("quarantined", "p", true).await;
+}
+
+#[tokio::test]
+async fn workflow_edit_with_children_in_another_project_matches_main() {
+    // Services reject cross-Project parents; the DB still preserves main's behavior for such rows.
+    workflow_edit_without_child_refresh("cross-project", "q", false).await;
 }

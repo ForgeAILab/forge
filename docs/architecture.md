@@ -6012,7 +6012,7 @@ parsed once per distinct definition text, not per write.
 | Ledger charge, window reset | `Budget` | the ledger, only when the condition is exhausted |
 | Remote-cancel marker and acknowledgement, machine removal, workspace deletion | `Operations`, for every Task the workspace fences | the cancellations fencing the Task |
 | Child creation, soft deletion, reparent, both subtask reorder writers | `Children` on the parent | the parent's children, only when its flag is set |
-| Project workflow edit | `Entry` for every Task in the Project; each child refreshes its watching parent through `Children` | per change |
+| Project workflow edit | `Entry` for every Task in the Project; `Children` for flagged coordination roots | per change |
 | Task insert, `sync_condition_in_tx`, backfill, invariant check | `Full` | everything |
 
 A producer that finds a status epoch the stored condition never saw recomputes
@@ -6246,23 +6246,24 @@ stores a `ConditionChange`, separately from its optional `ConditionStatement`.
 require a `change` field as well; `ConditionChange::None` explicitly skips the
 producer for content-only SQL, including any repair of an already corrupt cache.
 The adapters carry the value unchanged through direct writes, bulk splitting
-and durable replay. There is no SQL-text classifier. The redundant Project-wide
-metadata substring scan is removed: a Project workflow edit already restates
-every Task; a
-child refreshes its watching parent through the normal `Children` producer.
+and durable replay. There is no SQL-text classifier. A Project workflow edit
+restates `Entry` for every Task in the Project and `Children` for flagged
+coordination roots. The workflow-edit scan reads stored row metadata to find
+those roots.
 
 `task_mutation::decode_released_sql_change` handles the missing `change` field
 in released `TaskMutation::Sql` payloads by returning `Full`, reloading every fact
-family without inspecting SQL. On a healthy row, replay retains main
+family without inspecting SQL. A consistent cache retains main
 `13bc2ae1` cache bytes, Task version, list revision, scheduler dirty generation,
-events and diagnostics. On a recoverably corrupt row, replay repairs the cache
-earlier: its end state equals main replay followed by
-`check_task_conditions_of`. The same mapped cache, raw-text diagnostic row,
-list revision and scheduler dirty generation result; repair adds one diagnostic
-occurrence, one list revision and one dirty generation. This earlier repair is
-an accepted change in timing. Newer encodings retain the existing quarantine
-rule. The archived-main SQL fixture covers all former classifier families and
-literal released content, assignee-clear and blocked payloads on healthy and
+events and diagnostics. An inconsistent (corrupt or stale) cache is rewritten
+during replay to the state main replay followed by its background
+`check_task_conditions_of` reaches, including diagnostics and revisions.
+Recoverable corruption adds one raw-text diagnostic occurrence; a stale but
+decodable cache needs no diagnostic. A changed cache adds one list revision and
+one dirty generation. This earlier repair is an accepted change in timing.
+Newer encodings retain the existing quarantine rule. The archived-main SQL
+fixture covers all former classifier families and
+literal released content, assignee-clear and blocked payloads on consistent and
 corrupt rows.
 The common adapter carries the statement to the writer's existing transaction.
 Its version fence runs inside that transaction before the write. Inline edits
