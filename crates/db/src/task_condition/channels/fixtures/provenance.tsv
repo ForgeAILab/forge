@@ -1,0 +1,121 @@
+sample	channel	main_writer	provenance
+detected-merge_conflict	annotation	crates/services/src/workflow/actions/common.rs:382	archived main real writer
+detected-merge_conflict-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after detected-merge_conflict
+detected-ci_failed	annotation	crates/services/src/workflow/actions/common.rs:382	archived main real writer
+detected-ci_failed-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after detected-ci_failed
+dispatch-state	annotation	crates/services/src/workflow/engine/mod.rs:51	archived main real writer
+dispatch-state-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after dispatch-state
+dispatch-upgrade	annotation	crates/services/src/workflow/engine/mod.rs:136,194	archived main real writer
+dispatch-upgrade-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after dispatch-upgrade
+dispatch-upgrade/daemon_upgrade_refusal	daemon_upgrade_refusal	crates/services/src/workflow/engine/mod.rs:136,194	archived main real writer
+reset	annotation	crates/services/src/recovery/owner_failure.rs:275	archived main real writer
+reset-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after reset
+executor	annotation	crates/services/src/task_service/execution/cascade/failure.rs:292,323	archived main real writer
+executor	interruption	crates/services/src/task_service/execution/cascade/failure.rs:292,323	archived main real writer
+executor-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after executor
+dependency-hook	annotation	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-hook	interruption	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-hook-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after dependency-hook
+dependency-superseded	annotation	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-superseded	interruption	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-superseded-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after dependency-superseded
+script-hook	annotation	crates/services/src/workflow/actions/lifecycle.rs:317	archived main real writer
+script-hook-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after script-hook
+lifecycle-reset	annotation	crates/services/src/workflow/actions/lifecycle.rs:353	archived main real writer
+lifecycle-reset-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after lifecycle-reset
+owner-recovery	annotation	crates/services/src/recovery/owner_failure.rs:148	archived main real writer
+owner-recovery-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after owner-recovery
+removed-machine	annotation	crates/services/src/recovery/removed_machine.rs:237	archived main real writer
+removed-machine-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after removed-machine
+recovered-task	annotation	crates/services/src/recovery/tasks.rs:198	archived main real writer
+recovered-task-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after recovered-task
+budget	annotation	crates/services/src/task_service/replan.rs:67,74	archived main real writer
+budget	interruption	crates/services/src/task_service/replan.rs:67,74	archived main real writer
+budget-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after budget
+merge-budget	annotation	crates/services/src/workflow/actions/merge.rs:512	archived main real writer
+budget-barrier	barrier	crates/db/src/budget.rs:1337	archived main real writer
+review-finding	annotation	crates/services/src/task_service/execution/cascade/review_completion.rs:373,394	archived main real writer
+review-finding	interruption	crates/services/src/task_service/execution/cascade/review_completion.rs:373,394	archived main real writer
+review-finding-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after review-finding
+workflow-guard	annotation	crates/services/src/task_service/execution/cascade/workflow_guards.rs:213,234	archived main real writer
+workflow-guard	interruption	crates/services/src/task_service/execution/cascade/workflow_guards.rs:213,234	archived main real writer
+workflow-guard-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after workflow-guard
+review-candidate	annotation	crates/services/src/task_service/review_candidate.rs:353,358	archived main real writer
+review-candidate	interruption	crates/services/src/task_service/review_candidate.rs:353,358	archived main real writer
+review-candidate-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after review-candidate
+review-ci	annotation	crates/services/src/task_service/review.rs:189,194,204	archived main real writer
+review-ci	interruption	crates/services/src/task_service/review.rs:189,194,204	archived main real writer
+review-ci	barrier	crates/services/src/task_service/review.rs:189,194,204	archived main real writer
+review-ci-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after review-ci
+step-cascade_failed	annotation	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-cascade_failed-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after step-cascade_failed
+step-workspace_error	annotation	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-workspace_error-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after step-workspace_error
+step-workflow_loop	annotation	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-workflow_loop	interruption	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-workflow_loop-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after step-workflow_loop
+step-merge_conflict	annotation	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-merge_conflict-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after step-merge_conflict
+step-ci_failed	annotation	crates/services/src/worker_runtime/queue.rs:1780,1782,1803	archived main real writer
+step-ci_failed-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after step-ci_failed
+placement	annotation	crates/services/src/task_service/placement_refusal.rs:223,224,231	archived main real writer
+placement-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after placement
+placement/dispatch_disposition	dispatch_disposition	crates/services/src/task_service/placement_refusal.rs:223,224,231	archived main real writer
+placement/environment_wait	environment_wait	crates/services/src/task_service/placement_refusal.rs:223,224,231	archived main real writer
+placement/placement_refusal	placement_refusal	crates/services/src/task_service/placement_refusal.rs:223,224,231	archived main real writer
+plan-wait	annotation	crates/services/src/plan_artifact/transport.rs:138,139,140,158	archived main real writer
+plan-wait-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after plan-wait
+plan-wait/deferred_dispatch	deferred_dispatch	crates/services/src/plan_artifact/transport.rs:138,139,140,158	archived main real writer
+plan-wait/owner_wait	owner_wait	crates/services/src/plan_artifact/transport.rs:138,139,140,158	archived main real writer
+plan-wait/plan_settlement_wait	plan_settlement_wait	crates/services/src/plan_artifact/transport.rs:138,139,140,158	archived main real writer
+executor-unavailable	annotation	crates/services/src/task_service/execution/cascade/failure.rs:94,136	archived main real writer
+executor-unavailable	interruption	crates/services/src/task_service/execution/cascade/failure.rs:94,136	archived main real writer
+executor-unavailable-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after executor-unavailable
+owner-wait/deferred_dispatch	deferred_dispatch	crates/services/src/task_service/workspace/admission.rs:205,213	archived main real writer
+owner-wait/owner_wait	owner_wait	crates/services/src/task_service/workspace/admission.rs:205,213	archived main real writer
+restore-fallback	annotation	crates/services/src/task_service/execution/recovery/action_owner.rs:322,335	archived main real writer
+restore-fallback	interruption	crates/services/src/task_service/execution/recovery/action_owner.rs:322,335	archived main real writer
+restore-fallback-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after restore-fallback
+remote-cancel	annotation	crates/services/src/task_service/actions.rs:233	archived main real writer
+remote-cancel-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after remote-cancel
+remote-cancel/deferred_dispatch	deferred_dispatch	crates/services/src/task_service/actions.rs:233	archived main real writer
+hold	annotation	crates/services/src/task_service/actions.rs:864;crates/db/src/task_condition/statements.rs:66	archived main real writer
+hold	interruption	crates/services/src/task_service/actions.rs:864;crates/db/src/task_condition/statements.rs:66	archived main real writer
+hold-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after hold
+failed-null-kind	interruption	crates/services/src/task_service/execution/recovery/failure_metadata.rs:130	archived main real writer
+retry-metadata/deferred_dispatch	deferred_dispatch	crates/services/src/task_service/execution/cascade/failure.rs:494,498	archived main real writer
+retry-metadata/last_execution_failure_at	last_execution_failure_at	crates/services/src/task_service/execution/cascade/failure.rs:494,498	archived main real writer
+retry-metadata/last_execution_failure_execution_id	last_execution_failure_execution_id	crates/services/src/task_service/execution/cascade/failure.rs:494,498	archived main real writer
+coordination-metadata/coordination_review_pending	coordination_review_pending	crates/services/src/task_service/subtask.rs:411,415	archived main real writer
+coordination-metadata/coordination_review_pending_id	coordination_review_pending_id	crates/services/src/task_service/subtask.rs:411,415	archived main real writer
+environment-ready-wait/deferred_dispatch	deferred_dispatch	crates/services/src/placement/environment.rs:1104,1111	archived main real writer
+environment-ready-wait/environment_wait	environment_wait	crates/services/src/placement/environment.rs:1104,1111	archived main real writer
+planning-metadata/awaiting_human	awaiting_human	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+planning-metadata/awaiting_human_marker_id	awaiting_human_marker_id	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+planning-metadata/awaiting_human_reason	awaiting_human_reason	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+planning-metadata/planning_completed_at	planning_completed_at	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+planning-metadata/planning_execution_id	planning_execution_id	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+planning-metadata/planning_state_entry_token	planning_state_entry_token	crates/services/src/task_service/execution.rs:1137,1141,1145,1149,1153,1159	archived main real writer
+deferred/deferred_dispatch	deferred_dispatch	crates/services/src/deferred_dispatch.rs:117	archived main real writer
+paused-integration/paused_integration	paused_integration	crates/services/src/deferred_dispatch.rs:219,226	archived main real writer
+paused-integration/paused_integration_generation	paused_integration_generation	crates/services/src/deferred_dispatch.rs:219,226	archived main real writer
+disposition/dispatch_disposition	dispatch_disposition	crates/services/src/deferred_dispatch.rs:561	archived main real writer
+disposition-dependency/dispatch_disposition	dispatch_disposition	crates/services/src/deferred_dispatch.rs:561	archived main real writer
+integration-admission	annotation	crates/services/src/integration_steps/reconcile.rs:644,652	archived main real writer
+integration-admission	interruption	crates/services/src/integration_steps/reconcile.rs:644,652	archived main real writer
+integration-admission-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after integration-admission
+guard-metadata/last_workflow_guard_execution_id	last_workflow_guard_execution_id	crates/services/src/task_service/execution/cascade/workflow_guards.rs:77,81,85,89	archived main real writer
+guard-metadata/last_workflow_guard_name	last_workflow_guard_name	crates/services/src/task_service/execution/cascade/workflow_guards.rs:77,81,85,89	archived main real writer
+guard-metadata/last_workflow_guard_reason	last_workflow_guard_reason	crates/services/src/task_service/execution/cascade/workflow_guards.rs:77,81,85,89	archived main real writer
+guard-metadata/last_workflow_guard_rejection_at	last_workflow_guard_rejection_at	crates/services/src/task_service/execution/cascade/workflow_guards.rs:77,81,85,89	archived main real writer
+dependency-carried	annotation	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-carried	interruption	crates/services/src/task_service/dependencies.rs:264,288	archived main real writer
+dependency-carried-overlay	annotation	crates/services/src/worker_runtime/queue.rs:1780,1796,1797	archived main real writer; queue after dependency-carried
+manual-merge-null-artifact	annotation	crates/services/src/workflow/actions/merge.rs:772	archived main real writer
+upgrade-carried/daemon_upgrade_refusal	daemon_upgrade_refusal	crates/services/src/workflow/engine/mod.rs:162,168,174	archived main real writer
+verify-barrier	barrier	crates/services/src/workflow/actions/review.rs:675;crates/db/src/sqlite/task/repository.rs:1300	archived main committed SQL value; later lifecycle assertion NOT MET
+demo-reset	annotation	crates/services/src/demo.rs:107	exact fixed source literal
+demo-workspace	annotation	crates/services/src/demo.rs:116	exact fixed source literal
+historical-key/shared-identifier-codec	executor_unavailable_execution_id	crates/services/src/task_service/execution.rs:1159 (shared String codec; no active setter for historical key)	reuse actual main planning_execution_id literal for identical String codec; historical key has no setter
+review-park-execution	annotation	crates/services/src/workflow/actions/no_change.rs:110,113; workflow/engine/durable.rs:643,651; workflow/actions/common.rs:454	archived main real park_no_change writer; failed Review selected by failed_review_for_no_change; db::test_clock::freeze held; string execution id
+review-park-null	annotation	crates/services/src/workflow/actions/no_change.rs:110,113; workflow/engine/durable.rs:643,651; workflow/actions/common.rs:454	archived main real park_no_change writer; failed Review selected by failed_review_for_no_change; db::test_clock::freeze held; null execution id

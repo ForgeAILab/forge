@@ -6180,6 +6180,36 @@ unknown shapes retain the existing lenient mapping. This checkpoint retains
 rewriting existing Task data.
 
 The converted writers are workspace-owner reset and executor failure.
+`db::task_condition::channels` covers 16 observed fresh annotation shapes and
+all 24 condition metadata values. The shapes are Blocking, Hold, TimedBlock,
+RecoveryExecution, RemoteCancel, Message, Reason, ReviewCandidate, ReviewPark,
+Detected, DetectedState, Budget, StepFailure, PlacementRefusal, PlanWait and
+UpgradeDispatch. Historical and merge-onto-existing values can have other shapes.
+Strict decoders are for new writes only; stored-row reads, restores and
+`map_legacy_condition` stay lenient. `ErrorAnnotation` selects by field set,
+since multiple shapes share a failure kind, and retains one replacing step
+overlay. Unknown fields and tags are rejected, including in closed nested
+objects; missing and null stay distinct. `plan_settlement_wait` and interruption
+kind `integration_admission_failed` are stored tags outside `FailureKind`.
+The queue's kindless interruption has a required nullable reason.
+
+Storage encoding follows each main writer: `json!`/`Value` sorts object keys;
+`TaskBlockingAnnotation` uses declaration order, and demo message literals put
+`type` first. Only Blocking and Message accept that type-first encoding.
+An overlay sorts the whole combined value, including nested objects. Timestamp
+fields remain strings with their original spelling. SQL `json_set` preserves
+member positions and appends absent keys; preserve those patches and bind the
+original raw bytes for exact fences rather than re-rendering a typed value.
+Copied stored snapshots use infallible `CopiedJson`/`CopiedConditionObject`
+construction without size or depth limits at write time. Only decoding new
+copied values limits nesting to 32 container levels; there is no byte limit or
+truncation. Fresh superseded snapshots use closed fields with opaque saved
+channel strings; carried superseded objects retain their original JSON value.
+Known hooks and interruption details remain closed; assignment guidance fields
+are reader/legacy-only. Route attempts retain `candidate_key`/`outcome` strings.
+Metadata codecs select by key without a new wire tag; scalars stay scalars and
+`planning_state_entry_token` retains the explicit null its producer writes.
+
 Reset retains the alphabetical field order of its former `json!` object;
 executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
 step-failure overlay still sorts the combined object, as it did before. Both
