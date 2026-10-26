@@ -1,3 +1,4 @@
+use db::task_condition::channels;
 use std::sync::Arc;
 
 use db::{
@@ -379,11 +380,14 @@ pub(super) async fn persist_merge_error(
     message: &str,
 ) -> db::Result<db::Task> {
     let detected_at = now_rfc3339();
-    let annotation = json!({
-        "type": error_type,
-        "message": message,
-        "detected_at": detected_at,
-    });
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::Detected(channels::DetectedAnnotation {
+            kind: error_type,
+            message: message.into(),
+            detected_at,
+        }),
+    ))
+    .expect("condition channel serializes");
     TaskRepo::update(
         &*ctx.db,
         UpdateTask {
@@ -432,13 +436,15 @@ pub(super) async fn block_task_with_annotation(
     annotation: Option<String>,
 ) -> db::Result<()> {
     let now = now_rfc3339();
-    let blocked_meta = json!({
-        "reason": reason,
-        "created_at": now.clone(),
-        "kind": kind,
-        "source": source,
-        "execution_id": ctx.execution_id.clone(),
-    });
+    let blocked_meta = serde_json::to_string(&channels::Interruption {
+        reason: Some(reason.into()),
+        created_at: Some(Some(now.clone())),
+        kind: Some(Some(kind.into())),
+        source: Some(source.map(str::to_owned)),
+        execution_id: Some(ctx.execution_id.clone()),
+        ..Default::default()
+    })
+    .expect("condition channel serializes");
     let current = task.clone();
     {
         match TaskRepo::update(
@@ -853,15 +859,22 @@ async fn set_review_awaiting_human_metadata(ctx: &HookContext) -> Result<(), Str
         vec![
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human".to_owned(),
-                value: json!(true),
+                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHuman(true))
+                    .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human_reason".to_owned(),
-                value: json!("manual_review"),
+                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHumanReason(
+                    "manual_review".into(),
+                ))
+                .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human_marker_id".to_owned(),
-                value: json!(db::new_uuid_v4()),
+                value: serde_json::to_value(
+                    channels::ConditionMetadataValue::AwaitingHumanMarkerId(db::new_uuid_v4()),
+                )
+                .expect("condition metadata serializes"),
             },
         ],
         &now_rfc3339(),
@@ -936,3 +949,6 @@ pub(super) async fn disk_wait_over(ctx: &HookContext, task: &db::Task) {
         }
     }
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

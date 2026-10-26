@@ -1,6 +1,7 @@
 //! Reviewer completion, check failures, and terminal reconciliation.
 
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(super) async fn maybe_cascade_reviewer_completion(
@@ -370,33 +371,37 @@ impl TaskService {
         kind: api_types::FailureKind,
         message: String,
     ) -> Result<()> {
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: kind,
-            blocking_reason: kind.to_string(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(message.clone()),
-            hook: None,
-        };
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind,
+                blocking_reason: kind.to_string(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Workflow).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(message.clone()),
+                hook: None,
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize review blocking annotation: {error}"
             ))
         })?;
-        let blocked_meta = json!({
-            "reason": message,
-            "created_at": now_rfc3339(),
-            "kind": kind,
-            "execution_id": execution.id,
-        });
+        let blocked_meta = serde_json::to_string(&channels::Interruption {
+            reason: Some(message.clone()),
+            created_at: Some(Some(now_rfc3339())),
+            kind: Some(Some(kind.into())),
+            execution_id: Some(Some(execution.id.clone())),
+            ..Default::default()
+        })
+        .expect("condition channel serializes");
         let current = TaskRepo::get_by_id(&*self.db, &task.id, false)
             .await?
             .ok_or_else(|| ServiceError::not_found("task", task.id.clone()))?;
@@ -686,3 +691,6 @@ impl TaskService {
             .await
     }
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

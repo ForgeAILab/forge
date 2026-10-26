@@ -1,5 +1,7 @@
 //! Stored action normalization and queued recovery owner reconciliation.
 
+use db::task_condition::channels;
+
 use super::*;
 
 impl TaskService {
@@ -319,42 +321,62 @@ impl TaskService {
             && current.archived_at.is_none();
         let (annotation, blocked, failed) = if owns_condition {
             let reason = error.to_string();
-            let mut annotation: Value = saved("error_annotation")
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({"type":"recovery_required"}));
-            annotation
-                .as_object_mut()
-                .expect("object above")
-                .remove("recovery_actions");
-            annotation["blocking_reason"] = json!(reason);
-            annotation["message"] = json!(reason);
-            let mut blocked: Value = saved("blocked_json")
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .filter(Value::is_object)
-                .unwrap_or_else(|| json!({"kind":"recovery_required"}));
-            blocked
-                .as_object_mut()
-                .expect("object above")
-                .remove("recovery_actions");
-            blocked["reason"] = json!(reason);
-            let failed = saved("failed_json").map(|s| {
-                let mut value: Value = serde_json::from_str(&s)
-                    .ok()
+            let annotation =
+                restore_action_annotation(saved("error_annotation").as_deref(), &reason)
+                    .unwrap_or_else(|| {
+                        let mut annotation: Value = saved("error_annotation")
+                            .as_deref()
+                            .and_then(|s| serde_json::from_str(s).ok())
+                            .filter(Value::is_object)
+                            .unwrap_or_else(|| json!({"type":"recovery_required"}));
+                        annotation
+                            .as_object_mut()
+                            .expect("object above")
+                            .remove("recovery_actions");
+                        annotation["blocking_reason"] = json!(reason);
+                        annotation["message"] = json!(reason);
+                        annotation.to_string()
+                    });
+            let blocked = restore_action_interruption(
+                saved("blocked_json").as_deref(),
+                &reason,
+                api_types::FailureKind::RecoveryRequired,
+            )
+            .unwrap_or_else(|| {
+                let mut blocked: Value = saved("blocked_json")
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str(s).ok())
                     .filter(Value::is_object)
-                    .unwrap_or_else(|| json!({"kind":"executor_failed"}));
-                if let Some(object) = value.as_object_mut() {
-                    object.remove("recovery_actions");
-                }
-                value["reason"] = json!(reason);
-                value.to_string()
+                    .unwrap_or_else(|| json!({"kind":"recovery_required"}));
+                blocked
+                    .as_object_mut()
+                    .expect("object above")
+                    .remove("recovery_actions");
+                blocked["reason"] = json!(reason);
+                blocked.to_string()
+            });
+            let failed = saved("failed_json").map(|s| {
+                restore_action_interruption(
+                    Some(&s),
+                    &reason,
+                    api_types::FailureKind::ExecutorFailed,
+                )
+                .unwrap_or_else(|| {
+                    let mut value: Value = serde_json::from_str(&s)
+                        .ok()
+                        .filter(Value::is_object)
+                        .unwrap_or_else(|| json!({"kind":"executor_failed"}));
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("recovery_actions");
+                    }
+                    value["reason"] = json!(reason);
+                    value.to_string()
+                })
             });
             (
-                Some(annotation.to_string()),
+                Some(annotation),
                 if failed.is_none() {
-                    Some(blocked.to_string())
+                    Some(blocked)
                 } else {
                     None
                 },
@@ -387,3 +409,118 @@ impl TaskService {
         Ok(())
     }
 }
+
+// Restore known channels through their closed shapes; historical extensions keep
+// the original Value edit at the caller.
+fn restore_action_annotation(raw: Option<&str>, reason: &str) -> Option<String> {
+    let mut annotation = match raw
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+    {
+        Some(_) => serde_json::from_str::<channels::ErrorAnnotation>(raw?).ok()?,
+        None => channels::ErrorAnnotation::new(channels::AnnotationShape::Reason(
+            channels::ReasonAnnotation {
+                blocking_reason: reason.into(),
+                message: reason.into(),
+                kind: api_types::FailureKind::RecoveryRequired,
+            },
+        )),
+    };
+    use channels::AnnotationShape as S;
+    match &mut annotation.shape {
+        S::Blocking(value) => {
+            value.blocking_reason = reason.into();
+            value.message = Some(reason.into());
+        }
+        S::Hold(value) => {
+            annotation.shape = S::RecoveryExecution(channels::RecoveryExecutionAnnotation {
+                blocked_at: value.blocked_at.clone(),
+                blocked_by: value.blocked_by.clone(),
+                blocked_execution_id: value.blocked_execution_id.clone(),
+                blocking_reason: reason.into(),
+                message: reason.into(),
+                kind: value.kind,
+            });
+        }
+        S::TimedBlock(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::RecoveryExecution(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::RemoteCancel(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::Message(value) => {
+            annotation.shape = S::Reason(channels::ReasonAnnotation {
+                blocking_reason: reason.into(),
+                message: reason.into(),
+                kind: value.kind,
+            });
+        }
+        S::Reason(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::ReviewCandidate(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::ReviewPark(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::Detected(value) => {
+            annotation.shape = S::Budget(channels::BudgetAnnotation {
+                blocking_reason: reason.into(),
+                detected_at: value.detected_at.clone(),
+                message: reason.into(),
+                kind: value.kind,
+            });
+        }
+        S::Budget(value) => {
+            value.blocking_reason = reason.into();
+            value.message = reason.into();
+        }
+        S::StepFailure(value) => {
+            value.blocking_reason = Some(Some(reason.into()));
+            value.message = Some(reason.into());
+        }
+        // These main restore outputs add blocking_reason to a shape that the
+        // frozen gate-1 vocabulary cannot represent.
+        S::DetectedState(_) | S::PlacementRefusal(_) | S::PlanWait(_) | S::UpgradeDispatch(_) => {
+            return None
+        }
+    }
+    Some(
+        serde_json::to_value(annotation)
+            .expect("condition channel serializes")
+            .to_string(),
+    )
+}
+
+fn restore_action_interruption(
+    raw: Option<&str>,
+    reason: &str,
+    fallback: api_types::FailureKind,
+) -> Option<String> {
+    let mut interruption = match raw
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+    {
+        Some(_) => serde_json::from_str::<channels::Interruption>(raw?).ok()?,
+        None => channels::Interruption {
+            reason: Some(reason.into()),
+            kind: Some(Some(fallback.into())),
+            ..Default::default()
+        },
+    };
+    interruption.reason = Some(reason.into());
+    Some(serde_json::to_string(&interruption).expect("condition channel serializes"))
+}
+
+#[cfg(test)]
+mod lane_condition_tests;

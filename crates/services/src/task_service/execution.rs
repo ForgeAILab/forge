@@ -6,6 +6,7 @@ use crate::workflow::dispatch::{
     loader::load_agent_dispatch_context,
 };
 use async_trait::async_trait;
+use db::task_condition::channels;
 use db::{UpdateTask, UpdateTaskStatus};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
@@ -855,31 +856,47 @@ pub(super) async fn settle_plan_publication_for_review(
                 },
                 db::TaskMetadataMutation::Set {
                     key: "awaiting_human".to_owned(),
-                    value: json!(true),
+                    value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHuman(
+                        true,
+                    ))
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "awaiting_human_reason".to_owned(),
-                    value: json!("plan_review"),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::AwaitingHumanReason("plan_review".into()),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "planning_completed_at".to_owned(),
-                    value: Value::String(now_rfc3339()),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::PlanningCompletedAt(now_rfc3339()),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "awaiting_human_marker_id".to_owned(),
-                    value: Value::String(new_uuid_v4()),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::AwaitingHumanMarkerId(new_uuid_v4()),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "planning_execution_id".to_owned(),
-                    value: Value::String(execution.id.clone()),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::PlanningExecutionId(execution.id.clone()),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "planning_state_entry_token".to_owned(),
-                    value: claim
-                        .state_entry_token
-                        .clone()
-                        .map(Value::String)
-                        .unwrap_or(Value::Null),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::PlanningStateEntryToken(
+                            claim.state_entry_token.clone(),
+                        ),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: TERMINAL_EXECUTION_SETTLEMENT_KEY.to_owned(),
@@ -1136,29 +1153,45 @@ pub(super) async fn set_planning_awaiting_review_metadata(
         let mut next = vec![
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human".to_owned(),
-                value: json!(true),
+                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHuman(true))
+                    .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human_reason".to_owned(),
-                value: json!("plan_review"),
+                value: serde_json::to_value(channels::ConditionMetadataValue::AwaitingHumanReason(
+                    "plan_review".into(),
+                ))
+                .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "planning_completed_at".to_owned(),
-                value: Value::String(completed_at),
+                value: serde_json::to_value(channels::ConditionMetadataValue::PlanningCompletedAt(
+                    completed_at,
+                ))
+                .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "awaiting_human_marker_id".to_owned(),
-                value: Value::String(marker_id),
+                value: serde_json::to_value(
+                    channels::ConditionMetadataValue::AwaitingHumanMarkerId(marker_id),
+                )
+                .expect("condition metadata serializes"),
             },
             db::TaskMetadataMutation::Set {
                 key: "planning_state_entry_token".to_owned(),
-                value: state_entry_token.map(Value::String).unwrap_or(Value::Null),
+                value: serde_json::to_value(
+                    channels::ConditionMetadataValue::PlanningStateEntryToken(state_entry_token),
+                )
+                .expect("condition metadata serializes"),
             },
         ];
         if let Some(execution_id) = execution_id {
             next.push(db::TaskMetadataMutation::Set {
                 key: "planning_execution_id".to_owned(),
-                value: Value::String(execution_id.to_owned()),
+                value: serde_json::to_value(channels::ConditionMetadataValue::PlanningExecutionId(
+                    execution_id.to_owned(),
+                ))
+                .expect("condition metadata serializes"),
             });
         }
         next
@@ -1305,3 +1338,6 @@ pub(crate) async fn clear_stale_planning_review_metadata(
     .await
     .map_err(Into::into)
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

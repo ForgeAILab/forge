@@ -2,6 +2,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+use db::task_condition::channels;
 #[derive(Serialize, Deserialize)]
 pub(crate) struct HookDefinition {
     pub workflow: WorkflowDefinition,
@@ -830,14 +831,15 @@ impl WorkflowExecution<'_> {
                                     skip_target_enter_hooks = true;
                                 } else {
                                     let blocked_at = now_rfc3339();
-                                    let barrier = serde_json::json!({
-                                        "state": target_state.as_str(),
-                                        "status": "blocked",
-                                        "started_at": entry_barrier_started_at.as_str(),
-                                        "updated_at": blocked_at.as_str(),
-                                        "blocking_reason": error.as_str(),
+                                    let barrier = serde_json::to_string(&channels::EntryBarrier {
+                                        state: target_state.clone(),
+                                        status: channels::BarrierStatus::Blocked,
+                                        started_at: Some(Some(entry_barrier_started_at.clone())),
+                                        updated_at: Some(Some(blocked_at.clone())),
+                                        blocking_reason: Some(Some(error.clone())),
+                                        interrupted_at: None,
                                     })
-                                    .to_string();
+                                    .expect("condition channel serializes");
                                     task = self
                                         .set_entry_barrier_with_authority(
                                             &task_id,
@@ -851,14 +853,15 @@ impl WorkflowExecution<'_> {
                                 }
                             } else {
                                 let blocked_at = now_rfc3339();
-                                let barrier = serde_json::json!({
-                                    "state": target_state.as_str(),
-                                    "status": "blocked",
-                                    "started_at": entry_barrier_started_at.as_str(),
-                                    "updated_at": blocked_at.as_str(),
-                                    "blocking_reason": error.as_str(),
+                                let barrier = serde_json::to_string(&channels::EntryBarrier {
+                                    state: target_state.clone(),
+                                    status: channels::BarrierStatus::Blocked,
+                                    started_at: Some(Some(entry_barrier_started_at.clone())),
+                                    updated_at: Some(Some(blocked_at.clone())),
+                                    blocking_reason: Some(Some(error.clone())),
+                                    interrupted_at: None,
                                 })
-                                .to_string();
+                                .expect("condition channel serializes");
                                 task = self
                                     .set_entry_barrier_with_authority(
                                         &task_id,
@@ -1396,3 +1399,6 @@ impl WorkflowExecution<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

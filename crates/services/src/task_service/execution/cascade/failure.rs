@@ -1,6 +1,7 @@
 //! Execution failure blockers and retry scheduling.
 
 use super::*;
+use db::task_condition::channels;
 
 impl TaskService {
     pub(crate) async fn annotate_executor_failure_block(
@@ -91,38 +92,41 @@ impl TaskService {
             None
         };
 
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ExecutorUnavailable,
-            blocking_reason: "executor_unavailable".to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(
-                if let Some(reason) = retry_block_reason.filter(|_| execution.role != "interactive")
-                {
-                    format!(
-                        "Provider capacity {reason}: {}",
-                        execution
-                            .error
-                            .as_deref()
-                            .unwrap_or("no executor candidate available")
-                    )
-                } else {
-                    execution.error.clone().unwrap_or_else(|| {
+        let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+            channels::BlockingAnnotation {
+                kind: api_types::FailureKind::ExecutorUnavailable,
+                blocking_reason: "executor_unavailable".to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(
+                    if let Some(reason) =
+                        retry_block_reason.filter(|_| execution.role != "interactive")
+                    {
+                        format!(
+                            "Provider capacity {reason}: {}",
+                            execution
+                                .error
+                                .as_deref()
+                                .unwrap_or("no executor candidate available")
+                        )
+                    } else {
+                        execution.error.clone().unwrap_or_else(|| {
                         "No executor candidate is available (check CLI installs and authentication)"
                             .to_owned()
                     })
-                },
-            ),
-            hook: None,
-        };
+                    },
+                ),
+                hook: None,
+            },
+        ));
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize executor-unavailable annotation: {error}"
@@ -133,16 +137,31 @@ impl TaskService {
             .error
             .clone()
             .unwrap_or_else(|| "no executor candidate available".to_owned());
-        let blocked_meta = json!({
-            "reason": reason,
-            "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::ExecutorUnavailable,
-            "execution_id": execution.id,
-            "details": {
-                "retry_at": retry_at,
-                "attempts": attempts,
-            },
-        });
+        let created_at = now_rfc3339();
+        let blocked_meta = if let Ok(attempts) =
+            serde_json::from_value::<Option<Vec<channels::ExecutorRouteAttempt>>>(attempts.clone())
+        {
+            serde_json::to_value(channels::Interruption {
+                reason: Some(reason.clone()),
+                created_at: Some(Some(created_at.clone())),
+                kind: Some(Some(api_types::FailureKind::ExecutorUnavailable.into())),
+                execution_id: Some(Some(execution.id.clone())),
+                details: Some(Some(channels::InterruptionDetails {
+                    retry_at: Some(retry_at.clone()),
+                    attempts: Some(attempts),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+            .expect("condition channel serializes")
+        } else {
+            // Preserve caller-supplied attempts outside the closed route shape.
+            json!({
+                "reason": reason, "created_at": created_at,
+                "kind": api_types::FailureKind::ExecutorUnavailable, "execution_id": execution.id,
+                "details": { "retry_at": retry_at, "attempts": attempts },
+            })
+        };
 
         let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
@@ -497,11 +516,19 @@ impl TaskService {
                 }),
                 db::TaskMetadataMutation::Set {
                     key: "last_execution_failure_at".to_owned(),
-                    value: Value::String(now.clone()),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::LastExecutionFailureAt(now.clone()),
+                    )
+                    .expect("condition metadata serializes"),
                 },
                 db::TaskMetadataMutation::Set {
                     key: "last_execution_failure_execution_id".to_owned(),
-                    value: Value::String(execution.id.clone()),
+                    value: serde_json::to_value(
+                        channels::ConditionMetadataValue::LastExecutionFailureExecutionId(
+                            execution.id.clone(),
+                        ),
+                    )
+                    .expect("condition metadata serializes"),
                 },
             ],
         )
@@ -583,3 +610,6 @@ impl TaskService {
 
 #[cfg(test)]
 mod condition_tests;
+
+#[cfg(test)]
+mod lane_condition_tests;

@@ -1,6 +1,7 @@
 //! Task recovery and running execution cancellation.
 
 use super::*;
+use db::task_condition::channels;
 
 /// Every non-terminal Task that has a running execution, with those
 /// executions: implementation states and the gates a role runs in (the
@@ -188,23 +189,26 @@ pub(crate) async fn recover_task(
     let blocked_execution_id = cancelled
         .first()
         .map(|execution| execution.execution_id.clone());
-    let artifact = blocked_execution_id.as_ref().map(|execution_id| {
-        json!({
-            "kind": "execution",
-            "id": execution_id,
-            "log_path": null,
-        })
-    });
-    let annotation = json!({
-        "type": api_types::FailureKind::RecoveryRequired,
-        "blocking_reason": blocking_reason,
-        "blocked_by": stopped_by.display(),
-        "blocked_at": now_rfc3339(),
-        "blocked_execution_id": blocked_execution_id,
-        "artifact": artifact,
-        "message": message,
-    })
-    .to_string();
+    let artifact = blocked_execution_id
+        .as_ref()
+        .map(|execution_id| channels::AnnotationArtifact {
+            kind: "execution".into(),
+            id: Some(execution_id.clone()),
+            log_path: None,
+        });
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::sorted(
+        channels::AnnotationShape::Blocking(channels::BlockingAnnotation {
+            kind: api_types::FailureKind::RecoveryRequired,
+            blocking_reason: blocking_reason.into(),
+            blocked_by: Some(stopped_by.display()),
+            blocked_at: Some(now_rfc3339()),
+            blocked_execution_id,
+            artifact,
+            message: Some(message.into()),
+            hook: None,
+        }),
+    ))
+    .expect("condition channel serializes");
     // Applied under the recovery step's lease, or synchronously as the
     // Task's own step (bounded) from the heartbeat monitor. The outcome
     // reports a committed annotation only, never a queued one.
@@ -494,3 +498,6 @@ async fn cancel_running_executions_matching(
     }
     Ok(cancelled)
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

@@ -1,6 +1,7 @@
 //! Owner failure annotation and cleanup receipts.
 
 use super::*;
+use db::task_condition::channels;
 
 pub(super) async fn fail_placement_executions(
     db: &SqliteDb,
@@ -145,11 +146,17 @@ async fn annotate_owner_recovery(
                 existing_reason.as_deref(),
                 Some("owner_disconnected_timeout" | "owner_lost_execution")
             ));
-    let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
-            "blocking_reason": cause.to_string(), "blocked_by": actor.display(),
-            "blocked_at": now_rfc3339(), "blocked_execution_id": execution.id,
-            "message": format!("Workspace owner recovery required: {cause}"),
-    });
+    let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::RecoveryExecution(channels::RecoveryExecutionAnnotation {
+            kind: api_types::FailureKind::RecoveryRequired,
+            blocking_reason: cause.to_string(),
+            blocked_by: actor.display(),
+            blocked_at: now_rfc3339(),
+            blocked_execution_id: Some(execution.id.clone()),
+            message: format!("Workspace owner recovery required: {cause}"),
+        }),
+    ))
+    .expect("condition channel serializes");
     if can_annotate {
         // The heartbeat runs outside the Task lease, so this blocking
         // annotation is usually queued. It must never be dropped by a status
@@ -396,3 +403,6 @@ pub(super) async fn reconcile_owner_receipts(
 
 #[cfg(test)]
 mod condition_tests;
+
+#[cfg(test)]
+mod lane_condition_tests;

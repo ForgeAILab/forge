@@ -15,6 +15,7 @@ use super::admission;
 use crate::{integration_worker::IntegrationEnqueuePort, Result, ServiceError};
 use db::{IntegrationAttemptState as S, IntegrationQueueRepo, TaskRepo};
 
+use db::task_condition::channels;
 /// The state of `workflow` whose entry admits to the integration queue: the
 /// role a state has by carrying the `run_merge` entry hook, whatever its
 /// name. Nothing in the queue keys on the names of the default workflow.
@@ -468,17 +469,25 @@ impl crate::TaskService {
                 merge_config: None,
                 plan: None,
                 error_annotation: Some(Some(
-                    serde_json::json!({
-                        "type": api_types::FailureKind::WorkspaceError,
-                        "blocking_reason": reason, "message": message,
-                    })
-                    .to_string(),
+                    serde_json::to_string(&channels::ErrorAnnotation::new(
+                        channels::AnnotationShape::Reason(channels::ReasonAnnotation {
+                            kind: api_types::FailureKind::WorkspaceError,
+                            blocking_reason: reason.into(),
+                            message: message.clone(),
+                        }),
+                    ))
+                    .expect("condition channel serializes"),
                 )),
                 blocked_json: Some(Some(
-                    serde_json::json!({
-                        "kind": reason, "reason": message, "created_at": db::now_rfc3339(),
+                    serde_json::to_string(&channels::Interruption {
+                        kind: Some(Some(channels::InterruptionKind::Admission(
+                            channels::IntegrationAdmissionKind::Failed,
+                        ))),
+                        reason: Some(message.clone()),
+                        created_at: Some(Some(db::now_rfc3339())),
+                        ..Default::default()
                     })
-                    .to_string(),
+                    .expect("condition channel serializes"),
                 )),
                 failed_json: None,
                 task_state_config: None,
@@ -641,20 +650,25 @@ impl crate::TaskService {
                         merge_config: None,
                         plan: None,
                         error_annotation: Some(Some(
-                            serde_json::json!({
-                                "type": api_types::FailureKind::WorkspaceError,
-                                "blocking_reason": reason,
-                                "message": message,
-                            })
-                            .to_string(),
+                            serde_json::to_string(&channels::ErrorAnnotation::new(
+                                channels::AnnotationShape::Reason(channels::ReasonAnnotation {
+                                    kind: api_types::FailureKind::WorkspaceError,
+                                    blocking_reason: reason.into(),
+                                    message: message.clone(),
+                                }),
+                            ))
+                            .expect("condition channel serializes"),
                         )),
                         blocked_json: Some(Some(
-                            serde_json::json!({
-                                "kind": reason,
-                                "reason": message,
-                                "created_at": db::now_rfc3339(),
+                            serde_json::to_string(&channels::Interruption {
+                                kind: Some(Some(channels::InterruptionKind::Admission(
+                                    channels::IntegrationAdmissionKind::Failed,
+                                ))),
+                                reason: Some(message.clone()),
+                                created_at: Some(Some(db::now_rfc3339())),
+                                ..Default::default()
                             })
-                            .to_string(),
+                            .expect("condition channel serializes"),
                         )),
                         failed_json: None,
                         task_state_config: None,
@@ -842,3 +856,6 @@ impl crate::TaskService {
 pub(crate) fn counts_toward_merge_sweep_bound(error: &crate::ServiceError) -> bool {
     !matches!(error, crate::ServiceError::Db(db_error) if db_error.is_transient())
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

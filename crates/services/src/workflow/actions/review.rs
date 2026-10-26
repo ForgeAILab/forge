@@ -1,3 +1,4 @@
+use db::task_condition::channels;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -653,7 +654,17 @@ impl HookAction for RunCiSteps {
             }
             if review_details["verify"]["status"] == "inconclusive" {
                 let reason = "verify remained inconclusive after its automatic re-run";
-                let annotation = json!({"type":api_types::FailureKind::ReviewBlocked,"blocking_reason":"review_verify_inconclusive","message":reason,"blocked_at":now});
+                let annotation = serde_json::to_string(&channels::ErrorAnnotation::new(
+                    channels::AnnotationShape::ReviewCandidate(
+                        channels::ReviewCandidateAnnotation {
+                            kind: api_types::FailureKind::ReviewBlocked,
+                            blocking_reason: "review_verify_inconclusive".into(),
+                            message: reason.into(),
+                            blocked_at: now.clone(),
+                        },
+                    ),
+                ))
+                .expect("condition channel serializes");
                 if let Err(error) = super::common::block_task_with_annotation(
                     ctx,
                     &settled_task,
@@ -672,7 +683,15 @@ impl HookAction for RunCiSteps {
                     Ok(task) => task,
                     Err(reason) => return HookResult::Failed { reason },
                 };
-                let barrier = json!({"state":ctx.to_state,"status":"blocked","interrupted_at":now,"started_at":now,"blocking_reason":reason});
+                let barrier = serde_json::to_string(&channels::EntryBarrier {
+                    state: ctx.to_state.clone(),
+                    status: channels::BarrierStatus::Blocked,
+                    interrupted_at: Some(Some(now.clone())),
+                    started_at: Some(Some(now.clone())),
+                    blocking_reason: Some(Some(reason.into())),
+                    updated_at: None,
+                })
+                .expect("condition channel serializes");
                 if let Err(error) = TaskRepo::set_entry_barrier(
                     &*ctx.db,
                     &parked.id,

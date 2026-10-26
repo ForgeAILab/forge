@@ -1,6 +1,7 @@
 //! Removed-machine Task settlement.
 
 use super::*;
+use db::task_condition::channels;
 
 /// What the removal transaction recorded for one Task before it released the
 /// machine's placements and retired its Agents.
@@ -78,8 +79,41 @@ pub(crate) async fn settle_removed_machine_task(
                 if let Ok(mut annotation) = serde_json::from_str::<serde_json::Value>(raw) {
                     if annotation["blocking_reason"] == "pending_remote_cancel" {
                         let machines = remaining.join(", ");
-                        annotation["blocked_by"] = json!(format!("machine:{machines}"));
-                        annotation["message"] = json!(format!("Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup."));
+                        let blocked_by = format!("machine:{machines}");
+                        let message = format!("Waiting for machine {machines} to confirm its remote work has stopped. Reconnect that machine to finish cleanup.");
+                        let typed = serde_json::from_str::<channels::ErrorAnnotation>(raw)
+                            .ok()
+                            .and_then(|mut typed| {
+                                match &mut typed.shape {
+                                    channels::AnnotationShape::RemoteCancel(value) => {
+                                        value.blocked_by = blocked_by.clone();
+                                        value.message = message.clone();
+                                    }
+                                    channels::AnnotationShape::Blocking(value) => {
+                                        value.blocked_by = Some(blocked_by.clone());
+                                        value.message = Some(message.clone());
+                                    }
+                                    channels::AnnotationShape::TimedBlock(value) => {
+                                        value.blocked_by = blocked_by.clone();
+                                        value.message = message.clone();
+                                    }
+                                    channels::AnnotationShape::RecoveryExecution(value) => {
+                                        value.blocked_by = blocked_by.clone();
+                                        value.message = message.clone();
+                                    }
+                                    _ => return None,
+                                }
+                                Some(
+                                    serde_json::to_value(typed)
+                                        .expect("condition channel serializes"),
+                                )
+                            });
+                        if let Some(typed) = typed {
+                            annotation = typed;
+                        } else {
+                            annotation["blocked_by"] = json!(blocked_by);
+                            annotation["message"] = json!(message);
+                        }
                         db.refresh_remaining_machine_cancel_annotation(
                             task_id,
                             annotation.to_string(),
@@ -234,15 +268,20 @@ async fn annotate_machine_removed(
         .filter(|state| state.kind == api_types::StateKind::Terminal)
         .map(|state| state.name.clone())
         .collect::<Vec<_>>();
-    let annotation = json!({"type": api_types::FailureKind::RecoveryRequired,
-        "blocking_reason": MACHINE_REMOVED_REASON, "blocked_by": actor.display(),
-        "blocked_at": now_rfc3339(),
-        "message": if facts.workspace_lost {
-            format!("Machine {} was removed. Its workspace and any work that was not pushed were abandoned; the Task continues on another machine from its last server-known branch.", facts.hostname)
-        } else {
-            format!("Machine {} was removed while it was running this Task. The run was stopped; the Task continues on another machine.", facts.hostname)
+    let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::TimedBlock(
+        channels::TimedBlockAnnotation {
+            kind: api_types::FailureKind::RecoveryRequired,
+            blocking_reason: MACHINE_REMOVED_REASON.into(),
+            blocked_by: actor.display(),
+            blocked_at: now_rfc3339(),
+            message: if facts.workspace_lost {
+                format!("Machine {} was removed. Its workspace and any work that was not pushed were abandoned; the Task continues on another machine from its last server-known branch.", facts.hostname)
+            } else {
+                format!("Machine {} was removed while it was running this Task. The run was stopped; the Task continues on another machine.", facts.hostname)
+            },
         },
-    });
+    ));
+    let annotation = serde_json::to_string(&annotation).expect("condition channel serializes");
     // An expired owner wait also blocked the Task; that blocker goes with it.
     db.annotate_removed_machine_task(
         &task.id,
@@ -262,3 +301,6 @@ async fn annotate_machine_removed(
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod lane_condition_tests;

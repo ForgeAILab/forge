@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use db::task_condition::channels;
 use events::{event_timestamp, EventContext, ForgeEvent};
 
 use crate::{
@@ -510,13 +511,15 @@ async fn legacy_rebase_result(
 /// `merging` are advertised: `proceed_once` is review-only and would be
 /// rejected, so it is deliberately left out.
 fn merge_budget_annotation(reason: &str) -> String {
-    serde_json::json!({
-        "type": api_types::FailureKind::MergeFixBudgetExhausted,
-        "blocking_reason": reason,
-        "message": reason,
-        "detected_at": db::now_rfc3339(),
-    })
-    .to_string()
+    serde_json::to_string(&channels::ErrorAnnotation::new(
+        channels::AnnotationShape::Budget(channels::BudgetAnnotation {
+            kind: api_types::FailureKind::MergeFixBudgetExhausted,
+            blocking_reason: reason.into(),
+            message: reason.into(),
+            detected_at: db::now_rfc3339(),
+        }),
+    ))
+    .expect("condition channel serializes")
 }
 
 /// How many rebase conflicts one Task may be handed back to its Worker before
@@ -769,16 +772,18 @@ fn manual_merge_recovery_annotation(
     reason: &str,
     blocked_by: &str,
 ) -> String {
-    let annotation = api_types::TaskAnnotation::Blocking(api_types::TaskBlockingAnnotation {
-        annotation_type: kind,
-        blocking_reason: reason.to_owned(),
-        blocked_by: Some(blocked_by.to_owned()),
-        blocked_at: Some(db::now_rfc3339()),
-        blocked_execution_id: ctx.execution_id.clone(),
-        artifact: None,
-        message: Some(reason.to_owned()),
-        hook: None,
-    });
+    let annotation = channels::ErrorAnnotation::new(channels::AnnotationShape::Blocking(
+        channels::BlockingAnnotation {
+            kind,
+            blocking_reason: reason.to_owned(),
+            blocked_by: Some(blocked_by.to_owned()),
+            blocked_at: Some(db::now_rfc3339()),
+            blocked_execution_id: ctx.execution_id.clone(),
+            artifact: None,
+            message: Some(reason.to_owned()),
+            hook: None,
+        },
+    ));
     serde_json::to_string(&annotation).expect("a blocking annotation always serializes")
 }
 
@@ -903,3 +908,6 @@ pub(crate) mod test_faults {
             .and_then(VecDeque::pop_front)
     }
 }
+
+#[cfg(test)]
+mod lane_condition_tests;
