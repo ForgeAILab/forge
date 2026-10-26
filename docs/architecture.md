@@ -6180,6 +6180,11 @@ unknown shapes retain the existing lenient mapping. This checkpoint retains
 rewriting existing Task data.
 
 The converted writers are workspace-owner reset and executor failure.
+The channel types now cover the remaining writer shapes and all 24 condition
+metadata values; this gate adds strict decoders without converting more writers
+or installing those decoders on stored-row reads. See
+[condition channel encodings](task-condition-channels.md) for field order,
+opaque snapshot boundaries and the SQL append rules for the writer conversion.
 Reset retains the alphabetical field order of its former `json!` object;
 executor failure retains `TaskBlockingAnnotation` declaration order. The queue's
 step-failure overlay still sorts the combined object, as it did before. Both
