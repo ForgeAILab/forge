@@ -6192,7 +6192,13 @@ retains its match against pre-upgrade annotation bytes.
 The test harness zeros volatile RFC3339 digits and replaces fractional seconds
 with `.<frac>` so microsecond and nanosecond platform clocks compare equally.
 It preserves field locations, separators and timezone syntax; fixed 2099 retry
-deadlines remain exact.
+deadlines remain exact. Across every compared field, runs of at least 64 `h`
+characters (the seeded hold) or `z` characters (the writer's long message)
+become distinct fixed placeholders. Their presence and surrounding bytes,
+including truncation markers, remain compared; their retained lengths do not,
+because a byte cut after embedded timestamps depends on clock precision.
+Evidence truncation byte counts retain the source length after timestamp
+normalization, so fractional precision cannot leak through those counts either.
 
 The owner-record contracts described below remain scaffolding pending removal;
 the converted channel writers do not activate them. This checkpoint adds

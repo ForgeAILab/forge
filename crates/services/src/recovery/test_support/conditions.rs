@@ -219,15 +219,30 @@ fn normalized(raw: &str, row: &Task) -> String {
             _ => {}
         }
     }
+    let originals = [
+        row.error_annotation.as_deref(),
+        row.blocked_json.as_deref(),
+        row.failed_json.as_deref(),
+        row.entry_barrier_json.as_deref(),
+        row.metadata_json.as_deref(),
+    ];
     let mut timestamps = vec![row.created_at.clone(), row.updated_at.clone()];
-    if let Ok(value) = serde_json::from_str(raw) {
-        times(&value, &mut timestamps);
+    for text in std::iter::once(raw).chain(originals.iter().copied().flatten()) {
+        if let Ok(value) = serde_json::from_str(text) {
+            times(&value, &mut timestamps);
+        }
     }
     timestamps.sort_by_key(|time| std::cmp::Reverse(time.len()));
     timestamps.dedup();
     let mut output = raw
         .replace(&row.id, "fixture-task")
         .replace(&row.project_id, "fixture-project");
+    let mut sources: Vec<_> = originals
+        .into_iter()
+        .flatten()
+        .filter(|source| source.len() > db::task_condition::EVIDENCE_VALUE_LIMIT)
+        .map(|source| (source.len(), source.to_owned()))
+        .collect();
     for time in timestamps {
         let without_precision = if let Some((seconds, fraction)) = time.split_once('.') {
             let timezone = fraction.trim_start_matches(|ch: char| ch.is_ascii_digit());
@@ -240,7 +255,49 @@ fn normalized(raw: &str, row: &Task) -> String {
             .map(|ch| if ch.is_ascii_digit() { '0' } else { ch })
             .collect();
         output = output.replace(&time, &placeholder);
+        for (_, source) in &mut sources {
+            *source = source.replace(&time, &placeholder);
+        }
     }
+    // Evidence also records the original document's byte length. Preserve that
+    // count with only the clock-width delta removed, before collapsing filler.
+    for (original_length, source) in sources {
+        output = output.replace(
+            &format!("…[truncated; {original_length} bytes]"),
+            &format!("…[truncated; {} bytes]", source.len()),
+        );
+    }
+    collapse_long_reason_filler(&output)
+}
+
+fn collapse_long_reason_filler(raw: &str) -> String {
+    // Only the hold's `h` and the writers' `z` are fixture padding. Clock
+    // precision changes how much survives a cut made after an embedded time.
+    let bytes = raw.as_bytes();
+    let mut output = String::with_capacity(raw.len());
+    let mut copied = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let filler = bytes[cursor];
+        if !matches!(filler, b'h' | b'z') {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor] == filler {
+            cursor += 1;
+        }
+        if cursor - start >= 64 {
+            output.push_str(&raw[copied..start]);
+            output.push_str(if filler == b'h' {
+                "<long-reason:h>"
+            } else {
+                "<long-reason:z>"
+            });
+            copied = cursor;
+        }
+    }
+    output.push_str(&raw[copied..]);
     output
 }
 
@@ -446,6 +503,91 @@ async fn timestamp_normalization_ignores_platform_fractional_precision() {
             "platform clock precision with timezone {timezone}"
         );
     }
+}
+
+#[tokio::test]
+async fn timestamp_normalization_ignores_fraction_width_before_byte_cut() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
+    row.created_at = "2026-10-25T01:02:03.123456+00:00".into();
+    row.updated_at = "2026-10-25T01:02:03.123456789+00:00".into();
+    for filler in ['h', 'z'] {
+        for limit in [1024, 16 * 1024] {
+            let cut = |time: &str| {
+                let mut text = format!(
+                    "prefix:{time}:{time}:{}",
+                    filler.to_string().repeat(200_000)
+                );
+                text.truncate(limit);
+                text.push_str("… [truncated]:suffix");
+                json!({"operator_reason": text}).to_string()
+            };
+            let microseconds = cut(&row.created_at);
+            let nanoseconds = cut(&row.updated_at);
+            let expected = json!({"operator_reason": format!(
+                "prefix:0000-00-00T00:00:00.<frac>+00:00:0000-00-00T00:00:00.<frac>+00:00:<long-reason:{filler}>… [truncated]:suffix"
+            )});
+            assert_eq!(
+                normalized(&microseconds, &row),
+                normalized(&nanoseconds, &row),
+                "fraction width before {limit}-byte cut of {filler} filler"
+            );
+            assert_eq!(normalized(&microseconds, &row), expected.to_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn long_reason_normalization_preserves_run_boundaries_and_other_text() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let row = seed_task(&db, project, "in_progress".into(), None).await;
+    let raw = format!(
+        "é😀prefix:{}:{}:middle:{}:{}:{}:suffix",
+        "h".repeat(63),
+        "h".repeat(64),
+        "z".repeat(63),
+        "z".repeat(200_000),
+        "x".repeat(64),
+    );
+    let expected = format!(
+        "é😀prefix:{}:<long-reason:h>:middle:{}:<long-reason:z>:{}:suffix",
+        "h".repeat(63),
+        "z".repeat(63),
+        "x".repeat(64),
+    );
+    assert_eq!(normalized(&raw, &row), expected);
+    assert_eq!(normalized(&expected, &row), expected);
+}
+
+#[tokio::test]
+async fn stored_evidence_normalization_ignores_timestamp_fraction_width() {
+    let db = sqlite_db().await;
+    let (project, _) = seed_project_repo(&db).await;
+    let mut row = seed_task(&db, project, "in_progress".into(), None).await;
+    row.created_at = "2026-10-25T01:02:03.123456+00:00".into();
+    row.updated_at = "2026-10-25T01:02:03.123456789+00:00".into();
+    let mut projections = Vec::new();
+    for time in [&row.created_at, &row.updated_at] {
+        let mut snapshot = row.clone();
+        snapshot.error_annotation = Some(
+            json!({
+                "type": "workspace_reset_required",
+                "blocked_at": time,
+                "blocking_reason": "owner_workspace_reset_required",
+                "message": "z".repeat(200_000),
+            })
+            .to_string(),
+        );
+        let condition = db::map_legacy_condition(&db::LegacyConditionInput::from(&snapshot));
+        let projection = normalized(&serde_json::to_string(&condition).unwrap(), &snapshot);
+        let source = snapshot.error_annotation.as_ref().unwrap();
+        let normalized_source = source.replace(time, "0000-00-00T00:00:00.<frac>+00:00");
+        assert!(projection.contains(&format!("…[truncated; {} bytes]", normalized_source.len())));
+        projections.push(projection);
+    }
+    assert_eq!(projections[0], projections[1]);
 }
 
 pub(crate) async fn assert_next_write(
