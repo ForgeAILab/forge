@@ -95,6 +95,8 @@ pub use sqlite::{
 pub use sqlx::{Sqlite, SqlitePool};
 pub use task_metadata::TaskMetadata;
 pub use time::now_rfc3339;
+#[cfg(feature = "test-template")]
+pub use time::test_clock;
 
 pub use models::{
     CreateOAuthAuthorizationCode, CreateOAuthClient, CreateOAuthRefreshToken,

@@ -74,3 +74,23 @@ pub(crate) async fn assert_legacy_offers(
         db::CreateDomainEvent::task_interruption_changed(&legacy).dedupe_key
     );
 }
+
+#[cfg(test)]
+pub(crate) async fn condition_offers(db: &db::SqliteDb, task: &Task) -> serde_json::Value {
+    let project = db::ProjectRepo::get_by_id(db, &task.project_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let actor = Actor::user(api_types::UserActionSource::Api);
+    let workflow = crate::workflow::engine::WorkflowEngine::resolve_workflow_for_task(
+        task,
+        &project.workflow_definition,
+        &actor,
+    );
+    let snapshot = load_snapshot(db, task.clone(), workflow, &actor, None)
+        .await
+        .unwrap();
+    let offers = available_actions(&snapshot);
+    assert!(!offers.is_empty(), "fixture exercises real offers");
+    serde_json::to_value(offers).unwrap()
+}

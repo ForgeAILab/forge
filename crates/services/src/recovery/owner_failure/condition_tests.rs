@@ -377,3 +377,38 @@ async fn large_root_and_200kb_reason_store_main_encoder_bytes_and_full_diagnosti
     assert_eq!(text.byte_length, 200_000);
     assert_eq!(text.occurrence_count, 1);
 }
+
+#[tokio::test]
+async fn typed_reset_matches_archived_main_for_every_shape_and_second_write() {
+    use crate::recovery::test_support::conditions::*;
+    let mut visited = 0;
+    for shape in SHAPES {
+        let db = sqlite_db().await;
+        let _clock = freeze_clock();
+        let projector = attention_projector(&db);
+        let (project, _) = seed_project_repo(&db).await;
+        let task = seed_task(&db, project, "in_progress".into(), None).await;
+        let step = claim(&db, &task).await;
+        db::task_writer::in_task_step(step.clone(), async {
+            seed_shape(&db, &task, shape).await;
+            let before = read(&db, &task.id).await;
+            let message = match *shape {
+                "long_reason" => "z".repeat(200_000),
+                "clear" => ESCAPED_REASON.into(),
+                _ => format!("owner reset: {shape}"),
+            };
+            annotate_owner_workspace_reset(&db, &placement(&before), &message).await.unwrap();
+            let row = read(&db, &task.id).await;
+            // Independent main writer literal, including alphabetical key order.
+            let at = serde_json::from_str::<serde_json::Value>(row.error_annotation.as_ref().unwrap()).unwrap()["blocked_at"].clone();
+            let expected = serde_json::json!({"type":"workspace_reset_required", "blocking_reason":"owner_workspace_reset_required", "blocked_by":"system:heartbeat_monitor", "blocked_at":at, "message":message}).to_string();
+            assert_eq!(row.error_annotation.as_deref(), Some(expected.as_str()));
+            assert_eq!(row.blocked_json, before.blocked_json);
+            assert_eq!(row.failed_json, before.failed_json);
+            assert_main_snapshot(&db, &projector, &row, "reset", shape, "first").await;
+            assert_next_write(&db, &projector, &row, "reset", shape, &step).await;
+        }).await;
+        visited += 3;
+    }
+    assert_writer_cases("reset", visited);
+}

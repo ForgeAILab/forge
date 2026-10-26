@@ -437,3 +437,6 @@ impl SqliteDb {
             ).bind(task_id).bind(budget).bind(key).fetch_one(connection).await?)
     }
 }
+
+#[cfg(test)]
+mod tests;

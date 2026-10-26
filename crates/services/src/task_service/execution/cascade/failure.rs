@@ -289,27 +289,27 @@ impl TaskService {
         let Some(project) = ProjectRepo::get_by_id(&*self.db, &task.project_id).await? else {
             return Ok(());
         };
-        let annotation = api_types::TaskBlockingAnnotation {
-            annotation_type: api_types::FailureKind::ExecutorFailed,
-            blocking_reason: "executor_failed".to_owned(),
-            blocked_by: Some(
-                api_types::Actor::system(api_types::SystemComponent::Executor).display(),
-            ),
-            blocked_at: Some(now_rfc3339()),
-            blocked_execution_id: Some(execution.id.clone()),
-            artifact: Some(api_types::BlockingArtifact {
-                kind: "execution".to_owned(),
-                id: Some(execution.id.clone()),
-                log_path: execution.logs_path.clone(),
-            }),
-            message: Some(
-                execution
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "Execution failed".to_owned()),
-            ),
-            hook: None,
-        };
+        let annotation = db::task_condition::channels::ErrorAnnotation::ExecutorFailed(
+            db::task_condition::channels::ExecutorFailureAnnotation {
+                blocking_reason: "executor_failed".to_owned(),
+                blocked_by: Some(
+                    api_types::Actor::system(api_types::SystemComponent::Executor).display(),
+                ),
+                blocked_at: Some(now_rfc3339()),
+                blocked_execution_id: Some(execution.id.clone()),
+                artifact: Some(db::task_condition::channels::AnnotationArtifact {
+                    kind: "execution".to_owned(),
+                    id: Some(execution.id.clone()),
+                    log_path: execution.logs_path.clone(),
+                }),
+                message: Some(
+                    execution
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "Execution failed".to_owned()),
+                ),
+            },
+        );
         let annotation = serde_json::to_string(&annotation).map_err(|error| {
             ServiceError::invalid_operation(format!(
                 "failed to serialize executor-failure annotation: {error}"
@@ -320,12 +320,18 @@ impl TaskService {
             .error
             .clone()
             .unwrap_or_else(|| "executor failed".to_owned());
-        let blocked_meta = json!({
-            "reason": reason,
-            "created_at": now_rfc3339(),
-            "kind": api_types::FailureKind::InternalCommandFailed,
-            "execution_id": execution.id,
-        });
+        let blocked_meta = db::task_condition::channels::Interruption {
+            created_at: Some(Some(now_rfc3339())),
+            execution_id: Some(Some(execution.id.clone())),
+            kind: Some(Some(api_types::FailureKind::InternalCommandFailed)),
+            reason: reason.clone(),
+            ..Default::default()
+        };
+        let blocked_meta = serde_json::to_string(&blocked_meta).map_err(|error| {
+            ServiceError::invalid_operation(format!(
+                "failed to serialize executor-failure interruption: {error}"
+            ))
+        })?;
 
         let Some(updated) = TaskRepo::update_status_for_latest_execution(
             &*self.db,
@@ -335,7 +341,7 @@ impl TaskService {
                 status: task.status.clone(),
                 assignee_id: None,
                 error_annotation: Some(Some(annotation)),
-                blocked_json: Some(Some(blocked_meta.to_string())),
+                blocked_json: Some(Some(blocked_meta)),
                 failed_json: Some(None),
                 updated_at: now_rfc3339(),
             },
@@ -570,3 +576,6 @@ impl TaskService {
         )
     }
 }
+
+#[cfg(test)]
+mod condition_tests;
