@@ -1,4 +1,5 @@
 use super::*;
+use db::task_condition::channels as channel;
 use sha2::{Digest, Sha256};
 
 impl TaskService {
@@ -109,7 +110,13 @@ impl TaskService {
         for candidate in &refusal.rejected_candidates {
             if let Some(id) = &candidate.daemon_id {
                 let machine: Option<String> = self.db.placement_refusal_machine_name(id).await?;
-                machines.push(serde_json::json!({"daemon_id":id,"runtime_id":candidate.runtime_id,"machine":machine.unwrap_or_else(|| id.clone()),"filter_codes":candidate.filter_codes}));
+                machines.push(channel::RefusedMachine {
+                    daemon_id: id.clone(),
+                    runtime_id: candidate.runtime_id.clone(),
+                    machine: machine.unwrap_or_else(|| id.clone()),
+                    filter_codes: candidate.filter_codes.clone(),
+                    last_error: None,
+                });
                 if candidate
                     .filter_codes
                     .contains(&crate::placement::PlacementFilterCode::CapabilityMissing)
@@ -134,7 +141,7 @@ impl TaskService {
         capabilities.dedup();
         let names = machines
             .iter()
-            .filter_map(|machine| machine["machine"].as_str())
+            .map(|machine| machine.machine.as_str())
             .collect::<Vec<_>>()
             .join(", ");
         let unverified = refusal.rejected_candidates.iter().any(|candidate| {
@@ -155,16 +162,16 @@ impl TaskService {
                 .await?
                 .flatten();
             for machine in &mut machines {
-                if machine["filter_codes"]
-                    .as_array()
-                    .is_some_and(|codes| codes.iter().any(|code| code == "provision_failed"))
+                if machine
+                    .filter_codes
+                    .contains(&api_types::PlacementFilterCode::ProvisionFailed)
                 {
                     let candidate = refusal
                         .rejected_candidates
                         .iter()
                         .find(|candidate| {
-                            candidate.daemon_id.as_deref() == machine["daemon_id"].as_str()
-                                && candidate.runtime_id.as_deref() == machine["runtime_id"].as_str()
+                            candidate.daemon_id.as_deref() == Some(machine.daemon_id.as_str())
+                                && candidate.runtime_id == machine.runtime_id
                         })
                         .expect("failed machine");
                     let error: Option<String> = self
@@ -180,11 +187,8 @@ impl TaskService {
                             remote.as_deref().unwrap_or_default(),
                         ),
                     );
-                    machine["last_error"] = serde_json::json!(error);
-                    failures.push(format!(
-                        "{}: {error}",
-                        machine["machine"].as_str().unwrap_or("daemon machine")
-                    ));
+                    machine.last_error = Some(error.clone());
+                    failures.push(format!("{}: {error}", machine.machine));
                 }
             }
         }
@@ -220,23 +224,68 @@ impl TaskService {
         {
             return Ok(true);
         }
-        let annotation = serde_json::json!({"type":"dispatch_failed","code":"placement_unavailable","state":task.status,"message":message,"machines":machines,"missing_capabilities":capabilities,"rejected_candidates":refusal.rejected_candidates});
-        let marker = serde_json::json!({"state":task.status,"repo_id":refusal.repo_id,"eligibility_key":key,"annotation":annotation});
+        let annotation = channel::PlacementRefusalAnnotation {
+            kind: api_types::FailureKind::DispatchFailed,
+            code: channel::PlacementCode::PlacementUnavailable,
+            state: task.status.clone(),
+            message: message.clone(),
+            machines: machines.clone(),
+            missing_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+            rejected_candidates: refusal
+                .rejected_candidates
+                .iter()
+                .map(|candidate| channel::RejectedCandidate {
+                    daemon_id: candidate.daemon_id.clone(),
+                    runtime_id: candidate.runtime_id.clone(),
+                    repo_location_id: candidate.repo_location_id.clone(),
+                    owner_kind: candidate.owner_kind.clone(),
+                    filter_codes: candidate.filter_codes.clone(),
+                    failing_checks: (!candidate.failing_checks.is_empty())
+                        .then(|| candidate.failing_checks.clone()),
+                })
+                .collect(),
+        };
+        let marker = serde_json::to_string(&channel::PlacementRefusal {
+            state: task.status.clone(),
+            repo_id: refusal.repo_id.clone(),
+            eligibility_key: key,
+            annotation: annotation.clone(),
+        })
+        .expect("placement refusal serializes");
+        let annotation = serde_json::to_string(&channel::ErrorAnnotation::new(
+            channel::AnnotationShape::PlacementRefusal(annotation),
+        ))
+        .expect("placement annotation serializes");
         let wait_code = if failed {
             crate::placement::PlacementFilterCode::ProvisionFailed
         } else {
             crate::placement::PlacementFilterCode::EnvironmentUnverified
         };
-        let wait=refusal.rejected_candidates.iter().find(|candidate|candidate.filter_codes.contains(&wait_code))
-            .map(|candidate|serde_json::json!({"kind":if failed {"provision_failed"} else {"environment_unverified"},"machine":{"owner_kind":"daemon","daemon_id":candidate.daemon_id,"runtime_id":candidate.runtime_id},"checks":[]}));
+        let wait = refusal
+            .rejected_candidates
+            .iter()
+            .find(|candidate| candidate.filter_codes.contains(&wait_code))
+            .map(|candidate| channel::EnvironmentWait {
+                kind: Some(if failed {
+                    channel::EnvironmentWaitKind::ProvisionFailed
+                } else {
+                    channel::EnvironmentWaitKind::EnvironmentUnverified
+                }),
+                machine: channel::ConditionMachine::Daemon {
+                    daemon_id: candidate.daemon_id.clone(),
+                    runtime_id: candidate.runtime_id.clone(),
+                },
+                checks: vec![],
+                last_error: None,
+            });
         let result = self
             .db
             .record_placement_dispatch_refusal(db::RecordPlacementDispatchRefusalInput {
-                annotation: annotation.to_string(),
+                annotation: annotation.clone(),
                 environment_wait: unverified || failed,
-                marker: marker.to_string(),
+                marker: marker.clone(),
                 wait_json: serde_json::to_string(&wait).expect("wait"),
-                marker_copy: marker.to_string(),
+                marker_copy: marker,
                 updated_at: now_rfc3339(),
                 task_id: &task.id,
                 version: task.version,
@@ -279,7 +328,7 @@ impl TaskService {
                     causation_id: None,
                     causation_depth: 0,
                     dedupe_key: None,
-                    payload_json: annotation.to_string(),
+                    payload_json: annotation,
                     created_at: now.clone(),
                 },
             )
