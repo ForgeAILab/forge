@@ -57,25 +57,6 @@ pub(crate) async fn derive(
     metadata: Option<Option<&str>>,
     stated: Option<&ConditionStatement>,
 ) -> Result<Option<Produced>> {
-    derive_with_policy(
-        c,
-        task_id,
-        change,
-        metadata,
-        stated,
-        recovery::UNREADABLE_POLICY,
-    )
-    .await
-}
-
-pub(super) async fn derive_with_policy(
-    c: &mut SqliteConnection,
-    task_id: &str,
-    change: ConditionChange,
-    metadata: Option<Option<&str>>,
-    stated: Option<&ConditionStatement>,
-    policy: recovery::UnreadablePolicy,
-) -> Result<Option<Produced>> {
     use ConditionChange as Change;
     let explicit = stated.is_some();
     let scoped = write::current_statement(task_id);
@@ -89,18 +70,6 @@ pub(super) async fn derive_with_policy(
     let Some(mut snapshot) = Snapshot::read(c, task_id, families).await? else {
         return Ok(None);
     };
-    if let Some(ConditionStatement::Restore {
-        expected_epoch,
-        expected_condition_digest,
-        ..
-    }) = stated
-    {
-        if *expected_epoch != snapshot.epoch
-            || *expected_condition_digest != diagnostics::digest(&snapshot.stored)
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
     let mut corruption = None;
     let stored = match stored_condition(c, &snapshot.stored).await {
         Stored::Readable(stored) => Some(*stored),
@@ -135,49 +104,16 @@ pub(super) async fn derive_with_policy(
     let carried = (!explicit)
         .then(|| write::applied_condition(task_id, &snapshot.stored, snapshot.version))
         .flatten();
-    // New owner contracts replace projected lifecycle facts. Existing
-    // statements edit the stored condition exactly as before.
     let statement = stated;
     let empty = TaskCondition::default();
-    let stored_base = carried.as_ref().or(stored.as_ref());
-    let refreshed_base = stored_base
-        .filter(|_| {
-            matches!(
-                statement,
-                Some(
-                    ConditionStatement::Preserve
-                        | ConditionStatement::Edit { .. }
-                        | ConditionStatement::ReplaceDiagnostic { .. }
-                        | ConditionStatement::Restore { .. }
-                )
-            )
-        })
-        .map(recovery::owner_base);
-    let base = refreshed_base.as_ref().or(stored_base).unwrap_or(&empty);
+    let base = carried.as_ref().or(stored.as_ref()).unwrap_or(&empty);
     let stated = match statement {
-        _ if corruption.is_some() && policy == recovery::UnreadablePolicy::LegacyOracle => None,
-        Some(ConditionStatement::Edit { edit }) => {
-            Some(edit.apply_at_epoch(base, Some(snapshot.epoch))?)
-        }
-        Some(ConditionStatement::ReplaceDiagnostic {
-            replacement,
-            preserve_interruption,
-        }) => Some(diagnostic_projection::apply(
-            base,
-            replacement,
-            *preserve_interruption,
-        )?),
+        _ if corruption.is_some() => None,
         Some(statement) => Some(statement.apply(base)),
         _ => None,
     };
     let from_statement = stated.is_some();
-    let mapped = stated.unwrap_or_else(|| {
-        if corruption.is_some() && policy == recovery::UnreadablePolicy::DurableOwners {
-            TaskCondition::default()
-        } else {
-            map_view(&snapshot.input.view())
-        }
-    });
+    let mapped = stated.unwrap_or_else(|| map_view(&snapshot.input.view()));
     let exhausted = mapped.budget_exhausted();
     if change == Change::Budget && !exhausted {
         // Only an exhausted condition witnesses the ledger.
@@ -220,25 +156,6 @@ pub(super) async fn derive_with_policy(
             ConditionFacts::load_all(c, &snapshot).await?
         }
     };
-    if policy == recovery::UnreadablePolicy::DurableOwners
-        && (corruption.is_some() || stored.as_ref().is_some_and(recovery::unreadable))
-    {
-        recovery::load_owners(c, &mut facts).await?;
-    }
-    if let Some(ConditionStatement::ReplaceDiagnostic { replacement, .. }) = statement {
-        if replacement.identity.epoch() != snapshot.epoch {
-            return Err(DbError::VersionConflict);
-        }
-    }
-    if let Some(ConditionStatement::Edit { edit }) = statement {
-        if edit
-            .replacement
-            .as_ref()
-            .is_some_and(|r| r.identity.epoch() != snapshot.epoch)
-        {
-            return Err(DbError::VersionConflict);
-        }
-    }
     if let Some(statement) = statement {
         match statement {
             ConditionStatement::Integration { reason } => {
@@ -308,18 +225,7 @@ pub(super) async fn derive_with_policy(
     }
     // An initial state reads the entry barrier differently; only then is the
     // mapping taken again, from the same snapshot.
-    let condition = if policy == recovery::UnreadablePolicy::DurableOwners
-        && matches!(statement, None | Some(ConditionStatement::Preserve))
-        && (corruption.is_some() || stored.as_ref().is_some_and(recovery::unreadable))
-    {
-        recovery::project(
-            &facts,
-            corruption
-                .clone()
-                .unwrap_or(UnknownConditionProblem::InvalidShape),
-            stored.as_ref(),
-        )
-    } else if (facts.initial && !from_statement)
+    let condition = if (facts.initial && !from_statement)
         || matches!(
             statement,
             Some(
@@ -327,8 +233,7 @@ pub(super) async fn derive_with_policy(
                     | ConditionStatement::IntegrationHandedOff { .. }
                     | ConditionStatement::CheckCleared { .. }
             )
-        )
-    {
+        ) {
         // Clearing or handing off integration restores the other owners' current mapping,
         // including a Deferred timer whose continuation integration stood over.
         facts.condition_of(&snapshot.input.view())
@@ -337,12 +242,8 @@ pub(super) async fn derive_with_policy(
     };
     integration::validate(&condition)?;
     check::validate(&condition)?;
-    let mut condition = condition;
     if corruption.is_some() {
-        let id = recovery::record_raw(c, task_id, &snapshot.stored).await?;
-        if policy == recovery::UnreadablePolicy::DurableOwners {
-            condition.evidence_mut().diagnostic_ids.push(id);
-        }
+        recovery::record_raw(c, task_id, &snapshot.stored).await?;
     }
     if let Some(statement) = statement {
         write::record_statement_text(c, task_id, statement).await?;

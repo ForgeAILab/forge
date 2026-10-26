@@ -79,24 +79,6 @@ async fn operations_reason_keeps_base_json_limits_through_writes_reads_and_typed
         serde_json::from_str::<serde_json::Value>(&condition.read().operator_reason.unwrap())
             .is_ok()
     );
-    let full = ConditionPresentation {
-        diagnostic: Some(ConditionDiagnostic {
-            kind: api_types::FailureKind::WorkspaceError,
-            blocking_reason: "rendered diagnostic".into(),
-            minimal_operator: false,
-            message: None,
-            actor: None,
-            at: None,
-            execution_id: None,
-        }),
-        ..Default::default()
-    }
-    .read();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&full.operator_reason.unwrap()).unwrap(),
-        serde_json::to_value(full.diagnostic.unwrap()).unwrap(),
-        "full diagnostic rendering keeps the serializer's optional-field shape"
-    );
     super::statement_tests::hold(&db, "operations", &"h".repeat(4096)).await;
     let held = db.task_condition("operations").await.unwrap();
     let operator = held.read().operator_reason.unwrap();
@@ -111,10 +93,9 @@ async fn operations_reason_keeps_base_json_limits_through_writes_reads_and_typed
 }
 
 #[tokio::test]
-async fn scoped_statement_records_one_occurrence_and_restore_applies_once() {
+async fn scoped_statement_records_one_occurrence() {
     let db = db().await;
     task(&db, "once").await;
-    let saved = SavedTaskCondition::capture(&db.task_condition("once").await.unwrap());
     let hold = ConditionStatement::Hold {
         actor: "owner".into(),
         reason: "one occurrence".into(),
@@ -146,106 +127,6 @@ async fn scoped_statement_records_one_occurrence_and_restore_applies_once() {
     let texts = db.task_diagnostic_texts("once", None, 100).await.unwrap();
     assert_eq!(texts.items.len(), 1);
     assert_eq!(texts.items[0].occurrence_count, 1);
-    let statement = ConditionStatement::Restore {
-        saved: Box::new(saved),
-        expected_epoch: 0,
-        expected_condition_digest: diagnostics::digest(raw(&db, "once").await.as_bytes()),
-    };
-    let mut tx = crate::begin_immediate(db.pool()).await.unwrap();
-    write::with_statement("once", statement, async {
-        produce(&mut tx, "once", ConditionChange::Full)
-            .await
-            .unwrap();
-        produce(&mut tx, "once", ConditionChange::Full)
-            .await
-            .unwrap();
-    })
-    .await;
-    tx.commit().await.unwrap();
-    assert!(matches!(
-        db.task_condition("once").await.unwrap(),
-        TaskCondition::Clear { .. }
-    ));
-    assert_eq!(
-        db.task_diagnostic_texts("once", None, 100)
-            .await
-            .unwrap()
-            .items[0]
-            .occurrence_count,
-        1
-    );
-}
-
-#[tokio::test]
-async fn lifted_legacy_owner_uses_the_actual_epoch_when_no_entry_witness_exists() {
-    let db = db().await;
-    task(&db, "epoch").await;
-    let condition = TaskCondition::Parked {
-        primary: ParkReason::Held {
-            actor: "owner".into(),
-        },
-        additional: vec![],
-        resume: ConditionContinuation::Reconcile,
-        since: None,
-        evidence: Default::default(),
-    };
-    sqlx::query("UPDATE task SET status_epoch=9,condition_json=? WHERE id='epoch'")
-        .bind(encode(&condition))
-        .execute(db.pool())
-        .await
-        .unwrap();
-    let condition = test_support::set_task_condition(
-        &db,
-        "epoch",
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Diagnostic,
-                expected: None,
-                replacement: Some(ConditionReplacement {
-                    identity: ConditionIdentity::Entry {
-                        epoch: 9,
-                        transition_id: None,
-                    },
-                    condition: StatedCondition::Parked {
-                        reason: ParkReason::Failure {
-                            failure_kind: api_types::FailureKind::WorkspaceResetRequired,
-                        },
-                        resume: ConditionContinuation::Reconcile,
-                        since: None,
-                        presentation: Default::default(),
-                    },
-                }),
-            }),
-        },
-    )
-    .await
-    .unwrap();
-    let owner = condition
-        .evidence()
-        .ownership
-        .iter()
-        .find(|o| o.owner == ConditionReasonOwner::Hold)
-        .unwrap();
-    assert_eq!(
-        owner.identity,
-        ConditionIdentity::Entry {
-            epoch: 9,
-            transition_id: None
-        }
-    );
-    test_support::set_task_condition(
-        &db,
-        "epoch",
-        ConditionStatement::Edit {
-            edit: Box::new(ConditionOwnerEdit {
-                owner: ConditionReasonOwner::Hold,
-                expected: Some(owner.identity.clone()),
-                replacement: None,
-            }),
-        },
-    )
-    .await
-    .unwrap();
 }
 
 #[tokio::test]
