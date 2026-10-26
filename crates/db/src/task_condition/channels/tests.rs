@@ -85,9 +85,9 @@ fn strict_channels_keep_main_bytes_and_reject_unknown_fields_and_tags() {
             }
         }
     }
-    assert_eq!(names.len(), 118);
-    // An exhaustive match makes additions require a deliberate corpus update.
-    assert_eq!(shapes.len(), 15);
+    assert_eq!(names.len(), 120);
+    // Shape coverage makes additions require a deliberate corpus update.
+    assert_eq!(shapes.len(), 16);
     assert_eq!(
         ConditionMetadataValue::KEYS,
         super::super::EVIDENCE_METADATA_KEYS
@@ -159,7 +159,7 @@ fn kindless_loop_and_typed_superseded_channels_roundtrip() {
 }
 
 #[test]
-fn strict_nested_tags_and_opaque_bounds() {
+fn strict_nested_tags_and_copied_decode_depth() {
     for raw in [
         r#"{"owner_kind":"future"}"#,
         r#"{"owner_kind":"server","extra":true}"#,
@@ -178,21 +178,31 @@ fn strict_nested_tags_and_opaque_bounds() {
     assert!(
         serde_json::from_str::<EntryBarrier>(r#"{"state":"review","status":"future"}"#).is_err()
     );
-    assert!(BoundedJson::new(Value::String("x".repeat(BoundedJson::MAX_BYTES))).is_err());
-    assert!(BoundedJson::new(Value::String("x".repeat(BoundedJson::MAX_BYTES - 2))).is_ok());
     let mut deep = Value::Null;
-    for _ in 0..=BoundedJson::MAX_DEPTH {
+    for _ in 0..=CopiedJson::MAX_DEPTH {
         deep = Value::Array(vec![deep]);
     }
-    assert!(BoundedJson::new(deep).is_err());
-    assert!(BoundedConditionObject::new(Value::Null).is_err());
+    let encoded = serde_json::to_string(&deep).unwrap();
+    assert!(serde_json::from_str::<CopiedJson>(&encoded).is_err());
+    assert!(serde_json::from_str::<CopiedConditionObject>("null").is_err());
+    assert!(serde_json::from_str::<SupersededValue>("null").is_err());
+    let at_limit = &deep[0];
+    assert_eq!(
+        serde_json::to_value(serde_json::from_value::<CopiedJson>(at_limit.clone()).unwrap())
+            .unwrap(),
+        *at_limit
+    );
+    let mut deep_object = serde_json::json!({"saved": at_limit});
+    assert!(serde_json::from_value::<SupersededValue>(deep_object.clone()).is_err());
+    deep_object = serde_json::json!({"saved": &at_limit[0]});
+    assert!(serde_json::from_value::<SupersededValue>(deep_object).is_ok());
     let carried = r#"{"owner_extension":{"history":[1,true,null]}}"#;
     let value: SupersededValue = serde_json::from_str(carried).unwrap();
     assert!(matches!(value, SupersededValue::Carried(_)));
     assert_eq!(serde_json::to_string(&value).unwrap(), carried);
     let raw = serde_json::json!({"caller":{"custom":[1,true,null]}});
     assert_eq!(
-        serde_json::to_value(BoundedJson::new(raw.clone()).unwrap()).unwrap(),
+        serde_json::to_value(CopiedJson::new(raw.clone())).unwrap(),
         raw
     );
 }
@@ -231,4 +241,146 @@ fn legacy_mapping_matches_archived_main_without_strict_decode() {
         visited += 1;
     }
     assert_eq!(visited, 12);
+}
+
+#[test]
+fn review_fix_park_variants_cover_main_writes() {
+    let mut visited = 0;
+    for line in MAIN.lines() {
+        let sample: Sample = serde_json::from_str(line).unwrap();
+        if !sample.name.starts_with("review-park-") {
+            continue;
+        }
+        let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
+        assert_eq!(serde_json::to_string(&annotation).unwrap(), sample.raw);
+        let AnnotationShape::ReviewPark(park) = &annotation.shape else {
+            panic!("{} did not select ReviewPark", sample.name);
+        };
+        assert_eq!(
+            park.blocked_execution_id.as_deref(),
+            (sample.name == "review-park-execution").then_some("execution")
+        );
+        let mut missing: Value = serde_json::from_str(&sample.raw).unwrap();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("blocked_execution_id");
+        let missing: ErrorAnnotation = serde_json::from_value(missing).unwrap();
+        assert_ne!(
+            std::mem::discriminant(&annotation.shape),
+            std::mem::discriminant(&missing.shape)
+        );
+        visited += 1;
+    }
+    assert_eq!(visited, 2);
+}
+
+#[test]
+fn review_fix_copied_values_preserve_large_and_deep_stored_json() {
+    let raw = serde_json::json!({"type":"workspace_reset_required","message":"x".repeat(200_000)});
+    assert_eq!(
+        serde_json::to_value(CopiedJson::new(raw.clone())).unwrap(),
+        raw
+    );
+    let marker = serde_json::json!({
+        "code":"daemon_upgrade_required", "daemon_ids":["daemon"],
+        "deferred_dispatch":null, "dispatch_disposition":null, "error_annotation":raw,
+    });
+    let value: DaemonUpgradeRefusal = serde_json::from_value(marker.clone()).unwrap();
+    assert_eq!(serde_json::to_value(value).unwrap(), marker);
+    let carried =
+        SupersededValue::Carried(CopiedConditionObject::new(raw.as_object().unwrap().clone()));
+    assert_eq!(serde_json::to_value(&carried).unwrap(), raw);
+    assert_eq!(
+        serde_json::from_value::<SupersededValue>(raw.clone()).unwrap(),
+        carried
+    );
+    let mut deep = Value::Null;
+    for _ in 0..=CopiedJson::MAX_DEPTH {
+        deep = serde_json::json!({"saved": deep});
+    }
+    assert_eq!(
+        serde_json::to_value(CopiedJson::new(deep.clone())).unwrap(),
+        deep
+    );
+    let carried = SupersededValue::Carried(CopiedConditionObject::new(
+        deep.as_object().unwrap().clone(),
+    ));
+    assert_eq!(serde_json::to_value(carried).unwrap(), deep);
+}
+
+#[test]
+fn review_fix_type_first_is_reserved_for_struct_and_literal_writers() {
+    let mut checked = 0;
+    for line in MAIN.lines() {
+        let sample: Sample = serde_json::from_str(line).unwrap();
+        if sample.channel != "annotation" {
+            continue;
+        }
+        let annotation: ErrorAnnotation = serde_json::from_str(&sample.raw).unwrap();
+        if matches!(
+            annotation.shape,
+            AnnotationShape::Blocking(_) | AnnotationShape::Message(_)
+        ) && annotation.step_failure().is_none()
+        {
+            continue;
+        }
+        let mut fields: Value = serde_json::from_str(&sample.raw).unwrap();
+        let kind = fields.as_object_mut().unwrap().remove("type").unwrap();
+        let rest = fields.to_string();
+        let type_first = format!("{{\"type\":{kind},{}", &rest[1..]);
+        assert!(
+            serde_json::from_str::<ErrorAnnotation>(&type_first).is_err(),
+            "{}",
+            sample.name
+        );
+        checked += 1;
+    }
+    assert!(checked >= 15);
+}
+
+#[test]
+fn closed_nested_objects_reject_unknown_fields() {
+    let cases = [
+        ("executor", "annotation", "/artifact"),
+        ("dependency-hook", "annotation", "/hook"),
+        ("script-hook", "annotation", "/hook"),
+        ("placement", "annotation", "/machines/0"),
+        ("placement", "annotation", "/rejected_candidates/0"),
+        (
+            "placement/placement_refusal",
+            "placement_refusal",
+            "/annotation/machines/0",
+        ),
+        (
+            "environment-ready-wait/environment_wait",
+            "environment_wait",
+            "/machine",
+        ),
+        (
+            "executor-unavailable",
+            "interruption",
+            "/details/attempts/0",
+        ),
+    ];
+    for (name, channel, pointer) in cases {
+        let sample = MAIN
+            .lines()
+            .map(|line| serde_json::from_str::<Sample>(line).unwrap())
+            .find(|sample| sample.name == name && sample.channel == channel)
+            .unwrap();
+        let mut value: Value = serde_json::from_str(&sample.raw).unwrap();
+        value
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("future_field".into(), true.into());
+        let rejected = match channel {
+            "annotation" => serde_json::from_value::<ErrorAnnotation>(value).is_err(),
+            "interruption" => serde_json::from_value::<Interruption>(value).is_err(),
+            key => ConditionMetadataValue::decode(key, &value.to_string()).is_err(),
+        };
+        assert!(rejected, "{name} accepted an unknown field at {pointer}");
+    }
 }

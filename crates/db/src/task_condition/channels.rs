@@ -80,12 +80,14 @@ pub struct InterruptionDetails {
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
+    // Reader/legacy-only: no production setting writer on the baseline.
     pub assignment_guidance: Option<Option<String>>,
     #[serde(
         default,
         deserialize_with = "present",
         skip_serializing_if = "Option::is_none"
     )]
+    // Reader/legacy-only: no production setting writer on the baseline.
     pub assignment_required: Option<Option<bool>>,
     #[serde(
         default,
@@ -114,12 +116,13 @@ pub struct InterruptionDetails {
 }
 
 /// Dependency re-blocking may carry a caller's existing superseded object.
-/// Fresh snapshots use the closed shape; carried objects retain bounded JSON.
+/// Fresh snapshots use the closed shape; carried objects retain copied JSON
+/// without construction limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SupersededValue {
     Condition(SupersededCondition),
-    Carried(BoundedConditionObject),
+    Carried(CopiedConditionObject),
 }
 
 /// Saved channel bytes are opaque text: historical values must survive restore.

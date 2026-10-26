@@ -116,3 +116,5 @@
 {"channel":"annotation","name":"demo-reset","raw":"{\"type\":\"workspace_reset_required\",\"message\":\"workspace reset required: task branch no longer exists in repo\"}"}
 {"channel":"annotation","name":"demo-workspace","raw":"{\"type\":\"workspace_error\",\"message\":\"workspace error: repository directory not found on disk\"}"}
 {"channel":"executor_unavailable_execution_id","name":"historical-key/shared-identifier-codec","raw":"\"execution\""}
+{"channel":"annotation","name":"review-park-execution","raw":"{\"blocked_at\":\"2026-10-25T00:00:00.123684+00:00\",\"blocked_execution_id\":\"execution\",\"blocking_reason\":\"review_needs_owner\",\"message\":\"no change after repair round\",\"type\":\"review_needs_owner\"}"}
+{"channel":"annotation","name":"review-park-null","raw":"{\"blocked_at\":\"2026-10-25T00:00:00.123466+00:00\",\"blocked_execution_id\":null,\"blocking_reason\":\"review_needs_owner\",\"message\":\"no change after repair round\",\"type\":\"review_needs_owner\"}"}

@@ -106,10 +106,10 @@ pub struct DaemonUpgradeRefusal {
     pub code: super::UpgradeCode,
     pub daemon_ids: Vec<String>,
     #[serde(deserialize_with = "super::nullable")]
-    pub deferred_dispatch: Option<BoundedJson>,
+    pub deferred_dispatch: Option<CopiedJson>,
     #[serde(deserialize_with = "super::nullable")]
-    pub dispatch_disposition: Option<BoundedJson>,
-    pub error_annotation: BoundedJson,
+    pub dispatch_disposition: Option<CopiedJson>,
+    pub error_annotation: CopiedJson,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,16 +216,26 @@ pub enum BarrierStatus {
     Blocked,
 }
 
-/// Snapshot fields copy caller-supplied/stored JSON, rather than defining its
-/// schema. Bound only this explicit escape hatch, never historical readers.
+/// Stored snapshots may have schemas unknown to this build. Copy construction
+/// preserves every value main could write; only new-value decoding is bounded.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct BoundedJson(serde_json::Value);
+pub struct CopiedJson(serde_json::Value);
 
-impl BoundedJson {
-    pub const MAX_BYTES: usize = 32 * 1024;
+impl CopiedJson {
     pub const MAX_DEPTH: usize = 32;
-    pub fn new(value: serde_json::Value) -> serde_json::Result<Self> {
+
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    pub fn value(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for CopiedJson {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
         fn within_depth(value: &serde_json::Value, remaining: usize) -> bool {
             match value {
                 serde_json::Value::Array(values) => {
@@ -243,43 +253,36 @@ impl BoundedJson {
                 _ => true,
             }
         }
-        if !within_depth(&value, Self::MAX_DEPTH)
-            || serde_json::to_vec(&value)?.len() > Self::MAX_BYTES
-        {
-            return Err(<serde_json::Error as serde::de::Error>::custom(
-                "opaque condition JSON exceeds bounds",
+        let value = serde_json::Value::deserialize(decoder)?;
+        if !within_depth(&value, Self::MAX_DEPTH) {
+            return Err(serde::de::Error::custom(
+                "copied condition JSON exceeds depth bound",
             ));
         }
-        Ok(Self(value))
-    }
-    pub fn value(&self) -> &serde_json::Value {
-        &self.0
-    }
-}
-impl<'de> Deserialize<'de> for BoundedJson {
-    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        Self::new(serde_json::Value::deserialize(decoder)?).map_err(serde::de::Error::custom)
+        Ok(Self::new(value))
     }
 }
 
+/// Dependency re-blocking copies an existing superseded object. Requiring a map
+/// at construction makes copying infallible without accepting scalar new input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct BoundedConditionObject(BoundedJson);
+pub struct CopiedConditionObject(serde_json::Map<String, serde_json::Value>);
 
-impl BoundedConditionObject {
-    pub fn new(value: serde_json::Value) -> serde_json::Result<Self> {
-        if !value.is_object() {
-            return Err(<serde_json::Error as serde::de::Error>::custom(
-                "carried condition must be an object",
-            ));
-        }
-        BoundedJson::new(value).map(Self)
+impl CopiedConditionObject {
+    pub fn new(value: serde_json::Map<String, serde_json::Value>) -> Self {
+        Self(value)
     }
 }
 
-impl<'de> Deserialize<'de> for BoundedConditionObject {
+impl<'de> Deserialize<'de> for CopiedConditionObject {
     fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
-        Self::new(serde_json::Value::deserialize(decoder)?).map_err(serde::de::Error::custom)
+        match CopiedJson::deserialize(decoder)?.0 {
+            serde_json::Value::Object(value) => Ok(Self::new(value)),
+            _ => Err(serde::de::Error::custom(
+                "carried condition must be an object",
+            )),
+        }
     }
 }
 

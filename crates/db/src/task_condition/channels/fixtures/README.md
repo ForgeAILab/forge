@@ -2,10 +2,10 @@
 
 Baseline: main `13bc2ae1041137d53f9372d93a2ba08d8f5b0ead`.
 
-`main-13bc2ae1.jsonl` contains 118 byte literals: 66 annotations, 15
+`main-13bc2ae1.jsonl` contains 120 byte literals: 68 annotations, 15
 interruptions, three entry barriers and 34 metadata values. The tests preserve
 the raw string, including key order, nulls, escaping and timestamp spelling.
-The corpus covers 15 annotation variants and all 24 metadata codecs.
+The corpus covers 16 annotation variants and all 24 metadata codecs.
 
 The main driver was compiled and run in a `git archive` of that commit. It
 called production service writers under a claimed Task step, reread their
@@ -13,7 +13,12 @@ stored columns, and invoked the actual queue writer for overlay samples.
 `db::test_clock::freeze` stayed held on the current-thread runtime. The two
 `demo-*` samples instead copy the exact fixed literals from `demo.rs:107,116`.
 The main driver produced 103 records and the guard/admission extension produced
-seven; the opaque-boundary extension produced five. The unrelated `queued_recovery` record is excluded from this corpus.
+seven; the opaque-boundary extension produced five. The review-fix extension
+produced two no-change review-park annotations (string and null execution IDs)
+by calling `park_no_change` after creating a failed Review selected by
+`failed_review_for_no_change`. It reread the stored Task under
+`db::test_clock::freeze`; the driver and logs are retained in `31g1a2/`. The
+unrelated `queued_recovery` record is excluded from this corpus.
 
 The verify barrier was captured after `set_entry_barrier` committed its real
 transaction. Its timestamp call held the frozen clock in a synchronous block,
@@ -44,5 +49,6 @@ Its disposable Git fixture was built without commit/add/checkout/reset commands.
 SQL patches to existing JSON are a separate boundary: a patch can append a
 member after the sorted fields. Gate 2 must preserve those SQL edits and use
 typed-value comparisons where needed, as documented in
-`docs/task-condition-channels.md`. These fixtures do not authorize
-canonicalizing historical or patched rows through a strict decoder.
+[architecture.md](../../../../../../docs/architecture.md#task-condition-statements-and-diagnostic-text-31-in-progress).
+These fixtures do not authorize canonicalizing historical or patched rows
+through a strict decoder.

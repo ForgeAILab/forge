@@ -36,6 +36,7 @@ pub enum AnnotationShape {
     Message(MessageAnnotation),
     Reason(ReasonAnnotation),
     ReviewCandidate(ReviewCandidateAnnotation),
+    ReviewPark(ReviewParkAnnotation),
     Detected(DetectedAnnotation),
     DetectedState(DetectedStateAnnotation),
     Budget(BudgetAnnotation),
@@ -136,6 +137,18 @@ pub struct ReasonAnnotation {
 #[serde(deny_unknown_fields)]
 pub struct ReviewCandidateAnnotation {
     pub blocked_at: String,
+    pub blocking_reason: String,
+    pub message: String,
+    #[serde(rename = "type", deserialize_with = "super::failure_kind")]
+    pub kind: FailureKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewParkAnnotation {
+    pub blocked_at: String,
+    #[serde(deserialize_with = "super::nullable")]
+    pub blocked_execution_id: Option<String>,
     pub blocking_reason: String,
     pub message: String,
     #[serde(rename = "type", deserialize_with = "super::failure_kind")]
@@ -367,7 +380,17 @@ impl<'de> Deserialize<'de> for ErrorAnnotation {
                 };
                 let shape = serde_json::from_value(Value::Object(fields))
                     .map_err(serde::de::Error::custom)?;
-                let order = if first.as_deref() == Some("type") && step_failure.is_none() {
+                let order = if first.as_deref() == Some("type") {
+                    if step_failure.is_some()
+                        || !matches!(
+                            shape,
+                            AnnotationShape::Blocking(_) | AnnotationShape::Message(_)
+                        )
+                    {
+                        return Err(serde::de::Error::custom(
+                            "type-first encoding requires a blocking struct or message literal",
+                        ));
+                    }
                     AnnotationOrder::Declaration
                 } else {
                     AnnotationOrder::Sorted

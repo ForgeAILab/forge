@@ -117,3 +117,5 @@ verify-barrier	barrier	crates/services/src/workflow/actions/review.rs:675;crates
 demo-reset	annotation	crates/services/src/demo.rs:107	exact fixed source literal
 demo-workspace	annotation	crates/services/src/demo.rs:116	exact fixed source literal
 historical-key/shared-identifier-codec	executor_unavailable_execution_id	crates/services/src/task_service/execution.rs:1159 (shared String codec; no active setter for historical key)	reuse actual main planning_execution_id literal for identical String codec; historical key has no setter
+review-park-execution	annotation	crates/services/src/workflow/actions/no_change.rs:110,113; workflow/engine/durable.rs:643,651; workflow/actions/common.rs:454	archived main real park_no_change writer; failed Review selected by failed_review_for_no_change; db::test_clock::freeze held; string execution id
+review-park-null	annotation	crates/services/src/workflow/actions/no_change.rs:110,113; workflow/engine/durable.rs:643,651; workflow/actions/common.rs:454	archived main real park_no_change writer; failed Review selected by failed_review_for_no_change; db::test_clock::freeze held; null execution id
