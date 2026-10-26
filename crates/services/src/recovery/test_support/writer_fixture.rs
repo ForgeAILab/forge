@@ -1,7 +1,7 @@
+use super::conditions::{attention_incident_digest, fingerprint, normalize_ids};
 use crate::workflow::HookContext;
-use db::{ExecutionRepo, SqliteDb, Task, TaskRepo};
+use db::{ExecutionRepo, TaskRepo};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub(crate) struct Fixture {
@@ -103,11 +103,26 @@ impl Fixture {
     }
 }
 
-fn fingerprint(raw: &str) -> Value {
-    json!({"bytes": raw.len(), "sha256": hex::encode(Sha256::digest(raw.as_bytes()))})
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotOptions {
+    pub(crate) oracle: &'static str,
+    pub(crate) metadata_times: &'static [(&'static str, &'static str)],
+    pub(crate) condition_times: &'static [(&'static str, &'static str)],
+    pub(crate) workflow_offers: Option<&'static str>,
 }
 
-pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
+impl Default for SnapshotOptions {
+    fn default() -> Self {
+        Self {
+            oracle: include_str!("writer_fixture/fixtures/main-94609411.jsonl"),
+            metadata_times: &[],
+            condition_times: &[],
+            workflow_offers: None,
+        }
+    }
+}
+
+pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str, options: SnapshotOptions) {
     let row = f.read().await;
     let repo = db::ProjectRepo::get_by_id(&*f.db, &row.project_id)
         .await
@@ -135,36 +150,25 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
             replacements.push((id.into(), replacement.into()));
         }
     }
-    let identity_replacements = replacements.clone();
-    // Admission and retry deadlines deliberately use their own wall clock. Compare
-    // their stored copies consistently, and separately assert their timestamp shape.
-    if case.starts_with("admission-") || case.starts_with("review-retry") {
-        for pointer in ["/owner_wait/started_at", "/deferred_dispatch/not_before"] {
-            if let Some(at) = metadata.pointer(pointer).and_then(Value::as_str) {
-                chrono::DateTime::parse_from_rfc3339(at).unwrap();
-                replacements.push((at.into(), format!("fixture-time{pointer}")));
-            }
+    for (pointer, token) in options.metadata_times {
+        if let Some(at) = metadata.pointer(pointer).and_then(Value::as_str) {
+            chrono::DateTime::parse_from_rfc3339(at).unwrap();
+            replacements.push((at.into(), (*token).into()));
         }
-        if case == "admission-expired" {
-            for raw in [&row.error_annotation, &row.blocked_json]
-                .into_iter()
-                .flatten()
-            {
-                let value: Value = serde_json::from_str(raw).unwrap();
-                for key in ["blocked_at", "created_at"] {
-                    if let Some(at) = value[key].as_str() {
-                        chrono::DateTime::parse_from_rfc3339(at).unwrap();
-                        replacements.push((at.into(), "fixture-admission-time".into()));
-                    }
-                }
+    }
+    for (pointer, token) in options.condition_times {
+        for raw in [&row.error_annotation, &row.blocked_json]
+            .into_iter()
+            .flatten()
+        {
+            let value: Value = serde_json::from_str(raw).unwrap();
+            if let Some(at) = value.pointer(pointer).and_then(Value::as_str) {
+                chrono::DateTime::parse_from_rfc3339(at).unwrap();
+                replacements.push((at.into(), (*token).into()));
             }
         }
     }
-    let normalize = |raw: &str| {
-        replacements
-            .iter()
-            .fold(raw.to_owned(), |raw, (from, to)| raw.replace(from, to))
-    };
+    let normalize = |raw: &str| normalize_ids(raw, &replacements);
     let condition: String = sqlx::query_scalar("SELECT condition_json FROM task WHERE id=?")
         .bind(&row.id)
         .fetch_one(f.db.pool())
@@ -174,7 +178,7 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
     canonical.id = "fixture-task".into();
     canonical.condition = serde_json::from_str(&normalize(&condition)).unwrap();
     let event = db::CreateDomainEvent::task_interruption_changed(&canonical);
-    let offers = if case.starts_with("demo-") {
+    let offers = if let Some(expected) = options.workflow_offers {
         let actor = api_types::Actor::user(api_types::UserActionSource::Api);
         let snapshot = f
             .ctx
@@ -182,12 +186,14 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
             .task_action_snapshot_for_task(row.clone(), &actor)
             .await
             .unwrap();
-        let offers = crate::task_actions::available_actions(&snapshot);
-        assert!(
-            offers.is_empty(),
-            "main demo's blocked status has no workflow offers"
+        let offers =
+            serde_json::to_value(crate::task_actions::available_actions(&snapshot)).unwrap();
+        assert_eq!(
+            offers,
+            serde_json::from_str::<Value>(expected).unwrap(),
+            "workflow offers"
         );
-        serde_json::to_value(offers).unwrap()
+        offers
     } else {
         crate::task_actions::test_support::condition_offers(&f.db, &row).await
     };
@@ -197,7 +203,7 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
         &projector,
         &row,
         &format!("{case}/{phase}"),
-        &normalize,
+        &replacements,
     )
     .await;
     let fields = json!({
@@ -209,19 +215,6 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
         "operations_text": row.condition.read().operator_reason,
         "offers": offers, "attention_digest": event.dedupe_key, "attention_incident_digest": incident,
     });
-    if let Ok(path) = std::env::var("FORGE_LANE_B_RAW_CAPTURE") {
-        use std::io::Write;
-        let raw = identity_replacements
-            .iter()
-            .fold(fields.to_string(), |raw, (from, to)| raw.replace(from, to));
-        let record = json!({"case":format!("{case}/{phase}"), "fields":serde_json::from_str::<Value>(&raw).unwrap()});
-        let mut output = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap();
-        writeln!(output, "{record}").unwrap();
-    }
     let fields: serde_json::Map<String, Value> = fields
         .as_object()
         .unwrap()
@@ -229,7 +222,8 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
         .map(|(key, value)| (key.clone(), fingerprint(&normalize(&value.to_string()))))
         .collect();
     let actual = json!({"case":format!("{case}/{phase}"), "fields":fields});
-    let expected = include_str!("fixtures/main-94609411.jsonl")
+    let expected = options
+        .oracle
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .find(|value| value["case"] == actual["case"])
@@ -237,8 +231,8 @@ pub(crate) async fn snapshot(f: &Fixture, case: &str, phase: &str) {
     assert_eq!(actual, expected, "archived main parity: {case}/{phase}");
 }
 
-pub(crate) async fn after(f: &Fixture, case: &str) {
-    snapshot(f, case, "first").await;
+pub(crate) async fn after(f: &Fixture, case: &str, options: SnapshotOptions) {
+    snapshot(f, case, "first", options).await;
     TaskRepo::mutate_metadata(
         &*f.db,
         &f.task.id,
@@ -251,77 +245,11 @@ pub(crate) async fn after(f: &Fixture, case: &str) {
     )
     .await
     .unwrap();
-    snapshot(f, case, "following-unconverted-write").await;
+    snapshot(f, case, "following-unconverted-write", options).await;
     let row = f.read().await;
     if row.error_annotation.is_some() {
         crate::worker_runtime::queue::condition_tests::merge_after_writer(&f.db, &row, &f.step)
             .await;
-        snapshot(f, case, "queue-overlay").await;
+        snapshot(f, case, "queue-overlay", options).await;
     }
-}
-
-async fn attention_incident_digest(
-    db: &SqliteDb,
-    projector: &crate::recovery::test_support::conditions::AttentionProjector,
-    row: &Task,
-    phase: &str,
-    normalize: impl Fn(&str) -> String,
-) -> Option<String> {
-    projector.run_once(100).await.unwrap();
-    let mut event = db::CreateDomainEvent::task_interruption_changed(row);
-    // A separate delivery lets the initialized projector observe this exact
-    // snapshot even when the writer's own event predates its first cursor.
-    event.dedupe_key = Some(format!("condition-parity:{}:{phase}", row.id));
-    let event = db::DomainEventRepo::append_event(db, event).await.unwrap();
-    // The 400-child fixture also has 400 task.created trigger events. Drain
-    // through this receipt, rather than assuming two batches reach it.
-    const MAX_BATCHES: usize = 10;
-    let mut through = 0;
-    for _ in 0..MAX_BATCHES {
-        projector.run_once(100).await.unwrap();
-        through = db::DomainEventRepo::get_consumer_cursor(
-            db,
-            crate::attention_service::attention_consumer_name(),
-        )
-        .await
-        .unwrap()
-        .expect("Attention worker initialized its cursor")
-        .last_sequence;
-        if through >= event.sequence {
-            break;
-        }
-    }
-    assert!(
-        through >= event.sequence,
-        "Attention did not reach snapshot event {} (sequence {}, task {}, phase {}) after {} batches of 100; durable cursor stopped at {}",
-        event.id, event.sequence, row.id, phase, MAX_BATCHES, through
-    );
-    let incident: Option<String> = sqlx::query_scalar(
-        "SELECT id FROM attention_projection WHERE json_extract(details_json,'$.entity_id')=? AND attention_type IN ('execution_failed','review_needs_owner')",
-    ).bind(&row.id).fetch_optional(db.pool()).await.unwrap();
-    let Some(id) = incident else {
-        assert!(!db::material_blocker(&row.condition).requires_intervention);
-        return None;
-    };
-    let mut attention = db::AttentionRepo::get_attention(db, &id)
-        .await
-        .unwrap()
-        .unwrap();
-    if db::material_blocker(&row.condition).requires_intervention {
-        assert_eq!(
-            attention.source_event_id, event.id,
-            "snapshot incident source"
-        );
-        assert_eq!(
-            attention.source_sequence,
-            Some(event.sequence),
-            "snapshot incident sequence"
-        );
-    }
-    attention.scope_id = attention
-        .scope_id
-        .replace(&row.project_id, "fixture-project")
-        .replace(&row.id, "fixture-task");
-    attention.details_json = normalize(&attention.details_json);
-    Some(db::canonical_attention_incident_digest(&attention))
 }

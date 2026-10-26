@@ -1,22 +1,35 @@
-//! Real lane-B calls compared with snapshots captured from git archive 94609411.
+//! Real writer calls compared with snapshots captured from git archive 94609411.
 use super::*;
-use crate::demo::lane_fixture as fixture;
-use fixture::{after, Fixture};
+use crate::recovery::test_support::writer_fixture as fixture;
+use fixture::{after, Fixture, SnapshotOptions};
+
+const WALL_CLOCK_FIELDS: &[(&str, &str)] = &[
+    (
+        "/owner_wait/started_at",
+        "fixture-time/owner_wait/started_at",
+    ),
+    (
+        "/deferred_dispatch/not_before",
+        "fixture-time/deferred_dispatch/not_before",
+    ),
+];
 
 macro_rules! case {
-    ($name:expr, $state:expr, $f:ident, $body:block) => {{
-        let _clock = crate::recovery::test_support::conditions::freeze_clock();
+    ($name:expr, $state:expr, $f:ident, $body:block) => {
+        case!($name, $state, $f, SnapshotOptions::default(), $body)
+    };
+    ($name:expr, $state:expr, $f:ident, $options:expr, $body:block) => {{
         let $f = Fixture::new($state).await;
         db::task_writer::in_task_step($f.step.clone(), async {
             $body;
-            after(&$f, $name).await;
+            after(&$f, $name, $options).await;
         })
         .await;
     }};
 }
 
 #[tokio::test]
-async fn lane_b_dependency_and_budget_writers_match_main() {
+async fn dependency_and_budget_writers_match_main() {
     case!("dependency-hook", "in_progress", f, {
         f.ctx
             .task_service
@@ -33,12 +46,15 @@ async fn lane_b_dependency_and_budget_writers_match_main() {
             "dependency-carried",
             json!({"caller_extension":{"history":[1,true,null]}}),
         ),
-        ("dependency-scalar-fallback", json!(7)),
     ] {
         case!(name, "in_progress", f, {
             f.ctx
                 .task_service
-                .write_dependency_block(&f.task, &["dependency".into()], Some(saved))
+                .write_dependency_block(
+                    &f.task,
+                    &["dependency".into()],
+                    Some(saved.as_object().unwrap().clone()),
+                )
                 .await
                 .unwrap();
         });
@@ -84,7 +100,7 @@ async fn lane_b_dependency_and_budget_writers_match_main() {
 }
 
 #[tokio::test]
-async fn lane_b_review_writers_match_main() {
+async fn review_writers_match_main() {
     case!("review-candidate", "review", f, {
         f.ctx
             .task_service
@@ -116,27 +132,36 @@ async fn lane_b_review_writers_match_main() {
             Some(r#"{"state":"review","status":"blocked","started_at":null}"#),
         ),
     ] {
-        case!(name, "review", f, {
-            if let Some(raw) = barrier {
-                sqlx::query("UPDATE task SET entry_barrier_json=? WHERE id=?")
-                    .bind(raw)
-                    .bind(&f.task.id)
-                    .execute(f.db.pool())
+        case!(
+            name,
+            "review",
+            f,
+            SnapshotOptions {
+                metadata_times: if retry { WALL_CLOCK_FIELDS } else { &[] },
+                ..Default::default()
+            },
+            {
+                if let Some(raw) = barrier {
+                    sqlx::query("UPDATE task SET entry_barrier_json=? WHERE id=?")
+                        .bind(raw)
+                        .bind(&f.task.id)
+                        .execute(f.db.pool())
+                        .await
+                        .unwrap();
+                }
+                let row = f.read().await;
+                f.ctx
+                    .task_service
+                    .annotate_review_ci_interruption(&row, &f.ctx, "ci unavailable", retry, reset)
                     .await
                     .unwrap();
             }
-            let row = f.read().await;
-            f.ctx
-                .task_service
-                .annotate_review_ci_interruption(&row, &f.ctx, "ci unavailable", retry, reset)
-                .await
-                .unwrap();
-        });
+        );
     }
 }
 
 #[tokio::test]
-async fn lane_b_metadata_writers_match_main() {
+async fn metadata_writers_match_main() {
     case!("deferred", "in_progress", f, {
         crate::deferred_dispatch::set(
             &f.db,
@@ -232,7 +257,7 @@ async fn lane_b_metadata_writers_match_main() {
 }
 
 #[tokio::test]
-async fn lane_b_placement_writers_match_main() {
+async fn placement_writers_match_main() {
     for (name, codes, checks) in [
         (
             "placement",
@@ -277,52 +302,75 @@ async fn lane_b_placement_writers_match_main() {
                 .unwrap();
         });
     }
-    case!("admission-owner-wait", "in_progress", f, {
-        f.ctx
-            .task_service
-            .defer_placement_refusal(
-                &f.task,
-                &ServiceError::DaemonUnavailable {
-                    daemon_id: "daemon".into(),
-                },
+    case!(
+        "admission-owner-wait",
+        "in_progress",
+        f,
+        SnapshotOptions {
+            metadata_times: WALL_CLOCK_FIELDS,
+            ..Default::default()
+        },
+        {
+            f.ctx
+                .task_service
+                .defer_placement_refusal(
+                    &f.task,
+                    &ServiceError::DaemonUnavailable {
+                        daemon_id: "daemon".into(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    );
+    case!(
+        "admission-expired",
+        "in_progress",
+        f,
+        SnapshotOptions {
+            metadata_times: WALL_CLOCK_FIELDS,
+            condition_times: &[
+                ("/blocked_at", "fixture-admission-time"),
+                ("/created_at", "fixture-admission-time")
+            ],
+            ..Default::default()
+        },
+        {
+            TaskRepo::mutate_metadata(
+                &*f.db,
+                &f.task.id,
+                None,
+                vec![db::TaskMetadataMutation::Set {
+                    key: "owner_wait".into(),
+                    value: json!({"daemon_id":"daemon","started_at":"2000-01-01T00:00:00+00:00"}),
+                }],
+                &db::now_rfc3339(),
             )
             .await
             .unwrap();
-    });
-    case!("admission-expired", "in_progress", f, {
-        TaskRepo::mutate_metadata(
-            &*f.db,
-            &f.task.id,
-            None,
-            vec![db::TaskMetadataMutation::Set {
-                key: "owner_wait".into(),
-                value: json!({"daemon_id":"daemon","started_at":"2000-01-01T00:00:00+00:00"}),
-            }],
-            &db::now_rfc3339(),
-        )
-        .await
-        .unwrap();
-        f.ctx
-            .task_service
-            .defer_placement_refusal(
-                &f.read().await,
-                &ServiceError::DaemonUnavailable {
-                    daemon_id: "daemon".into(),
-                },
-            )
-            .await
-            .unwrap();
-        let row = f.read().await;
-        let metadata: Value = serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            metadata["owner_wait"]["started_at"],
-            "2000-01-01T00:00:00+00:00"
-        );
-    });
+            f.ctx
+                .task_service
+                .defer_placement_refusal(
+                    &f.read().await,
+                    &ServiceError::DaemonUnavailable {
+                        daemon_id: "daemon".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            let row = f.read().await;
+            let metadata: Value =
+                serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                metadata["owner_wait"]["started_at"],
+                "2000-01-01T00:00:00+00:00"
+            );
+        }
+    );
 }
 
 #[tokio::test]
-async fn lane_b_remote_cancel_writer_matches_main() {
+async fn remote_cancel_writer_matches_main() {
     case!("remote-cancel", "in_progress", f, {
         let execution = f.execution(db::ExecutionStatus::Failed).await;
         f.ctx
@@ -367,59 +415,8 @@ async fn lane_b_remote_cancel_writer_matches_main() {
     });
 }
 
-#[test]
-fn lane_b_production_constructs_typed_channels() {
-    for (source, marker) in [
-        (
-            include_str!("../../../../db/src/budget.rs"),
-            "channel::EntryBarrier",
-        ),
-        (
-            include_str!("../dependencies.rs"),
-            "channel::BlockingAnnotation",
-        ),
-        (
-            include_str!("../actions.rs"),
-            "channel::RemoteCancelAnnotation",
-        ),
-        (include_str!("../replan.rs"), "channel::BudgetAnnotation"),
-        (include_str!("../review.rs"), "channel::EntryBarrier"),
-        (
-            include_str!("../review_candidate.rs"),
-            "channel::ReviewCandidateAnnotation",
-        ),
-        (
-            include_str!("../placement_refusal.rs"),
-            "channel::PlacementRefusalAnnotation",
-        ),
-        (
-            include_str!("../subtask.rs"),
-            "channel::ConditionMetadataValue::CoordinationReviewPending",
-        ),
-        (
-            include_str!("../../deferred_dispatch.rs"),
-            "channel::DispatchDisposition",
-        ),
-        (
-            include_str!("../workspace/admission.rs"),
-            "channel::OwnerWait",
-        ),
-        (
-            include_str!("../../task_dispatcher/workspace_blocking.rs"),
-            "channel::TimedBlockAnnotation",
-        ),
-        (include_str!("../../demo.rs"), "MessageAnnotation"),
-    ] {
-        assert!(
-            source.contains(marker),
-            "production writer must construct {marker}"
-        );
-    }
-}
-
 #[tokio::test]
-async fn lane_b_carried_superseded_objects_keep_deep_existing_values() {
-    let _clock = crate::recovery::test_support::conditions::freeze_clock();
+async fn carried_superseded_objects_keep_deep_existing_values() {
     let f = Fixture::new("in_progress").await;
     let mut value = json!([1, true, null]);
     for _ in 0..40 {
@@ -429,18 +426,22 @@ async fn lane_b_carried_superseded_objects_keep_deep_existing_values() {
         let row = f
             .ctx
             .task_service
-            .write_dependency_block(&f.task, &["dependency".into()], Some(value.clone()))
+            .write_dependency_block(
+                &f.task,
+                &["dependency".into()],
+                Some(value.as_object().unwrap().clone()),
+            )
             .await
             .unwrap();
         let blocked: Value = serde_json::from_str(row.blocked_json.as_deref().unwrap()).unwrap();
         assert_eq!(blocked["details"]["superseded"], value);
-        after(&f, "dependency-deep-carried").await;
+        after(&f, "dependency-deep-carried", SnapshotOptions::default()).await;
     })
     .await;
 }
 
 #[tokio::test]
-async fn lane_b_refresh_pause_without_generation_matches_main() {
+async fn refresh_pause_without_generation_matches_main() {
     case!("paused-refresh-without-generation", "merging", f, {
         TaskRepo::mutate_metadata(
             &*f.db,

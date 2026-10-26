@@ -1,5 +1,6 @@
 use super::*;
 use db::task_condition::channels as channel;
+use serde_json::Map;
 
 /// Which way one prerequisite edge is moving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +243,8 @@ impl TaskService {
             failed_json: None,
         })
         .expect("superseded condition serializes");
+        let superseded = serde_json::from_value::<Map<String, Value>>(superseded)
+            .expect("superseded condition is an object");
         self.write_dependency_block(task, &block.cancelled_dependency_ids, Some(superseded))
             .await
             .map(Some)
@@ -251,7 +254,7 @@ impl TaskService {
         &self,
         task: &Task,
         cancelled_dependency_ids: &[String],
-        superseded: Option<Value>,
+        superseded: Option<Map<String, Value>>,
     ) -> Result<Task> {
         let reason = format!(
             "required dependenc{} cancelled: {}",
@@ -291,31 +294,27 @@ impl TaskService {
                 "failed to serialize dependency blocker: {error}"
             ))
         })?;
-        let blocked = match superseded.as_ref() {
-            None | Some(Value::Object(_)) => {
-                let superseded = superseded.map(|value| {
-                    // Existing copied objects can have schemas and depths unknown to this build.
-                    serde_json::from_value::<channel::SupersededCondition>(value.clone())
-                        .map(channel::SupersededValue::Condition)
-                        .unwrap_or_else(|_| channel::SupersededValue::Carried(channel::CopiedConditionObject::new(value.as_object().unwrap().clone())))
-                });
-                serde_json::to_string(&channel::Interruption {
-                    reason: Some(reason.clone()), created_at: Some(Some(now.clone())),
-                    kind: Some(Some(api_types::FailureKind::WorkflowGuardRejected.into())),
-                    source: Some(Some("dependency_gate".into())),
-                    details: Some(Some(channel::InterruptionDetails {
-                        cancelled_dependency_ids: Some(Some(cancelled_dependency_ids.to_vec())),
-                        superseded: Some(superseded), ..Default::default()
-                    })), ..Default::default()
-                }).expect("dependency interruption serializes")
-            }
-            // Preserve the historical edit if an unrecognized carried value reaches this writer.
-            Some(_) => json!({
-                "reason": reason, "created_at": now,
-                "kind": api_types::FailureKind::WorkflowGuardRejected, "source": "dependency_gate",
-                "details": {"cancelled_dependency_ids": cancelled_dependency_ids, "superseded": superseded},
-            }).to_string(),
-        };
+        let superseded = superseded.map(|map| {
+            // Unknown carried objects retain main's raw Value edit.
+            serde_json::from_value::<channel::SupersededCondition>(Value::Object(map.clone()))
+                .map(channel::SupersededValue::Condition)
+                .unwrap_or_else(|_| {
+                    channel::SupersededValue::Carried(channel::CopiedConditionObject::new(map))
+                })
+        });
+        let blocked = serde_json::to_string(&channel::Interruption {
+            reason: Some(reason.clone()),
+            created_at: Some(Some(now.clone())),
+            kind: Some(Some(api_types::FailureKind::WorkflowGuardRejected.into())),
+            source: Some(Some("dependency_gate".into())),
+            details: Some(Some(channel::InterruptionDetails {
+                cancelled_dependency_ids: Some(Some(cancelled_dependency_ids.to_vec())),
+                superseded: Some(superseded),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .map_err(|error| ServiceError::invalid_operation(error.to_string()))?;
 
         let current = task.clone();
         {
@@ -533,7 +532,7 @@ impl TaskService {
 struct DependencyBlock {
     cancelled_dependency_ids: Vec<String>,
     /// The condition columns the blocker displaced.
-    superseded: Option<Value>,
+    superseded: Option<Map<String, Value>>,
 }
 
 fn dependency_block(task: &Task) -> Option<DependencyBlock> {
@@ -558,8 +557,7 @@ fn dependency_block(task: &Task) -> Option<DependencyBlock> {
         .blocked_json
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .map(|blocked| blocked["details"]["superseded"].clone())
-        .filter(Value::is_object);
+        .and_then(|blocked| blocked["details"]["superseded"].as_object().cloned());
     Some(DependencyBlock {
         cancelled_dependency_ids,
         superseded,
@@ -568,16 +566,17 @@ fn dependency_block(task: &Task) -> Option<DependencyBlock> {
 
 /// What the Task is waiting on right now: its own condition columns, or the
 /// condition an accepted, not yet dispatched Task action saved.
-fn superseded_condition(task: &Task) -> Option<Value> {
+fn superseded_condition(task: &Task) -> Option<Map<String, Value>> {
     let columns = |annotation: Option<&str>, blocked: Option<&str>, failed: Option<&str>| {
         (annotation.is_some() || blocked.is_some() || failed.is_some()).then(|| {
-            serde_json::to_value(channel::SupersededCondition {
+            let value = serde_json::to_value(channel::SupersededCondition {
                 status: task.status.clone(),
                 error_annotation: annotation.map(str::to_owned),
                 blocked_json: blocked.map(str::to_owned),
                 failed_json: failed.map(str::to_owned),
             })
-            .expect("superseded condition serializes")
+            .expect("superseded condition serializes");
+            serde_json::from_value(value).expect("superseded condition is an object")
         })
     };
     columns(

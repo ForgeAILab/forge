@@ -613,7 +613,3 @@ mod tests {
 
 #[cfg(test)]
 mod condition_tests;
-
-#[cfg(test)]
-#[path = "task_service/dependencies/lane_fixture.rs"]
-pub(crate) mod lane_fixture;

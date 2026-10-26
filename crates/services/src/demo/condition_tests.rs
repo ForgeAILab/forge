@@ -1,9 +1,9 @@
 use super::*;
-use crate::demo::lane_fixture as fixture;
+use crate::recovery::test_support::writer_fixture as fixture;
+use fixture::SnapshotOptions;
 
 #[tokio::test]
-async fn lane_b_demo_annotations_match_main_literal_bytes() {
-    let _clock = crate::recovery::test_support::conditions::freeze_clock();
+async fn demo_annotations_match_main_literal_bytes() {
     let mut f = fixture::Fixture::new("in_progress").await;
     let db = f.db.clone();
     install_demo_data(&db).await.unwrap();
@@ -26,7 +26,15 @@ async fn lane_b_demo_annotations_match_main_literal_bytes() {
         f.task = TaskRepo::get_by_id(&*db, id, false).await.unwrap().unwrap();
         f.step = crate::recovery::test_support::conditions::claim(&db, &f.task).await;
         db::task_writer::in_task_step(f.step.clone(), async {
-            fixture::after(&f, if i == 0 { "demo-reset" } else { "demo-error" }).await;
+            fixture::after(
+                &f,
+                if i == 0 { "demo-reset" } else { "demo-error" },
+                SnapshotOptions {
+                    workflow_offers: Some("[]"),
+                    ..Default::default()
+                },
+            )
+            .await;
         })
         .await;
     }

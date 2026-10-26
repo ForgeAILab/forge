@@ -1369,7 +1369,9 @@ impl TaskService {
                             serde_json::from_value::<api_types::FailureKind>(kind).ok()
                         })
                         .unwrap_or(api_types::FailureKind::ExecutorFailed);
-                    if serde_json::from_value::<channel::Interruption>(failure.clone()).is_ok() {
+                    if kind != api_types::FailureKind::Unknown
+                        && serde_json::from_value::<channel::Interruption>(failure.clone()).is_ok()
+                    {
                         return serde_json::to_string(&channel::ErrorAnnotation::new(
                             channel::AnnotationShape::Blocking(channel::BlockingAnnotation {
                                 kind,

@@ -1,12 +1,17 @@
 use super::*;
-use crate::demo::lane_fixture as fixture;
+use crate::recovery::test_support::writer_fixture as fixture;
+use fixture::SnapshotOptions;
 
 #[tokio::test]
-async fn lane_b_saved_action_annotations_match_main_including_unknown_fallback() {
+async fn saved_action_annotations_match_main_including_unknown_fallback() {
     for (name, failure) in [
         (
             "saved-action-known",
             r#"{"created_at":"2026-10-25T00:00:00Z","kind":"executor_failed","reason":"failed"}"#,
+        ),
+        (
+            "saved-action-integration-admission-failed",
+            r#"{"kind":"integration_admission_failed","reason":"historical"}"#,
         ),
         ("saved-action-null", r#"{"kind":null,"reason":null}"#),
         (
@@ -18,7 +23,6 @@ async fn lane_b_saved_action_annotations_match_main_including_unknown_fallback()
             r#"{"kind":"executor_failed","reason":"historical","caller_extension":[1,null]}"#,
         ),
     ] {
-        let _clock = crate::recovery::test_support::conditions::freeze_clock();
         let f = fixture::Fixture::new("in_progress").await;
         db::task_writer::in_task_step(f.step.clone(), async {
             sqlx::query("UPDATE task SET failed_json=? WHERE id=?")
@@ -57,22 +61,24 @@ async fn lane_b_saved_action_annotations_match_main_including_unknown_fallback()
             let row = f.read().await;
             let metadata: Value =
                 serde_json::from_str(row.metadata_json.as_deref().unwrap()).unwrap();
-            if name == "saved-action-unknown" {
+            if matches!(
+                name,
+                "saved-action-unknown" | "saved-action-integration-admission-failed"
+            ) {
                 assert!(metadata["queued_recovery"]["error_annotation"]
                     .as_str()
                     .unwrap()
                     .contains(r#""type":"unknown""#));
             }
-            fixture::after(&f, name).await;
+            fixture::after(&f, name, SnapshotOptions::default()).await;
         })
         .await;
     }
 }
 
 #[tokio::test]
-async fn lane_b_hold_writers_match_main() {
+async fn hold_writers_match_main() {
     for dependency in [false, true] {
-        let _clock = crate::recovery::test_support::conditions::freeze_clock();
         let f = fixture::Fixture::new("in_progress").await;
         db::task_writer::in_task_step(f.step.clone(), async {
             if dependency {
@@ -101,6 +107,7 @@ async fn lane_b_hold_writers_match_main() {
                 } else {
                     "hold"
                 },
+                SnapshotOptions::default(),
             )
             .await;
         })

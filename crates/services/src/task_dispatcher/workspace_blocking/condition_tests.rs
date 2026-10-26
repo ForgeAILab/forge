@@ -1,10 +1,10 @@
 use super::*;
-use crate::demo::lane_fixture as fixture;
+use crate::recovery::test_support::writer_fixture as fixture;
+use fixture::SnapshotOptions;
 
 #[tokio::test]
-async fn lane_b_workspace_blockers_match_main() {
+async fn workspace_blockers_match_main() {
     for reset in [false, true] {
-        let _clock = crate::recovery::test_support::conditions::freeze_clock();
         let f = fixture::Fixture::new("in_progress").await;
         let service = std::sync::Arc::new(f.ctx.task_service.clone());
         let dispatcher = TaskDispatcher::new(f.db.clone(), f.ctx.event_bus.clone(), service);
@@ -28,6 +28,7 @@ async fn lane_b_workspace_blockers_match_main() {
                 } else {
                     "dispatcher-error"
                 },
+                SnapshotOptions::default(),
             )
             .await;
         })
