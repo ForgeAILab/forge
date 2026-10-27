@@ -782,6 +782,12 @@ reason rather than a global recency merge.
 
 ### Milestones, readiness, releases, and evidence
 
+Definition transitions reject acceptance check IDs belonging to another Project
+or milestone with 400 `bad_request`. Manual result writes return 409
+`idempotency_in_progress` on a unique conflict and 409 `version_conflict` if the
+check changes before its result is committed; either failure rolls back the
+result and its event.
+
 Milestone definition revisions use `draft`, `proposed`, `approved`, or
 `superseded`; milestone instances use `planned`, `active`, `ready_for_release`,
 `released`, or `cancelled`. Multiple milestones may be active and the

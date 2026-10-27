@@ -24,45 +24,24 @@ pub async fn list_milestone_revisions_with_query(
     .await?;
     let limit = bounded_limit(query.limit);
     let cursor = decode_cursor(query.cursor.as_deref())?;
-    let rows = if let Some((revision, id)) = cursor.as_ref() {
-        let revision = revision
-            .parse::<i64>()
-            .map_err(|_| ApiError::bad_request("invalid cursor"))?;
-        sqlx::query(
-            "SELECT r.id
-             FROM project_milestone_revision r
-             JOIN project_milestone m ON m.id = r.milestone_id
-             WHERE r.milestone_id = ? AND m.project_id = ?
-               AND (r.revision > ? OR (r.revision = ? AND r.id > ?))
-             ORDER BY r.revision ASC, r.id ASC LIMIT ?",
-        )
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(revision)
-        .bind(revision)
-        .bind(id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    } else {
-        sqlx::query(
-            "SELECT r.id
-             FROM project_milestone_revision r
-             JOIN project_milestone m ON m.id = r.milestone_id
-             WHERE r.milestone_id = ? AND m.project_id = ?
-             ORDER BY r.revision ASC, r.id ASC LIMIT ?",
-        )
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(limit + 1)
-        .fetch_all(state.db.pool())
-        .await?
-    };
+    let cursor = cursor
+        .map(|(revision, id)| {
+            revision
+                .parse::<i64>()
+                .map(|revision| (revision, id))
+                .map_err(|_| ApiError::bad_request("invalid cursor"))
+        })
+        .transpose()?;
+    let rows = state
+        .db
+        .project_milestone_revision_id_page(&project_id, &milestone_id, cursor, limit)
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     let has_more = rows.len() > limit as usize;
     let runtime = MilestoneRuntime::new(state.db.clone());
     let mut items = Vec::with_capacity(rows.len().min(limit as usize));
     for row in rows.into_iter().take(limit as usize) {
-        let revision_id: String = row.try_get("id")?;
+        let revision_id = row.id().map_err(ApiError::project_artifact_mutation)?;
         let revision = runtime
             .definition_revision(&project_id, &milestone_id, &revision_id)
             .await
@@ -174,56 +153,64 @@ pub async fn transition_milestone_revision(
         return Ok(Json(revision));
     }
     let mut tx = db::begin_immediate(state.db.pool()).await?;
-    let locked = sqlx::query(
-        "UPDATE project_milestone SET version = version
-         WHERE id = ? AND project_id = ? AND version = ?",
-    )
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .bind(request.mutation.expected_version)
-    .execute(&mut *tx)
-    .await?;
-    if locked.rows_affected() != 1 {
+    let locked = state
+        .db
+        .lock_milestone_version_in_tx(
+            &mut tx,
+            &milestone_id,
+            &project_id,
+            request.mutation.expected_version,
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
+    if locked != 1 {
         return Err(ApiError::conflict_with_code(
             "version_conflict",
             "the milestone changed before its definition transition",
         ));
     }
-    let target = sqlx::query(
-        "SELECT r.* FROM project_milestone_revision r
-         JOIN project_milestone m ON m.id = r.milestone_id
-         WHERE r.id = ? AND r.milestone_id = ? AND m.project_id = ?",
-    )
-    .bind(&revision_id)
-    .bind(&milestone_id)
-    .bind(&project_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| ApiError::not_found("milestone_definition_revision", revision_id.clone()))?;
-    let from_name: String = target.try_get("lifecycle")?;
+    let target = state
+        .db
+        .milestone_definition_transition_source_in_tx(
+            &mut tx,
+            &revision_id,
+            &milestone_id,
+            &project_id,
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?
+        .ok_or_else(|| ApiError::not_found("milestone_definition_revision", revision_id.clone()))?;
+    let from_name: String = target
+        .lifecycle()
+        .map_err(ApiError::project_artifact_mutation)?;
     let from = parse_definition_lifecycle(&from_name)?;
     services::validate_definition_transition(from, request.lifecycle)
         .map_err(|error| ApiError::conflict_with_code("invalid_transition", error.to_string()))?;
-    let acceptance_checks_json: String = target.try_get("acceptance_checks_json")?;
+    let acceptance_checks_json: String = target
+        .acceptance_checks_json()
+        .map_err(ApiError::project_artifact_mutation)?;
     let acceptance_checks: Vec<api_types::MilestoneAcceptanceCheck> =
         serde_json::from_str(&acceptance_checks_json)
             .map_err(|_| ApiError::internal("persisted milestone acceptance checks are invalid"))?;
-    let evidence_requirements_json: String = target.try_get("evidence_requirements_json")?;
+    let evidence_requirements_json: String = target
+        .evidence_requirements_json()
+        .map_err(ApiError::project_artifact_mutation)?;
     let evidence_requirements: Vec<api_types::AcceptanceEvidenceRequirement> =
         serde_json::from_str(&evidence_requirements_json).map_err(|_| {
             ApiError::internal("persisted milestone evidence requirements are invalid")
         })?;
-    let transitioned = sqlx::query(
-        "UPDATE project_milestone_revision SET lifecycle = ?
-         WHERE id = ? AND milestone_id = ? AND lifecycle = ?",
-    )
-    .bind(milestone_definition_lifecycle_name(request.lifecycle))
-    .bind(&revision_id)
-    .bind(&milestone_id)
-    .bind(&from_name)
-    .execute(&mut *tx)
-    .await?;
-    if transitioned.rows_affected() != 1 {
+    let transitioned = state
+        .db
+        .transition_milestone_definition_lifecycle_in_tx(
+            &mut tx,
+            &revision_id,
+            &milestone_id,
+            &from_name,
+            milestone_definition_lifecycle_name(request.lifecycle),
+        )
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
+    if transitioned != 1 {
         return Err(ApiError::conflict_with_code(
             "version_conflict",
             "the milestone definition changed before its transition",
@@ -235,6 +222,7 @@ pub async fn transition_milestone_revision(
         MilestoneDefinitionLifecycle::Proposed | MilestoneDefinitionLifecycle::Approved
     ) {
         materialize_check_definitions_in_tx(
+            &state.db,
             &mut tx,
             &project_id,
             &milestone_id,
@@ -245,47 +233,19 @@ pub async fn transition_milestone_revision(
         )
         .await?;
     }
-    if request.lifecycle == MilestoneDefinitionLifecycle::Approved {
-        sqlx::query(
-            "UPDATE project_milestone_revision
-             SET lifecycle = 'superseded'
-             WHERE milestone_id = ? AND id != ? AND lifecycle = 'approved'",
+    let advanced = state
+        .db
+        .advance_milestone_definition_in_tx(
+            &mut tx,
+            &project_id,
+            &milestone_id,
+            &revision_id,
+            request.mutation.expected_version,
+            milestone_definition_lifecycle_name(request.lifecycle),
+            &updated_at,
         )
-        .bind(&milestone_id)
-        .bind(&revision_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    let advanced = if matches!(
-        request.lifecycle,
-        MilestoneDefinitionLifecycle::Proposed | MilestoneDefinitionLifecycle::Approved
-    ) {
-        sqlx::query(
-            "UPDATE project_milestone
-             SET current_definition_revision_id = ?, version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(&revision_id)
-        .bind(&updated_at)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    } else {
-        sqlx::query(
-            "UPDATE project_milestone SET version = version + 1, updated_at = ?
-             WHERE id = ? AND project_id = ? AND version = ?",
-        )
-        .bind(&updated_at)
-        .bind(&milestone_id)
-        .bind(&project_id)
-        .bind(request.mutation.expected_version)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-    };
+        .await
+        .map_err(ApiError::project_artifact_mutation)?;
     if advanced != 1 {
         return Err(ApiError::conflict_with_code(
             "version_conflict",
@@ -394,7 +354,9 @@ pub async fn save_milestone_revision(
     Ok((StatusCode::CREATED, Json(revision)))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn materialize_check_definitions_in_tx(
+    db: &db::SqliteDb,
     tx: &mut Transaction<'_, Sqlite>,
     project_id: &str,
     milestone_id: &str,
@@ -474,64 +436,28 @@ async fn materialize_check_definitions_in_tx(
             ));
         }
         let source_kind = acceptance_source_kind_name(check.source_kind);
-        let existing: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT project_id, milestone_id, definition_revision_id
-             FROM project_milestone_check WHERE id = ?",
-        )
-        .bind(&check.id)
-        .fetch_optional(&mut **tx)
-        .await?;
-        if let Some((existing_project, existing_milestone, existing_revision)) = existing {
-            if existing_project != project_id || existing_milestone != milestone_id {
-                return Err(ApiError::bad_request(
-                    "milestone acceptance check belongs to another Project or milestone",
-                ));
-            }
-            if existing_revision == definition_revision_id {
-                continue;
-            }
-            sqlx::query(
-                "UPDATE project_milestone_check
-                 SET definition_revision_id = ?, check_key = ?, description = ?, required = ?,
-                     source_kind = ?, expected_result = ?, evidence_required = ?,
-                     version = version + 1, current_result_id = NULL, updated_at = ?
-                 WHERE id = ? AND project_id = ? AND milestone_id = ?",
+        let outcome = db
+            .materialize_milestone_definition_check_in_tx(
+                tx,
+                db::MaterializeMilestoneCheckInput {
+                    project_id,
+                    milestone_id,
+                    definition_revision_id,
+                    check_id: &check.id,
+                    description: &check.description,
+                    required: check.required,
+                    source_kind,
+                    expected_result: &check.expected_result,
+                    evidence_required,
+                    updated_at,
+                },
             )
-            .bind(definition_revision_id)
-            .bind(&check.id)
-            .bind(&check.description)
-            .bind(check.required)
-            .bind(source_kind)
-            .bind(&check.expected_result)
-            .bind(evidence_required)
-            .bind(updated_at)
-            .bind(&check.id)
-            .bind(project_id)
-            .bind(milestone_id)
-            .execute(&mut **tx)
-            .await?;
-        } else {
-            sqlx::query(
-                "INSERT INTO project_milestone_check (
-                    id, project_id, milestone_id, definition_revision_id, check_key,
-                    description, required, source_kind, expected_result,
-                    evidence_required, version, current_result_id, created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)",
-            )
-            .bind(&check.id)
-            .bind(project_id)
-            .bind(milestone_id)
-            .bind(definition_revision_id)
-            .bind(&check.id)
-            .bind(&check.description)
-            .bind(check.required)
-            .bind(source_kind)
-            .bind(&check.expected_result)
-            .bind(evidence_required)
-            .bind(updated_at)
-            .bind(updated_at)
-            .execute(&mut **tx)
-            .await?;
+            .await
+            .map_err(ApiError::project_artifact_mutation)?;
+        if outcome == db::MaterializeMilestoneCheckOutcome::ScopeMismatch {
+            return Err(ApiError::bad_request(
+                "milestone acceptance check belongs to another Project or milestone",
+            ));
         }
     }
     Ok(())
